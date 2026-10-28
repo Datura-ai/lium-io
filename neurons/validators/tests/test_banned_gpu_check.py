@@ -1,8 +1,11 @@
+
 import pytest
 
 from neurons.validators.src.services.task.checks.banned_gpu import BannedGpuCheck
 from neurons.validators.src.services.task.messages import BannedGpuMessages as Msg
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutorsResponse,
+)
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -46,3 +49,5 @@ async def test_banned_gpu_check(
         assert result.updates.get("clear_verified_job_info") is True
     else:
         assert "clear_verified_job_info" not in result.updates
+
+

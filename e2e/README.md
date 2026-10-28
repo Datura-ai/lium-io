@@ -8,7 +8,8 @@ missing is the chain: the subtensor client is never constructed, the miner never
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
-**`e2e-gate`**, routed by `.github/actions/changed-packages`); a PR that touches none of those skips it, and
+**`e2e-gate`**, routed by `.github/actions/changed-packages`; a push to `main` runs it when the push changed one of
+those); a PR that touches none of those, or only a neuron's own `tests/`, skips it, and
 `tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
 stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
 container on the provider's host.
@@ -98,14 +99,15 @@ miner signature → 401/403, a substituted public key (#744) → 400/401.
 the pyarmor+PyInstaller scrape build, key install through the miner, SSH, scrape upload + run, the check pipeline,
 a `JobResult` for OUR executor (not the synthetic `1111…` failure), with the deterministic verdict for the host — on
 a GPU-less runner the scrape runs and fails on the executor (its stderr comes back in the event) and the pipeline
-halts with **`SCRAPE_FAILED`**, score 0, "GPU unverified" (a provider whose driver is gone gets exactly this today;
+halts with **`SCRAPE_FAILED_ON_HOST`**, score 0, "GPU unverified" (a provider whose driver is gone gets exactly this today;
 known verdicts below); with `E2E_GPU=1` the suite expects `gpu_count ≥ 1` and a model (not yet observed — see above). Then
 `publish_machine_specs` → the `MACHINE_SPEC_CHANNEL` message the connector relays to the platform, with the fields
 the platform reads (`executor_uuid`, `score`, `log_text`, `incentive_reasons`, …). Failure paths: the seeded
 offline executor is dropped by the miner within its timeout and never scored while the live one is; an unreachable
 miner yields the synthetic failed result in seconds, not a hung cycle; `SysboxRequiredCheck` is in the pipeline
-and its refusal is `SYSBOX_REQUIRED_MISSING` (the stack runs with `REQUIRE_SYSBOX_FOR_UNRENTED=false` — neither a
-CI box nor a Lium pod can run sysbox; bare metal is the only place the flag-on AVAILABLE verdict can be observed).
+and its refusal is `SYSBOX_REQUIRED_MISSING` (the requirement is always on; neither a CI box nor a Lium pod can run
+sysbox, and on a GPU-less runner the scrape halts the pipeline before the check, so bare metal is the only place the
+AVAILABLE verdict can be observed).
 
 **`tests/rental`** — `MinerService.handle_container`: `ContainerCreateRequest` for the executor → a container from
 `pod/Dockerfile` (ubuntu + openssh-server; `seed` builds it onto the executor's dockerd) with the renter's key,
@@ -116,14 +118,14 @@ does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite e
 
 ## Known verdicts the suite pins
 
-- **No GPU → `SCRAPE_FAILED`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
+- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
   `gpu_details[0]`, so a host with zero GPUs cannot report `gpu.count = 0`; the validator sees the scrape's
-  `IndexError` and the provider gets the generic "ensure the script is executable" remediation. The suite asserts
+  `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
   the current behaviour so a change to it is a visible diff (and the misleading remediation is tracked as a ticket).
 
 ## What it cannot prove (and where that is proven)
 
-Weights on chain, the AVAILABLE verdict of an unrented executor behind `REQUIRE_SYSBOX_FOR_UNRENTED` (needs sysbox on
+Weights on chain, the AVAILABLE verdict of an unrented executor behind `SysboxRequiredCheck` (needs sysbox on
 bare metal), TDX/CVM attestation, the real GPU checks (matmul, VerifyX, nvml digest, fingerprint — `E2E_GPU=1` on a
 GPU host is meant to run them; no such run yet), the portal → central-miner sync (the executor row is seeded),
 Watchtower. Those stay on the team's staging (testnet-37, the staging A4000).

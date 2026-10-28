@@ -19,7 +19,9 @@
                   40002
                 ],
                 "created_at": "2026-09-08T20:33:00Z",
-                "gpu_count": 2
+                "gpu_count": 2,
+                "ssh_port": 40001,
+                "status": "RUNNING"
               }
             ]
           }
@@ -63,6 +65,21 @@
         "provider_discord_connected_executor_ids": [
           "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c"
         ],
+        "provider_email_held_executor_ids": [
+          "9c8d7e6f-5a4b-4c3d-8e2f-1a0b9c8d7e6f"
+        ],
+        "renter_hardware_fault_executor_ids": [
+          "9c8d7e6f-5a4b-4c3d-8e2f-1a0b9c8d7e6f"
+        ],
+        "maintenance_executor_ids": [
+          "3e2f1a0b-9c8d-4e7f-8a6b-5c4d3e2f1a0b"
+        ],
+        "maintenance_windows_by_executor": {
+          "3e2f1a0b-9c8d-4e7f-8a6b-5c4d3e2f1a0b": {
+            "starting_at": "2026-10-23T10:00:00Z",
+            "expiring_at": "2026-10-23T16:00:00Z"
+          }
+        },
         "default_job_owner_by_executor": {
           "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": "lium"
         },
@@ -94,6 +111,13 @@
       "expect": "PodHostRebootRecoveredResponse",
       "message": {
         "recorded": true
+      }
+    },
+    {
+      "expect": "PodSshUnreachableResponse",
+      "message": {
+        "recorded": true,
+        "delivery": "notified"
       }
     },
     {

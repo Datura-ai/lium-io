@@ -18,7 +18,7 @@ from __future__ import annotations
 import enum
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 import pydantic
 
@@ -40,6 +40,8 @@ class ValidatorMessageType(enum.Enum):
     RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
     GpuEstimatesRequest = "GpuEstimatesRequest"
     EstimateResponse = "EstimateResponse"
+    # DAH-3338: one chunk of the container states one cycle saw on one node, after its ExecutorSpecRequest
+    PodStatesReport = "PodStatesReport"
     # answers to the backend's container requests (payload_models.ContainerResponseType)
     ContainerCreated = "ContainerCreated"
     ContainerStarted = "ContainerStarted"
@@ -54,6 +56,8 @@ class ValidatorMessageType(enum.Enum):
     FailedAddDebugSshKey = "FailedAddDebugSshKey"
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
+    # 1.16.0: the answer to ResetPodGpuRequest
+    PodGpuResetResult = "PodGpuResetResult"
 
 
 VALIDATOR_MESSAGES: Registry[ValidatorMessage] = Registry(ValidatorMessageType)
@@ -85,6 +89,8 @@ class FailedContainerErrorCodes(enum.Enum):
     AttestationError = "AttestationError"
     # DAH-2703: the container the validator created was gone from the host before creation finished
     ContainerVanished = "ContainerVanished"
+    # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
+    ExecutorUnreachable = "ExecutorUnreachable"
 
 
 class FailedContainerErrorTypes(enum.Enum):
@@ -98,6 +104,8 @@ class FailedContainerErrorTypes(enum.Enum):
 
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
+    # the external volume is attached, nested Docker is turned off for it on this node
+    DockerInDockerDisabled = "DockerInDockerDisabled"
 
 
 class ValidatorMessage(Message, DeliveryStamps):
@@ -139,6 +147,102 @@ class IncentiveReason(pydantic.BaseModel):
 # `ExecutorSpecRequest.executor_uuid` of a miner-level failure (the validator's FAILED_MINER_EXECUTOR_UUID,
 # core/validator.py): a placeholder, not a provider node. The backend keys its emission eligibility off it.
 EXCLUDED_PROVIDER_EMISSION_EXECUTOR_ID = "11111111-1111-1111-1111-111111111111"
+
+
+class ContainerState(enum.Enum):
+    """DAH-3338: what the validator saw of one rented pod's container this cycle. `unknown` is a pod the
+    validator could not inspect (the SSH transport died first) and is never read as `absent`; `reaped` is
+    an orphan the stale-container cleanup removed."""
+
+    running = "running"
+    exited = "exited"
+    absent = "absent"
+    unknown = "unknown"
+    reaped = "reaped"
+
+
+class PodContainerState(pydantic.BaseModel):
+    pod_id: str
+    container_state: ContainerState
+    observed_at: datetime
+
+
+# The backend bounds `ExecutorSpecRequest.pod_states` and one `PodStatesReport` chunk at this many entries.
+POD_STATES_MAX_ITEMS = 256
+
+
+class PodSshResult(enum.StrEnum):
+    """What the validator's once-per-cycle SSH probe of one rented pod read, without a key: `banner` is an
+    `SSH-2.0` line; `refused` a connection the host turned away; `no_banner` a connection that closed or
+    sent something else; `timeout` no answer within the probe's timeout (a powered-off machine lands here)."""
+
+    banner = "banner"
+    refused = "refused"
+    no_banner = "no_banner"
+    timeout = "timeout"
+
+
+class PodSshObservation(pydantic.BaseModel):
+    """One rented pod's SSH probe in one cycle. `errno` is the OS error behind a failed connect, None when
+    there was none. `fleet_ok` is False when the cycle's non-banner share says the outage is on the
+    validator's side, so the observation says nothing about this pod."""
+
+    pod_id: str
+    result: PodSshResult
+    errno: int | None = None
+    fleet_ok: bool = True
+
+
+class CouldNotLookCode(enum.StrEnum):
+    """The `ValidationEvent.reason_code` values that mean the validator could not look at the node this
+    cycle, so its pod SSH observations are the only evidence for the rentals on it."""
+
+    EXECUTOR_SSH_UNREACHABLE = "EXECUTOR_SSH_UNREACHABLE"
+    EXECUTOR_TRANSPORT_UNREACHABLE = "EXECUTOR_TRANSPORT_UNREACHABLE"
+    UPLOAD_FAILED = "UPLOAD_FAILED"
+    SCRAPE_FAILED = "SCRAPE_FAILED"
+    # the miner returned no result for a rented node; the report carries only its pod SSH observations
+    EXECUTOR_RESULT_MISSING = "EXECUTOR_RESULT_MISSING"
+
+
+class ValidationEvent(pydantic.BaseModel):
+    """The validator's structured event for the check that decided the cycle's outcome (or where the
+    pipeline halted). `reason_code` is a plain string: new codes appear on the validator first, and a
+    receiver that does not know one still reads the event. Both peers keep extra keys."""
+
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    event: str
+    reason_code: str
+    severity: str
+    category: str = "runtime"
+    impact: str
+    remediation: str | None = None
+    what_we_saw: dict[str, Any] = pydantic.Field(default_factory=dict)
+    warnings: list[str] = pydantic.Field(default_factory=list)
+    help_uri: str | None = None
+    check_id: str | None = None
+    pipeline_id: str | None = None
+    trace_id: str | None = None
+    when: datetime
+    context: dict[str, Any] = pydantic.Field(default_factory=dict)
+
+
+@VALIDATOR_MESSAGES.register
+class PodStatesReport(ValidatorMessage):
+    """DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's
+    `ExecutorSpecRequest` when the validator's POD_STATES_REPORT_ENABLED is on. The backend writes the
+    states onto the rental rows and nothing else (no cycle row, no validation report); the write is
+    idempotent. `job_batch_id` is the cycle; `chunk_index` counts from 0 up to `chunk_total - 1`."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.PodStatesReport
+    validator_hotkey: str
+    miner_hotkey: str
+    executor_uuid: str
+    job_batch_id: str
+    chunk_index: int = pydantic.Field(ge=0)
+    chunk_total: int = pydantic.Field(ge=1)
+    pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
 
 
 @VALIDATOR_MESSAGES.register
@@ -185,6 +289,16 @@ class ExecutorSpecRequest(ValidatorMessage):
     # DAH-2792: specs the validator scored for this miner in this job_batch_id; expected minus received
     # is what was lost on the socket
     batch_total: int | None = None
+    # DAH-3338: per rented pod, the container state this cycle saw; at most POD_STATES_MAX_ITEMS entries
+    # (the rest of the cycle's states travel in PodStatesReport chunks). None from a publisher that
+    # predates the field.
+    pod_states: list[PodContainerState] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
+    # The event behind `log_text`, structured; its `reason_code` is what the backend stores for the cycle.
+    # None from a publisher that sends the event only inside `log_text`.
+    validation_event: ValidationEvent | None = None
+    # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None = the
+    # publisher does not probe; [] = it probed and the node has no pod to probe.
+    pod_ssh: list[PodSshObservation] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
 
 
 @VALIDATOR_MESSAGES.register
@@ -324,6 +438,8 @@ class ContainerDeleted(PodContainerResponse):
 class SshPubKeyAdded(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.SshPubKeyAdded
     user_public_keys: list[str] = []
+    # the AddSshPublicKeyRequest's command_id, echoed so the backend can tell which send this confirms
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register
@@ -335,6 +451,8 @@ class SshPubKeyRemoved(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
+    # the failed request's command_id; echoed for an AddSshPublicKeyRequest, empty otherwise
+    command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None
     # renter-safe headline: customer-facing events may show it, so never executor host details
@@ -343,6 +461,12 @@ class FailedContainerRequest(PodContainerResponse):
     detail: str | None = None
     failure_step: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # 1.1.0 (DAH-3504): the last lines a failed custom-Dockerfile build printed — the renter's own output,
+    # never executor host data; None for every other failure and from validators before it
+    build_log_tail: str | None = None
+    # 1.1.0 (DAH-3505): the Docker daemon's bounded reason for a failed volume step, or the fixed
+    # dead-SSH-session hint for any other step; never executor host data; None otherwise and from older validators
+    step_detail: str | None = None
 
 
 class PodLog(pydantic.BaseModel):
@@ -395,3 +519,38 @@ class JupyterServerInstalled(PodContainerResponse):
 class JupyterInstallationFailed(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.JupyterInstallationFailed
     msg: str
+
+
+class GpuResetErrorCode(enum.Enum):
+    """1.16.0: why a pod GPU reset did not run, or did not finish."""
+
+    MigEnabled = "MigEnabled"
+    NvlinkPeersOutsidePod = "NvlinkPeersOutsidePod"
+    GpuInUseOutsidePod = "GpuInUseOutsidePod"
+    ResetNotSupported = "ResetNotSupported"
+    GpuNotInContainer = "GpuNotInContainer"
+    ContainerNotFound = "ContainerNotFound"
+    OperationInProgress = "OperationInProgress"
+    ExecutorUnreachable = "ExecutorUnreachable"
+
+
+class GpuResetOutcome(pydantic.BaseModel):
+    index: int
+    uuid: str
+    result: Literal["reset", "latch_cleared", "failed"]
+    detail: str | None = None
+
+
+@VALIDATOR_MESSAGES.register
+class PodGpuResetResult(PodContainerResponse):
+    """1.16.0: the answer to `backend_to_validator.ResetPodGpuRequest`, same `request_id`. `gpus` is
+    one outcome per GPU the validator reset (possibly more than asked: NVLink peers inside the pod are
+    reset together); empty when a precheck refused before anything changed."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.PodGpuResetResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    container_restarted: bool = False
+    gpus: list[GpuResetOutcome] = []
+    detail: str | None = None

@@ -2,11 +2,11 @@
 
 The validator↔backend wire, once. Pydantic v2 models for:
 
-- `lium_protocol.validator_to_backend` — every message the validator sends the backend over its WebSocket (`ValidatorMessageType`, 26 types: cycle results and scores, and the answers to container requests).
-- `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 16 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
-- `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 9 bodies).
+- `lium_protocol.validator_to_backend` — every message the validator sends the backend over its WebSocket (`ValidatorMessageType`, 28 types: cycle results and scores, the per-cycle pod-states report, and the answers to container requests).
+- `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 17 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
+- `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.0.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.16.0`) is semver over the wire.
 
 ## Using it
 
@@ -38,10 +38,30 @@ Field types are what a receiver must accept: a field one peer sends and the othe
 
 Compatibility rules for a change:
 
-- add an optional field or an enum member → minor version bump (`1.1.0`);
+- add an optional field or an enum member → minor version bump (`1.0.0` → `1.1.0`, as `FailedContainerRequest.build_log_tail` did);
 - make a field required, remove or rename one, change a type → major version bump and a new `snapshots/lium_protocol.v2.json`.
 
-Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform (its pull request for DAH-3247): vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
+Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform: vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
+
+## Versions
+
+- `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed) and `FailedContainerRequest.step_detail` (optional; the Docker daemon's reason for a failed volume step, or the dead-transport hint).
+- `1.2.0` — `PodStatesReport`, `ExecutorSpecRequest.pod_states` and `FailedContainerErrorCodes.ExecutorUnreachable` (per-cycle pod container states, and "unreachable" told apart from "unknown id").
+- `1.3.0` — `RentedPod.ssh_port` and `RentedPod.status` (optional), and the `PodSshUnreachableResponse` HTTP body (the renter-side SSH probe's report).
+- `1.4.0` — `ExecutorSpecRequest.pod_ssh` (optional; the cycle's SSH probe of each rented pod, `PodSshObservation`: `pod_id`, `result`, `errno`, `fleet_ok`), `ExecutorSpecRequest.validation_event` (optional; the structured event both peers already sent and read beside the package), and `CouldNotLookCode`, which names the reason codes of a cycle that could not look at the node, the new `EXECUTOR_RESULT_MISSING` among them.
+- `1.5.0` — `RentedExecutorsResponse.filler_revenue_by_gpu_config` (optional): per (base model, GPU count), `usd_per_gpu_hour` = filler revenue / filler GPU-hours over the trailing 24 hours, with the `gpu_hours` it covers; the spot-node pay and the secure floor read it. `RentedExecutorsResponse.provider_spot_executor_ids` (optional, default empty): the subset of `spot_executor_ids` whose provider chose the Spot tier, with no demotion, force-spot hotkey, pin or no-incentive rental on it; only these may take spot-node pay, so the backend must send it before spot-node pay pays anyone. The validator's `incentive_formula_version` stays `rental_price_v2`, which now has two terms when `incentive_formula_inputs` carries `unbucketed_share`: the rental term `rental_share × gpu_count × effective_rate / total_rental_cost` plus the unbucketed term `unbucketed_share × gpu_count × floor_top_up_rate / unbucketed_rental_cost`. A floored secure node is paid both; a spot node (`spot_pay: true`) only the unbucketed term, with `floor_top_up_rate` = `effective_rate`.
+- `1.6.0` — `RentedExecutorsResponse.executor_owner_hotkeys` (optional, default empty): executor_id → the hotkey the executor is listed under (the pool hotkey for a custodied account, else the miner hotkey of its MinerExecutor row), for every listed executor, rented or not. The validator keys each verified-job record by (miner hotkey, executor_id) and reads this map only to move a record stored under the bare executor_id to the listed hotkey; any other hotkey starts a fresh record.
+- `1.7.0` — `RentedExecutorsResponse.provider_email_held_executor_ids` (optional; the nodes the backend keeps unlisted until the provider confirms an e-mail address).
+- `1.8.0` — `BackupContainerRequest.exclude_patterns` (optional, default empty): restic `--exclude` patterns for the backup; the default backup of a new pod sends its cache and key paths.
+- `1.9.0` — `ContainerWarningCode.DockerInDockerDisabled`: the container was created with its external volume attached, but without nested Docker on this node. A reader that requires nested Docker can refuse the container instead of handing it over without it.
+- `1.11.0` — `ContainerCreateRequest.build_context_url` and `ContainerCreateRequest.build_context_sha256` (optional): a gzipped tar the validator downloads and checks against the sha256 (hex), then unpacks as the build context of `dockerfile_content`. A validator that does not take build contexts refuses such a request instead of building without the files.
+- `1.12.0` — `RentedExecutorsResponse.renter_hardware_fault_executor_ids` (optional, default empty): the nodes whose rentals drew hardware-fault reports from at least two distinct renters in the backend's report window; the validator owes each a post-rental GPU recheck.
+- `1.13.0` — `command_id` (optional, default empty) on every `ServerRequest`; a validator that knows it answers a repeat from the first run instead of running it again.
+- `1.14.0` — `command_id` (optional, default empty) on `SshPubKeyAdded` and `FailedContainerRequest`: a validator that knows it echoes the `AddSshPublicKeyRequest`'s `command_id`, so the backend can tell which send an answer confirms.
+- `1.15.0` — `RestoreContainerRequest.recovery` (optional, default false): a re-dispatch of a restore that may already be running (after a reconnect or a redelivered create); the validator does not report its dispatch failure. An older validator ignores it.
+- `1.17.0` — `RentedExecutorsResponse.maintenance_executor_ids` (optional, default empty): the nodes inside a running provider maintenance window; the validator pays them no incentive from either pool, rented or not. `RentedExecutorsResponse.maintenance_windows_by_executor` (optional, default empty): executor_id → `MaintenanceWindow` (UTC `starting_at`, `expiring_at`, half-open); the validator fails a node with `PROVIDER_MAINTENANCE` when its cycle started inside the window.
+- `1.16.0` — `ResetPodGpuRequest` (backend → validator; `local_volume_path` optional, needed for a pod with an encrypted volume) and its answer `PodGpuResetResult` with `GpuResetErrorCode` and `GpuResetOutcome` (a renter resets their pod's GPUs; the validator stops the container, runs `nvidia-smi -r -i` on the pod's GPUs only and starts it again).
+- `1.0.0` — first release.
 
 ## Tests
 

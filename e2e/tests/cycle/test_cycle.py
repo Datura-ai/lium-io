@@ -7,7 +7,7 @@ hop, the same checks. `publish_machine_specs` then puts the verdict on the redis
 the platform — the message a node's "verification" state on lium.io is made from.
 
 Without a GPU (CI) the scrape itself fails on the executor (it keys its output on the first GPU's fields) and the
-pipeline halts with SCRAPE_FAILED, score 0 — the exact verdict a provider whose driver is gone gets today. With
+pipeline halts with SCRAPE_FAILED_ON_HOST, score 0 — the exact verdict a provider whose driver is gone gets today. With
 E2E_GPU=1 the executor sees the host's GPUs and the cycle must report them.
 """
 
@@ -74,10 +74,10 @@ def test_cycle_reaches_the_executor_and_returns_a_verdict(services):
     else:
         # no GPU on this host: the key was installed, the scrape was uploaded and RAN on the executor (the stderr tail
         # in the event is the scrape's own traceback), and the pipeline halted with the verdict a GPU-less host gets
-        # today — SCRAPE_FAILED (machine_scrape derives its output key from gpu_details[0], so zero GPUs cannot even
-        # report gpu.count=0; see README "known verdicts").
+        # today — SCRAPE_FAILED_ON_HOST (machine_scrape derives its output key from gpu_details[0], so zero GPUs cannot
+        # even report gpu.count=0; see README "known verdicts").
         assert job.score == 0 and job.gpu_count == 0
-        assert "SCRAPE_FAILED" in job.log_text, job.log_text
+        assert "SCRAPE_FAILED_ON_HOST" in job.log_text, job.log_text
         assert "IndexError" in job.log_text or "gpu" in job.log_text.lower(), job.log_text
         assert "GPU unverified" in job.log_text, job.log_text
 
@@ -102,7 +102,7 @@ def test_cycle_verdict_is_published_for_the_platform(services):
         assert key in body, f"{key} missing from the published verdict"
     assert body["batch_total"] == 1
     if not lib.GPU:
-        assert body["score"] == 0 and "SCRAPE_FAILED" in body["log_text"]
+        assert body["score"] == 0 and "SCRAPE_FAILED_ON_HOST" in body["log_text"]
 
 
 def test_offline_executor_is_dropped_not_scored_and_does_not_stall_the_cycle():
@@ -136,9 +136,9 @@ def test_unreachable_miner_fails_the_job_fast(services):
 
 
 def test_sysbox_gate_names_its_reason(services):
-    """REQUIRE_SYSBOX_FOR_UNRENTED is off in the stack (no sysbox on a CI box or a Lium pod). The check that enforces
-    it must still be in the pipeline and, when on, refuse an unrented executor with SYSBOX_REQUIRED_MISSING — the
-    verdict seen on staging. Asserted at the check level: flipping the flag mid-process is not supported."""
+    """Sysbox is always required for an unrented executor, but a CI box or a Lium pod cannot run it and the GPU-less
+    scrape halts the pipeline before the check. So the check is asserted at this level: it is in the pipeline and its
+    refusal is SYSBOX_REQUIRED_MISSING, the verdict seen on staging."""
     checks = PipelineFactory.build_checks()
     assert any(isinstance(c, SysboxRequiredCheck) for c in checks), [type(c).__name__ for c in checks]
     assert SysboxRequiredMessages.SYSBOX_MISSING.reason == "SYSBOX_REQUIRED_MISSING"

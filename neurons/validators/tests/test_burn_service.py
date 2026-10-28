@@ -30,7 +30,6 @@ async def test_new_logic_distributes_burn_share_equally_across_unique_burners(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — 4 unique burners share burn_share equally, so each gets burn_share / 4
@@ -58,7 +57,6 @@ async def test_new_logic_excludes_miners_that_are_not_burners(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — only the two burner hotkeys should be scored
@@ -78,7 +76,6 @@ async def test_new_logic_with_zero_burn_share_yields_zero_scores(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=0.0,
-        last_mechanism_step_block=None,
     )
 
     # Assert — there is nothing to distribute, so every burner gets exactly 0
@@ -98,7 +95,6 @@ async def test_new_logic_distributes_partial_burn_share(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=0.5,
-        last_mechanism_step_block=None,
     )
 
     # Assert — entire 0.5 burn_share split equally between the two burners
@@ -140,7 +136,6 @@ async def test_new_logic_aggregates_share_proportional_to_slot_count(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — target UID's score equals its slot fraction of the burn_share
@@ -169,7 +164,6 @@ async def test_new_logic_dah_2089_uid_47_absorbs_retired_burner_shares(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — UID 47 (3 slots) gets 30%, other 7 burners get 10% each, total = burn_share
@@ -203,7 +197,6 @@ async def test_new_logic_all_burn_slots_route_to_uid_47(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — only verified UID 47 receives the full burn_share
@@ -228,7 +221,6 @@ async def test_new_logic_withholds_burn_weight_on_coldkey_mismatch(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — coldkey mismatch withholds all burn weight for UID 47
@@ -252,7 +244,6 @@ async def test_new_logic_dah_2362_production_layout_gives_uid_47_seventy_percent
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — UID 47 (7 slots) gets 70%, other 3 burners get 10% each, total = burn_share
@@ -279,7 +270,6 @@ async def test_new_logic_skips_burner_uids_that_are_not_in_miner_list(
     scores = burn_service.calculate_burn_scores(
         miners=miners,
         burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=None,
     )
 
     # Assert — missing burners 188, 189 are dropped; UID 47 still claims its 3 slots
@@ -288,50 +278,6 @@ async def test_new_logic_skips_burner_uids_that_are_not_in_miner_list(
         "hk_187": pytest.approx(per_slot),
         "hk_47": pytest.approx(per_slot * 3),
     }
-
-
-@pytest.mark.asyncio
-async def test_old_logic_distributes_full_burn_share_across_burners(
-    burn_service, monkeypatch, mock_settings, create_neuron_info
-):
-    """Old (main-burner) logic must still fully distribute burn_share when enabled."""
-    # Arrange — disable new logic so the legacy main-burner path runs
-    monkeypatch.setattr("core.config.settings.ENABLE_NEW_BURN_LOGIC", False)
-    monkeypatch.setattr("core.config.settings.BURNERS", [4, 206, 207, 208])
-    miners = _make_miners(create_neuron_info, [4, 206, 207, 208])
-
-    # Act
-    scores = burn_service.calculate_burn_scores(
-        miners=miners,
-        burn_share=TOTAL_BURN_EMISSION,
-        last_mechanism_step_block=42,
-    )
-
-    # Assert — every legacy burner is scored and the totals add up to burn_share
-    assert set(scores.keys()) == {"hk_4", "hk_206", "hk_207", "hk_208"}
-    assert sum(scores.values()) == pytest.approx(TOTAL_BURN_EMISSION)
-
-
-@pytest.mark.asyncio
-async def test_old_logic_main_burner_selection_is_deterministic_per_block(
-    burn_service, monkeypatch, mock_settings, create_neuron_info
-):
-    """Same block seed → identical score map (random.Random is seeded by block)."""
-    # Arrange
-    monkeypatch.setattr("core.config.settings.ENABLE_NEW_BURN_LOGIC", False)
-    monkeypatch.setattr("core.config.settings.BURNERS", [4, 206, 207, 208])
-    miners = _make_miners(create_neuron_info, [4, 206, 207, 208])
-
-    # Act — call twice with the same block seed
-    first = burn_service.calculate_burn_scores(
-        miners=miners, burn_share=TOTAL_BURN_EMISSION, last_mechanism_step_block=42
-    )
-    second = burn_service.calculate_burn_scores(
-        miners=miners, burn_share=TOTAL_BURN_EMISSION, last_mechanism_step_block=42
-    )
-
-    # Assert — deterministic seeding must produce the exact same distribution
-    assert first == second
 
 
 @pytest.mark.asyncio
@@ -355,21 +301,6 @@ async def test_is_burner_under_new_logic(
 
     # Act / Assert — membership matches the configured NEW_BURNERS list
     assert burn_service.is_burner(uid) is expected
-
-
-@pytest.mark.asyncio
-async def test_is_burner_under_old_logic_uses_legacy_burner_list(
-    burn_service, monkeypatch, mock_settings
-):
-    """When new logic is disabled, is_burner must consult BURNERS, not NEW_BURNERS."""
-    # Arrange
-    monkeypatch.setattr("core.config.settings.ENABLE_NEW_BURN_LOGIC", False)
-    monkeypatch.setattr("core.config.settings.BURNERS", [4, 206, 207, 208])
-    monkeypatch.setattr("core.config.settings.NEW_BURNERS", [47])
-
-    # Assert — 4 is a legacy burner; 47 belongs to the (disabled) new list and must not match
-    assert burn_service.is_burner(4) is True
-    assert burn_service.is_burner(47) is False
 
 
 @pytest.mark.asyncio

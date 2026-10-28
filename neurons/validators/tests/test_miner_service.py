@@ -14,6 +14,7 @@ miner_service no longer makes an early wait_for_port_check_containers call.
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
+import aiohttp
 import pytest
 
 from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
@@ -107,40 +108,183 @@ def _wire_common_mocks(mocker, miner_service, executor_id: str):
     return my_key
 
 
+# ---------------------------------------------------------------------------
+# DAH-3338: an executor the miner KNOWS but could not reach is ExecutorUnreachable;
+# InvalidExecutorId is kept for an id the miner does not list at all, worded "the miner no longer
+# lists this executor" (DAH-4481); a miner without known_executor_ids keeps DAH-3508's wording.
+# ---------------------------------------------------------------------------
+
+from payload_models.payloads import FailedContainerErrorCodes, FailedContainerRequest
+
+
+def _storage_payload(kind, engine="restic", **extra):
+    from payload_models.payloads import BackupContainerRequest, ExternalVolumeInfo, RestoreContainerRequest
+
+    common = dict(
+        miner_hotkey="miner", executor_id="executor", pod_id="pod", auth_token="token", backup_engine=engine,
+        backup_volume_info=ExternalVolumeInfo(name="b", plugin="s3", iam_user_access_key="a", iam_user_secret_key="s"),
+    )
+    if kind == "backup":
+        return BackupContainerRequest(
+            **common, source_volume="v", backup_path="/root", source_volume_path="/root", backup_target_path="",
+            backup_log_id=str(uuid4()), **extra,
+        )
+    return RestoreContainerRequest(
+        **common, target_volume="v", backup_source_path="b", target_volume_path="/root", restore_path="/root",
+        restore_log_id=str(uuid4()), **extra,
+    )
+
+
+@pytest.mark.parametrize(
+    "kind,engine,extra,reported",
+    [
+        ("backup", "restic", {}, True),
+        ("backup", "tar_aws_cli", {}, False),
+        ("restore", "restic", {}, True),
+        # a reconnect re-dispatch may find the executor down while the first runner still works; never fail it
+        ("restore", "restic", {"recovery": True}, False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_create_request_delegates_to_create_container(mocker, miner_service):
-    """A ContainerCreateRequest is delegated to create_container, and
-    miner_service itself no longer calls wait_for_port_check_containers
-    (removal moved into create_container, after the pending-pod flag)."""
+async def test_storage_op_that_fails_before_its_runner_starts_is_reported_at_once(
+    mocker, miner_service, kind, engine, extra, reported
+):
+    """An unreachable executor used to leave the operation IN_PROGRESS until the 20-min heartbeat sweep."""
+    payload = _storage_payload(kind, engine, **extra)
+    failed = FailedContainerRequest(
+        miner_hotkey="miner", executor_id="executor", pod_id="pod", msg="Error: Executor unreachable",
+        error_code=FailedContainerErrorCodes.ExecutorUnreachable,
+    )
+    mocker.patch.object(miner_service, "_route_container", AsyncMock(return_value=failed))
+    report = mocker.patch("services.miner_service.report_launch_failure", AsyncMock())
+
+    assert await miner_service.handle_container(payload) is failed
+
+    if not reported:
+        report.assert_not_awaited()
+        return
+    operation_id, spec, error = report.await_args.args
+    assert str(operation_id) == (payload.backup_log_id if kind == "backup" else payload.restore_log_id)
+    assert spec["reporter"]["auth_token"] == "token" and spec["reporter"]["resource"] == kind
+    assert str(error) == "Error: Executor unreachable"
+
+
+@pytest.mark.asyncio
+async def test_an_old_executor_image_reports_its_specific_reason(mocker, miner_service):
+    payload = _storage_payload("backup", exclude_patterns=["*.cache"])
+    ssh = MagicMock()
+    ssh.__aenter__ = AsyncMock(return_value=Mock())
+    ssh.__aexit__ = AsyncMock(return_value=False)
+    mocker.patch("services.miner_service.asyncssh.connect", return_value=ssh)
+    mocker.patch("services.miner_service.public_host_sock", AsyncMock(return_value={}))
+    mocker.patch("services.miner_service.supports_workspace_field", AsyncMock(return_value=False))
+    start = mocker.patch("services.miner_service.start_storage_operation", AsyncMock())
+    report = mocker.patch("services.miner_service.report_launch_failure", AsyncMock())
+    executor = Mock(address="h", ssh_port=22, ssh_username="root", python_path="python3")
+
+    with pytest.raises(RuntimeError, match="exclude_patterns"):
+        await miner_service.handle_backup_container_req(
+            executor, payload, Mock(), Mock(_prepare_known_hosts_policy=AsyncMock(return_value=None))
+        )
+
+    start.assert_not_awaited()
+    assert "update the executor image" in str(report.await_args.args[2])
+
+def _refused():
+    return aiohttp.ClientConnectorError(Mock(host="10.0.0.1", port=8000, ssl=None), OSError(111, "Connect call failed"))
+
+
+@pytest.mark.asyncio
+async def test_a_create_waits_out_a_miner_that_refuses_connections_while_it_restarts(mocker, miner_service):
+    # a miner redeploy refuses connections for about a minute; a create used to fail on the first refusal
     executor_id = str(uuid4())
-    payload = _make_create_payload(executor_id)
     _wire_common_mocks(mocker, miner_service, executor_id)
+    accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
+    miner_service._make_rest_request.side_effect = [_refused(), _refused(), accepted]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    stamps = iter(range(100))
+    mocker.patch.object(miner_service, "_generate_auth_headers", side_effect=lambda *_: {"X-Timestamp": next(stamps)})
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
 
-    wait_mock = mocker.patch(
-        "services.miner_service.DockerService.wait_for_port_check_containers",
-        AsyncMock(return_value=(True, "No port check containers found")),
-    )
-    order: list[str] = []
-
-    async def create(*args, **kwargs):
-        order.append("create")
-        return Mock()
-
-    create_mock = mocker.patch(
-        "services.miner_service.DockerService.create_container",
-        AsyncMock(side_effect=create),
-    )
-    exclusion = miner_service.redis_service.executor_create_exclusion
-    exclusion.return_value.__aenter__.side_effect = lambda *a: order.append("lock")
-    exclusion.return_value.__aexit__.side_effect = lambda *a: order.append("unlock")
-
-    await miner_service._handle_container(payload)
+    await miner_service._handle_container(_make_create_payload(executor_id))
 
     create_mock.assert_awaited_once()
-    # First positional arg to create_container is the create payload.
-    assert create_mock.call_args.args[0] is payload
-    # DAH-3436 (review): the create ran inside the per-executor create lock the rental probe shares
-    exclusion.assert_called_once_with(executor_id)
-    assert order == ["lock", "create", "unlock"]
-    # No pre-flag port-check removal in miner_service anymore.
-    wait_mock.assert_not_awaited()
+    # the miner rejects a signed timestamp older than 10 s, so every attempt must be signed anew
+    sent = [c.kwargs["headers"]["X-Timestamp"] for c in miner_service._make_rest_request.await_args_list[:3]]
+    assert sent == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_a_create_gives_up_once_the_miner_stays_unreachable_past_the_wait(mocker, miner_service):
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    miner_service._make_rest_request.side_effect = _refused()
+    mocker.patch("services.miner_service.MINER_RESTART_WAIT_S", 0)
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock())
+
+    result = await miner_service._handle_container(_make_create_payload(executor_id))
+
+    create_mock.assert_not_awaited()
+    assert result.msg == "Resulted in an exception"
+
+
+def _passed_result(executor_id: str, gpu_uuid: str):
+    from services.task.models import JobResult
+
+    return JobResult(
+        spec={"gpu": {"count": 1, "details": [{"uuid": gpu_uuid}]}},
+        executor_info=_make_executor_info(executor_id),
+        score=1.0,
+        job_score=1.0,
+        job_batch_id="2026-10-27 01:06:00",
+        log_status="info",
+        log_text="Validation task completed",
+        gpu_model="NVIDIA H200",
+        gpu_count=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_node_back_under_a_new_gpu_uuid_is_published_before_the_cycle_ends(mocker, miner_service):
+    """27 Oct: the backend rented a GPU UUID the node no longer had until the cycle's publish."""
+    mocker.patch("services.miner_service.settings.DRY_RUN", False)
+    changed, unchanged, new = str(uuid4()), str(uuid4()), str(uuid4())
+    await miner_service.publish_machine_specs(
+        [_passed_result(changed, "GPU-old"), _passed_result(unchanged, "GPU-same")], "hk", "ck"
+    )
+    miner_service.redis_service.publish.reset_mock()
+    job = {
+        "miner_hotkey": "hk",
+        "miner_coldkey": "ck",
+        "results": [
+            _passed_result(changed, "GPU-new"),
+            _passed_result(unchanged, "GPU-same"),
+            _passed_result(new, "GPU-other"),  # never published: the cycle lists it
+        ],
+    }
+    mocker.patch.object(miner_service, "_route_job_to_miner", AsyncMock(return_value=job))
+
+    assert await miner_service.request_job_to_miner(Mock(miner_hotkey="hk"), None, None, {}) is job
+
+    published = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
+    assert [(spec["executor_uuid"], spec["batch_total"]) for spec in published] == [(changed, None)]
+    assert published[0]["specs"]["gpu"]["details"] == [{"uuid": "GPU-new"}]
+    assert miner_service.published_gpu_uuids[changed] == {"GPU-new"}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_report_under_the_new_gpu_uuid_does_not_hide_the_recovery(mocker, miner_service):
+    """A failed report of the new UUID does not move the cache, so the pass after it still publishes at once."""
+    mocker.patch("services.miner_service.settings.DRY_RUN", False)
+    node = str(uuid4())
+    await miner_service.publish_machine_specs([_passed_result(node, "GPU-old")], "hk", "ck")
+    failed = _passed_result(node, "GPU-new").model_copy(update={"score": 0.0, "job_score": 0.0})
+    await miner_service.publish_machine_specs([failed], "hk", "ck")
+    assert miner_service.published_gpu_uuids[node] == {"GPU-old"}
+
+    miner_service.redis_service.publish.reset_mock()
+    await miner_service.publish_gpu_set_changes(
+        {"miner_hotkey": "hk", "miner_coldkey": "ck", "results": [_passed_result(node, "GPU-new")]}
+    )
+    published = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
+    assert [spec["executor_uuid"] for spec in published] == [node]

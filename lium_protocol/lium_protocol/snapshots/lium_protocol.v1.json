@@ -2,6 +2,11 @@
   "$defs": {
     "AddDebugSshKeyRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -53,6 +58,11 @@
     },
     "AddSshPublicKeyRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -211,7 +221,8 @@
         "CancelStorageOperationRequest",
         "InstallJupyterServer",
         "ForcedValidationCycleRequest",
-        "GetEstimateRequest"
+        "GetEstimateRequest",
+        "ResetPodGpuRequest"
       ],
       "title": "BackendMessageType",
       "type": "string"
@@ -242,6 +253,11 @@
         "backup_volume_info": {
           "$ref": "#/$defs/ExternalVolumeInfo"
         },
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "anyOf": [
             {
@@ -253,6 +269,14 @@
           ],
           "default": null,
           "title": "Container Name"
+        },
+        "exclude_patterns": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Exclude Patterns",
+          "type": "array"
         },
         "executor_id": {
           "title": "Executor Id",
@@ -469,6 +493,11 @@
     },
     "CancelStorageOperationRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -627,6 +656,30 @@
           ],
           "default": null
         },
+        "build_context_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Context Sha256"
+        },
+        "build_context_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Context Url"
+        },
         "cache_volumes": {
           "anyOf": [
             {
@@ -652,6 +705,11 @@
             }
           ],
           "default": null
+        },
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
         },
         "cpu_count": {
           "anyOf": [
@@ -1208,6 +1266,11 @@
     },
     "ContainerDeleteRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -1359,6 +1422,11 @@
     },
     "ContainerStartRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -1494,8 +1562,25 @@
       "title": "ContainerStarted",
       "type": "object"
     },
+    "ContainerState": {
+      "description": "DAH-3338: what the validator saw of one rented pod's container this cycle. `unknown` is a pod the\nvalidator could not inspect (the SSH transport died first) and is never read as `absent`; `reaped` is\nan orphan the stale-container cleanup removed.",
+      "enum": [
+        "running",
+        "exited",
+        "absent",
+        "unknown",
+        "reaped"
+      ],
+      "title": "ContainerState",
+      "type": "string"
+    },
     "ContainerStopRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -1628,7 +1713,8 @@
     },
     "ContainerWarningCode": {
       "enum": [
-        "ExternalVolumeFailed"
+        "ExternalVolumeFailed",
+        "DockerInDockerDisabled"
       ],
       "title": "ContainerWarningCode",
       "type": "string"
@@ -2094,6 +2180,11 @@
     },
     "ExecutorRentFinishedRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -2399,6 +2490,38 @@
           "default": null,
           "title": "Node State At Cycle"
         },
+        "pod_ssh": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PodSshObservation"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pod Ssh"
+        },
+        "pod_states": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PodContainerState"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pod States"
+        },
         "price_per_gpu": {
           "anyOf": [
             {
@@ -2523,6 +2646,17 @@
           ],
           "default": null,
           "title": "Tee Type"
+        },
+        "validation_event": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValidationEvent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "validator_hotkey": {
           "title": "Validator Hotkey",
@@ -2687,7 +2821,8 @@
         "RentingInProgress",
         "NoJupyterPortMapping",
         "AttestationError",
-        "ContainerVanished"
+        "ContainerVanished",
+        "ExecutorUnreachable"
       ],
       "title": "FailedContainerErrorCodes",
       "type": "string"
@@ -2706,6 +2841,23 @@
     },
     "FailedContainerRequest": {
       "properties": {
+        "build_log_tail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Log Tail"
+        },
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "detail": {
           "anyOf": [
             {
@@ -2800,6 +2952,18 @@
           ],
           "default": null,
           "title": "Sent At"
+        },
+        "step_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step Detail"
         },
         "volume_encryption_status": {
           "anyOf": [
@@ -2901,6 +3065,35 @@
         "msg"
       ],
       "title": "FailedGetPodLogs",
+      "type": "object"
+    },
+    "FillerRevenueByGpuConfig": {
+      "description": "What Lium's fillers earned per GPU-hour, on average, on one GPU configuration (\"8x B200\"),\nover the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per\n(base model, GPU count).",
+      "properties": {
+        "base_model": {
+          "title": "Base Model",
+          "type": "string"
+        },
+        "gpu_count": {
+          "title": "Gpu Count",
+          "type": "integer"
+        },
+        "gpu_hours": {
+          "title": "Gpu Hours",
+          "type": "number"
+        },
+        "usd_per_gpu_hour": {
+          "title": "Usd Per Gpu Hour",
+          "type": "number"
+        }
+      },
+      "required": [
+        "base_model",
+        "gpu_count",
+        "usd_per_gpu_hour",
+        "gpu_hours"
+      ],
+      "title": "FillerRevenueByGpuConfig",
       "type": "object"
     },
     "FillerRunActiveResponse": {
@@ -3026,6 +3219,11 @@
     },
     "GetPodLogsRequestFromServer": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -3156,6 +3354,61 @@
         "watts"
       ],
       "title": "GpuPowerLimit",
+      "type": "object"
+    },
+    "GpuResetErrorCode": {
+      "description": "1.16.0: why a pod GPU reset did not run, or did not finish.",
+      "enum": [
+        "MigEnabled",
+        "NvlinkPeersOutsidePod",
+        "GpuInUseOutsidePod",
+        "ResetNotSupported",
+        "GpuNotInContainer",
+        "ContainerNotFound",
+        "OperationInProgress",
+        "ExecutorUnreachable"
+      ],
+      "title": "GpuResetErrorCode",
+      "type": "string"
+    },
+    "GpuResetOutcome": {
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "index": {
+          "title": "Index",
+          "type": "integer"
+        },
+        "result": {
+          "enum": [
+            "reset",
+            "latch_cleared",
+            "failed"
+          ],
+          "title": "Result",
+          "type": "string"
+        },
+        "uuid": {
+          "title": "Uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "uuid",
+        "result"
+      ],
+      "title": "GpuResetOutcome",
       "type": "object"
     },
     "IncentiveReason": {
@@ -3330,6 +3583,11 @@
     },
     "InstallJupyterServerRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -3694,6 +3952,27 @@
       "title": "MachineSpecRequest",
       "type": "object"
     },
+    "MaintenanceWindow": {
+      "description": "A provider maintenance window, UTC, half-open: [starting_at, expiring_at).",
+      "properties": {
+        "expiring_at": {
+          "format": "date-time",
+          "title": "Expiring At",
+          "type": "string"
+        },
+        "starting_at": {
+          "format": "date-time",
+          "title": "Starting At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "starting_at",
+        "expiring_at"
+      ],
+      "title": "MaintenanceWindow",
+      "type": "object"
+    },
     "ManualRentalInfo": {
       "description": "Specs a special manual (bare-metal) rental is force-passed against; both fields drive the score.",
       "properties": {
@@ -3872,6 +4151,143 @@
         "external_port"
       ],
       "title": "PayloadPortMapping",
+      "type": "object"
+    },
+    "PodContainerState": {
+      "properties": {
+        "container_state": {
+          "$ref": "#/$defs/ContainerState"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pod_id",
+        "container_state",
+        "observed_at"
+      ],
+      "title": "PodContainerState",
+      "type": "object"
+    },
+    "PodGpuResetResult": {
+      "description": "1.16.0: the answer to `backend_to_validator.ResetPodGpuRequest`, same `request_id`. `gpus` is\none outcome per GPU the validator reset (possibly more than asked: NVLink peers inside the pod are\nreset together); empty when a precheck refused before anything changed.",
+      "properties": {
+        "container_restarted": {
+          "default": false,
+          "title": "Container Restarted",
+          "type": "boolean"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GpuResetErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "gpus": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GpuResetOutcome"
+          },
+          "title": "Gpus",
+          "type": "array"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "PodGpuResetResult"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "ok": {
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "request_id",
+        "ok"
+      ],
+      "title": "PodGpuResetResult",
       "type": "object"
     },
     "PodHostRebootRecoveredRequest": {
@@ -4134,8 +4550,176 @@
       "title": "PodRentalActiveResponse",
       "type": "object"
     },
+    "PodSshObservation": {
+      "description": "One rented pod's SSH probe in one cycle. `errno` is the OS error behind a failed connect, None when\nthere was none. `fleet_ok` is False when the cycle's non-banner share says the outage is on the\nvalidator's side, so the observation says nothing about this pod.",
+      "properties": {
+        "errno": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Errno"
+        },
+        "fleet_ok": {
+          "default": true,
+          "title": "Fleet Ok",
+          "type": "boolean"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/PodSshResult"
+        }
+      },
+      "required": [
+        "pod_id",
+        "result"
+      ],
+      "title": "PodSshObservation",
+      "type": "object"
+    },
+    "PodSshResult": {
+      "description": "What the validator's once-per-cycle SSH probe of one rented pod read, without a key: `banner` is an\n`SSH-2.0` line; `refused` a connection the host turned away; `no_banner` a connection that closed or\nsent something else; `timeout` no answer within the probe's timeout (a powered-off machine lands here).",
+      "enum": [
+        "banner",
+        "refused",
+        "no_banner",
+        "timeout"
+      ],
+      "title": "PodSshResult",
+      "type": "string"
+    },
+    "PodSshUnreachableResponse": {
+      "description": "`POST \u2026/ssh-unreachable`: ``recorded`` False when the backend already holds this outage.",
+      "properties": {
+        "delivery": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delivery"
+        },
+        "recorded": {
+          "title": "Recorded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recorded"
+      ],
+      "title": "PodSshUnreachableResponse",
+      "type": "object"
+    },
+    "PodStatesReport": {
+      "description": "DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's\n`ExecutorSpecRequest` when the validator's POD_STATES_REPORT_ENABLED is on. The backend writes the\nstates onto the rental rows and nothing else (no cycle row, no validation report); the write is\nidempotent. `job_batch_id` is the cycle; `chunk_index` counts from 0 up to `chunk_total - 1`.",
+      "properties": {
+        "chunk_index": {
+          "minimum": 0,
+          "title": "Chunk Index",
+          "type": "integer"
+        },
+        "chunk_total": {
+          "minimum": 1,
+          "title": "Chunk Total",
+          "type": "integer"
+        },
+        "executor_uuid": {
+          "title": "Executor Uuid",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "job_batch_id": {
+          "title": "Job Batch Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "PodStatesReport"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_states": {
+          "items": {
+            "$ref": "#/$defs/PodContainerState"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Pod States",
+          "type": "array"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "validator_hotkey": {
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "validator_hotkey",
+        "miner_hotkey",
+        "executor_uuid",
+        "job_batch_id",
+        "chunk_index",
+        "chunk_total",
+        "pod_states"
+      ],
+      "title": "PodStatesReport",
+      "type": "object"
+    },
     "RemoveSshPublicKeysRequest": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -4318,6 +4902,14 @@
           "title": "Default Job Owner By Executor",
           "type": "object"
         },
+        "executor_owner_hotkeys": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "title": "Executor Owner Hotkeys",
+          "type": "object"
+        },
         "executors": {
           "additionalProperties": {
             "$ref": "#/$defs/RentedExecutor"
@@ -4352,12 +4944,36 @@
           "title": "Filler Ports By Executor",
           "type": "object"
         },
+        "filler_revenue_by_gpu_config": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FillerRevenueByGpuConfig"
+          },
+          "title": "Filler Revenue By Gpu Config",
+          "type": "array"
+        },
         "gpu_splitting_config": {
           "additionalProperties": {
             "type": "integer"
           },
           "default": {},
           "title": "Gpu Splitting Config",
+          "type": "object"
+        },
+        "maintenance_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Maintenance Executor Ids",
+          "type": "array"
+        },
+        "maintenance_windows_by_executor": {
+          "additionalProperties": {
+            "$ref": "#/$defs/MaintenanceWindow"
+          },
+          "default": {},
+          "title": "Maintenance Windows By Executor",
           "type": "object"
         },
         "manual_rental_executors": {
@@ -4398,6 +5014,30 @@
           ],
           "default": null,
           "title": "Provider Discord Connected Executor Ids"
+        },
+        "provider_email_held_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Email Held Executor Ids",
+          "type": "array"
+        },
+        "provider_spot_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Spot Executor Ids",
+          "type": "array"
+        },
+        "renter_hardware_fault_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Renter Hardware Fault Executor Ids",
+          "type": "array"
         },
         "spot_executor_ids": {
           "default": [],
@@ -4600,6 +5240,30 @@
           },
           "title": "Rented Ports",
           "type": "array"
+        },
+        "ssh_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ssh Port"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
         }
       },
       "required": [
@@ -4607,6 +5271,112 @@
         "container_name"
       ],
       "title": "RentedPod",
+      "type": "object"
+    },
+    "ResetPodGpuRequest": {
+      "description": "1.16.0: the renter asked to reset the GPUs of their running pod. `gpu_uuids` is every GPU\nthe backend holds for the pod; `gpu_indices` picks some of them by pod index (the pod's GPUs sorted by\nhost PCI bus id, the 0..n-1 order `nvidia-smi` shows inside the pod), None for all of them. Answered by\n`validator_to_backend.PodGpuResetResult` with the same `request_id`.",
+      "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "gpu_indices": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Indices"
+        },
+        "gpu_uuids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Gpu Uuids",
+          "type": "array"
+        },
+        "local_volume_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume Path"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ResetPodGpuRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name",
+        "gpu_uuids",
+        "request_id"
+      ],
+      "title": "ResetPodGpuRequest",
       "type": "object"
     },
     "ResetVerifiedJobReason": {
@@ -4729,6 +5499,11 @@
         "backup_volume_info": {
           "$ref": "#/$defs/ExternalVolumeInfo"
         },
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "anyOf": [
             {
@@ -4798,6 +5573,11 @@
         "pod_id": {
           "title": "Pod Id",
           "type": "string"
+        },
+        "recovery": {
+          "default": false,
+          "title": "Recovery",
+          "type": "boolean"
         },
         "repository_password": {
           "anyOf": [
@@ -4997,6 +5777,11 @@
     },
     "SshPubKeyAdded": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -5145,6 +5930,124 @@
       "title": "SshPubKeyRemoved",
       "type": "object"
     },
+    "ValidationEvent": {
+      "additionalProperties": true,
+      "description": "The validator's structured event for the check that decided the cycle's outcome (or where the\npipeline halted). `reason_code` is a plain string: new codes appear on the validator first, and a\nreceiver that does not know one still reads the event. Both peers keep extra keys.",
+      "properties": {
+        "category": {
+          "default": "runtime",
+          "title": "Category",
+          "type": "string"
+        },
+        "check_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check Id"
+        },
+        "context": {
+          "additionalProperties": true,
+          "title": "Context",
+          "type": "object"
+        },
+        "event": {
+          "title": "Event",
+          "type": "string"
+        },
+        "help_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Help Uri"
+        },
+        "impact": {
+          "title": "Impact",
+          "type": "string"
+        },
+        "pipeline_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pipeline Id"
+        },
+        "reason_code": {
+          "title": "Reason Code",
+          "type": "string"
+        },
+        "remediation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remediation"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        },
+        "trace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Trace Id"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        },
+        "what_we_saw": {
+          "additionalProperties": true,
+          "title": "What We Saw",
+          "type": "object"
+        },
+        "when": {
+          "format": "date-time",
+          "title": "When",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "reason_code",
+        "severity",
+        "impact",
+        "when"
+      ],
+      "title": "ValidationEvent",
+      "type": "object"
+    },
     "ValidatorMessageType": {
       "enum": [
         "AuthenticateRequest",
@@ -5160,6 +6063,7 @@
         "RevenuePerGpuTypeRequest",
         "GpuEstimatesRequest",
         "EstimateResponse",
+        "PodStatesReport",
         "ContainerCreated",
         "ContainerStarted",
         "ContainerStopped",
@@ -5172,7 +6076,8 @@
         "DebugSshKeyAdded",
         "FailedAddDebugSshKey",
         "JupyterServerInstalled",
-        "JupyterInstallationFailed"
+        "JupyterInstallationFailed",
+        "PodGpuResetResult"
       ],
       "title": "ValidatorMessageType",
       "type": "string"
@@ -5243,6 +6148,9 @@
     "RemoveSshPublicKeysRequest": {
       "$ref": "#/$defs/RemoveSshPublicKeysRequest"
     },
+    "ResetPodGpuRequest": {
+      "$ref": "#/$defs/ResetPodGpuRequest"
+    },
     "RestoreContainerRequest": {
       "$ref": "#/$defs/RestoreContainerRequest"
     }
@@ -5272,11 +6180,14 @@
     "PodRentalActiveResponse": {
       "$ref": "#/$defs/PodRentalActiveResponse"
     },
+    "PodSshUnreachableResponse": {
+      "$ref": "#/$defs/PodSshUnreachableResponse"
+    },
     "RentedExecutorsResponse": {
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.0.0",
+  "protocol_version": "1.17.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
@@ -5346,8 +6257,14 @@
     "NormalizedScoreRequest": {
       "$ref": "#/$defs/NormalizedScoreRequest"
     },
+    "PodGpuResetResult": {
+      "$ref": "#/$defs/PodGpuResetResult"
+    },
     "PodLogsResponseToServer": {
       "$ref": "#/$defs/PodLogsResponseToServer"
+    },
+    "PodStatesReport": {
+      "$ref": "#/$defs/PodStatesReport"
     },
     "RentedMachineRequest": {
       "$ref": "#/$defs/RentedMachineRequest"

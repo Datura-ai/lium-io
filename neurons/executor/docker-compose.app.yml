@@ -17,6 +17,13 @@ services:
       - pod_logs:/var/lib/executor-pod-logs
     pid: host
     privileged: true
+    # A renter's workload gets the whole host's cores and nearly all its RAM, with nothing reserved
+    # for the executor. Under full renter load the executor must keep answering /version and sshd or
+    # the validator reads the node as offline mid-rental and penalises the provider. Bias the CPU to
+    # the executor under contention (the renter keeps full cores while the executor is idle), keep a
+    # small RAM reservation, and tell the kernel OOM killer to spare it.
+    cpu_shares: 4096
+    oom_score_adj: -900
     environment:
       - NVIDIA_DRIVER_CAPABILITIES=all
     labels:
@@ -35,6 +42,7 @@ services:
     deploy:
       resources:
         reservations:
+          memory: 2g
           devices:
             - driver: nvidia
               count: all
@@ -50,6 +58,7 @@ services:
       - pod_logs:/var/lib/executor-pod-logs
     pid: host
     command: pdm run src/monitor.py
+    oom_score_adj: -900
     depends_on:
       - executor
     cap_add:
@@ -58,6 +67,8 @@ services:
   autoheal:
     restart: always
     image: willfarrell/autoheal
+    # autoheal is what restarts a wedged executor, so it must itself survive a host OOM.
+    oom_score_adj: -900
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 

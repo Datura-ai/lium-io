@@ -1,6 +1,5 @@
 import json
 import sys
-import types
 from pathlib import Path
 from typing import Any
 import asyncssh  # noqa: E402
@@ -17,15 +16,6 @@ if str(VALIDATOR_SRC) not in sys.path:
     sys.path.insert(0, str(VALIDATOR_SRC))
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
-
-if "celium_collateral_contracts" not in sys.modules:
-    module = types.ModuleType("celium_collateral_contracts")
-
-    class CollateralContract:  # type: ignore
-        ...
-
-    module.CollateralContract = CollateralContract
-    sys.modules["celium_collateral_contracts"] = module
 
 FIXTURE_PATH = THIS_DIR / "fixtures" / "tdx_quote.json"
 VERIFIER_RESPONSE_PATH = THIS_DIR / "fixtures" / "verifier_response.json"
@@ -51,7 +41,6 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
 
     monkeypatch.setattr(AttestationService, "_call_verifier", fake_call_verifier)
     monkeypatch.setattr(asyncssh, "import_public_key", lambda value: object())
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     # This test exercises the verify-and-accept happy path; whitelist gating is a
     # separate concern. Pin it off so the test is deterministic regardless of a

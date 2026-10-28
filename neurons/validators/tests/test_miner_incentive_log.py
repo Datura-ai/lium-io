@@ -9,7 +9,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
-    MissingFlagshipCapability,
+    MissingFull8xCapability,
+    PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
 )
@@ -26,7 +27,9 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_tier",
         "provider_discord_not_connected",
         "new_rentals_paused",
+        "provider_maintenance",
         "miner_default_job",
+        "hotkey_excluded_from_scoring",
         "gpu_model_not_eligible_for_unrented_incentive",
         "price_above_market_p90_soft_limit",
         "no_unrented_capacity_for_gpu_count",
@@ -36,6 +39,13 @@ def test_reason_enum_pins_the_stable_code_contract():
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
+        "port_limited_remainder",
+        "provider_email_not_confirmed",
+        "spot_without_lium_filler",
+        "spot_no_filler_revenue_for_gpu_config",
+        "spot_no_headroom_at_burn_cap",
+        "validation_failed",
+        "rented_sysbox_not_confirmed",
     }
 
 
@@ -85,6 +95,11 @@ def _job(**overrides) -> JobResult:
             "Discord",
         ),
         (
+            lambda job: MinerLogLine.no_payout_because_email_not_confirmed(job),
+            "provider_email_not_confirmed",
+            "A listed node stays listed and rented. Other listing and incentive requirements still apply.",
+        ),
+        (
             lambda job: MinerLogLine.no_payout_because_paused_for_new_rentals(job),
             "new_rentals_paused",
             "paused for new rentals",
@@ -93,6 +108,11 @@ def _job(**overrides) -> JobResult:
             lambda job: MinerLogLine.no_payout_because_running_own_default_job(job),
             "miner_default_job",
             "own default job",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_hotkey_excluded_from_scoring(job),
+            "hotkey_excluded_from_scoring",
+            "excludes this hotkey from scoring",
         ),
         (
             lambda job: MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job),
@@ -127,9 +147,14 @@ def _job(**overrides) -> JobResult:
             "sysbox",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            lambda job: MinerLogLine.no_payout_because_rented_sysbox_not_confirmed(job),
+            "rented_sysbox_not_confirmed",
+            "rented node",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job,
-                MissingFlagshipCapability(
+                MissingFull8xCapability(
                     ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
                 ),
             ),
@@ -143,6 +168,13 @@ def _job(**overrides) -> JobResult:
             ),
             "cannot_apply_gpu_power_cap",
             "CAP_SYS_ADMIN",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(available_port_count=2, required_port_count=3)
+            ),
+            "port_limited_remainder",
+            "2 free port",
         ),
     ],
 )
@@ -166,15 +198,32 @@ def test_banned_network_abuse_message():
 def test_provider_ban_is_excluded_from_both_pools():
     incentive = object.__new__(RentalPriceIncentive)
 
-    line = incentive._reason_excluded_from_both_pools(_job(is_provider_banned=True))
+    lines = incentive._reasons_excluded_from_both_pools(_job(is_provider_banned=True))
 
-    assert line is not None
-    assert line.reason is ZeroIncentiveReason.BANNED_NETWORK_ABUSE
+    assert [line.reason for line in lines] == [ZeroIncentiveReason.BANNED_NETWORK_ABUSE]
 
 
 def test_spot_tier_carries_internal_log_message():
     line = MinerLogLine.no_payout_because_spot_tier(_job())
     assert line.internal_message == "Executor excluded from both pools - spot tier"
+
+
+def test_spot_tier_message_lists_every_cause_of_spot_rating():
+    message = MinerLogLine.no_payout_because_spot_tier(_job()).message
+    assert "this executor is on the spot tier" not in message
+    assert message.startswith("No subnet incentive: this executor is rated as spot for this cycle")
+    for cause in (
+        "set to Spot",
+        "demoted for penalties",
+        "Lium banned its hotkey by hand",
+        "Lium pinned the machine as spot",
+        "open rental",
+        "contracted under the spot tier",
+    ):
+        assert cause in message
+    assert "by Lium by hand" not in message
+    assert "network abuse" not in message
+    assert message.endswith("spot-rated executors do not earn subnet incentive.")
 
 
 def test_discord_reason_carries_connected_flag_for_internal_log():

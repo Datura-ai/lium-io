@@ -3,7 +3,6 @@ import binascii
 import hashlib
 import json
 import logging
-import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any
@@ -11,6 +10,7 @@ from typing import Annotated, Any
 import aiohttp
 import asyncssh
 from datura.requests.miner_requests import ExecutorSSHInfo
+from datura.requests.validator_requests import fresh_upload_nonce
 from fastapi import Depends
 
 from core.config import settings
@@ -53,7 +53,8 @@ class AttestationNonce:
 
     @classmethod
     def issue(cls) -> "AttestationNonce":
-        return cls(value_hex=secrets.token_hex(32))
+        # dated, so the executor can refuse it once stale (I-78); still 32 hex bytes for the TDX channel
+        return cls(value_hex=fresh_upload_nonce())
 
     @property
     def value_bytes(self) -> bytes:
@@ -87,7 +88,7 @@ class AttestationService:
     Validates executor authenticity for Intel TDX deployments by verifying a pre-generated
     quote supplied alongside the executor's SSH host key.
 
-    If attestation is disabled (default), this service becomes a no-op and simply returns
+    If TDX_VERIFIER_URL is unset (default), this service becomes a no-op and simply returns
     the host key policy when possible.
     """
 
@@ -97,8 +98,7 @@ class AttestationService:
         self,
         redis_service: Annotated[RedisService | None, Depends(RedisService)] = None,
     ) -> None:
-        self.enabled: bool = bool(
-            settings.ENABLE_TDX_ATTESTATION and settings.TDX_VERIFIER_URL)
+        self.enabled: bool = bool(settings.TDX_VERIFIER_URL)
         self.verifier_url: str | None = settings.TDX_VERIFIER_URL
         self.quote_timeout: int = 60
         # Injected by FastAPI DI or passed explicitly (ioc / validator core).

@@ -176,14 +176,17 @@ class ValidatorConsumer(BaseConsumer):
 
             try:
                 msg: SSHPubKeySubmitRequest
-                executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
+                registration = await self.executor_service.register_pubkey(
                     self.validator_key,
                     msg.miner_hotkey,
                     msg.public_key,
                     msg.validator_signature,
                     msg.executor_id,
                     nonce=msg.nonce,
+                    validator_miner_signature=msg.validator_miner_signature,
+                    is_rental_request=msg.is_rental_request,
                 )
+                executors: list[ExecutorSSHInfo] = registration.accepted
                 if msg.is_rental_request and len(executors) == 1:
                     await self.invoke_rental_request_hook(
                         {
@@ -193,7 +196,11 @@ class ValidatorConsumer(BaseConsumer):
                         }
                     )
     
-                await self.send_message(AcceptSSHKeyRequest(executors=executors))
+                await self.send_message(
+                    AcceptSSHKeyRequest(
+                        executors=executors, known_executor_ids=registration.known_executor_ids
+                    )
+                )
                 logger.info("Sent AcceptSSHKeyRequest to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e))

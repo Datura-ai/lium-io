@@ -4,14 +4,15 @@ import os
 import time
 from datetime import UTC, datetime
 
-from clients.backend_client import BackendClient
+from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
-from incentive.eligibility import is_missing_discord_after_cutoff
+from core.settlement import cycle_node_shares, share_moved, tempo_index
+from incentive.burn_service import verified_burner_hotkey
+from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
-from services.collateral_contract_service import CollateralContractService
 from services.default_docker_image_digest_service import (
     fetch_default_image_digests,
     fetch_executor_image_digest,
@@ -23,6 +24,10 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
+    carry_renter_gpu_reset_results,
+    has_renter_gpu_reset_holds,
+    remember_rented_scored_results,
+    withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -31,6 +36,7 @@ from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
+from services.executor_connectivity.external_probe import external_port_probe
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
@@ -41,9 +47,13 @@ from services.redis_service import (
     PENDING_PODS_PREFIX,
     RedisService,
 )
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
 from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
+from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
 from core.express_lane import CycleInputs, ExpressLane
@@ -55,8 +65,76 @@ logger = get_logger(__name__)
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
+# accepted submissions whose inclusion the backend has not acknowledged yet, {tempo_index: block}, each retried
+# every cycle until its own acknowledgement, so the attribution has the block every vector went in at
+PENDING_INCLUSION_KEY = "settlement_pending_inclusion"
+# cycle reports the backend has not acknowledged yet, replayed every cycle until it does
+UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
+# DAH-4001: the cycles summed into miner_scores since the last live submission, and live submissions not yet
+# acknowledged by the backend
+LIVE_CYCLE_IDS_KEY = "settlement_live_cycle_ids"
+UNACKED_LIVE_WEIGHTS_KEY = "settlement_unacked_live_weights"
+UNACKED_CYCLE_REPORTS_MAX = 200
+# one cycle's settlement HTTP (kept reports, pending inclusions, this cycle's report) is cut off past this, retries
+# included, so a slow backend cannot hold up the cycle; what was not delivered stays in Redis for the next cycle
+SETTLEMENT_REPORTING_BUDGET_SECONDS = 60
+# the shadow comparison runs after the live weights; this caps how long it can hold up the rest of the tick
+SHADOW_COMPARISON_BUDGET_SECONDS = 30
+SETTLEMENT_OFF = "off"
+SETTLEMENT_SHADOW = "shadow"
+SETTLEMENT_ENFORCE = "enforce"
 # Executor uuid request_job_to_miner reports a miner-level failure under (no real executor).
 FAILED_MINER_EXECUTOR_UUID = "11111111-1111-1111-1111-111111111111"
+
+
+def settle_cycle_results(
+    all_job_results: dict[str, list[JobResult]],
+    default_extra: dict,
+    rented_executors: RentedExecutorsResponse | None = None,
+) -> dict[str, int]:
+    """Settle machines scored under more than one hotkey, then count the scored GPUs per model.
+
+    The count comes after: a copy zeroed there must not count in its tier. A failure of the
+    duplicate pass is logged and the cycle scores its results as they are.
+    """
+    try:
+        rental_hotkeys = {
+            str(executor_id).lower(): rented.miner_hotkey
+            for executor_id, rented in (rented_executors.executors if rented_executors else {}).items()
+        }
+        keep_one_miner_per_executor(all_job_results, default_extra, rental_hotkeys)
+        keep_one_executor_per_gpu(all_job_results, default_extra)
+    except Exception as exc:
+        logger.error(
+            _m("[sync] Duplicate-executor pass failed; results left as they are", extra=get_extra_info({**default_extra, "error": str(exc)})),
+            exc_info=True,
+        )
+    total_gpu_model_count_map: dict[str, int] = {}
+    for job_results in all_job_results.values():
+        for job_result in job_results:
+            if (
+                job_result.gpu_model
+                and job_result.gpu_count
+                and (job_result.score > 0 or job_result.job_score > 0)
+                and (not job_result.is_spot or earns_spot_rental_incentive(job_result))
+                and not is_missing_discord_after_cutoff(job_result)
+                and not (
+                    job_result.is_new_rentals_paused and not job_result.is_rented
+                )
+                and not job_result.is_in_maintenance
+            ):
+                total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
+    return total_gpu_model_count_map
+
+
+def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
+    """All but a zeroed duplicate under the keeper's own executor UUID (that backend row hears the keeper) and a
+    result carried over a renter GPU reset (the backend keeps the row it has)."""
+    return [
+        result
+        for result in results
+        if not result.duplicate_shares_kept_row and not result.carried_for_renter_gpu_reset
+    ]
 
 
 class Validator:
@@ -72,6 +150,7 @@ class Validator:
         self.first_cycle_started_at: datetime | None = None
 
         self.miner_scores = {}
+        self.live_cycle_ids: list[str] = []
         # Hotkeys with at least one live executor in the last completed cycle. Rebuilt
         # every cycle, never persisted — set_weights floors them to u16=1.
         self.active_hotkeys: set[str] = set()
@@ -92,7 +171,6 @@ class Validator:
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
-        self.collateral_contract_service = CollateralContractService()
         self.attestation_service = AttestationService(redis_service=self.redis_service)
         # DAH-3405: remembers the authorized executor digest and when it last changed.
         self.rollout_tracker = ExecutorRolloutTracker(redis_service=self.redis_service)
@@ -109,7 +187,7 @@ class Validator:
             orchestrator=ConnectivityOrchestrator(
                 PortSelector(),
                 PortProbe(
-                    BatchVerifier(port_tester, runner),
+                    BatchVerifier(port_tester, runner, external_port_probe()),
                     SemiBatchVerifier(port_tester, runner),
                     FallbackVerifier(port_tester, runner),
                 ),
@@ -127,7 +205,6 @@ class Validator:
             redis_service=self.redis_service,
             validation_service=self.validation_service,
             verifyx_validation_service=self.verifyx_validation_service,
-            collateral_contract_service=self.collateral_contract_service,
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,
@@ -147,6 +224,11 @@ class Validator:
             cycle_inputs=self.express_lane_cycle_inputs,
         )
 
+        # the tempo index already submitted (or read, in shadow, or found empty): should_set_weights stays true for a
+        # tick or two after a submission, and a second attempt for the same frozen window would be rejected as too fast
+        self._settled_tempo_done: int | None = None
+        # inclusions not acknowledged yet, also held here: a Redis down at both keeps must not lose one
+        self._unacknowledged_inclusions: dict[str, int] = {}
         # init miner_scores: always load from Redis if present so accumulated
         # scores survive an unclean restart (SIGKILL / OOM / liveness preempt).
         try:
@@ -161,6 +243,7 @@ class Validator:
                 self.miner_scores = {}
             else:
                 self.miner_scores = json.loads(miner_scores_json)
+            self.live_cycle_ids = json.loads(await self.redis_service.get(LIVE_CYCLE_IDS_KEY) or "[]")
 
             # remove pod renting-in-progress status
             await self.redis_service.delete(PENDING_PODS_PREFIX)
@@ -186,12 +269,11 @@ class Validator:
         )
 
     def express_lane_cycle_inputs(self) -> CycleInputs | None:
-        """DAH-2958: the express lane runs only once a full cycle has completed since start.
-        That cycle marks validated every executor of every miner that answered it; an executor
-        registered before it began whose miner failed or was offline is not in that set, so the
-        lane also skips everything registered before `fleet_known_since` (the inputs carry it)."""
-        if self.completed_cycles_since_start < 1:
-            return None
+        """DAH-2958: the express lane runs once the first cycle since start has begun (None before).
+        The lane skips everything registered before `fleet_known_since` (that cycle's start, the inputs
+        carry it), so it only ever takes executors no cycle since start could have known; one the running
+        cycle does pick up is in `in_flight` under the cycle lane, which the lane skips. Waiting for that
+        first cycle to finish instead kept new nodes out of the lane 8-14 minutes after every restart."""
         return self.cycle_inputs
 
     async def an_operator_asked_for_a_cycle_now(self) -> bool:
@@ -257,20 +339,48 @@ class Validator:
                                 ),
                             ),
                         )
-                    else:
-                        if settings.DRY_RUN:
-                            logger.info(
-                                _m(
-                                    "[sync] DRY_RUN: Skipping set_weights to Bittensor",
-                                    extra=get_extra_info({**self.default_extra, "miner_scores": self.miner_scores}),
-                                )
+                    elif settings.DRY_RUN:
+                        logger.info(
+                            _m(
+                                "[sync] DRY_RUN: Skipping set_weights to Bittensor",
+                                extra=get_extra_info({**self.default_extra, "miner_scores": self.miner_scores}),
                             )
-                        else:
-                            await self.subtensor_client.set_weights(
-                                miner_scores=self.miner_scores,
-                                active_hotkeys=self.active_hotkeys,
-                            )
+                        )
                         self.miner_scores = {}
+                        self.live_cycle_ids = []
+                    elif settings.SETTLEMENT_MODE == SETTLEMENT_ENFORCE:
+                        # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is
+                        await self.submit_settled_window()
+                        self.miner_scores = {}
+                        self.live_cycle_ids = []
+                        # a live report left unacknowledged when settlement switched to enforce still goes out
+                        await self.drain_live_weights()
+                    else:
+                        live_scores, live_cycle_ids = self.miner_scores, self.live_cycle_ids
+                        block_before = self._current_block_or_none()
+                        accepted = await self.subtensor_client.set_weights(
+                            miner_scores=live_scores,
+                            active_hotkeys=self.active_hotkeys,
+                            wait_for_inclusion=True,
+                        )
+                        self.miner_scores = {}
+                        self.live_cycle_ids = []
+                        if accepted:
+                            # the block read after it landed, or before it when that read fails, as for a window
+                            block = self._current_block_or_none()
+                            block = block if block is not None else block_before
+                            if block is not None:
+                                await self.report_live_weights(block, live_cycle_ids)
+                            else:
+                                logger.warning(
+                                    _m(
+                                        "[settlement] live weights landed but no block could be read; not reported",
+                                        extra=get_extra_info(self.default_extra),
+                                    )
+                                )
+                        # after the live submission: a slow or failing backend must not delay or skip it
+                        if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
+                            await self.shadow_settled_window(live_scores)
             except Exception as e:
                 logger.error(
                     _m(
@@ -368,23 +478,27 @@ class Validator:
                 # A fresh job-files directory for this cycle; the ones an express verification
                 # still reads are kept (DAH-2958). The express lane uses the new one from here on.
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=(
-                        self.express_lane.directories_in_use() if settings.EXPRESS_LANE_ENABLED else ()
-                    )
+                    keep_directories=self.express_lane.directories_in_use()
                 )
                 self.cycle_inputs = CycleInputs(
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
+                    job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
                 )
+                self.miner_service.start_awaiting_wave_lists(
+                    job_batch_id, [miner.hotkey for miner in miners]
+                )
+                # every listed rented pod's SSH (any status), probed once while the miners work
+                pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
                 task_info = {}
 
                 # request jobs
                 jobs = [
                     asyncio.create_task(
-                        self.miner_service.request_job_to_miner(
+                        self.request_wave_job(
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
@@ -410,12 +524,14 @@ class Validator:
                     }
 
                 try:
-                    total_gpu_model_count_map = {}
                     all_job_results = {}
                     miner_coldkeys = {}
 
-                    # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    # asyncio.wait rejects an empty set.
+                    if jobs:
+                        done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    else:
+                        done, pending = set(), set()
 
                     # Process completed jobs
                     for task in done:
@@ -441,19 +557,6 @@ class Validator:
 
                                 all_job_results[miner_hotkey] = job_results
                                 miner_coldkeys[miner_hotkey] = miner_coldkey
-
-                                for job_result in job_results:
-                                    if (
-                                        job_result.gpu_model
-                                        and job_result.gpu_count
-                                        and (job_result.score > 0 or job_result.job_score > 0)
-                                        and not job_result.is_spot
-                                        and not is_missing_discord_after_cutoff(job_result)
-                                        and not (
-                                            job_result.is_new_rentals_paused and not job_result.is_rented
-                                        )
-                                    ):
-                                        total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 
                             else:
                                 info = task_info.get(task, {})
@@ -507,6 +610,14 @@ class Validator:
                             )
                             task.cancel()
 
+                    # DAH-4658: before the duplicate pass and the GPU count, so a carried result counts in both
+                    await self.carry_scores_over_renter_gpu_resets(all_job_results, rented_executors, miner_coldkeys)
+                    total_gpu_model_count_map = settle_cycle_results(
+                        all_job_results,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
+                        rented_executors,
+                    )
+
                     try:
                         open_fd_count = len(os.listdir('/proc/self/fd'))
                     except FileNotFoundError:
@@ -525,19 +636,25 @@ class Validator:
                             ),
                         ),
                     )
+                    NETWORK_GATE_TALLY.log_and_reset(
+                        MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
+                    )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window
                     )
+                    await remember_rented_scored_results(all_job_results, self.redis_service)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
                     # withheld result (DAH-3405) got no verdict on that executor this cycle, so it
-                    # is treated as active as well.
+                    # is treated as active as well, and so is one whose passed copy another
+                    # hotkey kept the score for.
                     self.active_hotkeys = {
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
-                        if any(result.is_successful for result in results)
+                        if any(result.is_successful or result.duplicate_kept_by for result in results)
                     } | {withheld.miner_hotkey for withheld in withheld_results}
 
                     incentive = IncentiveFactory.create(
@@ -586,7 +703,6 @@ class Validator:
 
                     # PHASE 2: Calculate final weights with burning logic per cycle
                     miners = await self.subtensor_client.get_miners()
-                    last_mechanism_step_block = self.subtensor_client.get_last_mechansim_step_block()
 
                     # Current subnet epoch for the referral feed's staleness guard. This MUST use
                     # the SAME numbering as the backend feed's epoch_index — see
@@ -609,7 +725,6 @@ class Validator:
 
                     cycle_scores = await incentive.calculate_final_weights(
                         miners=miners,
-                        last_mechanism_step_block=last_mechanism_step_block,
                         current_epoch=current_epoch,
                     )
 
@@ -624,6 +739,17 @@ class Validator:
                     # PHASE 3: Accumulate scores with burning applied
                     for miner_hotkey, score in cycle_scores.items():
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+                    self.live_cycle_ids.append(job_batch_id)
+
+                    if settings.SETTLEMENT_MODE != SETTLEMENT_OFF:
+                        await self.report_cycle_scores(
+                            cycle_scores,
+                            cycle_node_shares(incentive.job_results),
+                            self._settlement_burner(miners),
+                            job_batch_id,
+                            job_block,
+                            scored_at,
+                        )
 
                     # DAH-2748: a cycle where most nodes failed at the connect is our own
                     # outage, not theirs; reporting it would empty the market in one cycle.
@@ -637,17 +763,38 @@ class Validator:
                             )
                         )
 
+                    # each node's pod SSH observations ride on its result; a probed rented
+                    # node the cycle has no result for gets one carrying only them. A withheld
+                    # executor has a result this cycle, held back, so it gets none.
+                    pod_ssh = await pod_ssh_probe
+                    reported = attach_pod_ssh(incentive.job_results, pod_ssh) | {
+                        str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results
+                    }
+                    result_missing = (
+                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
+                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
+                        else {}
+                    )
+
                     # Publish machine specs
                     published_executor_ids: list[str] = []
                     for miner_hotkey, results in incentive.job_results.items():
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
-                            await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
+                            await self.miner_service.publish_machine_specs(
+                                specs_to_publish(results), miner_hotkey, miner_coldkey
+                            )
+                            # an unpublished duplicate copy is still handled by this cycle: the
+                            # express lane must not run it as a new node
                             published_executor_ids.extend(
                                 result.executor_info.uuid
                                 for result in results
                                 if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
                             )
+
+                    # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
+                    # the express lane below.
+                    await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
 
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
@@ -655,23 +802,25 @@ class Validator:
                         withheld.result.executor_info.uuid for withheld in withheld_results
                     )
 
-                    if settings.EXPRESS_LANE_ENABLED:
-                        # DAH-2958: everything published by a cycle is "validated" for the
-                        # express lane; only what the portal lists beyond this set is new.
-                        # Never lets a Redis blip end the cycle: the next cycle seeds again, and
-                        # the wave's CYCLE_DONE claims keep the lane off those executors until then.
-                        try:
-                            await self.redis_service.mark_executors_validated(published_executor_ids)
-                            self.miner_service.forget_cycle_done()
-                        except Exception as exc:
-                            logger.error(
-                                _m(
-                                    "[sync] Failed to record validated executors for the express lane",
-                                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                                ),
-                            )
+                    # DAH-2958: everything published by a cycle is "validated" for the
+                    # express lane; only what the portal lists beyond this set is new.
+                    # Never lets a Redis blip end the cycle: the next cycle seeds again, and
+                    # the wave's CYCLE_DONE claims keep the lane off those executors until then.
+                    try:
+                        await self.redis_service.mark_executors_validated(published_executor_ids)
+                        self.miner_service.forget_cycle_done()
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[sync] Failed to record validated executors for the express lane",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
 
-                    self.completed_cycles_since_start += 1
+                    # A cycle with no miners validated nobody, so it keeps the post-restart
+                    # warm-up closed: set_weights and the express lane wait for a scored cycle.
+                    if jobs:
+                        self.completed_cycles_since_start += 1
 
                     logger.info(
                         _m(
@@ -746,6 +895,7 @@ class Validator:
                 await self.redis_service.set(
                     MINER_SCORES_KEY, json.dumps(self.miner_scores)
                 )
+                await self.redis_service.set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
             except Exception as e:
                 logger.warning(
                     _m(
@@ -755,6 +905,540 @@ class Validator:
                         ),
                     ),
                 )
+
+    async def report_cycle_scores(
+        self,
+        cycle_scores: dict[str, float],
+        node_shares: list[dict],
+        burner_hotkey: str | None,
+        job_batch_id: str,
+        job_block: int,
+        scored_at: datetime,
+    ) -> None:
+        """DAH-4001: hand the cycle's vector and per-node rows to the backend for delayed settlement. Never fails
+        the cycle.
+
+        A report the backend does not acknowledge is kept in Redis and replayed at every later cycle, so a
+        backend outage delays a cycle's settlement instead of dropping its scores: under enforce nothing else
+        ever submits them.
+        """
+        if burner_hotkey is None:
+            # withheld shares have nowhere safe to go; a substitute recipient is worse than a skipped cycle
+            logger.error(
+                _m(
+                    "[settlement] no verified burner in this cycle's miners; cycle not reported",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
+                )
+            )
+            return
+        try:
+            cycle_started_at = datetime.strptime(job_batch_id, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
+            cycle_started_at = scored_at
+        payload = {
+            "cycle_id": job_batch_id,
+            "cycle_started_at": cycle_started_at.isoformat(),
+            "scored_at": scored_at.isoformat(),
+            "block": job_block,
+            "burn_hotkey": burner_hotkey,
+            "hotkey_scores": cycle_scores,
+            "mode": settings.SETTLEMENT_MODE,
+            "node_shares": node_shares,
+        }
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SETTLEMENT_REPORTING_BUDGET_SECONDS
+        # kept before any network wait: the budget below may cut a delivery off, and the replay then sends it
+        if not await self._keep_cycle_report(payload):
+            # Redis could not keep it, so this send is its only chance: before anything else that needs Redis
+            try:
+                delivered = await asyncio.wait_for(
+                    self._deliver_cycle_report(payload), timeout=SETTLEMENT_REPORTING_BUDGET_SECONDS
+                )
+            except TimeoutError:
+                delivered = False
+            if not delivered:
+                logger.error(
+                    _m(
+                        "[settlement] cycle report neither kept nor delivered; its scores are lost",
+                        extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
+                    )
+                )
+        try:
+            await asyncio.wait_for(self._deliver_kept_settlement_reports(), timeout=max(0.0, deadline - loop.time()))
+        except TimeoutError:
+            logger.warning(
+                _m(
+                    "[settlement] reporting budget spent; undelivered kept reports wait for the next cycle",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
+                )
+            )
+        await self._cap_kept_cycle_reports()
+
+    async def _deliver_kept_settlement_reports(self) -> None:
+        await self._retry_pending_inclusion()
+        await self._replay_unacked_cycle_reports()
+
+    async def _deliver_cycle_report(self, payload: dict) -> bool:
+        try:
+            receipt = await self.backend_client.report_cycle_scores(payload)
+        except BackendRejected as exc:
+            # a 4xx is the report itself being wrong; keeping it would block every later report behind it
+            logger.error(
+                _m(
+                    "[settlement] cycle report rejected by the backend; dropped",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": payload["cycle_id"], "error": str(exc)}),
+                )
+            )
+            return True
+        except Exception as exc:
+            receipt = None
+            logger.error(
+                _m(
+                    "[settlement] cycle report failed",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": payload["cycle_id"], "error": str(exc)}),
+                )
+            )
+        if receipt is None:
+            return False
+        logger.info(
+            _m(
+                "[settlement] cycle reported",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "cycle_id": receipt.cycle_id,
+                        "created": receipt.created,
+                        "hotkeys": len(payload["hotkey_scores"]),
+                    }
+                ),
+            )
+        )
+        return True
+
+    async def _keep_cycle_report(self, payload: dict) -> bool:
+        try:
+            await self.redis_service.lpush(UNACKED_CYCLE_REPORTS_KEY, json.dumps(payload).encode())
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[settlement] could not keep the cycle report; sending it once without replay",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": payload["cycle_id"], "error": str(exc)}),
+                )
+            )
+            return False
+        return True
+
+    async def _cap_kept_cycle_reports(self) -> None:
+        """Trimmed only after the cycle's delivery pass: trimming before it would drop the oldest report even when the
+        backend is back and could take it. Past the cap during a long outage the oldest are dropped, and logged."""
+        try:
+            kept_count = await self.redis_service.llen(UNACKED_CYCLE_REPORTS_KEY)
+            if kept_count <= UNACKED_CYCLE_REPORTS_MAX:
+                return
+            await self.redis_service.ltrim(UNACKED_CYCLE_REPORTS_KEY, UNACKED_CYCLE_REPORTS_MAX)
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not cap the kept cycle reports", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return
+        logger.error(
+            _m(
+                "[settlement] kept cycle reports over the cap; the oldest are dropped and their scores lost",
+                extra=get_extra_info({**self.default_extra, "dropped": kept_count - UNACKED_CYCLE_REPORTS_MAX}),
+            )
+        )
+
+    async def _replay_unacked_cycle_reports(self) -> None:
+        try:
+            kept = await self.redis_service.lrange(UNACKED_CYCLE_REPORTS_KEY)
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not read kept cycle reports", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return
+        # oldest first (lpush puts the newest at the head); the first failure ends the pass, so a backend that is
+        # still down costs one timeout per cycle, not one per kept report
+        for raw in reversed(kept):
+            if not await self._deliver_cycle_report(json.loads(raw)):
+                break
+            try:
+                await self.redis_service.lrem(UNACKED_CYCLE_REPORTS_KEY, raw)
+            except Exception:
+                pass
+
+    async def report_live_weights(self, inclusion_block: int, cycle_ids: list[str]) -> None:
+        """DAH-4001: tell the backend where live weights landed and which cycles they summed, so it credits the epochs
+        they pay to those cycles instead of the last settled window. Kept in Redis before it is sent: a lost report
+        misattributes epochs. Never fails the tempo."""
+        report = {"inclusion_block": inclusion_block, "cycle_ids": cycle_ids}
+        try:
+            await self.redis_service.lpush(UNACKED_LIVE_WEIGHTS_KEY, json.dumps(report).encode())
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[settlement] could not keep the live weights report; sending it once without replay",
+                    extra=get_extra_info({**self.default_extra, "inclusion_block": inclusion_block, "error": str(exc)}),
+                )
+            )
+            await self._send_live_weights(report)
+            return
+        await self.drain_live_weights()
+        try:
+            # one report per tempo: past the cap during a long outage the oldest go, as for the cycle reports
+            await self.redis_service.ltrim(UNACKED_LIVE_WEIGHTS_KEY, UNACKED_CYCLE_REPORTS_MAX)
+        except Exception:
+            pass
+
+    async def drain_live_weights(self) -> None:
+        """Send the kept live weights reports, oldest first, until one is not taken: after every tempo's submission in
+        every mode, so the first failure costs one request per tempo and never delays a submission."""
+        try:
+            kept = list(reversed(await self.redis_service.lrange(UNACKED_LIVE_WEIGHTS_KEY)))
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not read kept live weights reports", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return
+        for raw in kept:
+            if not await self._send_live_weights(json.loads(raw)):
+                return
+            try:
+                await self.redis_service.lrem(UNACKED_LIVE_WEIGHTS_KEY, raw)
+            except Exception:
+                pass
+
+    async def _send_live_weights(self, report: dict) -> bool:
+        """Whether the report is done with: taken, or rejected as wrong (keeping it would block every later one)."""
+        try:
+            # bounded like the cycle reports: a hung backend costs one budget per tempo and the report stays kept
+            receipt = await asyncio.wait_for(
+                self.backend_client.report_live_weights(report["inclusion_block"], report["cycle_ids"]),
+                timeout=SETTLEMENT_REPORTING_BUDGET_SECONDS,
+            )
+            return receipt is not None
+        except BackendRejected as exc:
+            logger.error(
+                _m(
+                    "[settlement] live weights report rejected by the backend; dropped",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc), **report}),
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[settlement] live weights report failed; kept for the next tempo",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc), "inclusion_block": report["inclusion_block"]}),
+                )
+            )
+            return False
+
+    def _settlement_burner(self, miners) -> str | None:
+        """The verified burner. A test network has none, so our own hotkey stands in; on mainnet a burner that fails
+        its check is None and nothing is reported or paid to a substitute."""
+        burner = verified_burner_hotkey(miners)
+        if burner is None and settings.BITTENSOR_NETWORK != "finney":
+            return self.backend_client.keypair.ss58_address
+        return burner
+
+    def _current_tempo(self) -> tuple[int, int, int]:
+        tempo = int(self.subtensor_client.get_tempo())
+        block = int(self.subtensor_client.get_current_block())
+        return tempo_index(block, tempo), tempo, block
+
+    def _current_block_or_none(self) -> int | None:
+        try:
+            return self.subtensor_client.get_current_block()
+        except Exception:
+            return None
+
+    async def _fetch_settled_window(self, index: int, tempo: int):
+        try:
+            return await self.backend_client.get_settled_weights(index, tempo)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[settlement] settled weights request raised",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
+                )
+            )
+            return None
+
+    async def _submit_vector(self, vector: dict[str, float]) -> bool:
+        try:
+            return await self.subtensor_client.set_weights(
+                miner_scores=vector,
+                active_hotkeys=self.active_hotkeys,
+                wait_for_inclusion=True,
+                include_registered_scored=True,
+            )
+        except Exception as exc:
+            logger.error(
+                _m("[settlement] set_weights raised", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return False
+
+    async def submit_settled_window(self) -> bool:
+        """DAH-4001 enforce: submit the backend's settled vector for this tempo. When the backend cannot serve one
+        (unreachable, or nothing scored in its window) submit nothing: the chain keeps paying the weights already
+        in force, and an unreachable backend is asked again on the next tick. Returns whether this tempo is settled
+        on chain."""
+        index, tempo, block_before = self._current_tempo()
+        if index == getattr(self, "_settled_tempo_done", None):
+            return True
+        # a window that landed but is not reported reads as not landed, and the next one would decide its deposits
+        # again: it waits, and the landed vector stays in force meanwhile
+        if not await self._retry_pending_inclusion():
+            logger.error(
+                _m(
+                    "[settlement] an accepted window is not reported yet; the next one waits",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index}),
+                )
+            )
+            self._alert_if_near_activity_cutoff()
+            return False
+        window = await self._fetch_settled_window(index, tempo)
+        if window is None or not any(window.hotkey_scores.values()):  # all zero would land as uniform weights
+            if window is not None:
+                self._settled_tempo_done = index  # frozen empty: asking again only gets the same answer
+            logger.error(
+                _m(
+                    "[settlement] no settled window; the weights in force stay",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "tempo_index": index,
+                            "reason": "backend unreachable" if window is None else "empty window",
+                        }
+                    ),
+                )
+            )
+            self._alert_if_near_activity_cutoff()
+            return False
+        accepted = await self._submit_vector(window.hotkey_scores)
+        if accepted:
+            self._settled_tempo_done = index
+            block = self._current_block_or_none()
+            # the block read before the submission when the read after it fails: the window's deposits are owed
+            # back only once its inclusion is reported, so it is never left unreported
+            await self._confirm_inclusion(index, block if block is not None else block_before)
+        else:
+            self._alert_if_near_activity_cutoff()
+        logger.info(
+            _m(
+                "[settlement] window submitted" if accepted else "[settlement] window submission failed",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "tempo_index": index,
+                        "cycles": len(window.cycle_ids),
+                        "hotkeys": len(window.hotkey_scores),
+                        "withheld_shares": window.withheld_count,
+                        "withheld_total": window.withheld_total,
+                        "refunded_shares": window.refunded_count,
+                        "refunded_total": window.refunded_total,
+                        "mass_inactive_skipped": window.mass_inactive_skipped,
+                    }
+                ),
+            )
+        )
+        return accepted
+
+    async def _pending_inclusions(self) -> dict[str, int] | None:
+        """None when Redis cannot be read: the caller must not write the map back, or it erases older entries."""
+        try:
+            kept = await self.redis_service.get(PENDING_INCLUSION_KEY)
+        except Exception:
+            return None
+        return {**(json.loads(kept) if kept else {}), **self._unacknowledged_inclusions}
+
+    async def _confirm_inclusion(self, index: int, block: int) -> bool:
+        """Tell the backend the block read right after the chain accepted the tempo's vector (the extrinsic landed
+        at or just before it); kept before the report, so a restart while it is in flight does not lose it, and
+        retried until the backend answers. Returns whether it answered."""
+        await self._keep_pending_inclusion(index, block)
+        try:
+            confirmed = await self.backend_client.report_settled_weights_result(index, block)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[settlement] inclusion report raised",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
+                )
+            )
+            confirmed = None
+        # kept again when unanswered: the keep above may have met a Redis that has recovered since
+        await self._keep_pending_inclusion(index, block if confirmed is None else None)
+        return confirmed is not None
+
+    async def _keep_pending_inclusion(self, index: int, block: int | None) -> None:
+        # None drops the tempo's entry. Each tempo's stays until its own acknowledgement: a later one never clears it
+        if block is None:
+            self._unacknowledged_inclusions.pop(str(index), None)
+        else:
+            self._unacknowledged_inclusions[str(index)] = block
+        pending = await self._pending_inclusions()
+        if pending is None:
+            logger.warning(
+                _m(
+                    "[settlement] could not read the pending inclusions; left as they are",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index}),
+                )
+            )
+            return
+        if block is None:
+            pending.pop(str(index), None)
+        else:
+            pending[str(index)] = block
+        try:
+            await self.redis_service.set(PENDING_INCLUSION_KEY, json.dumps(pending))
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not keep the pending inclusions", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+
+    async def _retry_pending_inclusion(self) -> bool:
+        """Whether every kept inclusion is acknowledged now; stops at the first one the backend does not take."""
+        pending = await self._pending_inclusions()
+        if pending is None:
+            return False
+        for index, block in sorted(pending.items()):
+            if not await self._confirm_inclusion(int(index), int(block)):
+                return False
+        return True
+
+    def _alert_if_near_activity_cutoff(self) -> None:
+        """Error-log when no weights of ours were accepted for more than half the subnet's activity cutoff."""
+        try:
+            current_block = self.subtensor_client.get_current_block()
+            blocks_since_update = self.subtensor_client.get_last_update(current_block)
+            hyperparameters = self.subtensor_client.subtensor.get_subnet_hyperparameters(self.subtensor_client.netuid)
+            activity_cutoff = int(hyperparameters.activity_cutoff)
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not read activity cutoff", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return
+        if blocks_since_update * 2 < activity_cutoff:
+            return
+        logger.error(
+            _m(
+                "[settlement] no accepted weights for more than half the activity cutoff; the validator goes inactive at the cutoff",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "blocks_since_update": blocks_since_update,
+                        "activity_cutoff": activity_cutoff,
+                    }
+                ),
+            )
+        )
+
+    async def shadow_settled_window(self, live_scores: dict[str, float]) -> None:
+        """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live one just
+        submitted. Never raises: shadow is a comparison and must not end the sync tick."""
+        try:
+            await asyncio.wait_for(
+                self._log_settled_window_against_live(live_scores), timeout=SHADOW_COMPARISON_BUDGET_SECONDS
+            )
+        except Exception as exc:
+            logger.error(
+                _m("[settlement] shadow comparison failed", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+
+    async def _log_settled_window_against_live(self, live_scores: dict[str, float]) -> None:
+        index, tempo, _ = self._current_tempo()
+        if index == getattr(self, "_settled_tempo_done", None):
+            return
+        window = await self._fetch_settled_window(index, tempo)
+        if window is None:
+            logger.warning(
+                _m("[settlement] shadow: backend unreachable", extra=get_extra_info({**self.default_extra, "tempo_index": index}))
+            )
+            return
+        self._settled_tempo_done = index
+        logger.info(
+            _m(
+                "[settlement] shadow window",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "tempo_index": index,
+                        "cycles": len(window.cycle_ids),
+                        "hotkeys": len(window.hotkey_scores),
+                        "withheld_shares": window.withheld_count,
+                        "withheld_total": window.withheld_total,
+                        "refunded_shares": window.refunded_count,
+                        "refunded_total": window.refunded_total,
+                        "mass_inactive_skipped": window.mass_inactive_skipped,
+                        "share_moved_vs_live": round(share_moved(live_scores, window.hotkey_scores), 6),
+                    }
+                ),
+            )
+        )
+
+    async def request_wave_job(self, **kwargs) -> dict | None:
+        """One miner's wave request; its new executors that passed are listed now, not at the cycle's end."""
+        job = await self.miner_service.request_job_to_miner(**kwargs)
+        await self.miner_service.publish_new_executors_at_pass(job)
+        return job
+
+    async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
+        """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
+        if not settings.RENTED_POD_SSH_PROBE_ENABLED:
+            return {}
+        try:
+            return await probe_rented_pods(
+                rented_executors,
+                timeout=settings.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS,
+                concurrency=settings.RENTED_POD_SSH_PROBE_CONCURRENCY,
+                job_batch_id=job_batch_id,
+            )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[sync] rented pod SSH probe failed; this cycle reports no observations",
+                    extra=get_extra_info(
+                        {**self.default_extra, "job_batch_id": job_batch_id, "error_type": type(exc).__name__}
+                    ),
+                ),
+                exc_info=True,
+            )
+            return {}
+
+    async def publish_result_missing(
+        self, result_missing: dict[str, list[JobResult]], miners, miner_coldkeys: dict, job_batch_id: str
+    ) -> None:
+        """Publish the observations-only results (EXECUTOR_RESULT_MISSING), one miner at a time.
+
+        The coldkey is the miner's answer's when it answered, else the metagraph's; a hotkey that is
+        in neither is not registered any more and its nodes are skipped.
+        """
+        if not result_missing:
+            return
+        metagraph_coldkeys = {miner.hotkey: miner.coldkey for miner in miners}
+        skipped = []
+        for miner_hotkey, results in result_missing.items():
+            miner_coldkey = miner_coldkeys.get(miner_hotkey) or metagraph_coldkeys.get(miner_hotkey)
+            if not miner_coldkey:
+                skipped.extend(result.executor_info.uuid for result in results)
+                continue
+            await self.miner_service.publish_machine_specs(
+                results, miner_hotkey, miner_coldkey, is_whole_miner_batch=False
+            )
+        logger.info(
+            _m(
+                "[sync] rented nodes without a result reported with their pod SSH observations",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "job_batch_id": job_batch_id,
+                        "executors": sum(len(results) for results in result_missing.values()),
+                        "skipped_unregistered": skipped,
+                    }
+                ),
+            )
+        )
 
     async def fetch_executor_digest_or_none(self) -> str | None:
         """The registry digest of EXECUTOR_IMAGE_REF, or None when it cannot be read.
@@ -809,6 +1493,22 @@ class Validator:
                 grace_cycles=0,
             )
 
+    async def carry_scores_over_renter_gpu_resets(
+        self,
+        all_job_results: dict[str, list[JobResult]],
+        rented_executors: RentedExecutorsResponse | None,
+        miner_coldkeys: dict[str, str | None],
+    ) -> None:
+        """DAH-4658: only a node the backend still lists as rented carries its score: right now, or in this
+        cycle's snapshot when the backend does not answer."""
+        if not has_renter_gpu_reset_holds(all_job_results):
+            return
+        rented = await self.backend_client.get_rented_executors_now() or rented_executors
+        rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
+        await carry_renter_gpu_reset_results(
+            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+        )
+
     async def withhold_verdicts_for_rollout(
         self,
         all_job_results: dict[str, list[JobResult]],
@@ -827,7 +1527,8 @@ class Validator:
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
-        return standing, withheld_results
+        standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
+        return standing, withheld_results + held_for_gpu_reset
 
     async def record_withheld_verdicts(
         self,
@@ -876,9 +1577,9 @@ class Validator:
             await self.initiate_services()
             self.should_exit = False
 
-            if settings.EXPRESS_LANE_ENABLED and not settings.DRY_RUN:
+            if not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
-                # MinerService.in_flight. Flag off: the task is never created.
+                # MinerService.in_flight.
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
@@ -921,6 +1622,7 @@ class Validator:
 
         try:
             await self.redis_service.set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
+            await self.redis_service.set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
         except Exception as e:
             logger.info(
                 _m(

@@ -6,6 +6,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import IncentiveReason
 from protocol.vc_protocol.validator_requests import (
     AVAILABILITY_CATEGORY as AVAILABILITY_CATEGORY,
+    PodContainerState,
+    PodSshObservation,
     ValidationEvent,
 )
 from pydantic import BaseModel, Field, PrivateAttr
@@ -57,11 +59,25 @@ class JobResult(BaseModel):
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
     is_spot: bool = False
+    # in the backend's provider_spot_executor_ids, the spot pay list: set to Spot by its provider, or
+    # force-spot by a penalty demotion; not a banned hotkey, pin or no-incentive rental. Gates spot-node pay.
+    is_on_spot_pay_list: bool = False
     is_new_rentals_paused: bool = False
+    is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False
+    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS: no incentive from any pool, set
+    # by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
+    is_hotkey_excluded_from_scoring: bool = False
     provider_discord_connected: bool = True
+    is_provider_email_held: bool = False
     rental_created_at: datetime | None = None
     default_job_owner: str | None = None  # "miner" | "lium" | None; miner default job is excluded from unrented incentive
+    has_lium_filler: bool = False  # the backend lists at least one active Lium filler container on the node
+    # the node's GPU configuration's average filler USD per GPU-hour; None = no usable sample
+    filler_revenue_per_gpu_hour: float | None = None
+    # DAH-5128: what Lium's fillers earn per hour in total on the node's GPU model; the most all its
+    # idle spot nodes are paid together. None = no usable sample
+    filler_revenue_usd_per_hour: float | None = None
 
     # tdx attestation relevant fields
     attestation_digest: str | None = None
@@ -70,6 +86,15 @@ class JobResult(BaseModel):
     # G1 — NVIDIA CC GPU attestation outcome (None = not performed)
     gpu_attestation_passed: bool | None = None
     executor_image_report: dict[str, Any] | None = None
+    # DAH-3338: container state per rented pod plus reaped orphans; None = the cycle never
+    # observed any (not reached the rented-state check, nothing reaped).
+    pod_states: list[PodContainerState] | None = None
+    # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
+    # None when the node has no rented pod with an ssh_port or the probe did not run.
+    pod_ssh: list[PodSshObservation] | None = None
+    # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
+    # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
+    ssh_host_key_verified: bool = False
 
     inspector_outcome: str = "SKIPPED"
 
@@ -84,6 +109,15 @@ class JobResult(BaseModel):
     # itself failed). None on a scored run and on an error no check produced. Read by the
     # rollout-grace classifier at the end of the cycle.
     failure_reason_code: str | None = None
+    # The miner hotkey that keeps this machine's score this cycle, set on the other hotkeys' copies
+    # when duplicate enforcement zeroes them (checks/duplicate_executor.py).
+    duplicate_kept_by: str | None = Field(default=None, exclude=True)
+    # Such a copy under the keeper's own executor UUID: one backend row, so it is not published
+    # and the row hears only the copy that kept the score.
+    duplicate_shares_kept_row: bool = Field(default=False, exclude=True)
+    # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
+    # from; scored like the cycle it came from, never published
+    carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
@@ -109,6 +143,19 @@ class JobResult(BaseModel):
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False
+    # spot-node pay: set on a spot node that qualifies; its effective_rate is then the paid rate
+    spot_pay_candidate: bool = False
+    # the share of its own spot rate a spot node is paid: below 1 when its GPU model's spot nodes would
+    # together be paid more than the model's fillers earn per hour (filler_revenue_usd_per_hour)
+    spot_pool_multiplier: float | None = None
+    # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
+    # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
+    # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),
+    # on top of its effective_rate, which stays the listed or diluted rate.
+    # Set only on a node paid from that share, so every other node's output is unchanged.
+    unbucketed_share: float | None = None
+    unbucketed_rental_cost: float | None = None
+    floor_top_up_rate: float | None = None
     unrented_cap_multiplier: float | None = None          # Cap dilution multiplier: min(count, cap) / count
     rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
@@ -178,7 +225,11 @@ class JobResult(BaseModel):
     def incentive_formula_version(self) -> str:
         if self._is_mixed:
             return "mixed_v1"
-        return "rental_price_v2" if self.eligible_for_rental_share else "mining_v1"
+        return "rental_price_v2" if self._paid_from_rental_share else "mining_v1"
+
+    @property
+    def _paid_from_rental_share(self) -> bool:
+        return self.eligible_for_rental_share or self.spot_pay_candidate
 
     @property
     def incentive_formula_inputs(self) -> dict[str, Any]:
@@ -187,8 +238,8 @@ class JobResult(BaseModel):
             # The property's contract is a plain JSON-ready dict, and the payload is
             # published straight into a JSON message.
             return self._mixed_formula_inputs.model_dump()
-        if self.eligible_for_rental_share:
-            return {
+        if self._paid_from_rental_share:
+            inputs: dict[str, Any] = {
                 "rental_share": self.rental_share,
                 "rental_share_raw": self.rental_share_raw,
                 "total_burn_emission": self.total_burn_emission,
@@ -214,6 +265,19 @@ class JobResult(BaseModel):
                 "seconds_per_block": self.seconds_per_block,
                 "fixed_ratio": self.fixed_ratio,
             }
+            if self.unbucketed_share is not None:
+                # rental_price_v2 has two terms once these keys are present (documented in the
+                # lium_protocol README, 1.5.0):
+                #   rental term:     rental_share * gpu_count * effective_rate / total_rental_cost
+                #   unbucketed term: unbucketed_share * gpu_count * floor_top_up_rate / unbucketed_rental_cost
+                # A floored secure node is paid both. A spot node (spot_pay: true) is paid only the
+                # unbucketed term, with floor_top_up_rate = effective_rate.
+                inputs["unbucketed_share"] = self.unbucketed_share
+                inputs["unbucketed_rental_cost"] = self.unbucketed_rental_cost
+                inputs["floor_top_up_rate"] = self.floor_top_up_rate
+                if self.spot_pay_candidate:
+                    inputs["spot_pay"] = True
+            return inputs
         return {
             "score": self.score,
             "mining_share": self.mining_share,

@@ -1,13 +1,14 @@
 """Standardized HTTP client for backend API requests with validator signature."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import time
 from datetime import datetime
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import bittensor
@@ -20,6 +21,7 @@ from protocol.vc_protocol.compute_requests import (
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
+    RentedGpuDropResponse,
     VerificationStartedResponse,
 )
 from pydantic import BaseModel, ValidationError
@@ -38,6 +40,53 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 VERIFICATION_STARTED_BATCH_MAX = 512
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class CycleScoresReport(BaseModel):
+    """The backend's receipt for a cycle's vector (DAH-4001)."""
+
+    cycle_id: str
+    created: bool
+
+
+class SettledWeights(BaseModel):
+    """The vector the backend settled for one tempo (DAH-4001): the cycles scored a day earlier, the withhold
+    rule applied, frozen on first read. Empty `hotkey_scores` means nothing was scored in that window."""
+
+    tempo_index: int
+    window_from_block: int
+    window_to_block: int
+    cycle_ids: list[str]
+    hotkey_scores: dict[str, float]
+    withheld_count: int
+    withheld_total: float
+    refunded_count: int = 0
+    refunded_total: float = 0.0
+    mass_inactive_skipped: bool
+    inclusion_block: int | None = None
+
+
+class SettledWeightsResult(BaseModel):
+    tempo_index: int
+    inclusion_block: int | None = None
+
+
+class LiveWeightsReceipt(BaseModel):
+    inclusion_block: int
+    created: bool
+
+
+# the 4xx answers that mean the request itself is wrong; a 401/403 (a clock past the signature window) or a 429
+# is the moment, not the request, and the report is kept for the next replay
+DEFINITIVE_REJECTIONS = (400, 404, 422)
+
+
+class BackendRejected(Exception):
+    """The backend answered that the request itself is wrong, so sending it again would be wrong again."""
+
+    def __init__(self, status: int):
+        super().__init__(f"backend answered {status}")
+        self.status = status
 
 
 class BackendClient:
@@ -96,6 +145,46 @@ class BackendClient:
             "signature": f"0x{self.keypair.sign(str(timestamp)).hex()}",
         }
 
+    @staticmethod
+    def signed_request_message(method: str, path_with_query: str, body: bytes, timestamp: str) -> str:
+        """What the settlement routes verify (backend utils/auth.py validator_signed_message): the method, the path
+        with its query, the body's hash and the timestamp, so a captured signature fits no other request."""
+        return "\n".join(
+            ["lium-validator-v1", method.upper(), path_with_query, hashlib.sha256(body).hexdigest(), timestamp]
+        )
+
+    def _get_signed_request_headers(self, method: str, path_with_query: str, body: bytes) -> dict[str, str]:
+        timestamp = str(int(time.time()))
+        message = self.signed_request_message(method, path_with_query, body, timestamp)
+        return {
+            "hotkey": self.keypair.ss58_address,
+            "timestamp": timestamp,
+            "signature": f"0x{self.keypair.sign(message).hex()}",
+            "content-type": "application/json",
+        }
+
+    async def _signed_request(
+        self,
+        method: str,
+        path_with_query: str,
+        response_model: type[T],
+        *,
+        json_data: dict[str, Any] | None = None,
+        raise_on_4xx: bool = False,
+    ) -> T | None:
+        """A settlement call: the body is serialized once, and the signature covers these exact bytes."""
+        body = b"" if json_data is None else json.dumps(json_data, separators=(",", ":"), sort_keys=True).encode()
+        path = "/" + path_with_query.lstrip("/")
+        return await self._request(
+            method,
+            path,
+            response_model,
+            add_signature=False,
+            extra_headers=self._get_signed_request_headers(method, path, body),
+            raw_body=body if json_data is not None else None,
+            raise_on_4xx=raise_on_4xx,
+        )
+
     async def get(
         self,
         path: str,
@@ -147,6 +236,8 @@ class BackendClient:
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
         non_200_log_level: int = logging.ERROR,
+        raw_body: bytes | None = None,
+        raise_on_4xx: bool = False,
     ) -> T | None:
         # single signed round-trip, retrying connection-level errors per backoff schedule.
         # `non_200_log_level`: an optional call whose route may not exist on the backend yet logs
@@ -167,7 +258,8 @@ class BackendClient:
                         method,
                         url,
                         headers=headers,
-                        json=json_data,
+                        json=json_data if raw_body is None else None,
+                        data=raw_body,
                         timeout=aiohttp.ClientTimeout(total=timeout),
                     ) as resp:
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -185,6 +277,8 @@ class BackendClient:
                                     extra=get_extra_info({**context, "status": resp.status}),
                                 ),
                             )
+                            if raise_on_4xx and resp.status in DEFINITIVE_REJECTIONS:
+                                raise BackendRejected(resp.status)
                             return None
 
                         try:
@@ -223,6 +317,8 @@ class BackendClient:
                 _m(f"{method} client error", extra=get_extra_info({**context, "error": str(e)}))
             )
             return None
+        except BackendRejected:
+            raise
         except Exception as e:
             logger.error(
                 _m(f"{method} error", extra=get_extra_info({**context, "error": str(e)})), exc_info=True
@@ -233,12 +329,15 @@ class BackendClient:
         stop=stop_after_attempt(3),
         wait=wait_fixed(30),
         retry=retry_if_result(lambda x: x is None),
+        # without this, tenacity raises RetryError after the last None
+        retry_error_callback=lambda retry_state: None,
     )
     async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
         """Fetch all rented executors with their ports from the backend.
 
         Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
-        cannot start. A check that asks mid-cycle uses `get_rented_executors_now` instead.
+        cannot start. None when all three fail. A check that asks mid-cycle uses
+        `get_rented_executors_now` instead.
         """
         return await self.get_rented_executors_now()
 
@@ -298,6 +397,53 @@ class BackendClient:
             timeout=10,
         )
 
+    async def report_rented_gpu_drop(
+        self,
+        pod_id: str,
+        *,
+        state: str,
+        executor_id: str,
+        first_seen_at: str,
+        consecutive_cycles: int,
+        expected_gpu_count: int,
+        visible_gpu_count: int,
+        missing_uuids: list[str],
+        nvml_error_code: int | None,
+        faults: list[str],
+        pod_gpu_count: int | None,
+        rented_gpu_count: int | None,
+        nvml_gpu_count: int,
+    ) -> RentedGpuDropResponse | None:
+        """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
+        (``state="recovered"``).
+
+        The backend keeps one incident per pod until the recovery and tells the provider, support and
+        the renter once per incident. Older backends 404, which is no answer: the caller reports again
+        next cycle. ``expected_gpu_count``, ``visible_gpu_count``, ``rented_gpu_count`` (every pod's
+        ``gpu_count`` summed, None when one is unknown) and ``nvml_gpu_count`` are executor-wide;
+        ``pod_gpu_count`` is this pod's own share, so a split node's renters can be told apart.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
+            RentedGpuDropResponse,
+            json_data={
+                "state": state,
+                "executor_id": executor_id,
+                "first_seen_at": first_seen_at,
+                "consecutive_cycles": consecutive_cycles,
+                "expected_gpu_count": expected_gpu_count,
+                "visible_gpu_count": visible_gpu_count,
+                "missing_uuids": missing_uuids,
+                "nvml_error_code": nvml_error_code,
+                "faults": faults,
+                "pod_gpu_count": pod_gpu_count,
+                "rented_gpu_count": rented_gpu_count,
+                "nvml_gpu_count": nvml_gpu_count,
+            },
+            timeout=10,
+            non_200_log_level=logging.WARNING,
+        )
+
     async def get_filler_run_active(
         self, filler_run_id: str, *, container_missing: bool = False
     ) -> FillerRunActiveResponse | None:
@@ -323,6 +469,7 @@ class BackendClient:
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
+        loopback_plugin: str | None = None,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -342,6 +489,9 @@ class BackendClient:
                 probe with `--cpus=<cpu_count>`, so a host claiming more cores than it physically has
                 is rejected by its own Docker daemon (CPU_QUOTA_EXCEEDS_HOST) rather than only in a
                 paying customer's rent (DAH-2671). None omits the flag.
+            loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
+                probes that plugin; without it (or on an older backend, which ignores it) only the
+                legacy plugin is probed. None omits the field.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -365,6 +515,9 @@ class BackendClient:
         # stored specs. Omitted when unset so an unchanged backend keeps the pre-DAH-2671 behaviour.
         if cpu_count is not None:
             json_data["cpu_count"] = cpu_count
+
+        if loopback_plugin is not None:
+            json_data["loopback_plugin"] = loopback_plugin
 
         if executor_id:
             json_data["executor_id"] = executor_id
@@ -453,3 +606,38 @@ class BackendClient:
             )
         except Exception as exc:
             logger.warning(_m("Failed to report unknown driver", extra={"driver": driver_version, "error": str(exc)}))
+
+    # DAH-4001 — rolling idle settlement
+
+    async def report_cycle_scores(self, payload: dict[str, Any]) -> CycleScoresReport | None:
+        """Hand a cycle's vector and per-node rows to the backend, which settles it a day later. `payload` is the
+        request body (see core/settlement.py); the caller keeps it for replay when this returns None."""
+        return await self._signed_request(
+            "POST",
+            f"/validator/{self.keypair.ss58_address}/cycles",
+            CycleScoresReport,
+            json_data=payload,
+            raise_on_4xx=True,
+        )
+
+    async def get_settled_weights(self, tempo_index: int, tempo_blocks: int) -> SettledWeights | None:
+        """The vector to submit this tempo; None when the backend is unreachable."""
+        path = f"/validator/{self.keypair.ss58_address}/settled-weights?tempo_index={tempo_index}&tempo_blocks={tempo_blocks}"
+        return await self._signed_request("GET", path, SettledWeights)
+
+    async def report_live_weights(self, inclusion_block: int, cycle_ids: list[str]) -> LiveWeightsReceipt | None:
+        """Live weights this validator put on chain (settlement shadow or off) and the cycles summed into them, so the
+        backend credits the epochs they pay to those cycles, not to the last settled window."""
+        return await self._signed_request(
+            "POST",
+            f"/validator/{self.keypair.ss58_address}/live-weights",
+            LiveWeightsReceipt,
+            json_data={"inclusion_block": inclusion_block, "cycle_ids": cycle_ids},
+            raise_on_4xx=True,
+        )
+
+    async def report_settled_weights_result(self, tempo_index: int, inclusion_block: int) -> SettledWeightsResult | None:
+        path = f"/validator/{self.keypair.ss58_address}/settled-weights/{tempo_index}/result"
+        return await self._signed_request(
+            "POST", path, SettledWeightsResult, json_data={"inclusion_block": inclusion_block}
+        )

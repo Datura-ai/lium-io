@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 from typing import Any
 
 import asyncssh
@@ -15,6 +16,7 @@ from services.executor_connectivity.models import (
     PortPair,
 )
 from services.ssh_service import SSHService
+from services.node_host import public_host_sock
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,60 @@ DIND_SSHD_NOT_READY_MESSAGE = (
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
 
 
+# DAH-3634: `docker run` itself refused by the NVIDIA container hook. Every hook line counts
+# except `mount error`: that is sysbox's shiftfs fallback (nvidia_docker_sysbox_setup.sh --check)
+# and keeps SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
+# for the same host condition (watchtower/src/watchtower.py RUNTIME_PROBE_NVIDIA_MISMATCH).
+_HOOK_LINE_START = "nvidia-container-cli:"
+_SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
+
+# /proc/self/uid_map inside the sysbox probe container (G21), logged as `uid_map` on "Sysbox check ok"
+UID_MAP_USER_NAMESPACE = "user_namespace"
+UID_MAP_IDENTITY = "identity"
+UID_MAP_UNREADABLE = "unreadable"
+
+DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
+    (
+        "nvml error: driver/library version mismatch",
+        DindLogCause(
+            "NVIDIA_RUNTIME_MISMATCH",
+            "the NVIDIA container hook cannot start a GPU container: the kernel driver and the user-space "
+            "NVIDIA library are different versions (a driver update without a reboot)",
+        ),
+    ),
+    (
+        _HOOK_LINE_START,
+        DindLogCause(
+            "NVIDIA_CONTAINER_HOOK_FAILED",
+            "the NVIDIA container hook cannot start a GPU container on the host",
+        ),
+    ),
+)
+DOCKER_RUN_ERROR_LINE_MAX_CHARS = 400
+
+
+def diagnose_docker_run_error(stderr: str | None) -> DindLogCause | None:
+    """Name the cause when the NVIDIA container hook refused `docker run` of the DinD container;
+    None for anything else (a bound host port, a name conflict, a sysbox mount error).
+
+    The message quotes the hook's own line (from `nvidia-container-cli:` on, capped), so the
+    provider sees the hook's error in the event and not only the validator's reading of it.
+    """
+    hook_lines = [
+        line[line.find(_HOOK_LINE_START) :].strip()
+        for line in (stderr or "").splitlines()
+        if _HOOK_LINE_START in line and _SYSBOX_HOOK_ERROR not in line
+    ]
+    for pattern, cause in DOCKER_RUN_CAUSES:
+        line = next((ln for ln in hook_lines if pattern in ln), None)
+        if line is not None:
+            return DindLogCause(
+                cause.code,
+                f"{cause.message}. docker said: {line[:DOCKER_RUN_ERROR_LINE_MAX_CHARS]}",
+            )
+    return None
+
+
 def diagnose_dind_log(log_text: str | None) -> DindLogCause:
     """Name the cause for a DinD container whose sshd never answered.
 
@@ -77,6 +133,21 @@ def diagnose_dind_log(log_text: str | None) -> DindLogCause:
                 return DindLogCause(cause.code, f"{cause.message}. dockerd said: {line}", dockerd_line=line)
             return cause
     return DIND_SSHD_NOT_READY
+
+# DAH-3593: failures that come from the node or the network between us — a connect/login timeout,
+# a refused or dropped socket, an SSH error from the container's sshd. Logged at WARNING without a
+# traceback; every other exception in the probe is ours and stays ERROR.
+_NODE_SIDE_ERRORS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    asyncssh.Error,
+    ConnectionError,  # refused, reset, aborted
+    socket.gaierror,
+    socket.timeout,
+)
+
+
+# How long the removal of the probe container may take on the way out of a probe.
+REMOVE_TIMEOUT_SECONDS = 20
 
 
 class DindVerifier:
@@ -111,13 +182,23 @@ class DindVerifier:
             result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
-                await ssh_client.run(DockerCommand.remove_with_volumes(name))
+                # carried whether or not the probe asked for sysbox-runc: the executor's own sysbox
+                # self-report (machine_scrape.check_sysbox_gpu_compatibility) runs the same hook on the
+                # same host, so a refusal without sysbox-runc has the same cause
+                cause = diagnose_docker_run_error(error_msg)
+                cause_code = cause.code if cause else None
+                # DAH-3593: the host's dockerd refused the run (a port already bound on the host,
+                # most of the time) — the provider's state; the verdict line scores it.
+                failure_extra = get_extra_info(
+                    {**log_ctx, "reason": "dind_run_refused_by_host", "error": error_msg, "cause": cause_code}
+                )
+                logger.warning(_m("DinD creation failed", extra=failure_extra))
                 return DindProbeResult(
                     success=False,
                     log_text=f"dind: check failed port={port.internal}",
                     sysbox_runtime=sysbox,
                     port=port,
+                    error=cause,
                 )
 
             logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
@@ -132,7 +213,6 @@ class DindVerifier:
                 if sysbox:
                     sysbox = await self._sysbox_works(ssh, log_ctx)
 
-            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
             return DindProbeResult(
@@ -143,20 +223,47 @@ class DindVerifier:
             )
 
         except Exception as e:
-            logger.error(
-                _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
-                exc_info=True,
-            )
+            if isinstance(e, _NODE_SIDE_ERRORS):
+                # DAH-3593: sshd inside the DinD container never answered, or the node dropped the
+                # connection — one WARNING per executor per cycle, no traceback. Anything else is
+                # the validator's own failure and keeps ERROR with the traceback.
+                logger.warning(
+                    _m(
+                        "DinD check failed",
+                        extra=get_extra_info(
+                            {**log_ctx, "reason": "dind_node_unreachable", "error": str(e) or type(e).__name__}
+                        ),
+                    )
+                )
+            else:
+                logger.error(
+                    _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
+                    exc_info=True,
+                )
             error: DindLogCause | None = None
             if created and not sshd_answered and sysbox:
                 error = await self._diagnose_unanswered_container(ssh_client, name, e, log_ctx)
-            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
                 error=error,
+            )
+        finally:
+            # One removal on every way out — ok, failed, raised, and cancelled (the validation
+            # fast path cancels this check when the sibling lane stops), so no probe container
+            # keeps its port bound until the next wave's stale-container cleanup. The diagnosis
+            # above has already read the container's logs by the time this runs.
+            await self._remove_container(ssh_client, name, log_ctx)
+
+    async def _remove_container(self, ssh_client: SSHClientConnection, name: str, log_ctx: dict[str, Any]) -> None:
+        try:
+            async with asyncio.timeout(REMOVE_TIMEOUT_SECONDS):
+                await ssh_client.run(DockerCommand.remove_with_volumes(name))
+        except Exception as e:  # noqa: BLE001 — the probe's own verdict is already decided
+            logger.warning(
+                _m("DinD container removal failed", extra=get_extra_info({**log_ctx, "error": str(e)}))
             )
 
     async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
@@ -171,10 +278,43 @@ class DindVerifier:
             error_msg = "sysbox check timed out after 30s"
         else:
             if result.exit_status == 0:
-                logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
-                return True
+                uid_map = await self._read_uid_map(ssh)
+                logger.info(_m("Sysbox check ok", extra=get_extra_info({**log_ctx, "uid_map": uid_map})))
+                return self._user_namespace_allows_sysbox(uid_map, log_ctx)
             error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
         logger.warning(_m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+        return False
+
+    @staticmethod
+    async def _read_uid_map(ssh: SSHClientConnection) -> str:
+        """`user_namespace`, `identity` or `unreadable` for /proc/self/uid_map inside the sysbox probe container.
+
+        Sysbox always runs a container in a user namespace; runc, privileged or not, keeps the host's identity
+        map (`0 0 4294967295`). The `docker` that started this container is the node's own binary, so
+        hello-world passing does not show sysbox ran it.
+        """
+        try:
+            result = await asyncio.wait_for(ssh.run("cat /proc/self/uid_map"), timeout=10)
+        except (asyncio.TimeoutError, asyncssh.Error, OSError):
+            return UID_MAP_UNREADABLE
+        fields = (result.stdout or "").split() if isinstance(result.stdout, str) else []
+        if result.exit_status != 0 or len(fields) < 3:
+            return UID_MAP_UNREADABLE
+        if fields[:3] == ["0", "0", "4294967295"]:
+            return UID_MAP_IDENTITY
+        return UID_MAP_USER_NAMESPACE
+
+    @staticmethod
+    def _user_namespace_allows_sysbox(uid_map: str, log_ctx: dict[str, Any]) -> bool:
+        """False only for the identity map (logged as SYSBOX_IDENTITY_UID_MAP). True for a user namespace
+        and for an unreadable map (logged as SYSBOX_UID_MAP_UNREADABLE: no answer decides nothing).
+        """
+        if uid_map == UID_MAP_USER_NAMESPACE:
+            return True
+        if uid_map == UID_MAP_UNREADABLE:
+            logger.warning(_m("SYSBOX_UID_MAP_UNREADABLE", extra=get_extra_info(log_ctx)))
+            return True
+        logger.warning(_m("SYSBOX_IDENTITY_UID_MAP", extra=get_extra_info(log_ctx)))
         return False
 
     async def _diagnose_unanswered_container(
@@ -250,6 +390,7 @@ class DindVerifier:
                 connection = await asyncssh.connect(
                     host=host,
                     port=port.external,
+                    **await public_host_sock(host, port.external, attempt_timeout_seconds),
                     username="root",
                     client_keys=[pkey],
                     known_hosts=None,
@@ -277,7 +418,9 @@ class DindVerifier:
             )
             return connection
 
-        logger.warning(
+        # DAH-3593: DEBUG — the caller logs the error this raises, so this was a second line for
+        # the same outcome.
+        logger.debug(
             _m(
                 "DinD SSH not ready before deadline",
                 extra=get_extra_info(

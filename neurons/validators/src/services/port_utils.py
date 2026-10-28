@@ -1,6 +1,7 @@
 import json
 
 DEFAULT_PORT_RANGE = (20000, 65536)
+DEFAULT_PORT_RANGE_TEXT = f"{DEFAULT_PORT_RANGE[0]}-{DEFAULT_PORT_RANGE[1] - 1}"
 
 
 def get_all_ports(port_range: str | None, port_mappings: str | None, ssh_port: int) -> list[tuple[int, int]]:

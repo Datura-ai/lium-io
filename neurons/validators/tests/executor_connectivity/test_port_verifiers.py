@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from services.executor_connectivity.models import ContainerStartResult, PortPair
@@ -5,176 +7,123 @@ from services.executor_connectivity.port_verifiers import SemiBatchVerifier
 
 
 CONTAINER_STARTED = ContainerStartResult(ok=True, container_id="c", status="Up")
-CONTAINER_START_FAILED = ContainerStartResult(
-    ok=False, container_id=None, status="port is already allocated"
-)
 
 
 @pytest.mark.asyncio
-async def test_semi_batch_publishes_a_chunk_in_one_container(mocker):
-    ports = [PortPair(9000, 9000), PortPair(9001, 9001), PortPair(9002, 9002)]
+async def test_semi_batch_fails_a_chunk_that_does_not_answer_in_time(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(20)]
+
+    async def slow_then_ok(_ssh, name, *_args):
+        if runner.run.await_count == 1:
+            await asyncio.sleep(5)
+        return CONTAINER_STARTED
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(side_effect=slow_then_ok)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+    verifier = SemiBatchVerifier(port_tester, runner)
+    mocker.patch.object(SemiBatchVerifier, "CHUNK_TIMEOUT_SEC", 0.1)
+
+    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert failed == ports[:10]
+    assert successful == ports[10:]
+
+
+def _batch_verifier(mocker, test_many, external=None):
+    from services.executor_connectivity.port_verifiers import BatchVerifier
 
     runner = mocker.Mock()
     runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
     runner.cleanup = mocker.AsyncMock()
-
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(return_value=(ports, []))
-
-    verifier = SemiBatchVerifier(port_tester, runner)
-
-    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
-
-    assert successful == ports
-    assert failed == []
-    runner.run.assert_called_once()
-    runner.cleanup.assert_called_once()
-    publish_flags = runner.run.call_args.args[3]
-    assert publish_flags == "-p 9000:9000 -p 9001:9001 -p 9002:9002"
-    port_tester.test_many.assert_awaited_once()
+    port_tester.test_many = mocker.AsyncMock(side_effect=test_many)
+    mocker.patch.object(BatchVerifier, "REPROBE_DELAY_SEC", 0)
+    return BatchVerifier(port_tester, runner, external), port_tester
 
 
 @pytest.mark.asyncio
-async def test_semi_batch_maps_external_to_internal(mocker):
-    ports = [PortPair(22, 40009), PortPair(8000, 40010)]
+async def test_batch_reprobes_missed_ports_once_when_most_fail(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    calls = []
 
-    runner = mocker.Mock()
-    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
-    runner.cleanup = mocker.AsyncMock()
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return (probed[:1], probed[1:]) if len(calls) == 1 else (probed, [])
 
-    port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(return_value=(ports, []))
+    verifier, _ = _batch_verifier(mocker, late_listeners)
 
-    verifier = SemiBatchVerifier(port_tester, runner)
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
-
-    publish_flags = runner.run.call_args.args[3]
-    assert publish_flags == "-p 40009:22 -p 40010:8000"
-
-
-@pytest.mark.asyncio
-async def test_semi_batch_caps_at_max_ports(mocker):
-    ports = [PortPair(9000 + i, 9000 + i) for i in range(80)]
-
-    runner = mocker.Mock()
-    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
-    runner.cleanup = mocker.AsyncMock()
-
-    port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []))
-
-    verifier = SemiBatchVerifier(port_tester, runner)
-
-    successful, _ = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4", max_ports=50)
-
-    assert len(successful) == 50
-    assert runner.run.await_count == 50 / SemiBatchVerifier.CHUNK_SIZE
-    tested_ports = [port for call in port_tester.test_many.call_args_list for port in call.args[2]]
-    assert tested_ports == ports[:50]
+    assert calls == [ports, ports[1:]]
+    assert sorted(result.successful, key=lambda p: p.internal) == ports
+    assert result.failed == []
 
 
 @pytest.mark.asyncio
-async def test_semi_batch_returns_empty_when_no_chunk_can_start(mocker):
-    ports = [PortPair(40000 + i, 40000 + i) for i in range(25)]
+async def test_batch_does_not_reprobe_when_most_ports_pass(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: (probed[:8], probed[8:]))
 
-    runner = mocker.Mock()
-    runner.run = mocker.AsyncMock(return_value=CONTAINER_START_FAILED)
-    runner.cleanup = mocker.AsyncMock()
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock()
-
-    verifier = SemiBatchVerifier(port_tester, runner)
-
-    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
-
-    assert successful == []
-    assert failed == ports
-    port_tester.test_many.assert_not_called()
-    runner.cleanup.assert_not_called()
+    assert port_tester.test_many.await_count == 1
+    assert result.failed == ports[8:]
 
 
 @pytest.mark.asyncio
-async def test_semi_batch_busy_port_fails_only_its_own_chunk(mocker):
-    # DAH-2527: docker refuses the whole `run` over one already-allocated port, and idle fillers
-    # take the same low ports this tier probes. One busy port must cost one chunk, not the tier.
-    ports = [PortPair(40000 + i, 40000 + i) for i in range(25)]
+async def test_batch_late_bind_with_enforced_outside_prober_is_not_externally_blocked(mocker):
+    from core.config import settings
 
-    runner = mocker.Mock()
-    runner.run = mocker.AsyncMock(
-        side_effect=lambda ssh_client, name, script, publish_flags, timeout: (
-            CONTAINER_START_FAILED if "-p 40012:40012" in publish_flags else CONTAINER_STARTED
-        )
-    )
-    runner.cleanup = mocker.AsyncMock()
+    mocker.patch.object(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    calls = []
 
-    port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []))
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return (probed[:1], probed[1:]) if len(calls) == 1 else (probed, [])
 
-    verifier = SemiBatchVerifier(port_tester, runner)
+    external = mocker.Mock()
+    # the outside prober is refused: the listeners were not bound yet
+    external.reached = mocker.AsyncMock(return_value=[])
+    sample_late_ports = lambda ps, k: ps[1 : 1 + k]  # noqa: E731
+    mocker.patch("services.executor_connectivity.port_verifiers.random.sample", sample_late_ports)
+    verifier, _ = _batch_verifier(mocker, late_listeners, external)
 
-    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert successful == ports[:10] + ports[20:]
-    assert failed == ports[10:20]
-
-
-@pytest.mark.asyncio
-async def test_semi_batch_returns_empty_when_run_raises(mocker):
-    ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
-
-    runner = mocker.Mock()
-    runner.run = mocker.AsyncMock(side_effect=ConnectionError("ssh channel closed"))
-    runner.cleanup = mocker.AsyncMock()
-
-    port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock()
-
-    verifier = SemiBatchVerifier(port_tester, runner)
-
-    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
-
-    assert successful == []
-    assert failed == ports
-    port_tester.test_many.assert_not_called()
-    runner.cleanup.assert_not_called()
+    assert result.external_blocked is False
+    assert sorted(result.successful, key=lambda p: p.internal) == ports
 
 
 @pytest.mark.asyncio
-async def test_semi_batch_returns_empty_when_test_many_raises(mocker):
-    ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
+async def test_batch_reprobes_two_of_three_below_the_port_floor(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
+    calls = []
 
-    runner = mocker.Mock()
-    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
-    runner.cleanup = mocker.AsyncMock()
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return (probed[:2], probed[2:]) if len(calls) == 1 else (probed, [])
 
-    port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=RuntimeError("probe blew up"))
+    verifier, _ = _batch_verifier(mocker, late_listeners)
 
-    verifier = SemiBatchVerifier(port_tester, runner)
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
-
-    assert successful == []
-    assert failed == ports
-    runner.cleanup.assert_called_once()
+    assert calls == [ports, ports[2:]]
+    assert sorted(result.successful, key=lambda p: p.internal) == ports
 
 
 @pytest.mark.asyncio
-async def test_semi_batch_survives_cleanup_failure(mocker):
-    ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
+async def test_batch_reprobe_gives_up_after_its_budget(mocker):
+    from services.executor_connectivity.port_verifiers import BatchVerifier
 
-    runner = mocker.Mock()
-    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
-    runner.cleanup = mocker.AsyncMock(side_effect=ConnectionError("ssh dropped"))
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
 
-    port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(return_value=(ports, []))
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    verifier = SemiBatchVerifier(port_tester, runner)
-
-    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
-
-    assert successful == ports
-    assert failed == []
+    # each of the 2 attempts: one probe plus REPROBE_ROUNDS re-probes, then the attempt fails
+    assert port_tester.test_many.await_count == 2 * (1 + BatchVerifier.REPROBE_ROUNDS)
+    assert result.successful == [] and result.failed == ports

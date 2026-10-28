@@ -19,7 +19,6 @@ import base64
 import json
 import sys
 import time
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,15 +31,6 @@ if str(VALIDATOR_SRC) not in sys.path:
     sys.path.insert(0, str(VALIDATOR_SRC))
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
-
-if "celium_collateral_contracts" not in sys.modules:
-    module = types.ModuleType("celium_collateral_contracts")
-
-    class CollateralContract:  # type: ignore
-        ...
-
-    module.CollateralContract = CollateralContract
-    sys.modules["celium_collateral_contracts"] = module
 
 from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
 from datura.requests.validator_requests import ssh_pubkey_signing_blob  # noqa: E402
@@ -130,7 +120,6 @@ def _nras_response(
 
 @pytest.fixture()
 def service(monkeypatch):
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", False)
@@ -268,7 +257,6 @@ def test_g3_legacy_no_nonce_still_accepted(service):
 
 async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     monkeypatch.setattr(settings, "ENABLE_ATTESTATION_NONCE", True)
     monkeypatch.setattr(settings, "TDX_REATTEST_INTERVAL_SECONDS", 3600)
@@ -304,6 +292,21 @@ def test_g3_signing_blob_covers_nonce():
     assert nonce_blob != legacy_blob
     assert nonce.value_hex in nonce_blob
     assert ssh_pubkey_signing_blob("ssh-ed25519 AAAA key", "ff" * 32) != nonce_blob
+
+
+def test_miner_bound_signature_covers_the_miner_hotkey():
+    import bittensor
+    from services.miner_service import MinerService
+
+    kp = bittensor.Keypair.create_from_uri("//LiumTestValidator")
+    svc = MinerService.__new__(MinerService)  # signing needs no service state
+    key, nonce = "ssh-ed25519 AAAA key", "ab" * 32
+    sig = svc._sign_validator_pubkey(kp, key, nonce=nonce, miner_hotkey="5Miner")
+    assert kp.verify(ssh_pubkey_signing_blob(key, nonce, "5Miner"), sig)
+    assert not kp.verify(ssh_pubkey_signing_blob(key, nonce, "5Other"), sig)
+    # the legacy validator_signature blob is unchanged, so executors that predate the check keep working
+    assert not kp.verify(ssh_pubkey_signing_blob(key, nonce), sig)
+    assert kp.verify(ssh_pubkey_signing_blob(key, nonce), svc._sign_validator_pubkey(kp, key, nonce=nonce))
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +483,6 @@ def test_g1_attestation_passed_invariant():
 
 async def test_g5_ratcheted_executor_omitting_quote_fails_closed(monkeypatch):
     # Arrange — executor previously attested (in the ratchet set), now no quote
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     redis = FakeRedis()
@@ -495,7 +497,6 @@ async def test_g5_ratcheted_executor_omitting_quote_fails_closed(monkeypatch):
 
 async def test_g5_unknown_executor_without_quote_unaffected(monkeypatch):
     # Arrange — bare-metal executor (never attested) stays on the legacy path
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     import asyncssh
@@ -520,20 +521,20 @@ def _score_ctx(tdx_quote, attestation_passed):
     )
     return SimpleNamespace(
         state=state,
-        collateral_deposited=True,
-        collateral_error_message=None,
-        contract_version=None,
         executor=executor,
         tdx_attestation_passed=attestation_passed,
         cpu_truth_passed=True,
         provider_side_load_passed=True,
-        inspector_passed=True,
+        inspector_blind_streak_passed=True,
+        rented_pod_resources_passed=True,
+        rented_throughput_passed=True,
+        gpu_attestation_identity_passed=True,
+        inspector_host_write_passed=True,
     )
 
 
 def test_g5_score_gate_zeroes_failed_cvm(monkeypatch):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
 
     # Act
@@ -547,7 +548,6 @@ def test_g5_score_gate_zeroes_failed_cvm(monkeypatch):
 
 def test_g5_score_gate_passes_attested_cvm_and_bare_metal(monkeypatch):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
 
     # Act / Assert — attested CVM keeps its score
@@ -561,7 +561,6 @@ def test_g5_score_gate_passes_attested_cvm_and_bare_metal(monkeypatch):
 
 def test_g5_score_gate_inert_when_enforcement_off(monkeypatch):
     # Arrange — safe-off default: gate must not fire
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", False)
 
     # Act / Assert

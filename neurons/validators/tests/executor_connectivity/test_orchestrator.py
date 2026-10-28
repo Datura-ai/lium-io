@@ -180,3 +180,41 @@ async def test_orchestrator_probe_ok_dind_fails(sample_executor_info, mock_ssh_c
     port_selector.select.assert_called_once()
     port_probe.probe.assert_called_once()
     dind_probe.verify.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "requested, dind_success, dind_sysbox, measured",
+    [
+        (True, True, True, True),  # reached the container, sysbox-runc worked
+        (True, True, False, False),  # reached the container, sysbox-runc failed: a verdict
+        (True, False, True, None),  # never reached the container: measured nothing
+        (False, True, False, None),  # sysbox-runc not requested: measured nothing
+    ],
+)
+@pytest.mark.asyncio
+async def test_orchestrator_reports_the_probes_own_sysbox_reading(
+    sample_executor_info, mock_ssh_client, mocker, requested, dind_success, dind_sysbox, measured
+):
+    """ticket-0494: sysbox_measured is the DinD probe's reading, None unless it reached its container
+    with sysbox-runc requested."""
+    selected_ports = [PortPair(9000, 9000), PortPair(9001, 9001), PortPair(9002, 9002), PortPair(9003, 9003)]
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = selected_ports
+    port_probe = mocker.Mock(spec=PortProbe)
+    port_probe.probe = mocker.AsyncMock(
+        return_value=PortProbeResult(successful=tuple(selected_ports), failed=tuple())
+    )
+    dind_probe = mocker.Mock(spec=DindProbe)
+    dind_probe.verify = mocker.AsyncMock(
+        return_value=DindProbeResult(success=dind_success, sysbox_runtime=dind_sysbox, port=selected_ports[0])
+    )
+
+    result = await ConnectivityOrchestrator(port_selector, port_probe, dind_probe).verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=requested,
+        unavailable_ports=[],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert result.sysbox_measured is measured

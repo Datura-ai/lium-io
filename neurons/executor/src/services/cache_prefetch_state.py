@@ -241,6 +241,9 @@ class CachePrefetchState:
         self._last_outcome_at: str | None = None
         self._last_error: str | None = None
         self._outcome_counts: dict[str, int] = {}
+        # The validator holds a fresh node's cached-image verdict until this is set. Top-level
+        # rather than read off outcome_counts, which `_fit` sheds under size pressure.
+        self._first_sweep_ok_at: str | None = None
 
         self._images: dict[str, _ImageRecord] = {}
 
@@ -297,6 +300,8 @@ class CachePrefetchState:
         self._last_outcome_at = _utcnow()
         self._last_error = _clip(error)
         self._outcome_counts[outcome] = self._outcome_counts.get(outcome, 0) + 1
+        if outcome == Outcome.SWEEP_OK and self._first_sweep_ok_at is None:
+            self._first_sweep_ok_at = self._last_outcome_at
 
     # -- per-image facts --------------------------------------------------------
 
@@ -395,6 +400,7 @@ class CachePrefetchState:
             "last_outcome_at": self._last_outcome_at,
             "last_error": self._last_error,
             "outcome_counts": dict(self._outcome_counts),
+            "first_sweep_ok_at": self._first_sweep_ok_at,
             # `asdict` copies as it flattens, so `_fit` can trim its result freely.
             "images": {ref: asdict(record) for ref, record in self._images.items()},
         }

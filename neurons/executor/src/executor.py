@@ -12,6 +12,7 @@ from core.logger import get_logger
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
+from services.heartbeat_service import run_node_heartbeat
 from services.ssh_service import run_uploaded_key_purge
 
 # Set up logging
@@ -41,10 +42,15 @@ async def lifespan(app: FastAPI):
     prefetch_task = asyncio.create_task(run_cache_template_prefetch())
     # DAH-3394: ssh keys the validator uploaded and never removed expire (EXECUTOR_UPLOADED_KEY_TTL_S)
     key_purge_task = asyncio.create_task(run_uploaded_key_purge())
+    heartbeat_task = asyncio.create_task(run_node_heartbeat())
     try:
         yield
     finally:
-        for name, task in (("cache template pre-pull", prefetch_task), ("uploaded ssh key purge", key_purge_task)):
+        for name, task in (
+            ("cache template pre-pull", prefetch_task),
+            ("uploaded ssh key purge", key_purge_task),
+            ("node heartbeat", heartbeat_task),
+        ):
             task.cancel()
             try:
                 await task

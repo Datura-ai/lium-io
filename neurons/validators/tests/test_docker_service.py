@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -16,20 +17,25 @@ import pytest_asyncio
 from tenacity import Future, RetryError
 
 import services.docker_service as docker_service_module
+from services.attestation_service import AttestationError
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
+    NoUsableLoopbackPluginError,
     VolumeMinSizeError,
     _LIUM_CIPHER_MOUNT,
     _build_gocryptfs_setup_and_mount_script,
     _is_docker_container_removal_in_progress_error,
+    _is_docker_read_timeout_error,
+    _is_docker_volume_in_use_error,
     _parse_volume_size_to_bytes,
     _should_encrypt_local_volume,
 )
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
     _wrap_error_message,
@@ -56,6 +62,8 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
+from test_dah2740_edit_park_then_swap import _edit_payload, _run as _run_edit, _ssh_recording
+from test_deploy_optimizations import _patch_happy
 
 
 FAKE_SSH_HOST_KEY = "ssh-ed25519 AAAATESTKEY"
@@ -73,6 +81,14 @@ def _executor_without_host_key(executor_id: str) -> ExecutorSSHInfo:
     )
 
 
+def ssh_client_answering_through_run(run: AsyncMock) -> Mock:
+    # a bounded command opens its channel with create_process; asyncssh's run() bundles open and wait
+    async def create_process(command: str):
+        return Mock(wait=lambda: run(command), wait_closed=AsyncMock())
+
+    return Mock(run=run, create_process=create_process)
+
+
 class _FakeRentalDockerClient:
     def __init__(self):
         self.login_calls = []
@@ -82,6 +98,7 @@ class _FakeRentalDockerClient:
         self.run_specs = []
         self.exec_specs = []
         self.started_containers = []
+        self.start_networks = []
         self.stopped_containers = []
         self.stop_grace_seconds_calls = []
         self.removed_containers = []
@@ -97,7 +114,27 @@ class _FakeRentalDockerClient:
         self.stop_error = None
         self.remove_error = None
         self.remove_volume_error = None
+        # per-call answers for remove_volume, consumed in order (None = success); once empty,
+        # remove_volume_error applies
+        self.remove_volume_errors: list[Exception | None] = []
         self.prune_images_error = None
+        # DAH-3467: answers for container_status, consumed in order; the last one repeats.
+        # None = 404 (gone), a str = State.Status, an Exception = the inspect raised it.
+        self.container_statuses: list[str | Exception | None] = []
+        self.inspected_containers = []
+
+    async def container_status(self, *, container_name: str) -> str | None:
+        self.inspected_containers.append(container_name)
+        if not self.container_statuses:
+            raise AssertionError("container_status called without a scripted answer")
+        answer = (
+            self.container_statuses.pop(0)
+            if len(self.container_statuses) > 1
+            else self.container_statuses[0]
+        )
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     async def login(self, *, username: str, password: str, image: str) -> None:
         self.login_calls.append({"username": username, "password": password, "image": image})
@@ -107,6 +144,12 @@ class _FakeRentalDockerClient:
     async def image_exists(self, *, image: str) -> bool:
         self.inspected_images.append(image)
         return image in self.existing_images
+
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return () if await self.image_exists(image=image) else None
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        return True
 
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
@@ -122,8 +165,15 @@ class _FakeRentalDockerClient:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
 
-    async def start(self, *, container_name: str) -> None:
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
+
+    async def start(self, *, container_name: str, network: str | None = None) -> None:
         self.started_containers.append(container_name)
+        self.start_networks.append(network)
         if self.start_error is not None:
             raise self.start_error
 
@@ -159,6 +209,7 @@ class _FakeRentalDockerClient:
         driver: str | None = None,
         driver_opts: dict[str, str] | None = None,
         timeout: int | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         self.created_volumes.append(
             {
@@ -173,6 +224,11 @@ class _FakeRentalDockerClient:
         self.removed_volumes.append(
             {"volume_name": volume_name, "force": force}
         )
+        if self.remove_volume_errors:
+            error = self.remove_volume_errors.pop(0)
+            if error is not None:
+                raise error
+            return
         if self.remove_volume_error is not None:
             raise self.remove_volume_error
 
@@ -249,6 +305,8 @@ async def docker_service(mock_dependencies):
         attestation_service=attestation_service,
         rental_docker_client_factory=_FakeRentalDockerFactory(),
     )
+    # the pre-run kernel.pid_max read is mandatory; the SSH doubles here do not model /proc
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     return service
 
 
@@ -573,6 +631,35 @@ async def test_enable_jupyter_feature(
 
 
 @pytest.mark.asyncio
+async def test_generate_portMappings_does_not_leak_ports_into_the_next_rent(
+    docker_service, test_executor_id, test_miner_hotkey, monkeypatch
+):
+    # Arrange: a fresh copy of the real list, so a failure here cannot leak into other tests
+    preferred_ports = list(docker_service_module.PREFERRED_POD_PORTS)
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", preferred_ports)
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in range(20000, 20100)
+    ]
+    await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        initial_port_count=None, enable_jupyter=True,
+        available_ports_raw=available_ports_raw, pod_mapping_raw=[],
+    )
+
+    # Act
+    mappings, jupyter_port_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        initial_port_count=10, enable_jupyter=False,
+        available_ports_raw=available_ports_raw, pod_mapping_raw=[],
+    )
+
+    # Assert
+    assert [docker_port for docker_port, _, _ in mappings] == [22, *range(20000, 20010)]
+    assert jupyter_port_map is None
+    assert preferred_ports == list(range(20000, 20010))
+
+
+@pytest.mark.asyncio
 async def test_pod_mapping_reuse(docker_service, test_executor_id, test_miner_hotkey):
     """Test that existing pod mappings are reused when pod_id is provided."""
     pod_id = uuid4()
@@ -763,36 +850,6 @@ async def test_pod_mapping_partial_reuse(docker_service, test_executor_id, test_
 # Tests for _convert_payload_ports and backend data flow
 # =============================================================================
 
-@pytest.mark.parametrize("available_raw,pod_raw,expected_available_keys,expected_pod_keys", [
-    # Only available ports
-    (
-        [PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in [20000, 20001, 20002]],
-        [],
-        {20000, 20001, 20002},
-        set(),
-    ),
-    # Pod mapping with docker_port as key
-    (
-        [],
-        [PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=22),
-         PayloadPortMapping(internal_port=20001, external_port=20001, docker_port=8080)],
-        set(),
-        {22, 8080},
-    ),
-    # Pod mapping fallback to external_port when docker_port is None
-    (
-        [],
-        [PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=None)],
-        set(),
-        {20000},
-    ),
-])
-def test_convert_payload_ports(docker_service, available_raw, pod_raw, expected_available_keys, expected_pod_keys):
-    """Test _convert_payload_ports conversion logic."""
-    available, pod = docker_service._convert_payload_ports(available_raw, pod_raw)
-    assert set(available.keys()) == expected_available_keys
-    assert set(pod.keys()) == expected_pod_keys
-
 
 @pytest.mark.asyncio
 async def test_generate_portMappings_uses_backend_data(docker_service, test_executor_id, test_miner_hotkey):
@@ -959,7 +1016,6 @@ def _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     retry_ssh_mock.return_value = None
 
     return ssh_client
-
 
 
 @pytest.mark.asyncio
@@ -1152,61 +1208,6 @@ async def test_delete_container_stops_gracefully_before_forced_removal(
 
 
 @pytest.mark.asyncio
-async def test_delete_container_logs_point_at_the_call_site(
-    docker_service,
-    monkeypatch,
-    caplog,
-):
-    # Arrange: the bound logger must keep file/function/line on the caller, not on itself
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
-    monkeypatch.setattr(
-        "services.docker_service.asyncssh.connect",
-        Mock(return_value=DummySSHConnectionManager(ssh_client)),
-    )
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
-
-    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
-    docker_service.redis_service.remove_rented_machine = AsyncMock()
-
-    payload = ContainerDeleteRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=str(uuid4()),
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        container_name="pod_call_site",
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-
-    # Act
-    with caplog.at_level(logging.INFO, logger="services.docker_service"):
-        await docker_service.delete_container(
-            payload=payload,
-            executor_info=executor_info,
-            keypair=Mock(ss58_address="validator-hotkey"),
-            private_key="encrypted",
-        )
-
-    # Assert
-    functions = {
-        record.funcName
-        for record in caplog.records
-        if str(record.msg) in ("Deleting Docker Container", "Deleted Docker Container")
-    }
-    assert functions == {"delete_container"}
-
-
-@pytest.mark.asyncio
 async def test_delete_container_stop_failure_still_removes(
     docker_service,
     monkeypatch,
@@ -1265,70 +1266,6 @@ async def test_delete_container_stop_failure_still_removes(
             "remove_volumes": True,
         }
     ]
-
-
-@pytest.mark.asyncio
-async def test_delete_container_stop_missing_container_logs_info_and_removes(
-    docker_service,
-    monkeypatch,
-    caplog,
-):
-    # Arrange: the container is already gone when the graceful stop runs — must log info
-    # (not warning/error, which would raise a false failed-deletion alert) and still remove
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
-    monkeypatch.setattr(
-        "services.docker_service.asyncssh.connect",
-        Mock(return_value=DummySSHConnectionManager(ssh_client)),
-    )
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
-
-    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
-    docker_service.redis_service.remove_rented_machine = AsyncMock()
-    docker_service.rental_docker_client_factory.client.stop_error = Exception(
-        "Docker SDK stop failed: 404 Client Error: No such container: pod_stop_absent"
-    )
-
-    payload = ContainerDeleteRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=str(uuid4()),
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        container_name="pod_stop_absent",
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-
-    # Act
-    with caplog.at_level(logging.INFO, logger="services.docker_service"):
-        result = await docker_service.delete_container(
-            payload=payload,
-            executor_info=executor_info,
-            keypair=Mock(ss58_address="validator-hotkey"),
-            private_key="encrypted",
-        )
-
-    # Assert: absent container on stop is info-level only, forced removal still runs
-    assert isinstance(result, ContainerDeleted)
-    client = docker_service.rental_docker_client_factory.client
-    assert client.container_call_order == [
-        ("stop", payload.container_name),
-        ("remove", payload.container_name),
-    ]
-    stop_records = [r for r in caplog.records if "Graceful stop skipped" in str(r.msg)]
-    assert [r.levelno for r in stop_records] == [logging.INFO]
-    assert not any(
-        "Graceful container stop failed" in str(r.msg) for r in caplog.records
-    )
 
 
 @pytest.mark.asyncio
@@ -1405,7 +1342,6 @@ async def test_delete_container_redis_failures_still_deleted(
 ):
     # Arrange: redis is down — rented-machine cleanup and the inspector lookup both raise;
     # the container is already removed, so the undeploy must still succeed (DAH-2345)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     docker_service.redis_service.remove_rented_machine = AsyncMock(
         side_effect=Exception("redis down")
@@ -1452,57 +1388,6 @@ async def test_delete_container_redis_failures_still_deleted(
             "remove_volumes": True,
         }
     ]
-
-
-@pytest.mark.asyncio
-async def test_delete_container_failure_msg_includes_underlying_error(
-    docker_service,
-    monkeypatch,
-):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
-    monkeypatch.setattr(
-        "services.docker_service.asyncssh.connect",
-        Mock(return_value=DummySSHConnectionManager(ssh_client)),
-    )
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
-
-    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
-    docker_service.redis_service.remove_rented_machine = AsyncMock()
-    docker_service.rental_docker_client_factory.client.remove_error = Exception(
-        "Docker SDK remove container failed: 500 Server Error: daemon exploded"
-    )
-
-    payload = ContainerDeleteRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=str(uuid4()),
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        container_name="pod_stuck",
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-    keypair = Mock(ss58_address="validator-hotkey")
-
-    result = await docker_service.delete_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=keypair,
-        private_key="encrypted",
-    )
-
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
-    assert "500 Server Error: daemon exploded" in result.msg
 
 
 @pytest.mark.asyncio
@@ -1761,6 +1646,662 @@ async def test_delete_container_remove_container_error_fails_undeploy(
     docker_service.redis_service.remove_rented_machine.assert_not_awaited()
 
 
+# DAH-3467: the remove's reply outlives the SDK's 60 s read timeout. dockerd has the request; the
+# validator asks it what happened instead of failing the delete.
+_REMOVE_READ_TIMEOUT_TEXT = (
+    "Docker SDK remove container failed: SSHConnectionPool(host='localhost', port=None): "
+    "Read timed out. (read timeout=60)"
+)
+
+
+def _remove_read_timeout_error() -> RentalDockerOperationError:
+    # the shape RentalDockerSdkClient._call_api produces: our error wrapping requests' ReadTimeout
+    from requests.exceptions import ReadTimeout
+
+    cause = ReadTimeout("SSHConnectionPool(host='localhost', port=None): Read timed out. (read timeout=60)")
+    error = RentalDockerOperationError(_wrap_error_message("Docker SDK remove container failed", cause))
+    error.__cause__ = cause
+    return error
+
+
+def _arm_delete_after_remove_read_timeout(docker_service, monkeypatch, retry_ssh_mock, statuses):
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_POLL_SECONDS", 0)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_TIMEOUT_SECONDS", 0.05)
+    client = docker_service.rental_docker_client_factory.client
+    client.remove_error = _remove_read_timeout_error()
+    client.container_statuses = list(statuses)
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_slow_rm",
+        local_volume="volume_slow_rm",
+    )
+    return client, payload, _delete_container_executor_info(payload.executor_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_is_deleted(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.inspected_containers == [payload.container_name]
+    # the teardown after the removal still runs: prune, the local volume, the redis rental record
+    assert client.pruned_images == 1
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}]
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_polls_while_removing_then_gone(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=["removing", "removing", None]
+    )
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_TIMEOUT_SECONDS", 5)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.inspected_containers == [payload.container_name] * 3
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_still_removing_reports_in_progress(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=["removing"]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert "Read timed out" in result.msg and "still 'removing'" in result.msg
+    assert len(client.inspected_containers) >= 2  # kept asking until the confirm window ran out
+    # nothing after the removal ran: the container is not known to be gone
+    assert client.pruned_images == 0
+    assert client.removed_volumes == []
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["exited", "running", "dead"])
+async def test_delete_container_remove_read_timeout_with_container_present_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock, status
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[status]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_with_failing_inspect_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service,
+        monkeypatch,
+        retry_ssh_mock,
+        statuses=[RentalDockerOperationError("Docker SDK inspect container failed: 500 Server Error")],
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_with_hung_inspect_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS", 0.01)
+
+    async def hung_inspect(*, container_name: str):
+        client.inspected_containers.append(container_name)
+        await asyncio.sleep(1)
+        return None
+
+    client.container_status = hung_inspect
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_with_stateless_inspect_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # dockerd knows the name but the inspect body carries no State.Status: not proof of anything
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[""]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_connect_timeout_is_not_confirmed(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # a CONNECT timeout never reached dockerd: no inspect, the delete fails as before
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    from requests.exceptions import ConnectTimeout
+
+    cause = ConnectTimeout(
+        "SSHConnectionPool(host='localhost', port=None): Connection to localhost timed out. "
+        "(connect timeout=60)"
+    )
+    client.remove_error = RentalDockerOperationError(
+        _wrap_error_message("Docker SDK remove container failed", cause)
+    )
+    client.remove_error.__cause__ = cause
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert client.inspected_containers == []
+
+
+def _volume_in_use_error(volume_name: str) -> RentalDockerOperationError:
+    # dockerd's 409 on `volume rm`, wrapped the way RentalDockerSdkClient._call_api does
+    cause = APIError(
+        f"409 Client Error for http+docker://ssh/v1.52/volumes/{volume_name}: "
+        f'Conflict ("remove {volume_name}: volume is in use - [9f1c2d3e4a5b]")'
+    )
+    error = RentalDockerOperationError(_wrap_error_message("Docker SDK remove volume failed", cause))
+    error.__cause__ = cause
+    return error
+
+
+def _arm_volume_retry_timing(monkeypatch, attempts: int = 3):
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_VOLUME_ATTEMPTS", attempts)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_VOLUME_RETRY_SECONDS", 0)
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_retries_a_volume_still_in_use(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """Regression: the inspect 404 came before dockerd released the container's named-volume
+    reference, `volume rm` answered "volume is in use", the best-effort step swallowed it and the
+    pod closed on our success with the volume left on the executor. Now that answer is retried on
+    this path and the delete succeeds once the reference is gone."""
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    _arm_volume_retry_timing(monkeypatch)
+    client.remove_volume_errors = [
+        _volume_in_use_error(payload.local_volume),
+        _volume_in_use_error(payload.local_volume),
+        None,
+    ]
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 3
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_with_volume_still_in_use_stays_best_effort_once_retries_run_out(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """Regression (review round 4): the retries run out while dockerd still holds the volume. The
+    delete used to answer DeletionInProgress here; the backend counts that answer against its three
+    delete attempts (POD_DELETE_MAX_ATTEMPTS) and, still held on the third, gives up into the penalty
+    path for a node whose container was gone. The exhausted volume is now the best-effort failure any
+    other volume error is: logged, the volume left on the host, ContainerDeleted, the redis rental
+    record removed, no marker left for a re-ask that is not coming."""
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert client.pruned_images == 1
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_with_external_volume_still_in_use_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # the external volume takes the same retry; its s3fs plugin is removed only after a successful
+    # `volume rm`, so a volume given up leaves the plugin as the pre-DAH-3467 best-effort step did,
+    # and the delete completes
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    payload.local_volume = None
+    payload.external_volume = "volume_slow_rm_ext"
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+    client.remove_volume_error = _volume_in_use_error(payload.external_volume)
+    plugin_removal = AsyncMock()
+    monkeypatch.setattr(docker_service, "remove_s3fs_volume_plugin", plugin_removal)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.removed_volumes == [{"volume_name": payload.external_volume, "force": False}] * 2
+    plugin_removal.assert_not_awaited()
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_volume_in_use_after_a_plain_remove_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """The retry belongs to the confirmed-by-inspect path only: after a remove that answered in
+    time, "volume is in use" is the best-effort failure it always was (one attempt, ContainerDeleted)."""
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    _arm_volume_retry_timing(monkeypatch)
+    client = docker_service.rental_docker_client_factory.client
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_plain_rm",
+        local_volume="volume_plain_rm",
+    )
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+    executor_info = _delete_container_executor_info(payload.executor_id)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(client.removed_volumes) == 1
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_other_volume_error_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # on the confirmed-by-inspect path too, only "volume is in use" is retried: a 404 on the volume
+    # is one attempt and the delete succeeds as before
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    _arm_volume_retry_timing(monkeypatch)
+    client.remove_volume_error = Exception(
+        'Docker SDK remove volume failed: 404 Client Error: Not Found ("No such volume: volume_slow_rm")'
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(client.removed_volumes) == 1
+
+
+def _container_absent_error(container_name: str) -> Exception:
+    return Exception(
+        "Docker SDK remove container failed: 404 Client Error: Not Found "
+        f'("No such container: {container_name}")'
+    )
+
+
+async def _delete(docker_service, payload, executor_info):
+    return await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+
+async def _delete_answered_in_progress(docker_service, monkeypatch, retry_ssh_mock):
+    """Round 1 of a delete that answers DeletionInProgress: the container is still 'removing' after
+    the read timeout (the one path that answers it since review round 4). Returns the fake client,
+    the payload and the executor for the backend's re-ask."""
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=["removing"]
+    )
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+
+    first = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(first, FailedContainerRequest)
+    assert first.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    # the re-ask: dockerd has finished with the container, only the volume may still be held
+    client.remove_error = _container_absent_error(payload.container_name)
+    client.remove_volume_error = None
+    client.container_statuses = []
+    client.inspected_containers.clear()
+    client.removed_volumes.clear()
+    return client, payload, executor_info
+
+
+@pytest.mark.asyncio
+async def test_delete_re_asked_after_in_progress_retries_a_volume_still_in_use_then_gives_it_up(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """Regression (review round 3): the backend's re-ask after DeletionInProgress finds the
+    container already absent, which is not the inspect-confirmed path, so "volume is in use" got the
+    one best-effort attempt and the pod closed over a volume dockerd was about to release. The pod's
+    marker keeps the volume cleanup on the retried path across delete requests; a volume still held
+    after the retries is given up (round 4), the delete completes and the marker is cleared."""
+    client, payload, executor_info = await _delete_answered_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock
+    )
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert client.inspected_containers == []  # an absent container needs no inspect
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_re_asked_after_in_progress_completes_once_the_volume_is_gone(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # the re-ask finds the container absent and the volume released on the second try:
+    # ContainerDeleted, the redis rental record goes, and the marker is cleared
+    client, payload, executor_info = await _delete_answered_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock
+    )
+    client.remove_volume_errors = [_volume_in_use_error(payload.local_volume), None]
+
+    result = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_of_an_absent_container_without_a_pending_deletion_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # no earlier DeletionInProgress for this pod (DAH-2345: the container was removed by failed-create
+    # cleanup): an absent container plus "volume is in use" is the one-attempt best-effort it always was
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+    client = docker_service.rental_docker_client_factory.client
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_absent",
+        local_volume="volume_absent",
+    )
+    client.remove_error = _container_absent_error(payload.container_name)
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await _delete(docker_service, payload, _delete_container_executor_info(payload.executor_id))
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(client.removed_volumes) == 1
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+
+
+def test_pending_deletions_expire_after_the_ttl_and_a_new_mark_restarts_it():
+    """Regression (review round 4): the marker set never evicted, so a pod the backend gave up on, or
+    a rental-probe pod (a fresh id per run, never re-asked), stayed in it for the life of the process.
+    A marker is gone PENDING_DELETION_TTL_SECONDS after it was set; marking again restarts the clock."""
+    now = [1000.0]
+    registry = docker_service_module._PendingDeletionRegistry(clock=lambda: now[0])
+    ttl = docker_service_module.PENDING_DELETION_TTL_SECONDS
+
+    registry.mark("pod-a")
+    now[0] += ttl - 1
+    assert registry.is_pending("pod-a")
+    registry.mark("pod-a")  # the re-ask answered in progress again: a fresh marker
+    now[0] += ttl - 1
+    assert registry.is_pending("pod-a")
+    now[0] += 2
+    assert not registry.is_pending("pod-a")
+    assert len(registry) == 0
+
+
+def test_pending_deletions_do_not_accumulate_probe_pods():
+    # sixty probe runs, each answering in progress once and never re-asked: after the TTL none is left,
+    # and a clear on an expired or unknown id is a no-op
+    now = [0.0]
+    registry = docker_service_module._PendingDeletionRegistry(clock=lambda: now[0])
+    for i in range(60):
+        registry.mark(f"probe-{i}")
+        now[0] += 360.0  # one probe every 6 min
+    # 3600 s TTL over 360 s steps: only the last ten marks are younger than the TTL
+    assert len(registry) == 10
+    now[0] += docker_service_module.PENDING_DELETION_TTL_SECONDS
+    assert len(registry) == 0
+    registry.clear("probe-0")
+    assert not registry.is_pending("probe-0")
+
+
+def _arm_filler_delete_in_progress(
+    docker_service, monkeypatch, retry_ssh_mock, how: str, kind: WorkloadKind = WorkloadKind.FILLER
+):
+    ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_POLL_SECONDS", 0)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_TIMEOUT_SECONDS", 0.05)
+    client = docker_service.rental_docker_client_factory.client
+    if how == "read_timeout_still_removing":
+        client.remove_error = _remove_read_timeout_error()
+        client.container_statuses = ["removing"]
+    else:  # dockerd's 409 "removal already in progress"
+        client.remove_error = APIError(
+            "409 Client Error for http+docker://ssh/v1.52/containers/filler_slow: "
+            'Conflict ("removal of container filler_slow is already in progress")'
+        )
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=kind,
+        container_name="filler_slow",
+    )
+    sweep = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "_sweep_wedged_gpus_after_teardown", sweep)
+    return ssh_client, sweep, payload, _delete_container_executor_info(payload.executor_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["read_timeout_still_removing", "removal_already_in_progress"])
+async def test_delete_filler_answering_deletion_in_progress_sweeps_wedged_gpus_first(
+    docker_service, monkeypatch, retry_ssh_mock, how
+):
+    """Regression: a filler's read-timed-out remove used to raise, and the failed-remove path swept
+    the wedged GPUs before propagating (DAH-2427). Answering DeletionInProgress instead returned
+    without the sweep, so a wedged card outlived the answer while the backend kept retrying. The
+    sweep now runs before either in-progress answer."""
+    ssh_client, sweep, payload, executor_info = _arm_filler_delete_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock, how
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    sweep.assert_awaited_once()
+    assert sweep.await_args.args[0] is ssh_client
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_customer_rental_answering_deletion_in_progress_does_not_sweep(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # the sweep is the filler teardown's (DAH-2427); a customer rental's in-progress answer stays as it was
+    _, sweep, payload, executor_info = _arm_filler_delete_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock, "read_timeout_still_removing",
+        kind=WorkloadKind.CUSTOMER_RENTAL,
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    sweep.assert_not_awaited()
+
+
+def test_docker_volume_in_use_detection():
+    assert _is_docker_volume_in_use_error(_volume_in_use_error("volume_x"))
+    assert _is_docker_volume_in_use_error(_make_retry_error(_volume_in_use_error("volume_x")))
+    assert not _is_docker_volume_in_use_error(
+        Exception('Docker SDK remove volume failed: 404 Client Error: Not Found ("No such volume: v")')
+    )
+    assert not _is_docker_volume_in_use_error(Exception(_REMOVE_READ_TIMEOUT_TEXT))
+
+
+def test_docker_read_timeout_detection_matches_the_wrapped_sdk_error_and_the_prod_text():
+    assert _is_docker_read_timeout_error(_remove_read_timeout_error())
+    assert _is_docker_read_timeout_error(Exception(_REMOVE_READ_TIMEOUT_TEXT))
+    assert _is_docker_read_timeout_error(_make_retry_error(Exception(_REMOVE_READ_TIMEOUT_TEXT)))
+    assert not _is_docker_read_timeout_error(
+        Exception("Docker SDK remove container failed: Connection to localhost timed out. (connect timeout=60)")
+    )
+    from requests.exceptions import ConnectTimeout
+
+    connect_timeout = RentalDockerOperationError("Docker SDK remove container failed: connect")
+    connect_timeout.__cause__ = ConnectTimeout("Connection to localhost timed out. (connect timeout=60)")
+    assert not _is_docker_read_timeout_error(connect_timeout)
+    assert not _is_docker_read_timeout_error(
+        Exception("Docker SDK remove container failed: 500 Server Error: daemon exploded")
+    )
+
+
 @pytest.mark.asyncio
 async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service):
     executor_info = ExecutorSSHInfo(
@@ -1788,69 +2329,6 @@ async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service)
     )
     assert stop_command == (
         "/usr/bin/python3 '/root/app dir/src/inspector_executor.py' --stop-collector"
-    )
-
-
-@pytest.mark.asyncio
-async def test_inspector_lifecycle_logs_error_without_raising(docker_service, caplog):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        return_value=_make_ssh_command_result(
-            exit_status=1,
-            stderr="collector failed",
-        )
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid="exec-1",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python3",
-        root_dir="/root/app",
-    )
-
-    with caplog.at_level("ERROR"):
-        await docker_service._run_inspector_collector_lifecycle(
-            ssh_client=ssh_client,
-            executor_info=executor_info,
-            action="stop",
-            default_extra={"executor_uuid": "exec-1"},
-        )
-
-    assert ssh_client.run.await_count == 1
-    assert ssh_client.run.await_args.kwargs["timeout"] == 30
-    assert any(
-        "Inspector collector stop failed" in rec.getMessage()
-        for rec in caplog.records
-    )
-
-
-@pytest.mark.asyncio
-async def test_inspector_lifecycle_logs_success(docker_service, caplog):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
-    executor_info = ExecutorSSHInfo(
-        uuid="exec-1",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python3",
-        root_dir="/root/app",
-    )
-
-    with caplog.at_level("INFO"):
-        await docker_service._run_inspector_collector_lifecycle(
-            ssh_client=ssh_client,
-            executor_info=executor_info,
-            action="start",
-            default_extra={"executor_uuid": "exec-1"},
-        )
-
-    assert any(
-        "Inspector collector start launched" in rec.getMessage()
-        for rec in caplog.records
     )
 
 
@@ -1912,7 +2390,6 @@ def _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
 
 @pytest.mark.asyncio
 async def test_create_customer_rental_starts_inspector_collector(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -1946,6 +2423,9 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
+    ssh_session = RecordingSSHConnectionManager(ssh_client)
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(return_value=ssh_session))
+
     result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
@@ -1953,69 +2433,90 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         private_key="encrypted",
     )
 
+    # the reply does not wait for the collector or the session close: both come after the return
+    lifecycle_spy.assert_not_awaited()
+    assert ssh_session.closed is False
+    await _drain_create_steps_after_reply(pod_id)
     lifecycle_spy.assert_awaited_once()
+    assert ssh_session.closed is True
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client
     assert lifecycle_spy.await_args.kwargs["executor_info"] == executor_info
     assert lifecycle_spy.await_args.kwargs["default_extra"]["container_name"] == f"pod_{pod_id}"
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is False
-    assert inspector_step.duration is not None and inspector_step.duration >= 0
+    # its time is outside the create's window, so no duration rather than a fake 0
+    assert inspector_step.duration is None
+    assert all(p.name != ProfilerStepName.INSPECTOR_START for p in result.profilers)
+
+
+class RecordingSSHConnectionManager(DummySSHConnectionManager):
+    closed = False
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.closed = True
+
+
+async def _drain_create_steps_after_reply(pod_id: str) -> None:
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 5)
 
 
 @pytest.mark.asyncio
-async def test_create_customer_rental_skips_inspector_collector_when_disabled(
-    docker_service,
-    monkeypatch,
+async def test_delete_waits_for_the_create_steps_after_reply_before_its_teardown(
+    docker_service, retry_ssh_mock, monkeypatch
 ):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", False)
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    lifecycle_spy = AsyncMock()
-    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
-
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     pod_id = str(uuid4())
-    payload = ContainerCreateRequest(
+    events: list[str] = []
+
+    async def inspector_start_after_reply() -> None:
+        await asyncio.sleep(0.05)
+        events.append("create steps after reply done")
+
+    def connect_for_delete(**_):
+        events.append("delete connected")
+        return DummySSHConnectionManager(AsyncMock(run=AsyncMock(return_value=_make_ssh_command_result())))
+
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=connect_for_delete))
+    docker_service_module.create_steps_after_reply.start(pod_id, inspector_start_after_reply())
+    payload = ContainerDeleteRequest(
         miner_hotkey="miner",
         executor_id=str(uuid4()),
         pod_id=pod_id,
         workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        docker_image="daturaai/dlph:test",
-        user_public_keys=["ssh-ed25519 test-key"],
-        gpu_uuids=["GPU-test"],
-        cpu_count=1,
-        memory_gb=1,
-        volume_limit_gb=2,
-        storage_limit_gb=1,
-        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
-        pod_mapping=[],
-        active_container_names=[],
-        active_volume_names=[],
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
+        container_name=f"pod_{pod_id}",
     )
 
-    result = await docker_service.create_container(
+    await docker_service.delete_container(
         payload=payload,
-        executor_info=executor_info,
+        executor_info=_executor_info_for(_create_payload(pod_id, encrypted=False), tdx_quote=None),
         keypair=Mock(ss58_address="validator-hotkey"),
         private_key="encrypted",
     )
 
-    lifecycle_spy.assert_not_awaited()
-    inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
-    )
-    assert inspector_step.skipped is True
+    assert events[:2] == ["create steps after reply done", "delete connected"]
+
+
+@pytest.mark.asyncio
+async def test_create_steps_after_reply_past_the_timeout_are_cancelled_and_closed():
+    pod_id = str(uuid4())
+    closed = asyncio.Event()
+
+    async def hung_inspector_start() -> None:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            closed.set()
+
+    docker_service_module.create_steps_after_reply.start(pod_id, hung_inspector_start())
+
+    finished = await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01)
+
+    assert finished is False
+    assert closed.is_set()
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01) is True
 
 
 def _cvm_socket_payload(workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerCreateRequest:
@@ -2132,20 +2633,7 @@ async def test_create_container_no_quote_socket_for_filler_on_cvm_node(docker_se
 
 
 @pytest.mark.asyncio
-async def test_create_container_quote_socket_kill_switch(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_CVM_POD_QUOTE_SOCKET", False)
-    run_spy, ensure_broker = _patch_quote_socket_path(docker_service, monkeypatch)
-
-    await _create(docker_service, _cvm_socket_payload(), tdx_quote='{"quote": "0xdeadbeef"}')
-
-    ensure_broker.assert_not_awaited()
-    run_spec = run_spy.await_args.kwargs["run_spec"]
-    assert DSTACK_GUEST_SOCKET_PATH not in {m.target for m in run_spec.volumes}
-
-
-@pytest.mark.asyncio
 async def test_create_filler_starts_inspector_collector(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2185,10 +2673,11 @@ async def test_create_filler_starts_inspector_collector(docker_service, monkeypa
         private_key="encrypted",
     )
 
+    await _drain_create_steps_after_reply(payload.pod_id)
     lifecycle_spy.assert_awaited_once()
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is False
 
@@ -2199,7 +2688,6 @@ async def test_delete_last_customer_rental_stops_inspector_collector(
     retry_ssh_mock,
     monkeypatch,
 ):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2283,7 +2771,6 @@ async def test_delete_last_filler_stops_inspector_collector(
     retry_ssh_mock,
     monkeypatch,
 ):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2389,30 +2876,6 @@ async def test_install_ssh_service_returns_false_when_in_container_script_creati
     docker_service.execute_and_stream_logs.assert_not_awaited()
 
 
-def test_ssh_bootstrap_script_supports_multi_distro_install(docker_service):
-    """The injected SSH bootstrap script supports the expected package managers."""
-    script = docker_service._ssh_bootstrap_script_path().read_text()
-
-    assert "apt-get update" in script
-    assert "apt-get install -y openssh-server" in script
-    assert "apk add --no-cache openssh" in script
-    assert "dnf install -y openssh-server" in script
-    assert "yum install -y openssh-server" in script
-
-
-def test_ssh_bootstrap_script_uses_single_watchdog_with_30_second_sleep(docker_service):
-    """The watchdog loop is single-instance and checks sshd every 30 seconds."""
-    script = docker_service._ssh_bootstrap_script_path().read_text()
-
-    assert 'WATCHDOG_PIDFILE="$RUN_DIR/sshd-watchdog.pid"' in script
-    assert 'RUN_DIR="${LIUM_RUN_DIR:-/run}"' in script
-    assert 'WATCHDOG_LOG="/tmp/sshd-watchdog.log"' in script
-    assert 'SLEEP_SECONDS=30' in script
-    assert 'kill -0 "$watchdog_pid"' in script
-    assert 'nohup sh "$SCRIPT_PATH" --watchdog-loop' in script
-    assert 'sleep "$SLEEP_SECONDS"' in script
-
-
 @pytest.mark.asyncio
 async def test_start_container_restarts_ssh_after_docker_start(docker_service, monkeypatch):
     """start_container reruns the SSH bootstrap helper after SDK docker start."""
@@ -2456,6 +2919,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
     assert docker_service.rental_docker_client_factory.client.started_containers == [
         "pod_test"
     ]
+    assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals"]
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once_with(
         docker_client=docker_service.rental_docker_client_factory.client,
         container_name="pod_test",
@@ -2469,55 +2933,6 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
             "executor_ssh_port": 2200,
         },
     )
-
-
-@pytest.mark.asyncio
-async def test_start_container_logs_ssh_bootstrap_failure_and_keeps_starting(docker_service, monkeypatch):
-    """A failed SSH bootstrap does not interrupt docker start."""
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
-    monkeypatch.setattr(
-        "services.docker_service.asyncssh.connect",
-        Mock(return_value=DummySSHConnectionManager(ssh_client)),
-    )
-
-    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
-    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
-    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = (
-        AsyncMock(return_value=False)
-    )
-
-    payload = ContainerStartRequest(
-        miner_hotkey="miner-hotkey",
-        miner_address="127.0.0.1",
-        miner_port=8000,
-        executor_id=str(uuid4()),
-        pod_id="pod-id",
-        container_name="pod_test",
-        local_volume_path="/root",
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=str(uuid4()),
-        address="127.0.0.1",
-        port=8001,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python3",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-    keypair = Mock(ss58_address="validator-hotkey")
-    logger_mock = Mock()
-    monkeypatch.setattr("services.docker_service.logger.warning", logger_mock)
-
-    await docker_service.start_container(payload, executor_info, keypair, "encrypted-private-key")
-
-    assert docker_service.rental_docker_client_factory.client.started_containers == [
-        "pod_test"
-    ]
-    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
-    assert logger_mock.called
 
 
 @pytest.mark.asyncio
@@ -3181,16 +3596,18 @@ async def test_clean_stale_vloopback_volumes_skips_mounted_and_backend_known(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["vloopback:latest", "vloopback:v2"])
 async def test_clean_stale_vloopback_volumes_accepts_tagged_driver(
     docker_service,
     retry_ssh_mock,
+    driver,
 ):
     """Docker reports plugin drivers with tags, for example vloopback:latest."""
     # Arrange
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(
         side_effect=[
-            _make_ssh_command_result(stdout="volume_tagged vloopback:latest\n"),
+            _make_ssh_command_result(stdout=f"volume_tagged {driver}\n"),
             _make_ssh_command_result(stdout=""),
         ]
     )
@@ -3787,13 +4204,63 @@ def test_local_volume_timeout_preserves_larger_explicit_timeout():
     assert DockerService._get_local_volume_create_timeout(1024, 0) == 0
 
 
+def test_rental_pids_limit_scales_per_cpu_and_clamps_to_cap(monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    # a per-pod CPU cap gives a proportionate ceiling
+    assert DockerService._rental_pids_limit(1) == 4096
+    assert DockerService._rental_pids_limit(8) == 32768
+    # a huge share is clamped to the cap, never above kernel.pid_max
+    assert DockerService._rental_pids_limit(1000) == 1_048_576
+
+
+def test_rental_pids_limit_uses_cap_for_whole_host_rentals(monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    # no per-pod CPU cap (whole host) still gets a finite ceiling
+    assert DockerService._rental_pids_limit(None) == 1_048_576
+    assert DockerService._rental_pids_limit(0) == 1_048_576
+
+
+def test_rental_pids_limit_disabled_returns_none(monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 0)
+    assert DockerService._rental_pids_limit(8) is None
+    assert DockerService._rental_pids_limit(None) is None
+
+
+def test_rental_pids_limit_clamps_below_a_low_host_pid_max(monkeypatch):
+    # Review finding on #1531: on a host with a low kernel.pid_max the scaled cap must be clamped
+    # below it (minus a host margin) or a fork bomb exhausts the global PID space first.
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_HOST_MARGIN", 4096)
+    # whole-host / CVM (cpu_count None) on a 32768-pid_max host: cap clamped to 32768 - 4096
+    assert DockerService._rental_pids_limit(None, 32768) == 28672
+    # an 8-CPU rental would scale to 32768, still clamped under the host ceiling
+    assert DockerService._rental_pids_limit(8, 32768) == 28672
+    # a roomy host (default ~4M) leaves the scaled cap alone
+    assert DockerService._rental_pids_limit(8, 4_194_304) == 32768
+    assert DockerService._rental_pids_limit(None, 4_194_304) == 1_048_576
+
+
+def test_rental_pids_limit_never_emits_zero_or_negative(monkeypatch):
+    # A pathologically low pid_max must not drive the limit to 0/negative (Docker reads that as
+    # unlimited); it floors at _MIN_RENTAL_PIDS_LIMIT instead.
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_HOST_MARGIN", 4096)
+    assert DockerService._rental_pids_limit(None, 4096) == docker_service_module._MIN_RENTAL_PIDS_LIMIT
+    assert DockerService._rental_pids_limit(8, 2048) == docker_service_module._MIN_RENTAL_PIDS_LIMIT
+
+
 @pytest.mark.asyncio
 async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
     docker_service,
     monkeypatch,
 ):
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
     stream_log = AsyncMock()
     monkeypatch.setattr(docker_service, "stream_log", stream_log)
     docker_client = _FakeRentalDockerClient()
@@ -3813,7 +4280,7 @@ async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "1024g"},
             "timeout": 133,
         }
@@ -3832,7 +4299,8 @@ async def test_create_local_volume_sparse_true_appends_sparse_flag(
 ):
     """sparse=True (full-node rental) → `-o sparse=true` appended after the size cap."""
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
     stream_log = AsyncMock()
     monkeypatch.setattr(docker_service, "stream_log", stream_log)
     docker_client = _FakeRentalDockerClient()
@@ -3852,7 +4320,7 @@ async def test_create_local_volume_sparse_true_appends_sparse_flag(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "200g", "sparse": "true"},
             "timeout": 50,
         }
@@ -3866,7 +4334,8 @@ async def test_create_local_volume_sparse_false_keeps_preallocation(
 ):
     """sparse=False (partial / legacy rental) → no sparse flag; size cap unchanged."""
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
     stream_log = AsyncMock()
     monkeypatch.setattr(docker_service, "stream_log", stream_log)
     docker_client = _FakeRentalDockerClient()
@@ -3885,7 +4354,7 @@ async def test_create_local_volume_sparse_false_keeps_preallocation(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "200g"},
             "timeout": 50,
         }
@@ -4119,7 +4588,131 @@ async def test_create_container_repairs_stale_vloopback_mountpoint_then_retries(
     assert calls["n"] == 2
     assert seen_commands[0] == seen_commands[1]
     repair.assert_awaited_once_with(ssh_client, "volume_test", {})
-    ssh_client.run.assert_not_awaited()
+    ssh_client.run.assert_awaited_once_with("/usr/bin/docker rm -fv pod_test")
+
+
+@pytest.mark.asyncio
+async def test_rental_create_removes_the_failed_container_before_the_stale_mount_retry(
+    docker_service, monkeypatch,
+):
+    events: list[str] = []
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            if events.count("run") == 1:
+                raise Exception(_VLOOPBACK_STALE_MOUNT_ERR)
+            return "cid"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True)
+    )
+
+    container_id = await docker_service._run_rental_docker_create_with_port_retry(
+        docker_client=FakeRentalClient(),
+        ssh_client=Mock(),
+        run_spec=ContainerRunSpec(image="img", name="pod_test"),
+        container_name="pod_test",
+        default_extra={},
+        local_volume="volume_test",
+    )
+
+    assert container_id == "cid"
+    assert events == ["run", "rm pod_test", "run"]
+
+
+@contextlib.asynccontextmanager
+async def _another_create_live(pod_id: str, live: bool):
+    """Hold a second, separate create for the pod (its own task) while the body runs."""
+    registered, release = asyncio.Event(), asyncio.Event()
+
+    async def other_create():
+        with docker_service_module.inflight_creates.track(pod_id):
+            registered.set()
+            await release.wait()
+
+    other = asyncio.create_task(other_create()) if live else None
+    if other:
+        await registered.wait()
+    try:
+        yield
+    finally:
+        release.set()
+        if other:
+            await other
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "conflict_name, live_creates, expected_events",
+    [
+        # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
+        ("pod_test", 1, ["run", "rm pod_test", "run"]),
+        # the earlier attempt is still live (its start may fail later and clean up by name): touch nothing
+        ("pod_test", 2, ["run"]),
+        ("pod_other", 1, ["run"]),
+    ],
+)
+async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
+    docker_service, monkeypatch, conflict_name, live_creates, expected_events,
+):
+    events: list[str] = []
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            if events.count("run") == 1:
+                raise Exception(
+                    f'409 Client Error: Conflict ("Conflict. The container name "/{conflict_name}" '
+                    'is already in use by container "25b3b093".")'
+                )
+            return "cid"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        # production registers one create twice: the job runner, then the miner handler
+        with registry.track("test"), registry.track("test"):
+            run = docker_service._run_rental_docker_create_with_port_retry(
+                docker_client=FakeRentalClient(),
+                ssh_client=Mock(),
+                run_spec=ContainerRunSpec(image="img", name="pod_test"),
+                container_name="pod_test",
+                default_extra={},
+                pod_id="test",
+            )
+            if "rm pod_test" in expected_events:
+                assert await run == "cid"
+            else:
+                with pytest.raises(Exception, match="already in use"):
+                    await run
+    assert events == expected_events
+    assert not registry.is_running("test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_creates, removed", [(1, True), (2, False)])
+async def test_failed_create_without_container_id_removes_by_name_only_when_no_other_create_is_live(
+    docker_service, monkeypatch, live_creates, removed,
+):
+    monkeypatch.setattr(
+        docker_service, "capture_failed_container_diagnostics", AsyncMock(return_value=Mock(container_missing=False))
+    )
+    ssh_commands = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        with registry.track("test"), registry.track("test"):
+            await docker_service.cleanup_failed_container_creation(
+                ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
+            )
+    assert any("rm -fv pod_test" in str(call) for call in ssh_commands.call_args_list) is removed
 
 
 @pytest.mark.asyncio
@@ -4221,12 +4814,36 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
     assert "docker.io/library/alpine:3.19" in helper_cmd
     assert "rmdir" in helper_cmd
     assert "rm -rf" not in helper_cmd
-    assert "-v /var/lib/docker/plugins/plugin123/propagated-mount:/mnt" in helper_cmd
+    # `--mount type=bind` so a missing propagated-mount dir fails the helper instead of being created
+    assert "--mount type=bind,src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in helper_cmd
+    assert " -v " not in helper_cmd
     assert "/mnt/volume_test" in helper_cmd
     assert all(
         call.kwargs.get("timeout") == 30
         for call in ssh_client.run.await_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_inspects_the_plugin_of_a_v2_volume(docker_service):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout="vloopback:v2 /mnt/volume_test\n"),
+            _make_ssh_command_result(stdout="v2plugin\n"),
+            _VLOOPBACK_REPAIR_DEFAULT_ROOT,
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(exit_status=0),
+        ]
+    )
+
+    await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client, local_volume="volume_test", default_extra={}
+    )
+
+    commands = _vloopback_repair_commands(ssh_client)
+    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:v2 --format '{{.Id}}'"
+    assert "src=/var/lib/docker/plugins/v2plugin/propagated-mount," in commands[-1]
 
 
 @pytest.mark.parametrize(
@@ -4268,7 +4885,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_the_hosts_docker_root(
         ">/dev/null 2>&1"
     )
     assert (
-        "-v /mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount:/mnt "
+        "--mount type=bind,src=/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount,dst=/mnt "
         "docker.io/library/alpine:3.19 rmdir /mnt/volume_test"
     ) in commands[4]
     assert not any("/var/lib/docker" in command for command in commands)
@@ -4311,7 +4928,7 @@ async def test_repair_stale_vloopback_mountpoint_falls_back_to_the_default_root_
     assert repaired is True
     commands = _vloopback_repair_commands(ssh_client)
     assert "/usr/bin/findmnt /var/lib/docker/plugins/plugin123/propagated-mount/volume_test" in commands[3]
-    assert "-v /var/lib/docker/plugins/plugin123/propagated-mount:/mnt" in commands[4]
+    assert "--mount type=bind,src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in commands[4]
     fallback_extra = next(
         record.msg.extra
         for record in caplog.records
@@ -4403,8 +5020,29 @@ async def test_repair_stale_vloopback_mountpoint_refuses_unexpected_mountpoint(d
     ssh_client.run.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    "rmdir_result, absence_check_result",
+    [
+        pytest.param(
+            _make_ssh_command_result(exit_status=12, stderr="not empty"),
+            _make_ssh_command_result(exit_status=0),
+            id="target_still_present",
+        ),
+        pytest.param(
+            # the propagated-mount dir itself is missing (a guessed docker root): with
+            # `--mount type=bind` docker refuses both helpers instead of creating the dir
+            _make_ssh_command_result(exit_status=125, stderr="bind source path does not exist"),
+            _make_ssh_command_result(exit_status=125, stderr="bind source path does not exist"),
+            id="propagated_mount_dir_missing_helper_did_not_run",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker_service, caplog):
+async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(
+    docker_service, caplog, rmdir_result, absence_check_result
+):
+    # a failed rmdir counts as repaired only when the target is proven gone (`test -e` exit 1);
+    # a target that is still there, or a helper that could not answer, keeps the repair skipped
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(
         side_effect=[
@@ -4412,11 +5050,12 @@ async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker
             _VLOOPBACK_REPAIR_PLUGIN_ID,
             _make_ssh_command_result(stdout="/mnt/lium-xfs/lium-docker\n"),
             _make_ssh_command_result(exit_status=1),
-            _make_ssh_command_result(exit_status=12, stderr="not empty"),
+            rmdir_result,
+            absence_check_result,
         ]
     )
 
-    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
         repaired = await docker_service.repair_stale_vloopback_mountpoint(
             ssh_client=ssh_client,
             local_volume="volume_test",
@@ -4424,6 +5063,16 @@ async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker
         )
 
     assert repaired is False
+    commands = _vloopback_repair_commands(ssh_client)
+    assert len(commands) == 6
+    assert commands[5] == (
+        "/usr/bin/docker run --rm "
+        "--mount type=bind,src=/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount,dst=/mnt "
+        "docker.io/library/alpine:3.19 test -e /mnt/volume_test"
+    )
+    assert not any(
+        str(record.msg) == "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT" for record in caplog.records
+    )
     # the skipped-repair line names the path it tried, so the next wrong-root host is readable
     # from the log alone
     skipped_extra = next(
@@ -4434,7 +5083,62 @@ async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker
     assert skipped_extra["target"] == (
         "/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount/volume_test"
     )
-    assert skipped_extra["stderr"] == "not empty"
+    assert skipped_extra["exit_status"] == rmdir_result.exit_status
+    assert skipped_extra["stderr"] == rmdir_result.stderr
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_counts_a_hand_removed_target_as_repaired(
+    docker_service, caplog
+):
+    # DAH-3398 / ticket-0313: the provider removed the stale propagated-mount dir by hand, as our
+    # ticket replies ask. rmdir then fails on every cycle, and before this the failed rmdir was a
+    # failed repair, so recovery never reached `start_existing_container` (24 h of POD_NOT_RUNNING
+    # after the directory was gone). A target that is proven absent is already repaired.
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _VLOOPBACK_REPAIR_INSPECT,
+            _VLOOPBACK_REPAIR_PLUGIN_ID,
+            _make_ssh_command_result(stdout="/mnt/lium-xfs/lium-docker\n"),
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(
+                exit_status=1,
+                stderr="rmdir: '/mnt/volume_test': No such file or directory",
+            ),
+            _make_ssh_command_result(exit_status=1),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        repaired = await docker_service.repair_stale_vloopback_mountpoint(
+            ssh_client=ssh_client,
+            local_volume="volume_test",
+            default_extra={"executor_id": "executor-1"},
+        )
+
+    assert repaired is True
+    commands = _vloopback_repair_commands(ssh_client)
+    assert len(commands) == 6
+    # the absence check reads the same bind-mounted dir the rmdir used, from the same helper image
+    assert commands[5] == (
+        "/usr/bin/docker run --rm "
+        "--mount type=bind,src=/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount,dst=/mnt "
+        "docker.io/library/alpine:3.19 test -e /mnt/volume_test"
+    )
+    assert all(call.kwargs.get("timeout") == 30 for call in ssh_client.run.await_args_list)
+    events = [str(record.msg) for record in caplog.records]
+    assert "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED" not in events
+    assert "VLOOPBACK_STALE_MOUNTPOINT_REPAIRED" not in events
+    absent_extra = next(
+        record.msg.extra
+        for record in caplog.records
+        if str(record.msg) == "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT"
+    )
+    assert absent_extra["executor_id"] == "executor-1"
+    assert absent_extra["target"] == (
+        "/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount/volume_test"
+    )
 
 
 @pytest.mark.asyncio
@@ -4483,15 +5187,15 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
         keypair_mock = MagicMock()
         keypair_mock.ss58_address = "5Test"
 
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=executor_info,
             miner_hotkey="5TestMiner",
             keypair=keypair_mock,
             private_key="encrypted-private-key",
         )
 
-    assert ok is True
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
     # Inspect the docker ps command
     ps_cmd = next((c for c in seen_commands if "docker ps" in c), "")
     assert ps_cmd, f"No docker ps command issued. Commands seen: {seen_commands}"
@@ -4547,15 +5251,15 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
         keypair_mock = MagicMock()
         keypair_mock.ss58_address = "5Test"
 
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=executor_info,
             miner_hotkey="5OurHotkey",
             keypair=keypair_mock,
             private_key="x",
         )
 
-    assert ok is True
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
 
 
 # ---------------------------------------------------------------------------
@@ -4758,7 +5462,7 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
 
     with patch("services.docker_service.asyncssh.connect") as connect_mock, \
          patch("services.docker_service.asyncssh.import_private_key") as pkey_mock:
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=MagicMock(),
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
@@ -4766,8 +5470,8 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
             ssh_client=ssh_client,
         )
 
-    assert ok is True
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
     # The reused-session path must skip the connect dance entirely.
     connect_mock.assert_not_called()
     pkey_mock.assert_not_called()
@@ -4803,10 +5507,10 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
                     stdout="health_check_1777635787\n",
                     stderr="", exit_status=0,
                 )
-            # The xargs force-rm command — return success.
-            return MagicMock(stdout="", stderr="", exit_status=0)
+            # The xargs force-rm command — docker rm prints the removed container's ID.
+            return MagicMock(stdout="3f2a9c1d7e4b\n", stderr="", exit_status=0)
 
-    ok, msg = await docker_service.wait_for_port_check_containers(
+    removed, message = await docker_service.wait_for_port_check_containers(
         executor_info=MagicMock(),
         miner_hotkey="5TestMiner",
         keypair=MagicMock(),
@@ -4814,8 +5518,8 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
         ssh_client=FakeSSHClient(),
     )
 
-    assert ok is True
-    assert "forcefully removed" in msg
+    assert removed is True
+    assert "forcefully removed" in message
     # Must have issued the force-rm xargs command targeting both prefixes.
     assert any(
         "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
@@ -4842,7 +5546,7 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
             FakeSSHClient.seen.append(cmd)
             if "docker ps --format" in cmd:
                 return MagicMock(stdout="container_5TestMiner_9101\n", stderr="", exit_status=0)
-            return MagicMock(stdout="", stderr="", exit_status=0)
+            return MagicMock(stdout="3f2a9c1d7e4b\n", stderr="", exit_status=0)
 
     sleep_calls = {"n": 0}
 
@@ -4853,7 +5557,7 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
     real_sleep = svc_mod.asyncio.sleep
     svc_mod.asyncio.sleep = counting_sleep
     try:
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=MagicMock(),
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
@@ -4863,8 +5567,8 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
     finally:
         svc_mod.asyncio.sleep = real_sleep
 
-    assert ok is True
-    assert "forcefully removed" in msg
+    assert removed is True
+    assert "forcefully removed" in message
     assert sleep_calls["n"] == 0, "the rental path must never sleep waiting on a probe"
     ps_checks = [c for c in FakeSSHClient.seen if "docker ps --format" in c]
     assert len(ps_checks) == 1, f"expected exactly 1 docker ps check, saw: {ps_checks}"
@@ -4978,17 +5682,6 @@ async def test_get_fs_available_bytes_garbage_output_raises(docker_service):
 
 
 @pytest.mark.asyncio
-async def test_get_fs_available_bytes_short_output_raises(docker_service):
-    # Arrange: only the header line, no data line.
-    ssh_client = Mock()
-    ssh_client.run = AsyncMock(return_value=Mock(stdout="Filesystem\n", exit_status=0))
-
-    # Act / Assert
-    with pytest.raises(Exception, match="Unexpected df output"):
-        await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
-
-
-@pytest.mark.asyncio
 async def test_resolve_volume_sizing_legacy_passthrough(docker_service):
     # Arrange
     payload = _make_sizing_payload(volume_limit_gb=40, storage_limit_gb=20)
@@ -5027,6 +5720,24 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     assert result.storage_limit_gb == 196
     assert result.df_avail_bytes == 900 * _SIZING_GB
     assert result.existing_volumes_bytes == 300 * _SIZING_GB
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_fresh_caps_volume_at_ext4_file_limit(docker_service):
+    # Arrange: ~28 TiB free, whole node -> 2/3 slice is ~18 TiB, above the 16 TiB ext4 file cap.
+    payload = _make_sizing_payload(disk_share=1.0, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=28 * 1024 * _SIZING_GB,
+        volume_ls_stdout="other_volume local\n",
+    )
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh"
+    assert result.capped_by == "max_file_size"
+    assert result.volume_limit_gb == 16 * 1024 - 1
 
 
 @pytest.mark.asyncio
@@ -5103,25 +5814,6 @@ async def test_resolve_volume_sizing_below_min_raises(docker_service):
     # Act / Assert
     with pytest.raises(VolumeMinSizeError):
         await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
-
-
-@pytest.mark.asyncio
-async def test_resolve_volume_sizing_severe_shrink_logged(docker_service):
-    # Arrange: requested 1000GB, share=1.0, df_avail=100GB, no volumes ->
-    # pool 80GB binds -> volume 53GB < 1000/2 -> severe shrink.
-    payload = _make_sizing_payload(disk_share=1.0, volume_limit_gb=1000, storage_limit_gb=1)
-    ssh_client = _make_sizing_ssh_client(df_avail_bytes=100 * _SIZING_GB)
-
-    # Act
-    with patch("services.docker_service.logger") as mock_logger:
-        result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
-
-    # Assert
-    assert result.path == "fresh"
-    assert result.capped_by == "pool"
-    assert result.volume_limit_gb == 53
-    warning_keys = [call.args[0].message for call in mock_logger.warning.call_args_list]
-    assert "vloopback_fresh_sizing_severe_shrink" in warning_keys
 
 
 @pytest.mark.asyncio
@@ -5288,7 +5980,6 @@ async def test_create_container_fresh_sizing_uses_effective_values(
 
 
 def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monkeypatch):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -5396,7 +6087,6 @@ async def test_create_container_refuses_an_encrypted_restore_while_the_hold_is_o
     # DAH-3274 (review, 14 Sep): the image's entrypoint runs while a create-time restore writes
     # under /root through the pod's mount; until the workload can be held stopped, the create
     # refuses before the probes, the volume and the pod. A plain volume is not affected.
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
     )
@@ -5440,7 +6130,6 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
     # an encrypted one only after its gocryptfs mount exists inside the running pod, through
     # that pod — so the executor is never handed the passphrase.
     _lift_encrypted_bootstrap_restore_hold(monkeypatch)
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -5504,6 +6193,96 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
 
 
 @pytest.mark.asyncio
+async def test_create_container_ends_the_log_stream_when_attestation_fails(docker_service, monkeypatch):
+    # Arrange: the attestation fails before the stream task ever ran
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    for streamed in ("stream_log", "handle_stream_logs", "finish_stream_logs"):
+        monkeypatch.delattr(docker_service, streamed)
+    docker_service.redis_service.publish = AsyncMock()
+    monkeypatch.setattr(
+        docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20020, 40022)], None))
+    )
+    monkeypatch.setattr(
+        docker_service, "_prepare_known_hosts_policy", AsyncMock(side_effect=AttestationError("bad quote"))
+    )
+    payload = _create_payload(str(uuid4()), encrypted=False).model_copy(update={"bootstrap_restore": None})
+
+    # Act
+    result = await asyncio.wait_for(
+        docker_service.create_container(
+            payload=payload,
+            executor_info=_executor_info_for(payload, tdx_quote=None),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        ),
+        timeout=2,
+    )
+
+    # Assert
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "attestation"
+    assert docker_service.log_task.done()
+    published_logs = docker_service.redis_service.publish.await_args.args[1]["logs"]
+    assert [log["log_text"] for log in published_logs] == ["Port mappings ready: 22->40022"]
+
+
+@pytest.mark.asyncio
+async def test_create_container_encrypted_keys_ride_in_the_volume_setup_exec(docker_service, monkeypatch):
+    # without a restore between mount and keys, the keys go in with the mount: no second exec
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    setup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
+    keys_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "add_ssh_public_keys_with_rental_docker", keys_spy)
+    payload = _create_payload(str(uuid4()), encrypted=True).model_copy(update={"bootstrap_restore": None})
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert setup_spy.await_args.kwargs["authorized_keys"] == ["ssh-ed25519 test-key"]
+    keys_spy.assert_not_awaited()
+
+
+@pytest.mark.parametrize("local_volume, allow_init", [(None, True), ("volume_reused", False)])
+@pytest.mark.asyncio
+async def test_create_container_initialises_only_a_volume_it_created(
+    docker_service, monkeypatch, local_volume, allow_init
+):
+    # a reboot re-runs create with the pod's volume: a missing gocryptfs.conf there must fail, not start empty
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    setup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
+    payload = _create_payload(str(uuid4()), encrypted=True).model_copy(
+        update={"bootstrap_restore": None, "local_volume": local_volume}
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert setup_spy.await_args.kwargs["allow_init"] is allow_init
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_old_executor(
     docker_service,
     monkeypatch,
@@ -5511,7 +6290,6 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_
     # DAH-3274 (review): an executor image without `workspace.bootstrap` would ignore the key and
     # refuse the non-empty target after the pod is up; the create fails before `docker run` instead.
     _lift_encrypted_bootstrap_restore_hold(monkeypatch)
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
     )
@@ -5552,7 +6330,6 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_withou
     # DAH-3274 (review): new models but no restic binary used to fail inside _run_bootstrap_restore,
     # with the pod already built; the engine check now runs next to the models probe.
     _lift_encrypted_bootstrap_restore_hold(monkeypatch)
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
     )
@@ -5594,7 +6371,6 @@ async def test_create_container_encrypted_local_volume_docker_run_flags(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -5663,7 +6439,6 @@ async def test_create_container_uses_plain_volume_when_encrypted_label_missing(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -5728,7 +6503,6 @@ async def test_create_container_volume_encryption_opt_out_skips_image_inspect(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     _patch_create_container_happy_path(docker_service, monkeypatch)
     inspect_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", inspect_spy)
@@ -5789,7 +6563,6 @@ async def test_create_container_fails_when_encrypted_label_inspect_raises(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -5855,7 +6628,6 @@ async def test_create_container_encrypted_setup_runs_before_ssh_bootstrap(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -5925,7 +6697,6 @@ async def test_create_container_encrypted_setup_failure_cleans_up(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -5995,7 +6766,6 @@ async def test_create_container_s3fs_external_volume_keeps_encrypted_local_mount
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -6071,7 +6841,6 @@ async def test_create_container_filler_skips_encrypted_volume_setup(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -6169,6 +6938,62 @@ async def test_run_jupyter_with_encrypted_volume_installs_into_plaintext_mount(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setup_opens_second", "inspect_error", "raised", "commands_run"),
+    [
+        # an sshd with MaxSessions=1 refuses whichever channel opens second: it runs again alone
+        (False, None, contextlib.nullcontext(), ["setup", "inspect"]),
+        (True, None, contextlib.nullcontext(), ["inspect", "setup"]),
+        (False, asyncssh.ConnectionLost("lost"), pytest.raises(asyncssh.ConnectionLost), ["setup"]),
+        # the inspect failed: the create fails, the refused setup never runs
+        (True, 1, pytest.raises(asyncssh.ChannelOpenError), ["inspect"]),
+    ],
+    ids=["one_session_host_inspect_refused", "one_session_host_setup_refused", "inspect_failed", "inspect_exited_1"],
+)
+async def test_the_volume_setup_and_the_inspect_settle_together(
+    docker_service, setup_opens_second, inspect_error, raised, commands_run
+):
+    # the setup exec and `docker inspect` run side by side on a host that opens one channel at a time;
+    # the create's failure cleanup may start only after the setup has settled
+    session_in_use, setup_states, commands = False, [], []
+
+    async def one_session_host(cmd, *args, **kwargs):
+        nonlocal session_in_use
+        command = "setup" if kwargs.get("input") is not None else "inspect"
+        if command == "setup" and setup_opens_second and not commands:
+            await asyncio.sleep(0)
+        if command == "inspect" and isinstance(inspect_error, Exception):
+            raise inspect_error
+        if session_in_use:
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed")
+        session_in_use = True
+        setup_states.extend(["started"] if command == "setup" else [])
+        await asyncio.sleep(0.05)
+        setup_states.extend(["completed"] if command == "setup" else [])
+        commands.append(command)
+        session_in_use = False
+        return _make_ssh_command_result(exit_status=inspect_error if command == "inspect" and inspect_error else 0)
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=one_session_host)
+
+    with patch.object(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"), raised:
+        await docker_service.setup_encrypted_local_volume(
+            ssh_client=ssh_client,
+            container_name="pod_test",
+            plaintext_path="/root",
+            volume_name="volume_test",
+            pod_id="pod-id",
+            log_tag="test",
+            log_extra={},
+            authorized_keys=["ssh-ed25519 AAAA renter"],
+        )
+
+    assert setup_states == ["started", "completed"] * ("setup" in commands_run)
+    assert commands == commands_run
+
+
+@pytest.mark.asyncio
 async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, caplog):
     from services.volume_keys import derive_volume_passphrase
 
@@ -6189,6 +7014,7 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
                 pod_id=pod_id,
                 log_tag="test",
                 log_extra={},
+                authorized_keys=["ssh-ed25519 AAAA'$(id)' renter"],
             )
 
     logged = " ".join(rec.getMessage() for rec in caplog.records)
@@ -6213,10 +7039,16 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     upload_call = stdin_calls[0]
     upload_cmd = upload_call.args[0]
     # 0600 from the first byte: the script holds the same material as the passfile it writes
-    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c 'umask 077 && cat > ")
+    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c ")
+    assert "(umask 077 && dd bs=1 " in upload_cmd
     assert f"{docker_service_module._VOLUME_SETUP_TMPFS}/.x" in upload_cmd
     assert "<<" not in upload_cmd
-    setup_script = upload_call.kwargs["input"]
+    # the renter's key is data on stdin behind the script, never shell text
+    assert "AAAA" not in upload_cmd
+    stdin_data = upload_call.kwargs["input"]
+    setup_script, renter_keys = stdin_data.split("ssh-ed25519", 1)
+    assert renter_keys == " AAAA'$(id)' renter\n"
+    assert f"dd bs=1 count={len(setup_script)} of=" in upload_cmd
     assert "gocryptfs" in setup_script
     assert passphrase not in setup_script
     assert passphrase.encode("ascii").hex() not in setup_script
@@ -6224,6 +7056,85 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     # nothing about the key ever lands on the container's writable layer
     assert all("/tmp/.x" not in command for command in commands)
     assert "/tmp/" not in setup_script
+
+
+@pytest.mark.asyncio
+async def test_setup_encrypted_local_volume_counts_the_utf8_bytes_of_a_unicode_path(docker_service):
+    # a template volume path such as /workspace/данные; asyncssh sends a str input as UTF-8,
+    # so `dd` must take the script's UTF-8 bytes, or it cuts into the keys behind it
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+
+    with patch.object(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    ):
+        await docker_service.setup_encrypted_local_volume(
+            ssh_client=ssh_client,
+            container_name="pod_test",
+            plaintext_path="/workspace/\u0434\u0430\u043d\u043d\u044b\u0435",
+            volume_name="volume_test",
+            pod_id="pod-id",
+            log_tag="test",
+            log_extra={},
+            authorized_keys=["ssh-ed25519 AAAA renter"],
+        )
+
+    upload_call = next(
+        call for call in ssh_client.run.await_args_list if call.kwargs.get("input") is not None
+    )
+    setup_script, renter_keys = upload_call.kwargs["input"].split("ssh-ed25519", 1)
+    assert "/workspace/\u0434\u0430\u043d\u043d\u044b\u0435" in setup_script
+    assert f"dd bs=1 count={len(setup_script.encode('utf-8'))} of=" in upload_call.args[0]
+    assert renter_keys == " AAAA renter\n"
+
+
+def test_volume_setup_exec_upload_leaves_every_byte_after_the_script_on_stdin(tmp_path):
+    # a stdio `head -c` (busybox, BSD) reads a whole buffer from the pipe and swallows the keys
+    setup_script = "# gocryptfs setup and mount\n" * 200
+    renter_keys = "ssh-ed25519 AAAA renter\n"
+    setup_script_path = tmp_path / "setup"
+    program = docker_service_module._build_volume_setup_exec_script(
+        "/root",
+        setup_script_path=str(setup_script_path),
+        passfile_path=str(tmp_path / "passfile"),
+        setup_script_size=len(setup_script.encode("utf-8")),
+        with_authorized_keys=True,
+    )
+    upload_line = next(line for line in program.splitlines() if line.endswith("exit 90"))
+
+    completed = subprocess.run(
+        ["sh", "-c", f"{upload_line}\ncat"],
+        input=(setup_script + renter_keys).encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert setup_script_path.read_text() == setup_script
+    assert completed.stdout.decode("utf-8") == renter_keys
+
+
+def test_volume_setup_exec_runs_the_setup_script_under_the_exec_default_umask(tmp_path):
+    # only the upload is 0077; the script's mkdir -p of a volume path's missing parents keeps 0022
+    setup_script = "umask\n"
+    program = docker_service_module._build_volume_setup_exec_script(
+        "/root",
+        setup_script_path=str(tmp_path / "setup"),
+        passfile_path=str(tmp_path / "passfile"),
+        setup_script_size=len(setup_script.encode("utf-8")),
+        with_authorized_keys=False,
+    )
+    upload_and_run_lines = [line for line in program.splitlines() if not line.endswith("exit 92; }")]
+
+    completed = subprocess.run(
+        ["sh", "-c", "umask 022\n" + "\n".join(upload_and_run_lines)],
+        input=setup_script.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.decode("utf-8").strip() in ("0022", "022")
 
 
 def _run_gocryptfs_setup_script_in_sandbox(script: str) -> tuple[int, str, str]:
@@ -6395,6 +7306,77 @@ async def test_recover_pod_does_not_start_when_repair_fails(docker_service, monk
     start_existing_container.assert_not_awaited()
 
 
+def _hand_cleaned_host_ssh_client(absence_check_exit_status: int) -> AsyncMock:
+    # ticket-0313's host after the provider's cleanup: data-root under /mnt/lium-xfs, the container
+    # still carries its vloopback volume, nothing is mounted, and rmdir finds no directory. The last
+    # answer is the absence check: exit 1 = the directory is gone, exit 0 = it is still there.
+    async def run(command, *_args, **_kwargs):
+        if ".Destination" in command:
+            return _make_ssh_command_result(stdout="/root\n")
+        if "/usr/bin/docker inspect pod_pod-1" in command:
+            return _make_ssh_command_result(stdout="volume_pod-1\n")
+        if "/usr/bin/docker volume inspect volume_pod-1" in command:
+            return _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_pod-1\n")
+        if "/usr/bin/docker plugin inspect" in command:
+            return _make_ssh_command_result(stdout="plugin123\n")
+        if "/usr/bin/docker info" in command:
+            return _make_ssh_command_result(stdout="/mnt/lium-xfs/lium-docker\n")
+        if command.startswith("/usr/bin/findmnt "):
+            return _make_ssh_command_result(exit_status=1)
+        if command.endswith(" rmdir /mnt/volume_pod-1"):
+            return _make_ssh_command_result(
+                exit_status=1, stderr="rmdir: '/mnt/volume_pod-1': No such file or directory"
+            )
+        if command.endswith(" test -e /mnt/volume_pod-1"):
+            return _make_ssh_command_result(exit_status=absence_check_exit_status)
+        raise AssertionError(f"unexpected command on the hand-cleaned host: {command}")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    return ssh_client
+
+
+@pytest.mark.parametrize(
+    "absence_check_exit_status, expected_recovered",
+    [
+        pytest.param(1, True, id="mountpoint_dir_gone_starts_the_container"),
+        pytest.param(0, False, id="mountpoint_dir_still_there_stays_failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_starts_when_the_provider_already_removed_the_stale_dir(
+    docker_service, monkeypatch, caplog, absence_check_exit_status, expected_recovered
+):
+    # DAH-3398 / ticket-0313, through the real repair: a reboot-stranded pod whose stale dir the
+    # provider removed by hand reaches `start_existing_container`; the same host with the dir still
+    # in place (rmdir failed for another reason) keeps POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED.
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(
+            docker_service,
+            _STALE_MOUNT_ERROR,
+            _hand_cleaned_host_ssh_client(absence_check_exit_status),
+        )
+
+    assert recovered is expected_recovered
+    events = [str(record.msg) for record in caplog.records]
+    if expected_recovered:
+        start_kwargs = start_existing_container.await_args.kwargs
+        assert start_kwargs["container_name"] == "pod_pod-1"
+        assert start_kwargs["default_extra"]["local_volume"] == "volume_pod-1"
+        assert "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT" in events
+        assert "POD_STALE_MOUNT_RECOVERED" in events
+        assert "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED" not in events
+    else:
+        start_existing_container.assert_not_awaited()
+        assert "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED" in events
+        assert "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED" in events
+
+
 @pytest.mark.asyncio
 async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
     docker_service, monkeypatch
@@ -6473,7 +7455,6 @@ async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_
 ):
     # DAH-2545: with the plaintext path in hand the encrypted pod is recoverable, and the path is
     # handed on untouched — a guessed one would write the customer's data out in the clear
-    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -6493,28 +7474,6 @@ async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_
 
     assert recovered is True
     assert start_existing_container.await_args.kwargs["local_volume_path"] == "/workspace"
-
-
-@pytest.mark.asyncio
-async def test_recover_pod_declines_an_encrypted_volume_when_the_kill_switch_is_off(
-    docker_service, monkeypatch
-):
-    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", False)
-    monkeypatch.setattr(
-        docker_service_module.settings,
-        "VOLUME_MASTER_SECRET",
-        "test-master-secret-32-chars-long!!",
-    )
-    start_existing_container = AsyncMock()
-    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
-    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
-
-    recovered = await _attempt_stale_mount_recovery(
-        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
-    )
-
-    assert recovered is False
-    start_existing_container.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -6538,7 +7497,6 @@ async def test_recover_pod_declines_an_unusable_plaintext_path(
     # leading slash, so this gate is the only thing keeping a traversal out of the mount command.
     # Asserted on the gate directly as well as on the outcome: the outcome alone would stay green
     # for any of the other reasons recovery can decline.
-    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -6567,7 +7525,6 @@ async def test_recover_pod_declines_an_unusable_plaintext_path(
     ],
 )
 def test_a_plain_absolute_plaintext_path_is_accepted(monkeypatch, local_volume_path):
-    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -6608,7 +7565,6 @@ async def test_recover_pod_stops_the_container_when_the_start_is_cancelled(
     # the check runs under an outer timeout, so cancellation can land after `docker start` but
     # before gocryptfs is remounted, leaving the customer a running pod whose plaintext path is an
     # ordinary container dir writing to the miner's disk. The stop has to survive the cancellation.
-    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
     monkeypatch.setattr(
         docker_service_module.settings,
         "VOLUME_MASTER_SECRET",
@@ -6664,7 +7620,7 @@ def test_gocryptfs_script_still_initialises_at_create_time():
         passfile_path="/tmp/pf",
     )
 
-    assert "gocryptfs -init /lium-cipher" in script
+    assert "gocryptfs -init /lium-cipher -scryptn 10 " in script
 
 
 @pytest.mark.asyncio
@@ -6868,14 +7824,16 @@ def _state(**overrides) -> ContainerStateSnapshot:
     return ContainerStateSnapshot(**{**base, **overrides})
 
 
-async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, state, exec_error):
+async def _create_failing_at_add_public_keys(
+    docker_service, monkeypatch, *, state, exec_error, failure_step="add_public_keys", container_missing=False
+):
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(
         docker_service, "add_ssh_public_keys_with_rental_docker", AsyncMock(side_effect=exec_error)
     )
     inspect = AsyncMock(side_effect=state) if isinstance(state, Exception) else AsyncMock(return_value=state)
     docker_service.rental_docker_client_factory.client.inspect_container_state = inspect
-    cleanup = AsyncMock(return_value=False)
+    cleanup = AsyncMock(return_value=container_missing)
     monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
     payload = _filler_create_payload()
     payload.docker_image = _CUDA_IMAGE
@@ -6887,8 +7845,15 @@ async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, sta
         private_key="encrypted",
     )
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "add_public_keys", "dashboards key on the step"
-    assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
+    assert result.failure_step == failure_step, "dashboards key on the step"
+    if failure_step in ("killed_during_bootstrap", "oom_during_bootstrap"):
+        # a kill's msg is its renter-safe cause sentence; the diagnosis stays in detail
+        assert result.msg.startswith(
+            ("the container was stopped by the node", "the container stopped before", "the container was killed for lack of memory")
+        )
+        assert "cause=" not in result.msg
+    else:
+        assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
     # the container was still there to inspect: the explanation is read before cleanup removes it
     assert inspect.await_args.kwargs == {"container_name": docker_service.get_container_name(payload)}
     cleanup.assert_awaited_once()
@@ -6913,15 +7878,21 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
             "is restarting",
             id="restarting",
         ),
+        # Docker restarts only a command that ended on its own: a SIGTERM-handling CMD's 143 is its own exit
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=143, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-143",
+        ),
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=137, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-137",
+        ),
         pytest.param(
             _state(status="running", running=True, restart_count=1),
             "is restarting",
             id="running-again-after-a-restart",
-        ),
-        pytest.param(
-            _state(status="dead", running=False, exit_code=1, restart_count=0),
-            "is not running",
-            id="dead",
         ),
     ],
 )
@@ -6944,6 +7915,26 @@ async def test_a_key_injection_that_fails_on_an_exiting_image_names_the_image(
 
 
 @pytest.mark.asyncio
+async def test_a_filler_that_exits_at_start_sends_its_log_tail_as_its_own_detail_field(
+    docker_service, monkeypatch
+) -> None:
+    docker_service.rental_docker_client_factory.client.container_log_tail = AsyncMock(
+        return_value="error: missing --pool\n"
+    )
+
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="exited", running=False, exit_code=1),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+    )
+
+    detail_fields = json.loads(result.detail.split(" >>> ", 1)[1])
+    assert detail_fields["container_logs_tail"] == "error: missing --pool"
+    assert "missing --pool" not in detail_fields["error"]
+
+
+@pytest.mark.asyncio
 async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_error(
     docker_service, monkeypatch
 ):
@@ -6957,22 +7948,34 @@ async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_
 
 
 @pytest.mark.parametrize(
-    "state",
+    "state, failure_step",
     [
-        pytest.param(_state(status="exited", running=False, exit_code=137, oom_killed=True), id="oom-killed"),
-        pytest.param(_state(status="exited", running=False, exit_code=137), id="sigkill"),
+        pytest.param(
+            _state(status="exited", running=False, exit_code=137, oom_killed=True), "oom_during_bootstrap", id="oom-killed"
+        ),
+        pytest.param(_state(status="exited", running=False, exit_code=137), "killed_during_bootstrap", id="sigkill"),
+        # `dead` is a removal the daemon could not finish, not the image's exit, whatever the code
+        pytest.param(
+            _state(status="dead", running=False, exit_code=1, restart_count=0), "killed_during_bootstrap", id="dead"
+        ),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_key_injection_that_fails_after_a_host_kill_keeps_the_exec_error(
-    docker_service, monkeypatch, state
+async def test_a_key_injection_that_fails_after_a_host_kill_is_killed_during_bootstrap(
+    docker_service, monkeypatch, state, failure_step
 ):
     """An OOM or SIGKILL is not the image's fault: the renter must not read "add `sleep infinity`"."""
     result = await _create_failing_at_add_public_keys(
-        docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
+        docker_service,
+        monkeypatch,
+        state=state,
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        failure_step=failure_step,
     )
 
-    assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+    error = _failure_error_field(result)
+    assert "has no long-running command" not in error
+    assert str(_EXEC_KILLED_BY_EXIT) in error
 
 
 @pytest.mark.asyncio
@@ -6988,3 +7991,178 @@ async def test_a_key_injection_failure_whose_inspect_fails_keeps_the_exec_error(
     )
 
     assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+
+
+# DAH-3980: on the encrypted path the keys ride at the end of the one volume setup exec; its exit
+# status says which part failed (90 upload, 91 init/mount, 92 mount check, 93 keys).
+
+
+async def _create_with_volume_setup_exit(docker_service, monkeypatch, *, exit_status, state):
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+
+    async def run(command, *_args, **_kwargs):
+        if "(umask 077 && dd bs=1 " in command:
+            return _make_ssh_command_result(exit_status=exit_status)
+        return _make_ssh_command_result()
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    inspect = AsyncMock(return_value=state)
+    docker_service.rental_docker_client_factory.client.inspect_container_state = inspect
+    cleanup = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image=_CUDA_IMAGE,
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        is_sysbox=True,
+        enable_volume_encryption=True,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+    assert isinstance(result, FailedContainerRequest)
+    cleanup.assert_awaited_once()
+    assert cleanup.await_args.kwargs["container_name"] == f"pod_{payload.pod_id}"
+    assert cleanup.await_args.kwargs["remove_volume"] is True
+    return result, inspect
+
+
+@pytest.mark.asyncio
+async def test_a_key_write_that_fails_in_the_volume_setup_exec_names_the_exiting_image(
+    docker_service, monkeypatch
+):
+    result, _ = await _create_with_volume_setup_exit(
+        docker_service,
+        monkeypatch,
+        exit_status=93,
+        state=_state(status="exited", running=False, exit_code=0, restart_count=1),
+    )
+
+    assert result.failure_step == "add_public_keys"
+    # the mount was up: the encryption itself did not fail
+    assert result.volume_encryption_status is None
+    error = _failure_error_field(result)
+    assert "is not running" in error, error
+    assert f"image {_CUDA_IMAGE!r} has no long-running command" in error
+    assert "exit_status=93" in error
+
+
+@pytest.mark.asyncio
+async def test_a_key_write_that_fails_in_a_running_container_keeps_the_exec_error(
+    docker_service, monkeypatch
+):
+    result, _ = await _create_with_volume_setup_exit(
+        docker_service, monkeypatch, exit_status=93, state=_state()
+    )
+
+    assert result.failure_step == "add_public_keys"
+    assert result.volume_encryption_status is None
+    assert _failure_error_field(result).startswith("Failed to add SSH public keys inside container")
+
+
+@pytest.mark.parametrize("exit_status", [90, 91, 92, 1])
+@pytest.mark.asyncio
+async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
+    docker_service, monkeypatch, exit_status
+):
+    result, inspect = await _create_with_volume_setup_exit(
+        docker_service, monkeypatch, exit_status=exit_status, state=_state()
+    )
+
+    assert result.failure_step == "encrypted_volume_setup"
+    assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
+    inspect.assert_not_awaited()
+
+
+_OOM_STATES = {
+    "removing": _state(status="removing", running=False, exit_code=137, oom_killed=True),
+    "exited": _state(status="exited", running=False, exit_code=137, oom_killed=True),
+    "restarting": _state(status="restarting", running=True, restarting=True, exit_code=137, oom_killed=True),
+}
+
+
+@pytest.mark.parametrize("swept", [False, True], ids=["unswept", "swept"])
+@pytest.mark.parametrize("container_missing", [False, True], ids=["cleanup-found-it", "cleanup-404"])
+@pytest.mark.parametrize("status", list(_OOM_STATES))
+@pytest.mark.asyncio
+async def test_an_oom_never_goes_out_as_container_vanished(docker_service, monkeypatch, status, container_missing, swept):
+    """The backend's filler streak reads ContainerVanished apart from the failure step: an OOM must not carry it."""
+    monkeypatch.setattr(docker_service_module.own_sweep_removals, "sent_rm_for", lambda _id: swept)
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_OOM_STATES[status],
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        # a container still restarting fails the key injection itself, before any kill is read
+        failure_step="add_public_keys" if status == "restarting" else "oom_during_bootstrap",
+        container_missing=container_missing,
+    )
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+
+
+@pytest.mark.parametrize("container_missing, error_code", [(False, "UnknownError"), (True, "ContainerVanished")])
+@pytest.mark.asyncio
+async def test_a_sigkill_whose_container_is_gone_still_goes_out_as_container_vanished(
+    docker_service, monkeypatch, container_missing, error_code
+):
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="removing", running=False, exit_code=137),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        failure_step="killed_during_bootstrap",
+        container_missing=container_missing,
+    )
+    assert result.error_code == getattr(FailedContainerErrorCodes, error_code)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("docker_run_fails", [False, True])
+async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(monkeypatch, docker_run_fails):
+    # an edit mounts the pod's volume by name and Docker routes it to the plugin that made it
+    # (`vloopback:latest` for every rental before v2): no plugin command, no volume create or rm
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    svc._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.delattr(svc, "create_local_volume")  # the real one, should anything reach it
+    if docker_run_fails:
+        monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+        monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("x")))
+
+    result = await _run_edit(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest if docker_run_fails else ContainerCreated)
+    assert not any(word in command for command in ssh.commands for word in ("docker plugin", "volume create", "volume rm"))
+    if not docker_run_fails:
+        run_spec = svc._run_rental_docker_create_with_port_retry.await_args.kwargs["run_spec"]
+        assert [volume.source for volume in run_spec.volumes] == [payload.local_volume]
+
+
+def test_no_usable_loopback_plugin_error_preserves_the_disabled_classification():
+    # the stats classifier files any error with "plugin vloopback" + "disabled" as
+    # volume.plugin_disabled; the message names the plugin the rent used
+    message = str(NoUsableLoopbackPluginError("verified v2 plugin remains disabled", "false"))
+
+    assert "plugin vloopback" in message and "disabled" in message

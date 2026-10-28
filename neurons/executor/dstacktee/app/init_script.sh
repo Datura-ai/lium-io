@@ -15,6 +15,7 @@ GPU_ATTESTATION_ARCH \
 EXECUTOR_LOCAL_VERIFY_ENABLED \
 LOCAL_VERIFY_MAX_DEADLINE_SECONDS \
 LOCAL_VERIFY_INTENT_WINDOW_SECONDS \
+EXECUTOR_SSH_SOURCE_PIN \
 "
 
 if [ -f .host-shared/.user-config ]; then
@@ -36,4 +37,6 @@ if [ -f .host-shared/.user-config ]; then
 else
     echo "WARNING: .user-config not found, skipping environment variable loading"
 fi
+# QEMU user networking shows sshd 10.0.2.2, never the validator's address, so a CVM pins no source unless its config asks
+grep -q '^EXECUTOR_SSH_SOURCE_PIN=' .env 2>/dev/null || echo "EXECUTOR_SSH_SOURCE_PIN=false" >>.env
 dstack-util extend --event "env_end" --payload ""

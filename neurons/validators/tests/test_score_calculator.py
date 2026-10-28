@@ -1,5 +1,5 @@
 """Tests for calculate_scores in score_calculator.py, focused on the EMA verifyx download
-speed threshold. Other score_calculator paths (collateral, rental, price) are exercised
+speed threshold. Other score_calculator paths (rental, price) are exercised
 via integration in test_score_check.py and test_pipeline_default_scenarios.py.
 """
 import pytest
@@ -98,3 +98,58 @@ def test_none_specs_rented_does_not_penalise():
     assert actual_score == 1.0
     assert job_score == 1.0
     assert warning == ""
+
+
+@pytest.mark.parametrize("gpu_model", ["NVIDIA RTX 4090", "NVIDIA B200"])
+def test_executor_without_deposit_scores_in_full(gpu_model):
+    """Provider collateral is optional: an executor with nothing deposited keeps a full score, no warning."""
+    ctx = make_context(
+        executor=default_executor().model_copy(update={"price_per_gpu": None}),
+        state=build_state(gpu_model=gpu_model, specs={"network": {"ema_verifyx_download_speed": 500.0}}),
+        services=build_services(),
+        config=build_context_config(),
+        collateral_deposited=False,
+        is_rental_succeed=True,
+    )
+    actual_score, job_score, warning = calculate_scores(ctx, rented=False)
+    assert actual_score == 1.0
+    assert job_score == 1.0
+    assert warning == ""
+
+
+def test_inspector_blind_streak_flag_zeroes_a_rented_score():
+    """InspectorRentedCheck is non-fatal: only this flag, set under enforcement, zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"inspector_blind_streak_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "Rental sensor saw nothing of the rental" in warning
+
+
+def test_rented_pod_resources_flag_zeroes_a_rented_score():
+    """RentedPodResourcesCheck is non-fatal: only this flag, set under enforcement, zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"rented_pod_resources_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "below its deployed CPUs" in warning
+
+
+def test_rented_throughput_flag_zeroes_a_rented_score():
+    ctx = _ctx(500.0).model_copy(update={"rented_throughput_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "network or disk throughput" in warning
+
+
+def test_gpu_identity_flag_zeroes_a_rented_score():
+    """GpuAttestationIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"gpu_attestation_identity_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "GPU identity changed" in warning
+
+
+def test_inspector_host_write_flag_zeroes_a_rented_score():
+    ctx = _ctx(500.0).model_copy(update={"inspector_host_write_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "The host wrote into a renter's container" in warning

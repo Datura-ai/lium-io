@@ -1,5 +1,7 @@
 import enum
 import json
+import secrets
+import time
 from typing import Optional
 
 import pydantic
@@ -35,7 +37,6 @@ class AuthenticationPayload(pydantic.BaseModel):
 
         All callers MUST use this method instead of constructing their own JSON strings.
         See call sites in:
-        - neurons/validators/src/clients/miner_client.py (WebSocket signing)
         - neurons/miners/src/dependencies/auth.py (REST verification)
         - neurons/validators/src/services/miner_service.py (REST signing)
 
@@ -55,7 +56,9 @@ class AuthenticateRequest(BaseValidatorRequest):
         return self.payload.blob_for_signing()
 
 
-def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
+def ssh_pubkey_signing_blob(
+    public_key: str, nonce: str | None = None, miner_hotkey: str | None = None
+) -> str:
     """Canonical message the validator signs over an SSH public key.
 
     CRITICAL: This is the single source of truth for the validator_signature
@@ -67,10 +70,38 @@ def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
     folded into the signed message so it cannot be stripped or swapped in
     transit while keeping a valid signature (a stripped nonce downgrades the
     verification to the legacy blob, which no longer matches the signature).
+
+    With a miner hotkey the blob also names the miner the validator is talking
+    to, so the executor can check the key was meant for its own miner. That form
+    is only used for the separate `validator_miner_signature`; the
+    `validator_signature` blob never carries it, so older executors keep working.
     """
-    if not nonce:
-        return public_key
-    return f"{public_key}\nnonce:{nonce}"
+    blob = f"{public_key}\nnonce:{nonce}" if nonce else public_key
+    return f"{blob}\nminer:{miner_hotkey}" if miner_hotkey else blob
+
+
+# I-78: a validator signature over an SSH key used to be good forever, so one captured upload could be
+# replayed to any executor at any time. Every upload now carries a nonce whose first bytes say when it
+# was minted; the signature covers it, and executors refuse it once stale. Still 32 hex-encoded bytes,
+# the shape the TDX report_data and GPU-evidence channels take.
+UPLOAD_NONCE_MAGIC = b"LTS1"
+
+
+def fresh_upload_nonce() -> str:
+    """32 bytes, hex: the magic, the minting time (8 bytes, big-endian unix seconds), 20 random bytes."""
+    issued_at = int(time.time())
+    return (UPLOAD_NONCE_MAGIC + issued_at.to_bytes(8, "big") + secrets.token_bytes(20)).hex()
+
+
+def upload_nonce_issued_at(nonce: str | None) -> int | None:
+    """When a fresh_upload_nonce was minted, or None for any other nonce (or none)."""
+    try:
+        raw = bytes.fromhex(nonce or "")
+    except ValueError:
+        return None
+    if len(raw) != 32 or not raw.startswith(UPLOAD_NONCE_MAGIC):
+        return None
+    return int.from_bytes(raw[4:12], "big")
 
 
 # liumd phase 1 (DAH-2834): the validator's one-call verification intent, `POST /verify` on the
@@ -161,6 +192,10 @@ class SSHPubKeySubmitRequest(BaseValidatorRequest):
     # into TDX report_data[32:64] and the GPU evidence nonce. Optional for
     # backward compatibility with executors that predate the nonce channel.
     nonce: str | None = None
+    # Validator signature over ssh_pubkey_signing_blob(public_key, nonce, miner_hotkey): relayed by
+    # the miner so the executor can check the key was issued for its own miner hotkey. Optional
+    # while validators, miners and executors roll out.
+    validator_miner_signature: str | None = None
 
 
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):

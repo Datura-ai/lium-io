@@ -1,9 +1,16 @@
+import logging
 import pathlib
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
+from datura.chain import (
+    DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS,
+    PUBLIC_NODE_SOURCE,
+    ChainEndpoint,
+    chain_endpoint_candidates,
+)
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,6 +19,8 @@ if TYPE_CHECKING:
 
 from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureFlag(str, Enum):
@@ -25,7 +34,7 @@ class VerifyXSettings(BaseSettings):
     Set via environment variables prefixed with VERIFYX_ (e.g., VERIFYX_MEMORY_MIN_TEST_GB=16).
     Use .env for local development (git-ignored).
     """
-    model_config = SettingsConfigDict(env_prefix="VERIFYX_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="VERIFYX_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     # Memory configuration
     MEMORY_ALLOCATION_PERCENTAGE: int = Field(
@@ -58,11 +67,23 @@ class VerifyXSettings(BaseSettings):
     )
     NETWORK_MIN_DOWNLOAD_SPEED_MBPS: float = Field(
         default=50.0,
-        description="Minimum required network download speed in Mbps"
+        description="Minimum Cloudflare capacity download speed in Mbps",
     )
-    ENABLE_XET_CHALLENGE: bool = Field(
-        default=True,
-        description="Include HuggingFace Xet download challenge in VerifyX",
+    NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS: float = Field(
+        default=50.0,
+        description="Minimum package (integrity object) download speed in Mbps; also the Cloudflare fallback floor",
+    )
+    # When LIBRARY_REFRESH_ENABLED is on and the executor's libverifyx.so hash does not
+    # match, curl this URL once, install, check the hash, and retry. The validator's own
+    # file is the source of truth if the fetch hash differs. Off by default: a mismatch
+    # does not write /usr/lib on the provider host.
+    LIBRARY_REFRESH_ENABLED: bool = Field(
+        default=False,
+        description="If true, a libverifyx.so hash mismatch may replace /usr/lib/libverifyx.so on the executor",
+    )
+    LIBRARY_FETCH_URL: str = Field(
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libverifyx.so",
+        description="Raw GitHub URL the executor curls when library refresh is on and the hash does not match",
     )
 
 
@@ -72,7 +93,7 @@ class DebugSettings(BaseSettings):
     Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
     Use .env for local development (git-ignored).
     """
-    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     ENABLED: bool = Field(default=False, description="Enable debug mode")
     USE_LOCAL_MINER: bool = Field(default=False, description="Use local miner")
@@ -86,7 +107,7 @@ class DebugSettings(BaseSettings):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     PROJECT_NAME: str = "compute-subnet-validator"
 
     BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
@@ -97,8 +118,13 @@ class Settings(BaseSettings):
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID", default=51)
     BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
+    # Ordered, comma-separated: our proxy first, the public node is always appended last.
+    BITTENSOR_CHAIN_ENDPOINTS: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINTS", default=None)
+    # A failed endpoint is not dialled again for this long; the next ones in the list serve meanwhile.
+    BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS: int = Field(
+        env="BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS", default=DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS
+    )
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
-    SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
@@ -111,12 +137,9 @@ class Settings(BaseSettings):
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
     REDIS_USERNAME: str | None = Field(env="REDIS_USERNAME", default=None)
     REDIS_PASSWORD: str | None = Field(env="REDIS_PASSWORD", default=None)
-    # DAH-3006: RedisService wraps every command in one process-wide asyncio.Lock. In a ~500-executor
-    # wave the lock's FIFO queue drains at ~0.4 s per command (each hold spans several starved
-    # event-loop iterations), so a 1-ms SISMEMBER waits p50 73 s (Loki, 6 Sep 12:03 wave) — ~45 %
-    # of the median idle pipeline. Off: commands go straight to the bounded BlockingConnectionPool
-    # (DAH-2475), which is what serialises them when it must. On = today's behaviour.
-    REDIS_COMMAND_LOCK_ENABLED: bool = Field(env="REDIS_COMMAND_LOCK_ENABLED", default=True)
+    BACKEND_COMMAND_CLAIM_TTL_SECONDS: int = Field(default=60, gt=0)
+    BACKEND_COMMAND_HEARTBEAT_SECONDS: float = Field(default=20, gt=0)
+    BACKEND_COMMAND_ANSWER_TTL_SECONDS: int = Field(default=900, gt=0)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
@@ -128,7 +151,6 @@ class Settings(BaseSettings):
         env="MINER_PORTAL_REST_API_URL", default="https://provider-api.lium.io/"
     )
     TAO_PRICE_API_URL: str = Field(env="TAO_PRICE_API_URL", default="https://api.coingecko.com/api/v3/coins/bittensor")
-    COLLATERAL_DAYS: int = 7
     ENV: str = Field(env="ENV", default="dev")
 
     PORTION_FOR_UPTIME: float = 1
@@ -138,14 +160,15 @@ class Settings(BaseSettings):
     PORTION_FOR_SYSBOX_UNRENTED: float = 1
     PORTION_FOR_SYSBOX_RENTED: float = 1
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
-    # DAH-2313: reject unrented executors without sysbox so they never appear on the network.
-    REQUIRE_SYSBOX_FOR_UNRENTED: bool = Field(env="REQUIRE_SYSBOX_FOR_UNRENTED", default=True)
     # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
     # in PortConnectivityCheck, the TTL bounds the window between two misses.
     DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
     DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS: int = Field(
         env="DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS", default=3600, gt=0
     )
+    # ticket-0494: how long a DinD probe's sysbox pass is remembered for a rented executor whose later
+    # probes cannot reach the host (PortConnectivityCheck). Refreshed by every passing probe.
+    SYSBOX_VERIFIED_TTL_SECONDS: int = Field(env="SYSBOX_VERIFIED_TTL_SECONDS", default=24 * 3600, gt=0)
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
     # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
@@ -158,6 +181,13 @@ class Settings(BaseSettings):
     # live: unrented executors are enforced, rented ones are exempt (the check runs after the
     # tenant short-circuit).
     CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 14, 12, 0, 0)
+    # A node this validator has just found without its recommended image is held as pending, not
+    # failed, until the executor's first pre-pull sweep completes or GRACE_SECONDS after that first
+    # sighting, whichever comes first. The express lane verifies a new node seconds after it is
+    # added, long before a multi-GB pull can finish. GRACE_SECONDS=0 turns the grace off.
+    CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS: int = Field(
+        env="CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS", default=30 * 60, ge=0
+    )
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that
@@ -172,6 +202,8 @@ class Settings(BaseSettings):
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
+    # Pre-DAH-2274 burner uids. They receive no burn (burn goes to NEW_BURNERS); they are only kept
+    # in the miner list even when not serving (subtensor_client._build_serving_miners_with_opted_in_routing).
     BURNERS: list[int] = [4, 206, 207, 208]
     # All burn emission slots route to UID 47 (Datura payout key).
     NEW_BURNERS: list[int] = [47, 47, 47, 47, 47, 47, 47, 47, 47, 47]
@@ -179,7 +211,12 @@ class Settings(BaseSettings):
     BURNER_COLDKEYS: dict[int, str] = {
         47: "5G694c15wAu1LKi9rpSQqJjpBfg4K1oiBxEm5QSVdVZAfp9f",
     }
-    ENABLE_NEW_BURN_LOGIC: bool = True
+
+    # Comma-separated miner hotkeys that earn no subnet incentive from this validator. Their
+    # executors are still validated, listed and rentable exactly as before; only the incentive
+    # is zeroed (every pool, spot pay and referral), and the share they would have taken is
+    # left to burn. Empty (the default) changes nothing. Burner hotkeys are never affected.
+    SCORING_EXCLUDED_HOTKEYS: str = Field(env="SCORING_EXCLUDED_HOTKEYS", default="")
 
     # DAH-2251 — referral incentive paid via emission, to referrer hotkeys weighted by
     # the backend's epoch-stable EMA feed. There is no funding wallet, so unlike the
@@ -206,48 +243,72 @@ class Settings(BaseSettings):
         env="REFERRAL_FEED_MAX_STALENESS_EPOCHS", default=3
     )
 
-    ENABLE_NO_COLLATERAL: bool = True
-    ENABLE_VERIFYX: bool = True
-    # DAH-2959: a never-measured executor whose first VerifyX download sample is below the 100 Mbps
-    # EMA gate gets one more sample inside the same task, and the better one seeds the EMA. 11 of
-    # 80 fresh nodes (2–5 Sep) lost 1–3 cycles to a cold first sample (32–88 Mbps on one
-    # single-stream CDN object) and passed the next cycle at 205–760 Mbps. The gate, the threshold
-    # and known hosts (any prior EMA) are unchanged.
-    VERIFYX_COLD_SAMPLE_RETRY_ENABLED: bool = Field(env="VERIFYX_COLD_SAMPLE_RETRY_ENABLED", default=False)
-    ENABLE_INSPECTOR: bool = True
-    # DAH-2794: feed the obfuscated scrape to the executor's own interpreter over stdin
-    # instead of freezing it into a ~13 MB onefile and uploading that every cycle.
-    ENABLE_SCRAPE_SOURCE_DELIVERY: bool = Field(env="ENABLE_SCRAPE_SOURCE_DELIVERY", default=False)
-    INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK: bool = Field(
-        env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
-        default=True,
+    # A cycle that a check other than VerifyX failed publishes the VerifyX EMA the backend held
+    # before it (none for a never-measured node) instead of one moved by its sample. A passing
+    # cycle without the recommended image cached does not seed a never-measured node; a node with
+    # a stored EMA publishes its sample on every passing cycle. See verifyx_ema_hold_reason.
+    # Rented cycles in a row in which the inspector saw nothing (error, failed canary, stopped or
+    # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
+    # many on.
+    INSPECTOR_BLIND_STREAK_LIMIT: int = Field(env="INSPECTOR_BLIND_STREAK_LIMIT", default=5)
+    # On: the Inspector check fails from that cycle until the sensor reports again. Off by default.
+    INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
+        env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
     )
-    # DAH-3275: a provider-origin Inspector finding on a rented pod fails the check, zeroes the
-    # score and asks the backend for an inspector_auto quarantine (off the marketplace + renters
-    # told; nothing deleted). Off = shadow: the verdict and the evidence hashes are recorded in
-    # the inspector event, no renter is told, the score is untouched.
-    INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
-    SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
-    # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
-    # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
-    # plugin is already enabled — instead of five serial commands. Off: the per-command path.
-    RENTAL_VOLUME_FAST_PATH_ENABLED: bool = Field(env="RENTAL_VOLUME_FAST_PATH_ENABLED", default=False)
-    # DAH-3257: on a rent, read the host listings the pre-run steps need (containers, volumes,
-    # mounted volumes, GPU minor map, device nodes, nvidia-smi power state, the image's
-    # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
-    # own command, and a probe that fails leaves every step on its own commands. Off: as before.
-    RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
+    # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
+    # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
+    # root write to /usr/lib on a renter's host, so it has its own switch, off by default and
+    # independent of VERIFYX_LIBRARY_REFRESH_ENABLED (which covers only unrented executors).
+    # Off stops later replacements and undoes none; restoring the replaced file (its hash is
+    # previous_sha256 in INSPECTOR_LIBRARY_REPLACED) is in .env.template.
+    INSPECTOR_LIBRARY_REFRESH_ENABLED: bool = Field(env="INSPECTOR_LIBRARY_REFRESH_ENABLED", default=False)
+    # Tracks main, like verifyx.LIBRARY_FETCH_URL, so executors on older images still get the current build.
+    INSPECTOR_LIBRARY_FETCH_URL: str = Field(
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
+        description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
+    )
+    # Emergency switch for new volumes only; existing recorded drivers remain usable.
+    LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
+    # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
+    # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
+    POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
+    # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
+    # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
+    # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker
+    # refuses anything past 1000, which would fail every rental create.
+    RENTAL_CONTAINER_OOM_SCORE_ADJ: int = Field(env="RENTAL_CONTAINER_OOM_SCORE_ADJ", default=500, ge=1, le=1000)
+    # DAH-4537: the outside port prober (an AWS Lambda function URL) and its bearer token. Each batch
+    # port check first fetches a few listening ports through it; when none answers it while the
+    # validator reaches them, the node gets no verified ports. Unset URL: no outside probe.
+    EXTERNAL_PORT_PROBE_URL: str = Field(env="EXTERNAL_PORT_PROBE_URL", default="")
+    EXTERNAL_PORT_PROBE_TOKEN: str = Field(env="EXTERNAL_PORT_PROBE_TOKEN", default="")
+    # Off: a node whose ports answer only the validator is logged ("log-only"), not failed, so prod can count
+    # those nodes before enforcing.
+    EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
     # SCORED cycle expensive to fake, and the next scored cycle runs them anyway. Only a caller that
-    # passes `first_pass=True` to TaskService.create_task gets the fast path, and only with this
-    # flag on; the wave never does, so every scored verification is unchanged. Measured (Loki,
+    # passes `first_pass=True` to TaskService.create_task gets the fast path (the settings below);
+    # the wave never does, so every scored verification is unchanged. Measured (Loki,
     # 2–6 Sep, idle runs): matmul p50 26 s (74 s on the fresh dogfood node), VerifyX p50 78 s.
-    FIRST_PASS_FAST_PATH_ENABLED: bool = Field(env="FIRST_PASS_FAST_PATH_ENABLED", default=False)
+    # A node whose Docker cannot cap a container's disk (specs.storage_limit_supported) lets one renter fill the
+    # host's Docker storage and take every pod down. Off: a STORAGE_LIMIT_MISSING warning only, so providers get
+    # notice first. On: an unrented node without the limit scores 0 (StorageLimitCheck).
+    REQUIRE_STORAGE_LIMIT_SUPPORTED: bool = Field(env="REQUIRE_STORAGE_LIMIT_SUPPORTED", default=False)
     # The matmul is sized from min(card VRAM, this) instead of the whole card: same challenge,
     # seal and UUID check, 5–17x less data to generate and copy.
     FIRST_PASS_MATMUL_VRAM_MB: int = Field(env="FIRST_PASS_MATMUL_VRAM_MB", default=8192)
+    # A filler-only node skips the matmul while the filler runs. With N > 0, every Nth such cycle
+    # runs the challenge on a small VRAM budget beside the filler and records the answer
+    # (FILLER_MATMUL_SAMPLE); the check result never depends on it. Each sample is pinned to the
+    # next claimed card in rotation. 0 = never. Default 96 = about once a day per node (Mikhail, DAH-4278).
+    FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES: int = Field(
+        env="FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", default=96, ge=0
+    )
+    # Above the 2048 MB the matmul keeps in reserve, or no matrix fits.
+    FILLER_MATMUL_SAMPLE_VRAM_MB: int = Field(env="FILLER_MATMUL_SAMPLE_VRAM_MB", default=4096, ge=4096)
     # VerifyX challenge config for the first pass (defaults 128 GB / 5 GB in VerifyXSettings). The
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
@@ -268,19 +329,30 @@ class Settings(BaseSettings):
     # `GET /version` (connect, and twice this as its whole budget) and the tunnel's local bind and
     # connect; the direct-tcpip channel open on the executor runs inside the whole-call budget.
     LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
-    # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
-    # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
-    # whether a fabric must be measured before it is sold, so the feature has one switch across both
-    # services. On by default: a fabric nobody measured is one nobody should be selling.
-    ROCE_LINK_PROBE_ENABLED: bool = Field(env="ROCE_LINK_PROBE_ENABLED", default=True)
-    # ISSUE-050 filler liveness. CHECK_ENABLED is the master switch: shadow mode runs the SSH
-    # probe + backend re-check and logs the verdict, but never withholds incentive; switching it
-    # off disables the probe entirely. ENFORCEMENT (only effective while CHECK_ENABLED is on)
-    # additionally fails the fatal check — no unrented incentive — when a host killed the Lium
-    # filler container. Rollout: shadow first, flip enforcement after the shadow data is clean.
-    FILLER_LIVENESS_CHECK_ENABLED: bool = Field(env="FILLER_LIVENESS_CHECK_ENABLED", default=True)
-    FILLER_LIVENESS_ENFORCEMENT_ENABLED: bool = Field(env="FILLER_LIVENESS_ENFORCEMENT_ENABLED", default=False)
-    # DAH-2671 spec-truth checks. Each pair mirrors the FILLER_LIVENESS precedent above:
+    # The liumd shadow: after the pipeline has produced the node's result, run the same
+    # GPU steps again through `liumd run` on an SSH exec channel of the same session and log one
+    # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
+    # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
+    VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
+    # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the
+    # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
+    # and the matmul (at most 120 s) run one after the other.
+    LIUMD_SHADOW_TIMEOUT_SECONDS: int = Field(env="LIUMD_SHADOW_TIMEOUT_SECONDS", default=330)
+    # The only executors the shadow runs on: reserved, non-rentable dev executors, as
+    # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries. A pod or filler started
+    # after the cycle's snapshot is not seen, so on a rentable node the shadow could run its
+    # GPU/RAM/disk/network probe next to a workload. Executor UUIDs are miner-chosen, so an entry
+    # matches only that miner's executor at that SSH endpoint. Empty = none.
+    LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
+    # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
+    # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
+    # backend accepts the message (lium-platform#312); a backend without it logs and drops each
+    # report. Off: the spec is the only carrier, with a floor of REAPED_POD_STATES_FLOOR slots for
+    # reaped ids; on a node with more than 224 rented pods the last rented pods' states are cut
+    # until the queue drains.
+    POD_STATES_REPORT_ENABLED: bool = Field(env="POD_STATES_REPORT_ENABLED", default=False)
+    # DAH-2671 spec-truth checks. Each pair follows the shadow-first pattern:
     # CHECK_ENABLED is the master switch — shadow mode computes the signal and emits the event/log
     # but returns passed=True and never changes score; ENFORCEMENT (only effective while
     # CHECK_ENABLED is on) additionally lets the signal fail closed / fail the check. No enforcement
@@ -289,21 +361,30 @@ class Settings(BaseSettings):
     #
     # Item 1 — surface the kernel (procfs) GPU verdict the validator already computes and throws
     # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
-    KERNEL_GPU_VERDICT_CHECK_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_CHECK_ENABLED", default=True)
-    KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", default=False)
     # DAH-2662 — match provider/GPU bans against the kernel's GPU UUIDs (/proc/driver/nvidia) as well
     # as the host-reported ones. Shadow by default: the kernel list is read, recorded on specs and
     # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
     # matched on the reported list until this is flipped from a week of clean fleet data.
     KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
-    # Item 2a — corroborate the advertised CPU(s) count against sources the lscpu wrapper does not
-    # author (/proc/cpuinfo, /sys present population, docker NCPU).
-    CPU_TRUTH_CHECK_ENABLED: bool = Field(env="CPU_TRUTH_CHECK_ENABLED", default=True)
-    CPU_TRUTH_ENFORCEMENT_ENABLED: bool = Field(env="CPU_TRUTH_ENFORCEMENT_ENABLED", default=False)
+    # DAH-4547 - HardwareIdentityCheck: DMI files not served by sysfs (a cloak script's overlay), the
+    # kernel and NVML GPU lists disagreeing, or DMI identity changing under an unchanged GPU set.
+    # Shadow by default: the finding is logged as a warning event and the node passes.
+    HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED: bool = Field(
+        env="HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED", default=False
+    )
+    # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
+    # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
+    # logs a verdict every validation (check_id gpu.validate.kernel_count); a kernel list that is
+    # present and shorter than the reported GPU count fails the validation
+    # (GPU_KERNEL_COUNT_MISMATCH). A missing kernel list never fails.
+    GPU_KERNEL_COUNT_CHECK_ENABLED: bool = Field(env="GPU_KERNEL_COUNT_CHECK_ENABLED", default=True)
+    # The scrape mounts a size-limited vloopback volume the way a rental does and reports the verdict in
+    # its SCRAPE_OK event. Kill switch: off, the scrape skips the test (baked in by FileEncryptService).
+    VLOOPBACK_SCRAPE_CHECK_ENABLED: bool = Field(env="VLOOPBACK_SCRAPE_CHECK_ENABLED", default=True)
     # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
     # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
     # fails device selection or serialises past a wide wall-clock threshold.
-    # Defaults to False like RENTAL_CPU_LIMIT_CHECK_ENABLED: "shadow" here only means the verdict is
+    # Defaults to False: "shadow" here only means the verdict is
     # not scored — the GPU work itself is real, so an 8-card host would run 8 near-full-VRAM matmuls
     # on top of the legacy single-card one every cycle. Flip it on once elapsed/VRAM/host-RSS numbers
     # from a real 8-GPU box show what that costs an honest miner.
@@ -312,14 +393,49 @@ class Settings(BaseSettings):
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
     # host's Docker daemon creates the probe with `--cpus=<advertised>` and rejects a count that
     # exceeds the machine's physical cores (a signal the lscpu wrapper cannot forge, since dockerd
-    # reads the kernel directly). CHECK_ENABLED sends the count and observes the verdict; ENFORCEMENT
-    # additionally zeroes the score on CPU_QUOTA_EXCEEDS_HOST.
-    # Defaults to False, unlike the other CHECK_ENABLED flags: this one is the only item that
-    # changes what the backend does (the probe is created with `--cpus`), so a rejection the backend
-    # does not yet tag CPU_QUOTA_EXCEEDS_HOST lands in the fatal branch of the check. Flip it on once
-    # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
-    RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
-    RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # reads the kernel directly). The count is always sent (not on TDX hosts); a
+    # CPU_QUOTA_EXCEEDS_HOST verdict zeroes the score.
+    # Rented pod SSH, observe only: at the start of each cycle the validator
+    # reads the SSH identification line of every rented pod listed with an ssh_port, from outside the
+    # container (services/pod_ssh_probe.py), and reports each result with the node's result. The
+    # score is not changed by it. TIMEOUT bounds one probe (connect and read); CONCURRENCY bounds how
+    # many run at once, so a fleet of N pods takes at most ceil(N / CONCURRENCY) * TIMEOUT.
+    RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
+    RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0, gt=0)
+    RENTED_POD_SSH_PROBE_CONCURRENCY: int = Field(env="RENTED_POD_SSH_PROBE_CONCURRENCY", default=64, ge=1)
+    # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
+    # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
+    # stores such a report as evidence only (lium-platform) is deployed:
+    # an older backend would score it as a failed validation.
+    RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
+        env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
+    )
+    # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
+    # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
+    # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
+    # marks the executor inactive and stops billing the renter. Only the validator's scrape on the host
+    # decides; nothing read from the renter's container does. A later clean scrape validates the node as
+    # usual. Off (the default): the scrape failure halts the cycle without a reset, as before. On once
+    # the matching backend change has rolled out, which handles this reset like GPU_MISSING (penalty
+    # proposed, relisted only after a full GPU re-verification). Turning it off stops
+    # future resets only: an executor already reset stays inactive until its next clean scrape, and
+    # cycles already skipped are not billed or paid afterwards.
+    RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=False)
+    # A rented pod whose reboot failed (backend status REBOOT_FAILED) and whose container is not running:
+    # the validator asks the host to start a throwaway GPU container (the executor's own image,
+    # `nvidia-smi -L`). If the Docker daemon or the NVIDIA runtime refuses, the host is at fault and the
+    # verified job is cleared, so the backend marks the executor inactive and billing stops. A transport
+    # error or timeout decides nothing. Off by default: the pod keeps the plain POD_NOT_RUNNING verdict.
+    REBOOT_FAILED_HOST_CHECK_ENABLED: bool = Field(env="REBOOT_FAILED_HOST_CHECK_ENABLED", default=False)
+    # DAH-4564 — read a rented pod's cpuset, CPU quota and init oom_score_adj and flag a host that
+    # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
+    # oom_score_adj is recorded only, never scored.
+    RENTED_POD_RESOURCES_CHECK_ENABLED: bool = Field(env="RENTED_POD_RESOURCES_CHECK_ENABLED", default=True)
+    # The per-pod incident mark expires this long after the last cycle that saw the fault.
+    RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
+    # DAH-4457: a node whose GPU dropped out stays hidden (GPU_LOST availability entry, no new rentals) until its
+    # cards have read clean this long after the last faulty cycle (GpuLossHoldCheck).
+    GPU_LOSS_HOLD_SECONDS: int = Field(env="GPU_LOSS_HOLD_SECONDS", default=7200, gt=0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
@@ -339,11 +455,18 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
-    PROVIDER_SIDE_LOAD_CHECK_ENABLED: bool = Field(env="PROVIDER_SIDE_LOAD_CHECK_ENABLED", default=True)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
-    FOREIGN_GPU_WORKLOAD_CHECK_ENABLED: bool = Field(env="FOREIGN_GPU_WORKLOAD_CHECK_ENABLED", default=True)
+    # The executor's own stack is excused from the provider-side load by image digest, and any
+    # container started from that image carries it. Cores excused that way above this number are
+    # logged (PROVIDER_SIDE_LOAD_STACK_EXCUSE_HIGH); with the cap on, the tier then excuses nothing.
+    PROVIDER_SIDE_LOAD_STACK_EXCUSE_CORES: float = Field(
+        env="PROVIDER_SIDE_LOAD_STACK_EXCUSE_CORES", default=8.0, gt=0
+    )
+    PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED: bool = Field(
+        env="PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED", default=False
+    )
     FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
     )
@@ -351,10 +474,27 @@ class Settings(BaseSettings):
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in
     # uncorrected ECC or remapped rows, a pending or failed remap, or a required recovery action is a fault.
     # A card that faults under indexed access (Blender "Illegal address in CUDA queue", 6 Sep) passes the
-    # sequential matmul. CHECK runs it and logs the verdict; ENFORCEMENT lets a fault zero the score. Both
-    # default off: the probe is new GPU work on every idle node per cycle, so it starts as an opt-in shadow.
-    GPU_FAULT_PROBE_CHECK_ENABLED: bool = Field(env="GPU_FAULT_PROBE_CHECK_ENABLED", default=False)
+    # sequential matmul. It always runs and logs the verdict (DAH-4257 shadow, flag removed);
+    # ENFORCEMENT lets a fault zero the score and stays off until the owner decides.
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
+    # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
+    # row remap, a required recovery action) fails the node like a GPU ban until the host resets or
+    # replaces it. On: a broken card faults renters' jobs. Off is the kill switch back to flag-only.
+    GPU_MEMORY_HEALTH_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_MEMORY_HEALTH_ENFORCEMENT_ENABLED", default=True
+    )
+    # F-1599 — a 64 MB pinned-host-memory H2D/D2H round trip on every GPU of an idle node, compared on the host.
+    # A TDX guest whose GPUs are not in CC mode passed every check yet could not DMA pinned memory (8x H200,
+    # 13 Oct). CHECK runs it; wrong data, a copy error or a hung copy fails the node (enforced since the shadow
+    # review of prod logs). CHECK is on (milliseconds of copy per card; a probe that cannot start is UNKNOWN,
+    # never a fault).
+    PINNED_MEMORY_PROBE_CHECK_ENABLED: bool = Field(env="PINNED_MEMORY_PROBE_CHECK_ENABLED", default=True)
+    # A fault probe with no verdict passes. Five such cycles in a row on one node are logged
+    # (GPU_FAULT_PROBE_UNKNOWN_STREAK); with this on they are judged like a fault, which fails the
+    # node only while GPU_FAULT_PROBE_ENFORCEMENT_ENABLED is on too. Off by default.
+    GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED", default=False
+    )
     # DAH-3436: the synthetic rental probe. On an idle node (no renter pod, no filler) the validator
     # rents the node from itself once per RENTAL_PROBE_INTERVAL_HOURS: it starts the default renter
     # image through the same create_container path a renter's pod takes, with a probe-owned SSH key
@@ -363,25 +503,83 @@ class Settings(BaseSettings):
     # the container down through delete_container.
     # A failed step zeroes the score and clears the verified job (RENTAL_PROBE_FAILED), like the GPU
     # runtime quarantine, and the failed step stands in Redis until a probe passes: a later cycle with
-    # no verdict of its own (filler running, image gone, inconclusive) fails the node again with it; a
+    # no verdict of its own (image gone, inconclusive) fails the node again with it; a
     # rented node is left alone. An idle node with the image pulled is probed again every cycle until
-    # it passes. Off by default:
-    # it rents a container on every idle node every 6 h, so the team turns it on after staging.
-    RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
+    # it passes. Renters' most common complaint after GPU faults is a pod they cannot reach (SSH refused,
+    # "error connection"), the exact path this probe walks. It rents a container on every idle node every
+    # 6 h. Always on and enforcing.
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
-    # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
-    # wave writes nothing about it: no report row, no availability error, no evidence for the
-    # backend's staleness sweep. On, the wave writes one failed result per rented executor of that
-    # miner that the backend lists and the miner did not return (RENTED_EXECUTOR_NOT_LISTED,
-    # score 0, availability error). Manual rentals keep their forced pass. Off = today's behaviour.
-    RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED: bool = Field(
-        env="RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED", default=False
+    # A node whose containers cannot reach the internet passed every check. CHECK runs the rental probe's
+    # `egress` step, which resolves and fetches pypi.org inside its renter container; ENFORCEMENT fails the
+    # probe on it with NO_OUTBOUND_INTERNET (score 0). Slow still passes. Enforcement is off by default
+    # until its log-only window is reviewed. Decider: taiberium; backup jam6099.
+    NO_OUTBOUND_INTERNET_CHECK_ENABLED: bool = Field(env="NO_OUTBOUND_INTERNET_CHECK_ENABLED", default=True)
+    NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED: bool = Field(
+        env="NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED", default=False
+    )
+    # ticket-0361: a node failed 16 rents in 24 h, every one a template it did not have cached; its
+    # dockerd pulls through the mirror docker.m.daocloud.io, whose DNS lookup times out, while cached
+    # templates start fine. RegistryPullCheck removes and pulls a digest-pinned hello-world through the
+    # daemon (registry-mirrors apply) under a 30 s bound on idle nodes, once per INTERVAL_HOURS at a
+    # per-node phase (RETRY_MINUTES after a failed pull, so the confirming pull comes soon). A Docker Hub
+    # 429 is no verdict. Two failed pulls in a row (timeout, DNS error, unreachable, manifest unknown) are
+    # the finding: a fail (REGISTRY_PULL_FAILED, score 0). A failed pull counts only if the validator
+    # itself reaches Docker Hub. Nothing guards an outage only the nodes see (a CDN region, a shared
+    # mirror). Enforced since the log-only window's prod logs were clean (21 Oct 2026).
+    # DAH-3420: the host-side speed test runs on the host network; a renter's container crosses the docker bridge,
+    # NAT and runtime and can get 1000x less (297-588 Mbps on the host, under 1 Mbps from PyPI in a container). CHECK
+    # reads up to 16 MiB of a pinned PyPI wheel and a pinned Hugging Face file from a throwaway container on idle
+    # nodes once per INTERVAL_HOURS and logs CONTAINER_DOWNLOAD_SPEED; two failing readings in a row (30 min apart)
+    # are the finding and fail the node (CONTAINER_DOWNLOAD_SLOW, score 0) when both were read on the rentals network.
+    # MIN_MBPS is a fifth of NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS (50): one cold single-stream CDN object
+    # read 32-88 Mbps on healthy nodes (DAH-2959), so 50 would flag them; the defect is two orders of magnitude lower.
+    CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED: bool = Field(env="CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED", default=True)
+    CONTAINER_DOWNLOAD_SPEED_MIN_MBPS: float = Field(env="CONTAINER_DOWNLOAD_SPEED_MIN_MBPS", default=10.0, gt=0)
+    CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
+        env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
+    )
+    # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
+    # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
+    # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
+    # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
+    # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
+    # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
+    RENTED_THROUGHPUT_CHECK_ENABLED: bool = Field(env="RENTED_THROUGHPUT_CHECK_ENABLED", default=True)
+    RENTED_THROUGHPUT_INTERVAL_HOURS: float = Field(env="RENTED_THROUGHPUT_INTERVAL_HOURS", default=3.0, gt=0)
+    RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
+    RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
+    RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
+    # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
+    # renter can SSH into any container on the node either. The connector stamps that per executor and
+    # SshdBootstrapCheck fails the unrented node (SSHD_BOOTSTRAP_FAILED, score 0) until a filler create
+    # verifies sshd again. Enforcing by default: a listed node renters cannot reach. Off = logged as
+    # SSHD_BOOTSTRAP_FAILED_OBSERVED, score unchanged.
+    SSHD_BOOTSTRAP_ENFORCEMENT_ENABLED: bool = Field(env="SSHD_BOOTSTRAP_ENFORCEMENT_ENABLED", default=True)
+    REGISTRY_PULL_CHECK_ENABLED: bool = Field(env="REGISTRY_PULL_CHECK_ENABLED", default=True)
+    REGISTRY_PULL_PROBE_INTERVAL_HOURS: float = Field(
+        env="REGISTRY_PULL_PROBE_INTERVAL_HOURS", default=6.0, gt=0
+    )
+    REGISTRY_PULL_PROBE_RETRY_MINUTES: float = Field(
+        env="REGISTRY_PULL_PROBE_RETRY_MINUTES", default=30.0, gt=0
+    )
+    # DAH-4124, the unrented twin of the rented-not-listed row (DAH-3558, always on since
+    # DAH-4276): a node in the miner's known_executor_ids that is missing
+    # from its accepted executors (the miner could not reach it to install our key) gets no
+    # pipeline and no row, so it only "stops reporting". On, the wave writes one failed result per
+    # such unrented node (EXECUTOR_UNREACHABLE_BY_MINER, score 0, availability error). Off = today.
+    UNREACHABLE_EXECUTOR_REPORT_ENABLED: bool = Field(
+        env="UNREACHABLE_EXECUTOR_REPORT_ENABLED", default=False
     )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
-    CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
-    DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
+    # DAH-4001 — delayed idle settlement. off: today's behaviour, nothing reported. shadow: post every cycle's
+    # vector and per-node rows to the backend and read its settled vector every tempo for comparison only; live
+    # weights unchanged. enforce: submit the backend's settled vector (the cycles scored a day earlier, inactive
+    # nodes' idle shares moved to the verified burner); with none to serve, submit this tempo's vector with its
+    # idle moved to the burner, never an older vector.
+    SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
     EXECUTOR_IMAGE_REF: str = Field(
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
@@ -414,58 +612,75 @@ class Settings(BaseSettings):
     # real slow connects happen.
     SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=False, description="Enable verbose asyncssh SSH handshake debug logging and per-connect phase timing")
 
-    # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
-    # whose price_per_gpu exceeds market p90 * SOFT_LIMIT_PRICE_RATE loses the unrented
-    # rental incentive while staying active. When False, the breach is only logged
-    # (shadow mode) so prod impact can be observed before enforcing.
-    ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
-    # DAH-2520 — unrented VRAM/disk sanity gate. When True, an unrented executor whose
-    # total GPU VRAM exceeds the machine's total disk loses the unrented rental incentive
-    # while staying active. When False, the breach is only logged (shadow mode) so prod
-    # impact can be observed before enforcing.
-    ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT: bool = Field(env="ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", default=False)
+    # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
+    # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
+    LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # DAH-2546 — flagship capability gate. When True, an unrented 8x H200/B200/B300 executor
-    # with no NCU profiling counters open, no real GPU splitting enabled and no verified TDX
-    # quote (DAH-2594) loses the unrented rental incentive while staying active.
-    # When False, the breach is only logged
-    # (shadow mode) so prod impact can be observed before enforcing.
-    ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT: bool = Field(env="ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", default=False)
-
-    # DAH-2715 — GPU power cap capability gate. When True, an unrented executor whose
-    # container provably cannot apply a GPU power cap (no CAP_SYS_ADMIN, or /dev/nvidiactl
-    # not owned by root - see DAH-2705) loses the unrented rental incentive while staying
-    # active. A node whose probe is missing or unreadable is never penalized.
-    # Unlike the gates above this one ships ENFORCED: the fix is one compose flag on the
-    # provider's side, and the shadow window would only delay it. Set to False to fall back
-    # to logging the breach without withholding anything.
-    ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
-
-    # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
-    # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
-    # scoring the whole box as rented.
-    ENABLE_SPLIT_PARTIAL_RENTAL_SCORING: bool = Field(env="ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", default=True)
-
-    COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
+    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
+    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
+    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
+        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
-    CONTRACT_VERSIONS: dict = {
-        "1.0.2": {
-            "address": "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6",
-            "info": "3rd version: Fixed 'ExecutorNotOwned' error",
-        },
-    }
+
+    # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
+    # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
+    # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
+    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
+    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
+    # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
+    # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
+    # False: every spot node earns 0, as before.
+    ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
+    # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
+    # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
+    # Lium filler runs on it: a filler Lium did not start is Lium's doing (Fish). Provider-caused
+    # cases stay excluded by the shared rules. The amount is unchanged. False: paid only while a
+    # Lium filler runs on it, as before.
+    SPOT_IDLE_PAY_SECURE_DECISION_ENABLED: bool = Field(
+        env="SPOT_IDLE_PAY_SECURE_DECISION_ENABLED", default=False
+    )
+    # Spot rental incentive, independent of the flag above. True: a rented spot node the backend
+    # lists in provider_spot_executor_ids earns rental incentive at 0.5 x what the same node would
+    # earn rented as secure (0.5 = SPOT_RENTAL_INCENTIVE_FACTOR); a node that is spot as a
+    # restriction, and the free remainder of a partially rented spot node, earn 0 as before.
+    # False: every rented spot node earns 0, as before.
+    ENABLE_SPOT_RENTAL_INCENTIVE: bool = Field(env="ENABLE_SPOT_RENTAL_INCENTIVE", default=False)
+    # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
+    # bucket-cap dilution is raised to 1.0 x its configuration's average filler revenue, even above
+    # its listed rate (1.0 = SECURE_FILLER_REVENUE_FLOOR_FACTOR, set apart from the spot factor).
+    # False: dilution applies as before.
+    ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
+    # A configuration's filler average is used only when it was taken over at least this many
+    # filler GPU-hours; a thinner sample reads as no average.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
+
+    # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
+    # unrented node) when every pod in the batch-start rented list is stale: not running and its
+    # rental closed (STALE_POD_NOT_RUNNING). One running pod, one still-active rental, or a pod whose
+    # state cannot be read keeps the rented exemption. False: the run completes and its events say
+    # the node is hidden. It stops idle pay on those nodes, so it stays off until the validator owner
+    # turns it on.
+    ENFORCE_PORT_FLOOR_ON_STALE_POD: bool = Field(env="ENFORCE_PORT_FLOOR_ON_STALE_POD", default=False)
+
+    # collateral_deposited keeps its meaning for the backend's provider statistics and the support board:
+    # the miner's associated EVM address owns the executor on this contract and its collateral covers
+    # required_deposit_amount × gpu_count × COLLATERAL_DAYS. It has no score effect. The read is the contract's
+    # storage at the finalized block through the Substrate JSON-RPC (state_getStorage), so the URL must be a
+    # Subtensor node; it is cached per executor for COLLATERAL_STATUS_CACHE_SECONDS.
+    SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
+    COLLATERAL_CONTRACT_ADDRESS: str = Field(
+        env="COLLATERAL_CONTRACT_ADDRESS", default="0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6"
+    )
+    COLLATERAL_CONTRACT_VERSION: str = "1.0.2"
+    COLLATERAL_DAYS: int = 7
+    COLLATERAL_STATUS_TIMEOUT_SECONDS: float = Field(env="COLLATERAL_STATUS_TIMEOUT_SECONDS", default=5.0, gt=0)
+    COLLATERAL_STATUS_CACHE_SECONDS: int = Field(env="COLLATERAL_STATUS_CACHE_SECONDS", default=1800, ge=0)
+
     FEATURE_FLAGS: dict[str, bool] = {
         FeatureFlag.VERIFYX_NETWORK_VALIDATION: False,  # If it's True - then bad internet connection will raise error on synthetic job
     }
 
-    # GPU types that will be excluded in collateral checks
-    COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
-        "NVIDIA B200"
-    ]
-    
     # TDX Attestation settings
-    ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
     TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)
     ENABLE_ATTESTATION_WHITELIST: bool = Field(env="ENABLE_ATTESTATION_WHITELIST", default=False)
 
@@ -491,16 +706,18 @@ class Settings(BaseSettings):
     # Issued nonce validity window; a quote echoing an older nonce is stale.
     ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
 
-    # DAH-2828: customer pods on CVM nodes get /var/run/dstack.sock through the quote-only broker
-    # (services/cvm_quote_broker.py). Kill switch only; off = pods get no quote path.
-    ENABLE_CVM_POD_QUOTE_SOCKET: bool = Field(env="ENABLE_CVM_POD_QUOTE_SOCKET", default=True)
-
     # G1 — NVIDIA GPU confidential-compute attestation (validator-side verification).
     # Off = observe-only: nvidia_payload, when present, is verified and logged but
     # never affects the outcome. On = a CVM executor (verified TDX quote) must supply
     # GPU evidence bound to the issued nonce; any failure raises AttestationError.
     ENABLE_GPU_ATTESTATION_ENFORCEMENT: bool = Field(
         env="ENABLE_GPU_ATTESTATION_ENFORCEMENT", default=False
+    )
+    # DAH-4551 - GpuAttestationIdentityCheck: each Hopper/Blackwell GPU's NVIDIA-signed identity, pinned to its
+    # UUID both ways. Shadow by default: a mismatch or forged evidence is logged as a warning event and the node
+    # passes. On = it fails the node (not fatal with a live rental). Unavailable evidence alone never fails it.
+    GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED", default=False
     )
     # Hosted NRAS endpoint (interim verification locus; a local nv-verifier removes
     # this outbound SPOF before fleet enforcement — see remediation plan CD4).
@@ -530,21 +747,41 @@ class Settings(BaseSettings):
     def get_allowed_advisory_ids(self) -> set[str]:
         return {s.strip() for s in self.TDX_ALLOWED_ADVISORY_IDS.split(",") if s.strip()}
 
+    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]]:
+        """`LIUMD_SHADOW_RESERVED_EXECUTORS` as (miner_hotkey, executor_uuid, address, ssh_port).
+        A malformed entry raises ValueError rather than being dropped."""
+        reserved = set()
+        for entry in self.LIUMD_SHADOW_RESERVED_EXECUTORS.split(","):
+            if not entry.strip():
+                continue
+            fields = [f.strip() for f in entry.split("/")]
+            if len(fields) != 4 or not all(fields) or not fields[3].isdigit():
+                raise ValueError(
+                    "LIUMD_SHADOW_RESERVED_EXECUTORS entry is not "
+                    f"miner_hotkey/executor_uuid/address/ssh_port: {entry.strip()!r}"
+                )
+            hotkey, uuid, address, ssh_port = fields
+            reserved.add((hotkey, uuid, address, int(ssh_port)))
+        return reserved
+
     def get_allowed_gpu_hwmodels(self) -> set[str]:
         return {s.strip() for s in self.GPU_ATTESTATION_ALLOWED_HWMODELS.split(",") if s.strip()}
 
-    # Use REST API instead of WebSocket for miner communication
-    USE_REST_API: bool = Field(env="USE_REST_API", default=False)
+    def get_scoring_excluded_hotkeys(self) -> set[str]:
+        return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
+
+    # A rented node missing from its miner's answer for ONE cycle is mostly a key upload that missed the miner's 10 s
+    # window: 86 of the 347 RENTED_EXECUTOR_NOT_LISTED rows on 19 Oct were back in the next answer. On: the row is
+    # written from the second consecutive miss. Off by default: provider scoring, enabling it is the penalty owners' call.
+    RENTED_NOT_LISTED_ONE_CYCLE_GRACE: bool = Field(env="RENTED_NOT_LISTED_ONE_CYCLE_GRACE", default=False)
 
     # DAH-2958 — express lane for never-validated executors. A new node is published only by
     # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and
     # then for the slowest miner in the fleet (2–9 min): node add → AVAILABLE p50 21.4 min over
-    # 175 onboardings, floor 8.2 min. With the flag on, core/express_lane.py polls the portal's
+    # 175 onboardings, floor 8.2 min. core/express_lane.py polls the portal's
     # executor snapshot every TICK seconds, runs the SAME pipeline the cycle runs on executors
     # this validator has never published, and publishes the result spec-only (no scored_at, so
-    # no incentive ledger row); the next cycle scores and overwrites it as today. Off by default:
-    # flag off = today's behaviour, nothing else in this block is read.
-    EXPRESS_LANE_ENABLED: bool = Field(env="EXPRESS_LANE_ENABLED", default=False)
+    # no incentive ledger row); the next cycle scores and overwrites it as today.
     EXPRESS_LANE_TICK_SECONDS: int = Field(env="EXPRESS_LANE_TICK_SECONDS", default=30)
     # Hard bound on the extra load a registration flood can add: at most this many express
     # verifications in flight at once (so also per tick), and per miner.
@@ -552,6 +789,37 @@ class Settings(BaseSettings):
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
+    # Validation fast path for a new node's first, unscored verification (the express lane's).
+    # Every check still runs and decides as it does today; only the waiting changes:
+    # - the checks with no data dependency run at once (`PipelineFactory.build_checks(fast_path=True)`:
+    #   the matmul chain beside the port/sysbox/rental-check chain, after VerifyX has measured the
+    #   network alone — the split and the order the executor's own one-call verification uses);
+    # - the express lane ticks every EXPRESS_LANE_FAST_TICK_SECONDS and, when the miner's portal
+    #   snapshot does not list the node yet, asks again after EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS
+    #   (the central miner refreshes that snapshot every 30 s); the 120-s retry stays for every other reason.
+    # Scored cycles never take this path: the wave passes first_pass=False. Off by default.
+    VALIDATION_FAST_PATH_ENABLED: bool = Field(env="VALIDATION_FAST_PATH_ENABLED", default=False)
+    EXPRESS_LANE_FAST_TICK_SECONDS: int = Field(env="EXPRESS_LANE_FAST_TICK_SECONDS", default=15, gt=0)
+    EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS: int = Field(
+        env="EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS", default=35, gt=0
+    )
+    # With the fast re-ask the lane asks this many times for a node the miner did not list yet, so
+    # the window it covers (7 × 35 s ≈ 245 s) stays at least the serial one (2 × 120 s = 240 s).
+    EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS: int = Field(
+        env="EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS", default=8, gt=0
+    )
+
+    # A new node whose first pass failed is run again by the lane (up to 3 runs, 60 s
+    # apart) instead of waiting for the next cycle; off = the failed result waits for the cycle.
+    EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED: bool = Field(
+        env="EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED", default=True
+    )
+
+    def express_lane_tick_seconds(self) -> int:
+        """How often the express lane reads the portal snapshot: the fast tick with the fast path on."""
+        if self.VALIDATION_FAST_PATH_ENABLED:
+            return min(self.EXPRESS_LANE_TICK_SECONDS, self.EXPRESS_LANE_FAST_TICK_SECONDS)
+        return self.EXPRESS_LANE_TICK_SECONDS
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
@@ -564,6 +832,21 @@ class Settings(BaseSettings):
     CUSTOM_DOCKERFILE_MAX_BYTES: int = Field(
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,
         description="Defense-in-depth cap on dockerfile_content size; route is authoritative.",
+    )
+    CUSTOM_DOCKERFILE_BUILD_CONTEXT_HOSTS: str = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_CONTEXT_HOSTS", default="",
+        description=(
+            "Comma-separated hosts a build_context_url may name (https only). Empty: a request that "
+            "names a build context fails at build_context instead of building without the files."
+        ),
+    )
+    CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_BYTES: int = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_BYTES", default=100 * 1024 * 1024, gt=0,
+        description="Largest build-context archive the validator downloads (compressed bytes).",
+    )
+    CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_UNPACKED_BYTES: int = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_UNPACKED_BYTES", default=1024 * 1024 * 1024, gt=0,
+        description="Largest total size of the files in a build-context archive.",
     )
     # DAH-2211 — internet-enabled custom builds run inside a throwaway sysbox
     # Docker-in-Docker container (NOT on the host daemon) so the build can
@@ -582,9 +865,61 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_DIND_MEMORY", default="8g",
         description="--memory limit for the throwaway DinD build container.",
     )
+    RENTAL_PIDS_LIMIT_PER_CPU: int = Field(
+        env="RENTAL_PIDS_LIMIT_PER_CPU", default=4096, ge=0,
+        description=(
+            "cgroup pids.max granted to a rental container per allocated CPU. 0 disables the limit "
+            "(rollback switch). The product is clamped to RENTAL_PIDS_LIMIT_CAP; a rental with no "
+            "per-pod CPU cap (whole host) gets RENTAL_PIDS_LIMIT_CAP. Stops a tenant fork bomb from "
+            "exhausting the host PID space and taking the executor offline mid-rental."
+        ),
+    )
+    RENTAL_PIDS_LIMIT_CAP: int = Field(
+        env="RENTAL_PIDS_LIMIT_CAP", default=1_048_576, gt=0,
+        description=(
+            "Absolute ceiling for a rental container's pids.max, and the value used when the rental "
+            "has no per-pod CPU cap. Kept well below a host's kernel.pid_max so a fork bomb still hits "
+            "the cgroup wall first."
+        ),
+    )
+    RENTAL_PIDS_LIMIT_HOST_MARGIN: int = Field(
+        env="RENTAL_PIDS_LIMIT_HOST_MARGIN", default=4096, ge=0,
+        description=(
+            "PIDs reserved for the host's own tasks (sshd, dockerd, the executor) when a rental "
+            "container's pids.max is clamped to the executor's actual kernel.pid_max. The container "
+            "gets min(scaled cap, kernel.pid_max - this), so on a host with a low kernel.pid_max it "
+            "still cannot exhaust the global PID space before hitting its own cgroup wall."
+        ),
+    )
+    RENTAL_HOST_RAM_RESERVE_GB: int = Field(
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=4, ge=0,
+        description=(
+            "RAM kept back for the host (sshd, dockerd, the executor) when a rental arrives with no "
+            "memory limit: the container gets host MemTotal minus max(this, "
+            "RENTAL_HOST_RAM_RESERVE_PERCENT), so a renter cannot exhaust the host's memory."
+        ),
+    )
+    RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
+        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
+    )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
-        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60,
-        description="Max seconds to wait for the inner DinD dockerd to become ready.",
+        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
+        description=(
+            "Readiness budget for the inner DinD dockerd: this many one-second probes; each probe is "
+            "bounded by min(this value, 10) s (a `docker info` that hangs counts as one not-ready "
+            "probe). Zero or negative would cancel the only probe, so the setting refuses them at "
+            "load time."
+        ),
+    )
+    CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", default=180, gt=0,
+        description=(
+            "Max seconds for each setup command before a custom build (sysbox preflight, DinD "
+            "start including its image pull, IP and resolver reads, the egress firewall helper, "
+            "the Dockerfile write; the readiness loop keeps CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS). "
+            "A command over the bound fails the build at its own step instead of leaving the pod PENDING."
+        ),
     )
     CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS: str = Field(
         env="CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS",
@@ -596,15 +931,7 @@ class Settings(BaseSettings):
         ),
     )
     
-    ENABLE_VOLUME_ENCRYPTION: bool = Field(env="ENABLE_VOLUME_ENCRYPTION", default=True)
     VOLUME_MASTER_SECRET: str | None = Field(env="VOLUME_MASTER_SECRET", default=None)
-    # DAH-2545 switch, off until the plaintext window is closed. A restarted container runs its own
-    # entrypoint and startup_commands before gocryptfs can be mounted into it, so writes to the
-    # plaintext path in that window land unencrypted in the container's upper layer on the miner's
-    # disk. The same window exists on the pod-creation path today; until it is closed for both,
-    # encrypted pods keep the pre-DAH-2545 behaviour — skipped, and the miner keeps the
-    # POD_NOT_RUNNING verdict.
-    RECOVER_ENCRYPTED_VOLUMES: bool = Field(env="RECOVER_ENCRYPTED_VOLUMES", default=False)
 
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 
@@ -614,13 +941,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_volume_encryption_secret(self) -> "Settings":
-        if self.ENABLE_VOLUME_ENCRYPTION:
-            secret = self.VOLUME_MASTER_SECRET
-            if secret is None or len(secret) < 32:
-                raise ValueError(
-                    "ENABLE_VOLUME_ENCRYPTION requires VOLUME_MASTER_SECRET "
-                    "of at least 32 characters"
-                )
+        secret = self.VOLUME_MASTER_SECRET
+        if secret is None or len(secret) < 32:
+            raise ValueError("VOLUME_MASTER_SECRET is required and must be at least 32 characters")
+        # one unit of up to 8 bytes repeated holds at most 64 bits however long it is; a random secret
+        # of 32+ characters is never one (odds about 2^-96 for hex). A warning, not a refusal: the
+        # remedy, a new secret, leaves every volume encrypted under the old one unreadable
+        encoded = secret.encode()
+        if any(encoded[period:] == encoded[:-period] for period in range(1, 9)):
+            logger.warning("VOLUME_MASTER_SECRET repeats a unit of at most 8 bytes, so it holds at most 64 bits")
         return self
 
     def get_bittensor_wallet(self) -> "Wallet":
@@ -638,9 +967,6 @@ class Settings(BaseSettings):
         if self.REDIS_USERNAME and self.REDIS_PASSWORD:
             return f"redis://{self.REDIS_USERNAME}:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{int(self.REDIS_PORT)}"
         return f"redis://{self.REDIS_HOST}:{int(self.REDIS_PORT)}"
-
-    def get_latest_contract_version(self) -> str:
-        return max(self.CONTRACT_VERSIONS.keys())
 
     def get_referral_feed_url(self) -> str:
         """Referral-weights feed URL, derived from COMPUTE_REST_API_URL unless overridden.
@@ -664,10 +990,22 @@ class Settings(BaseSettings):
         if self.BITTENSOR_NETWORK:
             config.subtensor.network = self.BITTENSOR_NETWORK
 
-        if self.BITTENSOR_CHAIN_ENDPOINT:
-            config.subtensor.chain_endpoint = self.BITTENSOR_CHAIN_ENDPOINT
+        first_endpoint = self.get_chain_endpoints()[0]
+        if first_endpoint.source != PUBLIC_NODE_SOURCE:
+            config.subtensor.chain_endpoint = first_endpoint.value
 
         return config
+
+    def get_chain_endpoints(self) -> list[ChainEndpoint]:
+        """The ordered dial list: `BITTENSOR_CHAIN_ENDPOINTS` (comma-separated) or the single
+        `BITTENSOR_CHAIN_ENDPOINT`, then the public `BITTENSOR_NETWORK` node last. A connect or
+        read failure moves the client to the next entry; the failed entry is dialled again only
+        after `BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS`."""
+        return chain_endpoint_candidates(
+            chain_endpoints=self.BITTENSOR_CHAIN_ENDPOINTS,
+            chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
+            network=self.BITTENSOR_NETWORK,
+        )
 
     def get_debug_miner(self) -> dict:
         if not self.debug.MINER_ADDRESS or not self.debug.MINER_PORT:

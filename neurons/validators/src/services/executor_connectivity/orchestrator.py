@@ -1,5 +1,4 @@
 import random
-import logging
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -7,9 +6,11 @@ from services.const import BATCH_PORT_VERIFICATION_SIZE
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
-from services.executor_connectivity.port_selector import PortSelector
-
-logger = logging.getLogger(__name__)
+from services.executor_connectivity.port_selector import (
+    PortSelector,
+    declared_ports,
+    tally_port_ranges,
+)
 
 
 class ConnectivityOrchestrator:
@@ -40,9 +41,15 @@ class ConnectivityOrchestrator:
             "executor_uuid": executor_info.uuid,
             "executor_ip": executor_info.address,
         }
+        declared = declared_ports(executor_info)
+        unavailable = set(unavailable_ports or [])
         ports = self.port_selector.select(
-            executor_info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable_ports or [])
+            executor_info,
+            BATCH_PORT_VERIFICATION_SIZE,
+            unavailable,
+            declared=declared,
         )
+        declared_port_count = len(declared)
 
         if not ports:
             return PortVerificationResult(
@@ -53,6 +60,8 @@ class ConnectivityOrchestrator:
                 dind_ok=False,
                 sysbox_runtime=sysbox_runtime,
                 status="no_ports",
+                declared_port_count=declared_port_count,
+                port_ranges=tally_port_ranges(declared, (), ()),
             )
 
         probe_result = await self.port_probe.probe(
@@ -66,6 +75,7 @@ class ConnectivityOrchestrator:
         failed = list(probe_result.failed)
 
         dind_port = successful.pop(0) if successful else random.choice(ports)
+        sysbox_requested = sysbox_runtime
         dind_result = await self.dind_probe.verify(
             dind_port,
             ssh_client=ssh_client,
@@ -82,7 +92,17 @@ class ConnectivityOrchestrator:
             failed.append(dind_port)
             sysbox_runtime = False
 
-        status = "ok" if successful else "no_working_ports"
+        externally_unreachable = probe_result.tier == "external_blocked"
+        if externally_unreachable:
+            # DAH-4537: renters cannot reach the host, so no port counts, whatever the validator reached
+            failed, successful = failed + successful, []
+
+        port_ranges = tally_port_ranges(declared, ports, successful)
+
+        if externally_unreachable:
+            status = "externally_unreachable"
+        else:
+            status = "ok" if successful else "no_working_ports"
         return PortVerificationResult(
             selected_ports=tuple(ports),
             successful_ports=tuple(successful),
@@ -92,4 +112,8 @@ class ConnectivityOrchestrator:
             sysbox_runtime=sysbox_runtime,
             status=status,
             dind_error=dind_result.error,
+            probe_tier=probe_result.tier,
+            declared_port_count=declared_port_count,
+            port_ranges=port_ranges,
+            sysbox_measured=dind_result.sysbox_runtime if dind_result.success and sysbox_requested else None,
         )

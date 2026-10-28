@@ -29,15 +29,21 @@ class PortProbe:
         log_ctx: dict | None = None,
     ) -> PortProbeResult:
         log_ctx = log_ctx or {}
-        successful, failed = await self.batch_verifier.verify(
+        batch = await self.batch_verifier.verify(
             ports,
             ssh_client=ssh_client,
             host=host,
             log_ctx=log_ctx,
         )
+        if batch.external_blocked:
+            # the other tiers probe from the validator too, so they would pass the same host
+            return PortProbeResult((), tuple(ports), "external_blocked")
+        successful, failed = batch.successful, batch.failed
+        tier = "batch"
 
         if not successful:
-            logger.warning(
+            # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
+            logger.debug(
                 _m("batch verification failed, trying semi-batch", extra=get_extra_info(log_ctx))
             )
             successful, failed = await self.semi_batch_verifier.verify(
@@ -47,9 +53,10 @@ class PortProbe:
                 max_ports=50,
                 log_ctx=log_ctx,
             )
+            tier = "semi_batch"
 
         if not successful:
-            logger.warning(
+            logger.debug(
                 _m("semi-batch verification failed, trying fallback", extra=get_extra_info(log_ctx))
             )
             successful, failed = await self.fallback_verifier.verify(
@@ -59,5 +66,6 @@ class PortProbe:
                 max_ports=10,
                 log_ctx=log_ctx,
             )
+            tier = "fallback"
 
-        return PortProbeResult(tuple(successful), tuple(failed))
+        return PortProbeResult(tuple(successful), tuple(failed), tier)

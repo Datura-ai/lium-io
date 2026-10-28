@@ -3,6 +3,10 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from typing import Literal, NamedTuple
+
+from pydantic import BaseModel, ValidationError
+from payload_models.payloads import WorkloadKind
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
@@ -18,17 +22,44 @@ MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 INSPECTOR_EVENT_CHANNEL = "INSPECTOR_EVENT_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
+# DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
+POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
+GPU_RESET_PENDING_KIND = "gpu_reset"
+# DAH-4658: the pod of a renter GPU reset that ended a moment ago, per node, for a short TTL
+GPU_RESET_RECENT_PREFIX = "gpu_reset_recent"
+# DAH-4658: a rented node's last scored result, carried into a cycle where the renter's own GPU reset hides the cards
+LAST_SCORED_RESULT_PREFIX = "last_scored_result"
+LAST_SCORED_RESULT_TTL_SECONDS = 60 * 60
+# DAH-4698: creates the backend sent that are running in this connector right now, by pod id; what is left when a
+# connector starts was cut off by the restart (a redeploy recreates the connector mid-create)
+INFLIGHT_BACKEND_CREATES_KEY = "inflight_backend_creates"
+BACKEND_COMMAND_PREFIX = "backend_command:"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
+RENTAL_PROBE_OK_PREFIX = "rental_probe_ok"
+RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
+# filler container name -> JSON list of the image digests (bare sha256) the validator started it from
+FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
+FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# set by a filler create whose sshd never came up in the container, cleared by one where it did
+SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
+# prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
+# longest gap about twice over; a stale stamp ends by itself
+SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
+# sshd_bootstrap.sh's verify_sshd line: sshd is installed but not running or listening
+SSHD_VERIFY_FAILED_MARKER = "sshd verification failed"
+# where the sshd bootstrap script is copied in a filler container
+IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 # The anchor: the GPU UUID set of the executor's first successful verification, kept by every later write.
 GPU_ANCHOR_KEY = "uuids"
 # DAH-3457: field of a verified-job record, set once by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED and kept by
 # every later write; read back by the same check, which then fails the node without comparing the sets.
 GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
+
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
@@ -45,6 +76,13 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
+# ticket-0494: one key per executor while its last DinD probe that reached the container found sysbox.
+SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
+# One key per executor: when this validator first found it without its recommended default image
+# (epoch seconds). Opens CachedTemplateVerificationCheck's fresh-node grace.
+CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
+# One key per (miner hotkey, executor): what the rented GPU health read flagged and when (DAH-4482).
+POST_RENTAL_GPU_RECHECK_PREFIX = "post_rental_gpu_recheck"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
@@ -98,19 +136,72 @@ REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 
-class _PassThroughLock:
-    """`RedisService.lock` with REDIS_COMMAND_LOCK_ENABLED off (DAH-3006): every `async with
-    self.lock:` site stays as it is, but nothing waits — each call is one atomic Redis command
-    and the pool bounds the concurrency."""
+class BackendCommand(BaseModel):
+    state: Literal["running", "finished"]
+    owner: str = ""
+    responses: list[str] = []
 
-    async def __aenter__(self):
+
+class InflightBackendCreate(BaseModel):
+    miner_hotkey: str
+    executor_id: str
+    workload_kind: WorkloadKind
+    started_at_unix_seconds: int
+
+
+class RedisWrite(NamedTuple):
+    """One queued write of a `RedisWrites` batch."""
+
+    command: str
+    args: tuple[str | int, ...]
+    kwargs: dict[str, int | None]
+
+
+class RedisWrites:
+    """Writes that apply together or not at all: `RedisService.write_atomically` runs them as one
+    MULTI/EXEC. A state kept in several keys (a mark and a streak, a hash and its TTL) is moved in one
+    step, so a connection lost between two writes cannot leave half of it behind (DAH-2870: a
+    healthy SET followed by a failed DELETE kept the old streak next to a fresh ok mark).
+    Only the write commands the validator uses are offered; the methods chain."""
+
+    def __init__(self):
+        self.ops: list[RedisWrite] = []
+
+    def set(self, key: str, value: str, ex: int | None = None) -> "RedisWrites":
+        self.ops.append(RedisWrite("set", (key, value), {"ex": ex}))
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
+    def delete(self, key: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("delete", (key,), {}))
+        return self
 
-    def locked(self) -> bool:
-        return False
+    def hset(self, key: str, field: str, value: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("hset", (key, field, value), {}))
+        return self
+
+    def expire(self, key: str, seconds: int) -> "RedisWrites":
+        self.ops.append(RedisWrite("expire", (key, seconds), {}))
+        return self
+
+    def __len__(self) -> int:
+        return len(self.ops)
+
+
+class RecentGpuReset(BaseModel):
+    """DAH-4658: a renter GPU reset that ended a moment ago; a mark written before it named its GPUs has none."""
+
+    pod_id: str
+    gpu_uuids: list[str] = []
+
+
+def last_scored_result_key(miner_hotkey: str, executor_id: str) -> str:
+    return f"{LAST_SCORED_RESULT_PREFIX}:{miner_hotkey}:{executor_id}"
+
+
+def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
+    """The verified record is per (miner hotkey, executor id): an executor id is unique only per hotkey, so a
+    hotkey that lists another's executor id writes, resets and marks only its own record."""
+    return f"{miner_hotkey}:{executor_id}"
 
 
 class RedisService:
@@ -140,7 +231,7 @@ class RedisService:
                 retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
             )
         )
-        self.lock = asyncio.Lock() if settings.REDIS_COMMAND_LOCK_ENABLED else _PassThroughLock()
+        self.lock = asyncio.Lock()
 
     @asynccontextmanager
     async def acquire_executor_lock(
@@ -285,6 +376,33 @@ class RedisService:
         """Forget the recorded miss: the probe reached its container again."""
         await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
 
+    @staticmethod
+    def _sysbox_verified_key(miner_hotkey: str, executor_id: str) -> str:
+        return f"{SYSBOX_VERIFIED_PREFIX}:{miner_hotkey}:{executor_id}"
+
+    async def record_sysbox_verified(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> None:
+        """A DinD probe reached its container and sysbox worked; remembered for ttl_seconds."""
+        async with self.lock:
+            await self.redis.set(self._sysbox_verified_key(miner_hotkey, executor_id), "1", ex=ttl_seconds)
+
+    async def clear_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> None:
+        """A DinD probe reached its container and sysbox did not work: forget the earlier pass."""
+        await self.delete(self._sysbox_verified_key(miner_hotkey, executor_id))
+
+    async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
+        return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
+
+    async def first_uncached_at(self, executor_id: str, now: float, ttl_seconds: int) -> float:
+        """When this validator first found the executor without its recommended image (epoch s).
+
+        SET NX keeps the first sighting, so every later cycle inside the TTL reads the same instant.
+        """
+        key = f"{CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX}:{executor_id}"
+        async with self.lock:
+            await self.redis.set(key, repr(now), ex=ttl_seconds, nx=True)
+            value = await self.redis.get(key)
+        return float(value) if value is not None else now
+
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
         async with self.lock:
@@ -295,10 +413,27 @@ class RedisService:
         async with self.lock:
             return await self.redis.get(key)
 
+    async def mget(self, keys: list[str]) -> list:
+        """Several GETs in one round trip and one lock hold; None for a missing key."""
+        if not keys:
+            return []
+        async with self.lock:
+            return await self.redis.mget(keys)
+
     async def delete(self, key: str):
         """Remove a key from Redis."""
         async with self.lock:
             await self.redis.delete(key)
+
+    async def expire(self, key: str, seconds: int):
+        """Set (or refresh) a key's time to live."""
+        async with self.lock:
+            await self.redis.expire(key, seconds)
+
+    async def persist(self, key: str):
+        """Remove a key's time to live, so it stays until deleted."""
+        async with self.lock:
+            await self.redis.persist(key)
 
     async def sadd(self, key: str, elem: str) -> int:
         """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""
@@ -328,6 +463,11 @@ class RedisService:
         """Get all elements from a list in Redis in order."""
         async with self.lock:
             return await self.redis.lrange(key, 0, -1)
+
+    async def llen(self, key: str) -> int:
+        """Number of elements in a list in Redis."""
+        async with self.lock:
+            return await self.redis.llen(key)
 
     async def lrem(self, key: str, element: bytes, count: int = 0):
         """Remove elements from a list in Redis."""
@@ -364,6 +504,22 @@ class RedisService:
     async def hdel(self, key: str, *fields: str):
         async with self.lock:
             await self.redis.hdel(key, *fields)
+
+    async def write_atomically(self, writes: RedisWrites) -> None:
+        """Apply every write in `writes` as one MULTI/EXEC, or none of them.
+
+        The server applies the queued commands at EXEC as one unit, so a connection lost before EXEC
+        reaches it applies nothing, and one lost after it applies all of it (the client raises either
+        way; the caller sees "this transition did not happen" or the whole transition). The server
+        refusing one command is a bug in the batch, not a Redis state.
+        """
+        if not writes.ops:
+            return
+        async with self.lock:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                for write in writes.ops:
+                    getattr(pipe, write.command)(*write.args, **write.kwargs)
+                await pipe.execute()
 
     async def clear_by_pattern(self, pattern: str):
         async with self.lock:
@@ -430,11 +586,24 @@ class RedisService:
             logger.error(_m("Error getting executor uptime: {e}", extra={"error": e}), exc_info=True)
             return 0
 
-    async def add_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+    async def add_pending_pod(
+        self,
+        miner_hotkey: str,
+        executor_id: str,
+        pod_id: str,
+        kind: str | None = None,
+        gpu_uuids: list[str] | None = None,
+    ):
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
         now = int(time.time())
-        
-        pending_pods.append({"time": now, "pod_id": pod_id})
+
+        item: dict = {"time": now, "pod_id": pod_id}
+        if kind:
+            # DAH-4658: "gpu_reset" marks a renter's own GPU reset, which the rented GPU checks skip
+            item["kind"] = kind
+        if gpu_uuids:
+            item["gpu_uuids"] = list(gpu_uuids)
+        pending_pods.append(item)
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
@@ -444,7 +613,74 @@ class RedisService:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
         else:
             await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
-    
+
+    async def claim_backend_command(self, command_id: str, claim: str) -> BackendCommand | None:
+        key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
+        while True:
+            if await self.redis.set(
+                key, claim, nx=True, ex=settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS
+            ):
+                return None
+            existing = await self.redis.get(key)
+            if existing is not None:
+                existing = BackendCommand.model_validate_json(existing)
+                # Redis may retry SET NX after storing our claim but losing the reply.
+                return None if existing == BackendCommand.model_validate_json(claim) else existing
+
+    async def update_backend_command(
+        self, command_id: str, claim: str, value: str, ttl: int
+    ) -> None:
+        # Compare ownership atomically: a stale job must not touch a retry's claim.
+        await self.redis.eval(
+            """
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                if ARGV[2] == '' then
+                    return redis.call('DEL', KEYS[1])
+                end
+                return redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+            end
+            """,
+            1,
+            f"{BACKEND_COMMAND_PREFIX}{command_id}",
+            claim,
+            value,
+            ttl,
+        )
+
+    async def clear_running_backend_commands(self) -> None:
+        async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
+            value = await self.redis.get(key)
+            if value is not None and BackendCommand.model_validate_json(value).state == "running":
+                await self.redis.delete(key)
+
+    async def add_inflight_backend_create(
+        self, pod_id: str, miner_hotkey: str, executor_id: str, workload_kind: WorkloadKind
+    ) -> None:
+        create = InflightBackendCreate(
+            miner_hotkey=miner_hotkey,
+            executor_id=executor_id,
+            workload_kind=workload_kind,
+            started_at_unix_seconds=int(time.time()),
+        )
+        await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
+
+    async def remove_inflight_backend_create(self, pod_id: str) -> None:
+        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+
+    async def inflight_backend_creates(self) -> dict[str, InflightBackendCreate]:
+        """pod id -> the create the backend sent for it"""
+        raw = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
+        creates: dict[str, InflightBackendCreate] = {}
+        for raw_pod_id, entry in raw.items():
+            pod_id = raw_pod_id.decode() if isinstance(raw_pod_id, bytes) else raw_pod_id
+            try:
+                creates[pod_id] = InflightBackendCreate.model_validate_json(entry)
+            except ValidationError:
+                # one bad entry must not block the sweep of the others on every start
+                logger.error(_m("Dropping an unreadable inflight backend create", extra={"pod_id": pod_id}))
+                await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+        return creates
+
     async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
@@ -466,6 +702,29 @@ class RedisService:
             pending_pods.append(item)
         
         return pending_pods
+
+    async def gpu_reset_marks(self, miner_hotkey: str, executor_id: str) -> list[dict]:
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        return [item for item in pending_pods if item.get("kind") == GPU_RESET_PENDING_KIND]
+
+    async def mark_gpu_reset_recent(
+        self, miner_hotkey: str, executor_id: str, pod_id: str, gpu_uuids: list[str], seconds: int
+    ) -> None:
+        # ponytail: one pod per node; a second pod's reset in the same window replaces the first
+        mark = RecentGpuReset(pod_id=pod_id, gpu_uuids=gpu_uuids)
+        await self.set(f"{GPU_RESET_RECENT_PREFIX}:{miner_hotkey}:{executor_id}", mark.model_dump_json(), ex=seconds)
+
+    async def gpu_reset_recent(self, miner_hotkey: str, executor_id: str) -> RecentGpuReset | None:
+        """The node's renter GPU reset that ended within the mark's TTL, if any."""
+        raw = await self.get(f"{GPU_RESET_RECENT_PREFIX}:{miner_hotkey}:{executor_id}")
+        if not raw:
+            return None
+        raw = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            return RecentGpuReset.model_validate_json(raw)
+        except ValidationError:
+            # a mark written before it named its GPUs: the bare pod id
+            return RecentGpuReset(pod_id=raw)
 
     async def renting_in_progress(self, miner_hotkey: str, executor_id: str, pod_id: str | None = None) -> bool:
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
@@ -511,7 +770,7 @@ class RedisService:
         if prev_info.get(GPU_ANCHOR_BROKEN_KEY):
             data[GPU_ANCHOR_BROKEN_KEY] = True
 
-        await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        await self.hset(VERIFIED_JOB_COUNT_KEY, _verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
     async def clear_verified_job_info(
         self,
@@ -521,9 +780,11 @@ class RedisService:
         reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
         evidence: dict | None = None,
         anchor_broken: bool = False,
+        reanchor_uuids: str = '',
     ):
         spec = prev_info.get('spec', '')
-        uuids = prev_info.get(GPU_ANCHOR_KEY, '')
+        # a whole replaced set is anchored now, so a second swap inside the hold is judged against it
+        uuids = reanchor_uuids or prev_info.get(GPU_ANCHOR_KEY, '')
 
         data = {
             "count": 0,
@@ -533,7 +794,7 @@ class RedisService:
         }
         if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
             data[GPU_ANCHOR_BROKEN_KEY] = True
-        await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        await self.hset(VERIFIED_JOB_COUNT_KEY, _verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the
         # penalty row (lium-platform DAH-3385). Optional on the wire: an older backend ignores the keys.
@@ -552,8 +813,16 @@ class RedisService:
             },
         )
 
-    async def get_verified_job_info(self, executor_id: str):
-        data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
+    async def get_verified_job_info(self, miner_hotkey: str, executor_id: str, listed_owner_hotkey: str | None = None):
+        field = _verified_job_field(miner_hotkey, executor_id)
+        data = await self.hget(VERIFIED_JOB_COUNT_KEY, field)
+        if not data and listed_owner_hotkey == miner_hotkey:
+            # shortcut: a record from before the per-hotkey key moves to the hotkey the backend lists, and only
+            # to it, so no other hotkey with this id inherits its GPU anchor; drop once no bare-id field is left.
+            data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
+            if data:
+                await self.hset(VERIFIED_JOB_COUNT_KEY, field, data)
+                await self.hdel(VERIFIED_JOB_COUNT_KEY, executor_id)
         if not data:
             return {}
 

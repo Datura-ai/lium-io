@@ -6,26 +6,37 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dockerhub-push
     env:
       TAG: "dev" 
       TARGET_FILE: "docker-compose.app.dev.yml"
-      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Make scripts executable
-        run: |
-          chmod +x neurons/miners/docker_publish.sh
-          chmod +x neurons/miners/docker_runner_publish.sh
-          
-      - name: Run docker_publish.sh
+      # Build before the login: the base images (python, docker) are public docker.io images, and once
+      # the OIDC token is the docker.io credential every pull uses it. It covers only the daturaai push
+      # repositories, so a build after the login fails with `insufficient scope`.
+      - name: Build the images
         run: |
           cd neurons/miners
-          ./docker_publish.sh
-          
-      - name: Run docker_runner_publish.sh
+          bash ./docker_build.sh
+          bash ./docker_runner_build.sh
+
+      - name: Log in to Docker Hub (OIDC, no stored token)
+        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          # The exchanged token is the docker password for the rest of the job (default 300 s);
+          # the pushes must finish inside it, so 30 min leaves room for a cold cache or a slow runner.
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
+        with:
+          username: daturaai
+
+      - name: Push the images
         run: |
-          cd neurons/miners
-          ./docker_runner_publish.sh
+          docker push "daturaai/compute-subnet-miner:$TAG"
+          docker push "daturaai/compute-subnet-miner-runner:$TAG"

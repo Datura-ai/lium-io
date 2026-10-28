@@ -2,13 +2,13 @@ import asyncio
 
 from clients.backend_client import BackendClient
 from core.config import settings
-from services.collateral_contract_service import CollateralContractService
 from services.docker_service import DockerService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
+from services.executor_connectivity.external_probe import external_port_probe
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -39,7 +39,6 @@ async def initiate_services():
     )
     ioc["ValidationService"] = ValidationService()
     ioc["VerifyXValidationService"] = VerifyXValidationService()
-    ioc["CollateralContractService"] = CollateralContractService()
     ioc["AttestationService"] = AttestationService(redis_service=ioc["RedisService"])
     port_tester = PortTester()
     runner = ContainerRunner()
@@ -47,7 +46,7 @@ async def initiate_services():
         orchestrator=ConnectivityOrchestrator(
             PortSelector(),
             PortProbe(
-                BatchVerifier(port_tester, runner),
+                BatchVerifier(port_tester, runner, external_port_probe()),
                 SemiBatchVerifier(port_tester, runner),
                 FallbackVerifier(port_tester, runner),
             ),
@@ -64,7 +63,6 @@ async def initiate_services():
         redis_service=ioc["RedisService"],
         validation_service=ioc["ValidationService"],
         verifyx_validation_service=ioc["VerifyXValidationService"],
-        collateral_contract_service=ioc["CollateralContractService"],
         executor_connectivity_service=ioc["ExecutorConnectivityService"],
         backend_client=ioc["BackendClient"],
         attestation_service=ioc["AttestationService"],

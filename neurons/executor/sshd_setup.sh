@@ -15,6 +15,11 @@
 # `Include /etc/ssh/sshd_config.d/*.conf` reads ahead of the `Match User liumuser` block
 # (a line appended after that block would become part of the Match).
 #
+# Whatever the version, the drop-in also sets LogLevel VERBOSE (DAH-4629): every login then logs
+# "Accepted publickey for <user> from <ip> port <n> ssh2: <type> SHA256:<fingerprint>", the one record
+# that names the key behind a session into this container. run.sh sends sshd's log to a file the
+# validator reads each cycle.
+#
 # Whatever the sshd version, the last step is `sshd -T` over the rendered config: the image
 # build fails on any directive sshd would refuse at container start.
 set -eu
@@ -46,16 +51,20 @@ else
 fi
 
 mkdir -p "$SSHD_CONFIG_DIR"
+printf '# written by sshd_setup.sh at image build (DAH-3236, DAH-4629); that script says why\nLogLevel VERBOSE\n' >"$DROP_IN"
 if [ "$supported" = yes ]; then
-    printf '# written by sshd_setup.sh at image build (DAH-3236); that script says why\nPerSourcePenalties no\n' >"$DROP_IN"
+    printf 'PerSourcePenalties no\n' >>"$DROP_IN"
     if ! sshd_test | grep -qx 'persourcepenalties no'; then
         echo "sshd_setup: $DROP_IN is not in effect; does $SSHD_CONFIG include $SSHD_CONFIG_DIR/*.conf?" >&2
         exit 1
     fi
     echo "sshd_setup: PerSourcePenalties no ($sshd_version)"
 else
-    rm -f "$DROP_IN"
     echo "sshd_setup: this sshd predates PerSourcePenalties, nothing to turn off ($sshd_version)"
+fi
+if ! sshd_test | grep -qx 'loglevel VERBOSE'; then
+    echo "sshd_setup: LogLevel VERBOSE from $DROP_IN is not in effect" >&2
+    exit 1
 fi
 
 sshd_test >/dev/null

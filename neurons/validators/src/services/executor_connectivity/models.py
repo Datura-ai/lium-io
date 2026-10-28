@@ -6,6 +6,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PortPair:
     """Immutable port mapping."""
+
     internal: int
     external: int
 
@@ -14,11 +15,21 @@ class PortPair:
 class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
+    tier: str = "batch"
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    successful: list[PortPair]
+    failed: list[PortPair]
+    # DAH-4537: the validator reached the sampled ports but the outside prober reached none of them
+    external_blocked: bool = False
 
 
 @dataclass(frozen=True)
 class DindLogCause:
-    """Why the DinD container's sshd never answered: a stable code and the words the provider reads."""
+    """Why the DinD probe failed — the container's sshd never answered, or `docker run` itself was refused
+    by the NVIDIA container hook: a stable code and the words the provider reads."""
 
     code: str
     message: str
@@ -46,8 +57,30 @@ class DindProbeResult:
     port: PortPair | None
     log_text: str | None = None
     # DAH-2856: the cause when the container started but sshd never answered, read from the
-    # container's own logs before removal (None when the probe passed or never got that far).
+    # container's own logs before removal. DAH-3634: also when `docker run` itself was refused by
+    # the NVIDIA container hook (docker's stderr). None when the probe passed or the cause is unknown.
     error: DindLogCause | None = None
+
+
+@dataclass(frozen=True)
+class PortRangeResult:
+    """One declared port range's tally for a cycle: how many ports it declares, how many were probed
+    and how many answered, so a partial forward shows where it sits."""
+
+    first: int
+    last: int
+    declared: int
+    probed: int
+    answered: int
+
+    def as_dict(self) -> dict[str, object]:
+        label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
+        return {
+            "range": label,
+            "declared": self.declared,
+            "probed": self.probed,
+            "answered": self.answered,
+        }
 
 
 @dataclass(frozen=True)
@@ -63,6 +96,15 @@ class PortVerificationResult:
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
     dind_error: DindLogCause | None = None
+    # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending.
+    port_ranges: tuple[PortRangeResult, ...] = ()
+    probe_tier: str | None = None
+    # len(get_all_ports(...)) for the executor's declared range or mappings; None when they could not be parsed
+    declared_port_count: int | None = None
+    # ticket-0494: the DinD probe's own sysbox reading, before any fallback. True/False only when the
+    # probe reached its container with sysbox-runc requested; None when it never reached the container
+    # or did not test sysbox. PortConnectivityCheck remembers a True and forgets on a False.
+    sysbox_measured: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -37,6 +37,7 @@ from pydantic import BaseModel
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import PROBE_CONTAINER_NAME
+from services.node_host import public_host_sock
 from services.task.models import JobResult
 
 logger = logging.getLogger(__name__)
@@ -295,6 +296,7 @@ async def _connected(
     async with asyncssh.connect(
         host=executor_info.address,
         port=executor_info.ssh_port,
+        **await public_host_sock(executor_info.address, executor_info.ssh_port),
         username=executor_info.ssh_username,
         client_keys=[pkey],
         known_hosts=None,
@@ -329,9 +331,6 @@ async def measure_and_attach(
     `job_started_at` is `time.monotonic()` taken when this miner's job began, and it is what keeps
     the sweep inside the cycle that is already running.
     """
-    if not settings.ROCE_LINK_PROBE_ENABLED:
-        return
-
     budget_seconds: float = 0.0
     # Nothing in here may reach the caller: an exception in the probe would abort the miner's whole
     # job and score it zero for the cycle, which is a far worse outcome than an unmeasured pair.

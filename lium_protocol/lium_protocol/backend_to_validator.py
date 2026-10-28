@@ -39,6 +39,8 @@ class BackendMessageType(enum.Enum):
     ForcedValidationCycleRequest = "ForcedValidationCycleRequest"
     # ask the validator for an exact rental estimate; it answers with EstimateResponse
     GetEstimateRequest = "GetEstimateRequest"
+    # 1.16.0: reset a running pod's GPUs; the validator answers with PodGpuResetResult
+    ResetPodGpuRequest = "ResetPodGpuRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -51,6 +53,7 @@ class BackendMessage(Message):
 class ServerRequest(BackendMessage):
     """A request about one executor of one miner."""
 
+    command_id: str = ""
     miner_hotkey: str
     executor_id: str
     # the validator's copy carries where the miner listens; the backend does not send them
@@ -164,6 +167,10 @@ class ContainerCreateRequest(ContainerRequest):
     cluster_membership: ClusterMembership | None = None
     # DAH-2211: build from this Dockerfile on the host instead of pulling `docker_image`
     dockerfile_content: str | None = None
+    # 1.11.0: a gzipped tar of the build context for `dockerfile_content`, fetched by the validator and
+    # checked against `build_context_sha256` (hex) before the build; None builds with the Dockerfile alone
+    build_context_url: str | None = None
+    build_context_sha256: str | None = None
     # DAH-1524: the image ships sshd (and runs Jupyter itself); None keeps the validator's bootstrap
     ships_sshd: bool | None = None
     gpu_power_limits: list[GpuPowerLimit] | None = None
@@ -247,6 +254,8 @@ class BackupContainerRequest(ContainerRequest):
     repository_pod_id: str | None = None
     repository_password: str | None = pydantic.Field(default=None, repr=False)
     failure_timeout_seconds: int = pydantic.Field(default=STORAGE_OPERATION_REPORTING_FAILURE_TIMEOUT_SECONDS, gt=0)
+    # 1.8.0: restic --exclude patterns (the default backup skips caches and keys); an older validator ignores them.
+    exclude_patterns: list[str] = []
 
 
 @BACKEND_MESSAGES.register
@@ -267,6 +276,8 @@ class RestoreContainerRequest(ContainerRequest):
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
     failure_timeout_seconds: int = pydantic.Field(default=STORAGE_OPERATION_REPORTING_FAILURE_TIMEOUT_SECONDS, gt=0)
+    # a reconnect re-dispatch of a restore that may already be running; its dispatch failure is not reported
+    recovery: bool = False
 
 
 @BACKEND_MESSAGES.register
@@ -281,6 +292,22 @@ class InstallJupyterServerRequest(ContainerRequest):
     container_name: str
     jupyter_port_map: tuple[int, int]
     local_volume: str | None = None
+    local_volume_path: str | None = None
+
+
+@BACKEND_MESSAGES.register
+class ResetPodGpuRequest(ContainerRequest):
+    """1.16.0: the renter asked to reset the GPUs of their running pod. `gpu_uuids` is every GPU
+    the backend holds for the pod; `gpu_indices` picks some of them by pod index (the pod's GPUs sorted by
+    host PCI bus id, the 0..n-1 order `nvidia-smi` shows inside the pod), None for all of them. Answered by
+    `validator_to_backend.PodGpuResetResult` with the same `request_id`."""
+
+    message_type: BackendMessageType = BackendMessageType.ResetPodGpuRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    request_id: str
+    # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
     local_volume_path: str | None = None
 
 

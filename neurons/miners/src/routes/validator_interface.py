@@ -25,7 +25,7 @@ from dependencies.auth import (
     verify_simple_validator_signature,
     verify_validator_auth_from_headers,
 )
-from services.executor_service import ExecutorService
+from services.executor_service import RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS, ExecutorService
 from services.ssh_service import MinerSSHService
 
 logger = logging.getLogger(__name__)
@@ -114,15 +114,18 @@ async def submit_ssh_pubkey(
     try:
         logger.info("Validator %s sent SSH Pubkey via REST API.", authenticated_validator)
         
-        executors = await executor_service.register_pubkey(
+        registration = await executor_service.register_pubkey(
             authenticated_validator,
             request.miner_hotkey,
             request.public_key,
             request.validator_signature,
             request.executor_id,
             nonce=request.nonce,
+            validator_miner_signature=request.validator_miner_signature,
+            is_rental_request=request.is_rental_request,
         )
-        
+        executors = registration.accepted
+
         if request.is_rental_request and len(executors) == 1:
             # Invoke rental request hook if configured
             if settings.RENTAL_REQUEST_HOOK:
@@ -136,7 +139,7 @@ async def submit_ssh_pubkey(
                                 "executor_port": executors[0].port,
                                 "uuid": str(executors[0].uuid),
                             },
-                            timeout=aiohttp.ClientTimeout(total=5)
+                            timeout=aiohttp.ClientTimeout(total=RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS)
                         ) as resp:
                             if resp.status != 200:
                                 logger.error(f"RENTAL_REQUEST_HOOK returned status {resp.status}: {await resp.text()}")
@@ -148,7 +151,9 @@ async def submit_ssh_pubkey(
             authenticated_validator,
             len(executors),
         )
-        return AcceptSSHKeyRequest(executors=executors)
+        return AcceptSSHKeyRequest(
+            executors=executors, known_executor_ids=registration.known_executor_ids
+        )
     except Exception as e:
         logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e), exc_info=True)
         return FailedRequest(details=str(e))

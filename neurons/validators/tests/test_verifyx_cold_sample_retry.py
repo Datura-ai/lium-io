@@ -1,10 +1,9 @@
 """DAH-2959: a never-measured executor's first VerifyX download sample decides its first cycle alone
-(the EMA bootstraps from it). With VERIFYX_COLD_SAMPLE_RETRY_ENABLED the check takes one more sample
-inside the same task and gates on the better one; flag off is today's single sample."""
+(the EMA bootstraps from it). The check takes one more sample inside the same task and gates on the
+better one."""
 
 import pytest
 
-from core.config import settings
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
@@ -49,32 +48,13 @@ def _known(download: float) -> RentedExecutorsResponse:
 def _ctx(context_factory, service, rented_data):
     return context_factory(
         services=build_services(verifyx=service),
-        config=build_context_config(verifyx_enabled=True),
+        config=build_context_config(),
         state=build_state(specs={"gpu": {"count": 1}}, rented_data=rented_data),
     )
 
 
-@pytest.fixture
-def retry_on(monkeypatch):
-    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
-
-
 @pytest.mark.asyncio
-async def test_flag_off_is_todays_single_cold_sample(monkeypatch, context_factory):
-    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", False)
-    service = _ProbeSequence(_probe(59.9), _probe(760.0))
-
-    result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
-
-    assert service.calls == 1
-    assert result.passed is False
-    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
-    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(59.9)
-    assert "cold_sample_retry" not in result.event.what_we_saw
-
-
-@pytest.mark.asyncio
-async def test_cold_first_sample_is_re_measured_and_the_better_one_seeds_the_ema(retry_on, context_factory):
+async def test_cold_first_sample_is_re_measured_and_the_better_one_seeds_the_ema(context_factory):
     # b3e4ca69, 4 Sep: 59.9 Mbps on the first sample, ~760 Mbps once the link was free.
     service = _ProbeSequence(_probe(59.9, upload=20.0), _probe(760.0, upload=110.0))
 
@@ -95,7 +75,7 @@ async def test_cold_first_sample_is_re_measured_and_the_better_one_seeds_the_ema
 
 
 @pytest.mark.asyncio
-async def test_two_slow_samples_still_fail_the_unchanged_gate(retry_on, context_factory):
+async def test_two_slow_samples_still_fail_the_unchanged_gate(context_factory):
     service = _ProbeSequence(_probe(40.0), _probe(88.0))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
@@ -109,7 +89,7 @@ async def test_two_slow_samples_still_fail_the_unchanged_gate(retry_on, context_
 
 
 @pytest.mark.asyncio
-async def test_failed_network_probe_on_first_sample_is_retried(retry_on, context_factory):
+async def test_failed_network_probe_on_first_sample_is_retried(context_factory):
     # download_speed None (probe timed out) would bootstrap the EMA to 0.0.
     service = _ProbeSequence(_probe(None), _probe(300.0))
 
@@ -122,7 +102,7 @@ async def test_failed_network_probe_on_first_sample_is_retried(retry_on, context
 
 
 @pytest.mark.asyncio
-async def test_a_worse_retry_keeps_the_first_sample(retry_on, context_factory):
+async def test_a_worse_retry_keeps_the_first_sample(context_factory):
     service = _ProbeSequence(_probe(70.0), _probe(30.0))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
@@ -134,7 +114,7 @@ async def test_a_worse_retry_keeps_the_first_sample(retry_on, context_factory):
 
 
 @pytest.mark.asyncio
-async def test_a_retry_whose_probe_failed_outright_is_not_used(retry_on, context_factory):
+async def test_a_retry_whose_probe_failed_outright_is_not_used(context_factory):
     service = _ProbeSequence(_probe(70.0), _probe(900.0, success=False))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
@@ -145,7 +125,7 @@ async def test_a_retry_whose_probe_failed_outright_is_not_used(retry_on, context
 
 
 @pytest.mark.asyncio
-async def test_known_host_below_the_gate_is_not_retried(retry_on, context_factory):
+async def test_known_host_below_the_gate_is_not_retried(context_factory):
     # prev EMA 110 + sample 20 -> EMA 65: a real slow host, judged as today.
     service = _ProbeSequence(_probe(20.0), _probe(900.0))
 
@@ -157,7 +137,7 @@ async def test_known_host_below_the_gate_is_not_retried(retry_on, context_factor
 
 
 @pytest.mark.asyncio
-async def test_fast_first_sample_is_not_retried(retry_on, context_factory):
+async def test_fast_first_sample_is_not_retried(context_factory):
     service = _ProbeSequence(_probe(500.0), _probe(1.0))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
@@ -168,7 +148,7 @@ async def test_fast_first_sample_is_not_retried(retry_on, context_factory):
 
 
 @pytest.mark.asyncio
-async def test_without_backend_data_nobody_looks_new_and_nothing_is_retried(retry_on, context_factory):
+async def test_without_backend_data_nobody_looks_new_and_nothing_is_retried(context_factory):
     # rented_data None: every executor would look never-measured; a backend blip must not double VerifyX fleet-wide.
     service = _ProbeSequence(_probe(59.9), _probe(760.0))
 
@@ -179,7 +159,7 @@ async def test_without_backend_data_nobody_looks_new_and_nothing_is_retried(retr
 
 
 @pytest.mark.asyncio
-async def test_ram_or_disk_failure_on_the_first_sample_is_not_retried(retry_on, context_factory):
+async def test_ram_or_disk_failure_on_the_first_sample_is_not_retried(context_factory):
     # The retry is for the network sample only; a probe that failed on RAM/disk is judged as today.
     service = _ProbeSequence(_probe(59.9, success=False), _probe(760.0))
 

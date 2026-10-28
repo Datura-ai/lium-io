@@ -11,8 +11,8 @@ digest-pinned, and only if
 
 * the node is idle — no ``pod_*`` container exists (in any state), no validator docker-over-ssh
   session is open (that is how a rental's own pull and ``docker run`` reach this host) and the
-  validator's VerifyX bandwidth sample is not running; a pull already running is cancelled
-  within 10 s when any of them appears (2 s for the bandwidth sample);
+  validator's VerifyX bandwidth sample and container download probe are not running; a pull
+  already running is cancelled within 10 s when any of them appears (2 s for the two samples);
 * the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — pre-pulled images that left
   the current top-N are evicted, least recently used first, to make room; nothing else is ever
   removed, and a pull that would not fit without evicting a served image is skipped;
@@ -21,7 +21,8 @@ digest-pinned, and only if
   hands in, and a pull that would not fit waits for the next sweep. The loop starts the
   sweep as its own task and never waits for it, so the default image's refresh runs on
   time even when a sweep overruns (a silent pull stream, a slow eviction); while one
-  sweep is still running the next refresh does not start another.
+  sweep is still running the next refresh does not start another, and the task is
+  cancelled when the loop ends, however it ends.
 
 One pull per sweep per node plus a random start delay keeps a fleet-wide enable from
 stampeding the registry. Every pull attempt ends in exactly one log line
@@ -34,7 +35,10 @@ import asyncio
 import json
 import os
 import random
+import socket
+import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import docker
@@ -65,6 +69,10 @@ DOCKER_OVER_SSH_MARKER = "dial-stdio"
 # `python …/verifyx_executor.py --seed …`, over SSH or as the `/verify` subprocess
 # (local_verify_service). A pull sharing the link would lower that sample.
 BANDWIDTH_TEST_MARKER = "verifyx_executor.py"
+# The validator's idle-node download probe (container_download_speed): one SSH shell command
+# whose script echoes `lium_dl …` lines, so the marker is in the shell's and `docker run`'s
+# cmdline for the whole scored fetch. A pull sharing the link would lower that sample too.
+DOWNLOAD_TEST_MARKER = "lium_dl"
 # How often a running pull re-checks for the probe alone (a process scan, no docker call): a
 # sample lasts tens of seconds, so the full idle check's cadence would share too much of it.
 BANDWIDTH_TEST_CHECK_SECONDS = 2
@@ -102,6 +110,8 @@ def host_activity() -> str | None:
             return "docker-over-ssh session"
         if any(part.endswith(BANDWIDTH_TEST_MARKER) for part in cmdline):
             return "validator bandwidth test"
+        if any(DOWNLOAD_TEST_MARKER in part for part in cmdline):
+            return "validator download test"
     return None
 
 
@@ -186,11 +196,11 @@ def _pull_pinned(
     headers = {"X-Registry-Auth": auth_header} if auth_header else {}
     started = time.monotonic()
     deadline = started + timeout_seconds
-    next_check = started + ACTIVITY_CHECK_SECONDS
-    next_probe_check = started + BANDWIDTH_TEST_CHECK_SECONDS
-    # The deadline and the idle check run per stream event, so the read timeout is what
-    # bounds a stream that goes silent: without it a stalled registry would hold this thread
-    # (and the pull lock) for the whole budget past the caller's refresh deadline.
+    # The deadline and the idle checks run on their own thread, not per stream event: Docker
+    # can go quiet for long stretches (a big layer extracting, a slow registry), and a check
+    # that waits for the next event could let a pull share the link with the bandwidth sample
+    # for up to the read timeout. Shutting the stream's socket from the watcher ends the read.
+    # The read timeout still bounds a silent stream when nothing else ends it.
     response = api._post(
         api._url("/images/create"),
         params={"fromImage": repo, "tag": digest},
@@ -198,33 +208,70 @@ def _pull_pinned(
         stream=True,
         timeout=(CONNECT_TIMEOUT_SECONDS, STREAM_READ_TIMEOUT_SECONDS),
     )
+    stop = threading.Event()
+    watcher_stop_outcome: list[tuple[str, str]] = []
+
+    def watch() -> None:
+        next_check = started + ACTIVITY_CHECK_SECONDS
+        while not stop.wait(BANDWIDTH_TEST_CHECK_SECONDS):
+            now = time.monotonic()
+            try:
+                if now > deadline:
+                    reason = ("timeout", f"exceeded {timeout_seconds:.0f}s")
+                elif now >= next_check:
+                    next_check = now + ACTIVITY_CHECK_SECONDS
+                    busy = rental_activity(client)
+                    reason = ("preempted", busy) if busy else None
+                else:
+                    busy = host_activity()
+                    reason = ("preempted", busy) if busy else None
+            except Exception as e:
+                logger.info(f"pre-pull idle check failed, retrying: {type(e).__name__}")
+                continue
+            if reason and not stop.is_set():
+                watcher_stop_outcome.append(reason)
+                _abort_stream(api, response)
+                return
+
+    watcher = threading.Thread(target=watch, name="pre-pull-watch", daemon=True)
     try:
         api._raise_for_status(response)
+        watcher.start()
         for event in api._stream_helper(response, decode=True) or ():
+            if watcher_stop_outcome:
+                break
             if isinstance(event, dict) and event.get("error"):
                 return "pull_failed", str(event["error"])
-            now = time.monotonic()
-            if now > deadline:
-                return "timeout", f"exceeded {timeout_seconds:.0f}s"
-            busy = None
-            if now >= next_check:
-                next_check = now + ACTIVITY_CHECK_SECONDS
-                next_probe_check = now + BANDWIDTH_TEST_CHECK_SECONDS
-                busy = rental_activity(client)
-            elif now >= next_probe_check:
-                next_probe_check = now + BANDWIDTH_TEST_CHECK_SECONDS
-                busy = host_activity()
-            if busy:
-                return "preempted", busy
     except (requests.exceptions.Timeout, urllib3.exceptions.TimeoutError):
-        # docker-py reads the chunked stream off `response.raw`, so a silent stream surfaces as
-        # urllib3's ReadTimeoutError, not requests' (requests only remaps inside iter_content).
-        return "timeout", f"no stream event for {STREAM_READ_TIMEOUT_SECONDS}s"
+        if not watcher_stop_outcome:
+            # docker-py reads the chunked stream off `response.raw`, so a silent stream surfaces
+            # as urllib3's ReadTimeoutError, not requests' (requests only remaps inside iter_content).
+            return "timeout", f"no stream event for {STREAM_READ_TIMEOUT_SECONDS}s"
+    except Exception:
+        if not watcher_stop_outcome:
+            raise
+        # reading a stream the watcher shut down raises whatever the transport raises
     finally:
+        stop.set()
+        if watcher.is_alive():
+            watcher.join()
+        # closing the stream is what makes the daemon abandon an unfinished pull
         response.close()
+    if watcher_stop_outcome:
+        return watcher_stop_outcome[0]
     # A digest pull leaves the tag untouched; rentals look the image up by repo:tag.
     client.images.get(f"{repo}@{digest}").tag(repo, tag)
     return "pull_ok", None
+
+
+def _abort_stream(api: docker.APIClient, response: requests.Response) -> None:
+    """Wake the thread blocked reading the pull stream. On Linux a close() from another thread
+    does not wake a blocked recv(), and closing the buffered reader waits for that read to end;
+    a shutdown() of the socket ends the read at once."""
+    with suppress(Exception):
+        sock = api._get_raw_response_socket(response)
+        # docker's unix-socket stream hands back the makefile's SocketIO, which wraps the socket
+        getattr(sock, "_sock", sock).shutdown(socket.SHUT_RDWR)
 
 
 class PrePuller:

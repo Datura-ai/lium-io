@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 
 import bittensor
 from clients.referral_feed_client import ReferralFeedClient
+from services.executor_rollout import RUN_ENDED_WITHOUT_FAILING
+from services.task.messages import ExecutorImageMessages
 from services.task_service import JobResult
 
 from core.config import get_total_burn_emission, settings
@@ -96,6 +98,7 @@ class DefaultIncentive(BaseIncentive):
         """
         self.total_executors += 1
         result = await self.calculate_executor_score(result)
+        self._record_validation_failed_reason(result)
         self.total_mining_score += result.mining_score
         if result.job_score == 1.0:
             self.successful_executors += 1
@@ -123,6 +126,26 @@ class DefaultIncentive(BaseIncentive):
                 MinerLogLine.no_payout_because_outdated_executor_image(result)
             )
         return True
+
+    @staticmethod
+    def _record_validation_failed_reason(result: JobResult) -> None:
+        """A result whose run stopped at a failed check earns 0; record that check's code.
+
+        A run that passed every check and still scored 0 (CPU truth, an outdated
+        image, a rented node's halt) records nothing here: it names no check to fix.
+        """
+        if result.is_successful:
+            return
+        reason_code: str = MinerLogLine.validation_failure_code(result)
+        if reason_code in RUN_ENDED_WITHOUT_FAILING:
+            return
+        if reason_code == ExecutorImageMessages.OUTDATED.reason and any(
+            reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
+            for reason in result.zero_incentive_reasons
+        ):
+            # the image check failed on the outdated image: outdated_executor_image already says so
+            return
+        result.record_incentive_log(MinerLogLine.no_payout_because_validation_failed(result))
 
     async def _post_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Process a job result.
@@ -165,6 +188,19 @@ class DefaultIncentive(BaseIncentive):
             job_result.mining_score = 0
             return job_result
 
+        # Fallback for the legacy/default algorithm; rental_price records this among its
+        # hard exclusions before it calls into DefaultIncentive.
+        if job_result.is_hotkey_excluded_from_scoring:
+            if not any(
+                reason.reason == ZeroIncentiveReason.HOTKEY_EXCLUDED_FROM_SCORING.value
+                for reason in job_result.zero_incentive_reasons
+            ):
+                job_result.record_incentive_log(
+                    MinerLogLine.no_payout_because_hotkey_excluded_from_scoring(job_result)
+                )
+            job_result.mining_score = 0
+            return job_result
+
         # Early exit check - if job score is 0, return immediately
         if not job_result.score:
             job_result.mining_score = 0
@@ -173,16 +209,16 @@ class DefaultIncentive(BaseIncentive):
         # Fallback for deployments using the legacy/default incentive algorithm
         # directly. The active rental_price algorithm handles this before it
         # calls into DefaultIncentive.
-        if job_result.is_new_rentals_paused and not job_result.is_rented:
+        if job_result.is_in_maintenance or (job_result.is_new_rentals_paused and not job_result.is_rented):
             logger.info(
                 _m(
-                    "Executor excluded from mining pool - paused for new rentals",
+                    "Executor excluded from mining pool - paused for new rentals or in maintenance",
                     extra=get_extra_info(
                         {
                             "executor_id": str(job_result.executor_info.uuid),
                             "gpu_model": job_result.gpu_model,
                             "gpu_count": job_result.gpu_count,
-                            "reason": "new_rentals_paused",
+                            "reason": "provider_maintenance" if job_result.is_in_maintenance else "new_rentals_paused",
                             "score": 0,
                             "pool": "none",
                         }
@@ -233,18 +269,30 @@ class DefaultIncentive(BaseIncentive):
             )
 
         # Apply multiplier
+        spot_rental_factor: float = self._spot_rental_factor(job_result)
         job_result.mining_score *= (
-            job_result.sysbox_multiplier * job_result.uptime_multiplier * job_result.driver_multiplier
+            job_result.sysbox_multiplier
+            * job_result.uptime_multiplier
+            * job_result.driver_multiplier
+            * spot_rental_factor
         )
-        line: MinerLogLine = MinerLogLine.mining_score_calculated(job_result, is_rented_after_cutoff)
+        line: MinerLogLine = MinerLogLine.mining_score_calculated(
+            job_result, is_rented_after_cutoff, spot_rental_factor
+        )
         job_result.record_incentive_log(line)
         logger.info(line.as_internal_log())
+        # a rented node zeroed by the Sysbox portion must say why (the idle path has its own reason)
+        if job_result.is_rented and job_result.sysbox_multiplier == 0:
+            job_result.record_incentive_log(MinerLogLine.no_payout_because_rented_sysbox_not_confirmed(job_result))
         return job_result
+
+    def _spot_rental_factor(self, job_result: JobResult) -> float:
+        """Share of the mining score a rented spot node keeps; 1.0 for every other node."""
+        return 1.0
 
     async def calculate_final_weights(
         self,
         miners: list[bittensor.NeuronInfo],
-        last_mechanism_step_block: int | None,
         current_epoch: int | None = None,
     ) -> dict[str, float]:
         """Calculate scores with burning logic for this cycle.
@@ -255,7 +303,6 @@ class DefaultIncentive(BaseIncentive):
 
         Args:
             miners: List of miner neuron information
-            last_mechanism_step_block: Last mechanism step block number
 
         Returns:
             dict[str, float]: Scores with burning applied for each miner
@@ -264,7 +311,6 @@ class DefaultIncentive(BaseIncentive):
         burn_scores = self.burn_service.calculate_burn_scores(
             miners=miners,
             burn_share=self.burn_share,  # burn-emission share sourced from shared config (DAH-2274)
-            last_mechanism_step_block=last_mechanism_step_block,
         )
         cycle_scores = dict(burn_scores)
         for miner in miners:
@@ -273,11 +319,46 @@ class DefaultIncentive(BaseIncentive):
                 continue
             cycle_scores[miner.hotkey] = self.miner_incentives.get(miner.hotkey, 0.0)
 
+        self._burn_excluded_hotkey_scores(cycle_scores, burn_scores)
+
         # DAH-2251: fund referral rewards from the residual burn pool, split across the
         # miners who referred paying customers by their EMA (see _apply_referral_pool).
         await self._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch)
 
         return cycle_scores
+
+    @staticmethod
+    def _burn_excluded_hotkey_scores(cycle_scores: dict[str, float], burn_scores: dict[str, float]) -> None:
+        """Zero every SCORING_EXCLUDED_HOTKEYS hotkey and give what it held to the burn hotkeys.
+
+        Its executors were already scored 0 in every pool, so this is normally a no-op; it is the
+        last guard for any path that still left a score on it. The amount moves to the burn
+        hotkeys in proportion to their burn scores, so the cycle total and every other miner's
+        share stay as they were. A burner is never touched. With no burn score the amount is
+        dropped, and set_weights' normalization spreads it over the rest.
+        """
+        excluded_hotkeys: set[str] = settings.get_scoring_excluded_hotkeys()
+        if not excluded_hotkeys:
+            return
+        freed: float = 0.0
+        for hotkey in excluded_hotkeys:
+            if hotkey in burn_scores or hotkey not in cycle_scores:
+                continue
+            freed += max(cycle_scores[hotkey], 0.0)
+            cycle_scores[hotkey] = 0.0
+        if freed <= 0:
+            return
+        logger.warning(
+            _m(
+                "Excluded hotkey still held a score at final weights; moved to burn",
+                extra=get_extra_info({"freed_score": freed}),
+            )
+        )
+        burn_total: float = sum(burn_scores.values())
+        if burn_total <= 0:
+            return
+        for burner, score in burn_scores.items():
+            cycle_scores[burner] += freed * score / burn_total
 
     async def _apply_referral_pool(
         self,
@@ -301,6 +382,8 @@ class DefaultIncentive(BaseIncentive):
         - **Rental-share keeps first claim.** ``burn_scores`` is already the burn left AFTER
           the rental-share (idle) pool took its cut, and the pool is capped at that residual,
           so a short burn shrinks referral — never the rental-share and never the miners.
+          Spot pay and secure-floor top-ups (``unbucketed_share``) are also taken before this
+          residual, so the referral pool shrinks first when they grow.
         - **Fail closed.** An unset/zero/NaN share, an unreachable/stale/empty feed, no
           residual burn, or no eligible referrer all leave the weight vector exactly as it
           was — no referral emission that cycle.
@@ -314,11 +397,17 @@ class DefaultIncentive(BaseIncentive):
             return
 
         # Eligible referrers: present in THIS cycle's miner list, positive EMA, and never a
-        # burn slot (a burner must not also collect referral emission). Note `miners` is
+        # burn slot (a burner must not also collect referral emission) nor a
+        # SCORING_EXCLUDED_HOTKEYS hotkey (it earns no emission at all). Note `miners` is
         # already filtered by SubtensorClient.fetch_miners to serving axons plus burners,
         # so a referrer whose axon is not serving is not eligible -- same bar as mining.
         cycle_hotkeys = {miner.hotkey for miner in miners}
-        eligible = {hk: e for hk, e in ema.items() if hk in cycle_hotkeys and hk not in burn_scores and e > 0}
+        excluded_hotkeys: set[str] = settings.get_scoring_excluded_hotkeys()
+        eligible = {
+            hk: e
+            for hk, e in ema.items()
+            if hk in cycle_hotkeys and hk not in burn_scores and hk not in excluded_hotkeys and e > 0
+        }
         total_ema = sum(eligible.values())
         if total_ema <= 0:
             # The feed named referrers but none cleared the bar. Silent here would hide a

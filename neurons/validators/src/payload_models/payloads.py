@@ -197,6 +197,7 @@ class ContainerRequestType(enum.Enum):
     RestoreContainerRequest = "RestoreContainerRequest"
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
+    ResetPodGpuRequest = "ResetPodGpuRequest"
 
 
 class ForcedValidationCycleRequest(BaseModel):
@@ -215,6 +216,7 @@ class WorkloadKind(enum.Enum):
 
 
 class BaseServerRequest(BaseRequest):
+    command_id: str = ""
     message_type: ContainerRequestType
     miner_hotkey: str
     miner_address: str | None = None
@@ -340,6 +342,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.
     dockerfile_content: str | None = None
+    # a gzipped tar of the build context for `dockerfile_content` and its sha256 (hex); see
+    # services/build_context.py. None builds with the Dockerfile as the only file.
+    build_context_url: str | None = None
+    build_context_sha256: str | None = None
     # DAH-1524 / DAH-2265 (default-image / cached-template deploy): set truthy by the
     # backend when the user selects the default Docker image or default cache template.
     # Such images run their own start.sh, so the validator skips work the image already
@@ -419,6 +425,19 @@ class InstallJupyterServerRequest(ContainerBaseRequest):
     local_volume_path: str = "/root"
 
 
+class ResetPodGpuRequest(ContainerBaseRequest):
+    """DAH-4658: reset the GPUs of a running pod; answered by PodGpuResetResult (lium_protocol 1.16.0)."""
+
+    message_type: ContainerRequestType = ContainerRequestType.ResetPodGpuRequest
+    container_name: str
+    # every GPU the backend holds for the pod; gpu_indices picks some of them by pod index, None for all
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    request_id: str
+    # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
+    local_volume_path: str | None = None
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -451,6 +470,7 @@ class BackupContainerRequest(ContainerBaseRequest):
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
     failure_timeout_seconds: int = Field(default=600, gt=0)
+    exclude_patterns: list[str] = []
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -470,6 +490,7 @@ class RestoreContainerRequest(ContainerBaseRequest):
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
     failure_timeout_seconds: int = Field(default=600, gt=0)
+    recovery: bool = False  # reconnect re-dispatch: the restore may already be running, so never report it failed
 
 
 class CancelStorageOperationRequest(ContainerBaseRequest):
@@ -495,6 +516,7 @@ class ContainerResponseType(enum.Enum):
     SshPubKeyRemoved = "SshPubKeyRemoved"
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
+    PodGpuResetResult = "PodGpuResetResult"
 
 
 class DeliveryStamps(BaseModel):
@@ -513,6 +535,7 @@ class BaseValidatorResponse(BaseRequest, DeliveryStamps):
 
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
+    DockerInDockerDisabled = "DockerInDockerDisabled"
 
 
 class VolumeEncryptionStatus(str, enum.Enum):
@@ -555,7 +578,16 @@ class ProfilerStepName(str, enum.Enum):
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
+    # DAH-3980: the collector starts after the reply, outside the create's window: this row has
+    # no duration, the log line "Create step after reply finished" carries it
+    INSPECTOR_START_AFTER_REPLY = "Inspector collector start runs after the reply"
     FINISHED_IN_SUBNET = "Finished in subnet."
+    # DAH-3980: host work started early that runs beside the steps above; each row is that
+    # work's own start->end, overlapping the step rows (which keep only the residual wait),
+    # so it is never part of a sum of the profile.
+    PRERUN_HOST_PROBE_PARALLEL = "Prerun host probe (parallel)"
+    VOLUME_HOST_PROBE_PARALLEL = "Volume host probe (parallel)"
+    GPU_POWER_RESTORE_PARALLEL = "GPU power restore (parallel)"
     # DAH-2458: backend-measured spans that happen OUTSIDE the subnet window. The backend
     # appends these to its own profiler and passes the pre-dispatch ones in
     # ContainerCreateRequest.pre_dispatch_profilers; the subnet seeds its profile from them so the
@@ -565,6 +597,13 @@ class ProfilerStepName(str, enum.Enum):
     FILLER_PREEMPTION = "Filler preemption"
     BACKEND_PREP = "Backend rent prep"
     BACKEND_FINALIZE = "Backend finalize"
+
+
+PARALLEL_PROFILER_STEP_NAMES = frozenset({
+    ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+    ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+    ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
+})
 
 
 def now_ms() -> int:
@@ -671,6 +710,7 @@ class ContainerDeleted(ContainerBaseResponse):
 class SshPubKeyAdded(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
     user_public_keys: list[str] = []
+    command_id: str = ""
 
 
 class SshPubKeyRemoved(ContainerBaseResponse):
@@ -693,6 +733,9 @@ class FailedContainerErrorCodes(enum.Enum):
     DeletionInProgress = "DeletionInProgress"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
+    # DAH-3338: the miner lists the executor but the node did not accept the validator's key. Was
+    # reported as InvalidExecutorId, which the backend cannot tell from an id nobody knows.
+    ExecutorUnreachable = "ExecutorUnreachable"
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"
@@ -714,6 +757,7 @@ class FailedContainerErrorTypes(enum.Enum):
 
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
+    command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     # Renter-safe HEADLINE only. The backend surfaces this in customer-facing events, so it must never
     # carry executor host details (IP, SSH port/username, hotkey) — those go in `detail`.
@@ -724,6 +768,14 @@ class FailedContainerRequest(ContainerBaseResponse):
     error_code: FailedContainerErrorCodes | None = None
     failure_step: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # DAH-2211 follow-up: for a custom-Dockerfile build that failed, the last lines the build printed
+    # (docker_build), the timeout (build_timeout) or a fixed one-line reason for build_export and the
+    # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
+    # host data. None for every other failure and from old validators.
+    build_log_tail: str | None = Field(default=None, repr=False)
+    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, or the fixed
+    # dead-SSH-session hint for any other step. Never executor host data; None otherwise.
+    step_detail: str | None = None
 
 
 class DuplicateExecutorsResponse(BaseModel):
@@ -757,6 +809,34 @@ class JupyterServerInstalled(ContainerBaseResponse):
 class JupyterInstallationFailed(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.JupyterInstallationFailed
     msg: str
+
+
+class GpuResetErrorCode(enum.Enum):
+    MigEnabled = "MigEnabled"
+    NvlinkPeersOutsidePod = "NvlinkPeersOutsidePod"
+    GpuInUseOutsidePod = "GpuInUseOutsidePod"
+    ResetNotSupported = "ResetNotSupported"
+    GpuNotInContainer = "GpuNotInContainer"
+    ContainerNotFound = "ContainerNotFound"
+    OperationInProgress = "OperationInProgress"
+    ExecutorUnreachable = "ExecutorUnreachable"
+
+
+class GpuResetOutcome(BaseModel):
+    index: int
+    uuid: str
+    result: Literal["reset", "latch_cleared", "failed"]
+    detail: str | None = None
+
+
+class PodGpuResetResult(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodGpuResetResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    container_restarted: bool = False
+    gpus: list[GpuResetOutcome] = []
+    detail: str | None = None
 
 
 class GetEstimateRequest(BaseModel):

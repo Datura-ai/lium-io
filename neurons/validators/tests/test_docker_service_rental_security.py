@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -15,15 +16,18 @@ from payload_models.payloads import (
     FailedContainerRequest,
     ContainerStartRequest,
     ContainerStopRequest,
+    ContainerWarningCode,
     CustomOptions,
     ExternalVolumeInfo,
     PayloadPortMapping,
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
-from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
+import services.docker_service as docker_service_module
+from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerStateSnapshot,
     RentalDockerOperationError,
     build_gpu_docker_config,
 )
@@ -93,6 +97,12 @@ class RecordingRentalDockerClient:
         self.inspected_images.append(image)
         return image in self.existing_images
 
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return () if await self.image_exists(image=image) else None
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        return True
+
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
 
@@ -105,7 +115,13 @@ class RecordingRentalDockerClient:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
 
-    async def start(self, *, container_name: str) -> None:
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
+
+    async def start(self, *, container_name: str, network: str | None = None) -> None:
         self.started_containers.append(container_name)
 
     async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
@@ -133,6 +149,7 @@ class RecordingRentalDockerClient:
         driver: str | None = None,
         driver_opts: dict[str, str] | None = None,
         timeout: int | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         self.created_volumes.append(
             {
@@ -184,12 +201,15 @@ def docker_service():
     lock.__aenter__ = AsyncMock(return_value=lock)
     lock.__aexit__ = AsyncMock(return_value=None)
     redis_service.acquire_executor_lock = Mock(return_value=lock)
-    return DockerService(
+    service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
         attestation_service=attestation_service,
         rental_docker_client_factory=RecordingRentalDockerFactory(),
     )
+    # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    return service
 
 
 @pytest.fixture
@@ -480,7 +500,7 @@ async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
         ),
     )
 
-    await docker_service.create_container(
+    result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
         keypair=keypair,
@@ -489,6 +509,8 @@ async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
 
     run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
     assert run_spec.runtime is None
+    # the backend reads this to refuse a rental that asked for nested Docker
+    assert ContainerWarningCode.DockerInDockerDisabled in result.warnings
     streamed_messages = [
         call.args[0] for call in docker_service.stream_log.await_args_list
     ]
@@ -615,6 +637,27 @@ async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
     ]
 
 
+def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_removed_or_reconfigured():
+    # disable, rm, set or upgrade on a loopback plugin loses every volume whose backing file is in its rootfs
+    source = open(docker_service_module.__file__).read()
+
+    targets = re.findall(r"""docker plugin (?:disable|rm|remove|set|upgrade|push|create) ([^\s"']+)""", source)
+
+    assert set(targets) == {"{plugin_alias}"}
+    installed_or_enabled = re.findall(r"""docker plugin (?:install|enable) ([^\s"']+)""", source)
+    assert set(installed_or_enabled) == {
+        "{S3FS_PLUGIN_IMAGE}",
+        "{plugin_alias}",
+        "{LEGACY_S3FS_PLUGIN_ALIAS}",
+    }
+    assert set(re.findall(r"\bplugin_alias(?:: str)? = (\w+)", source)) == {"_s3fs_plugin_alias"}
+
+
+@pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc"])
+def test_s3fs_plugin_alias_never_names_a_loopback_plugin(volume_name):
+    assert not _is_vloopback_driver(_s3fs_plugin_alias(volume_name))
+
+
 @pytest.mark.asyncio
 async def test_remove_s3fs_volume_plugin_ignores_unsafe_volume_name(
     docker_service,
@@ -634,8 +677,8 @@ async def test_remove_s3fs_volume_plugin_ignores_unsafe_volume_name(
     [
         # Sysbox cannot ID-shift a FUSE mount, so s3fs must report the objects as
         # owned by the host uid sysbox maps container root to.
-        (231072, "allow_other,uid=231072,gid=231072"),
-        (None, "allow_other"),
+        (231072, "allow_other,umask=0000,uid=231072,gid=231072"),
+        (None, "allow_other,umask=0000"),
     ],
 )
 async def test_create_s3fs_volume_mount_options(
@@ -1059,7 +1102,7 @@ async def test_port_check_filters_quote_hostile_miner_hotkey(
         ssh_client=ssh_client,
     )
 
-    assert result == (True, "No port check containers found")
+    assert result == (False, "No port check containers found")
     assert len(ssh_client.commands) == 1
     _assert_shell_arg_is_single_token(
         ssh_client.commands[0],
@@ -1087,3 +1130,57 @@ async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
 
     assert ssh_client.commands == []
     assert docker_client.created_volumes == []
+
+
+def _pod_host_key_commands(ssh_client):
+    return [shlex.split(cmd) for cmd in ssh_client.commands if "pod_ssh_host_key" in cmd]
+
+
+@pytest.mark.asyncio
+async def test_create_container_installs_the_same_ssh_host_key_each_time_a_pod_is_created(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    ssh_client.run = AsyncMock(wraps=ssh_client.run)
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+
+    for _ in range(2):
+        await docker_service.create_container(
+            payload=_base_create_payload(),
+            executor_info=executor_info,
+            keypair=keypair,
+            private_key="encrypted-private-key",
+        )
+
+    specs = _pod_host_key_commands(ssh_client)
+    assert len(specs) == 2
+    public_keys = {spec[-1] for spec in specs}
+    assert len(public_keys) == 1
+    assert next(iter(public_keys)).startswith("ssh-ed25519 ")
+    calls = [c for c in ssh_client.run.call_args_list if "pod_ssh_host_key" in c.args[0]]
+    assert all("OPENSSH PRIVATE KEY" in c.kwargs["input"] for c in calls)
+    assert all("OPENSSH PRIVATE KEY" not in " ".join(spec) for spec in specs)
+
+
+@pytest.mark.asyncio
+async def test_create_container_skips_the_pod_ssh_host_key_without_a_master_secret(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.VOLUME_MASTER_SECRET", None)
+
+    await docker_service.create_container(
+        payload=_base_create_payload(),
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert _pod_host_key_commands(ssh_client) == []

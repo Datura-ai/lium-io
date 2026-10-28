@@ -27,12 +27,26 @@ log_header()  {
 log_header "Lium Executor — Publish Image"
 
 # ── Login & push ───────────────────────────────────────────────────────────────
-log_step "Logging in to Docker Hub"
-echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-log_success "Authenticated as ${DOCKERHUB_USERNAME}"
+# The lium-io workflows log in with docker/login-action (OIDC) before this script runs and pass no
+# token; a caller in another repository that still passes DOCKERHUB_PAT logs in here.
+if [[ -n "${DOCKERHUB_PAT:-}" ]]; then
+  log_step "Logging in to Docker Hub"
+  echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+  log_success "Authenticated as ${DOCKERHUB_USERNAME}"
+else
+  log_step "Docker Hub login: using the workflow's login step"
+fi
 
 log_step "Pushing image: ${IMAGE_NAME}"
-PUSH_OUTPUT=$(docker push "$IMAGE_NAME" 2>&1 | tee /dev/stderr)
+if [[ -n "${PLATFORMS:-}" ]]; then
+  # The multi-arch OCI archive docker_build.sh wrote; skopeo reads the docker login and records the
+  # index digest, which both amd64 and arm64 hosts pull by.
+  skopeo copy --all --preserve-digests --digestfile /tmp/executor.digest \
+    "oci-archive:${OCI_ARCHIVE:-/tmp/executor.oci.tar}" "docker://docker.io/${IMAGE_NAME}"
+  PUSH_OUTPUT="digest: $(cat /tmp/executor.digest)"
+else
+  PUSH_OUTPUT=$(docker push "$IMAGE_NAME" 2>&1 | tee /dev/stderr)
+fi
 
 # ── Extract sha256 digest ──────────────────────────────────────────────────────
 log_step "Extracting image digest"

@@ -58,6 +58,11 @@ class SharedConfig(BaseModel):
     # serialized configs still validate.
     payout_delay_days: int = Field(default=2)
     payout_processing_hour_utc: int = Field(default=17)
+    # Mirrors the payout task's MINER_PAYMENT_MIN_TAO; MINER_PAYMENT_MIN_USD is the fallback when
+    # the TAO price lookup fails.
+    miner_payment_min_tao: float = Field(default=0.0021)
+    # Mirrors the payout task's MINER_PAYMENT_MIN_USD fallback when the TAO price lookup fails.
+    miner_payment_min_usd: float = Field(default=0.5)
 
     # Lists
     # default cache-template docker images, served verbatim from the backend

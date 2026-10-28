@@ -1,5 +1,5 @@
 import os
-import random
+import secrets
 import shutil
 import string
 import subprocess
@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated
 
 import PyInstaller.__main__
+from core.config import settings
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles
 
@@ -17,6 +18,18 @@ from services.ssh_service import SSHService
 
 # Where each cycle's job files (the frozen scrape) are written: one `cycle-*` directory per cycle.
 JOB_FILES_ROOT = Path(__file__).parent / "temp"
+_rng = secrets.SystemRandom()
+
+# machine_scrape's VLOOPBACK_CHECK_SWITCH: the scrape runs its vloopback mount test only while it ends in ":on"
+VLOOPBACK_CHECK_SWITCH_ON = "lium-vloopback-check:on"
+VLOOPBACK_CHECK_SWITCH_OFF = "lium-vloopback-check:off"
+
+
+def with_vloopback_check_switch(scrape_source: str, enabled: bool) -> str:
+    """The scrape source with its vloopback mount test on or off (VLOOPBACK_SCRAPE_CHECK_ENABLED)."""
+    if enabled:
+        return scrape_source
+    return scrape_source.replace(VLOOPBACK_CHECK_SWITCH_ON, VLOOPBACK_CHECK_SWITCH_OFF)
 
 # ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
 # gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order.
@@ -36,6 +49,9 @@ KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
     "gpu.speed_pcie",
     "gpu.utilization",
     "gpu.memory_utilization",
+    "gpu.temperature",
+    "gpu.max_graphics_speed",
+    "gpu.clocks_event_reasons",
 ]
 
 ORIGINAL_KEYS = {
@@ -54,6 +70,9 @@ ORIGINAL_KEYS = {
     "gpu.utilization": "gpu_utilization",
     "gpu.memory_utilization": "memory_utilization",
     "gpu.memory_used_mb": "memory_used_mb",
+    "gpu.temperature": "temperature",
+    "gpu.max_graphics_speed": "max_graphics_speed",
+    "gpu.clocks_event_reasons": "clocks_event_reasons",
     '<default>': "<default>",
     'c_nvmlMemory_t_total': "total",
     'c_nvmlMemory_t_free': "free",
@@ -65,10 +84,6 @@ ORIGINAL_KEYS = {
     'c_nvmlMemory_v2_t_used': "used",
     'c_nvmlUtilization_t_gpu': "gpu",
     'c_nvmlUtilization_t_memory': "memory",
-    'upload_speed': "upload_speed",
-    'download_speed': "download_speed",
-    'network_speed_error': "network_speed_error",
-    'net_speed_error': "net_speed_error",
     'gpu_count': "count",
     'gpu_driver': "driver",
     'gpu_cuda_driver': "cuda_driver",
@@ -104,9 +119,12 @@ ORIGINAL_KEYS = {
     'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
     # DAH-3674: nvme | ssd | hdd | unknown for the disk under docker's data root
     'hard_disk_disk_type': "disk_type",
+    # DAH-5045: used size of the engy_cache_* volumes, in GB
+    'hard_disk_engy_cache_used_gb': "engy_cache_used_gb",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
+    'data_machine_arch': "machine_arch",
     'data_ram': "ram",
     'data_hard_disk': "hard_disk",
     "data_docker_cfg_scrape_error": "docker_cfg_scrape_error",
@@ -133,8 +151,16 @@ ORIGINAL_KEYS = {
     'each_cpu_percent': "cpu_percent",
     'data_sysbox_runtime': "sysbox_runtime",
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
+    'data_sysbox_version': "sysbox_version",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
+    # ticket-0331: the vloopback mount test. Prefixed so no existing key is a substring of them
+    # (ecrypt_miner_job_files renames by sequential str.replace).
+    'data_vloopback_check': "vloopback_check",
+    'vc_verdict': "verdict",
+    'vc_reason_code': "reason_code",
+    'vc_detail': "detail",
+    'vc_runtime': "runtime",
     'data_ncu_profiling_access': "ncu_profiling_access",
     'data_ncu_profiling_scrape_error': "ncu_profiling_scrape_error",
     'data_infiniband_ports': "infiniband_ports",
@@ -152,7 +178,10 @@ ORIGINAL_KEYS = {
     'ib_pkey': "pkey",
     'ib_gids': "gids",
     'data_boot_id': "boot_id",
+    'data_egress_ip': "egress_ip",
     'data_container_cap_eff': "container_cap_eff",
+    'data_executor_pid_mode_scrape_error': "executor_pid_mode_scrape_error",
+    'data_executor_pid_mode': "executor_pid_mode",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
     # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
@@ -236,8 +265,8 @@ class FileEncryptService:
         return file_name
 
     def generate_random_name(self):
-        length = random.randint(3, 15)
-        return "_" + "".join(random.choices(string.ascii_letters, k=length))
+        length = _rng.randint(3, 15)
+        return "_" + "".join(_rng.choices(string.ascii_letters, k=length))
 
     def generate_key_mappings(self):
         # Order is load-bearing: ecrypt_miner_job_files() substitutes these keys with a sequential
@@ -258,6 +287,9 @@ class FileEncryptService:
             "gpu.utilization": "",
             "gpu.memory_utilization": "",
             "gpu.memory_used_mb": "",
+            "gpu.temperature": "",
+            "gpu.max_graphics_speed": "",
+            "gpu.clocks_event_reasons": "",
             "gpu_count": "",
             "gpu_driver": "",
             "gpu_cuda_driver": "",
@@ -289,10 +321,6 @@ class FileEncryptService:
             'c_nvmlMemory_v2_t_used': "",
             'c_nvmlUtilization_t_gpu': "",
             'c_nvmlUtilization_t_memory': "",
-            'upload_speed': "",
-            'download_speed': "",
-            'network_speed_error': "",
-            'net_speed_error': "",
             'hard_disk_total': "",
             'hard_disk_used': "",
             'hard_disk_free': "",
@@ -303,9 +331,11 @@ class FileEncryptService:
             'hard_disk_scrape_error': "",
             'hard_disk_docker_scrape_error': "",
             'hard_disk_disk_type': "",
+            'hard_disk_engy_cache_used_gb': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",
+            'data_machine_arch': "",
             'os_scrape_error': "",
             'data_network': "",
             'data_hard_disk': "",
@@ -337,8 +367,14 @@ class FileEncryptService:
             'machine_specs': "",
             'data_sysbox_runtime_scrape_error': "",
             'data_sysbox_runtime': "",
+            'data_sysbox_version': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
+            'data_vloopback_check': "",
+            'vc_verdict': "",
+            'vc_reason_code': "",
+            'vc_detail': "",
+            'vc_runtime': "",
             'data_ncu_profiling_scrape_error': "",
             'data_ncu_profiling_access': "",
             'data_infiniband_ports': "",
@@ -356,7 +392,10 @@ class FileEncryptService:
             'ib_pkey': "",
             'ib_gids': "",
             'data_boot_id': "",
+            'data_egress_ip': "",
             'data_container_cap_eff': "",
+            'data_executor_pid_mode_scrape_error': "",
+            'data_executor_pid_mode': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
             # DAH-2922 - longer keys before the key they extend (prefix rule above)
@@ -382,9 +421,15 @@ class FileEncryptService:
             'dh_write_probe': "",
         }
 
-        # Generate dictionary key mapping on validator side
-        for key, value in all_keys.items():
-            all_keys[key] = self.generate_random_name()
+        # Names must be unique: the validator reverses this map, so a shared name loses a key.
+        # No key fits "_" + letters (tested), so a later str.replace never matches inside a name.
+        used_names: set[str] = set()
+        for key in all_keys:
+            name = self.generate_random_name()
+            while name in used_names:
+                name = self.generate_random_name()
+            used_names.add(name)
+            all_keys[key] = name
 
         encryption_key = "".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
@@ -449,6 +494,9 @@ class FileEncryptService:
         all_keys, encryption_key = self.generate_key_mappings()
         for key, value in all_keys.items():
             obfuscated_content = obfuscated_content.replace(key, value)
+        obfuscated_content = with_vloopback_check_switch(
+            obfuscated_content, settings.VLOOPBACK_SCRAPE_CHECK_ENABLED
+        )
 
         # build binary with nuitka
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:

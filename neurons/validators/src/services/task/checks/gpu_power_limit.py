@@ -130,8 +130,9 @@ class GpuPowerLimitCheck:
             )
 
         if incomplete:
+            # No reading is no proof of a full limit: a host that hides the value from NVML fails.
             event = render_message(
-                Msg.DATA_INCOMPLETE,
+                Msg.DATA_INCOMPLETE_REJECTED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -140,7 +141,15 @@ class GpuPowerLimitCheck:
                     "incomplete_gpus": _dump_measurements(incomplete),
                 },
             )
-            return CheckResult(passed=True, event=event)
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={
+                    "score": 0.0,
+                    "job_score": 0.0,
+                    "score_warning": " WARNING: GPU power limit could not be read",
+                },
+            )
 
         event = render_message(
             Msg.LIMIT_OK,

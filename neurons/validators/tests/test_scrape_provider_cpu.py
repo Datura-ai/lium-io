@@ -130,3 +130,19 @@ def test_the_cpu_keys_are_registered_in_both_obfuscation_tables():
 
     assert emitted <= original_keys, f"missing from ORIGINAL_KEYS: {sorted(emitted - original_keys)}"
     assert emitted <= mapped_keys, f"missing from generate_key_mappings: {sorted(emitted - mapped_keys)}"
+
+
+def test_a_container_whose_image_is_gone_is_listed_without_a_digest_and_the_scrape_survives():
+    # Arrange — `docker inspect <image id>` answers "no such object" for an image removed under
+    # a running container (seen on a provider host 14 Oct: SCRAPE_FAILED_ON_HOST every wave)
+    outputs = _docker_outputs(f"{RENTER[:12]}|5.00%\n", [RENTER])
+    outputs["json .RepoDigests"] = RuntimeError("run_cmd error: error: no such object: sha256:image")
+    scrape = _scrape(outputs)
+
+    # Act
+    data = scrape["get_docker_info"](b"#!/bin/sh\n")
+
+    # Assert — the container is still listed, with no digest to excuse its load
+    assert data["docker_containers"][0]["each_digest"] == ""
+    assert data["docker_containers"][0]["each_cpu_percent"] == 5.0
+    assert data["docker_version"] == "24.0.7"

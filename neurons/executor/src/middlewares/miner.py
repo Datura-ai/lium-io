@@ -2,7 +2,7 @@ import asyncio
 import re
 import time
 
-import bittensor
+from bittensor_wallet import Keypair
 from fastapi.responses import JSONResponse
 from payloads.miner import MinerAuthPayload
 from pydantic import ValidationError
@@ -18,7 +18,8 @@ AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 30
 # Everything not listed here must carry a miner signature in its body. A GET has
 # no body, so a GET route is reachable only when it is named below: either public
 # by design or verifying its own signature (the validator's, sent in headers).
-PUBLIC_GET_PATHS = frozenset({"/version", "/update-status"})
+# /miner-identity returns the miner hotkey (public on chain) and the account claim (not a secret).
+PUBLIC_GET_PATHS = frozenset({"/version", "/update-status", "/miner-identity"})
 SELF_AUTHENTICATED_GET_PATTERNS = (
     re.compile(r"^/containers/[^/]+/logs/?$"),  # verify_container_logs_signature
 )
@@ -79,7 +80,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
 
             verified = False
             for hotkey in hotkeys_to_verify:
-                keypair = bittensor.Keypair(ss58_address=hotkey)
+                keypair = Keypair(ss58_address=hotkey)
                 try:
                     if keypair.verify(payload.data_to_sign, payload.signature):
                         verified = True

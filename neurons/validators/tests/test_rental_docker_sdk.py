@@ -14,6 +14,7 @@ from docker.types import ContainerConfig
 import services.rental_docker_sdk as rental_docker_sdk
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.rental_docker_sdk import (
+    FILLER_VOLUME_LABELS,
     RENTAL_NETWORK_ICC_OPTION,
     RENTAL_NETWORK_LABELS,
     RENTAL_NETWORK_NAME,
@@ -31,6 +32,7 @@ from services.rental_docker_sdk import (
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
+    RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC,
     _build_rental_ssh_http_adapter_class,
 )
 
@@ -87,6 +89,10 @@ class FakeApiClient:
         self.inspected_images = []
         self.missing_images = set()
         self.inspect_image_error = None
+        self.repo_digests = []
+        self.remote_digest = "sha256:remote"
+        self.inspect_distribution_error = None
+        self.distribution_calls = []
         self.host_config_kwargs = None
         self.created_container = None
         self.started = []
@@ -96,6 +102,7 @@ class FakeApiClient:
         self.exec_inspected = []
         self.containers_inspected = []
         self.container_states = None
+        self.inspect_container_error = None
         self.events = []
         self.pruned_images = False
         self.created_volumes = []
@@ -139,7 +146,13 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id"}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests}
+
+    def inspect_distribution(self, image, auth_config=None):
+        self.distribution_calls.append({"image": image, "auth_config": auth_config})
+        if self.inspect_distribution_error is not None:
+            raise self.inspect_distribution_error
+        return {"Descriptor": {"digest": self.remote_digest}}
 
     def create_container(self, **kwargs):
         self.events.append("create_container")
@@ -169,6 +182,8 @@ class FakeApiClient:
     def inspect_container(self, container_name):
         self.events.append("inspect_container")
         self.containers_inspected.append(container_name)
+        if self.inspect_container_error is not None:
+            raise self.inspect_container_error
         if self.container_states is not None:
             if len(self.container_states) > 1:
                 return self.container_states.pop(0)
@@ -498,6 +513,60 @@ async def test_image_exists_returns_false_for_missing_image():
 
 
 @pytest.mark.asyncio
+async def test_local_image_repo_digests_reads_one_inspect_and_none_for_a_missing_image():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["daturaai/pytorch@sha256:abc"]
+    api_client.missing_images.add("daturaai/missing:tag")
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_repo_digests(image="daturaai/pytorch:prod") == ("daturaai/pytorch@sha256:abc",)
+    assert await client.local_image_repo_digests(image="daturaai/missing:tag") is None
+    assert api_client.inspected_images == ["daturaai/pytorch:prod", "daturaai/missing:tag"]
+    assert api_client.distribution_calls == []
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_when_a_repo_digest_matches_the_registry():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["ghcr.io/org/app@sha256:old", "ghcr.io/org/app@sha256:remote"]
+    client = RentalDockerSdkClient(api_client)
+    auth_config = {"username": "renter", "password": "secret"}
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app:prod", auth_config=auth_config) is True
+
+    assert api_client.distribution_calls == [{"image": "ghcr.io/org/app:prod", "auth_config": auth_config}]
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_stale_when_the_registry_tag_moved():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["ghcr.io/org/app@sha256:old"]
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app:prod") is False
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_raises_when_the_registry_check_fails():
+    api_client = FakeApiClient()
+    api_client.inspect_distribution_error = APIError("toomanyrequests")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="toomanyrequests"):
+        await client.local_image_is_current(image="ghcr.io/org/app:prod")
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_skips_the_registry_for_a_digest_reference():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app@sha256:pinned") is True
+
+    assert api_client.distribution_calls == []
+
+
+@pytest.mark.asyncio
 async def test_stop_forwards_grace_as_docker_py_timeout():
     # Arrange: the SIGTERM grace must cross into docker-py as its `timeout` kwarg —
     # every delete test fakes this client, so this seam is the only place it's verified
@@ -553,6 +622,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
             cpu_count=2,
             memory_gb=8,
             storage_limit_gb=20,
+            pids_limit=8192,
             shm_size="1g",
         )
     )
@@ -577,6 +647,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.host_config_kwargs["nano_cpus"] == 2_000_000_000
     assert api_client.host_config_kwargs["mem_limit"] == "8g"
     assert api_client.host_config_kwargs["storage_opt"] == {"size": "20g"}
+    assert api_client.host_config_kwargs["pids_limit"] == 8192
     assert api_client.started == ["pod_test"]
 
 
@@ -968,10 +1039,8 @@ async def test_exec_in_container_keeps_original_restart_conflict_after_retry_bud
     api_client.remaining_restarts = 10
     client = RentalDockerSdkClient(api_client)
 
-    with pytest.raises(
-        RentalDockerOperationError,
-        match="Container abc123 is restarting, wait until the container is running",
-    ):
+    # DAH-3593: the message names the container state; Docker's 409 text rides as the cause
+    with pytest.raises(RentalDockerOperationError, match="^container restarting, exit_code=") as raised:
         await client.exec_in_container(
             ContainerExecSpec(
                 container_name="pod_exec",
@@ -979,9 +1048,15 @@ async def test_exec_in_container_keeps_original_restart_conflict_after_retry_bud
             )
         )
 
+    assert "Container abc123 is restarting, wait until the container is running" in str(
+        raised.value.__cause__
+    )
+    # and in the message itself: the backend's IMAGE_EXITED_MARKERS match `is restarting` there
+    assert "Container abc123 is restarting" in str(raised.value)
     assert len(api_client.exec_created) == 3
     assert api_client.exec_started == []
-    assert api_client.containers_inspected == ["pod_exec", "pod_exec", "pod_exec"]
+    # three readiness inspects, then one more to read the exit code for the message
+    assert api_client.containers_inspected == ["pod_exec", "pod_exec", "pod_exec", "pod_exec"]
 
 
 @pytest.mark.asyncio
@@ -1146,6 +1221,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         driver="vloopback",
         driver_opts={"size": "23g"},
         timeout=133,
+        labels=FILLER_VOLUME_LABELS,
     )
     await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
@@ -1155,6 +1231,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
             "name": "volume_test",
             "driver": "vloopback",
             "driver_opts": {"size": "23g"},
+            "labels": FILLER_VOLUME_LABELS,
             "client_timeout": 133,
         }
     ]
@@ -1309,6 +1386,10 @@ def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_p
         "key_filename": str(key_path),
         "look_for_keys": False,
         "allow_agent": False,
+        # a (re)connect is bounded: TCP connect, banner, key auth
+        "timeout": 15,
+        "banner_timeout": 15,
+        "auth_timeout": 15,
     }
     assert calls["host_keys_path"] == str(known_hosts_path)
     assert isinstance(calls["policy"], FakeRejectPolicy)
@@ -1400,3 +1481,200 @@ async def test_inspect_container_state_without_a_state_block_is_an_error():
 
     with pytest.raises(RentalDockerOperationError, match="did not include container State"):
         await client.inspect_container_state(container_name="pod_exec")
+
+
+def test_rental_ssh_adapter_sets_a_keepalive_on_its_transport(monkeypatch, tmp_path):
+    """The SDK's paramiko session idles through a long build, so the adapter arms its keepalive
+    right after every connect."""
+    import paramiko
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+    keepalives = []
+
+    class FakeTransport:
+        def set_keepalive(self, interval):
+            keepalives.append(interval)
+
+    class FakeSSHClient:
+        def __init__(self):
+            self.connected_with = None
+            self._transport = None
+
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            self.connected_with = params
+            self._transport = FakeTransport()
+
+        def get_transport(self):
+            return self._transport
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    # Through docker-py's own constructor: SSHHTTPAdapter.__init__ is what calls _connect, so the
+    # hook the fix relies on is pinned here, not assumed. The adapter defers that connect until the
+    # builder has released the adapter-swap lock.
+    adapter = adapter_class("ssh://root@127.0.0.1:2222")
+    assert adapter.ssh_client.connected_with is None
+    assert keepalives == []
+
+    adapter.connect_deferred()
+
+    assert adapter.ssh_client.connected_with["hostname"] == "127.0.0.1"
+    assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC]
+    assert 0 < RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC <= 60
+
+    # docker-py reconnects a closed transport through the same hook.
+    adapter._connect()
+    assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC] * 2
+
+
+def test_rental_ssh_adapter_connect_without_transport_does_not_fail(monkeypatch, tmp_path):
+    """A connect that leaves no transport (a stub client, or docker-py's shell-out mode) must not
+    turn into an AttributeError of our own."""
+    import paramiko
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+
+    class FakeSSHClient:
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            pass
+
+        def get_transport(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    adapter = adapter_class.__new__(adapter_class)
+    adapter._create_paramiko_client("ssh://root@127.0.0.1:2222")
+
+    adapter._connect()
+
+
+# DAH-3467: container_status is what the delete path asks after a remove read timeout. A 404 is the
+# only answer that may report the container gone; every other failure has to surface as an error.
+@pytest.mark.asyncio
+async def test_container_status_returns_none_when_dockerd_no_longer_knows_the_name():
+    api_client = FakeApiClient()
+    api_client.inspect_container_error = NotFound(
+        '404 Client Error for http+docker://ssh/v1.52/containers/pod_gone/json: '
+        'Not Found ("No such container: pod_gone")'
+    )
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_status(container_name="pod_gone") is None
+    assert api_client.containers_inspected == ["pod_gone"]
+
+
+@pytest.mark.asyncio
+async def test_container_status_returns_the_lowercased_state_status():
+    api_client = FakeApiClient()
+    api_client.container_states = [_container_state(status="Removing", running=False)]
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_status(container_name="pod_slow") == "removing"
+
+
+@pytest.mark.asyncio
+async def test_container_status_raises_on_any_other_inspect_failure():
+    api_client = FakeApiClient()
+    api_client.inspect_container_error = APIError("500 Server Error: daemon exploded")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="inspect container failed.*daemon exploded"):
+        await client.container_status(container_name="pod_slow")
+
+
+def _executor_info_named(address: str) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid="executor-id",
+        address=address,
+        port=8000,
+        ssh_username="root",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/root",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
+    )
+
+
+@pytest.mark.asyncio
+async def test_factory_refuses_a_hostname_with_a_private_address_before_building_a_client(monkeypatch):
+    # Arrange
+    # the rental connect resolves in node_host's pool (socket.getaddrinfo), not via loop.getaddrinfo
+    def private(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", private)
+    api_client_factory = Mock()
+    factory = RentalDockerSdkClientFactory(api_client_factory=api_client_factory)
+
+    # Act / Assert
+    with pytest.raises(RentalDockerConnectionError, match="non-public"):
+        async with factory.connect(
+            executor_info=_executor_info_named("gpu-node1.example.net"),
+            private_key="PRIVATE KEY",
+        ):
+            pass
+    api_client_factory.assert_not_called()
+
+
+def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_path):
+    # Arrange
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    pinned = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+    connected = {}
+
+    class FakeSSHClient:
+        def connect(self, **params):
+            connected.update(params)
+
+        def get_transport(self):
+            return None
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=tmp_path / "id_executor",
+        known_hosts_path=tmp_path / "known_hosts",
+        pinned_addresses=pinned,
+    )
+    adapter = adapter_class.__new__(adapter_class)
+    adapter.ssh_client = FakeSSHClient()
+    adapter.ssh_params = {"hostname": "gpu-node1.example.net", "port": port}
+
+    # Act
+    adapter._connect()
+
+    # Assert: the name stays the hostname (known_hosts); the socket is to the pinned address
+    try:
+        assert connected["hostname"] == "gpu-node1.example.net"
+        assert connected["sock"].getpeername() == ("127.0.0.1", port)
+    finally:
+        connected["sock"].close()
+        listener.close()

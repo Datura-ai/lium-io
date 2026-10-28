@@ -125,7 +125,7 @@ def verifyx_service(monkeypatch):
     monkeypatch.setattr(
         vvs,
         "_perform_verification_checks",
-        lambda payload: {
+        lambda payload, **_: {
             "success": True,
             "ram": {},
             "network": {"download_speed": 900.0, "upload_speed": 500.0, "success": True},
@@ -343,7 +343,6 @@ def context(
     validation,
     verifyx,
     first_pass=True,
-    verifyx_enabled=True,
     state=None,
     ssh=None,
 ):
@@ -356,7 +355,7 @@ def context(
             redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
         ),
         config=build_context_config(
-            validator_keypair=keypair, first_pass=first_pass, verifyx_enabled=verifyx_enabled
+            validator_keypair=keypair, first_pass=first_pass
         ),
         state=state or build_state(specs=SPECS),
     )
@@ -1148,7 +1147,7 @@ async def test_intent_carries_the_shortened_deadline(
 async def test_all_cards_check_keeps_the_matmul_on_ssh(
     keypair, monkeypatch, local_verify_on, verifyx_service
 ):
-    """DAH-2671 item 3: `_probe_all_claimed_cards` runs inside the SSH matmul path only. With the
+    """DAH-2671 item 3: `probe_all_claimed_cards` runs inside the SSH matmul path only. With the
     check on, the intent carries no matmul, CapabilityCheck runs the SSH path (probe included) and
     VerifyX is still consumed locally."""
     monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
@@ -1173,27 +1172,6 @@ async def test_all_cards_check_keeps_the_matmul_on_ssh(
     assert capability.updates["state"].gpu_metrics == {"from": "ssh"}
     ssh_matmul.assert_awaited_once()
     assert verifyx.event.what_we_saw["transport"] == "local_verify"
-
-
-@pytest.mark.asyncio
-async def test_all_cards_check_with_verifyx_off_makes_no_call(
-    keypair, monkeypatch, local_verify_on, verifyx_service
-):
-    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
-    validation = matmul_service(monkeypatch)
-    async with FakeExecutor(keypair) as executor:
-        ctx = context(
-            keypair,
-            executor.executor_info,
-            validation=validation,
-            verifyx=verifyx_service,
-            verifyx_enabled=False,
-        )
-        factory = MagicMock(side_effect=AssertionError("nothing to run: no client, no /version"))
-        result = await LocalVerifyCheck(client_factory=factory).run(ctx)
-    assert result.passed and result.event.reason_code == "LOCAL_VERIFY_FALLBACK"
-    assert result.event.what_we_saw["reason"] == "allcards_ssh"
-    assert executor.intents == [] and not factory.called
 
 
 @pytest.mark.asyncio
@@ -1247,7 +1225,7 @@ async def test_filler_only_node_is_skipped_without_a_call(
     keypair, monkeypatch, local_verify_on, verifyx_service
 ):
     """A node running only Lium's own filler (no customer pod) is not probed — the same rule as
-    `CapabilityCheck` (`_get_filler_only_container`); a filler beside a customer pod is a rental
+    `CapabilityCheck` (`get_filler_only_container`); a filler beside a customer pod is a rental
     and is handled by the rented branch, not here."""
     validation = matmul_service(monkeypatch)
     factory = MagicMock(side_effect=AssertionError("no client for a filler-only node"))
@@ -1459,31 +1437,6 @@ async def test_a_scored_cycle_sends_full_size_verifyx_only(
     assert outcomes and all(o["first_pass"] is False for o in outcomes)
 
 
-@pytest.mark.asyncio
-async def test_a_scored_cycle_with_verifyx_off_sends_the_matmul_alone(
-    keypair, monkeypatch, local_verify_on, verifyx_service
-):
-    """`scored_ssh` is about the serial VerifyX inflating the matmul's round trip. With VerifyX
-    off there is no VerifyX in the call, the round trip is the matmul's own, and the full-size
-    matmul rides the call and is consumed — the shape #1340 had before the gate; a gate that also
-    fired here would turn a working call into "nothing to run"."""
-    validation = matmul_service(monkeypatch)
-    async with FakeExecutor(keypair) as executor:
-        ctx = context(
-            keypair,
-            executor.executor_info,
-            validation=validation,
-            verifyx=verifyx_service,
-            first_pass=False,
-            verifyx_enabled=False,
-        )
-        local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
-    assert executor.intents[0]["steps"]["verifyx"] is None
-    assert executor.intents[0]["steps"]["matmul"]["cipher_text"]
-    assert local.event.what_we_saw["consumed"] == ["matmul"]
-    assert local.event.what_we_saw["fallbacks"] == {}
-
-
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():
     names = [type(c).__name__ for c in PipelineFactory.build_checks()]
     assert names.index("TenantEnforcementCheck") < names.index("LocalVerifyCheck")
@@ -1508,7 +1461,6 @@ async def test_transport_names_the_sample_the_cold_retry_kept(
     """DAH-2959's cold-sample retry always runs over SSH. When it wins, the event's `transport`
     must say so; a consumed local answer that lost to it is not what the event describes.
     First pass, so the kept-first case ends in the DAH-3011 deferred-gate success event too."""
-    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
     local_answer = vvs.VerifyXResponse(
         data={"success": True, "network": {"download_speed": 59.9, "upload_speed": 20.0}}
     )
@@ -1518,7 +1470,7 @@ async def test_transport_names_the_sample_the_cold_retry_kept(
     ssh = SimpleNamespace(validate_verifyx_and_process_job=AsyncMock(return_value=ssh_answer))
     ctx = make_context(
         services=build_services(verifyx=ssh),
-        config=build_context_config(verifyx_enabled=True, first_pass=True),
+        config=build_context_config(first_pass=True),
         state=build_state(
             specs=SPECS,
             rented_data=RentedExecutorsResponse(executors={}, banned_guids=[], network_ema={}),

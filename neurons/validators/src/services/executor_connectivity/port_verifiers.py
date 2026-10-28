@@ -1,25 +1,41 @@
 import asyncio
 import logging
+import random
 import uuid
 
 import aiohttp
 from asyncssh import SSHClientConnection
 
+from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.container_runner import ContainerRunner
-from services.executor_connectivity.models import PortPair
+from services.executor_connectivity.external_probe import ExternalPortProbe
+from services.executor_connectivity.models import BatchResult, PortPair
 from services.executor_connectivity.netcat_script import NetcatScript
 from services.executor_connectivity.port_tester import PortTester
+from services.node_host import public_host_connector
 
 logger = logging.getLogger(__name__)
+
+
+# DAH-4537: ports fetched from outside first; each netcat listener answers once, so these are not
+# fetched again by the validator unless the outside fetch missed them
+EXTERNAL_PROBE_SAMPLE = 3
 
 
 class BatchVerifier:
     """Verifies ports using --network=host in batches."""
 
-    def __init__(self, port_tester: PortTester, runner: ContainerRunner):
+    REPROBE_DELAY_SEC = 3
+    REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
+
+    def __init__(
+        self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
+    ):
         self.port_tester = port_tester
         self.runner = runner
+        self.external_probe = external_probe
 
     async def verify(
         self,
@@ -28,11 +44,11 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
-    ) -> tuple[list[PortPair], list[PortPair]]:
+    ) -> BatchResult:
         """Verify ports with retries."""
         log_ctx = log_ctx or {}
-        max_attempts = 2
         timeout_sec = 60
+        max_attempts = 2
 
         for attempt in range(1, max_attempts + 1):
             token = uuid.uuid4().hex
@@ -46,25 +62,27 @@ class BatchVerifier:
             )
 
             try:
-                successful, failed = await asyncio.wait_for(
+                attempt_result = await asyncio.wait_for(
                     self._attempt(ports, token, container_name, ssh_client, host, log_ctx),
                     timeout=timeout_sec
                 )
-
-                if successful:
+                if attempt_result.successful:
                     logger.info(
-                        _m(f"complete: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+                        _m(
+                            f"complete: {len(attempt_result.successful)}/{len(ports)} verified",
+                            extra=get_extra_info(log_ctx),
+                        )
                     )
-                    return successful, failed
+                    return attempt_result
 
                 if attempt < max_attempts:
-                    logger.warning(
+                    logger.debug(
                         _m(f"attempt {attempt} failed, retrying in 2s", extra=get_extra_info(log_ctx))
                     )
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
-                logger.error(
+                logger.debug(
                     _m(f"attempt {attempt} timed out after {timeout_sec}s", extra=get_extra_info(log_ctx))
                 )
                 await self.runner.cleanup(ssh_client, container_name)
@@ -80,8 +98,11 @@ class BatchVerifier:
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
 
-        logger.error(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
-        return [], ports
+        # DAH-3593: the outcome is the PortCountCheck verdict ("Port verification failed"); the
+        # attempts and tiers on the way there are DEBUG. An exception inside an attempt keeps
+        # ERROR above: that is the validator's own failure, not the node's ports.
+        logger.debug(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
+        return BatchResult([], ports)
 
     async def _attempt(
         self,
@@ -91,30 +112,57 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
-    ) -> tuple[list[PortPair], list[PortPair]]:
+    ) -> BatchResult:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
         script = NetcatScript.batch(ports, token, 0)
         start_result = await self.runner.run(ssh_client, name, script, "host", 60)
         if not start_result.ok:
-            logger.warning(
+            logger.debug(
                 _m(
                     f"batch start failed: status={start_result.status} logs={start_result.logs}",
                     extra=get_extra_info(log_ctx),
                 )
             )
-            return [], ports
+            return BatchResult([], ports)
 
         try:
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as session:
-                successful, failed = await self.port_tester.test_many(session, host, ports, token, log_ctx)
+            sample = random.sample(ports, min(EXTERNAL_PROBE_SAMPLE, len(ports))) if self.external_probe else []
+            reached = await self.external_probe.reached(host, sample, token) if sample else None
+            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+                remaining = [p for p in ports if p not in (reached or [])]
+                successful, failed = (
+                    await self.port_tester.test_many(session, host, remaining, token, log_ctx) if remaining else ([], [])
+                )
+                first_round = successful
+                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
+                # re-probe the refused ports while the count is below PortCountCheck's floor (the failure condition)
+                for round_no in range(1, self.REPROBE_ROUNDS + 1):
+                    if not failed or len(reached or []) + len(successful) >= MIN_PORT_COUNT:
+                        break
+                    await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                    late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
+                    successful = successful + late
+                    logger.debug(
+                        _m(f"re-probe {round_no}/{self.REPROBE_ROUNDS}: {len(late)} late", extra=get_extra_info(log_ctx))
+                    )
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
         finally:
             await self.runner.cleanup(ssh_client, name)
 
-        return successful, failed
+        # only first-round answers count against the outside prober: it ran before them, so a late bind refuses it too
+        external_blocked = reached == [] and all(p in first_round for p in sample)
+        if external_blocked:
+            logger.warning(
+                _m(
+                    f"ports {[p.external for p in sample]} answer the validator but not the outside prober"
+                    f"{'' if settings.EXTERNAL_PORT_PROBE_ENFORCE else ' (log-only)'}",
+                    extra=get_extra_info(log_ctx),
+                )
+            )
+        return BatchResult((reached or []) + successful, failed, external_blocked and settings.EXTERNAL_PORT_PROBE_ENFORCE)
 
 
 class FallbackVerifier:
@@ -142,7 +190,7 @@ class FallbackVerifier:
 
         successful, failed = [], []
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=public_host_connector()) as session:
             for idx, port in enumerate(ports_to_test, 1):
                 token = uuid.uuid4().hex
                 name = f"port_test_seq_{token[:8]}"
@@ -153,7 +201,7 @@ class FallbackVerifier:
                 try:
                     start_result = await self.runner.run(ssh_client, name, script, network_flag, 10)
                     if not start_result.ok:
-                        logger.warning(
+                        logger.debug(
                             _m(
                                 f"fallback: port {port.internal} failed to start: "
                                 f"status={start_result.status} logs={start_result.logs}",
@@ -216,6 +264,9 @@ class SemiBatchVerifier:
     # chunk size is the blast radius of one busy port (DAH-2527: idle fillers take the same low
     # ports this tier probes). Ten matches the sequential tier's cap.
     CHUNK_SIZE = 10
+    # a healthy chunk answers in under 10 s (prod p90 9 s); a host too loaded to start a container
+    # took 6.5 min and pushed rented B300s past the job deadline (20 Oct), so a stalled chunk fails
+    CHUNK_TIMEOUT_SEC = 60
 
     def __init__(self, port_tester: PortTester, runner: ContainerRunner):
         self.port_tester = port_tester
@@ -246,7 +297,7 @@ class SemiBatchVerifier:
         )
 
         chunk_results = await asyncio.gather(
-            *(self._verify_chunk(chunk, ssh_client=ssh_client, host=host, log_ctx=log_ctx) for chunk in chunks)
+            *(self._verify_chunk_in_time(chunk, ssh_client=ssh_client, host=host, log_ctx=log_ctx) for chunk in chunks)
         )
         successful = [port for chunk_successful, _ in chunk_results for port in chunk_successful]
         failed = [port for _, chunk_failed in chunk_results for port in chunk_failed]
@@ -255,6 +306,29 @@ class SemiBatchVerifier:
             _m(f"semi-batch: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(log_ctx))
         )
         return successful, failed
+
+    async def _verify_chunk_in_time(
+        self,
+        ports: list[PortPair],
+        *,
+        ssh_client: SSHClientConnection,
+        host: str,
+        log_ctx: dict,
+    ) -> tuple[list[PortPair], list[PortPair]]:
+        try:
+            return await asyncio.wait_for(
+                self._verify_chunk(ports, ssh_client=ssh_client, host=host, log_ctx=log_ctx),
+                self.CHUNK_TIMEOUT_SEC,
+            )
+        except TimeoutError:
+            # the container kills itself after its 20 s window, so nothing is left holding the ports
+            logger.warning(
+                _m(
+                    f"semi-batch: chunk of {len(ports)} ports timed out after {self.CHUNK_TIMEOUT_SEC}s",
+                    extra=get_extra_info(log_ctx),
+                )
+            )
+            return [], ports
 
     async def _verify_chunk(
         self,
@@ -280,7 +354,7 @@ class SemiBatchVerifier:
             # port (and its docker-proxy) against the next cycle's verification
             start_result = await self.runner.run(ssh_client, container_name, script, publish_flags, 20)
             if not start_result.ok:
-                logger.warning(
+                logger.debug(
                     _m(
                         f"semi-batch start failed for {len(ports)} ports: "
                         f"status={start_result.status} logs={start_result.logs}",
@@ -290,7 +364,7 @@ class SemiBatchVerifier:
                 return [], ports
 
             started = True
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as session:
+            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
                 return await self.port_tester.test_many(session, host, ports, token, log_ctx)
 
         except Exception as e:

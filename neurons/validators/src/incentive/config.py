@@ -35,11 +35,90 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
 }
+# Max-Q (300 W) Workstation Edition: priced at parity with the Workstation (DAH-3453). Derived from the
+# Workstation entry; the pinned lium-core release lacks the key, so this pin adds it until the lock catches up.
+RENTAL_PRICES_PER_HOUR["NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"] = RENTAL_PRICES_PER_HOUR[
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+]
 # `NVIDIA B300 SXM6 PC`: provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300
 # SXM6 PC, memory.total 275040 MiB, all 8 GPUs of the host); not in NVIDIA's public chip list, which has
 # only the AC spelling. Listed as the AC card's alias and never a row of its own: every table derives it
 # from the AC entry, so a re-price of the AC card moves both names.
 RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+# `NVIDIA GB300` is priced like B300 for now. A different card from the B300, so its own base
+# model and idle tier (it never fills the B300 cap), at the B300 rate and caps.
+RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]  # mirrors B300; revisit when GB300 market data exists
+
+# Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
+# price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.
+RENTAL_PRICES_PER_HOUR.update({
+    "NVIDIA GeForce RTX 5080": 0.15,
+    "NVIDIA GeForce RTX 5070 Ti": 0.12,
+    "NVIDIA GeForce RTX 5060 Ti": 0.12,
+    "NVIDIA GeForce RTX 4060 Ti": 0.11,
+    "NVIDIA GeForce RTX 4070 SUPER": 0.09,
+    "NVIDIA GeForce RTX 3080": 0.09,
+    "NVIDIA GeForce RTX 3060": 0.06,
+    "NVIDIA GeForce RTX 2080 Ti": 0.08,
+    "NVIDIA Tesla V100 Tensor Core GPU": 0.17,
+    "NVIDIA RTX PRO 5000 Blackwell": 0.67,
+    "NVIDIA RTX PRO 4500 Blackwell": 0.40,
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 0.40,
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": 0.82,
+    "NVIDIA RTX 6000D": 0.82,
+    "NVIDIA GeForce RTX 4080": 0.16,
+    "NVIDIA GeForce RTX 4080 SUPER": 0.16,
+    "NVIDIA GeForce RTX 3070": 0.07,
+    "NVIDIA Quadro RTX 8000": 0.21,
+    "NVIDIA CMP 170HX": 0.30,
+})
+# Every other GPU model gets the unrented incentive too (DAH-5070, Fish 23 Oct 2026: "make sure all gpu types get idle
+# pay"). Anchors are the backend's MACHINE_PRICES, except the two noted below; rows are in lium-core's defaults too.
+RENTAL_PRICES_PER_HOUR.update({
+    "NVIDIA GeForce RTX 5090 D": 0.15,
+    "NVIDIA GeForce RTX 5070": 0.09,
+    "NVIDIA GeForce RTX 5060": 0.11,
+    "NVIDIA GeForce RTX 4070 Ti": 0.11,
+    "NVIDIA GeForce RTX 4070 Ti SUPER": 0.18,
+    "NVIDIA GeForce RTX 4070": 0.08,
+    "NVIDIA GeForce RTX 4060": 0.06,
+    "NVIDIA RTX PRO 2000 Blackwell": 0.17,
+    "NVIDIA RTX PRO 4000 Blackwell": 0.20,
+    "NVIDIA RTX 4500 Ada Generation": 0.20,
+    "NVIDIA RTX 5000 Ada Generation": 0.27,
+    "NVIDIA RTX 5880 Ada Generation": 0.34,
+    "NVIDIA A800 80GB PCIe": 0.31,
+    "NVIDIA A10 Tensor Core GPU": 0.20,
+    "NVIDIA RTX A2000": 0.06,
+    "NVIDIA T4 Tensor Core GPU": 0.15,
+    "NVIDIA TITAN V": 0.10,
+    "NVIDIA GeForce RTX 3090 Ti": 0.16,
+    "NVIDIA GeForce RTX 3080 Ti": 0.10,
+    "NVIDIA GeForce RTX 3070 Ti": 0.09,
+    "NVIDIA GeForce RTX 3060 Ti": 0.06,
+    "NVIDIA GeForce RTX 3060 Laptop GPU": 0.08,
+    "NVIDIA GeForce RTX 3050": 0.05,
+    "NVIDIA Quadro RTX 6000": 0.13,
+    "NVIDIA Quadro RTX 5000": 0.07,
+    "NVIDIA TITAN RTX": 0.12,
+    "NVIDIA GeForce RTX 2080 SUPER": 0.08,  # backend 0.74 is above an RTX 4090; the 2080 Ti rate
+    "NVIDIA GeForce RTX 2070 SUPER": 0.07,
+    "NVIDIA GeForce RTX 2060 SUPER": 0.06,
+    "NVIDIA GeForce RTX 2060": 0.04,
+    "NVIDIA GeForce GTX 1660 Ti": 0.07,
+    "NVIDIA GeForce GTX 1660 SUPER": 0.05,
+    "NVIDIA GeForce GTX 1660": 0.07,
+    "NVIDIA Tesla P100": 0.08,
+    "NVIDIA Tesla P40": 0.07,
+    "NVIDIA Quadro P4000": 0.05,
+    "NVIDIA TITAN Xp": 0.04,
+    "NVIDIA GeForce GTX 1080 Ti": 0.04,
+    "NVIDIA GeForce GTX 1080": 0.03,
+    "NVIDIA GeForce GTX 1070 Ti": 0.04,
+    "NVIDIA GeForce GTX 1070": 0.04,  # backend 0.37 is above an RTX 3090; the 1070 Ti rate
+    "NVIDIA GeForce GTX 1060": 0.09,
+    "NVIDIA Tesla M40": 0.08,
+})
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -50,10 +129,10 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # `gpu_count`. Cap dilution is computed independently per `(base_model, bucket)`.
 #
 # An empty dict `{}` means the base model is known but not eligible for rental
-# subsidy (no buckets → no subsidy path).
+# subsidy (no buckets → no subsidy path). Since DAH-5070 every base model has buckets.
 #
 # The cap is expressed in GPUs (the per-bucket sum of executor `gpu_count`), so a
-# bucket cap equals `machines × gpus_per_machine`. Eligible families use
+# bucket cap equals `machines × gpus_per_machine`. Eligible families default to
 # `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
 # GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
 #
@@ -65,89 +144,94 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # always rated at the node's `gpu_splitting_min_count` tier (`_resolve_bucket`: a
 # remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
 # those cards share the 4 with the idle single-card nodes.
+#
+# The A100 and L40S 8-card buckets use lower, demand-based caps than the default
+# 8-card bucket; the values are in the table below.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
     "RTX 4090": {1: 10, 8: 64},
-    "A100": {1: 10, 8: 64},
+    "A100": {1: 10, 8: 40},
     "RTX A6000": {1: 10, 8: 64},
     "RTX 3090": {1: 10, 8: 64},
-    "H800": {},
-    "A800": {},
-    "CMP 170HX": {},
+    "H800": {1: 10, 8: 64},
+    "A800": {1: 10, 8: 64},
+    "CMP 170HX": {1: 10, 8: 64},
     "RTX 5090": {1: 10, 8: 64},
-    "RTX 4000 Ada Generation": {},
+    "RTX 5090 D": {1: 10, 8: 64},
+    "RTX 4000 Ada Generation": {1: 10, 8: 64},
     "RTX 6000 Ada Generation": {1: 10, 8: 64},
     "RTX PRO 6000": {1: 10, 8: 64},
-    "L4": {},
-    "L40S": {1: 10, 8: 64},
+    "L4": {1: 10, 8: 64},
+    "L40S": {1: 10, 8: 16},
     "L40": {1: 10, 8: 64},
-    "RTX 2000 Ada Generation": {},
-    "RTX A5000": {},
-    "RTX A4500": {},
-    "RTX A4000": {},
-    "A40": {},
-    "A30": {},
-    "RTX 5080": {},
-    "RTX 5070 Ti": {},
-    "RTX 5070": {},
-    "RTX 5060 Ti": {},
-    "RTX 5060": {},
-    "RTX 4080 SUPER": {},
-    "RTX 4080": {},
-    "RTX 4070 Ti": {},
-    "RTX 4070 Ti SUPER": {},
-    "RTX 4070 SUPER": {},
-    "RTX 4070": {},
-    "RTX 4060 Ti": {},
-    "RTX 4060": {},
-    "RTX PRO 2000": {},
-    "RTX PRO 4000": {},
-    "RTX PRO 4500": {},
-    "RTX PRO 5000": {},
-    "RTX PRO 6000D": {},
-    "RTX 4500 Ada Generation": {},
-    "RTX 5000 Ada Generation": {},
-    "RTX 5880 Ada Generation": {},
-    "A10": {},
-    "RTX A2000": {},
-    "T4": {},
-    "V100": {},
-    "TITAN V": {},
-    "RTX 3090 Ti": {},
-    "RTX 3080 Ti": {},
-    "RTX 3080": {},
-    "RTX 3070 Ti": {},
-    "RTX 3070": {},
-    "RTX 3060 Ti": {},
-    "RTX 3060 Laptop": {},
-    "RTX 3060": {},
-    "RTX 3050": {},
-    "Quadro RTX 8000": {},
-    "Quadro RTX 6000": {},
-    "Quadro RTX 5000": {},
-    "TITAN RTX": {},
-    "RTX 2080 Ti": {},
-    "RTX 2080 SUPER": {},
-    "RTX 2070 SUPER": {},
-    "RTX 2060 SUPER": {},
-    "RTX 2060": {},
-    "GTX 1660 Ti": {},
-    "GTX 1660 SUPER": {},
-    "GTX 1660": {},
-    "Tesla P100": {},
-    "Tesla P40": {},
-    "Quadro P4000": {},
-    "TITAN Xp": {},
-    "GTX 1080 Ti": {},
-    "GTX 1080": {},
-    "GTX 1070 Ti": {},
-    "GTX 1070": {},
-    "GTX 1060": {},
-    "Tesla M40": {},
+    "RTX 2000 Ada Generation": {1: 10, 8: 64},
+    "RTX A5000": {1: 10, 8: 64},
+    "RTX A4500": {1: 10, 8: 64},
+    "RTX A4000": {1: 10, 8: 64},
+    "A40": {1: 10, 8: 64},
+    "A30": {1: 10, 8: 64},
+    "RTX 5080": {1: 10, 8: 64},
+    "RTX 5070 Ti": {1: 10, 8: 64},
+    "RTX 5070": {1: 10, 8: 64},
+    "RTX 5060 Ti": {1: 10, 8: 64},
+    "RTX 5060": {1: 10, 8: 64},
+    "RTX 4080 SUPER": {1: 10, 8: 64},
+    "RTX 4080": {1: 10, 8: 64},
+    "RTX 4070 Ti": {1: 10, 8: 64},
+    "RTX 4070 Ti SUPER": {1: 10, 8: 64},
+    "RTX 4070 SUPER": {1: 10, 8: 64},
+    "RTX 4070": {1: 10, 8: 64},
+    "RTX 4060 Ti": {1: 10, 8: 64},
+    "RTX 4060": {1: 10, 8: 64},
+    "RTX PRO 2000": {1: 10, 8: 64},
+    "RTX PRO 4000": {1: 10, 8: 64},
+    "RTX PRO 4500": {1: 10, 8: 64},
+    "RTX PRO 5000": {1: 10, 8: 64},
+    "RTX PRO 6000D": {1: 10, 8: 64},
+    "RTX 4500 Ada Generation": {1: 10, 8: 64},
+    "RTX 5000 Ada Generation": {1: 10, 8: 64},
+    "RTX 5880 Ada Generation": {1: 10, 8: 64},
+    "A10": {1: 10, 8: 64},
+    "RTX A2000": {1: 10, 8: 64},
+    "T4": {1: 10, 8: 64},
+    "V100": {1: 10, 8: 64},
+    "TITAN V": {1: 10, 8: 64},
+    "RTX 3090 Ti": {1: 10, 8: 64},
+    "RTX 3080 Ti": {1: 10, 8: 64},
+    "RTX 3080": {1: 10, 8: 64},
+    "RTX 3070 Ti": {1: 10, 8: 64},
+    "RTX 3070": {1: 10, 8: 64},
+    "RTX 3060 Ti": {1: 10, 8: 64},
+    "RTX 3060 Laptop": {1: 10, 8: 64},
+    "RTX 3060": {1: 10, 8: 64},
+    "RTX 3050": {1: 10, 8: 64},
+    "Quadro RTX 8000": {1: 10, 8: 64},
+    "Quadro RTX 6000": {1: 10, 8: 64},
+    "Quadro RTX 5000": {1: 10, 8: 64},
+    "TITAN RTX": {1: 10, 8: 64},
+    "RTX 2080 Ti": {1: 10, 8: 64},
+    "RTX 2080 SUPER": {1: 10, 8: 64},
+    "RTX 2070 SUPER": {1: 10, 8: 64},
+    "RTX 2060 SUPER": {1: 10, 8: 64},
+    "RTX 2060": {1: 10, 8: 64},
+    "GTX 1660 Ti": {1: 10, 8: 64},
+    "GTX 1660 SUPER": {1: 10, 8: 64},
+    "GTX 1660": {1: 10, 8: 64},
+    "Tesla P100": {1: 10, 8: 64},
+    "Tesla P40": {1: 10, 8: 64},
+    "Quadro P4000": {1: 10, 8: 64},
+    "TITAN Xp": {1: 10, 8: 64},
+    "GTX 1080 Ti": {1: 10, 8: 64},
+    "GTX 1080": {1: 10, 8: 64},
+    "GTX 1070 Ti": {1: 10, 8: 64},
+    "GTX 1070": {1: 10, 8: 64},
+    "GTX 1060": {1: 10, 8: 64},
+    "Tesla M40": {1: 10, 8: 64},
 }
+MAX_UNRENTED_GPUS_BY_TYPE["GB300"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B300"])  # mirrors B300; revisit when GB300 market data exists
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
@@ -184,6 +268,7 @@ BASE_GPU_MAP = {
     "NVIDIA H800 NVL": "H800",
     "NVIDIA H800 PCIe": "H800",
     "NVIDIA GeForce RTX 5090": "RTX 5090",
+    "NVIDIA GeForce RTX 5090 D": "RTX 5090 D",
     "NVIDIA GeForce RTX 5080": "RTX 5080",
     "NVIDIA GeForce RTX 5070 Ti": "RTX 5070 Ti",
     "NVIDIA GeForce RTX 5070": "RTX 5070",
@@ -211,6 +296,7 @@ BASE_GPU_MAP = {
     "NVIDIA RTX 6000 Ada Generation": "RTX 6000 Ada Generation",
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": "RTX PRO 6000",
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": "RTX PRO 6000",
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": "RTX PRO 6000",
     "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": "RTX PRO 6000D",
     "NVIDIA RTX 6000D": "RTX PRO 6000D",
     "NVIDIA L4": "L4",
@@ -266,6 +352,7 @@ BASE_GPU_MAP = {
     "NVIDIA Tesla M40": "Tesla M40",
 }
 BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
+BASE_GPU_MAP["NVIDIA GB300"] = "GB300"  # own family, see RENTAL_PRICES_PER_HOUR
 
 
 class IncentiveConfig(BaseModel):

@@ -1,5 +1,6 @@
 """DAH-2748: an availability error means we could not reach something, and hides the node."""
 
+import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncssh
@@ -11,6 +12,7 @@ from services.task import service as task_service_module
 from services.task.availability import (
     AVAILABILITY_CATEGORY,
     MAX_PEER_TEXT_LENGTH,
+    SSH_HOST_KEY_MISMATCH_REMEDIATION,
     AvailabilityErrorCode,
     ReachSource,
     ReachTarget,
@@ -36,7 +38,7 @@ def test_ssh_unreachable_is_an_availability_error() -> None:
     assert event.what_we_saw["reach_source"] == "validator"
     assert event.what_we_saw["reach_target"] == "executor_ssh"
     assert event.what_we_saw["ssh_port"] == 2200
-    assert event.remediation
+    assert "EXECUTOR_SSH_SOURCE_PIN=false" in event.remediation  # the NAT/proxy opt-out is named
     assert [e.reason_code for e in availability_errors([event])] == ["EXECUTOR_SSH_UNREACHABLE"]
 
 
@@ -170,6 +172,72 @@ async def test_a_cycle_that_cannot_open_ssh_scores_zero_and_reports_the_code(mon
     assert result.score == 0
     assert [e["reason_code"] for e in result.availability_errors] == ["EXECUTOR_SSH_UNREACHABLE"]
     assert "EXECUTOR_SSH_UNREACHABLE" in result.log_text
+
+
+class _ShellAnsweredByAnotherSshd(_ShellThatRefusesToConnect):
+    async def __aenter__(self) -> "_ShellAnsweredByAnotherSshd":
+        raise asyncssh.HostKeyNotVerifiable("Host key is not trusted for host 1.2.3.4")
+
+
+@pytest.mark.asyncio
+async def test_an_untrusted_host_key_points_at_the_ssh_port_not_the_firewall(monkeypatch) -> None:
+    """A provider on Discord, 11 Oct 2026: the node SSH port reached the host's own sshd, not the executor."""
+    monkeypatch.setattr(task_service_module, "InteractiveShellService", _ShellAnsweredByAnotherSshd)
+    miner, executor = _a_job_for("node-9")
+
+    result = await _run_cycle(_task_service_that_reaches_the_ssh_connect(), miner, executor)
+
+    [error] = result.availability_errors
+    assert error["reason_code"] == "EXECUTOR_SSH_UNREACHABLE"
+    assert error["remediation"] == SSH_HOST_KEY_MISMATCH_REMEDIATION
+    assert "firewall" not in error["remediation"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_connect_keeps_the_firewall_advice(monkeypatch) -> None:
+    monkeypatch.setattr(task_service_module, "InteractiveShellService", _ShellThatRefusesToConnect)
+    miner, executor = _a_job_for("node-9")
+
+    result = await _run_cycle(_task_service_that_reaches_the_ssh_connect(), miner, executor)
+
+    assert "firewall" in result.availability_errors[0]["remediation"]
+
+
+def _does_not_resolve(host, port, *args, **kwargs):
+    raise socket.gaierror(-2, "Name or service not known")
+
+
+def _resolves_to_a_private_address(host, port, *args, **kwargs):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fake_getaddrinfo", "detail"),
+    [
+        (_does_not_resolve, "does not resolve"),
+        (_resolves_to_a_private_address, "non-public address"),
+    ],
+)
+async def test_a_node_hostname_that_fails_the_preflight_hides_the_node(
+    monkeypatch, fake_getaddrinfo, detail
+) -> None:
+    """DAH-4035: the real shell's hostname preflight fails at the connect, so the node is unreachable.
+
+    A generic error here would leave availability_errors unset and the node listed.
+    """
+    monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+    dialled = AsyncMock(side_effect=AssertionError("the preflight must stop the dial"))
+    monkeypatch.setattr("services.interactive_shell_service.asyncssh.connect", dialled)
+    miner, executor = _a_job_for("node-9")
+    executor = executor.model_copy(update={"address": "gpu-node1.example.net"})
+
+    result = await _run_cycle(_task_service_that_reaches_the_ssh_connect(), miner, executor)
+
+    assert result.score == 0
+    assert [e["reason_code"] for e in result.availability_errors] == ["EXECUTOR_SSH_UNREACHABLE"]
+    assert detail in result.log_text
+    dialled.assert_not_awaited()
 
 
 @pytest.mark.asyncio

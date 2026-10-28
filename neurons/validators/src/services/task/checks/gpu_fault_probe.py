@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import shlex
 from pathlib import Path
 from typing import Any
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 
 from ..messages import GpuFaultProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .capability import _get_filler_only_container
+from .capability import get_filler_only_container
 
 # The probe runs on the executor's own interpreter, standard library only, and ships over stdin the way
 # the scrape source does (DAH-2794): nothing to upload, nothing the miner has to update.
@@ -37,6 +39,15 @@ MAX_NVML_GPUS = 16
 MAX_XID_LINES = 5
 MAX_XID_CHARS = 200
 
+logger = logging.getLogger(__name__)
+
+# A probe with no verdict passes: the timeout, the missing report and the report that is not ok or
+# fault are each innocent once. They are also all a host can produce at will (kill the interpreter,
+# print another status), so a node could sit on "no verdict" for good. Cycles in a row without a
+# verdict are counted per (miner hotkey, executor uuid), per process, and logged from this many on.
+UNKNOWN_STREAK_LIMIT = 5
+_unknown_streak: dict[tuple[str, str], int] = {}
+
 
 class GpuFaultProbeCheck:
     """Run the kernel-fault probe on the executor's GPUs after the matmul has passed (DAH-3035).
@@ -48,7 +59,7 @@ class GpuFaultProbeCheck:
     round-trips pinned memory through the copy engines, verifies every result on the device, and reads
     uncorrected ECC / remapped rows / recovery action from NVML before and after.
 
-    Shadow-first like every score-zeroing gate: GPU_FAULT_PROBE_CHECK_ENABLED runs it and emits the verdict,
+    Shadow-first like every score-zeroing gate: it always runs and emits the verdict;
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED lets a fault fail the (fatal) check. A probe that could not run
     (no libcuda, cuInit, JIT) passes with GPU_FAULT_PROBE_UNKNOWN: inability to measure is not a fault.
     """
@@ -56,14 +67,24 @@ class GpuFaultProbeCheck:
     check_id = "gpu.validate.fault_probe"
     fatal = True
 
+    def __init__(self, enforce: bool = False):
+        # enforce: run and judge a fault as a failure whatever the GPU_FAULT_PROBE_* flags say
+        # (the post-rental recheck, DAH-4482)
+        self.enforce = enforce
+
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.GPU_FAULT_PROBE_CHECK_ENABLED:
+        if ctx.config.first_pass and not (
+            self.enforce or settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED
+        ):
+            # a shadow verdict cannot fail the node, so it does not delay a new node's first verification
             return CheckResult(
-                passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
+                passed=True,
+                event=render_message(Msg.FIRST_PASS_SKIPPED, ctx=ctx, check_id=self.check_id),
             )
 
-        filler_container = _get_filler_only_container(ctx)
-        if filler_container:
+        filler_container = get_filler_only_container(ctx)
+        # enforce: the recheck only probes beside a filler after it removed the node's Lium fillers
+        if filler_container and not self.enforce:
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -91,10 +112,7 @@ class GpuFaultProbeCheck:
                 stdout_tail=run.stdout[-OUTPUT_TAIL_CHARS:],
                 stderr_tail=run.stderr[-OUTPUT_TAIL_CHARS:],
             )
-            return CheckResult(
-                passed=True,
-                event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
-            )
+            return self._no_verdict(ctx, what)
         if report is None:
             # the interpreter never printed a verdict: an SSH error, a python that could not run stdlib
             # code, or a crash in the parent process. Not something the GPU is blamed for.
@@ -103,13 +121,12 @@ class GpuFaultProbeCheck:
                 stdout_tail=run.stdout[-OUTPUT_TAIL_CHARS:],
                 stderr_tail=run.stderr[-OUTPUT_TAIL_CHARS:],
             )
-            return CheckResult(
-                passed=True,
-                event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
-            )
+            return self._no_verdict(ctx, what)
 
         what["probe"] = _summary(report)
         status = report.get("status")
+        if status in ("ok", "fault"):
+            _unknown_streak.pop((ctx.miner_hotkey, ctx.executor.uuid), None)
         if status == "ok":
             return CheckResult(
                 passed=True,
@@ -124,6 +141,34 @@ class GpuFaultProbeCheck:
             )
             return self._fault_verdict(ctx, what, error=error or "fault", report=report)
         what["error"] = _cap(report.get("error")) or f"probe status {_cap(status)!r}"
+        return self._no_verdict(ctx, what)
+
+    def _no_verdict(self, ctx: Context, what: dict[str, Any]) -> CheckResult:
+        """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is logged, and under
+        GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. An enforce run is a
+        second probe in the same cycle, so it does not count."""
+        if self.enforce:
+            return CheckResult(
+                passed=True,
+                event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
+            )
+        key = (ctx.miner_hotkey, ctx.executor.uuid)
+        streak = _unknown_streak.get(key, 0) + 1
+        _unknown_streak[key] = streak
+        if streak >= UNKNOWN_STREAK_LIMIT:
+            enforced = settings.GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED
+            what["unknown_streak"] = streak
+            logger.warning(
+                _m(
+                    "GPU_FAULT_PROBE_UNKNOWN_STREAK",
+                    extra=get_extra_info(
+                        {**ctx.default_extra, "unknown_streak": streak, "enforced": enforced}
+                    ),
+                )
+            )
+            if enforced:
+                error = f"probe gave no verdict {streak} cycles in a row: {what.get('error')}"
+                return self._fault_verdict(ctx, what, error=error, report=None)
         return CheckResult(
             passed=True,
             event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
@@ -132,7 +177,7 @@ class GpuFaultProbeCheck:
     def _fault_verdict(
         self, ctx: Context, what: dict[str, Any], *, error: str, report: dict[str, Any] | None
     ) -> CheckResult:
-        enforce = settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED
+        enforce = self.enforce or settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED
         what["error"] = error[: MAX_FAULT_LINES * MAX_FAULT_CHARS]
         if report is not None:
             what["xid"] = _capped_xid(report.get("xid"))

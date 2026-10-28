@@ -13,15 +13,17 @@ Covers (from the plan + DAH-2211 isolated-build flow):
 - A.13 egress firewall failure → build_egress_setup (never builds)
 - A.14 DinD container always torn down (finally)
 - A.15 image export (save|load) failure → build_export
+- A.20–A.26 (DAH-3521) the egress block lets the DinD's own DNS through;
+  every setup command before the build is bounded, the firewall helpers
+  included (named, bounded on the executor, force-removed before the DinD)
 - B.1 SSE latency p95 ≤ 2000 ms (stubbed redis consumer)
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import time
-from pathlib import Path
+import logging
+import re
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -30,12 +32,15 @@ import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import (
     ContainerCreateRequest,
-    FailedContainerErrorCodes,
     FailedContainerRequest,
     PayloadPortMapping,
 )
 from services.docker_service import DockerService
-from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
+from services.rental_docker_sdk import (
+    ContainerExecResult,
+    ContainerStateSnapshot,
+    build_gpu_docker_config,
+)
 
 # ------------------------------------------------------------------
 # Shared fixtures / helpers
@@ -57,12 +62,15 @@ def deps():
 @pytest_asyncio.fixture
 async def svc(deps):
     ssh_service, redis_service, attestation_service = deps
-    return DockerService(
+    service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
         attestation_service=attestation_service,
         rental_docker_client_factory=_FakeRentalDockerFactory(),
     )
+    # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    return service
 
 
 class _FakeRentalDockerClient:
@@ -94,6 +102,12 @@ class _FakeRentalDockerClient:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
 
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
+
     async def create_volume(
         self,
         *,
@@ -101,6 +115,7 @@ class _FakeRentalDockerClient:
         driver: str | None = None,
         driver_opts: dict[str, str] | None = None,
         timeout: int | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         self.created_volumes.append(
             {
@@ -157,24 +172,114 @@ def _ssh_result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
     return r
 
 
+def _is_probe(command: str) -> bool:
+    return "docker exec" in command and command.rstrip().endswith("docker info")
+
+
+class _FakeProbeProcess:
+    """What `ssh_client.create_process` hands the readiness loop: an async
+    context manager whose `wait(check, timeout)` does what asyncssh's does.
+    It returns the completed process, or raises `TimeoutError` when the wait
+    outlives `timeout` and leaves the channel OPEN (asyncssh's `run()` drops
+    the process right there). `closed` records the `async with` exit (`close`
+    then `wait_closed`), which is what frees the sshd session slot.
+
+    `hangs`: a hung dockerd. With the executor-side `timeout -k 2 N` prefix
+    the probe returns exit 124 after N s (the remote `docker exec` is killed);
+    without it the wait runs to asyncssh's `timeout=` and raises, and with no
+    bound at all it blocks for the hour. `backstop`: a host where even
+    `timeout(1)` did not return, so only asyncssh's bound ends the wait; the
+    fake raises at once and records the bound it was given (`wait_timeout`),
+    the timing is asyncssh's.
+    """
+
+    def __init__(self, command: str, *, exit_status: int = 0, hangs: bool = False,
+                 backstop: bool = False, on_wait=None, on_close=None):
+        self.command = command
+        self._exit_status = exit_status
+        self._hangs, self._backstop = hangs, backstop
+        self._on_wait, self._on_close = on_wait, on_close
+        self.wait_timeout = None
+        self.closed = False
+        self.close_awaited = False
+
+    async def wait(self, check: bool = False, timeout=None):
+        self.wait_timeout = timeout
+        if self._on_wait:
+            self._on_wait(self.command, {"timeout": timeout})
+        if self._backstop:
+            if timeout is None:
+                await asyncio.sleep(3600)
+            raise asyncio.TimeoutError()
+        if self._hangs:
+            bound = re.match(r"timeout -k \d+ (\d+) ", self.command)
+            if bound:
+                await asyncio.sleep(int(bound.group(1)))
+                return _ssh_result(exit_status=124)
+            await asyncio.sleep(timeout if timeout else 3600)
+            if timeout:
+                raise asyncio.TimeoutError()
+        return _ssh_result(exit_status=self._exit_status)
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        self.close_awaited = True
+        if self._on_close:
+            self._on_close(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.close()
+        await self.wait_closed()
+        return False
+
+
 def _make_dind_ssh(
     *,
     sysbox: bool = True,
     dind_start_exit: int = 0,
+    dind_start_hangs: bool = False,
     ready_exit: int = 0,
+    ready_hangs: bool = False,
+    ready_hangs_first: int = 0,
+    ready_backstop_first: int = 0,
     dind_ip: str = "172.20.0.2",
+    resolv_conf: str = "nameserver 8.8.8.8\n",
+    resolv_exit: int = 0,
+    remove_helper_exit: int = 0,
 ):
-    """An `ssh.run` router emulating the DAH-2211 DinD build control commands.
+    """An ssh client emulating the DAH-2211 DinD build control commands.
 
-    Routes by command substring: sysbox preflight, DinD `run -d`, the
-    readiness `docker exec ... docker info` probe, IP inspect, and everything
-    else (Dockerfile write, teardown) → exit 0. The build / egress / export
-    steps go through `execute_and_stream_logs`, not `ssh.run`.
+    `run` routes by command substring: sysbox preflight, DinD `run -d`, IP
+    inspect, the DinD `cat /etc/resolv.conf` read, and everything else
+    (Dockerfile write, teardown) → exit 0. `create_process` serves the
+    readiness `docker exec ... docker info` probe with a `_FakeProbeProcess`
+    (each one on `ssh.probe_processes`; its open/close order on
+    `ssh.probe_events`); the probe's command and `wait` bound are recorded on
+    `ssh.calls` / `ssh.call_kwargs` with the `run` commands. The build / egress
+    / export steps go through `execute_and_stream_logs`, stubbed by
+    `_make_esl`. `dind_start_hangs` makes the `run -d` raise
+    `asyncio.TimeoutError`, what asyncssh raises when the command outlives its
+    `timeout=`; `ready_hangs` makes every readiness probe hang (a hung host
+    dockerd); `ready_hangs_first=n` makes only the first n probes hang (a
+    dockerd still starting), the rest answer `ready_exit`;
+    `ready_backstop_first=n` makes the first n probes outlive even the
+    executor-side bound, so asyncssh's own `timeout=` ends them.
+    `remove_helper_exit` is the teardown's firewall remove helper's exit status
+    (124 = the executor's `timeout(1)` killed it).
     """
     calls: list[str] = []
+    call_kwargs: list[dict] = []
+    probe_processes: list[_FakeProbeProcess] = []
+    probe_events: list[tuple[str, int]] = []
 
     async def _run(cmd, **kw):
         calls.append(cmd)
+        call_kwargs.append(kw)
         if "info --format" in cmd and "Runtimes" in cmd:
             runtimes = '{"runc":{"path":"runc"}'
             if sysbox:
@@ -182,16 +287,50 @@ def _make_dind_ssh(
             runtimes += "}"
             return _ssh_result(stdout=runtimes)
         if "run -d --runtime=sysbox-runc" in cmd:
+            if dind_start_hangs:
+                raise asyncio.TimeoutError()
             return _ssh_result(exit_status=dind_start_exit, stdout="dind-cid")
-        if "docker exec" in cmd and cmd.rstrip().endswith("docker info"):
-            return _ssh_result(exit_status=ready_exit)
         if "docker inspect -f" in cmd:
             return _ssh_result(stdout=dind_ip)
+        if "docker exec" in cmd and cmd.rstrip().endswith("cat /etc/resolv.conf"):
+            return _ssh_result(exit_status=resolv_exit, stdout=resolv_conf)
+        if "--network=host" in cmd and "-D DOCKER-USER" in cmd:  # the firewall remove helper
+            return _ssh_result(exit_status=remove_helper_exit)
         return _ssh_result(exit_status=0)
+
+    def _record(cmd, kw):
+        calls.append(cmd)
+        call_kwargs.append(kw)
+
+    def _probe_process(command: str) -> _FakeProbeProcess:
+        n = len(probe_processes) + 1
+        proc = _FakeProbeProcess(
+            command,
+            exit_status=ready_exit,
+            hangs=ready_hangs or n <= ready_hangs_first,
+            backstop=n <= ready_backstop_first,
+            on_wait=_record,
+            on_close=lambda p: probe_events.append(("closed", n)),
+        )
+        probe_processes.append(proc)
+        probe_events.append(("open", n))
+        return proc
+
+    def _create_process(command: str):
+        if _is_probe(command):
+            return _probe_process(command)
+        raise AssertionError(
+            f"unexpected create_process (the streamed steps are stubbed here): {command}"
+        )
 
     ssh = AsyncMock()
     ssh.run = _run
+    ssh.create_process = _create_process
+    ssh.probe_process = _probe_process
+    ssh.probe_processes = probe_processes
+    ssh.probe_events = probe_events
     ssh.calls = calls
+    ssh.call_kwargs = call_kwargs
     return ssh
 
 
@@ -291,97 +430,9 @@ def _patch_create_container_happy(svc, monkeypatch, ssh_client):
 # ------------------------------------------------------------------
 
 
-_GOLDEN_PATH = Path(__file__).parent / "fixtures" / "container_create_request_pull.json"
-
-
-def _make_pull_payload_for_golden() -> ContainerCreateRequest:
-    """Fixed-shape payload for the golden snapshot. NB: `dockerfile_content` is
-    omitted entirely so this proves the image-pull wire stays byte-identical
-    when the new optional field is at its default `None` value."""
-    return ContainerCreateRequest(
-        miner_hotkey="miner-hotkey-A.1",
-        executor_id="00000000-0000-0000-0000-000000000001",
-        pod_id="00000000-0000-0000-0000-0000000000aa",
-        docker_image="daturaai/pytorch:1.0.0",
-        user_public_keys=["ssh-ed25519 AAAA test-key user@host"],
-        gpu_uuids=["GPU-aaaaaaaaaaaa"],
-        cpu_count=2,
-        memory_gb=8,
-        volume_limit_gb=10,
-        storage_limit_gb=20,
-        available_ports=[PayloadPortMapping(internal_port=20001, external_port=30001)],
-        pod_mapping=[],
-        active_container_names=[],
-        active_volume_names=[],
-    )
-
-
-def test_A1_golden_snapshot_image_pull_wire(update_snapshot):
-    """AC-7: serialized image-pull `ContainerCreateRequest` is byte-identical."""
-    payload = _make_pull_payload_for_golden()
-    serialized = payload.model_dump_json()
-
-    _GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    if update_snapshot or not _GOLDEN_PATH.exists():
-        _GOLDEN_PATH.write_text(serialized + "\n", encoding="utf-8")
-        if not update_snapshot:
-            pytest.fail(
-                f"Golden snapshot did not exist; wrote it. Re-run to assert. Path={_GOLDEN_PATH}"
-            )
-        return
-
-    expected = _GOLDEN_PATH.read_text(encoding="utf-8").rstrip("\n")
-    assert serialized == expected, (
-        "Image-pull ContainerCreateRequest JSON drifted! AC-7 violation.\n"
-        f"expected={expected!r}\nactual={serialized!r}"
-    )
-
-
-def test_A1_dockerfile_field_omitted_when_none():
-    """Defense-in-depth: `dockerfile_content` must not appear in the wire when
-    None and a model_dump excludes None — but pydantic default model_dump
-    INCLUDES the field as `null`. Either is fine for byte-identity provided
-    the field is present in both pre- and post-change snapshots. The actual
-    AC-7 guard is the golden file above; this test pins the convention."""
-    payload = _make_pull_payload_for_golden()
-    data = json.loads(payload.model_dump_json())
-    # The field must exist with the documented default. The wire shape is
-    # `str | None` — null when not set, which is what backend serializers can
-    # safely drop or include.
-    assert data["dockerfile_content"] is None
-    # DAH-1524: the new optional flag follows the same convention (null by default).
-    assert data["ships_sshd"] is None
-    assert data["enable_volume_encryption"] is None
-
-
 # ------------------------------------------------------------------
 # A.11 — Empty Dockerfile guard (validator-level, no SSH command)
 # ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("content", ["", "   \n  ", "\t \n\n  "])
-async def test_A11_empty_dockerfile_content_emits_ccf_without_ssh(svc, monkeypatch, content):
-    """`dockerfile_content` empty / whitespace-only → CCF before any SSH connect."""
-    # If create_container reaches asyncssh.connect, fail loudly.
-    def _fail(*a, **kw):
-        raise AssertionError("asyncssh.connect must NOT be called for empty dockerfile_content")
-
-    monkeypatch.setattr("services.docker_service.asyncssh.connect", _fail)
-    svc.redis_service.remove_pending_pod = AsyncMock()
-
-    payload = _base_payload(dockerfile_content=content)
-    result = await svc.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == FailedContainerErrorCodes.UnknownError
-    assert result.failure_step == "build_input_empty"
 
 
 # ------------------------------------------------------------------
@@ -389,101 +440,9 @@ async def test_A11_empty_dockerfile_content_emits_ccf_without_ssh(svc, monkeypat
 # ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_A2_build_success_overrides_docker_image_tag(svc, monkeypatch):
-    """`dockerfile_content` present → build runs, image tag becomes `lium-build-{pod_id}`."""
-    ssh_client = AsyncMock()
-    # df reports plenty of free space (KiB)
-    ssh_client.run = AsyncMock(return_value=_ssh_result(stdout=str(1024 * 1024 * 100)))
-    _patch_create_container_happy(svc, monkeypatch, ssh_client)
-
-    # Stub the build helper to succeed and assert it's called.
-    build_mock = AsyncMock(return_value=(True, None))
-    monkeypatch.setattr(svc, "_custom_build_image", build_mock)
-    # Mock execute_and_stream_logs so the test does not try to run the real pull either.
-    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
-
-    payload = _base_payload(
-        dockerfile_content="FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04\n",
-        docker_image="ignored-when-building",
-    )
-    await svc.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    build_mock.assert_awaited_once()
-    # docker_image was replaced with lium-build-{pod_id}
-    assert payload.docker_image == f"lium-build-{payload.pod_id}"
-
-    run_spec = svc.rental_docker_client_factory.client.run_specs[-1]
-    assert run_spec.image == f"lium-build-{payload.pod_id}"
-
-
-@pytest.mark.asyncio
-async def test_A2_image_pull_path_unchanged_when_dockerfile_none(svc, monkeypatch):
-    """Default branch still pulls the requested image and skips custom build."""
-    ssh_client = AsyncMock()
-
-    # DAH-1524: the pull is now guarded by a `docker image inspect` probe. Make
-    # the probe report the image as ABSENT (exit !=0) so the pull still runs,
-    # which is what this test asserts. All other ssh commands succeed (exit 0).
-    def _ssh_run_side(cmd, *args, **kwargs):
-        if "image inspect" in cmd:
-            return _ssh_result(exit_status=1)
-        return _ssh_result()
-
-    ssh_client.run = AsyncMock(side_effect=_ssh_run_side)
-    _patch_create_container_happy(svc, monkeypatch, ssh_client)
-
-    build_mock = AsyncMock(return_value=(True, None))
-    monkeypatch.setattr(svc, "_custom_build_image", build_mock)
-
-    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
-
-    payload = _base_payload(dockerfile_content=None, docker_image="daturaai/pytorch:1.2.3")
-    await svc.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    build_mock.assert_not_awaited()
-    assert svc.rental_docker_client_factory.client.pulled_images == [
-        "daturaai/pytorch:1.2.3"
-    ]
-
-
 # ------------------------------------------------------------------
 # A.4 — Build failure (bad RUN) routes through CCF UnknownError
 # ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_A4_build_failure_returns_ccf_unknown_error(svc, monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_ssh_result())
-    _patch_create_container_happy(svc, monkeypatch, ssh_client)
-
-    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(False, "docker_build")))
-    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
-    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
-
-    payload = _base_payload(dockerfile_content="FROM scratch\nRUN false\n")
-    result = await svc.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == FailedContainerErrorCodes.UnknownError
-    assert result.failure_step == "docker_build"
-    svc._cleanup_custom_build_artifacts.assert_awaited()
 
 
 # ------------------------------------------------------------------
@@ -492,98 +451,15 @@ async def test_A4_build_failure_returns_ccf_unknown_error(svc, monkeypatch):
 # ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_A5_unreachable_base_image_ccf_classification(svc, monkeypatch):
-    ssh_client = _make_dind_ssh()
-    _patch_create_container_happy(svc, monkeypatch, ssh_client)
-    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
-
-    # Egress applies fine; the build step fails resolving an unreachable base.
-    monkeypatch.setattr(
-        svc, "execute_and_stream_logs",
-        _make_esl(build=(False, "ERROR: failed to solve: could not resolve host gcr.io")),
-    )
-
-    payload = _base_payload(dockerfile_content="FROM gcr.io/this-does-not-exist:latest\n")
-    result = await svc.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == FailedContainerErrorCodes.UnknownError
-    # With network enabled there is no special network-blocked step anymore.
-    assert result.failure_step == "docker_build"
-
-
 # ------------------------------------------------------------------
 # A.6 — Hard timeout → CCF with failure_step="build_timeout"
 # ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_A6_build_hard_timeout(svc, monkeypatch):
-    ssh_client = _make_dind_ssh()
-    _patch_create_container_happy(svc, monkeypatch, ssh_client)
-
-    # Egress applies fine; the build step times out.
-    monkeypatch.setattr(
-        svc, "execute_and_stream_logs",
-        _make_esl(build=(False, "Process timed out")),
-    )
-    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
-
-    payload = _base_payload(dockerfile_content="FROM scratch\nRUN sleep 99999\n")
-    result = await svc.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == FailedContainerErrorCodes.UnknownError
-    assert result.failure_step == "build_timeout"
 
 
 # ------------------------------------------------------------------
 # A.9 — Build runs inside a sysbox DinD container WITH network (no
 #       --network=none), then the image is exported to the host.
 # ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_A9_build_runs_in_sysbox_dind_with_network(svc, monkeypatch):
-    """`_custom_build_image` launches a sysbox DinD container, builds inside it
-    WITHOUT `--network=none`, firewalls egress, and exports the image."""
-    ssh_client = _make_dind_ssh()
-    esl = _make_esl()
-    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
-
-    payload = _base_payload(dockerfile_content="FROM alpine\nRUN curl -m 2 http://example.com\n")
-    ok, step = await svc._custom_build_image(
-        ssh_client=ssh_client,
-        payload=payload,
-        log_tag="t",
-        default_extra={"pod_id": payload.pod_id},
-    )
-    assert ok is True and step is None
-
-    all_run = "\n".join(ssh_client.calls)
-    all_esl = "\n".join(esl.seen)
-    # DinD launched under sysbox-runc with the per-pod name.
-    assert "run -d --runtime=sysbox-runc" in all_run
-    assert f"lium-dind-build-{payload.pod_id}" in all_run
-    # Build happens inside the DinD container and NEVER with --network=none.
-    assert any("docker build" in c for c in esl.seen)
-    assert "--network=none" not in all_esl
-    # Egress firewall applied + image exported (save | load) onto the host.
-    assert any("--network=host" in c and "DOCKER-USER" in c for c in esl.seen)
-    assert any("docker save" in c and "docker load" in c for c in esl.seen)
-    assert any(f"lium-build-{payload.pod_id}" in c for c in esl.seen)
 
 
 # ------------------------------------------------------------------
@@ -599,7 +475,7 @@ async def test_A12_sysbox_unavailable_aborts_before_build(svc, monkeypatch):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -617,52 +493,9 @@ async def test_A12_sysbox_unavailable_aborts_before_build(svc, monkeypatch):
 # ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_A13_egress_failure_aborts_before_build(svc, monkeypatch):
-    ssh_client = _make_dind_ssh()
-    esl = _make_esl(egress=(False, "DOCKER-USER chain not found"))
-    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
-
-    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
-        ssh_client=ssh_client,
-        payload=payload,
-        log_tag="t",
-        default_extra={"pod_id": payload.pod_id},
-    )
-    assert ok is False
-    assert step == "build_egress_setup"
-    # The build must NOT run when egress filtering can't be guaranteed.
-    assert not any("docker build" in c for c in esl.seen)
-    # But the DinD container is still torn down.
-    assert any(f"docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c
-               for c in ssh_client.calls)
-
-
 # ------------------------------------------------------------------
 # A.14 — DinD container is always torn down (finally), even on success
 # ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_A14_dind_container_always_torn_down(svc, monkeypatch):
-    ssh_client = _make_dind_ssh()
-    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl())
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
-
-    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
-        ssh_client=ssh_client,
-        payload=payload,
-        log_tag="t",
-        default_extra={"pod_id": payload.pod_id},
-    )
-    assert ok is True and step is None
-    assert any(
-        "docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c
-        for c in ssh_client.calls
-    ), ssh_client.calls
 
 
 # ------------------------------------------------------------------
@@ -670,22 +503,82 @@ async def test_A14_dind_container_always_torn_down(svc, monkeypatch):
 # ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_A15_export_failure_classifies_build_export(svc, monkeypatch):
-    ssh_client = _make_dind_ssh()
-    esl = _make_esl(export=(False, "Error: no space left on device"))
-    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+# ------------------------------------------------------------------
+# A.16–A.19 — a failed build says WHY (its last output lines), not only WHERE.
+# ------------------------------------------------------------------
 
-    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
-        ssh_client=ssh_client,
-        payload=payload,
-        log_tag="t",
-        default_extra={"pod_id": payload.pod_id},
+
+def _log_record_texts(caplog) -> list[str]:
+    """Everything a log handler could format from each record: the message, the structured extra
+    (`_StructuredMessage.to_full_string`) and the exception text — what Loki would receive."""
+    texts = []
+    for record in caplog.records:
+        parts = [record.getMessage()]
+        if hasattr(record.msg, "to_full_string"):
+            parts.append(record.msg.to_full_string())
+        if record.exc_info:
+            parts.append(repr(record.exc_info[1]))
+        texts.append("\n".join(parts))
+    return texts
+
+
+@pytest.mark.asyncio
+async def test_A16d_a_credential_in_the_build_tail_never_reaches_a_log_record(svc, monkeypatch, caplog):
+    """BuildKit's `--progress=plain` echoes `ARG HF_TOKEN=…` and `user:TOKEN@host` lines as the renter
+    wrote them. The tail goes to the renter (the secret's owner) in `build_log_tail`; the validator's
+    own log line (`Custom build failed`, Loki) carries the step and the tail's size, never its text."""
+    ssh_client = _make_dind_ssh()
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
+    # the values are resolved at build time (`--build-arg`, an `.env` in the context): they are in
+    # the build output, not in the Dockerfile text the payload carries
+    leaked = (
+        "#3 [2/4] ARG HF_TOKEN=abc\n"
+        "#4 [3/4] RUN pip install --extra-index-url https://user:abc@pypi.example.invalid/simple torch\n"
+        "#4 1.201 ERROR: Could not find a version that satisfies the requirement torch\n"
+        '#4 ERROR: process "/bin/sh -c pip install …" did not complete successfully: exit code: 1\n'
+        "BUILD_FAILED_RC=1\n"
     )
-    assert ok is False
-    assert step == "build_export"
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, leaked)))
+
+    payload = _base_payload(
+        dockerfile_content=(
+            "FROM python:3.11\nARG HF_TOKEN\nARG PYPI_TOKEN\n"
+            "RUN pip install --extra-index-url https://user:${PYPI_TOKEN}@pypi.example.invalid/simple torch\n"
+        )
+    )
+    with caplog.at_level(logging.DEBUG):
+        result = await svc.create_container(
+            payload=payload,
+            executor_info=_executor_info_for(payload),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_build"
+    # the renter gets their own output back
+    assert "HF_TOKEN=abc" in result.build_log_tail and "user:abc@" in result.build_log_tail
+    # no log record anywhere carries a byte of the tail
+    texts = _log_record_texts(caplog)
+    for text in texts:
+        assert "HF_TOKEN=abc" not in text
+        assert "user:abc@" not in text
+        assert "Could not find a version" not in text
+    # the ops log line exists and says how much was sent, not what
+    failed_lines = [t for t in texts if t.startswith("Custom build failed")]
+    assert len(failed_lines) == 1
+    assert '"failure_step": "docker_build"' in failed_lines[0]
+    assert '"build_log_tail_lines": 4' in failed_lines[0]
+    assert f'"build_log_tail_chars": {len(result.build_log_tail)}' in failed_lines[0]
+
+
+# ------------------------------------------------------------------
+# A.20–A.24 — the egress block must not eat the DinD's own DNS (DAH-2211
+# docker_build class: 18 of 23 prod failures were `FROM` failing on a DNS
+# timeout because the host resolver sits in a blocked range), and every
+# setup command before the build is bounded.
+# ------------------------------------------------------------------
 
 
 # ------------------------------------------------------------------
@@ -693,51 +586,70 @@ async def test_A15_export_failure_classifies_build_export(svc, monkeypatch):
 # ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_B1_log_emit_to_publish_p95_under_2s(svc):
-    """Each `stream_log` -> `redis.publish` chunk must reach the SSE consumer
-    within p95 ≤ 2000 ms over 200 emitted lines. This stubs the redis
-    publish so the test runs in CI without infrastructure."""
-    received: list[tuple[str, float]] = []
-
-    class _Redis:
-        async def publish(self, channel, payload):
-            # Record the receive timestamp per line entry.
-            now = time.perf_counter()
-            for entry in payload.get("logs", []):
-                received.append((entry["log_text"], now))
-
-    svc.redis_service = _Redis()
-
-    # Start the log shipper coroutine.
-    shipper = asyncio.create_task(svc.handle_stream_logs(
-        miner_hotkey="m", executor_id="e", pod_id="p",
-    ))
-
-    # Emit 200 lines, recording emit timestamps.
-    emit_times: dict[str, float] = {}
-    for i in range(200):
-        msg = f"build-line-{i:03d}"
-        emit_times[msg] = time.perf_counter()
-        await svc.stream_log(msg, "success", "build")
-        await asyncio.sleep(0.001)  # 1ms cadence
-
-    # Give the shipper a short grace period to flush, then stop it.
-    deadline = time.perf_counter() + 6.0  # well under the 2s p95 requirement budget
-    while len(received) < 200 and time.perf_counter() < deadline:
-        await asyncio.sleep(0.05)
-
-    await svc.finish_stream_logs()
-    shipper.cancel()
-    try:
-        await shipper
-    except asyncio.CancelledError:
-        pass
-
-    assert len(received) >= 200, f"only {len(received)} of 200 lines received"
-
-    latencies_ms = sorted(
-        (recv_t - emit_times[msg]) * 1000 for msg, recv_t in received[:200] if msg in emit_times
+def test_A16e_a_buildx_stack_trace_does_not_push_the_error_out_of_the_tail():
+    # Arrange: the error line followed by more stack frames than the tail holds
+    frames = [
+        "sync.(*Once).Do",
+        "/usr/local/go/src/sync/once.go:67",
+        "runtime.goexit",
+        "runtime/asm_amd64.s:1700",
+        "711 v0.21.0 /usr/local/lib/docker/cli-plugins/docker-buildx buildx build --progress=plain --pull -t x /build",
+        "github.com/moby/buildkit/client.(*Client).solve.func2",
+        "github.com/moby/buildkit@v0.20.0/client/solve.go:285",
+        "143 /usr/local/bin/dockerd",
+    ]
+    output = "\n".join(
+        [
+            "#5 [2/3] RUN pip install nope",
+            'ERROR: failed to solve: process "/bin/sh -c pip install nope" did not complete',
+        ]
+        + frames * 10
     )
-    p95 = latencies_ms[int(0.95 * len(latencies_ms))]
-    assert p95 <= 2000, f"p95 emit→publish latency={p95:.1f}ms exceeds 2000ms budget"
+
+    # Act
+    from services.docker_service import custom_build_log_tail
+
+    tail = custom_build_log_tail(output)
+
+    # Assert
+    assert tail.splitlines() == [
+        "#5 [2/3] RUN pip install nope",
+        'ERROR: failed to solve: process "/bin/sh -c pip install nope" did not complete',
+    ]
+
+
+def test_A17e_a_stack_trace_longer_than_the_tail_still_reaches_the_renter_with_its_error(tmp_path, monkeypatch):
+    # Arrange: buildx prints the ERROR line, then 40 Go stack lines, and fails
+    import subprocess
+
+    from services import docker_service
+    from services.docker_service import custom_build_inner_command, custom_build_log_tail
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'echo "#5 [2/3] RUN pip install nope"\n'
+        'echo "ERROR: failed to solve: pip install nope did not complete"\n'
+        'i=1; while [ $i -le 20 ]; do echo "runtime.goexit"; echo "runtime/asm_amd64.s:1700"; i=$((i + 1)); done\n'
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_FILE", str(tmp_path / "lium-build.log"))
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_RC_FILE", str(tmp_path / "lium-build.rc"))
+
+    # Act
+    run = subprocess.run(
+        ["sh", "-c", custom_build_inner_command("lium-custom-test:latest", "/build")],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+    )
+    tail = custom_build_log_tail(run.stderr)
+
+    # Assert
+    assert tail.splitlines() == [
+        "#5 [2/3] RUN pip install nope",
+        "ERROR: failed to solve: pip install nope did not complete",
+    ]

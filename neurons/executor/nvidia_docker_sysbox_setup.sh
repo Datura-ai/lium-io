@@ -6,16 +6,36 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
+# After sysbox works, install mode also sets up the vloopback volume plugin (pinned by digest,
+# DATA_DIR=<Docker data-root>/loopback) and mounts a 1 GB test volume into a sysbox container; the run exits 1
+# with a doc link when that fails.
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
 #   SYSBOX_SETUP_HOST_ROOT      test-only: prefix for the host files the preflight reads (/proc/modules, /etc/os-release, ...)
 
-SYSBOX_VERSION="0.6.6"
-SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
-SYSBOX_SHA="87cfa5cad97dc5dc1a243d6d88be1393be75b93a517dc1580ecd8a2801c2777a"
+# 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
+# and 0.7.0 brings the runc container-escape fixes (CVE-2025-52565, CVE-2025-52881)
+SYSBOX_VERSION="0.7.1"
+# nestybox publishes amd64 and arm64 .debs; arm64 is for GB300 / Grace hosts (check_arch refuses the rest)
+case "$(uname -m)" in
+    aarch64|arm64) SYSBOX_ARCH=arm64; SYSBOX_SHA="04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b" ;;
+    *) SYSBOX_ARCH=amd64; SYSBOX_SHA="9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5" ;;
+esac
+SYSBOX_DEB_NAME="sysbox-ce_${SYSBOX_VERSION}.linux_${SYSBOX_ARCH}.deb"
+SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/${SYSBOX_DEB_NAME}"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
+# the validators' old plugin, LEGACY_LOOPBACK_PLUGIN_ALIAS (neurons/validators/src/services/const.py):
+# a rental with a disk limit gets a volume from this plugin, mounted into its sysbox container. The plugin runs
+# as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13).
+VLOOPBACK_PLUGIN="vloopback"
+VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170"
+VLOOPBACK_DOC_URL="https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
+VLOOPBACK_INSTALL_TIMEOUT=300
+VLOOPBACK_RUN_TIMEOUT=120
+VLOOPBACK_CLEANUP_TIMEOUT=30
+VLOOPBACK_TEST_NAME=""
 
 G='\033[0;32m' Y='\033[1;33m' R='\033[0;31m' B='\033[1;34m' N='\033[0m'
 ok()   { echo -e "  ${G}✓${N} $1"; }
@@ -25,7 +45,10 @@ step() { echo -e "\n${B}[$1/$2]${N} $3"; }
 
 # an `if`, not `[ … ] && rm`: under `set -e` the failing test made the EXIT trap end every run
 # with status 1, including "Nothing to do." and SUCCESS
-cleanup() { if [ -n "$DOWNLOADED_DEB" ]; then rm -f "$DOWNLOADED_DEB"; fi; }
+cleanup() {
+    if [ -n "$DOWNLOADED_DEB" ]; then rm -f "$DOWNLOADED_DEB"; fi
+    if [ -n "$VLOOPBACK_TEST_NAME" ]; then vloopback_remove_test_objects >/dev/null 2>&1 || true; fi
+}
 trap cleanup EXIT
 
 version_ge() {
@@ -102,12 +125,11 @@ sysbox_idmapped_report() {
 }
 
 sysbox_runc_version() {
-    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.6.6" is one of the
+    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.7.1" is one of the
     # tab-indented lines after it (edition, version, commit, ...), so the first line is never the
     # version. Prints the number; exit 1 when the binary is missing or prints no version.
     sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep .
 }
-
 daemon_feature_state() {
     # features.<$1> in /etc/docker/daemon.json for the diagnostics: true, false, "not set" (key
     # absent or null), "no daemon.json", or "unreadable" when jq cannot parse the file or is not
@@ -120,6 +142,14 @@ daemon_feature_state() {
         || echo "unreadable (invalid JSON, or jq missing)"
 }
 
+# only for that error: a host without its NVIDIA driver on Docker 29.9 was told to downgrade Docker (24 Oct 2026)
+time_namespace_hint() {
+    docker_version_ge 29 5 && [[ "$1" == *'namespace {"time"'* ]] || return 0
+    fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
+    fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
+    fail "  if the error is still there, downgrade the daemon to Docker 28.x."
+}
+
 failure_diagnostics() {
     # what a provider pastes into a ticket when the verify container did not start
     echo "    Docker daemon:       $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
@@ -128,16 +158,19 @@ failure_diagnostics() {
     echo "    NVIDIA driver:       $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo FAILED)"
     echo "    /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo exists || echo MISSING)"
     echo "    sysbox-runc:         $(sysbox_runc_version || echo 'not found')"
+    echo "    fusermount3:         $(command -v fusermount3 || echo 'MISSING (apt-get install -y fuse3)')"
     echo "    CDI specs:           $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo none)"
     echo "    daemon.json cdi:     $(daemon_feature_state cdi)"
     echo "    daemon.json time-ns: $(daemon_feature_state time-namespaces)"
 }
 
 abort_on_active_rentals() {
-    # a rental blocks every path below, so check before anything that costs the node time or bandwidth
-    docker ps --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
-    fail "Active rentals found (pod_* containers). Cannot proceed."
-    docker ps --filter "name=pod_" --format "    - {{.Names}}" 2>/dev/null
+    # a rental blocks every path below, so check before anything that costs the node time or bandwidth;
+    # -a: a renter's stopped pod is still a rental, and the install removes every stopped container
+    docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
+    fail "Rentals found (pod_* containers, running or stopped). Cannot proceed."
+    docker ps -a --filter "name=pod_" --format "    - {{.Names}} ({{.Status}})" 2>/dev/null
+    fail "Check them with: docker ps -a --filter name=pod_"
     exit 1
 }
 
@@ -157,7 +190,7 @@ fail_no_idmapped() {
 
 # ── Preflight ───────────────────────────────────────────
 # One PASS / FIX line per requirement, each FIX with the command that fixes it. The host checks
-# run before anything is installed: a FIX in what sysbox itself needs (root, x86_64, kernel,
+# run before anything is installed: a FIX in what sysbox itself needs (root, architecture, kernel,
 # Docker) ends the run with nothing changed; the rest (driver, iptables modules, disk, ports)
 # print the fix and the install goes on, because the node cannot be listed at all without
 # sysbox. `--check` runs them all plus the checks on what this script installs. Paths under
@@ -165,6 +198,8 @@ fail_no_idmapped() {
 
 MIN_NVIDIA_DRIVER="580.65.06"   # validators' MIN_NVIDIA_DRIVER_VERSION: an idle node below it earns nothing after the cutoff
 MIN_DISK_TO_VRAM_RATE="1.5"     # validators' MIN_DISK_TO_VRAM_RATE (rental_price.py): idle pay needs total disk >= 1.5x total VRAM
+MIN_FREE_STORAGE_GB=100         # VerifyX storage challenge: "Insufficient storage: N GB allocated, 100 GB required"
+NODE_IMAGES_GB=40               # what the node's images take once pulled; a 100 GB disk passes the 1.5x rule and still fails VerifyX
 PREFLIGHT_PASS=0 PREFLIGHT_FIX=0 PREFLIGHT_SKIP=0
 
 pf_pass() { PREFLIGHT_PASS=$((PREFLIGHT_PASS + 1)); echo -e "  ${G}PASS${N} $1"; }
@@ -222,8 +257,8 @@ check_root() {
 check_arch() {
     local arch
     arch=$(uname -m)
-    [ "$arch" = "x86_64" ] && { pf_pass "Architecture $arch."; return 0; }
-    pf_fix "Architecture $arch — sysbox ships for x86_64 only." "Use an x86_64 host."
+    case "$arch" in x86_64|aarch64|arm64) pf_pass "Architecture $arch."; return 0 ;; esac
+    pf_fix "Architecture $arch — sysbox ships for x86_64 and aarch64 only." "Use an x86_64 or aarch64 host."
 }
 
 check_kernel() {
@@ -265,8 +300,9 @@ check_docker() {
         pf_fix "Docker is running but reported no server version." "docker version   # then sudo systemctl restart docker"
         return 1
     fi
-    if docker_version_ge 29 0 && ! docker_version_ge 29 2; then
-        pf_pass "Docker $version (29.0–29.1 is untested with sysbox; 28.x and 29.2+ are)."
+    # 29.1 with sysbox 0.7.1 took a fresh host end to end to listed on 7 Oct 2026
+    if docker_version_ge 29 0 && ! docker_version_ge 29 1; then
+        pf_pass "Docker $version (29.0 is untested with sysbox; 28.x and 29.1+ are)."
     else
         pf_pass "Docker $version."
     fi
@@ -297,11 +333,36 @@ check_docker_features() {
         "or by hand: add $daemon_features_block to /etc/docker/daemon.json && sudo systemctl restart docker"
 }
 
+check_fuse3() {
+    # sysbox-fs 0.7 mounts its FUSE file systems with fusermount3 (package fuse3), but the sysbox-ce .deb
+    # depends only on fuse (v2): without fuse3 its postinst fails with "failed to pre-register with sysbox-fs"
+    if command -v fusermount3 &>/dev/null; then
+        pf_pass "fusermount3 (fuse3), which sysbox-fs $SYSBOX_VERSION needs."
+        return 0
+    fi
+    pf_fix "fusermount3 is missing — sysbox-fs $SYSBOX_VERSION needs fuse3 and the sysbox-ce package does not install it." \
+        "$(self_cmd)   # installs fuse3 before sysbox" \
+        "or by hand: sudo apt-get install -y fuse3"
+}
+
+nvidia_driver_package() {
+    # Blackwell (RTX 50xx, RTX PRO 6000 Blackwell, B200, B300) runs only the open kernel module, and a host already on
+    # the open module would otherwise be switched to the closed one by the FIX command
+    if grep -q "Open Kernel Module" "$(host_path /proc/driver/nvidia/version)" 2>/dev/null \
+        || nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -Eq 'RTX 50[0-9]{2}|Blackwell|B200|B300' \
+        || lspci 2>/dev/null | grep -i nvidia | grep -Eq 'GB[12][0-9]{2}|RTX 50[0-9]{2}|Blackwell|B200|B300'; then
+        # lspci names the chip (GB100, GB202, ...) even before any driver is installed
+        echo nvidia-driver-580-server-open
+    else
+        echo nvidia-driver-580-server
+    fi
+}
+
 check_nvidia_driver() {
     local driver
     if ! command -v nvidia-smi &>/dev/null; then
         pf_fix "nvidia-smi not found — no NVIDIA driver installed." \
-            "sudo apt-get install -y nvidia-driver-580-server && sudo reboot   # Ubuntu; or your vendor's driver package"
+            "sudo apt-get install -y $(nvidia_driver_package) && sudo reboot   # Ubuntu; or your vendor's driver package"
         return 1
     fi
     # nvidia-smi prints its errors on stdout ("Failed to initialize NVML: Driver/library version mismatch"), so only a
@@ -317,7 +378,7 @@ check_nvidia_driver() {
         return 0
     fi
     pf_fix "NVIDIA driver $driver is below $MIN_NVIDIA_DRIVER, the validators' minimum — an idle node below it earns nothing." \
-        "sudo apt-get install -y nvidia-driver-580-server && sudo reboot   # stop rentals first"
+        "sudo apt-get install -y $(nvidia_driver_package) && sudo reboot   # stop rentals first"
 }
 
 check_nvidia_toolkit() {
@@ -331,16 +392,31 @@ check_nvidia_toolkit() {
         "$(self_cmd)   # adds NVIDIA's apt repository and installs nvidia-container-toolkit"
 }
 
-check_iptables_modules() {
-    # The validators' Docker-in-Docker probe runs legacy iptables inside the pod; on an nftables
-    # host without these modules its dockerd fails with "can't initialize iptables table 'nat'",
-    # sshd never starts and the node is scored as having no sysbox (ticket-0309: three reinstalls).
+missing_iptables_modules() {
     local mod missing=""
     for mod in ip_tables iptable_nat iptable_filter; do
         grep -q "^$mod " "$(host_path /proc/modules)" 2>/dev/null && continue
         [ -d "$(host_path "/sys/module/$mod")" ] && continue
         missing="${missing:+$missing }$mod"
     done
+    echo "$missing"
+}
+
+load_iptables_modules() {
+    # install mode does the iptables FIX itself instead of leaving two commands and a re-run to the provider
+    [ -n "$(missing_iptables_modules)" ] || return 1
+    modprobe -a ip_tables iptable_nat iptable_filter 2>/dev/null || return 1
+    [ -z "$(missing_iptables_modules)" ] || return 1
+    mkdir -p "$(host_path /etc/modules-load.d)" 2>/dev/null
+    printf 'ip_tables\niptable_nat\niptable_filter\n' > "$(host_path /etc/modules-load.d/lium-iptables.conf)"
+}
+
+check_iptables_modules() {
+    # The validators' Docker-in-Docker probe runs legacy iptables inside the pod; on an nftables
+    # host without these modules its dockerd fails with "can't initialize iptables table 'nat'",
+    # sshd never starts and the node is scored as having no sysbox (ticket-0309: three reinstalls).
+    local missing
+    missing=$(missing_iptables_modules)
     if [ -z "$missing" ]; then
         pf_pass "Legacy iptables modules loaded (ip_tables iptable_nat iptable_filter) for the validators' Docker-in-Docker probe."
         return 0
@@ -372,6 +448,27 @@ check_total_disk_for_vram() {
     fi
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
         "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+}
+
+check_free_disk_for_node() {
+    # VerifyX allocates MIN_FREE_STORAGE_GB on the node's filesystem; before the first `lium mine` the node's images
+    # still have to come out of the same free space
+    local data_root free_kb free_gb needed_gb
+    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
+    [ -d "$data_root" ] || data_root=/
+    free_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $4}')
+    [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $data_root."; return 0; }
+    free_gb=$(awk -v k="$free_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
+    needed_gb=$MIN_FREE_STORAGE_GB
+    docker image inspect "$VERIFY_IMAGE" &>/dev/null || needed_gb=$((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB))
+    # compare raw KiB: 99.96 GiB rounds to 100.0 for display but is still below 100 GiB
+    if [ "$free_kb" -ge $((needed_gb * 1024 * 1024)) ]; then
+        pf_pass "Free disk ${free_gb} GB on $data_root >= ${needed_gb} GB for the node's images and the validators' ${MIN_FREE_STORAGE_GB} GB storage test."
+        return 0
+    fi
+    pf_fix "Free disk ${free_gb} GB on $data_root is below ${needed_gb} GB — the validators' storage test needs ${MIN_FREE_STORAGE_GB} GB free after the node's images (~${NODE_IMAGES_GB} GB) are pulled, so \`lium mine\` would fail at validation." \
+        "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
 }
 
 resolve_preflight_ports() {
@@ -470,7 +567,216 @@ check_sysbox() {
             "$(self_cmd)   # re-applies the Docker 29 settings and re-verifies; then: journalctl -u sysbox-mgr --no-pager -n 20"
         return 1
     fi
-    pf_pass "sysbox-runc $(sysbox_runc_version || echo installed) runs a container."
+    local installed
+    installed=$(sysbox_runc_version || true)
+    if [ -n "$installed" ] && ! version3_ge "$installed" "$SYSBOX_VERSION"; then
+        pf_fix "sysbox-runc $installed is older than $SYSBOX_VERSION, the version this installer pins." \
+            "$(self_cmd)   # upgrades Sysbox; it refuses to run while the node has a rental"
+        return 1
+    fi
+    pf_pass "sysbox-runc ${installed:-installed} runs a container."
+}
+
+# ── vloopback: size-limited volumes ─────────────────────
+# ticket-0331 (22 Sep 2026): pods with a vloopback volume failed at start while the validators' storage check
+# passed. Install mode sets the plugin up the way the validators' rental path installs it and then mounts a
+# real volume into a sysbox container; --check only reports. VLOOPBACK_REASON carries the cause of the last failure, VLOOPBACK_CHANGED what install mode changed.
+
+vloopback_plugin_state() {
+    # true / false / absent; a missing plugin makes `docker plugin inspect` print a blank line before it fails
+    (timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker plugin inspect --format '{{.Enabled}}' "$VLOOPBACK_PLUGIN" 2>/dev/null \
+        || echo absent) | tail -n 1
+}
+
+vloopback_plugin_data_dir() {
+    timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker plugin inspect --format '{{range .Settings.Env}}{{println .}}{{end}}' "$VLOOPBACK_PLUGIN" 2>/dev/null \
+        | sed -n 's/^DATA_DIR=//p' | head -1
+}
+
+vloopback_last_line() { grep . | tail -n 1; }
+
+ensure_vloopback_plugin() {
+    # the fix support sent by hand, idempotent: installed, DATA_DIR absolute, enabled. A plugin that already
+    # has an absolute DATA_DIR keeps it (the validators never reinstall an enabled plugin either).
+    local root state data_dir wanted out
+    VLOOPBACK_CHANGED="" VLOOPBACK_REASON=""
+    root=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    case "$root" in
+        /*) ;;
+        *) VLOOPBACK_REASON="Docker reports the data-root '${root}', not an absolute path (docker info --format '{{.DockerRootDir}}')."
+           return 1 ;;
+    esac
+    # <DockerRootDir>/loopback: the DATA_DIR the validators' rental path passes today (create_local_volume)
+    wanted="${root%/}/loopback"
+    state=$(vloopback_plugin_state)
+    if [ "$state" = "absent" ]; then
+        out=$(timeout "$VLOOPBACK_INSTALL_TIMEOUT" docker plugin install "$VLOOPBACK_PLUGIN_IMAGE" --alias "$VLOOPBACK_PLUGIN" \
+            --grant-all-permissions "DATA_DIR=$wanted" 2>&1) || {
+            [ -n "$out" ] || out="timed out after ${VLOOPBACK_INSTALL_TIMEOUT}s"
+            VLOOPBACK_REASON="docker plugin install $VLOOPBACK_PLUGIN_IMAGE failed: $(echo "$out" | vloopback_last_line)"
+            return 1
+        }
+        VLOOPBACK_CHANGED="installed the $VLOOPBACK_PLUGIN plugin with DATA_DIR=$wanted"
+        return 0
+    fi
+    data_dir=$(vloopback_plugin_data_dir)
+    case "$data_dir" in
+        /*) ;;
+        *)
+            # changing the plugin under a running pod would pull its disk away; the executor is stopped
+            # by now, so a hung docker or a rental returns through the caller's restart, never exits
+            out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>&1) || {
+                [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+                VLOOPBACK_REASON="could not check for rentals before changing the $VLOOPBACK_PLUGIN plugin: $(echo "$out" | vloopback_last_line)"
+                return 1
+            }
+            out=$(echo "$out" | grep .)
+            [ -z "$out" ] || {
+                VLOOPBACK_REASON="rentals found (${out//$'\n'/ }); the $VLOOPBACK_PLUGIN plugin's DATA_DIR '${data_dir}' is not changed under them. Run the installer again with no rental on the node."
+                return 1
+            }
+            if [ "$state" = "true" ]; then
+                out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker plugin disable "$VLOOPBACK_PLUGIN" 2>&1) || {
+                    [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+                    VLOOPBACK_REASON="the $VLOOPBACK_PLUGIN plugin has DATA_DIR '${data_dir}' and cannot be disabled to change it: $(echo "$out" | vloopback_last_line)"
+                    return 1
+                }
+            fi
+            out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker plugin set "$VLOOPBACK_PLUGIN" "DATA_DIR=$wanted" 2>&1) || {
+                [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+                VLOOPBACK_REASON="docker plugin set $VLOOPBACK_PLUGIN DATA_DIR=$wanted failed: $(echo "$out" | vloopback_last_line)"
+                return 1
+            }
+            VLOOPBACK_CHANGED="set the $VLOOPBACK_PLUGIN plugin's DATA_DIR from '${data_dir}' to $wanted"
+            state=false
+            ;;
+    esac
+    if [ "$state" != "true" ]; then
+        out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker plugin enable "$VLOOPBACK_PLUGIN" 2>&1) || {
+            [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+            VLOOPBACK_REASON="docker plugin enable $VLOOPBACK_PLUGIN failed: $(echo "$out" | vloopback_last_line)"
+            return 1
+        }
+        VLOOPBACK_CHANGED="${VLOOPBACK_CHANGED:-enabled the $VLOOPBACK_PLUGIN plugin}"
+    fi
+}
+
+vloopback_remove_test_objects() {
+    # the test container first: a `docker run` killed by its timeout leaves it running with the volume attached
+    local out
+    timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker rm -f "$VLOOPBACK_TEST_NAME" &>/dev/null || true
+    out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume rm -f "$VLOOPBACK_TEST_NAME" 2>&1) || {
+        [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+        echo "$out" | vloopback_last_line
+        return 1
+    }
+}
+
+vloopback_mount_test() {
+    # what a rental with a disk limit does: create a volume, mount it into a sysbox container, write and read
+    # a file, unmount (the container exits), remove the volume. Container and volume share one name; they are
+    # removed whatever step failed, and by the EXIT trap when the script is interrupted.
+    local mountpoint out rc=0 run_rc remove_error
+    VLOOPBACK_REASON=""
+    VLOOPBACK_TEST_NAME="lium_vloopback_check_$$"
+    out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume create -d "$VLOOPBACK_PLUGIN" -o size=1G "$VLOOPBACK_TEST_NAME" 2>&1) || {
+        [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+        VLOOPBACK_REASON="docker volume create -d $VLOOPBACK_PLUGIN -o size=1G failed: $(echo "$out" | vloopback_last_line)"
+        rc=1
+    }
+    if [ "$rc" -eq 0 ]; then
+        mountpoint=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume inspect --format '{{.Mountpoint}}' "$VLOOPBACK_TEST_NAME" 2>/dev/null)
+        case "$mountpoint" in
+            /*) ;;
+            *) VLOOPBACK_REASON="the $VLOOPBACK_PLUGIN plugin reports the Mountpoint '${mountpoint}', not an absolute path; Docker cannot mount it into a container."
+               rc=1 ;;
+        esac
+    fi
+    if [ "$rc" -eq 0 ]; then
+        out=$(timeout "$VLOOPBACK_RUN_TIMEOUT" docker run --rm --name "$VLOOPBACK_TEST_NAME" --runtime=sysbox-runc \
+            -v "$VLOOPBACK_TEST_NAME:/lium-vol" "$VERIFY_IMAGE" \
+            sh -c 'echo lium-vloopback-ok > /lium-vol/probe && cat /lium-vol/probe' 2>&1) && run_rc=0 || run_rc=$?
+        if [ "$run_rc" -ne 0 ] || ! echo "$out" | grep -qx 'lium-vloopback-ok'; then
+            # the token alone is not a pass: the container must also exit cleanly, as the validator's scrape requires
+            if [ "$run_rc" -eq 124 ]; then out="the container did not finish within ${VLOOPBACK_RUN_TIMEOUT}s"
+            elif [ "$run_rc" -ne 0 ] && echo "$out" | grep -qx 'lium-vloopback-ok'; then out="the container exited with status $run_rc"
+            fi
+            VLOOPBACK_REASON="a $VLOOPBACK_PLUGIN volume does not mount into a sysbox container: $(echo "$out" | vloopback_last_line)"
+            rc=1
+        fi
+    fi
+    if ! remove_error=$(vloopback_remove_test_objects); then
+        [ "$rc" -ne 0 ] || VLOOPBACK_REASON="the test volume $VLOOPBACK_TEST_NAME did not unmount and remove: $remove_error"
+        rc=1
+    fi
+    VLOOPBACK_TEST_NAME=""
+    return "$rc"
+}
+
+vloopback_storage_opt_unsupported() {
+    # the scrape's CHECK_STORAGE_LIMIT_ABILITY without the GPU: a node whose Docker refuses --storage-opt is rented
+    # without a disk limit, so no rental there ever gets a vloopback volume. Only Docker's own refusal counts: a
+    # timeout or any other error leaves the plugin repair and mount test to run.
+    local out
+    out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker run --rm --storage-opt size=1g "$VERIFY_IMAGE" true 2>&1) && return 1
+    echo "$out" | grep -qi -e 'storage-opt' -e 'storage opt'
+}
+
+VLOOPBACK_NOT_USED="Docker here does not accept --storage-opt, so rentals run without a disk limit and never use the plugin."
+# a renter filling an uncapped disk fills the Docker data-root and takes the host down; validators score such a node 0
+STORAGE_LIMIT_MISSING="Docker here cannot limit a container's disk (needs overlay2 on xfs mounted with pquota); one renter can fill it and take the node down, and validators will reject such nodes (not released yet)."
+STORAGE_LIMIT_FIX="sudo lium gpu-splitting setup --device <spare disk>   # guide: https://docs.lium.io/providers/nodes/docker-storage"
+
+check_vloopback() {
+    # --check: report the plugin, change nothing but the test volume the mount test creates and removes
+    local state data_dir
+    docker ps &>/dev/null || { pf_skip "vloopback volumes — Docker is not running."; return 0; }
+    if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q sysbox-runc; then
+        pf_skip "vloopback volumes — the test mounts one into a sysbox container, and sysbox-runc is not registered yet."
+        return 0
+    fi
+    if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
+        pf_skip "vloopback volumes — the test runs $VERIFY_IMAGE, which is not on this host yet (install mode pulls it)."
+        return 0
+    fi
+    ! vloopback_storage_opt_unsupported || { pf_fix "$STORAGE_LIMIT_MISSING" "$STORAGE_LIMIT_FIX"; return 1; }
+    state=$(vloopback_plugin_state)
+    if [ "$state" = "absent" ]; then
+        pf_fix "The $VLOOPBACK_PLUGIN volume plugin is not installed; the mount test cannot run until it is." \
+            "$(self_cmd)   # installs it with DATA_DIR=<Docker data-root>/loopback and tests a volume in a sysbox container"
+        return 1
+    fi
+    data_dir=$(vloopback_plugin_data_dir)
+    case "$data_dir" in
+        /*) ;;
+        *) pf_fix "The $VLOOPBACK_PLUGIN plugin's DATA_DIR is '${data_dir}', not an absolute path — the plugin refuses to start with it." \
+               "$(self_cmd)   # sets DATA_DIR=<Docker data-root>/loopback and tests a volume in a sysbox container; stop rentals first"
+           return 1 ;;
+    esac
+    if [ "$state" != "true" ]; then
+        pf_fix "The $VLOOPBACK_PLUGIN volume plugin is not enabled; the mount test cannot run until it is." \
+            "docker plugin enable $VLOOPBACK_PLUGIN"
+        return 1
+    fi
+    if ! vloopback_mount_test; then
+        pf_fix "vloopback volumes fail on this host: $VLOOPBACK_REASON" "See $VLOOPBACK_DOC_URL"
+        return 1
+    fi
+    pf_pass "vloopback plugin (DATA_DIR=$data_dir): a 1 GB volume mounts, takes a write and unmounts in a sysbox container."
+}
+
+fail_vloopback() {
+    fail "Size-limited volumes (vloopback) do not work on this host: $VLOOPBACK_REASON"
+    fail "Rentals with a disk limit cannot start here until this is fixed. What to do: $VLOOPBACK_DOC_URL"
+}
+
+setup_vloopback() {
+    # install mode: the plugin fix, then the mount test; on a failure the caller prints fail_vloopback
+    ! vloopback_storage_opt_unsupported || { ok "vloopback: skipped. $VLOOPBACK_NOT_USED"; warn "$STORAGE_LIMIT_MISSING Fix: $STORAGE_LIMIT_FIX"; return 0; }
+    ensure_vloopback_plugin || return 1
+    [ -z "$VLOOPBACK_CHANGED" ] || ok "vloopback: $VLOOPBACK_CHANGED."
+    vloopback_mount_test || return 1
+    ok "vloopback: a size-limited volume mounts, takes a write and unmounts in a sysbox container."
 }
 
 preflight_summary() {
@@ -480,7 +786,7 @@ preflight_summary() {
 }
 
 preflight_blocking() {
-    # what sysbox itself needs before it can go on this host: x86_64 (the .deb is amd64 only), a kernel with
+    # what sysbox itself needs before it can go on this host: x86_64 or aarch64 (the .debs), a kernel with
     # ID-mapped mounts (or the override), Docker installed and running (the runtime is registered in its
     # daemon.json and it is restarted). Returns 1 when any of them is a FIX; install mode stops there.
     local fixes_before=$PREFLIGHT_FIX
@@ -496,6 +802,7 @@ preflight_advisory() {
     check_nvidia_driver || true
     check_iptables_modules || true
     check_total_disk_for_vram || true
+    check_free_disk_for_node || true
     check_ports || true
 }
 
@@ -509,7 +816,9 @@ preflight_stack() {
     # what this script installs: reported in --check mode, done in install mode
     check_nvidia_toolkit || true
     check_docker_features || true
+    check_fuse3 || true
     check_sysbox || true
+    check_vloopback || true
 }
 
 
@@ -525,7 +834,8 @@ case "${1:-}" in
     -h|--help)
         echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
-        echo "               a FIX on root, x86_64, kernel or Docker stops the install, any other FIX is printed and the install goes on"
+        echo "               a FIX on root, architecture, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
+        echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
@@ -564,9 +874,22 @@ if [ -t 0 ]; then
     read -rp "  Continue? [Y/n]: " c; [ "$c" = "n" ] || [ "$c" = "N" ] && { ok "Aborted."; exit 0; }
 fi
 
+if load_iptables_modules; then
+    ok "Loaded the iptables modules (ip_tables iptable_nat iptable_filter) and made them load at boot."
+    PREFLIGHT_FIX=$((PREFLIGHT_FIX - 1))
+fi
+
 # ── 2. Already working? ─────────────────────────────────
 
-if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc; then
+INSTALLED_SYSBOX=$(sysbox_runc_version || true)
+SYSBOX_UP_TO_DATE=false
+if [ -n "$INSTALLED_SYSBOX" ] && ! version3_ge "$INSTALLED_SYSBOX" "$SYSBOX_VERSION"; then
+    warn "Sysbox $INSTALLED_SYSBOX is installed; upgrading to $SYSBOX_VERSION."
+elif command -v sysbox-runc &>/dev/null; then
+    SYSBOX_UP_TO_DATE=true
+fi
+
+if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-runc; then
     # pull first: without the image the real test cannot run and the host would be judged on kernel version alone
     if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
         abort_on_active_rentals
@@ -574,7 +897,12 @@ if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbo
         docker pull "$VERIFY_IMAGE" &>/dev/null || true
     fi
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
-        ok "Sysbox is already working. Nothing to do."
+        setup_vloopback || { fail_vloopback; exit 1; }
+        if [ -n "$VLOOPBACK_CHANGED" ]; then
+            ok "Sysbox is already working."
+        else
+            ok "Sysbox is already working. Nothing to do."
+        fi
         preflight_reminder
         exit 0
     fi
@@ -591,7 +919,7 @@ elif [ "$(sysbox_idmapped_report)" = "no" ]; then
 fi
 
 SKIP_INSTALL=false
-command -v sysbox-runc &>/dev/null && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
+[ "$SYSBOX_UP_TO_DATE" = true ] && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
 
 # ── 3. Check running containers ─────────────────────────
 
@@ -605,7 +933,7 @@ unknown_list=""
 for name in $all_containers; do
     case "$name" in
         pod_*)       ;;  # handled by abort_on_active_rentals below
-        container_*) has_validator=true ;;
+        container_*|lium_storage_check_*) has_validator=true ;;  # a validator's scrape or its vloopback test
         executor-*|executor_*)
             has_executor=true
             if [ -z "$EXECUTOR_COMPOSE_DIR" ]; then
@@ -619,7 +947,7 @@ done
 abort_on_active_rentals
 
 if [ "$has_validator" = true ]; then
-    fail "Validator check in progress (container_* containers). Wait ~30 seconds and retry."
+    fail "Validator check in progress (container_* or lium_storage_check_* containers). Wait ~30 seconds and retry."
     exit 1
 fi
 
@@ -684,11 +1012,12 @@ step 3 7 "Installing packages"
 
 ensure_nvidia_container_toolkit_repo || exit 1
 apt_install update -qq || exit 1
-apt_install install -y -qq nvidia-container-toolkit jq || exit 1
-ok "nvidia-container-toolkit, jq"
+# fuse3 before the .deb: its postinst starts sysbox-fs, which needs fusermount3 (see check_fuse3)
+apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1
+ok "nvidia-container-toolkit, jq, fuse3"
 
 if [ "$SKIP_INSTALL" = false ]; then
-    LOCAL_DEB="./sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
+    LOCAL_DEB="./${SYSBOX_DEB_NAME}"
     if [ -f "$LOCAL_DEB" ]; then
         SYSBOX_DEB="$LOCAL_DEB"
     else
@@ -749,18 +1078,24 @@ ok "Docker is running."
 
 # ── 7. Verify ──────────────────────────────────────────
 
-step 6 7 "Verifying sysbox + GPU"
+step 6 7 "Verifying sysbox + GPU and a size-limited volume"
 
-if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
-    echo ""
-    echo -e "  ${G}╔══════════════════════════════════════════╗${N}"
-    echo -e "  ${G}║  SUCCESS: Sysbox is working with GPUs!   ║${N}"
-    echo -e "  ${G}╚══════════════════════════════════════════╝${N}"
-    echo ""
-    ok "Your executor now supports Docker-in-Docker."
-    preflight_reminder
+if VERIFY_OUT=$(docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi 2>&1); then
+    ok "A GPU container starts under sysbox-runc."
+    VLOOPBACK_OK=true
+    setup_vloopback || VLOOPBACK_OK=false
+    if [ "$VLOOPBACK_OK" = true ]; then
+        echo ""
+        echo -e "  ${G}╔══════════════════════════════════════════╗${N}"
+        echo -e "  ${G}║  SUCCESS: Sysbox is working with GPUs!   ║${N}"
+        echo -e "  ${G}╚══════════════════════════════════════════╝${N}"
+        echo ""
+        ok "Your executor now supports Docker-in-Docker."
+        preflight_reminder
+    fi
 
     # ── 8. Restart executor ──────────────────────────────
+    # also after a vloopback failure: the node was running before and still earns without disk limits
     if [ -n "$EXECUTOR_COMPOSE_DIR" ]; then
         step 7 7 "Restarting executor"
         if docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" up -d 2>/dev/null; then
@@ -769,17 +1104,21 @@ if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &
             warn "Failed to restart executor. Run manually: cd $EXECUTOR_COMPOSE_DIR && docker compose up -d"
         fi
     fi
+    if [ "$VLOOPBACK_OK" = false ]; then
+        fail_vloopback
+        exit 1
+    fi
 else
     echo ""
-    fail "Verification FAILED. Diagnostics:"
+    fail "Verification FAILED. The test container said:"
+    # the docker run error names the cause (e.g. no CDI device driver); ticket-0478 had only "FAILED"
+    printf '%s\n' "$VERIFY_OUT" | tail -n 20 | sed 's/^/    /'
+    echo ""
+    fail "Diagnostics:"
     echo ""
     failure_diagnostics
     echo ""
-    if docker_version_ge 29 5; then
-        fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
-        fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
-        fail "  if the error is still there, downgrade the daemon to Docker 28.x."
-    fi
+    time_namespace_hint "$VERIFY_OUT"
     fail "Check: journalctl -u docker.service --no-pager -n 20"
     fail "Check: journalctl -u sysbox-mgr.service --no-pager -n 20"
     exit 1

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+logger = logging.getLogger(__name__)
 
 
 class PortConnectivityCheck:
@@ -58,12 +62,22 @@ class PortConnectivityCheck:
             },
         )
         verified_port_count = len(result.successful_ports)
+        probed_port_count = len(result.selected_ports)
+        declared_port_count = result.declared_port_count
         extra_info: dict[str, object] = {
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
+            "probed_port_count": probed_port_count,
+            "declared_port_count": declared_port_count,
+            "probe_tier": result.probe_tier,
+            "dind_ok": result.dind_ok,
         }
         if result.dind_error:
             extra_info["dind_error"] = result.dind_error.text
+        # event-only: kept out of default_extra so later checks' log lines stay small
+        event_extra: dict[str, object] = {
+            "port_ranges": [r.as_dict() for r in result.port_ranges],
+        }
         updated_state = replace(
             ctx.state,
             specs={
@@ -73,6 +87,8 @@ class PortConnectivityCheck:
             },
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count,
+            probed_port_count=probed_port_count,
+            declared_port_count=declared_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
         )
@@ -86,6 +102,16 @@ class PortConnectivityCheck:
                     "sysbox_runtime": ctx.state.sysbox_runtime,
                 },
                 sysbox_runtime=ctx.state.sysbox_runtime,
+            )
+
+        if await self._should_use_last_verified_sysbox(
+            ctx, result, rented=rented_executor is not None, sysbox_now=updated_state.sysbox_runtime
+        ):
+            extra_info["sysbox_from_last_verified"] = True
+            updated_state = replace(
+                updated_state,
+                specs={**updated_state.specs, "sysbox_runtime": True},
+                sysbox_runtime=True,
             )
 
         total = len(result.successful_ports) + len(result.failed_ports)
@@ -132,6 +158,12 @@ class PortConnectivityCheck:
                 details = "No ports available for docker container - all ports may be in use or misconfigured"
             elif result.status == "no_working_ports":
                 details = f"No working ports found - verified {len(result.failed_ports)} ports, all failed connectivity test"
+            elif result.status == "externally_unreachable":
+                details = (
+                    "Ports answer the validator but not a probe from outside the validator's network: a firewall "
+                    "on the host admits only some source addresses, so renters cannot reach their pods. Allow "
+                    "inbound TCP from any address on the port range"
+                )
             elif result.status == "skipped_rental_active":
                 # This shouldn't happen anymore but provide clear message if it does
                 details = "Port verification was incorrectly skipped due to rental detection - this is a bug"
@@ -153,9 +185,10 @@ class PortConnectivityCheck:
                     "total_ports_tested": len(result.successful_ports) + len(result.failed_ports),
                     "successful_ports": len(result.successful_ports),
                     "failed_ports": len(result.failed_ports),
+                    **event_extra,
                     **rental_info,
                 },
-                extra=extra_info,
+                extra={**extra_info, **event_extra},
             )
             return CheckResult(
                 passed=False,
@@ -168,7 +201,7 @@ class PortConnectivityCheck:
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},
-            extra=extra_info,
+            extra={**extra_info, **event_extra},
         )
         return CheckResult(
             passed=True,
@@ -215,3 +248,38 @@ class PortConnectivityCheck:
         elif result.dind_ok:
             await ctx.services.redis.clear_dind_probe_miss(ctx.miner_hotkey, ctx.executor.uuid)
         return False
+
+    @staticmethod
+    async def _should_use_last_verified_sysbox(
+        ctx: Context, result: PortVerificationResult, *, rented: bool, sysbox_now: bool
+    ) -> bool:
+        """ticket-0494: keep a rented executor's verified sysbox when this cycle measured nothing.
+
+        On a busy rented host the scrape's own sysbox test can time out (sysbox_runtime False), so
+        the DinD probe runs without sysbox-runc and then is refused by the host or never reaches its
+        container. The fallbacks above key off ctx.state.sysbox_runtime, which is that same scrape,
+        so neither applies and a rented node scored 0 for the cycle. Every probe that reached its
+        container with sysbox-runc is remembered here (pass refreshes, fail forgets); a rented
+        executor whose probe never reached its container reads that memory. A probe that reached
+        its container and found no sysbox stays a verdict. Fails open to the current behaviour on a
+        Redis error.
+        """
+        redis = ctx.services.redis
+        try:
+            if result.sysbox_measured is True:
+                await redis.record_sysbox_verified(
+                    ctx.miner_hotkey, ctx.executor.uuid, settings.SYSBOX_VERIFIED_TTL_SECONDS
+                )
+            elif result.sysbox_measured is False:
+                await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+            if not rented or sysbox_now or result.dind_ok:
+                return False
+            return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+        except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
+            logger.warning(
+                _m(
+                    "last verified sysbox unavailable",
+                    extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
+                )
+            )
+            return False

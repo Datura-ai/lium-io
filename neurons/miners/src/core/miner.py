@@ -1,10 +1,18 @@
 import asyncio
+import contextlib
 import logging
 import traceback
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import bittensor
+from datura.chain import (
+    ChainConnection,
+    ChainEndpoint,
+    EndpointCursor,
+    EndpointSource,
+    is_chain_error,
+)
 from sqlmodel import Session, select
 
 from core.config import settings
@@ -20,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 VALIDATORS_LIMIT = 24
 RECONNECT_POLL_CYCLE = 2 * 60
+# async_substrate_interface retries an unresolvable hostname forever, so a dial needs a deadline
+CHAIN_CONNECT_TIMEOUT_SECONDS = 60
 
 
 class Miner:
@@ -45,9 +55,102 @@ class Miner:
             ip=settings.EXTERNAL_IP_ADDRESS,
         )
         self.subtensor = None
+        self._endpoint_cursor = EndpointCursor(
+            settings.get_chain_endpoints(),
+            retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
+        )
 
         self.should_exit = False
         self.bootstrap_complete = False
+
+    def _log_endpoint_switched(
+        self, previous: ChainEndpoint, current: ChainEndpoint, reason: str, error: Exception
+    ) -> None:
+        logger.warning(
+            _m(
+                f"Subtensor endpoint switched from={previous.value} to={current.value}",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "from": previous.value,
+                        "to": current.value,
+                        "from_source": previous.source,
+                        "to_source": current.source,
+                        "reason": reason,
+                        "error": repr(error),  # a timeout has an empty str()
+                    }
+                ),
+            ),
+        )
+
+    async def _connect_subtensor(self) -> ChainConnection[bittensor.AsyncSubtensor]:
+        """Dial the current entry of the ordered endpoint list; when it refuses, move to the next
+        one (`Subtensor endpoint switched from=… to=…`) until one answers, so a proxy outage never
+        leaves the central miner without a chain client. Providers set no endpoint and dial the
+        network name as before. Raises the last error when every entry failed. Returns the client
+        and which setting chose the endpoint."""
+        cursor = self._endpoint_cursor
+        last_error: Exception | None = None
+        for _attempt in range(len(cursor.candidates)):
+            endpoint = cursor.current
+            client: bittensor.AsyncSubtensor | None = None
+            try:
+                client = bittensor.AsyncSubtensor(network=endpoint.value, config=self.config)
+                subtensor = await asyncio.wait_for(
+                    client.initialize(), timeout=CHAIN_CONNECT_TIMEOUT_SECONDS
+                )
+            except Exception as e:
+                if client is not None:
+                    # a dial cut by the deadline can leave its websocket open
+                    with contextlib.suppress(Exception):
+                        await client.close()
+                last_error = e
+                if len(cursor.candidates) == 1:
+                    raise
+                previous, current = cursor.advance()
+                self._log_endpoint_switched(previous, current, "connect failed", e)
+                continue
+            return ChainConnection(subtensor, cursor.current_source_label())
+        assert last_error is not None
+        raise last_error
+
+    async def _switch_endpoint_after_read_failure(self, error: Exception) -> None:
+        """A chain read on the connected endpoint failed: close the client and move the cursor
+        to the next entry, so the redial that follows skips the failing one. A database or
+        other local error leaves the cursor on the healthy proxy."""
+        if not is_chain_error(error):
+            return
+        if self.subtensor is None or len(self._endpoint_cursor.candidates) == 1:
+            return
+        await self.close_subtensor()
+        previous, current = self._endpoint_cursor.advance()
+        self._log_endpoint_switched(previous, current, "read failed", error)
+
+    async def _return_to_first_endpoint(self) -> None:
+        """A sync cycle starts on the first entry that is not resting: after a cycle ran on a
+        fallback node, once the failed endpoint's retry window is over, the client is closed and
+        the next dial tries it again (the proxy may be back). Inside the window the fallback client
+        stays, so a dead proxy is not redialled every cycle."""
+        if not self._endpoint_cursor.move_to_first_ready_endpoint():
+            return
+        await self.close_subtensor()
+
+    def _log_subtensor_connected(
+        self, subtensor: bittensor.AsyncSubtensor, endpoint_source: EndpointSource
+    ) -> None:
+        logger.info(
+            _m(
+                "Subtensor connected",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "chain_endpoint": subtensor.chain_endpoint,
+                        "network": subtensor.network,
+                        "endpoint_source": endpoint_source,
+                    }
+                ),
+            ),
+        )
 
     async def initialize_subtensor(self):
         self.bootstrap_complete = False
@@ -64,12 +167,13 @@ class Miner:
             if self.should_exit:
                 return
 
-            subtensor = await bittensor.AsyncSubtensor(config=self.config).initialize()
+            subtensor, endpoint_source = await self._connect_subtensor()
             if self.should_exit:
                 await subtensor.close()
                 return
 
             self.subtensor = subtensor
+            self._log_subtensor_connected(subtensor, endpoint_source)
 
             # check registered
             await self.check_registered()
@@ -286,6 +390,9 @@ class Miner:
 
     async def sync(self):
         try:
+            # every cycle, so a cycle that failed on a fallback node (a database error in
+            # save_validators) still returns once the first endpoint's retry window is over
+            await self._return_to_first_endpoint()
             await self.set_subtensor()
             if not self.bootstrap_complete:
                 await self.bootstrap()
@@ -301,7 +408,9 @@ class Miner:
                     ),
                 ),
             )
-            if not self.should_exit:
+            if not self.should_exit and is_chain_error(e):
+                # a chain read on the connected endpoint failed: the redial below dials the next one
+                await self._switch_endpoint_after_read_failure(e)
                 await self.initialize_subtensor()
 
     async def start(self):

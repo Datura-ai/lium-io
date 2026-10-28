@@ -23,11 +23,11 @@ from tests.helpers import build_context_config, build_services, build_state, def
 
 
 @contextmanager
-def probe_gate(*, check_enabled: bool = True, enforce: bool = False):
+def probe_gate(*, enforce: bool = False, enforce_unknown_streak: bool = False):
     # shadow-first like every score-zeroing gate: the check runs and logs, enforcement fails the node
     with patch("neurons.validators.src.services.task.checks.gpu_fault_probe.settings") as s:
-        s.GPU_FAULT_PROBE_CHECK_ENABLED = check_enabled
         s.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED = enforce
+        s.GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED = enforce_unknown_streak
         yield s
 
 
@@ -101,24 +101,47 @@ def probe_stdout(status: str, **extra) -> str:
     return "some driver noise\n" + PROBE_JSON_MARKER + " " + json.dumps(report) + "\n"
 
 
-def make_ctx(context_factory, runner, *, rented_data=None):
+def make_ctx(context_factory, runner, *, rented_data=None, first_pass=False):
     state = build_state(specs={"gpu": {"count": 1}}, rented_data=rented_data)
     return context_factory(
-        services=build_services(), config=build_context_config(), state=state, runner=runner
+        services=build_services(),
+        config=build_context_config(first_pass=first_pass),
+        state=state,
+        runner=runner,
     )
 
 
-@pytest.mark.asyncio
-async def test_disabled_by_default_runs_nothing(context_factory):
-    runner = FakeRunner()
-    ctx = make_ctx(context_factory, runner)
+def test_shadow_by_default_runs_the_probe_but_never_enforces():
+    # DAH-4257: the probe runs on every idle node and logs its verdict; a fault zeroes nothing until
+    # the owner turns enforcement on
+    fields = type(module.settings).model_fields
+    assert "GPU_FAULT_PROBE_CHECK_ENABLED" not in fields
+    assert fields["GPU_FAULT_PROBE_ENFORCEMENT_ENABLED"].default is False
 
-    with probe_gate(check_enabled=False):
+
+@pytest.mark.asyncio
+async def test_first_pass_in_shadow_skips_the_probe(context_factory):
+    runner = FakeRunner(probe_stdout("ok"))
+    ctx = make_ctx(context_factory, runner, first_pass=True)
+
+    with probe_gate(enforce=False):
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.DISABLED.reason
+    assert result.event.reason_code == Msg.FIRST_PASS_SKIPPED.reason
     assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_first_pass_under_enforcement_runs_the_probe(context_factory):
+    runner = FakeRunner(probe_stdout("ok"))
+    ctx = make_ctx(context_factory, runner, first_pass=True)
+
+    with probe_gate(enforce=True):
+        result = await GpuFaultProbeCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.PROBE_OK.reason
+    assert len(runner.calls) == 1
 
 
 @pytest.mark.asyncio
