@@ -37,6 +37,9 @@ class RentedExecutor(pydantic.BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-2348: volume names of the executor's paused (STOPPED) pods, which are left out of `pods`;
+    # the validator never sweeps them. Empty from an older backend.
+    kept_volume_names: list[str] = []
 
 
 class NetworkEMA(pydantic.BaseModel):

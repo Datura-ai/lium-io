@@ -4801,6 +4801,14 @@
           "title": "Executor Ip Port",
           "type": "string"
         },
+        "kept_volume_names": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Kept Volume Names",
+          "type": "array"
+        },
         "miner_hotkey": {
           "title": "Miner Hotkey",
           "type": "string"
@@ -6150,7 +6158,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.16.0",
+  "protocol_version": "1.17.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

@@ -1742,3 +1742,73 @@ async def test_a_filler_given_during_a_probe_beside_another_is_no_verdict():
     assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert result.event.what_we_saw["reason"] == "node was given a filler during the probe"
     assert redis.standing_failure() is None
+
+
+def _paused_only(executor_uuid: str = EXECUTOR.uuid, **extra) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse.model_validate(
+        {
+            "executors": {
+                executor_uuid: {
+                    "miner_hotkey": MINER,
+                    "executor_ip_address": EXECUTOR.address,
+                    "executor_ip_port": str(EXECUTOR.port),
+                    "pods": [],
+                    "kept_volume_names": ["volume_paused"],
+                    **extra,
+                }
+            }
+        }
+    )
+
+
+def test_a_paused_only_node_reads_as_unrented_and_keeps_its_volume_names():
+    """DAH-2348: a node whose only pod is paused is not rented (no down-rental penalty, the probe may run)."""
+    rented = _paused_only()
+    assert EXECUTOR.uuid not in rented.executors
+    assert rented.get_kept_volume_names(EXECUTOR.uuid) == ["volume_paused"]
+    # parsing a dump again (a cached copy) gives the same answer
+    again = RentedExecutorsResponse.model_validate(rented.model_dump())
+    assert EXECUTOR.uuid not in again.executors
+    assert again.get_kept_volume_names(EXECUTOR.uuid) == ["volume_paused"]
+
+
+def test_a_node_with_a_live_and_a_paused_pod_stays_rented():
+    rented = _paused_only(pods=[{"pod_id": "p0", "container_name": "pod_p0"}])
+    assert rented.executors[EXECUTOR.uuid].pods
+    assert rented.get_kept_volume_names(EXECUTOR.uuid) == ["volume_paused"]
+
+
+def test_the_probe_create_protects_a_paused_pods_volume():
+    ctx, _, _ = make_probe_context(rented=_paused_only())
+    payload = module._probe_payload(ctx, pod_id="probe", image_ref="img", public_key="key")
+    assert payload.active_volume_names == ["volume_paused"]
+
+
+def test_an_older_backend_without_the_field_protects_nothing_as_before():
+    rented = RentedExecutorsResponse.model_validate(
+        {
+            "executors": {
+                EXECUTOR.uuid: {
+                    "miner_hotkey": MINER,
+                    "executor_ip_address": EXECUTOR.address,
+                    "executor_ip_port": str(EXECUTOR.port),
+                    "pods": [],
+                }
+            }
+        }
+    )
+    # an empty executor from an older backend is left where it was
+    assert EXECUTOR.uuid in rented.executors
+    ctx, _, _ = make_probe_context(rented=rented)
+    payload = module._probe_payload(ctx, pod_id="probe", image_ref="img", public_key="key")
+    assert payload.active_volume_names == []
+
+
+@pytest.mark.asyncio
+async def test_the_probe_create_protects_a_volume_paused_after_the_cycle_snapshot():
+    """A pod rented and paused after the cycle's snapshot is only in the fresh read under the lock."""
+    ctx, docker, _ = make_probe_context(rented=rented_data(), rented_now=_paused_only())
+    with probe_settings(), renter_path():
+        await RentalProbeCheck().run(ctx)
+
+    assert docker.create_calls[0][0].active_volume_names == ["volume_paused"]
