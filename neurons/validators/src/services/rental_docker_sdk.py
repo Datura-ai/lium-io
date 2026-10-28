@@ -431,7 +431,11 @@ class RentalDockerSdkClient:
     async def pull(self, *, image: str) -> None:
         timeout_seconds = self._normalized_pull_timeout_seconds()
         try:
-            pull_call = _in_docker_thread(self._pull_sync, image)
+            # a pull is idempotent (dockerd keeps finished layers), so a dropped SSH channel
+            # mid-stream gets the same one re-open + retry as other calls, inside the one deadline
+            pull_call = self._retry_once_on_transport_drop(
+                operation="pull", attempt=lambda: _in_docker_thread(self._pull_sync, image)
+            )
             if timeout_seconds is not None:
                 await asyncio.wait_for(
                     pull_call,

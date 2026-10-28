@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import enum
 import ipaddress
@@ -357,10 +358,18 @@ _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
 
 PORT_COLLISION_ERROR_CLASS = "port_collision"
 _PORT_COLLISION_CANDIDATE_CAP = 3
+# Bound on remaps within one create: a second bind refusal (e.g. a filler holding two ports of the
+# range) moves that mapping too instead of failing the create.
+_PORT_COLLISION_REMAP_CAP = 5
 _PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
 # `ss -Hltn` (iproute2) first, `netstat -ltn` where only net-tools is installed; either prints one
-# listening socket per line with the local address in one column.
-_LISTENING_PORTS_COMMAND = "ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null"
+# listening socket per line with the local address in one column. Then the host ports running
+# containers publish (`0.0.0.0:10071->9101/tcp`): with docker's iptables publishing and no
+# userland-proxy those never show as a listening socket.
+_LISTENING_PORTS_COMMAND = (
+    "{ ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null; docker ps --format '{{.Ports}}' 2>/dev/null; } || true"
+)
+_PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})->")
 # dockerd's two bind refusals name the host address the bind was for:
 #   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
 #   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
@@ -434,8 +443,11 @@ def _port_collision_candidates(
 
 
 def _parse_listening_ports(output: str) -> set[int]:
-    """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`)."""
-    ports: set[int] = set()
+    """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`),
+    plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`)."""
+    ports: set[int] = {
+        int(port) for port in _PUBLISHED_HOST_PORT_RE.findall(output) if 0 < int(port) <= 65535
+    }
     for line in output.splitlines():
         for column in line.split():
             if column.endswith("*") or ":" not in column:
@@ -1670,14 +1682,25 @@ class _InflightCreateRegistry:
 
     def __init__(self) -> None:
         self._creates_by_pod_id: dict[str, _InflightCreate] = {}
+        # Pods this task's create already holds: the job runner and the miner handler both
+        # register one create, and that must count once so `running` counts distinct creates.
+        self._held_pod_ids: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+            "inflight_create_held_pod_ids", default=frozenset()
+        )
 
     @contextlib.contextmanager
     def track(self, pod_id: str) -> Iterator[None]:
+        held = self._held_pod_ids.get()
+        if pod_id in held:
+            yield
+            return
+        token = self._held_pod_ids.set(held | {pod_id})
         create = self._creates_by_pod_id.setdefault(pod_id, _InflightCreate())
         create.running += 1
         try:
             yield
         finally:
+            self._held_pod_ids.reset(token)
             create.running -= 1
             if create.running <= 0:
                 self._creates_by_pod_id.pop(pod_id, None)
@@ -1697,6 +1720,11 @@ class _InflightCreateRegistry:
 
     def is_running(self, pod_id: str) -> bool:
         return pod_id in self._creates_by_pod_id
+
+    def is_only_create(self, pod_id: str) -> bool:
+        """Exactly one create for this pod is registered (the caller's): no other attempt is live."""
+        create = self._creates_by_pod_id.get(pod_id)
+        return create is not None and create.running == 1
 
     async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
         """Wait for the create(s) on this pod to leave. False when the wait ran out."""
@@ -2707,6 +2735,7 @@ class DockerService:
         flatten_reserved_bytes: int | None = None,
         before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
         flatten_beside_other_create: Callable[[], bool] | None = None,
+        pod_id: str | None = None,
     ) -> str | None:
         """`_run_rental_docker_create_attempts`, then the release of the flattened copy's lease (when a
         flatten ran) however the create ended: success (the container now keeps the copy), failure or
@@ -2728,6 +2757,7 @@ class DockerService:
                 before_flatten_retry=before_flatten_retry,
                 flatten_beside_other_create=flatten_beside_other_create,
                 flatten_lease=flatten_lease,
+                pod_id=pod_id,
             )
         finally:
             for lease in flatten_lease:
@@ -2753,6 +2783,7 @@ class DockerService:
         before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
         flatten_beside_other_create: Callable[[], bool] | None = None,
         flatten_lease: list[str],
+        pod_id: str | None = None,
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
@@ -2769,10 +2800,11 @@ class DockerService:
         Port collision: when dockerd refuses the bind of a host port
         and `port_maps` / `spare_port_pairs` are given, the colliding mapping moves to the next
         free pair of the executor's advertised range (at most `_PORT_COLLISION_CANDIDATE_CAP`
-        candidates, the host's listening sockets read once over `ssh_client`) and the run is
-        retried ONCE with the new mapping; `port_maps` is updated in place so the create's answer
-        carries the port the pod really got. No free candidate, or a second bind refusal, fails the
-        create as `RentalPortCollisionError`.
+        candidates, skipping the host's listening sockets and container-published ports read over
+        `ssh_client`) and the run is retried with the new mapping; a further refusal moves again, up
+        to `_PORT_COLLISION_REMAP_CAP` remaps. `port_maps` is updated in place so the create's answer
+        carries the port the pod really got. No free candidate, or a refusal after the last remap,
+        fails the create as `RentalPortCollisionError`.
 
         `remove_port_checks_listed_live` runs once, on the first bind refusal, before either retry;
         when it removed a port check, the run is retried at once on the same mapping.
@@ -2781,7 +2813,8 @@ class DockerService:
         attempt = 0
         vloopback_mount_repair_attempted = False
         image_flattened = False
-        remapped = False
+        remaps = 0
+        own_leftover_removed = False
         while True:
             try:
                 container_id = await run_logged_rental_docker_sdk_operation(
@@ -2795,6 +2828,26 @@ class DockerService:
             except ContainerCreateRefused:
                 raise
             except Exception as exc:
+                # A re-sent create for this pod meets its earlier attempt's container under the
+                # pod's own (unique) name: 409 "The container name "/pod_<id>" is already in use".
+                # Only that exact name is removed, once, and only while no other create for this pod is
+                # registered: a live attempt (registered until its own failure cleanup ends) may still own
+                # that container, so then the conflict fails as before. Any other name conflict fails too.
+                if (
+                    not own_leftover_removed
+                    and pod_id is not None
+                    and inflight_creates.is_only_create(pod_id)
+                    and f'"/{container_name}" is already in use' in str(exc)
+                ):
+                    own_leftover_removed = True
+                    attempt += 1
+                    await self._remove_failed_rental_container_for_retry(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                        warning_event="OWN_LEFTOVER_CONTAINER_RM_FAILED",
+                    )
+                    continue
                 if _should_repair_stale_mountpoint(
                     exc,
                     local_volume,
@@ -2870,12 +2923,11 @@ class DockerService:
                             warning_event="PORT_RETRY_STALE_RM_FAILED",
                         )
                         continue
-                if port_allocation_phrase and remapped:
-                    # the one retry on the new mapping was refused too: no third candidate
+                if port_allocation_phrase and remaps >= _PORT_COLLISION_REMAP_CAP:
                     error_text = str(exc)
                     await self.stream_log(error_text, "error", log_tag)
                     raise RentalPortCollisionError(
-                        f"docker run could not bind a host port on the remapped port either: {exc}"
+                        f"docker run could not bind a host port after {remaps} remap(s): {exc}"
                     ) from exc
                 if (
                     port_allocation_phrase
@@ -2897,7 +2949,7 @@ class DockerService:
                             # the UI's SSH command still names the port dockerd just refused
                             await self.stream_log(f"Port mappings ready: 22->{ssh_port_map[2]}", "success", log_tag)
                         run_spec = remapped_spec
-                        remapped = True
+                        remaps += 1
                         attempt += 1
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
@@ -5352,33 +5404,38 @@ class DockerService:
         volume_name: str | None = None,
         remove_volume: bool = False,
         container_id: str | None = None,
+        pod_id: str | None = None,
     ) -> bool:
         """Remove the failed container's artifacts; report whether it was already gone.
 
         ``container_id``, once the create has one, is what gets read and removed: a concurrent
         retry for the same pod can be running its own container under ``container_name``.
+        Without an id, the name is removed only while no other create for ``pod_id`` is live.
 
         DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
         on missing evidence.
         """
         container_missing = False
+        # without an id, the container under this name may be another live create's: leave it to that create
+        owns_container = container_id is not None or pod_id is None or inflight_creates.is_only_create(pod_id)
         try:
-            # DAH-2395: read the death evidence before `rm -fv` destroys it —
-            # without this line, "why did the container die" (OOM vs entrypoint
-            # crash) is unanswerable: the host is the miner's, not ours.
-            diagnostics = await self.capture_failed_container_diagnostics(
-                ssh_client=ssh_client,
-                default_extra=default_extra,
-                container_name=container_id or container_name,
-            )
-            container_missing = diagnostics.container_missing
+            if owns_container:
+                # DAH-2395: read the death evidence before `rm -fv` destroys it —
+                # without this line, "why did the container die" (OOM vs entrypoint
+                # crash) is unanswerable: the host is the miner's, not ours.
+                diagnostics = await self.capture_failed_container_diagnostics(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    container_name=container_id or container_name,
+                )
+                container_missing = diagnostics.container_missing
 
-            container = shlex.quote(container_id or container_name)
-            await retry_ssh_command(
-                ssh_client,
-                f"/usr/bin/docker rm -fv {container} 2>/dev/null || true",
-                "cleanup_failed_container_creation",
-            )
+                container = shlex.quote(container_id or container_name)
+                await retry_ssh_command(
+                    ssh_client,
+                    f"/usr/bin/docker rm -fv {container} 2>/dev/null || true",
+                    "cleanup_failed_container_creation",
+                )
 
             if remove_volume and volume_name:
                 volume = shlex.quote(volume_name)
@@ -5846,6 +5903,30 @@ class DockerService:
             )
 
         return success
+
+    async def register_vulkan_icd_with_rental_docker(
+        self, docker_client: RentalDockerSdkClient, *, container_name: str, log_extra: dict
+    ) -> None:
+        """DAH-4668: the bootstrap's ICD step alone, for an image that starts its own sshd. Best effort."""
+        try:
+            await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_register_vulkan_icd",
+                exec_spec=ContainerExecSpec(
+                    container_name=container_name,
+                    argv=("sh", "-s", "--", "--vulkan-icd-only"),
+                    stdin=self._ssh_bootstrap_script_path().read_text(),
+                    idempotent=True,
+                ),
+                log_extra=log_extra,
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to register the Vulkan ICD",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": str(exc)}),
+                )
+            )
 
     async def install_open_ssh_server_and_start_ssh_service_with_rental_docker(
         self,
@@ -9342,6 +9423,7 @@ class DockerService:
                         log_tag=log_tag,
                         port_maps=port_maps,
                         spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                        pod_id=payload.pod_id,
                         remove_port_checks_listed_live=(
                             None
                             if probed_port_check_names is None
@@ -9454,6 +9536,7 @@ class DockerService:
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                         container_id=container_id,
+                        pod_id=payload.pod_id,
                     )
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
@@ -9594,6 +9677,9 @@ class DockerService:
                                 "Skipping SSH-server bootstrap; template ships sshd",
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
+                        )
+                        await self.register_vulkan_icd_with_rental_docker(
+                            docker_client, container_name=container_name, log_extra=default_extra
                         )
                     elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                         docker_client=docker_client,

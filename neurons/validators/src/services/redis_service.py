@@ -780,10 +780,11 @@ class RedisService:
         reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
         evidence: dict | None = None,
         anchor_broken: bool = False,
-        reanchor: bool = False,
+        reanchor_uuids: str = '',
     ):
         spec = prev_info.get('spec', '')
-        uuids = '' if reanchor else prev_info.get(GPU_ANCHOR_KEY, '')
+        # a whole replaced set is anchored now, so a second swap inside the hold is judged against it
+        uuids = reanchor_uuids or prev_info.get(GPU_ANCHOR_KEY, '')
 
         data = {
             "count": 0,
