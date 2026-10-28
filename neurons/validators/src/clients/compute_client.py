@@ -107,6 +107,9 @@ logger = logging.getLogger(__name__)
 # mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
+# the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
+MAX_FRAME_BYTES = 4 * 1024 * 1024
+MESSAGE_TOO_BIG = 1009
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
@@ -136,6 +139,23 @@ class OutgoingMessages(list[DeliveryStamps]):
             responses.append(message.model_dump_json())
         super().append(message)
         self.appended.set()
+
+
+class FrameTooBig(Exception):
+    def __init__(self, size: int):
+        super().__init__(f"frame of {size} bytes exceeds {MAX_FRAME_BYTES}")
+        self.size = size
+
+
+def _closed_as_too_big(exc: BaseException) -> bool:
+    return isinstance(exc, websockets.ConnectionClosed) and MESSAGE_TOO_BIG in (
+        getattr(exc.rcvd, "code", None),
+        getattr(exc.sent, "code", None),
+    )
+
+
+def _retryable(exc: BaseException) -> bool:
+    return isinstance(exc, websockets.ConnectionClosed) and not _closed_as_too_big(exc)
 
 
 class AuthenticationError(Exception):
@@ -551,13 +571,17 @@ class ComputeClient:
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(3),
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
-        retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
+        retry=tenacity.retry_if_exception(_retryable),
     )
     async def send_model(self, msg: DeliveryStamps):
         # stamped inside the retry so a message resent after a reconnect reports its own delay
         msg.forwarded_at = time.time()
         msg.queue_depth = len(self.message_queue)
-        await self.ws.send(msg.model_dump_json())
+        payload = msg.model_dump_json()
+        size = len(payload.encode())
+        if size > MAX_FRAME_BYTES:
+            raise FrameTooBig(size)
+        await self.ws.send(payload)
 
     async def handle_send_messages(self):
         while True:
@@ -576,6 +600,20 @@ class ComputeClient:
                             # kept until now so a second restart before the send reports it again
                             await self._untrack_backend_create_for_restart_report(log_to_send.pod_id)
                     except Exception as exc:
+                        if isinstance(exc, FrameTooBig) or _closed_as_too_big(exc):
+                            # requeued, it went first on every reconnect and closed each new socket the same way
+                            logger.error(
+                                _m(
+                                    "Dropped a message the backend refuses as too big",
+                                    extra=get_extra_info({
+                                        **self.logging_extra,
+                                        "message_type": type(log_to_send).__name__,
+                                        "size": getattr(exc, "size", None)
+                                        or len(log_to_send.model_dump_json().encode()),
+                                    }),
+                                )
+                            )
+                            continue
                         async with self.lock:
                             self.message_queue.insert(0, log_to_send)
                         logger.error(
