@@ -2,6 +2,7 @@ import logging
 
 from clients.compute_client import EVENT_REPORT_MAX_BYTES, MAX_FRAME_BYTES, fit_event_report
 from protocol.vc_protocol.validator_requests import InspectorEventRequest
+from services.task.inspector_verdict import canonical_sha256
 
 
 def _event(findings: list[dict]) -> InspectorEventRequest:
@@ -42,3 +43,16 @@ def test_one_finding_bigger_than_a_frame_is_left_out_with_the_rest_counted():
     fitted = fit_event_report(_event([{"command": "x" * MAX_FRAME_BYTES}, {"kind": "b"}]))
     assert fitted.report["findings"] == []
     assert fitted.report["findings_omitted"] == 2
+
+
+def test_a_trimmed_reports_verdict_hash_matches_the_report_sent():
+    findings = [{"i": i, "command": "x" * 2000} for i in range(5_000)]
+    event = _event(findings)
+    event.context = {"verdict": {"report_sha256": canonical_sha256(event.report), "kind": "v"}}
+
+    fitted = fit_event_report(event)
+
+    assert fitted.report["findings_omitted"] > 0
+    assert fitted.context["verdict"]["report_sha256"] == canonical_sha256(fitted.report)
+    assert fitted.context["verdict"]["kind"] == "v"
+    assert event.context["verdict"]["report_sha256"] == canonical_sha256(event.report)

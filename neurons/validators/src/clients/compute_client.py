@@ -84,6 +84,7 @@ from clients.subtensor_client import SubtensorClient
 from services.docker_service import create_steps_after_reply, inflight_creates
 from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
+from services.task.inspector_verdict import canonical_sha256
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
     BackendCommand,
@@ -175,7 +176,13 @@ def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
             }),
         )
     )
-    return event.model_copy(update={"report": report})
+    update = {"report": report}
+    verdict = event.context.get("verdict")
+    if isinstance(verdict, dict) and "report_sha256" in verdict:
+        # the verdict hashed the full report; it must match the report actually stored
+        verdict = {**verdict, "report_sha256": canonical_sha256(report)}
+        update["context"] = {**event.context, "verdict": verdict}
+    return event.model_copy(update=update)
 
 
 class FrameTooBig(Exception):
