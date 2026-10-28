@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from payload_models.payloads import WorkloadKind
-from services.docker_service import ImageExitedDuringKeyInjection, _explain_add_public_keys_failure
+from services.docker_service import (
+    ImageExitedDuringKeyInjection,
+    _attach_filler_log_tail,
+    _explain_add_public_keys_failure,
+)
 from services.rental_docker_sdk import ContainerStateSnapshot
 
 EXITED = ContainerStateSnapshot(
@@ -20,15 +24,13 @@ def _client(log_tail=None, log_error=None):
 
 
 async def _explain(client, workload_kind, environment=None):
-    return await _explain_add_public_keys_failure(
-        client,
-        container_name="c1",
-        image="jetskipool/jetski-miner:latest",
-        cause=RuntimeError("exec failed"),
-        log_extra={},
-        workload_kind=workload_kind,
-        environment=environment,
+    explained = await _explain_add_public_keys_failure(
+        client, container_name="c1", image="jetskipool/jetski-miner:latest", cause=RuntimeError("exec failed"), log_extra={}
     )
+    await _attach_filler_log_tail(
+        explained, client, container_name="c1", workload_kind=workload_kind, environment=environment, log_extra={}
+    )
+    return explained
 
 
 @pytest.mark.asyncio
@@ -44,13 +46,15 @@ async def test_filler_exit_at_start_carries_the_log_tail_outside_the_error():
 
 @pytest.mark.asyncio
 async def test_filler_log_tail_redacts_the_job_environment():
-    client = _client(log_tail="key=sk-secret-123 pool=stratum://p:1 empty=\n")
+    client = _client(log_tail="key=sk-secret-123 pool=stratum://p:1 empty= gpus=1 of 1\n")
 
     explained = await _explain(
-        client, WorkloadKind.FILLER, environment={"DOLPHIN_API_KEY": "sk-secret-123", "POOL": "stratum://p:1", "E": ""}
+        client,
+        WorkloadKind.FILLER,
+        environment={"DOLPHIN_API_KEY": "sk-secret-123", "POOL": "stratum://p:1", "E": "", "N": "1"},
     )
 
-    assert explained.log_tail == "key=*** pool=*** empty="
+    assert explained.log_tail == "key=*** pool=*** empty= gpus=1 of 1"
 
 
 @pytest.mark.asyncio

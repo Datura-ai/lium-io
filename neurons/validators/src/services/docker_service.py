@@ -1316,6 +1316,8 @@ class AuthorizedKeysWriteFailed(RuntimeError):
 # (default-job) containers only: a renter's container output is never read.
 CONTAINER_LOG_TAIL_LINES = 20
 CONTAINER_LOG_TAIL_MAX_CHARS = 1500
+# shorter env values ('1', 'yes') are not secrets, and masking them would garble every number in the log
+LOG_TAIL_REDACT_MIN_CHARS = 4
 
 
 async def _container_log_tail_or_empty(
@@ -1339,9 +1341,24 @@ async def _container_log_tail_or_empty(
         return ""
     tail = tail.strip()
     # a printed env value (e.g. an API key) must not reach the provider; redact before the cut so no half survives
-    for value in sorted({v for v in (environment or {}).values() if v}, key=len, reverse=True):
+    for value in sorted({v for v in (environment or {}).values() if len(v) >= LOG_TAIL_REDACT_MIN_CHARS}, key=len, reverse=True):
         tail = tail.replace(value, "***")
     return tail[-CONTAINER_LOG_TAIL_MAX_CHARS:]
+
+
+async def _attach_filler_log_tail(
+    explained: Exception,
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    workload_kind: WorkloadKind,
+    environment: dict[str, str] | None,
+    log_extra: dict,
+) -> None:
+    if isinstance(explained, ImageExitedDuringKeyInjection) and workload_kind == WorkloadKind.FILLER:
+        explained.log_tail = await _container_log_tail_or_empty(
+            docker_client, container_name=container_name, environment=environment, log_extra=log_extra
+        )
 
 
 async def _explain_add_public_keys_failure(
@@ -1351,8 +1368,6 @@ async def _explain_add_public_keys_failure(
     image: str,
     cause: Exception,
     log_extra: dict,
-    workload_kind: WorkloadKind,
-    environment: dict[str, str] | None = None,
 ) -> Exception:
     """The exception to raise for a failed `add_public_keys` step: the DAH-2624 explanation when the
     container has exited or restarted since `docker run`, otherwise `cause` unchanged.
@@ -1412,18 +1427,12 @@ async def _explain_add_public_keys_failure(
         situation = f"Docker is restarting it ({state.describe()})"
     else:
         situation = f"the container is not running ({state.describe()})"
-    log_tail = ""
-    if workload_kind == WorkloadKind.FILLER:
-        log_tail = await _container_log_tail_or_empty(
-            docker_client, container_name=container_name, environment=environment, log_extra=log_extra
-        )
     return ImageExitedDuringKeyInjection(
         f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
         f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
         "SSH keys were being installed; a pod needs a long-running process, for example a start "
         f"command such as `sleep infinity`. Exec error: {cause}",
         state=state,
-        log_tail=log_tail,
     )
 
 
@@ -9434,11 +9443,17 @@ class DockerService:
                             image=payload.docker_image,
                             cause=keys_exc,
                             log_extra=default_extra,
-                            workload_kind=payload.workload_kind,
-                            environment=custom_options.environment,
                         )
                         if explained is keys_exc:
                             raise
+                        await _attach_filler_log_tail(
+                            explained,
+                            docker_client,
+                            container_name=container_name,
+                            workload_kind=payload.workload_kind,
+                            environment=custom_options.environment,
+                            log_extra=default_extra,
+                        )
                         raise explained from keys_exc
 
                     # a bootstrap that failed without a kill goes on (inherited soft failure); the final
