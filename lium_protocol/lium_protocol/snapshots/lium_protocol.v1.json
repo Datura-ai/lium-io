@@ -222,7 +222,8 @@
         "InstallJupyterServer",
         "ForcedValidationCycleRequest",
         "GetEstimateRequest",
-        "ResetPodGpuRequest"
+        "ResetPodGpuRequest",
+        "EngyCachePrefetchRequest"
       ],
       "title": "BackendMessageType",
       "type": "string"
@@ -2029,6 +2030,73 @@
         "executors"
       ],
       "title": "DuplicateExecutorsResponse",
+      "type": "object"
+    },
+    "EngyCachePrefetchRequest": {
+      "description": "1.18.0: download `hf_repo` into `local_dir` of the `engy_cache_hf_<N>gb_<model>` volume, in a helper\ncontainer beside whatever the node runs (no GPU). A customer rental stops it; the next request resumes it.\nNo answer: the scrape's `engy_cache_complete` names the volumes that hold their whole checkpoint.",
+      "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "hf_repo": {
+          "title": "Hf Repo",
+          "type": "string"
+        },
+        "local_dir": {
+          "title": "Local Dir",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "EngyCachePrefetchRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "volume_name": {
+          "title": "Volume Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "volume_name",
+        "hf_repo",
+        "local_dir"
+      ],
+      "title": "EngyCachePrefetchRequest",
       "type": "object"
     },
     "Error": {
@@ -6130,6 +6198,9 @@
     "DuplicateExecutorsResponse": {
       "$ref": "#/$defs/DuplicateExecutorsResponse"
     },
+    "EngyCachePrefetchRequest": {
+      "$ref": "#/$defs/EngyCachePrefetchRequest"
+    },
     "ExecutorRentFinished": {
       "$ref": "#/$defs/ExecutorRentFinishedRequest"
     },
@@ -6187,7 +6258,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.17.0",
+  "protocol_version": "1.18.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

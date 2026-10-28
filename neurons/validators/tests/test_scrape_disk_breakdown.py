@@ -13,6 +13,7 @@ import glob
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 from collections import namedtuple
@@ -36,6 +37,7 @@ DISK_HELPERS = {
     "get_host_disk_usage",
     "get_docker_disk_usage",
     "cache_volume_bytes",
+    "complete_engy_caches",
     "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_VOLUME_LABEL_KEY",
     "FILLER_VOLUME_LABEL_VALUE",
@@ -49,7 +51,7 @@ def scrape() -> dict:
     return build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HELPERS,
-        {"glob": glob, "http": http, "json": json, "os": os, "shutil": shutil, "socket": socket},
+        {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket},
     )
 
 
@@ -84,6 +86,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_volumes": 5454000000 // 1024,
         "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
+        "hard_disk_engy_cache_complete": [],
     }
 
 
@@ -112,6 +115,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_volumes": 0,
         "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
+        "hard_disk_engy_cache_complete": [],
     }
 
 
@@ -454,6 +458,8 @@ def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
                 "Containers": [],
                 "Volumes": [
                     {"Name": "engy_cache_hf_kimi-k3-0123abcd", "UsageData": {"Size": 1500 * 1024**3}},
+                    {"Name": "engy_cache_hf_1561gb_kimi-k3-1a2b", "UsageData": {"Size": 1530 * 10**9}},
+                    {"Name": "engy_cache_hf_700gb_glm-5-3c4d", "UsageData": {"Size": 600 * 10**9}},
                     {"Name": "dphn_cache_hf_x", "UsageData": {"Size": 40 * 1024**3}},
                     {"Name": "volume_renter", "UsageData": {"Size": 10 * 1024**3}},
                 ],
@@ -481,9 +487,11 @@ def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
         "hard_disk_utilization": 40.0,
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
-        "hard_disk_volumes": 1550 * 1024**2,
-        # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
-        "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
+        "hard_disk_volumes": (1550 * 1024**3 + 2130 * 10**9) // 1024,
+        # DAH-5045: the engy checkpoints' real used size, without the dolphin cache or the renter's volume
+        "hard_disk_engy_cache_used_gb": (1500 * 1024**3 + 2130 * 10**9) // 10**9,
+        # DAH-4300: only the sized cache that holds its whole checkpoint
+        "hard_disk_engy_cache_complete": ["engy_cache_hf_1561gb_kimi-k3-1a2b"],
     }
 
 

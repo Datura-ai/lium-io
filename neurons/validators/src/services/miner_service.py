@@ -55,6 +55,7 @@ from payload_models.payloads import (
     JupyterInstallationFailed,
     PodGpuResetResult,
     ResetPodGpuRequest,
+    EngyCachePrefetchRequest,
     WorkloadKind,
     now_ms,
 )
@@ -2415,6 +2416,8 @@ class MinerService:
                     result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, ResetPodGpuRequest):
                     result = await docker_service.reset_pod_gpus(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, EngyCachePrefetchRequest):
+                    result = await docker_service.prefetch_engy_cache(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, BackupContainerRequest):
                     result = await self.handle_backup_container_req(executor, payload, ssh_pkey, docker_service)
                 elif isinstance(payload, RestoreContainerRequest):

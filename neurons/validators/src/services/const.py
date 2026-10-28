@@ -386,6 +386,14 @@ PROBE_CONTAINER_NAME = "lium_roce_probe"
 # of CPU it holds instead of counting our own housekeeping against the miner.
 CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
 
+# DAH-4300: the helper that fills an Engy checkpoint cache on an idle node (EngyCachePrefetchRequest). It mounts
+# only that volume and no GPU; the caps keep its CPU and its dirty page cache small beside a running filler.
+ENGY_CACHE_PREFETCH_CONTAINER_NAME = "lium_engy_cache_prefetch"
+ENGY_CACHE_PREFETCH_IMAGE = "docker.io/library/python:3.12-slim"
+ENGY_CACHE_PREFETCH_HF_HUB = "huggingface_hub==0.35.3"
+ENGY_CACHE_PREFETCH_CPUS = 4
+ENGY_CACHE_PREFETCH_MEMORY = "16g"
+
 # Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
 # them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
 # provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
@@ -404,6 +412,7 @@ LIUM_INFRA_CONTAINER_PREFIXES = (
     "s3fs-backup",
     PROBE_CONTAINER_NAME,
     CACHE_SWEEP_CONTAINER_NAME,
+    ENGY_CACHE_PREFETCH_CONTAINER_NAME,
 )
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 

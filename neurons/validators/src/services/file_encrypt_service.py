@@ -121,6 +121,8 @@ ORIGINAL_KEYS = {
     'hard_disk_disk_type': "disk_type",
     # DAH-5045: used size of the engy_cache_* volumes, in GB
     'hard_disk_engy_cache_used_gb': "engy_cache_used_gb",
+    # DAH-4300: the engy_cache_* volumes that hold their whole checkpoint (the model is in the name)
+    'hard_disk_engy_cache_complete': "engy_cache_complete",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
@@ -332,6 +334,7 @@ class FileEncryptService:
             'hard_disk_docker_scrape_error': "",
             'hard_disk_disk_type': "",
             'hard_disk_engy_cache_used_gb': "",
+            'hard_disk_engy_cache_complete': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",

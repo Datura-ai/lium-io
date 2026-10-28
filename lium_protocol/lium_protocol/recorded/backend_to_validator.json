@@ -383,6 +383,17 @@
         "request_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
         "local_volume_path": "/root"
       }
+    },
+    {
+      "expect": "EngyCachePrefetchRequest",
+      "message": {
+        "message_type": "EngyCachePrefetchRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "volume_name": "engy_cache_hf_1561gb_kimi-k3-1a2b3c4d",
+        "hf_repo": "moonshotai/Kimi-K3",
+        "local_dir": "kimi-k3"
+      }
     }
   ]
 }

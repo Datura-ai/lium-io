@@ -198,6 +198,7 @@ class ContainerRequestType(enum.Enum):
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
     ResetPodGpuRequest = "ResetPodGpuRequest"
+    EngyCachePrefetchRequest = "EngyCachePrefetchRequest"
 
 
 class ForcedValidationCycleRequest(BaseModel):
@@ -436,6 +437,18 @@ class ResetPodGpuRequest(ContainerBaseRequest):
     request_id: str
     # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
     local_volume_path: str | None = None
+
+
+class EngyCachePrefetchRequest(ContainerBaseRequest):
+    """DAH-4300: fill an Engy checkpoint cache volume in a helper container (no GPU); no answer (lium_protocol 1.18.0).
+    Not about a pod: the empty pod_id makes any pending rental on the node decline it."""
+
+    message_type: ContainerRequestType = ContainerRequestType.EngyCachePrefetchRequest
+    pod_id: str = ""
+    workload_kind: WorkloadKind = WorkloadKind.FILLER
+    volume_name: str
+    hf_repo: str
+    local_dir: str
 
 
 class ContainerStopRequest(ContainerBaseRequest):

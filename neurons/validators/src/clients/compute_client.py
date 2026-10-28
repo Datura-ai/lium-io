@@ -50,6 +50,7 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     PodGpuResetResult,
     ResetPodGpuRequest,
+    EngyCachePrefetchRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
 )
@@ -1026,7 +1027,8 @@ class ComputeClient:
         | BackupContainerRequest
         | RestoreContainerRequest
         | InstallJupyterServerRequest
-        | ResetPodGpuRequest,
+        | ResetPodGpuRequest
+        | EngyCachePrefetchRequest,
     ):
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
@@ -1148,6 +1150,7 @@ class ComputeClient:
         | RestoreContainerRequest
         | InstallJupyterServerRequest
         | ResetPodGpuRequest
+        | EngyCachePrefetchRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -1322,6 +1325,10 @@ class ComputeClient:
 
             async with self.lock:
                 self.message_queue.append(response)
+        elif isinstance(job_request, EngyCachePrefetchRequest):
+            # DAH-4300: no answer; the scrape reports the cache
+            outcome = await self.miner_service.handle_container(job_request)
+            logger.info(_m("Engy cache prefetch", extra=get_extra_info({**logging_extra, "outcome": str(outcome)})))
         elif isinstance(job_request, BackupContainerRequest):
             await self.backup_handler.handle_backup_container_req(job_request)
         elif isinstance(job_request, RestoreContainerRequest):

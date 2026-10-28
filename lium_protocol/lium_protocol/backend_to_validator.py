@@ -41,6 +41,8 @@ class BackendMessageType(enum.Enum):
     GetEstimateRequest = "GetEstimateRequest"
     # 1.16.0: reset a running pod's GPUs; the validator answers with PodGpuResetResult
     ResetPodGpuRequest = "ResetPodGpuRequest"
+    # 1.18.0: fill an Engy checkpoint cache volume on an idle node; no answer, the scrape reports progress
+    EngyCachePrefetchRequest = "EngyCachePrefetchRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -309,6 +311,18 @@ class ResetPodGpuRequest(ContainerRequest):
     request_id: str
     # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
     local_volume_path: str | None = None
+
+
+@BACKEND_MESSAGES.register
+class EngyCachePrefetchRequest(ServerRequest):
+    """1.18.0: download `hf_repo` into `local_dir` of the `engy_cache_hf_<N>gb_<model>` volume, in a helper
+    container beside whatever the node runs (no GPU). A customer rental stops it; the next request resumes it.
+    No answer: the scrape's `engy_cache_complete` names the volumes that hold their whole checkpoint."""
+
+    message_type: BackendMessageType = BackendMessageType.EngyCachePrefetchRequest
+    volume_name: str
+    hf_repo: str
+    local_dir: str
 
 
 @BACKEND_MESSAGES.register

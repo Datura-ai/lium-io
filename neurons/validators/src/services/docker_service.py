@@ -64,6 +64,7 @@ from payload_models.payloads import (
     ProfilerStepName,
     RemoveSshPublicKeysRequest,
     ResetPodGpuRequest,
+    EngyCachePrefetchRequest,
     SshPubKeyAdded,
     SshPubKeyRemoved,
     VolumeEncryptionStatus,
@@ -85,6 +86,11 @@ from services.const import (
     FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE,
     ENGY_CACHE_COMPLETE_SHARE,
     ENGY_CACHE_MIN_FREE_BESIDE_GB,
+    ENGY_CACHE_PREFETCH_CONTAINER_NAME,
+    ENGY_CACHE_PREFETCH_CPUS,
+    ENGY_CACHE_PREFETCH_HF_HUB,
+    ENGY_CACHE_PREFETCH_IMAGE,
+    ENGY_CACHE_PREFETCH_MEMORY,
     CACHE_SWEEP_CONTAINER_NAME,
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
@@ -459,6 +465,26 @@ def _cache_download_gb(volume_name: str) -> float:
         return DPHN_CACHE_SIZE_GB
     match: re.Match[str] | None = _ENGY_CACHE_SIZE_IN_NAME.match(volume_name)
     return int(match.group(1)) if match else math.inf
+
+
+def _cache_download_refused(
+    free_gb: float, download_gb: float, volume_limit_gb: int | None, run_volume_gb: int | None
+) -> bool:
+    # DAH-5014/5192: free_gb is real disk with every cache on it counted as used; the run volume (if any) is
+    # created after this check, so the listing floor must hold with both on disk.
+    # A download the run's own volume could hold is not refused for its share: refused, it lands in that
+    # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
+    # Granted for that reason only while the node still fits the model beside it (ENGY_CACHE_MIN_FREE_BESIDE_GB).
+    # No volume limit (no --storage-opt): the run writes the weights to the same disk anyway.
+    over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and (
+        (volume_limit_gb is not None and download_gb > volume_limit_gb)
+        or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
+    )
+    free_after_gb: float = free_gb - download_gb - (run_volume_gb or 0)
+    return over_share or free_after_gb <= DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
+
+
+REMOVE_ENGY_CACHE_PREFETCH_CONTAINER = f"/usr/bin/docker rm -f {ENGY_CACHE_PREFETCH_CONTAINER_NAME} >/dev/null 2>&1"
 
 
 def _filler_run_volume_gb(volume_limit_gb: int | None, cache_volumes: list[CacheVolume] | None) -> int | None:
@@ -4907,6 +4933,8 @@ class DockerService:
             return False
         requested_gb: int | None = payload.volume_limit_gb
         try:
+            # DAH-4300: a rental stops the Engy cache download first; it also frees the volume for the eviction below.
+            await ssh_client.run(REMOVE_ENGY_CACHE_PREFETCH_CONTAINER)
             # DAH-5014: the Engy checkpoint cache gives way to the renter too.
             cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
                 ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES, host_probe=host_probe
@@ -4975,6 +5003,9 @@ class DockerService:
         """
         if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
             return []
+        if any(volume.name.startswith(ENGY_CACHE_VOLUME_PREFIX) for volume in payload.cache_volumes):
+            # DAH-4300: the Engy run takes over (and resumes) the volume the cache download was filling
+            await ssh_client.run(REMOVE_ENGY_CACHE_PREFETCH_CONTAINER)
         requested_names: list[str] = [cache_volume.name for cache_volume in payload.cache_volumes]
         existing: set[str] = set(
             await self._find_cache_volumes_to_sweep(
@@ -5013,28 +5044,19 @@ class DockerService:
             )
             return present
 
-        floor_gb: int = DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
         # One family per launch: DPHN's whole set is DPHN_CACHE_SIZE_GB, an Engy launch asks for one volume.
         download_gb: float = max(
             missing_gb.get(volume.name) or _cache_download_gb(volume.name)
             for volume in payload.cache_volumes
             if volume.name not in {kept.name for kept in present}
         )
-        # DAH-5014: free_gb is real disk, every cache on it counted as used. The pod's own volume is
-        # created (preallocated) after this check, so the floor must hold with both on disk.
         # Granted, the cache shrinks the run volume (_filler_run_volume_gb), so the floor is held with that size.
-        free_after_gb: float = free_gb - download_gb - (
-            _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes) or 0
-        )
-        # A download the run's own volume could hold is not refused for its share: refused, it lands in that
-        # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
-        # Granted for that reason only while the node still fits the model beside it (ENGY_CACHE_MIN_FREE_BESIDE_GB).
-        # No volume limit (no --storage-opt): the run writes the weights to the same disk anyway.
-        over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and (
-            (payload.volume_limit_gb is not None and download_gb > payload.volume_limit_gb)
-            or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
-        )
-        if over_share or free_after_gb <= floor_gb:
+        if _cache_download_refused(
+            free_gb,
+            download_gb,
+            payload.volume_limit_gb,
+            _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes),
+        ):
             logger.info(
                 _m(
                     "Node cannot afford the filler cache download; keeping only the volumes it already has",
@@ -5048,6 +5070,71 @@ class DockerService:
             )
             return present
         return list(payload.cache_volumes)
+
+    async def start_engy_cache_prefetch(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        volume_name: str,
+        hf_repo: str,
+        local_dir: str,
+        default_extra: dict,
+    ) -> str:
+        """DAH-4300: start filling an Engy checkpoint cache in a helper container; returns what happened.
+
+        Only on a node with no customer pod, and never beside a running helper. The helper mounts only the cache
+        volume, gets no GPU and capped CPU and memory, so it runs beside PEARL, Dolphin or nothing. `hf download`
+        resumes per file, so a partial volume (a rental removed the helper) is charged only for what it lacks."""
+        # trust boundary: only a sized Engy cache volume (never a renter's), a relative dir inside it, no option as repo
+        if (
+            not volume_name.startswith(ENGY_CACHE_VOLUME_PREFIX)
+            or math.isinf(_cache_download_gb(volume_name))
+            or not local_dir
+            or local_dir.startswith("/")
+            or ".." in local_dir.split("/")
+            or not hf_repo
+            or hf_repo.startswith("-")
+        ):
+            return "refused"
+        names, _ = parse_container_listing(((await ssh_client.run(DOCKER_PS_ALL_NAMES_IDS_CMD)).stdout or "").splitlines())
+        if any(name.startswith(POD_CONTAINER_PREFIX) for name in names):
+            return "rented"
+        if ENGY_CACHE_PREFETCH_CONTAINER_NAME in names:
+            return "running"
+        existing: list[str] = await self._find_cache_volumes_to_sweep(
+            ssh_client, set(), default_extra, (ENGY_CACHE_VOLUME_PREFIX,)
+        )
+        if volume_name in existing:
+            missing_gb: float = await self._engy_cache_missing_gb(ssh_client, volume_name, default_extra)
+            if not missing_gb:
+                return "complete"
+        else:
+            missing_gb = _cache_download_gb(volume_name)
+        docker_root_dir: str = await self.get_docker_root_dir(ssh_client)
+        free_gb: float = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+        if _cache_download_refused(free_gb, missing_gb, None, None):
+            logger.info(
+                _m(
+                    "Node cannot afford the Engy cache download",
+                    extra=get_extra_info({**default_extra, "free_gb": round(free_gb, 1), "missing_gb": missing_gb}),
+                )
+            )
+            return "unaffordable"
+        download: str = shlex.join(
+            ["hf", "download", hf_repo, "--local-dir", f"/cache/{local_dir}", "--max-workers", "4"]
+        )
+        await ssh_client.run(
+            f"/usr/bin/docker run -d --rm --name {ENGY_CACHE_PREFETCH_CONTAINER_NAME} "
+            f"--cpus {ENGY_CACHE_PREFETCH_CPUS} --memory {ENGY_CACHE_PREFETCH_MEMORY} "
+            f"-v {shlex.quote(volume_name)}:/cache {ENGY_CACHE_PREFETCH_IMAGE} sh -c "
+            + shlex.quote(f"pip install -q --no-cache-dir {ENGY_CACHE_PREFETCH_HF_HUB} && exec {download}")
+        )
+        logger.info(
+            _m(
+                "Engy cache download started",
+                extra=get_extra_info({**default_extra, "volume": volume_name, "missing_gb": round(missing_gb, 1)}),
+            )
+        )
+        return "started"
 
     async def _engy_cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
@@ -11225,6 +11312,44 @@ class DockerService:
 
             # str(log_text) drops extra, hiding the cause from the backend
             return self._failed_delete(payload, msg=f"Unknown Error delete_container: {e}")
+
+    async def prefetch_engy_cache(
+        self,
+        payload: EngyCachePrefetchRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ) -> str:
+        """DAH-4300: the backend's EngyCachePrefetchRequest; no answer, the scrape reports the cache."""
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_uuid": payload.executor_id,
+            "executor_ip_address": executor_info.address,
+            "executor_ssh_port": executor_info.ssh_port,
+            "volume": payload.volume_name,
+        }
+        pkey = asyncssh.import_private_key(self.ssh_service.decrypt_payload(keypair.ss58_address, private_key))
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(executor_info, payload.miner_hotkey, default_extra)
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                **await public_host_sock(executor_info.address, executor_info.ssh_port),
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=known_hosts_policy,
+            ) as ssh_client:
+                return await self.start_engy_cache_prefetch(
+                    ssh_client, payload.volume_name, payload.hf_repo, payload.local_dir, default_extra
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m("Engy cache download not started", extra=get_extra_info({**default_extra, "error": str(exc)})),
+                exc_info=True,
+            )
+            return "failed"
 
     async def install_jupyter_server(
         self,
