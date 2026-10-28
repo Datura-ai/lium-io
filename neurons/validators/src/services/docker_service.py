@@ -5631,6 +5631,30 @@ class DockerService:
 
         return success
 
+    async def register_vulkan_icd_with_rental_docker(
+        self, docker_client: RentalDockerSdkClient, *, container_name: str, log_extra: dict
+    ) -> None:
+        """DAH-4668: the bootstrap's ICD step alone, for an image that starts its own sshd. Best effort."""
+        try:
+            await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_register_vulkan_icd",
+                exec_spec=ContainerExecSpec(
+                    container_name=container_name,
+                    argv=("sh", "-s", "--", "--vulkan-icd-only"),
+                    stdin=self._ssh_bootstrap_script_path().read_text(),
+                    idempotent=True,
+                ),
+                log_extra=log_extra,
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to register the Vulkan ICD",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": str(exc)}),
+                )
+            )
+
     async def install_open_ssh_server_and_start_ssh_service_with_rental_docker(
         self,
         docker_client: RentalDockerSdkClient,
@@ -9334,6 +9358,9 @@ class DockerService:
                                 "Skipping SSH-server bootstrap; template ships sshd",
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
+                        )
+                        await self.register_vulkan_icd_with_rental_docker(
+                            docker_client, container_name=container_name, log_extra=default_extra
                         )
                     elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                         docker_client=docker_client,
