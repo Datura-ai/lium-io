@@ -288,3 +288,29 @@ async def test_a_failed_report_under_the_new_gpu_uuid_does_not_hide_the_recovery
     )
     published = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
     assert [spec["executor_uuid"] for spec in published] == [node]
+
+
+@pytest.mark.asyncio
+async def test_an_engy_cache_prefetch_holds_the_create_lock_like_a_create(mocker, miner_service):
+    # DAH-4300 (review): a rental arriving between the helper's pod check and its docker run waits for the lock
+    from payload_models.payloads import EngyCachePrefetchRequest
+
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    held: list[bool] = []
+    lock = MagicMock()
+    lock.__aenter__ = AsyncMock(side_effect=lambda *_: held.append(True))
+    lock.__aexit__ = AsyncMock(side_effect=lambda *_: held.append(False))
+    miner_service.redis_service.executor_create_exclusion = MagicMock(return_value=lock)
+    prefetch = mocker.patch(
+        "services.miner_service.DockerService.prefetch_engy_cache", AsyncMock(side_effect=lambda *_: list(held))
+    )
+    payload = EngyCachePrefetchRequest(
+        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="10.0.0.1", miner_port=8000,
+        volume_name="engy_cache_hf_1561gb_kimi-k3-1a2b3c4d", hf_repo="moonshotai/Kimi-K3", local_dir="kimi-k3",
+    )
+
+    assert await miner_service._handle_container(payload) == [True]
+    miner_service.redis_service.executor_create_exclusion.assert_called_once_with(executor_id)
+    prefetch.assert_awaited_once()
+    assert held == [True, False]

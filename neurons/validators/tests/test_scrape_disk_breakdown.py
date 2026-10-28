@@ -37,7 +37,7 @@ DISK_HELPERS = {
     "get_host_disk_usage",
     "get_docker_disk_usage",
     "cache_volume_bytes",
-    "complete_engy_caches",
+    "complete_engy_cache_volume_names",
     "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_VOLUME_LABEL_KEY",
     "FILLER_VOLUME_LABEL_VALUE",

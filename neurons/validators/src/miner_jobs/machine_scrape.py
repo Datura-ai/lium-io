@@ -813,7 +813,7 @@ def cache_volume_bytes(df, prefixes):
     )
 
 
-def complete_engy_caches(df):
+def complete_engy_cache_volume_names(df):
     # DAH-4300: the Engy caches holding their whole checkpoint (engy_cache_hf_<N>gb_<model>...), so the backend
     # counts a node warm only for the model it would serve; 0.98 is the validator's ENGY_CACHE_COMPLETE_SHARE
     names = []
@@ -856,7 +856,7 @@ def get_docker_disk_usage():
         "filler_run_volume_kb": filler_run_volumes // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
-        "hard_disk_engy_cache_complete": complete_engy_caches(df),
+        "hard_disk_engy_cache_complete": complete_engy_cache_volume_names(df),
     }
 
 

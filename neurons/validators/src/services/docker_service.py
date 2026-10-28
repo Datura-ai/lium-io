@@ -487,6 +487,18 @@ def _cache_download_refused(
 REMOVE_ENGY_CACHE_PREFETCH_CONTAINER = f"/usr/bin/docker rm -f {ENGY_CACHE_PREFETCH_CONTAINER_NAME} >/dev/null 2>&1"
 
 
+class EngyCachePrefetchOutcome(enum.StrEnum):
+    """DAH-4300: what one EngyCachePrefetchRequest did on the node."""
+
+    STARTED = "started"
+    REFUSED = "refused"
+    RENTED = "rented"
+    RUNNING = "running"
+    COMPLETE = "complete"
+    UNAFFORDABLE = "unaffordable"
+    FAILED = "failed"
+
+
 def _filler_run_volume_gb(volume_limit_gb: int | None, cache_volumes: list[CacheVolume] | None) -> int | None:
     # DAH-5192: with the Engy checkpoint in its mounted cache, the run volume would only hold it a second time.
     if volume_limit_gb is None or not any(v.name.startswith(ENGY_CACHE_VOLUME_PREFIX) for v in cache_volumes or []):
@@ -5078,7 +5090,7 @@ class DockerService:
         hf_repo: str,
         local_dir: str,
         default_extra: dict,
-    ) -> str:
+    ) -> EngyCachePrefetchOutcome:
         """DAH-4300: start filling an Engy checkpoint cache in a helper container; returns what happened.
 
         Only on a node with no customer pod, and never beside a running helper. The helper mounts only the cache
@@ -5094,47 +5106,59 @@ class DockerService:
             or not hf_repo
             or hf_repo.startswith("-")
         ):
-            return "refused"
+            return EngyCachePrefetchOutcome.REFUSED
         names, _ = parse_container_listing(((await ssh_client.run(DOCKER_PS_ALL_NAMES_IDS_CMD)).stdout or "").splitlines())
         if any(name.startswith(POD_CONTAINER_PREFIX) for name in names):
-            return "rented"
+            return EngyCachePrefetchOutcome.RENTED
         if ENGY_CACHE_PREFETCH_CONTAINER_NAME in names:
-            return "running"
+            return EngyCachePrefetchOutcome.RUNNING
         existing: list[str] = await self._find_cache_volumes_to_sweep(
             ssh_client, set(), default_extra, (ENGY_CACHE_VOLUME_PREFIX,)
         )
         if volume_name in existing:
             missing_gb: float = await self._engy_cache_missing_gb(ssh_client, volume_name, default_extra)
             if not missing_gb:
-                return "complete"
+                return EngyCachePrefetchOutcome.COMPLETE
         else:
             missing_gb = _cache_download_gb(volume_name)
         docker_root_dir: str = await self.get_docker_root_dir(ssh_client)
         free_gb: float = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-        if _cache_download_refused(free_gb, missing_gb, None, None):
+        # review: floor only, no free-disk share; the Engy run's own volume beside the cache must still fit
+        free_after_gb: float = free_gb - missing_gb - FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE
+        if free_after_gb <= DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB:
             logger.info(
                 _m(
                     "Node cannot afford the Engy cache download",
                     extra=get_extra_info({**default_extra, "free_gb": round(free_gb, 1), "missing_gb": missing_gb}),
                 )
             )
-            return "unaffordable"
+            return EngyCachePrefetchOutcome.UNAFFORDABLE
         download: str = shlex.join(
             ["hf", "download", hf_repo, "--local-dir", f"/cache/{local_dir}", "--max-workers", "4"]
         )
-        await ssh_client.run(
+        started = await ssh_client.run(
             f"/usr/bin/docker run -d --rm --name {ENGY_CACHE_PREFETCH_CONTAINER_NAME} "
             f"--cpus {ENGY_CACHE_PREFETCH_CPUS} --memory {ENGY_CACHE_PREFETCH_MEMORY} "
             f"-v {shlex.quote(volume_name)}:/cache {ENGY_CACHE_PREFETCH_IMAGE} sh -c "
             + shlex.quote(f"pip install -q --no-cache-dir {ENGY_CACHE_PREFETCH_HF_HUB} && exec {download}")
         )
+        if started.exit_status != 0:
+            logger.warning(
+                _m(
+                    "Engy cache download did not start",
+                    extra=get_extra_info(
+                        {**default_extra, "volume": volume_name, "stderr": (started.stderr or "")[-500:]}
+                    ),
+                )
+            )
+            return EngyCachePrefetchOutcome.FAILED
         logger.info(
             _m(
                 "Engy cache download started",
                 extra=get_extra_info({**default_extra, "volume": volume_name, "missing_gb": round(missing_gb, 1)}),
             )
         )
-        return "started"
+        return EngyCachePrefetchOutcome.STARTED
 
     async def _engy_cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
@@ -11319,7 +11343,7 @@ class DockerService:
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
-    ) -> str:
+    ) -> EngyCachePrefetchOutcome:
         """DAH-4300: the backend's EngyCachePrefetchRequest; no answer, the scrape reports the cache."""
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
@@ -11349,7 +11373,7 @@ class DockerService:
                 _m("Engy cache download not started", extra=get_extra_info({**default_extra, "error": str(exc)})),
                 exc_info=True,
             )
-            return "failed"
+            return EngyCachePrefetchOutcome.FAILED
 
     async def install_jupyter_server(
         self,

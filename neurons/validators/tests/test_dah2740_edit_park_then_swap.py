@@ -18,7 +18,13 @@ from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _s
 
 from core.docker_utils import DockerCommand
 from core.utils import retry_ssh_command
-from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply, inflight_creates
+from services.docker_service import (
+    EDIT_PARKED_SUFFIX,
+    REMOVE_ENGY_CACHE_PREFETCH_CONTAINER,
+    DockerService,
+    create_steps_after_reply,
+    inflight_creates,
+)
 from services.prerun_host_probe import prerun_host_probe_command
 
 
@@ -128,6 +134,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         prerun_host_probe_command(
             docker_image=payload.docker_image, image_label=None, with_power=True, miner_hotkey=payload.miner_hotkey
         ),
+        # DAH-4300: the rental stops the Engy cache download before it reclaims disk
+        REMOVE_ENGY_CACHE_PREFETCH_CONTAINER,
         '/usr/bin/docker volume ls --format "{{.Name}}"',
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"

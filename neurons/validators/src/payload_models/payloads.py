@@ -440,7 +440,7 @@ class ResetPodGpuRequest(ContainerBaseRequest):
 
 
 class EngyCachePrefetchRequest(ContainerBaseRequest):
-    """DAH-4300: fill an Engy checkpoint cache volume in a helper container (no GPU); no answer (lium_protocol 1.18.0).
+    """DAH-4300: fill an Engy checkpoint cache volume in a helper container (no GPU); no answer (lium_protocol 1.20.0).
     Not about a pod: the empty pod_id makes any pending rental on the node decline it."""
 
     message_type: ContainerRequestType = ContainerRequestType.EngyCachePrefetchRequest

@@ -44,6 +44,7 @@ from services.docker_service import (
     SshSessionMayStillBeTakenError,
     VolumeHostProbe,
     _remove_and_list_containers_command,
+    REMOVE_ENGY_CACHE_PREFETCH_CONTAINER,
 )
 import services.docker_service as ds_module
 from services.nvidia_devices import (
@@ -601,6 +602,8 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
+        # DAH-4300: the rental stops the Engy cache download before it reclaims disk
+        REMOVE_ENGY_CACHE_PREFETCH_CONTAINER,
     ]
     assert _relisting_commands(ssh_client) == []
     handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
@@ -814,12 +817,12 @@ async def test_a_create_cancelled_at_ssh_connect_never_starts_the_filler_removal
     ("container", "payload_fields", "bootstrap_restore", "commands"),
     [
         # nothing to remove: the commands of before, plus the removal's one read-only listing beside the probes
-        ("pod_keep", {"active_container_names": ["pod_keep"], "active_volume_names": ["volume_keep"]}, False, [DOCKER_PS_ALL_NAMES_IDS_CMD]),
+        ("pod_keep", {"active_container_names": ["pod_keep"], "active_volume_names": ["volume_keep"]}, False, [DOCKER_PS_ALL_NAMES_IDS_CMD, REMOVE_ENGY_CACHE_PREFETCH_CONTAINER]),
         # a filler create keeps protecting its sibling bundle (DAH-2465) and lists nothing at SSH connect; its
         # volume sweep lists the filler-labelled volumes, which the probe's listing cannot tell apart
         ("filler_sibling", {"workload_kind": WorkloadKind.FILLER, "active_container_names": ["filler_sibling"], "active_volume_names": ["volume_sibling"]}, False, [DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD]),
         # a bootstrap restore removes the filler at the cleanup step
-        ("filler_x", {"active_volume_names": ["volume_x"]}, True, [_FILLER_X_REMOVAL]),
+        ("filler_x", {"active_volume_names": ["volume_x"]}, True, [_FILLER_X_REMOVAL, REMOVE_ENGY_CACHE_PREFETCH_CONTAINER]),
     ],
     ids=["customer_without_a_filler", "filler_create", "bootstrap_restore"],
 )

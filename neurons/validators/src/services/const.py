@@ -391,7 +391,8 @@ CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
 ENGY_CACHE_PREFETCH_CONTAINER_NAME = "lium_engy_cache_prefetch"
 ENGY_CACHE_PREFETCH_IMAGE = "docker.io/library/python:3.12-slim"
 ENGY_CACHE_PREFETCH_HF_HUB = "huggingface_hub==0.35.3"
-ENGY_CACHE_PREFETCH_CPUS = 4
+# One core: the provider-side load gate excuses Lium's infra containers only while together under its CPU cap.
+ENGY_CACHE_PREFETCH_CPUS = 1
 ENGY_CACHE_PREFETCH_MEMORY = "16g"
 
 # Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
