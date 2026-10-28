@@ -109,6 +109,8 @@ WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 # the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
 MAX_FRAME_BYTES = 4 * 1024 * 1024
+# room left for the delivery stamps send_model adds to an event report
+EVENT_REPORT_MAX_BYTES = MAX_FRAME_BYTES - 64 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
@@ -138,6 +140,31 @@ class OutgoingMessages(list[DeliveryStamps]):
             responses.append(message.model_dump_json())
         super().append(message)
         self.appended.set()
+
+
+def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
+    """Keeps the leading findings of an oversized report that fit one frame; counts the rest.
+
+    Not split into several requests: the backend stores each request as one row, one per cycle.
+    """
+    findings = (event.report or {}).get("findings")
+    if not isinstance(findings, list):
+        return event
+    if len(event.model_dump_json().encode()) <= EVENT_REPORT_MAX_BYTES:
+        return event
+    empty = {**event.report, "findings": [], "findings_omitted": len(findings)}
+    room = EVENT_REPORT_MAX_BYTES - len(
+        event.model_copy(update={"report": empty}).model_dump_json().encode()
+    )
+    kept = 0
+    for finding in findings:
+        # json.dumps escapes non-ASCII and adds spaces, so it never undercounts the compact frame
+        room -= len(json.dumps(finding).encode()) + 1
+        if room < 0:
+            break
+        kept += 1
+    report = {**event.report, "findings": findings[:kept], "findings_omitted": len(findings) - kept}
+    return event.model_copy(update={"report": report})
 
 
 class FrameTooBig(Exception):
@@ -471,7 +498,7 @@ class ComputeClient:
                         )
 
                         async with self.lock:
-                            self.message_queue.append(inspector_event)
+                            self.message_queue.append(fit_event_report(inspector_event))
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         # DAH-4658: the renter is resetting the node's GPUs, or did a moment ago; what a reset can
                         # cause is the renter's doing, never the provider's fault (an unreadable mark sends it)
