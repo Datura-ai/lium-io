@@ -40,6 +40,8 @@ from storage.restic import (
     ResticStorageRunner,
     RestoreStats,
     StorageOperationCancelled,
+    kernel_kill_lines,
+    kernel_kill_note,
     restic_restore_helper_memory,
 )
 from storage.workspace import (
@@ -771,7 +773,10 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
         if "inspect" in command:
             if oom_killed is None:
                 return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
-            return SimpleNamespace(returncode=0, stdout=json.dumps(state) if oom_killed != "" else "", stderr="")
+            inspection = json.dumps({"Id": HELPER_ID, "State": state})
+            return SimpleNamespace(returncode=0, stdout=inspection if oom_killed != "" else "", stderr="")
+        if command[0] == "dmesg":
+            return SimpleNamespace(returncode=0, stdout=OOM_KILL_DMESG, stderr="")
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"id": SNAPSHOT_ID}]), stderr="")
 
     monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)  # restore's empty-target check
@@ -797,12 +802,45 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
 
     assert str(raised.value) == f"{action}{message}"
     assert session.puts[-1]["json"]["error_message"] == f"{action}{message}"
-    assert calls[-1][1:3] == ["rm", "--force"]
+    assert [c for c in calls if c[0] != "dmesg"][-1][1:3] == ["rm", "--force"]
     # detached runs delete stderr, so the state line must reach the reported operation logs
     log = "\n".join(session.puts[-1]["json"]["logs"] or [])
     assert ("docker state" in log) is (oom_killed is not True)
     if oom_killed is False:
         assert '"ExitCode": 137' in log
+        assert "kernel: " + " | ".join(OOM_KILL_DMESG.splitlines()[1:3]) in log
+    elif oom_killed is True:
+        assert not any(c[0] == "dmesg" for c in calls)
+    else:
+        assert "kernel: no helper container ID to match" in log
+
+
+HELPER_ID = "4f2a" + "0" * 60
+OOM_KILL_DMESG = f"""[1000.1] restic invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=1000
+[1000.2] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=docker-{HELPER_ID}.scope,mems_allowed=0,\
+oom_memcg=/system.slice/docker-{HELPER_ID}.scope,task_memcg=/system.slice/docker-{HELPER_ID}.scope,task=restic,pid=4242,uid=0
+[1000.3] Memory cgroup out of memory: Killed process 4242 (restic) total-vm:9000000kB, anon-rss:4100000kB, file-rss:0kB
+[1000.4] oom_reaper: reaped process 4242 (restic), now anon-rss:0kB
+"""
+
+
+def test_kernel_kill_lines_match_the_helper_container_only() -> None:
+    assert kernel_kill_lines(OOM_KILL_DMESG, HELPER_ID) == OOM_KILL_DMESG.splitlines()[1:3]
+    assert kernel_kill_lines(OOM_KILL_DMESG.replace(HELPER_ID, "9" * 64), HELPER_ID) == []
+    assert kernel_kill_lines("", HELPER_ID) == []
+
+
+def test_kernel_kill_note_names_a_missing_kill_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_dmesg(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("dmesg")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", no_dmesg)
+    assert kernel_kill_note(HELPER_ID) == "kernel: dmesg unreadable (FileNotFoundError)"
+    monkeypatch.setattr(
+        "storage.restic.subprocess.run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="[1.0] unrelated\n", stderr=""),
+    )
+    assert kernel_kill_note(HELPER_ID) == "kernel: no kernel kill line for the helper"
 
 
 class _TerminatedRunnerPopen(_FakePopen):
