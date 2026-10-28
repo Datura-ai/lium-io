@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import suppress
 from contextvars import ContextVar
@@ -10,6 +11,8 @@ from uuid import uuid4
 import aiohttp
 import bittensor
 import pydantic
+import redis.asyncio as aioredis
+import redis.exceptions
 import tenacity
 import websockets
 from payload_models.payloads import (
@@ -106,8 +109,21 @@ logger = logging.getLogger(__name__)
 # mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
+# the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
+MAX_FRAME_BYTES = 4 * 1024 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
+# DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
+# pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
+# so the backend loses the validator for seconds, not the whole startup.
+CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
+CONNECTOR_LEAD_LOCK_TTL_SECONDS = 15
+CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
+
+
+def mark_connector_unready() -> None:
+    with suppress(FileNotFoundError):
+        os.remove(CONNECTOR_READY_FILE)
 
 
 command_responses: ContextVar[list[str] | None] = ContextVar("command_responses", default=None)
@@ -124,6 +140,12 @@ class OutgoingMessages(list[DeliveryStamps]):
             responses.append(message.model_dump_json())
         super().append(message)
         self.appended.set()
+
+
+class FrameTooBig(Exception):
+    def __init__(self, size: int):
+        super().__init__(f"frame of {size} bytes exceeds {MAX_FRAME_BYTES}")
+        self.size = size
 
 
 class AuthenticationError(Exception):
@@ -212,6 +234,7 @@ class ComputeClient:
 
     async def run_forever(self) -> NoReturn:
         self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
+        await self.take_connector_lead()
 
         try:
             await self.fail_creates_cut_off_by_restart()
@@ -544,7 +567,11 @@ class ComputeClient:
         # stamped inside the retry so a message resent after a reconnect reports its own delay
         msg.forwarded_at = time.time()
         msg.queue_depth = len(self.message_queue)
-        await self.ws.send(msg.model_dump_json())
+        payload = msg.model_dump_json()
+        size = len(payload.encode())
+        if size > MAX_FRAME_BYTES:
+            raise FrameTooBig(size)
+        await self.ws.send(payload)
 
     async def handle_send_messages(self):
         while True:
@@ -563,6 +590,20 @@ class ComputeClient:
                             # kept until now so a second restart before the send reports it again
                             await self._untrack_backend_create_for_restart_report(log_to_send.pod_id)
                     except Exception as exc:
+                        if isinstance(exc, FrameTooBig):
+                            # checked before the send: requeued, it went first on every reconnect and closed each new
+                            # socket with 1009. A 1009 close itself is not judged: it fails every later send too.
+                            logger.error(
+                                _m(
+                                    "Dropped a message the backend refuses as too big",
+                                    extra=get_extra_info({
+                                        **self.logging_extra,
+                                        "message_type": type(log_to_send).__name__,
+                                        "size": exc.size,
+                                    }),
+                                )
+                            )
+                            continue
                         async with self.lock:
                             self.message_queue.insert(0, log_to_send)
                         logger.error(
@@ -1024,6 +1065,47 @@ class ComputeClient:
                 extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, "error": str(exc)}),
             )
         )
+
+    async def take_connector_lead(self) -> None:
+        """Wait until no other connector leads, then lead while this process lives (DAH-5177).
+
+        Ready (the deployment lets the old pod go) only while waiting on the lock or leading: a Redis error retries
+        here, unready, instead of unwinding into start_process's full restart with the probe still passing."""
+        lock = aioredis.lock.Lock(
+            self.miner_service.redis_service.redis,
+            CONNECTOR_LEAD_LOCK_KEY,
+            timeout=CONNECTOR_LEAD_LOCK_TTL_SECONDS,
+            sleep=0.5,
+            thread_local=False,
+        )
+        extra = get_extra_info(self.logging_extra)
+        while True:
+            with open(CONNECTOR_READY_FILE, "w"):
+                pass
+            logger.info(_m("Waiting to lead the backend connection", extra=extra))
+            try:
+                await lock.acquire()
+                break
+            except redis.exceptions.RedisError as exc:
+                mark_connector_unready()
+                logger.warning(_m("Could not take the connector lead", extra={**extra, "error": str(exc)}))
+                await asyncio.sleep(1)
+        logger.info(_m("Leading the backend connection", extra=extra))
+        self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
+
+    async def _keep_connector_lead(self, lock: aioredis.lock.Lock) -> None:
+        extra = get_extra_info(self.logging_extra)
+        while True:
+            await asyncio.sleep(CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3)
+            try:
+                await lock.reacquire()
+            except redis.exceptions.LockNotOwnedError:
+                # expired in a Redis outage or a stalled loop: lead on if nobody took over, else stop
+                if not await lock.acquire(blocking=False):
+                    logger.error(_m("Another connector took the lead; exiting", extra=extra))
+                    os._exit(1)
+            except Exception as exc:
+                logger.warning(_m("Could not renew the connector lead", extra={**extra, "error": str(exc)}))
 
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never

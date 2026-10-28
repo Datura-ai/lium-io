@@ -61,6 +61,7 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     PostRentalGpuRecheckCheck,
+    ProviderMaintenanceCheck,
     ProviderSideLoadCheck,
     RegistryPullCheck,
     RentalProbeCheck,
@@ -75,6 +76,7 @@ from .checks import (
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
     SshdBootstrapCheck,
+    PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
     TenantEnforcementCheck,
@@ -354,6 +356,10 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                # DAH-4709: an idle node inside its provider maintenance window fails here, before the
+                # ports, registry pull, download speed, VerifyX and rental probe; a rented one passes on to
+                # TenantEnforcementCheck, which reads its pods first.
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
@@ -386,6 +392,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
@@ -501,6 +508,7 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
@@ -522,6 +530,7 @@ class PipelineFactory:
                             RegistryPullCheck(),
                             ContainerDownloadSpeedCheck(),
                             SysboxRequiredCheck(),
+                            PidHostRequiredCheck(),
                             RentalVerificationCheck(),
                         ],
                         [
@@ -609,6 +618,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
                 ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).
