@@ -396,7 +396,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     anchor_broken=context.gpu_anchor_broken,
-                    reanchor=context.gpu_reanchor,
+                    reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                 )
             else:
                 await self.redis_service.set_verified_job_info(
