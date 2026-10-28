@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import datetime
 import json
 import subprocess
@@ -27,7 +28,10 @@ from neurons.validators.src.services.task.checks.gpu_attestation_identity import
     verify_gpu_evidence,
 )
 from neurons.validators.src.services.task.messages import GpuAttestationIdentityMessages as Msg
+from core.utils import JSONFormatter
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+
+from services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_services, build_state, default_executor
 
@@ -445,7 +449,7 @@ def test_cc_vbios_unparseable_is_reported_not_raised():
     assert {v["status"] for v in found.values()} == {"unparseable"}
 
 
-def _cc_b200_ctx(context_factory, ca, vbios):
+def _cc_b200_ctx(context_factory, ca, vbios, rented=False):
     gpus = ("GPU-a", "GPU-b")
     cards = {g: ca.card() for g in gpus}
     details = [{"uuid": g, "name": "NVIDIA B200", "capacity": 183359} for g in gpus]
@@ -455,6 +459,7 @@ def _cc_b200_ctx(context_factory, ca, vbios):
         lambda n: [{**_row(g, cards[g], n), "vbios": vbios} for g in gpus],
         gpus=gpus,
         details=details,
+        rented=rented,
     )
 
 
@@ -469,14 +474,43 @@ async def test_cc_vbios_below_minimum_is_shadow_by_default(context_factory, capl
     assert set(result.event.what_we_saw["cc_vbios"]) == {"GPU-a", "GPU-b"}
     assert await ctx.services.redis.get("gpu_identity:uuid:GPU-a")  # pins still written
     record = next(r for r in caplog.records if "VBIOS" in r.getMessage())
-    assert record.cc_vbios["GPU-a"]["minimum"] == "97.00.E4.00.XX" and record.enforced is False
+    payload = json.loads(JSONFormatter(include_validator_hotkey=False).format(record))  # what operators see
+    assert payload["extra"]["cc_vbios"] == result.event.what_we_saw["cc_vbios"]
+    assert payload["extra"]["enforced"] is False
+
+
+def _scorable(ctx):
+    """Unrelated score gates satisfied: no price cap to hit, and an idle node needs a verifyx EMA."""
+    state = dataclasses.replace(ctx.state, specs={"network": {"ema_verifyx_download_speed": 500.0}})
+    return ctx.model_copy(update={"state": state, "executor": ctx.executor.model_copy(update={"price_per_gpu": None})})
 
 
 @pytest.mark.asyncio
-async def test_cc_vbios_below_minimum_fails_only_under_its_flag(context_factory):
+@pytest.mark.parametrize("rented", [False, True])
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("enforce_cc", [False, True])
+@pytest.mark.parametrize("identity_finding", [False, True])
+async def test_cc_vbios_below_minimum_fails_only_under_its_flag(
+    context_factory, rented, enforce, enforce_cc, identity_finding
+):
     ca = FakeCa()
-    result = await _run(_cc_b200_ctx(context_factory, ca, "97.00.C5.00.2D"), ca, enforce=False, enforce_cc_vbios=True)
-    assert result.passed is False
-    assert result.event.reason_code == Msg.CC_VBIOS_BELOW_MINIMUM.reason
+    ctx = _cc_b200_ctx(context_factory, ca, "97.00.C5.00.2D", rented=rented)
+    if identity_finding:  # another node's card already pinned under GPU-a: identity_changed
+        await ctx.services.redis.set("gpu_identity:uuid:GPU-a", "another-card")
+    result = await _run(ctx, ca, enforce, enforce_cc_vbios=enforce_cc)
+    expected_failure = enforce_cc or (enforce and identity_finding)
+    assert result.passed is (not expected_failure)
+    if expected_failure:
+        assert result.fatal is (not rented)
+    if enforce_cc and not enforce:  # the enforced finding leads; identity observations stay in what
+        assert result.event.reason_code == Msg.CC_VBIOS_BELOW_MINIMUM.reason
+        assert result.event.what_we_saw["findings"] == (["identity_changed"] if identity_finding else [])
+    scored = _scorable(ctx.model_copy(update=result.updates))
+    assert calculate_scores(scored, rented=rented)[0] == (0.0 if expected_failure else 1.0)
+
+
+@pytest.mark.asyncio
+async def test_cc_vbios_at_minimum_passes_under_its_flag(context_factory):
+    ca = FakeCa()
     ok = await _run(_cc_b200_ctx(context_factory, ca, "97.00.E4.00.2D"), ca, enforce=False, enforce_cc_vbios=True)
-    assert ok.passed is True and "cc_vbios" not in ok.event.what_we_saw
+    assert ok.passed is True and ok.updates == {} and "cc_vbios" not in ok.event.what_we_saw

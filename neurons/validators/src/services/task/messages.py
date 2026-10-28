@@ -2567,7 +2567,7 @@ class GpuAttestationIdentityMessages:
         category="policy",
         impact="Score set to 0 while the finding stands",
         remediation="Update every GPU's VBIOS to at least the version NVIDIA lists for multi-GPU CC mode "
-        "(B200 97.00.E4.00.xx, B300 97.10.64.00.xx), or run the node with CC off.",
+        "(B200 97.00.E4.00.xx, B300 97.10.64.00.xx).",
     )
     OK = MessageTemplate(
         event="GPU identity verified against NVIDIA's root",

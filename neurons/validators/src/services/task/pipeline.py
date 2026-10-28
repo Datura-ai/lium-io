@@ -281,6 +281,9 @@ class Context(BaseModel):
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
+    # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
+    # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
+    cc_vbios_passed: bool = True
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True

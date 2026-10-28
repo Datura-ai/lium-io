@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from core.config import settings
+from core.utils import _m
 from services.redis_service import RedisWrites
 
 from ..messages import GpuAttestationIdentityMessages as Msg, render_message
@@ -391,8 +392,10 @@ class GpuAttestationIdentityCheck:
         )
         if cc_vbios:
             logger.warning(
-                "CC multi-GPU node: GPU VBIOS below NVIDIA's minimum or unparseable",
-                extra={**ctx.default_extra, "cc_vbios": cc_vbios, "enforced": cc_vbios_fails},
+                _m(
+                    "CC multi-GPU node: GPU VBIOS below NVIDIA's minimum or unparseable",
+                    extra={**ctx.default_extra, "cc_vbios": cc_vbios, "enforced": cc_vbios_fails},
+                )
             )
 
         enforce = settings.GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED
@@ -408,8 +411,12 @@ class GpuAttestationIdentityCheck:
             "enforced": enforce,
             **({"cc_vbios": cc_vbios} if cc_vbios else {}),
         }
+        # non-fatal on a live rental, so calculate_scores reads this flag to zero the score
+        cc_updates = {"cc_vbios_passed": False} if cc_vbios_fails else {}
         if findings:
-            if SWAP_FINDINGS & set(findings):
+            if cc_vbios_fails and not enforce:  # identity is shadow-only here: lead with the enforced VBIOS finding
+                template = Msg.CC_VBIOS_BELOW_MINIMUM
+            elif SWAP_FINDINGS & set(findings):
                 template = Msg.SWAPPED
             elif {"attestation_invalid", "one_card_under_several_uuids", "identity_changed"} & set(findings):
                 template = Msg.MISMATCH
@@ -422,12 +429,12 @@ class GpuAttestationIdentityCheck:
                 impact=None if enforce or cc_vbios_fails else "Shadow observation only: score was NOT changed",
                 what=what,
             )
-            updates = {"gpu_attestation_identity_passed": False} if enforce else {}
+            updates = {**({"gpu_attestation_identity_passed": False} if enforce else {}), **cc_updates}
             return CheckResult(
                 passed=not (enforce or cc_vbios_fails), event=event, fatal=not has_live_rental(ctx), updates=updates
             )
         if cc_vbios_fails:
             event = render_message(Msg.CC_VBIOS_BELOW_MINIMUM, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx))
+            return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx), updates=cc_updates)
         template = Msg.OK if verified and not unavailable else Msg.UNAVAILABLE
         return CheckResult(passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what))
