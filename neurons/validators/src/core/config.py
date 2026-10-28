@@ -539,25 +539,6 @@ class Settings(BaseSettings):
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
-    # DAH-5320: the 16 MiB read above is over in a second; a node can start fast and stall. Once a day per idle node
-    # (filler nodes too, unless the host NICs already move RENTED_THROUGHPUT_BUSY_MBPS)
-    # ContainerDownloadSustainedCheck, last in the pipeline, reads SUSTAINED_URL (an object on our CDN; the S3 public/
-    # prefix behind CloudFront) in 32 MiB requests on 4 streams for 60 s, at most SUSTAINED_MAX_BYTES a run (16
-    # requests at 512 MiB; fleet egress about $6/day), and
-    # logs CONTAINER_DOWNLOAD_SUSTAINED with six 10 s window readings and a shadow verdict (fail: median window under
-    # 100 Mbps, or under 1 Mbps for 30 s or more). Logged only: no score,
-    # verification, availability or rental outcome reads it. ENFORCE_ENABLED is read by nothing yet; the follow-up
-    # (two shadow fails in a row -> CONTAINER_DOWNLOAD_SLOW, score 0) turns it on.
-    CONTAINER_DOWNLOAD_SUSTAINED_ENABLED: bool = Field(env="CONTAINER_DOWNLOAD_SUSTAINED_ENABLED", default=True)
-    CONTAINER_DOWNLOAD_SUSTAINED_URL: str = Field(
-        env="CONTAINER_DOWNLOAD_SUSTAINED_URL", default="https://cdn.lium.io/public/speedtest/256MiB.bin"
-    )
-    CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES: int = Field(
-        env="CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES", default=512 * 1024**2, gt=0
-    )
-    CONTAINER_DOWNLOAD_SUSTAINED_ENFORCE_ENABLED: bool = Field(
-        env="CONTAINER_DOWNLOAD_SUSTAINED_ENFORCE_ENABLED", default=False
-    )
     # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
     # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
     # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
@@ -569,6 +550,12 @@ class Settings(BaseSettings):
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5320: IdleDiskWriteCheck, last in the pipeline, writes the same 256 MiB with fsync on idle and filler nodes
+    # once a day per node (skipped while the docker root disk already moves DISK_BUSY_MB_PER_S) and logs
+    # IDLE_DISK_WRITE with a shadow verdict against DISK_MIN_MB_PER_S. Logged only; ENFORCE_ENABLED is read by nothing
+    # yet (the follow-up zeroes the score on a slow disk).
+    IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
+    IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and

@@ -33,7 +33,6 @@ from .checks import (
     CapabilityCheck,
     CollateralStatusCheck,
     ContainerDownloadSpeedCheck,
-    ContainerDownloadSustainedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
@@ -53,6 +52,7 @@ from .checks import (
     GpuUsageCheck,
     GpuVramPrecheck,
     HardwareIdentityCheck,
+    IdleDiskWriteCheck,
     InspectorRentedCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
@@ -428,8 +428,8 @@ class PipelineFactory:
                 # `nvidia-smi -L`. Last before scoring: it needs the verified ports, the GPU list and
                 # the rented/filler state every check above settled. Flag-gated, off by default.
                 RentalProbeCheck(),
-                # DAH-5320: the 60 s sustained download read, shadow only; last so it never takes the checks' time.
-                ContainerDownloadSustainedCheck(),
+                # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
+                IdleDiskWriteCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -546,8 +546,8 @@ class PipelineFactory:
                     ]
                 ),
                 RentalProbeCheck(),
-                # DAH-5320: the 60 s sustained download read, shadow only; last so it never takes the checks' time.
-                ContainerDownloadSustainedCheck(),
+                # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
+                IdleDiskWriteCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
