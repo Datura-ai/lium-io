@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import redis.exceptions
@@ -62,6 +62,18 @@ async def last_good_ports_under_filler(ctx: Context) -> dict[str, Any] | None:
         or kept["count"] < MIN_PORT_COUNT
     ):
         return None
+    # The ports were measured under this range/mappings; after a change they may not be declared any more.
+    if (kept.get("port_range"), kept.get("port_mappings")) != (
+        ctx.executor.port_range,
+        ctx.executor.port_mappings,
+    ):
+        return None
+    try:
+        age = datetime.now(UTC) - datetime.fromisoformat(kept["at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not timedelta(0) <= age <= timedelta(seconds=LAST_GOOD_PORTS_TTL_SECONDS):
+        return None
     return kept
 
 
@@ -69,7 +81,13 @@ async def remember_good_ports(ctx: Context, port_count: int, verified_ports: lis
     # A dry run shares Redis with the live validator, so it leaves the live record alone.
     if settings.DRY_RUN:
         return
-    record = {"count": port_count, "ports": verified_ports, "at": datetime.now(UTC).isoformat()}
+    record = {
+        "count": port_count,
+        "ports": verified_ports,
+        "at": datetime.now(UTC).isoformat(),
+        "port_range": ctx.executor.port_range,
+        "port_mappings": ctx.executor.port_mappings,
+    }
     try:
         await ctx.services.redis.set(
             _last_good_key(ctx), json.dumps(record), ex=LAST_GOOD_PORTS_TTL_SECONDS

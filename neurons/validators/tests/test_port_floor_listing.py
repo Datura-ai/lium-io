@@ -7,6 +7,8 @@ probe cascade and checks to show where the 2 comes from and what each run now re
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -596,6 +598,7 @@ def filler_run_ctx(
     verified: int,
     probed: int = BATCH_PORT_VERIFICATION_SIZE,
     filler=True,
+    port_range: str = DECLARED_RANGE,
 ):
     rented_data = RentedExecutorsResponse(
         executors={}, all_filler_containers_by_executor={EXECUTOR_UUID: [FILLER]} if filler else {}
@@ -606,7 +609,7 @@ def filler_run_ctx(
         specs={"verified_ports": list(range(40000, 40000 + verified))},
         rented_data=rented_data,
     )
-    return context_factory(executor=executor(), state=state, services=build_services(redis=redis))
+    return context_factory(executor=executor(port_range), state=state, services=build_services(redis=redis))
 
 
 @pytest.mark.asyncio
@@ -629,19 +632,26 @@ async def test_our_filler_saturating_the_host_keeps_the_last_good_count(context_
 
 @pytest.mark.parametrize(
     "case",
-    ["no_filler", "no_recent_good_count", "not_a_collapse"],
+    ["no_filler", "no_recent_good_count", "not_a_collapse", "port_range_changed", "older_than_24h"],
 )
 @pytest.mark.asyncio
 async def test_a_real_port_drop_still_hides_the_node(context_factory, case):
     redis = FakeRedis()
     if case != "no_recent_good_count":
         await apply(filler_run_ctx(context_factory, redis, verified=300), PortCountCheck())
+    key = f"port_count_last_good:miner-hotkey:{EXECUTOR_UUID}"
+    if case == "older_than_24h":
+        record = json.loads(redis.store[key])
+        record["at"] = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+        redis.store[key] = json.dumps(record)
     ctx = filler_run_ctx(
         context_factory,
         redis,
         verified=2,
         probed=3 if case == "not_a_collapse" else BATCH_PORT_VERIFICATION_SIZE,
         filler=case != "no_filler",
+        # the kept externals were measured under the old range; a renter must not get one of them
+        port_range="50000-50300" if case == "port_range_changed" else DECLARED_RANGE,
     )
 
     result, _ = await apply(ctx, PortCountCheck())
