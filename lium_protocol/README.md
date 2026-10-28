@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 18 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.17.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.18.0`) is semver over the wire.
 
 ## Using it
 
@@ -61,7 +61,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `1.15.0` — `RestoreContainerRequest.recovery` (optional, default false): a re-dispatch of a restore that may already be running (after a reconnect or a redelivered create); the validator does not report its dispatch failure. An older validator ignores it.
 - `1.17.0` — `RentedExecutorsResponse.maintenance_executor_ids` (optional, default empty): the nodes inside a running provider maintenance window; the validator pays them no incentive from either pool, rented or not. `RentedExecutorsResponse.maintenance_windows_by_executor` (optional, default empty): executor_id → `MaintenanceWindow` (UTC `starting_at`, `expiring_at`, half-open); the validator fails a node with `PROVIDER_MAINTENANCE` when its cycle started inside the window.
 - `1.16.0` — `ResetPodGpuRequest` (backend → validator; `local_volume_path` optional, needed for a pod with an encrypted volume) and its answer `PodGpuResetResult` with `GpuResetErrorCode` and `GpuResetOutcome` (a renter resets their pod's GPUs; the validator stops the container, runs `nvidia-smi -r -i` on the pod's GPUs only and starts it again).
-- `1.17.0` — `LockPodGpuClocksRequest` (backend → validator) and its answer `PodGpuClocksResult` with `GpuClockOutcome`; `GpuResetErrorCode.ClockLockNotSupported` (a renter locks their pod's GPU clocks with `nvidia-smi -i <uuid> -lgc`, clamped to the supported clocks, or resets them with `-rgc`; the pod's delete resets them).
+- `1.18.0` — `LockPodGpuClocksRequest` (backend → validator) and its answer `PodGpuClocksResult` with `GpuClockOutcome`; `GpuResetErrorCode.ClockLockNotSupported` (a renter locks their pod's GPU clocks with `nvidia-smi -i <uuid> -lgc`, clamped to the supported clocks, or resets them with `-rgc`; the pod's delete resets them).
 - `1.0.0` — first release.
 
 ## Tests

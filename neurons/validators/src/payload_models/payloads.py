@@ -441,7 +441,7 @@ class ResetPodGpuRequest(ContainerBaseRequest):
 
 class LockPodGpuClocksRequest(ContainerBaseRequest):
     """DAH-4663: lock (or with reset, release) a running pod's GPU clocks; answered by PodGpuClocksResult
-    (lium_protocol 1.17.0)."""
+    (lium_protocol 1.18.0)."""
 
     message_type: ContainerRequestType = ContainerRequestType.LockPodGpuClocksRequest
     container_name: str
