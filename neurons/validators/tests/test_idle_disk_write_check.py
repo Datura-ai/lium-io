@@ -11,6 +11,7 @@ import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
 from services.task.checks import idle_disk_write as module
+from services.task.checks import task_time
 from services.task.checks.idle_disk_write import IdleDiskWriteCheck
 from services.task.runner import SSHCommandResult
 from tests.helpers import build_services, build_state, default_executor, make_context
@@ -98,7 +99,11 @@ def flags(enabled=True):
         JOB_TIME_OUT=900,
     )
     clock = Clock()
-    with patch.object(module, "settings", fake), patch.object(module, "time", clock):
+    with (
+        patch.object(module, "settings", fake),
+        patch.object(module, "time", clock),
+        patch.object(task_time, "time", clock),
+    ):
         yield clock
 
 
@@ -163,7 +168,7 @@ async def test_skips_a_node_rented_at_cycle_start_or_since():
 async def test_once_a_day_at_the_node_phase():
     with flags() as clock:
         ctx, runner, redis = make_ctx(clock, due=False)
-        with patch.object(module, "_phase_fraction", lambda c: 1.0):
+        with patch.object(module, "_node_fraction_of_day", lambda c: 1.0):
             await IdleDiskWriteCheck().run(ctx)  # first sight: stamped, nothing run
         assert not runner.commands and KEY in redis.store
         runner.answers = [IDLE, write(400)]
@@ -178,11 +183,11 @@ async def test_once_a_day_at_the_node_phase():
         assert writes(runner) == 2
 
 
-@pytest.mark.parametrize(("elapsed", "runs"), [(500, 1), (600, 0)])
+@pytest.mark.parametrize(("elapsed", "runs"), [(500, 1), (520, 0)])
 async def test_runs_only_while_its_own_reads_fit(elapsed, runs):
     with flags() as clock:
         ctx, runner, _ = make_ctx(clock, IDLE, write(400))
-        clock.mono = ctx.started_at_monotonic + elapsed  # 900 - 120 - elapsed against 30 + 30 + 150
+        clock.mono = ctx.started_at_monotonic + elapsed  # 900 - 120 - elapsed against 30 + 30 + 150 + 60 slack
         await IdleDiskWriteCheck().run(ctx)
     assert writes(runner) == runs
 
@@ -195,3 +200,11 @@ async def test_a_failure_or_the_flag_off_never_changes_the_result():
     with flags(enabled=False) as clock:
         ctx, runner, _ = make_ctx(clock)
         assert (await IdleDiskWriteCheck().run(ctx)).passed and not runner.commands
+
+
+async def test_an_unresolvable_docker_root_disk_is_its_own_reason_and_stamps_the_day():
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(clock, "lium_tp t=0.00 io=\nlium_tp t=2.00 io=\n")
+        res = await IdleDiskWriteCheck().run(ctx)
+    assert writes(runner) == 0 and float(redis.store[KEY]) == clock.now
+    assert res.event.what_we_saw["reason"] == "docker root disk not resolvable"
