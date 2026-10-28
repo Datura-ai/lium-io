@@ -54,17 +54,23 @@ class FakeHost:
             return make_command_result(self.lgc_exit == 0, "not supported", exit_code=self.lgc_exit)
         if "--query-gpu=clocks.gr" in cmd:
             return make_command_result(True, "1410")
-        if cmd.endswith(" -rgc"):
-            return make_command_result(self.rgc_exit == 0, "refused", exit_code=self.rgc_exit)
+        if " -rgc " in cmd:  # the batched resets: one "<uuid> <exit>" line per GPU
+            uuids = [part.split()[2] for part in cmd.split("; ") if part.startswith("nvidia-smi -i ")]
+            return make_command_result(True, "\n".join(f"{u} {self.rgc_exit}" for u in uuids))
         raise AssertionError(f"unexpected command {cmd}")
 
 
 def _assert_invariants(host: FakeHost, allowed) -> None:
     for cmd in host.commands:
         assert "docker exec" not in cmd and " -pl" not in cmd, "never inside the pod, never the power limit"
-        if " -lgc" in cmd or " -rgc" in cmd:
-            assert cmd.startswith("nvidia-smi -i GPU-"), "never -lgc/-rgc without -i"
-            assert cmd.split()[2] in set(allowed)
+        for part in cmd.split("; "):
+            if " -lgc" in part or " -rgc" in part:
+                assert part.startswith("nvidia-smi -i GPU-"), "never -lgc/-rgc without -i"
+                assert part.split()[2] in set(allowed)
+
+
+def _reset_uuids(cmd: str) -> list[str]:
+    return [part.split()[2] for part in cmd.split("; ") if part.startswith("nvidia-smi -i ") and " -rgc " in part]
 
 
 async def _lock(host, redis=None, *, backend=(U[0], U[1]), indices=None, lo=1200, hi=1500, reset=False, **kw):
@@ -152,7 +158,7 @@ async def test_reset_runs_rgc_per_gpu_and_clears_the_records():
     host.commands.clear()
     report, _ = await _lock(host, redis, reset=True, indices=[0])
     assert report.ok and [(g.uuid, g.result) for g in report.gpus] == [(U[1], "reset")]
-    assert f"nvidia-smi -i {U[1]} -rgc" in host.commands
+    assert any(c.startswith(f"nvidia-smi -i {U[1]} -rgc ") for c in host.commands)
     assert f"gpu_clock_lock:{U[1]}" not in redis.store and f"gpu_clock_lock:{U[0]}" in redis.store
     assert json.loads(redis.store["gpu_clock_lock_pod:pod1"]) == [U[0]]
 
@@ -168,7 +174,7 @@ async def test_the_pods_delete_resets_its_locks_and_a_failed_reset_is_caught_by_
     host.rgc_exit, host.commands = 0, []
     # U[2] has no record (a lost one looks the same): reset too
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1], U[2]]) == 3
-    assert host.commands == [f"nvidia-smi -i {U[0]} -rgc", f"nvidia-smi -i {U[1]} -rgc", f"nvidia-smi -i {U[2]} -rgc"]
+    assert len(host.commands) == 1 and _reset_uuids(host.commands[0]) == [U[0], U[1], U[2]], "one SSH call"
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
 
 
@@ -179,7 +185,7 @@ async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_chec
     assert await reset_pod_clock_locks(host, redis, "pod1") == 0 and host.commands == []
     redis.store[f"gpu_clock_lock:{U[3]}"] = json.dumps({"pod_id": "old"})
     assert await reset_leftover_clock_locks(host, redis, []) == 4
-    assert host.commands[1:] == [f"nvidia-smi -i {u} -rgc" for u in U]
+    assert len(host.commands) == 2 and _reset_uuids(host.commands[1]) == U
     assert f"gpu_clock_lock:{U[3]}" not in redis.store
 
 

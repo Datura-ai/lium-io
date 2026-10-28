@@ -133,7 +133,7 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs before the create
-        "nvidia-smi -i GPU-test -rgc",
+        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         host_key,
