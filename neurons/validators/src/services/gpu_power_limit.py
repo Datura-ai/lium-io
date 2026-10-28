@@ -746,8 +746,6 @@ async def _record_rental_start_ratios(
     except Exception as exc:
         # without the old records a reboot could replace its rental's start with today's limit
         raise GpuPowerRestoreStateError("GPU power rental-start records could not be read") from exc
-    # a GPU of an already-started rental with no record of its own lost it, or predates the records
-    started = pod_on_host or any(rental_record_pod_id(old) == pod_id for old in existing)
     unrecorded: list[str] = []
     for gpu_uuid, key, old in zip(uuids, keys, existing):
         if rental_record_pod_id(old) == pod_id:
@@ -756,8 +754,8 @@ async def _record_rental_start_ratios(
         if state is None or state.default_watts is None or state.default_watts <= 0:
             continue  # nothing to record; the check rejects a GPU it cannot read anyway
         ratio = state.current_watts / state.default_watts
-        if legacy or started or ratio < MIN_POWER_LIMIT_RATIO:
-            # raised to its default just above, or a rental from before its record: it stays at 90 %
+        if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
+            # raised to its default just above, or a running rental from before the records: it stays at 90 %
             ratio = 1.0
         try:
             await redis.set(key, json.dumps({"pod_id": pod_id, "ratio": round(ratio, 4)}), ex=RENTAL_START_RATIO_TTL_SECONDS)

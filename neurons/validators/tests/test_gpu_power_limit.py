@@ -201,12 +201,13 @@ async def test_rental_start_of_a_rental_from_before_the_records_records_stock(mo
 
 
 @pytest.mark.asyncio
-async def test_rental_start_gpu_missing_its_record_on_a_started_rental_records_stock(monkeypatch) -> None:
+async def test_rental_start_retry_after_a_partial_write_records_the_live_limit(monkeypatch) -> None:
+    # the refused create wrote GPU-0 only; its retry must keep GPU-1 in the 80 % tier
     monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
     redis = SharedFakeRedis()
     redis.store[gpl.rental_start_ratio_key("ex-1", "GPU-0")] = json.dumps({"pod_id": "pod-1", "ratio": 1.0})
-    await _rental_start(monkeypatch, redis, _power(350, 298))  # GPU-1 cut to 85 % before a reboot
-    assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": 1.0}
+    await _rental_start(monkeypatch, redis, _power(350, 280))
+    assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": 0.8}
 
 
 @pytest.mark.parametrize(("pod_on_host", "ratio"), [(True, 1.0), (False, 0.8514)])
