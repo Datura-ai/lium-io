@@ -109,7 +109,6 @@ WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 # the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
 MAX_FRAME_BYTES = 4 * 1024 * 1024
-MESSAGE_TOO_BIG = 1009
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
@@ -147,17 +146,6 @@ class FrameTooBig(Exception):
         self.size = size
 
 
-def _closed_as_too_big(exc: BaseException) -> bool:
-    return isinstance(exc, websockets.ConnectionClosed) and MESSAGE_TOO_BIG in (
-        getattr(exc.rcvd, "code", None),
-        getattr(exc.sent, "code", None),
-    )
-
-
-def _retryable(exc: BaseException) -> bool:
-    return isinstance(exc, websockets.ConnectionClosed) and not _closed_as_too_big(exc)
-
-
 class AuthenticationError(Exception):
     def __init__(self, reason: str, errors: list[Error]):
         self.reason = reason
@@ -173,7 +161,9 @@ class ComputeClient:
         self.keypair = keypair
         self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
-        self.compute_app_rest_api_uri = compute_app_uri.replace("wss", "https").replace("ws", "http")
+        self.compute_app_rest_api_uri = compute_app_uri.replace("wss", "https").replace(
+            "ws", "http"
+        )
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -194,12 +184,7 @@ class ComputeClient:
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
-        logger.info(
-            _m(
-                "Connecting to backend app",
-                extra=get_extra_info(self.logging_extra)
-            )
-        )
+        logger.info(_m("Connecting to backend app", extra=get_extra_info(self.logging_extra)))
         return websockets.connect(
             self.compute_app_uri,
             ping_interval=WS_PING_INTERVAL,
@@ -219,10 +204,7 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "Error occurred during driving a miner client",
-                        extra=get_extra_info({
-                            **self.logging_extra,
-                            "error": str(exc)
-                        }),
+                        extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
                     )
                 )
 
@@ -236,7 +218,7 @@ class ComputeClient:
         await create_steps_after_reply.wait_until_all_done()
 
         # Cleanup subtensor client
-        if hasattr(self, 'subtensor_client'):
+        if hasattr(self, "subtensor_client"):
             await SubtensorClient.shutdown()
 
     def my_hotkey(self) -> str:
@@ -248,7 +230,9 @@ class ComputeClient:
 
         try:
             await self.fail_creates_cut_off_by_restart()
-        except Exception as exc:  # the sweep is best-effort; it must never keep the connector from starting
+        except (
+            Exception
+        ) as exc:  # the sweep is best-effort; it must never keep the connector from starting
             logger.error(
                 _m(
                     "Failed to report creates cut off by a connector restart",
@@ -367,18 +351,20 @@ class ComputeClient:
                 )
                 async for message in pubsub.listen():
                     try:
-                        channel = message['channel'].decode('utf-8')
-                        data = json.loads(message['data'])
+                        channel = message["channel"].decode("utf-8")
+                        data = json.loads(message["data"])
                     except Exception:
                         continue
 
                     logger.info(
                         _m(
-                            'Received message from redis',
-                            extra=get_extra_info({
-                                **self.logging_extra,
-                                "channel": channel,
-                            }),
+                            "Received message from redis",
+                            extra=get_extra_info(
+                                {
+                                    **self.logging_extra,
+                                    "channel": channel,
+                                }
+                            ),
                         )
                     )
 
@@ -386,14 +372,16 @@ class ComputeClient:
                         logger.info(
                             _m(
                                 "Received machine specs from redis",
-                                extra=get_extra_info({
-                                    **self.logging_extra,
-                                    "job_batch_id": data['job_batch_id'],
-                                    "miner_hotkey": data["miner_hotkey"],
-                                    "executor_uuid": data["executor_uuid"],
-                                    "actual_score": data["score"],
-                                    "synthetic_job_score": data["synthetic_job_score"],
-                                }),
+                                extra=get_extra_info(
+                                    {
+                                        **self.logging_extra,
+                                        "job_batch_id": data["job_batch_id"],
+                                        "miner_hotkey": data["miner_hotkey"],
+                                        "executor_uuid": data["executor_uuid"],
+                                        "actual_score": data["score"],
+                                        "synthetic_job_score": data["synthetic_job_score"],
+                                    }
+                                ),
                             )
                         )
                         specs = ExecutorSpecRequest(
@@ -401,7 +389,7 @@ class ComputeClient:
                             score=data["score"],
                             synthetic_job_score=data["synthetic_job_score"],
                             log_status=data["log_status"],
-                            job_batch_id=data['job_batch_id'],
+                            job_batch_id=data["job_batch_id"],
                             netuid=data.get("netuid"),
                             scored_at=data.get("scored_at"),
                             incentive=data.get("incentive"),
@@ -487,26 +475,32 @@ class ComputeClient:
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         # DAH-4658: the renter is resetting the node's GPUs, or did a moment ago; what a reset can
                         # cause is the renter's doing, never the provider's fault (an unreadable mark sends it)
-                        evidence = ResetVerifiedJobEvidence.model_validate(data.get("evidence") or {})
+                        evidence = ResetVerifiedJobEvidence.model_validate(
+                            data.get("evidence") or {}
+                        )
                         reset_marks = (
                             self.miner_service.redis_service,
                             data["miner_hotkey"],
                             data["executor_uuid"],
                             evidence.pod_id,
                         )
-                        if reset_caused(data.get("check_id"), data.get("reason_code"), evidence) and (
+                        if reset_caused(
+                            data.get("check_id"), data.get("reason_code"), evidence
+                        ) and (
                             await renter_gpu_reset_in_progress(*reset_marks)
                             or await renter_gpu_reset_recent(*reset_marks)
                         ):
                             logger.info(
                                 _m(
                                     "Verified-job reset not sent: renter GPU reset in progress",
-                                    extra=get_extra_info({
-                                        **self.logging_extra,
-                                        "miner_hotkey": data["miner_hotkey"],
-                                        "executor_uuid": data["executor_uuid"],
-                                        "check_id": data.get("check_id"),
-                                    }),
+                                    extra=get_extra_info(
+                                        {
+                                            **self.logging_extra,
+                                            "miner_hotkey": data["miner_hotkey"],
+                                            "executor_uuid": data["executor_uuid"],
+                                            "check_id": data.get("check_id"),
+                                        }
+                                    ),
                                 )
                             )
                             continue
@@ -540,10 +534,12 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "Error: unknown",
-                        extra=get_extra_info({
-                            **self.logging_extra,
-                            "error": str(exc),
-                        }),
+                        extra=get_extra_info(
+                            {
+                                **self.logging_extra,
+                                "error": str(exc),
+                            }
+                        ),
                     )
                 )
             finally:
@@ -571,7 +567,7 @@ class ComputeClient:
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(3),
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
-        retry=tenacity.retry_if_exception(_retryable),
+        retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
     async def send_model(self, msg: DeliveryStamps):
         # stamped inside the retry so a message resent after a reconnect reports its own delay
@@ -596,21 +592,28 @@ class ComputeClient:
                 if log_to_send:
                     try:
                         await self.send_model(log_to_send)
-                        if getattr(log_to_send, "failure_step", None) == CREATE_CUT_OFF_BY_RESTART_STEP:
+                        if (
+                            getattr(log_to_send, "failure_step", None)
+                            == CREATE_CUT_OFF_BY_RESTART_STEP
+                        ):
                             # kept until now so a second restart before the send reports it again
-                            await self._untrack_backend_create_for_restart_report(log_to_send.pod_id)
+                            await self._untrack_backend_create_for_restart_report(
+                                log_to_send.pod_id
+                            )
                     except Exception as exc:
-                        if isinstance(exc, FrameTooBig) or _closed_as_too_big(exc):
-                            # requeued, it went first on every reconnect and closed each new socket the same way
+                        if isinstance(exc, FrameTooBig):
+                            # checked before the send: requeued, it went first on every reconnect and closed each new
+                            # socket with 1009. A 1009 close itself is not judged: it fails every later send too.
                             logger.error(
                                 _m(
                                     "Dropped a message the backend refuses as too big",
-                                    extra=get_extra_info({
-                                        **self.logging_extra,
-                                        "message_type": type(log_to_send).__name__,
-                                        "size": getattr(exc, "size", None)
-                                        or len(log_to_send.model_dump_json().encode()),
-                                    }),
+                                    extra=get_extra_info(
+                                        {
+                                            **self.logging_extra,
+                                            "message_type": type(log_to_send).__name__,
+                                            "size": exc.size,
+                                        }
+                                    ),
                                 )
                             )
                             continue
@@ -619,10 +622,12 @@ class ComputeClient:
                         logger.error(
                             _m(
                                 "Error: message sent error",
-                                extra=get_extra_info({
-                                    **self.logging_extra,
-                                    "error": str(exc),
-                                }),
+                                extra=get_extra_info(
+                                    {
+                                        **self.logging_extra,
+                                        "error": str(exc),
+                                    }
+                                ),
                             )
                         )
             else:
@@ -656,8 +661,11 @@ class ComputeClient:
                 await self.get_executors_uptime()
             except Exception as exc:
                 logger.error(
-                    _m("Exception during get executors uptime from compute app", extra={**self.logging_extra, "error": str(exc)}),
-                    exc_info=True
+                    _m(
+                        "Exception during get executors uptime from compute app",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    ),
+                    exc_info=True,
                 )
             finally:
                 await asyncio.sleep(20 * 60)
@@ -683,20 +691,36 @@ class ComputeClient:
             try:
                 url = f"{self.compute_app_rest_api_uri}/executors"
                 headers = {
-                    'X-Validator-Signature': f"0x{self.keypair.sign(self.my_hotkey()).hex()}"
+                    "X-Validator-Signature": f"0x{self.keypair.sign(self.my_hotkey()).hex()}"
                 }
-                async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                async with session.post(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)
+                ) as response:
                     if response.status != 200:
                         error_msg = await response.text()
                         logger.error(
-                            _m("Failed to get executors uptime from compute app", extra={**default_log_info, "status": response.status, "response": error_msg}),
+                            _m(
+                                "Failed to get executors uptime from compute app",
+                                extra={
+                                    **default_log_info,
+                                    "status": response.status,
+                                    "response": error_msg,
+                                },
+                            ),
                         )
                         return
 
                     executors_json = await response.json()
                     executors = [ExecutorUptimeResponse(**executor) for executor in executors_json]
                     logger.info(
-                        _m("Successfully got response from compute app", extra={**default_log_info, "status": len(executors), "time_cost": time.time() - start_time}),
+                        _m(
+                            "Successfully got response from compute app",
+                            extra={
+                                **default_log_info,
+                                "status": len(executors),
+                                "time_cost": time.time() - start_time,
+                            },
+                        ),
                     )
                     # clean up old redis data
                     redis_service = self.miner_service.redis_service
@@ -706,12 +730,18 @@ class ComputeClient:
                         await redis_service.add_executor_uptime(executor)
 
                     logger.info(
-                        _m("Successfully stored executors uptime into redis", extra={**default_log_info, "time_cost": time.time() - start_time}),
+                        _m(
+                            "Successfully stored executors uptime into redis",
+                            extra={**default_log_info, "time_cost": time.time() - start_time},
+                        ),
                     )
             except Exception as exc:
                 logger.error(
-                    _m("Exception during get executors uptime from compute app", extra={**default_log_info, "error": str(exc)}),
-                    exc_info=True
+                    _m(
+                        "Exception during get executors uptime from compute app",
+                        extra={**default_log_info, "error": str(exc)},
+                    ),
+                    exc_info=True,
                 )
 
     async def handle_message(self, raw_msg: str | bytes):
@@ -725,27 +755,28 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "received error response from compute app",
-                        extra=get_extra_info({
-                            **self.logging_extra,
-                            "response": str(response)
-                        }),
+                        extra=get_extra_info({**self.logging_extra, "response": str(response)}),
                     )
                 )
             return
 
         try:
-            response: RentedMachineResponse = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
+            response: RentedMachineResponse = pydantic.TypeAdapter(
+                RentedMachineResponse
+            ).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
             logger.info(
                 _m(
                     "Rented machines",
-                    extra=get_extra_info({
-                        **self.logging_extra,
-                        "machines": len(response.machines),
-                        "banned_guids": len(response.banned_guids)
-                    }),
+                    extra=get_extra_info(
+                        {
+                            **self.logging_extra,
+                            "machines": len(response.machines),
+                            "banned_guids": len(response.banned_guids),
+                        }
+                    ),
                 )
             )
             redis_service = self.miner_service.redis_service
@@ -756,18 +787,24 @@ class ComputeClient:
             return
 
         try:
-            response: DuplicateExecutorsResponse = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
+            response: DuplicateExecutorsResponse = pydantic.TypeAdapter(
+                DuplicateExecutorsResponse
+            ).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
             logger.info(
                 _m(
                     "Duplicated executors",
-                    extra=get_extra_info({
-                        **self.logging_extra,
-                        "executors": len(response.executors),
-                        "rental_succeed_executors": len(response.rental_succeed_executors) if response.rental_succeed_executors else 0
-                    }),
+                    extra=get_extra_info(
+                        {
+                            **self.logging_extra,
+                            "executors": len(response.executors),
+                            "rental_succeed_executors": len(response.rental_succeed_executors)
+                            if response.rental_succeed_executors
+                            else 0,
+                        }
+                    ),
                 )
             )
 
@@ -787,24 +824,21 @@ class ComputeClient:
             await redis_service.delete(RENTAL_SUCCEED_MACHINE_SET)
             if response.rental_succeed_executors:
                 for executor_uuid in response.rental_succeed_executors:
-                    await redis_service.sadd(
-                        RENTAL_SUCCEED_MACHINE_SET, executor_uuid
-                    )
+                    await redis_service.sadd(RENTAL_SUCCEED_MACHINE_SET, executor_uuid)
 
             return
 
         try:
-            response: RevenuePerGpuTypeResponse = pydantic.TypeAdapter(RevenuePerGpuTypeResponse).validate_json(raw_msg)
+            response: RevenuePerGpuTypeResponse = pydantic.TypeAdapter(
+                RevenuePerGpuTypeResponse
+            ).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
             logger.info(
                 _m(
                     "RevenuePerGpuTypeResponse",
-                    extra=get_extra_info({
-                        **self.logging_extra,
-                        "revenues": response.revenues
-                    }),
+                    extra=get_extra_info({**self.logging_extra, "revenues": response.revenues}),
                 )
             )
 
@@ -821,7 +855,9 @@ class ComputeClient:
             return
 
         try:
-            req: GetEstimateRequest = pydantic.TypeAdapter(GetEstimateRequest).validate_json(raw_msg)
+            req: GetEstimateRequest = pydantic.TypeAdapter(GetEstimateRequest).validate_json(
+                raw_msg
+            )
         except pydantic.ValidationError:
             pass
         else:
@@ -949,10 +985,12 @@ class ComputeClient:
         try:
             existing = await redis_service.claim_backend_command(command_id, claim)
         except Exception:
-            logger.exception(_m(
-                "Backend command dedup failed open",
-                extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
-            ))
+            logger.exception(
+                _m(
+                    "Backend command dedup failed open",
+                    extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
+                )
+            )
             return await self._run_miner_job(job_request)
         if existing is not None:
             return await self._handle_backend_command_duplicate(job_request, existing)
@@ -991,10 +1029,12 @@ class ComputeClient:
             try:
                 replies = [BaseValidatorResponse.parse(raw) for raw in existing.responses]
             except Exception:
-                logger.exception(_m(
-                    "Backend command reply replay failed open",
-                    extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
-                ))
+                logger.exception(
+                    _m(
+                        "Backend command reply replay failed open",
+                        extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
+                    )
+                )
                 await self._run_miner_job(job_request)
                 return
             async with self.lock:
@@ -1004,11 +1044,13 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Ignoring running backend command duplicate",
-                    extra=get_extra_info({
-                        **self.logging_extra,
-                        "command_id": command_id,
-                        "request_type": job_request.message_type.value,
-                    }),
+                    extra=get_extra_info(
+                        {
+                            **self.logging_extra,
+                            "command_id": command_id,
+                            "request_type": job_request.message_type.value,
+                        }
+                    ),
                 )
             )
 
@@ -1052,11 +1094,16 @@ class ComputeClient:
             finally:
                 await self._untrack_backend_create_for_restart_report(job_request.pod_id)
 
-    async def _track_backend_create_for_restart_report(self, job_request: ContainerCreateRequest) -> None:
+    async def _track_backend_create_for_restart_report(
+        self, job_request: ContainerCreateRequest
+    ) -> None:
         # best-effort: a Redis error loses only the restart report, never the create itself
         try:
             await self.miner_service.redis_service.add_inflight_backend_create(
-                job_request.pod_id, job_request.miner_hotkey, job_request.executor_id, job_request.workload_kind
+                job_request.pod_id,
+                job_request.miner_hotkey,
+                job_request.executor_id,
+                job_request.workload_kind,
             )
         except Exception as exc:
             self._log_backend_create_tracking_error(job_request.pod_id, exc)
@@ -1097,7 +1144,9 @@ class ComputeClient:
                 break
             except redis.exceptions.RedisError as exc:
                 mark_connector_unready()
-                logger.warning(_m("Could not take the connector lead", extra={**extra, "error": str(exc)}))
+                logger.warning(
+                    _m("Could not take the connector lead", extra={**extra, "error": str(exc)})
+                )
                 await asyncio.sleep(1)
         logger.info(_m("Leading the backend connection", extra=extra))
         self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
@@ -1114,7 +1163,9 @@ class ComputeClient:
                     logger.error(_m("Another connector took the lead; exiting", extra=extra))
                     os._exit(1)
             except Exception as exc:
-                logger.warning(_m("Could not renew the connector lead", extra={**extra, "error": str(exc)}))
+                logger.warning(
+                    _m("Could not renew the connector lead", extra={**extra, "error": str(exc)})
+                )
 
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never
@@ -1141,7 +1192,9 @@ class ComputeClient:
             logger.warning(
                 _m(
                     "Create cut off by a connector restart, reported failed",
-                    extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json")}),
+                    extra=get_extra_info(
+                        {**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json")}
+                    ),
                 )
             )
 
@@ -1159,7 +1212,7 @@ class ComputeClient:
         | BackupContainerRequest
         | RestoreContainerRequest
         | InstallJupyterServerRequest
-        | ResetPodGpuRequest
+        | ResetPodGpuRequest,
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -1299,7 +1352,9 @@ class ComputeClient:
                 )
             )
 
-            await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id, job_request.pod_id)
+            await self.miner_service.redis_service.remove_pending_pod(
+                job_request.miner_hotkey, job_request.executor_id, job_request.pod_id
+            )
         elif isinstance(job_request, GetPodLogsRequestFromServer):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port

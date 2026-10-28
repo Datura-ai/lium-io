@@ -1,7 +1,8 @@
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+import tenacity
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
@@ -46,13 +47,23 @@ async def test_an_oversized_message_is_dropped_before_sending_and_the_next_one_s
 
 
 @pytest.mark.asyncio
-async def test_a_message_the_backend_closes_with_1009_is_not_retried_or_requeued():
+async def test_messages_on_a_socket_the_backend_closed_with_1009_stay_queued():
+    # after a 1009 close every later send on that socket raises 1009 too, so none of them is the oversized one
     ws = AsyncMock()
-    ws.send.side_effect = ConnectionClosedError(Close(1009, "message too big"), Close(1009, "message too big"), True)
     client = _client(ws)
-    client.message_queue.append(_message("pod-1"))
+    first, second = _message("pod-1"), _message("pod-2")
+    client.message_queue.append(first)
+    client.message_queue.append(second)
 
-    await _drain(client)
+    def closed(_payload):
+        client.ws = None  # as run_forever does once the socket is gone
+        raise ConnectionClosedError(
+            Close(1009, "message too big"), Close(1009, "message too big"), True
+        )
 
-    assert ws.send.await_count == 1
-    assert len(client.message_queue) == 0
+    ws.send.side_effect = closed
+
+    with patch.object(ComputeClient.send_model.retry, "wait", tenacity.wait_none()):
+        await _drain(client)
+
+    assert list(client.message_queue) == [first, second]
