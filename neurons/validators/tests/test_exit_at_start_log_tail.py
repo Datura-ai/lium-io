@@ -99,3 +99,12 @@ async def test_filler_log_tail_redacts_the_kept_lines_of_a_multiline_secret() ->
     )
 
     assert explained.log_tail == "***\n***\nexit 1"
+
+
+@pytest.mark.asyncio
+async def test_filler_log_tail_redacts_an_indented_secret_line_at_the_start_of_the_tail() -> None:
+    client = _client(log_tail="  indented-secret\nexit 1\n")
+
+    explained = await _explain(client, WorkloadKind.FILLER, environment={"CONFIG": "a: 1\n  indented-secret"})
+
+    assert explained.log_tail == "***\nexit 1"
