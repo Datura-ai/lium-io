@@ -199,28 +199,34 @@ async def test_rental_start_of_a_rental_from_before_the_records_records_stock(mo
     assert _ratio(redis, "GPU-0") == {"pod_id": "pod-1", "ratio": 1.0}
 
 
+@pytest.mark.asyncio
+async def test_rental_start_gpu_missing_its_record_on_a_started_rental_records_stock(monkeypatch) -> None:
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    redis = SharedFakeRedis()
+    redis.store[gpl.rental_start_ratio_key("ex-1", "GPU-0")] = json.dumps({"pod_id": "pod-1", "ratio": 1.0})
+    await _rental_start(monkeypatch, redis, _power(350, 298))  # GPU-1 cut to 85 % before a reboot
+    assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": 1.0}
+
+
 @pytest.mark.parametrize(
-    ("watts", "failing_gpus", "raises"),
+    ("watts", "failing_gpus"),
     [
-        ((280,), {"GPU-0"}, True),  # a tier rental without its record would be held at 90 %
-        ((350, 280), {"GPU-1"}, True),  # partial: the tier GPU's write failed
-        ((350, 280), {"GPU-0"}, False),  # a stock GPU without a record is held at 90 % anyway
+        ((280,), {"GPU-0"}),  # a tier rental without its record would be held at 90 %
+        ((350, 280), {"GPU-1"}),  # partial: the tier GPU's write failed
+        ((350, 350), {"GPU-1"}),  # stock: an unrecorded GPU could be cut and re-recorded at a reboot
     ],
 )
 @pytest.mark.asyncio
 async def test_rental_start_record_write_failure_fails_the_create_then_a_retry_records(
-    monkeypatch, watts, failing_gpus, raises
+    monkeypatch, watts, failing_gpus
 ) -> None:
     monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
     redis = SharedFakeRedis()
     redis.fail_next_set_of = {gpl.rental_start_ratio_key("ex-1", u) for u in failing_gpus}
-    if raises:
-        with pytest.raises(gpl.GpuPowerRestoreStateError):
-            await _rental_start(monkeypatch, redis, _power(*watts))
-        await _rental_start(monkeypatch, redis, _power(*watts))  # the retried create
-        assert all(_ratio(redis, f"GPU-{i}")["pod_id"] == "pod-1" for i in range(len(watts)))
-    else:
+    with pytest.raises(gpl.GpuPowerRestoreStateError):
         await _rental_start(monkeypatch, redis, _power(*watts))
+    await _rental_start(monkeypatch, redis, _power(*watts))  # the retried create
+    assert all(_ratio(redis, f"GPU-{i}")["pod_id"] == "pod-1" for i in range(len(watts)))
 
 
 @pytest.mark.asyncio
