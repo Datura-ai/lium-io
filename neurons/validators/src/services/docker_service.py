@@ -1340,9 +1340,13 @@ async def _container_log_tail_or_empty(
         )
         return ""
     tail = tail.strip()
-    # a printed env value (e.g. an API key) must not reach the provider; redact before the cut so no half survives
+    # a printed env value (e.g. an API key) must not reach the provider; redact before the cut so no half survives.
+    # Each line of a multi-line value too: docker's line tail can keep only the value's last lines.
     secret_values: set[str] = {
-        value for value in (environment or {}).values() if len(value) >= LOG_TAIL_REDACT_MIN_CHARS
+        part
+        for value in (environment or {}).values()
+        for part in (value, *value.splitlines())
+        if len(part) >= LOG_TAIL_REDACT_MIN_CHARS
     }
     for secret_value in sorted(secret_values, key=len, reverse=True):
         tail = tail.replace(secret_value, "***")

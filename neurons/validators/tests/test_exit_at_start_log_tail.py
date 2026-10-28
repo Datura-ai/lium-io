@@ -87,3 +87,15 @@ async def test_sdk_log_tail_asks_docker_for_both_streams_and_decodes_bad_bytes()
 
     assert tail == "bad � byte\n"
     api_client.logs.assert_called_once_with("c1", stdout=True, stderr=True, tail=20)
+
+
+@pytest.mark.asyncio
+async def test_filler_log_tail_redacts_the_kept_lines_of_a_multiline_secret() -> None:
+    # docker cut the tail inside the value: only its last lines are left, so the whole value never matches
+    client = _client(log_tail="key-line-2\nkey-line-3\nexit 1\n")
+
+    explained = await _explain(
+        client, WorkloadKind.FILLER, environment={"SSH_KEY": "key-line-1\nkey-line-2\nkey-line-3"}
+    )
+
+    assert explained.log_tail == "***\n***\nexit 1"
