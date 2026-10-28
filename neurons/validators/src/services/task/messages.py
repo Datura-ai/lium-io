@@ -2559,6 +2559,16 @@ class GpuAttestationIdentityMessages:
         category="policy",
         impact="Proceed",
     )
+    # Fails the node only under CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; in shadow it is a log line.
+    CC_VBIOS_BELOW_MINIMUM = MessageTemplate(
+        event="GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing",
+        reason="CC_VBIOS_BELOW_MINIMUM",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 while the finding stands",
+        remediation="Update every GPU's VBIOS to at least the version NVIDIA lists for multi-GPU CC mode "
+        "(B200 97.00.E4.00.xx, B300 97.10.64.00.xx), or run the node with CC off.",
+    )
     OK = MessageTemplate(
         event="GPU identity verified against NVIDIA's root",
         reason="GPU_IDENTITY_OK",

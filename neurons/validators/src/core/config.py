@@ -719,6 +719,14 @@ class Settings(BaseSettings):
     GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED: bool = Field(
         env="GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED", default=False
     )
+    # Minimum VBIOS per GPU model for multi-GPU Confidential Computing (NVIDIA Trusted Computing Solutions
+    # Release Notes R595, RN-12817-001_v02, Table 3 "Component Versions to Enable MPT CC Mode for Blackwell GPUs").
+    # Dotted hex fields; "XX" matches any value. Below it multi-GPU NCCL fails in CC while the node otherwise validates.
+    CC_VBIOS_MINIMUMS: dict[str, str] = Field(
+        env="CC_VBIOS_MINIMUMS", default={"B200": "97.00.E4.00.XX", "B300": "97.10.64.00.XX"}
+    )
+    # Off = shadow: a CC multi-GPU node below the minimum is only logged. On = it fails the node like an identity finding.
+    CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED: bool = Field(env="CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED", default=False)
     # Hosted NRAS endpoint (interim verification locus; a local nv-verifier removes
     # this outbound SPOF before fleet enforcement — see remediation plan CD4).
     NVIDIA_NRAS_URL: str = Field(

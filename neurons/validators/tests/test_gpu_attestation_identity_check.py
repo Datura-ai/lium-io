@@ -20,8 +20,10 @@ from neurons.validators.src.services.task.checks.gpu_attestation_identity import
     AttestationInvalid,
     GpuAttestationIdentityCheck,
     build_attest_command,
+    cc_vbios_findings,
     nvidia_root,
     parse_attest_output,
+    vbios_below,
     verify_gpu_evidence,
 )
 from neurons.validators.src.services.task.messages import GpuAttestationIdentityMessages as Msg
@@ -31,6 +33,7 @@ from tests.helpers import build_services, build_state, default_executor
 
 MODULE = "neurons.validators.src.services.task.checks.gpu_attestation_identity"
 FIXTURES = Path(__file__).parent / "fixtures"
+MINIMUMS = {"B200": "97.00.E4.00.XX", "B300": "97.10.64.00.XX"}
 
 
 # --- NVIDIA's own published sample (nvtrust local_gpu_verifier/src/verifier/samples), checked against the pinned root
@@ -166,9 +169,11 @@ def _ctx(context_factory, ca, rows_for, *, gpus=("GPU-a",), redis=None, rented=F
     )
 
 
-async def _run(ctx, ca, enforce):
+async def _run(ctx, ca, enforce, enforce_cc_vbios=False):
     with patch(f"{MODULE}.settings") as s, patch(f"{MODULE}.nvidia_root", return_value=ca.root):
         s.GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED = enforce
+        s.CC_VBIOS_MINIMUMS = MINIMUMS
+        s.CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED = enforce_cc_vbios
         return await GpuAttestationIdentityCheck().run(ctx)
 
 
@@ -385,3 +390,93 @@ async def test_vbios_update_and_ecc_toggle_are_recorded_not_flagged(context_fact
     assert result.passed is True
     assert result.event.reason_code == Msg.UNAVAILABLE.reason
     assert json.loads(await redis.get("gpu_identity:hw:GPU-a"))["vbios"] == "96.00.99.00.02"
+
+
+# --- multi-GPU CC needs NVIDIA's minimum VBIOS on B200/B300 (R595 Trusted Computing release notes, MPT CC table)
+
+
+@pytest.mark.parametrize(
+    ("seen", "minimum", "expected"),
+    [
+        ("97.00.C5.00.2D", "97.00.E4.00.XX", True),  # the reported node
+        ("97.00.E4.00.00", "97.00.E4.00.XX", False),  # at the minimum, any last field
+        ("97.00.e4.00.ff", "97.00.E4.00.XX", False),
+        ("97.00.F0.00.01", "97.00.E4.00.XX", False),
+        ("97.10.63.00.99", "97.10.64.00.XX", True),
+        ("98.00.00.00.00", "97.10.64.00.XX", False),
+        ("garbage", "97.00.E4.00.XX", None),
+        ("97.00.E4", "97.00.E4.00.XX", None),
+        (None, "97.00.E4.00.XX", None),
+    ],
+)
+def test_vbios_below(seen, minimum, expected):
+    assert vbios_below(seen, minimum) is expected
+
+
+def _b200(gpu_uuid, vbios, cert_rc=0):
+    return {"uuid": gpu_uuid, "cert_rc": cert_rc, "vbios": vbios}
+
+
+def _hw_of(rows, name="NVIDIA B200"):
+    return {r["uuid"]: {"name": name, "vbios": r["vbios"]} for r in rows}
+
+
+def test_cc_vbios_flags_b200_and_b300_below_the_minimum():
+    rows = [_b200("GPU-a", "97.00.C5.00.2D"), _b200("GPU-b", "97.00.E4.00.01")]
+    assert cc_vbios_findings(_hw_of(rows), rows, MINIMUMS) == {
+        "GPU-a": {"name": "NVIDIA B200", "vbios": "97.00.C5.00.2D", "minimum": "97.00.E4.00.XX", "status": "below"}
+    }
+    rows = [_b200("GPU-a", "97.10.50.00.01"), _b200("GPU-b", "97.10.64.00.01")]
+    assert set(cc_vbios_findings(_hw_of(rows, "NVIDIA B300 SXM6 AC"), rows, MINIMUMS)) == {"GPU-a"}
+
+
+def test_cc_vbios_skips_cc_off_single_gpu_and_other_models():
+    old = [_b200("GPU-a", "97.00.C5.00.2D"), _b200("GPU-b", "97.00.C5.00.2D")]
+    cc_off = [{**r, "cert_rc": 3} for r in old]
+    assert cc_vbios_findings(_hw_of(cc_off), cc_off, MINIMUMS) == {}
+    assert cc_vbios_findings(_hw_of(old[:1]), old[:1], MINIMUMS) == {}  # single-GPU CC is not multi-GPU
+    assert cc_vbios_findings(_hw_of(old, "NVIDIA H200"), old, MINIMUMS) == {}
+    assert cc_vbios_findings(_hw_of(old, "NVIDIA GB200"), old, MINIMUMS) == {}
+
+
+def test_cc_vbios_unparseable_is_reported_not_raised():
+    rows = [_b200("GPU-a", None), _b200("GPU-b", "n/a")]
+    found = cc_vbios_findings(_hw_of(rows), rows, MINIMUMS)
+    assert {v["status"] for v in found.values()} == {"unparseable"}
+
+
+def _cc_b200_ctx(context_factory, ca, vbios):
+    gpus = ("GPU-a", "GPU-b")
+    cards = {g: ca.card() for g in gpus}
+    details = [{"uuid": g, "name": "NVIDIA B200", "capacity": 183359} for g in gpus]
+    return _ctx(
+        context_factory,
+        ca,
+        lambda n: [{**_row(g, cards[g], n), "vbios": vbios} for g in gpus],
+        gpus=gpus,
+        details=details,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cc_vbios_below_minimum_is_shadow_by_default(context_factory, caplog):
+    ca = FakeCa()
+    ctx = _cc_b200_ctx(context_factory, ca, "97.00.C5.00.2D")
+    with caplog.at_level("WARNING", logger=MODULE):
+        result = await _run(ctx, ca, enforce=True)
+    assert result.passed is True
+    assert result.event.reason_code == Msg.OK.reason
+    assert set(result.event.what_we_saw["cc_vbios"]) == {"GPU-a", "GPU-b"}
+    assert await ctx.services.redis.get("gpu_identity:uuid:GPU-a")  # pins still written
+    record = next(r for r in caplog.records if "VBIOS" in r.getMessage())
+    assert record.cc_vbios["GPU-a"]["minimum"] == "97.00.E4.00.XX" and record.enforced is False
+
+
+@pytest.mark.asyncio
+async def test_cc_vbios_below_minimum_fails_only_under_its_flag(context_factory):
+    ca = FakeCa()
+    result = await _run(_cc_b200_ctx(context_factory, ca, "97.00.C5.00.2D"), ca, enforce=False, enforce_cc_vbios=True)
+    assert result.passed is False
+    assert result.event.reason_code == Msg.CC_VBIOS_BELOW_MINIMUM.reason
+    ok = await _run(_cc_b200_ctx(context_factory, ca, "97.00.E4.00.2D"), ca, enforce=False, enforce_cc_vbios=True)
+    assert ok.passed is True and "cc_vbios" not in ok.event.what_we_saw
