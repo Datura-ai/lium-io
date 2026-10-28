@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import neurons.validators.src.services.gpu_power_limit as gpl
 import pytest
+from helpers import FakeRedis as SharedFakeRedis
 from neurons.validators.src.services.gpu_power_limit import (
     POWER_STATE_CMD,
     GpuPowerRestoreRecord,
@@ -134,24 +135,102 @@ async def test_pod_index_delete_failure_after_successful_restore(require_complet
     assert redis.store == {_pod_index_key(POD_ID): '["GPU-a"]'}
 
 
+def _power(*watts: int) -> dict[str, gpl.GpuPowerState]:
+    return {
+        f"GPU-{index}": gpl.GpuPowerState(current_watts=w, min_watts=100, max_watts=450, default_watts=350)
+        for index, w in enumerate(watts)
+    }
+
+
+async def _rental_start(monkeypatch, redis, states, pod_id: str = "pod-1") -> int:
+    monkeypatch.setattr(gpl, "_query_power_state", AsyncMock(return_value=states))
+    return await gpl.raise_low_power_limits_to_default(
+        AsyncMock(), "ex-1", list(states), redis=redis, pod_id=pod_id
+    )
+
+
+def _ratio(redis, gpu_uuid: str) -> dict:
+    return json.loads(redis.store[gpl.rental_start_ratio_key("ex-1", gpu_uuid)])
+
+
 @pytest.mark.asyncio
 async def test_rental_start_raise_keeps_the_80_percent_tier_and_records_each_pod_gpu(monkeypatch) -> None:
-    states = {
-        "GPU-tier": gpl.GpuPowerState(current_watts=298, min_watts=100, max_watts=450, default_watts=350),
-        "GPU-low": gpl.GpuPowerState(current_watts=200, min_watts=100, max_watts=450, default_watts=350),
-        "GPU-other-pod": gpl.GpuPowerState(current_watts=298, min_watts=100, max_watts=450, default_watts=350),
-    }
-    monkeypatch.setattr(gpl, "_query_power_state", AsyncMock(return_value=states))
+    states = _power(298, 200, 298)
     set_side_by_side = AsyncMock(return_value=1)
     monkeypatch.setattr(gpl, "_set_side_by_side", set_side_by_side)
-    redis = FakeRedis()
+    monkeypatch.setattr(gpl, "_query_power_state", AsyncMock(return_value=states))
+    redis = SharedFakeRedis()
 
     raised = await gpl.raise_low_power_limits_to_default(
-        AsyncMock(), "ex-1", ["GPU-tier", "GPU-low"], redis=redis, pod_id="pod-1"
+        AsyncMock(), "ex-1", ["GPU-0", "GPU-1"], redis=redis, pod_id="pod-1"
     )
 
     assert raised == 1
-    assert [gpu.gpu_uuid for gpu in set_side_by_side.await_args.args[1]] == ["GPU-low"]  # 85 % is left alone
-    assert json.loads(redis.store[gpl.rental_start_ratio_key("ex-1", "GPU-tier")]) == {"pod_id": "pod-1", "ratio": 0.8514}
-    assert json.loads(redis.store[gpl.rental_start_ratio_key("ex-1", "GPU-low")]) == {"pod_id": "pod-1", "ratio": 1.0}
-    assert gpl.rental_start_ratio_key("ex-1", "GPU-other-pod") not in redis.store  # another pod's GPU
+    assert [gpu.gpu_uuid for gpu in set_side_by_side.await_args.args[1]] == ["GPU-1"]  # 85 % is left alone
+    assert _ratio(redis, "GPU-0") == {"pod_id": "pod-1", "ratio": 0.8514}
+    assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": 1.0}
+    assert gpl.rental_start_ratio_key("ex-1", "GPU-2") not in redis.store  # another pod's GPU
+
+
+@pytest.mark.parametrize(
+    ("first_pod", "second_pod", "expected"),
+    [
+        ("pod-1", "pod-1", {"pod_id": "pod-1", "ratio": 1.0}),  # reboot / edit: the start stands
+        ("pod-0", "pod-1", {"pod_id": "pod-1", "ratio": 0.8514}),  # a new rental: its own start
+    ],
+)
+@pytest.mark.asyncio
+async def test_rental_start_record_survives_a_reboot_of_the_same_rental(
+    monkeypatch, first_pod, second_pod, expected
+) -> None:
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    redis = SharedFakeRedis()
+    await _rental_start(monkeypatch, redis, _power(350), first_pod)
+    await _rental_start(monkeypatch, redis, _power(298), second_pod)  # host cut to 85 % meanwhile
+    assert _ratio(redis, "GPU-0") == expected
+
+
+@pytest.mark.asyncio
+async def test_rental_start_of_a_rental_from_before_the_records_records_stock(monkeypatch) -> None:
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    redis = SharedFakeRedis()
+    redis.store[gpl.rental_legacy_pod_key("pod-1")] = "1"
+    await _rental_start(monkeypatch, redis, _power(298))
+    assert _ratio(redis, "GPU-0") == {"pod_id": "pod-1", "ratio": 1.0}
+
+
+@pytest.mark.parametrize(
+    ("watts", "failing_gpus", "raises"),
+    [
+        ((280,), {"GPU-0"}, True),  # a tier rental without its record would be held at 90 %
+        ((350, 280), {"GPU-1"}, True),  # partial: the tier GPU's write failed
+        ((350, 280), {"GPU-0"}, False),  # a stock GPU without a record is held at 90 % anyway
+    ],
+)
+@pytest.mark.asyncio
+async def test_rental_start_record_write_failure_fails_the_create_then_a_retry_records(
+    monkeypatch, watts, failing_gpus, raises
+) -> None:
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    redis = SharedFakeRedis()
+    redis.fail_next_set_of = {gpl.rental_start_ratio_key("ex-1", u) for u in failing_gpus}
+    if raises:
+        with pytest.raises(gpl.GpuPowerRestoreStateError):
+            await _rental_start(monkeypatch, redis, _power(*watts))
+        await _rental_start(monkeypatch, redis, _power(*watts))  # the retried create
+        assert all(_ratio(redis, f"GPU-{i}")["pod_id"] == "pod-1" for i in range(len(watts)))
+    else:
+        await _rental_start(monkeypatch, redis, _power(*watts))
+
+
+@pytest.mark.asyncio
+async def test_rental_start_record_read_outage_fails_the_create(monkeypatch) -> None:
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    with pytest.raises(gpl.GpuPowerRestoreStateError):
+        await _rental_start(monkeypatch, SharedFakeRedis(failing=True), _power(280))
+
+
+@pytest.mark.asyncio
+async def test_raise_without_redis_never_records_or_raises(monkeypatch) -> None:
+    monkeypatch.setattr(gpl, "_query_power_state", AsyncMock(side_effect=RuntimeError("nvidia-smi hung")))
+    assert await gpl.raise_low_power_limits_to_default(AsyncMock(), "ex-1", None) == 0

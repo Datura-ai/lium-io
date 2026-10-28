@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from typing import Any
 
 from pydantic import BaseModel
 from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
+    RENTAL_START_RATIO_TTL_SECONDS,
     RENTED_MIN_POWER_LIMIT_RATIO,
     STALE_CAP_GRACE_SECONDS,
     GpuPowerRestoreRecord,
     read_gpu_power_restore_records,
+    rental_legacy_pod_key,
     rental_start_ratio_key,
     restore_tracked_gpu_power_limits,
 )
@@ -173,8 +176,12 @@ class GpuPowerLimitCheck:
         A GPU whose rental-start record names a pod rented now keeps min(its ratio then,
         RENTED_MIN_POWER_LIMIT_RATIO), never under MIN_POWER_LIMIT_RATIO, so a renter who rented
         it in the 80 % tier keeps that cap and nobody else's power drops mid-rental. Other GPUs
-        get MIN_POWER_LIMIT_RATIO when every rented pod has a record (they are not rented: a split
-        node's free bundle), else RENTED_MIN_POWER_LIMIT_RATIO (a rental from before the records).
+        get MIN_POWER_LIMIT_RATIO only when every settled pod has a record for each of its
+        `gpu_count` GPUs (so they are not rented: a split node's free bundle), else
+        RENTED_MIN_POWER_LIMIT_RATIO. A pod whose container the backend has not recorded yet is
+        still being created; its records are written before its container starts, so it is not
+        judged. A settled pod with no record at all is a rental from before the records: it is
+        marked so its next create (a reboot or edit) records 1.0, never the limit of that day.
         Unrented node, or Redis did not answer: {} = MIN_POWER_LIMIT_RATIO everywhere; our own
         outage must not zero a node.
         """
@@ -189,7 +196,7 @@ class GpuPowerLimitCheck:
             return {}
         rented_pod_ids = {pod.pod_id for pod in rented.pods}
         floors: dict[str, float] = {}
-        recorded_pods: set[str] = set()
+        records_by_pod: Counter[str] = Counter()
         for gpu_uuid, value in zip(uuids, raw):
             if not value:
                 continue
@@ -199,10 +206,23 @@ class GpuPowerLimitCheck:
             except (ValueError, TypeError, KeyError):
                 continue  # a corrupt record proves nothing: the GPU takes the "" floor
             if pod_id in rented_pod_ids:
-                recorded_pods.add(pod_id)
+                records_by_pod[pod_id] += 1
                 # 0.005 slack: the record is read from nvidia-smi in whole watts, the check from the scrape
                 floors[gpu_uuid] = max(MIN_POWER_LIMIT_RATIO, min(RENTED_MIN_POWER_LIMIT_RATIO, ratio - 0.005))
-        floors[""] = MIN_POWER_LIMIT_RATIO if rented_pod_ids <= recorded_pods else RENTED_MIN_POWER_LIMIT_RATIO
+        settled = [pod for pod in rented.pods if not pod.container_name_pending]
+        every_gpu_recorded = all(
+            pod.gpu_count is not None and records_by_pod[pod.pod_id] >= pod.gpu_count for pod in settled
+        )
+        floors[""] = MIN_POWER_LIMIT_RATIO if every_gpu_recorded else RENTED_MIN_POWER_LIMIT_RATIO
+        if self.restore_stale_caps:  # the dry-run pipeline writes nothing
+            for pod in settled:
+                if not records_by_pod[pod.pod_id]:
+                    try:
+                        await ctx.services.redis.set(
+                            rental_legacy_pod_key(pod.pod_id), "1", ex=RENTAL_START_RATIO_TTL_SECONDS
+                        )
+                    except Exception:
+                        pass  # marked on a later cycle
         return floors
 
     async def _rescue_stale_lium_caps(

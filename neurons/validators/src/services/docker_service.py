@@ -7721,6 +7721,7 @@ class DockerService:
         host_probe: PrerunHostProbe | None,
         default_extra: dict,
         concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
+        record_rental_start: bool = False,
     ) -> None:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
@@ -7754,8 +7755,9 @@ class DockerService:
             payload.gpu_uuids or None,
             log_extra=default_extra,
             concurrency=concurrency,
-            redis=self.redis_service,
-            pod_id=payload.pod_id,
+            # the create's last power read is the limit the rental starts on (DAH-5302)
+            redis=self.redis_service if record_rental_start else None,
+            pod_id=payload.pod_id if record_rental_start else None,
         )
 
     async def _run_create_steps_after_reply(
@@ -8963,9 +8965,17 @@ class DockerService:
                     # restore a filler create may have capped these GPUs (its Redis records) or the
                     # host may have lowered a limit with no record (the live floor raise).
                     if not beside_fillers:
-                        await self._restore_gpu_power_for_uncapped_pod(
-                            ssh_client, payload, host_probe, default_extra
-                        )
+                        try:
+                            await self._restore_gpu_power_for_uncapped_pod(
+                                ssh_client,
+                                payload,
+                                host_probe,
+                                default_extra,
+                                record_rental_start=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
+                            )
+                        except GpuPowerRestoreStateError:
+                            current_step = "gpu_power_restore_state"  # our Redis, not the host's fault
+                            raise
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
