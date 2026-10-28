@@ -36,6 +36,13 @@ RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
 # restic sizes its worker pools from GOMAXPROCS (~7.5 MiB per CPU); unpinned, 192+ CPU hosts hit 4g in seconds.
 RESTIC_HELPER_GOMAXPROCS = "8"
 RESTIC_HELPER_MEMORY = "4g"
+# restic restore loads the whole repository index before writing a byte, so its memory follows the repository,
+# not the restore. Restores that ran uncapped were SIGKILLed under 4g in restic's scan; 16g is unmeasured headroom,
+# limited to a quarter of host RAM so small hosts keep room for the rental, never under the 4g backups get.
+# oom-score-adj 1000 still makes the helper the first victim. Legacy tar restores load no index and keep 4g.
+RESTIC_RESTORE_HELPER_MAX_MIB = 16 * 1024
+RESTIC_HELPER_MIN_MIB = 4 * 1024
+MEMINFO_PATH = "/proc/meminfo"
 # Highest OOM score: the kernel kills the helper before the rental.
 RESTIC_HELPER_OOM_SCORE_ADJ = "1000"
 RESTIC_HELPER_GOGC = "50"
@@ -51,6 +58,16 @@ BACKUP_SOURCE_MISSING_EXIT = 66
 
 # restic 0.19.1 prints this as the exit_error JSON "message" with --json, else as a plain stderr line
 SNAPSHOT_EMPTY_MESSAGE = "Fatal: unable to save snapshot: snapshot is empty"
+
+def restic_restore_helper_memory(meminfo_path: str = MEMINFO_PATH) -> str:
+    try:
+        with open(meminfo_path, encoding="ascii") as meminfo:
+            total_kib = next(int(line.split()[1]) for line in meminfo if line.startswith("MemTotal:"))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return RESTIC_HELPER_MEMORY
+    quarter_mib = total_kib // 4 // 1024
+    return f"{max(RESTIC_HELPER_MIN_MIB, min(RESTIC_RESTORE_HELPER_MAX_MIB, quarter_mib))}m"
+
 
 class ResticOperationError(RuntimeError):
     def __init__(self, message: str, *, error_code: str | None = None) -> None:
@@ -68,6 +85,8 @@ class CredentialsExpired(ResticOperationError):
 
 # DAH-4945: the backend renews scoped credentials up to 4 sessions' worth after the backup started.
 CREDENTIAL_RENEWALS = 3
+# one rerun after an S3 network timeout: restic keeps the packs it already uploaded, so the rerun sends only the rest
+TRANSIENT_UPLOAD_RERUNS = 1
 
 
 @dataclass(frozen=True)
@@ -116,6 +135,10 @@ class JsonEventWriter:
 
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
+
+    def rerun(self) -> None:
+        """the next restic run starts over: its own failure, not this one's, describes the operation"""
+        self._write({"event": "rerun", "operation_id": self._operation_id})
 
     def stage(self, stage: str) -> None:
         self._write({"event": "stage", "operation_id": self._operation_id, "stage": stage})
@@ -192,6 +215,7 @@ class ResticStorageRunner:
         )
         self._environment = self._build_environment()
         self._snapshot_empty = False
+        self._last_error_text = ""
         self._helper_oom_killed = False
 
     def run(self) -> ResticResult:
@@ -392,17 +416,28 @@ class ResticStorageRunner:
                 raise ResticOperationError("the backup path is not a directory")
             if not path.exists() or not any(path.iterdir()):
                 return nothing
-        renewals = 0
+        renewals = reruns = 0
         while True:
+            self._last_error_text = ""
             try:
                 exit_code, summary = self._stream(command, working_directory=True)
-                break
             except CredentialsExpired:
                 if renewals >= CREDENTIAL_RENEWALS:
                     raise
                 renewals += 1
                 # restic resumes from the blobs its repository already indexed
                 self._renew_credentials()
+                continue
+            if (
+                exit_code not in (0, 3, SIGKILL_EXIT)
+                and not _snapshot_id(summary)
+                and reruns < TRANSIENT_UPLOAD_RERUNS
+                and _transient_upload_failure(self._last_error_text)
+            ):
+                reruns += 1
+                self._events.rerun()
+                continue
+            break
         snapshot_id = _snapshot_id(summary)
         # DAH-4693: an empty snapshot is a no-op only when excludes removed every file
         snapshot_empty = self._snapshot_empty and bool(self._operation.workspace.exclude_patterns)
@@ -448,6 +483,12 @@ class ResticStorageRunner:
             raise ResticOperationError("restore requires a snapshot ID")
         command, cwd = self._restore_execution_command(snapshot_id)
         exit_code, _ = self._stream_command(command, cwd)
+        if exit_code == SIGKILL_EXIT:
+            raise ResticOperationError(
+                "restore ran out of memory"
+                if self._helper_oom_killed
+                else "restore helper was killed (often out of memory)"
+            )
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
         self._events.stage("FINALIZING")
@@ -556,6 +597,8 @@ class ResticStorageRunner:
                 except json.JSONDecodeError:
                     if not _snapshot_id(summary):
                         self._raise_if_credentials_expired(line)
+                        if line.startswith("Fatal:"):
+                            self._last_error_text = line
                     self._events.diagnostic(_redact(line, self._secret_values()))
                     continue
                 if not isinstance(payload, dict):
@@ -566,6 +609,7 @@ class ResticStorageRunner:
                 # an expiry after the summary (restic's lock cleanup) must not rerun a finished backup
                 if not _snapshot_id(summary):
                     self._raise_if_credentials_expired(_error_text(payload))
+                    self._last_error_text = _error_text(payload) or self._last_error_text
                 self._events.restic_event(payload)
                 self._events.heartbeat_if_due()
                 self._cancel_if_requested(process)
@@ -796,7 +840,9 @@ class ResticStorageRunner:
             "--log-driver",
             "none",
             "--memory",
-            RESTIC_HELPER_MEMORY,
+            restic_restore_helper_memory()
+            if self._operation.action is StorageAction.RESTORE and self._operation.engine is StorageEngine.RESTIC
+            else RESTIC_HELPER_MEMORY,
             "--oom-score-adj",
             RESTIC_HELPER_OOM_SCORE_ADJ,
             "-e",
@@ -873,6 +919,15 @@ def _is_retryable_repository_failure(failure_detail: str) -> bool:
     # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
     normalized_detail = "".join(failure_detail.casefold().split())
     return any(marker in normalized_detail for marker in retryable_failure_markers)
+
+
+def _transient_upload_failure(error_text: str) -> bool:
+    # restic gives up on an S3 upload after its own retries; 24h on 27 Oct: 11 auto backups failed on
+    # "Fatal: unable to save snapshot: client.PutObject: Put ...: request timeout"
+    text = error_text.casefold()
+    return "unable to save snapshot" in text and any(
+        marker in text for marker in ("request timeout", "i/o timeout", "connection reset", "tls handshake timeout")
+    )
 
 
 def _credentials_expired(error_text: str) -> bool:
