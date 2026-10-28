@@ -1,5 +1,5 @@
 """DAH-4564 — RentedPodResourcesCheck: a host script that `docker update`s a renter's pod onto fewer
-cores or a smaller quota fails only under enforcement; a raised oom_score_adj is recorded, never
+cores or a smaller quota fails; a raised oom_score_adj is recorded, never
 failed; an inability to measure never fails."""
 
 from __future__ import annotations
@@ -62,10 +62,9 @@ def _ctx(context_factory, ssh):
     return context_factory(state=state, ssh=ssh)
 
 
-async def _run(ctx, enforce=False):
+async def _run(ctx):
     with patch(SETTINGS) as s:
         s.RENTED_POD_RESOURCES_CHECK_ENABLED = True
-        s.RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED = enforce
         return await RentedPodResourcesCheck().run(ctx)
 
 
@@ -75,47 +74,46 @@ def _findings(result):
 
 @pytest.mark.asyncio
 async def test_clean_pod_passes(context_factory):
-    result = await _run(_ctx(context_factory, _ssh(_container())), enforce=True)
+    result = await _run(_ctx(context_factory, _ssh(_container())))
     assert result.passed is True
     assert result.event.reason_code == Msg.RESOURCES_OK.reason
     assert _findings(result) == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enforce", [False, True])
-async def test_pinned_cpuset_fails_only_when_enforced(context_factory, enforce):
+async def test_pinned_cpuset_fails_and_zeroes_the_score(context_factory):
     # executor_protect.sh: 8 cores rented, pinned to 6 of them
-    result = await _run(_ctx(context_factory, _ssh(_container(cpuset="2-7"))), enforce=enforce)
+    result = await _run(_ctx(context_factory, _ssh(_container(cpuset="2-7"))))
     assert result.event.reason_code == Msg.RESOURCES_REDUCED.reason
     assert _findings(result) == ["cpuset_pinned"]
-    assert result.passed is (not enforce)
-    assert result.updates == ({"rented_pod_resources_passed": False} if enforce else {})
+    assert result.passed is False
+    assert result.updates == {"rented_pod_resources_passed": False}
 
 
 @pytest.mark.asyncio
 async def test_cpuset_covering_the_entitlement_is_not_pinned(context_factory):
-    result = await _run(_ctx(context_factory, _ssh(_container(cpuset="0-7"))), enforce=True)
+    result = await _run(_ctx(context_factory, _ssh(_container(cpuset="0-7"))))
     assert result.passed is True
 
 
 @pytest.mark.asyncio
 async def test_cpuset_without_label_or_quota_is_judged_against_host_cpus(context_factory):
     result = await _run(
-        _ctx(context_factory, _ssh(_container(cpuset="0-31", nano=0, label=None))), enforce=True
+        _ctx(context_factory, _ssh(_container(cpuset="0-31", nano=0, label=None)))
     )
     assert _findings(result) == ["cpuset_pinned"]
 
 
 @pytest.mark.asyncio
-async def test_reduced_nano_cpus_fails_under_enforcement(context_factory):
-    result = await _run(_ctx(context_factory, _ssh(_container(nano=4_000_000_000))), enforce=True)
+async def test_reduced_nano_cpus_fails(context_factory):
+    result = await _run(_ctx(context_factory, _ssh(_container(nano=4_000_000_000))))
     assert result.passed is False
     assert _findings(result) == ["cpu_quota_reduced"]
 
 
 @pytest.mark.asyncio
 async def test_raised_oom_score_is_recorded_never_failed(context_factory):
-    result = await _run(_ctx(context_factory, _ssh(_container(), init_oom=1000)), enforce=True)
+    result = await _run(_ctx(context_factory, _ssh(_container(), init_oom=1000)))
     assert result.passed is True
     assert result.updates == {}
     assert _findings(result) == ["oom_priority_raised"]
@@ -127,7 +125,7 @@ async def test_raised_oom_score_is_recorded_never_failed(context_factory):
     "ssh", [_ssh(raise_exc=asyncssh.Error(1, "boom")), _ssh(raise_exc=OSError("down")), _ssh(None)]
 )
 async def test_inability_to_measure_passes(context_factory, ssh):
-    result = await _run(_ctx(context_factory, ssh), enforce=True)
+    result = await _run(_ctx(context_factory, ssh))
     assert result.passed is True
     assert result.event.reason_code == Msg.RESOURCES_UNKNOWN.reason
 
@@ -142,12 +140,10 @@ async def test_disabled_skips(context_factory):
     assert result.event.reason_code == Msg.SKIPPED.reason
 
 
-def test_reporting_on_and_enforcement_off_by_default():
+def test_check_on_by_default():
     from core.config import Settings
 
-    fields = Settings.model_fields
-    assert fields["RENTED_POD_RESOURCES_CHECK_ENABLED"].default is True
-    assert fields["RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED"].default is False
+    assert Settings.model_fields["RENTED_POD_RESOURCES_CHECK_ENABLED"].default is True
 
 
 # 100 advertised cores; the owner's floor is 95% (MIN_RENTAL_CPU_SHARE) in both cpuset and quota.
@@ -176,7 +172,7 @@ def test_reporting_on_and_enforcement_off_by_default():
     ],
 )
 async def test_95_percent_floor(context_factory, container, findings):
-    result = await _run(_ctx(context_factory, _ssh(container)), enforce=True)
+    result = await _run(_ctx(context_factory, _ssh(container)))
     assert _findings(result) == findings
     assert result.passed is (not findings)
 
@@ -198,6 +194,6 @@ async def test_95_percent_floor(context_factory, container, findings):
 )
 async def test_cgroup_written_directly_is_seen(context_factory, cgroup_cpuset, cpu_max, findings):
     ssh = _ssh(_container(), cgroup_cpuset=cgroup_cpuset, cpu_max=cpu_max)
-    result = await _run(_ctx(context_factory, ssh), enforce=True)
+    result = await _run(_ctx(context_factory, ssh))
     assert _findings(result) == findings
     assert result.passed is (not findings)

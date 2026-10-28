@@ -221,7 +221,8 @@
         "CancelStorageOperationRequest",
         "InstallJupyterServer",
         "ForcedValidationCycleRequest",
-        "GetEstimateRequest"
+        "GetEstimateRequest",
+        "ResetPodGpuRequest"
       ],
       "title": "BackendMessageType",
       "type": "string"
@@ -2852,6 +2853,11 @@
           "default": null,
           "title": "Build Log Tail"
         },
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "detail": {
           "anyOf": [
             {
@@ -3348,6 +3354,61 @@
         "watts"
       ],
       "title": "GpuPowerLimit",
+      "type": "object"
+    },
+    "GpuResetErrorCode": {
+      "description": "1.16.0: why a pod GPU reset did not run, or did not finish.",
+      "enum": [
+        "MigEnabled",
+        "NvlinkPeersOutsidePod",
+        "GpuInUseOutsidePod",
+        "ResetNotSupported",
+        "GpuNotInContainer",
+        "ContainerNotFound",
+        "OperationInProgress",
+        "ExecutorUnreachable"
+      ],
+      "title": "GpuResetErrorCode",
+      "type": "string"
+    },
+    "GpuResetOutcome": {
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "index": {
+          "title": "Index",
+          "type": "integer"
+        },
+        "result": {
+          "enum": [
+            "reset",
+            "latch_cleared",
+            "failed"
+          ],
+          "title": "Result",
+          "type": "string"
+        },
+        "uuid": {
+          "title": "Uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "uuid",
+        "result"
+      ],
+      "title": "GpuResetOutcome",
       "type": "object"
     },
     "IncentiveReason": {
@@ -4092,6 +4153,120 @@
         "observed_at"
       ],
       "title": "PodContainerState",
+      "type": "object"
+    },
+    "PodGpuResetResult": {
+      "description": "1.16.0: the answer to `backend_to_validator.ResetPodGpuRequest`, same `request_id`. `gpus` is\none outcome per GPU the validator reset (possibly more than asked: NVLink peers inside the pod are\nreset together); empty when a precheck refused before anything changed.",
+      "properties": {
+        "container_restarted": {
+          "default": false,
+          "title": "Container Restarted",
+          "type": "boolean"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GpuResetErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "gpus": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GpuResetOutcome"
+          },
+          "title": "Gpus",
+          "type": "array"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "PodGpuResetResult"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "ok": {
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "request_id",
+        "ok"
+      ],
+      "title": "PodGpuResetResult",
       "type": "object"
     },
     "PodHostRebootRecoveredRequest": {
@@ -5061,6 +5236,112 @@
       "title": "RentedPod",
       "type": "object"
     },
+    "ResetPodGpuRequest": {
+      "description": "1.16.0: the renter asked to reset the GPUs of their running pod. `gpu_uuids` is every GPU\nthe backend holds for the pod; `gpu_indices` picks some of them by pod index (the pod's GPUs sorted by\nhost PCI bus id, the 0..n-1 order `nvidia-smi` shows inside the pod), None for all of them. Answered by\n`validator_to_backend.PodGpuResetResult` with the same `request_id`.",
+      "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "gpu_indices": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Indices"
+        },
+        "gpu_uuids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Gpu Uuids",
+          "type": "array"
+        },
+        "local_volume_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume Path"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ResetPodGpuRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name",
+        "gpu_uuids",
+        "request_id"
+      ],
+      "title": "ResetPodGpuRequest",
+      "type": "object"
+    },
     "ResetVerifiedJobReason": {
       "enum": [
         0,
@@ -5255,6 +5536,11 @@
         "pod_id": {
           "title": "Pod Id",
           "type": "string"
+        },
+        "recovery": {
+          "default": false,
+          "title": "Recovery",
+          "type": "boolean"
         },
         "repository_password": {
           "anyOf": [
@@ -5454,6 +5740,11 @@
     },
     "SshPubKeyAdded": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -5748,7 +6039,8 @@
         "DebugSshKeyAdded",
         "FailedAddDebugSshKey",
         "JupyterServerInstalled",
-        "JupyterInstallationFailed"
+        "JupyterInstallationFailed",
+        "PodGpuResetResult"
       ],
       "title": "ValidatorMessageType",
       "type": "string"
@@ -5819,6 +6111,9 @@
     "RemoveSshPublicKeysRequest": {
       "$ref": "#/$defs/RemoveSshPublicKeysRequest"
     },
+    "ResetPodGpuRequest": {
+      "$ref": "#/$defs/ResetPodGpuRequest"
+    },
     "RestoreContainerRequest": {
       "$ref": "#/$defs/RestoreContainerRequest"
     }
@@ -5855,7 +6150,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.13.0",
+  "protocol_version": "1.16.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
@@ -5924,6 +6219,9 @@
     },
     "NormalizedScoreRequest": {
       "$ref": "#/$defs/NormalizedScoreRequest"
+    },
+    "PodGpuResetResult": {
+      "$ref": "#/$defs/PodGpuResetResult"
     },
     "PodLogsResponseToServer": {
       "$ref": "#/$defs/PodLogsResponseToServer"

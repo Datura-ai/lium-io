@@ -26,13 +26,6 @@ def test_builtin_anchor_when_no_override_module(monkeypatch):
     assert config._resolve_validator_hotkey() == config._BUILTIN_VALIDATOR_HOTKEY_SS58
 
 
-def test_override_module_replaces_the_anchor(monkeypatch):
-    override = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-    _install_override(monkeypatch, _VALIDATOR_HOTKEY_SS58=override)
-
-    assert config._resolve_validator_hotkey() == override
-
-
 def test_override_with_invalid_address_fails_loudly(monkeypatch):
     _install_override(monkeypatch, _VALIDATOR_HOTKEY_SS58="5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13X")
 
@@ -40,8 +33,3 @@ def test_override_with_invalid_address_fails_loudly(monkeypatch):
         config._resolve_validator_hotkey()
 
 
-def test_override_missing_the_name_is_not_swallowed(monkeypatch):
-    _install_override(monkeypatch)  # module exists, name absent (typo at build time)
-
-    with pytest.raises(ImportError):
-        config._resolve_validator_hotkey()

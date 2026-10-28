@@ -7,7 +7,14 @@ import pytest
 
 from clients.compute_client import ComputeClient, OutgoingMessages
 from core.config import settings
-from payload_models.payloads import ContainerCreateRequest, ContainerCreated
+from payload_models.payloads import (
+    AddSshPublicKeyRequest,
+    ContainerCreateRequest,
+    ContainerCreated,
+    FailedContainerErrorTypes,
+    FailedContainerRequest,
+    SshPubKeyAdded,
+)
 from services.redis_service import BACKEND_COMMAND_PREFIX, RedisService
 
 
@@ -207,3 +214,33 @@ async def test_redis_failure_fails_open(client, monkeypatch, operation):
     await client.miner_driver(request())
     assert client.miner_service.handle_container.await_count == 1
     assert len(client.message_queue) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [
+        SshPubKeyAdded(miner_hotkey="miner", executor_id="executor", pod_id="pod", user_public_keys=["k"]),
+        FailedContainerRequest(
+            miner_hotkey="miner",
+            executor_id="executor",
+            pod_id="pod",
+            error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+            msg="failed",
+        ),
+    ],
+)
+async def test_ssh_key_add_answer_echoes_the_request_command_id(client, answer):
+    client.miner_service.handle_container.return_value = answer
+    add = AddSshPublicKeyRequest(
+        command_id="restore:1",
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        container_name="container",
+        user_public_keys=["k"],
+    )
+
+    await client.miner_driver(add)
+
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["restore:1"]

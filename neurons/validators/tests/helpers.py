@@ -226,6 +226,10 @@ class FakeRedis:
         if key in self.store or key in self.hashes:
             self.ttl[key] = seconds
 
+    async def persist(self, key: str):
+        self._touch()
+        self.ttl.pop(key, None)
+
 
 def default_executor() -> ExecutorSSHInfo:
     return ExecutorSSHInfo(

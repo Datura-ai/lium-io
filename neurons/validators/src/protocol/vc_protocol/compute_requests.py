@@ -15,8 +15,7 @@ GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
 GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
 # DAH-2671: the rental-verification container was created with `--cpus=<advertised>` and the host's
 # Docker daemon rejected the count — the machine has fewer physical cores than the miner reported.
-# Unlike the two GPU faults above this is spec fraud, not a broken runtime, and it is rolled out
-# shadow-first (see RENTAL_CPU_LIMIT_* in core/config.py).
+# Unlike the two GPU faults above this is spec fraud, not a broken runtime; it zeroes the score.
 CPU_QUOTA_EXCEEDS_HOST_REASON = "CPU_QUOTA_EXCEEDS_HOST"
 
 
@@ -139,6 +138,10 @@ class ManualRentalInfo(BaseModel):
     gpu_count: int
 
 
+# the window the backend takes each filler average over
+FILLER_REVENUE_WINDOW_HOURS = 24
+
+
 class FillerRevenueByGpuConfig(BaseModel):
     """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
     over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
@@ -222,6 +225,22 @@ class RentedExecutorsResponse(BaseModel):
                 return None
             return entry.usd_per_gpu_hour
         return None
+
+    def get_filler_revenue_usd_per_hour(self, base_model: str | None, min_gpu_hours: float) -> float | None:
+        """What Lium's fillers earned per hour in total on a GPU model, over every configuration with a
+        usable sample (the trailing 24 hours of each average); None when there is none."""
+        if not base_model:
+            return None
+        totals: list[float] = [
+            entry.usd_per_gpu_hour * entry.gpu_hours / FILLER_REVENUE_WINDOW_HOURS
+            for entry in self.filler_revenue_by_gpu_config
+            if entry.base_model == base_model
+            and entry.gpu_hours >= min_gpu_hours
+            and entry.usd_per_gpu_hour > 0
+            and math.isfinite(entry.usd_per_gpu_hour)
+            and math.isfinite(entry.gpu_hours)
+        ]
+        return sum(totals) if totals else None
 
     def is_provider_banned(
         self,
