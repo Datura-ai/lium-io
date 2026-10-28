@@ -4,6 +4,7 @@ fetched from PyPI at under 1 Mbps. The check measures from inside a container, t
 from __future__ import annotations
 
 import json
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -90,13 +91,19 @@ class Clock:
     def time(self) -> float:
         return self.now
 
+    def monotonic(self) -> float:
+        return time.monotonic()
+
 
 @contextmanager
-def flags(*, reachable=True):
+def flags(*, reachable=True, sustained=False):
     fake = SimpleNamespace(
         CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED=True,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
         CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS=6.0,
+        CONTAINER_DOWNLOAD_SUSTAINED_ENABLED=sustained,
+        CONTAINER_DOWNLOAD_SUSTAINED_URL="https://cdn.example/public/big.bin",
+        JOB_TIME_OUT=900,
     )
     clock = Clock()
 
@@ -331,3 +338,103 @@ async def test_a_deploy_keeps_the_open_streak_saved_under_the_uuid_alone():
         ctx, _, _ = make_ctx(SLOW, redis=redis)
         res = await ContainerDownloadSpeedCheck().run(ctx)
     assert not res.passed and res.event.reason_code == Msg.SLOW.reason
+
+
+# DAH-5320 sustained phase: cumulative received bytes every 10 s, then each stream's exit
+
+
+def sustained(mbps: list[float], rcs=(143, 143, 143, 143), alive_after: int | None = None) -> str:
+    rx, out = 0, [f"lium_dls t=0.00 rx=0 alive={4 if mbps else 0}"]
+    for i, m in enumerate(mbps, 1):
+        rx += int(m * 1e6 / 8 * 10)
+        alive = 0 if alive_after is not None and i >= alive_after else 4
+        out.append(f"lium_dls t={i * 10}.00 rx={rx} alive={alive}")
+    out += [f"lium_dls_rc s={s} rc={rc} err=" for s, rc in enumerate(rcs, 1)]
+    return RENTALS + "\n".join(out) + "\n"
+
+
+@pytest.mark.parametrize(
+    ("mbps", "verdict"),
+    [
+        ([400, 380, 420, 410, 390, 405], "pass"),
+        ([400, 90, 80, 95, 85, 400], "fail"),  # median 92.5
+        ([900, 900, 0.2, 0.1, 0.0, 0.3], "fail"),  # 40 s stalled after a fast start
+    ],
+)
+def test_sustained_verdict_on_the_window_series(mbps, verdict):
+    windows, errors = module.parse_sustained(sustained(mbps))
+    assert errors == [] and len(windows) == 6
+    assert module.sustained_verdict(windows) == verdict
+
+
+def test_sustained_stall_needs_more_than_30_s():
+    # the stall rule alone, as a series with fewer windows (an object read whole) can trip it under a passing median
+    assert module.sustained_verdict([500, 0.1, 0.1, 0.1, 500, 500, 500]) == "pass"
+    assert module.sustained_verdict([500, 0.1, 0.1, 0.1, 0.1, 500, 500, 500, 500, 500]) == "fail"
+
+
+def test_sustained_object_read_whole_early_drops_the_idle_windows_and_a_stream_error_is_no_verdict():
+    windows, errors = module.parse_sustained(sustained([3000, 3000, 0, 0, 0, 0], rcs=(0, 0, 0, 0), alive_after=2))
+    assert windows == [3000.0, 3000.0] and not errors and module.sustained_verdict(windows) == "pass"
+    windows, errors = module.parse_sustained(sustained([0.0], rcs=(1, 1, 1, 1), alive_after=1))
+    assert errors and len(errors) == 4  # e.g. the object answers 403: not the node's fault
+    assert module.parse_sustained(RENTALS)[1] == ["no_output"]
+
+
+async def test_sustained_runs_once_a_day_at_the_node_phase_and_never_changes_the_result(caplog):
+    with flags(sustained=True) as clock, caplog.at_level("INFO"):
+        ctx, runner, redis = make_ctx(FAST, sustained([5, 5, 5, 5, 5, 5]), redis=FakeRedis())
+        check = ContainerDownloadSpeedCheck()
+        key = f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"
+        with patch.object(module, "_phase_fraction", lambda uuid: 1.0):
+            first = await check.run(ctx)  # first sight: the short phase, sustained only due at the node's phase
+        assert len(runner.commands) == 1 and key in redis.store
+        res = await check.run(ctx)  # due now: the shadow fail is logged, the short phase's "not due" stands
+        assert len(runner.commands) == 2 and "wget -q -O /dev/null" in runner.commands[1]
+        assert first.passed and res.passed and res.event.reason_code == Msg.SKIPPED.reason
+        record = next(r for r in caplog.records if "CONTAINER_DOWNLOAD_SUSTAINED" in r.getMessage())
+        extra = record.msg.extra
+        assert extra["shadow_verdict"] == "fail" and extra["windows_mbps"] == [5.0] * 6 and not extra["enforced"]
+
+        def sustained_runs() -> int:
+            return sum("wget -q -O /dev/null" in c for c in runner.commands)
+
+        clock.now += 23 * 3600
+        await check.run(ctx)
+        assert sustained_runs() == 1
+        clock.now += 3600
+        await check.run(ctx)  # a day after the last one
+        assert sustained_runs() == 2
+
+
+async def test_sustained_skips_rented_nodes_and_a_late_cycle():
+    pod = RentedExecutorsResponse(
+        executors={
+            EXECUTOR.uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address=EXECUTOR.address,
+                executor_ip_port=str(EXECUTOR.port),
+                pods=[RentedPod(pod_id="p1", container_name="pod_p1")],
+            )
+        }
+    )
+    with flags(sustained=True) as clock:
+        redis = FakeRedis()
+        ctx, runner, _ = make_ctx(redis=redis, rented_data=pod)
+        redis.store[f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"] = str(clock.now - 2 * 86400)
+        await ContainerDownloadSpeedCheck().run(ctx)
+        assert not runner.commands
+
+        ctx, runner, _ = make_ctx(FAST, redis=redis)
+        with patch.object(clock, "monotonic", lambda: ctx.started_at_monotonic + 700):
+            await ContainerDownloadSpeedCheck().run(ctx)
+        assert len(runner.commands) == 1  # the short phase only: 900 - 120 - 700 s left is under 120 s
+
+
+async def test_sustained_failure_never_changes_the_result():
+    with flags(sustained=True):
+        redis = FakeRedis()
+        ctx, runner, _ = make_ctx(FAST, redis=redis)
+        redis.store[f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"] = "not-a-number"
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OK.reason and len(runner.commands) == 1
