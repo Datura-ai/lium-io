@@ -100,6 +100,9 @@ STALE_CAP_GRACE_SECONDS = 30 * 60
 # Floor enforced by GpuPowerLimitCheck. Doubles as the raise trigger at rental start: a limit
 # below this can't be a legitimate miner setting (the check would zero-score it anyway).
 MIN_POWER_LIMIT_RATIO = 0.9
+# The line a Pearl run counts as uncapped at: the backend guard's PEARL_POWER_LIMIT_APPLIED_FLOOR_RATIO
+# (default_job/runner.py). Its own constant, so a lower host floor (DAH-5302's 80 % tier) never moves it.
+PEARL_UNCAPPED_RATIO = 0.9
 # GPUs restored (or raised) at the same time. One verified set is three nvidia-smi round trips
 # (-pm 1, -pl, readback), about 1.8 s on a loaded host; done one GPU after another an 8-GPU PEARL
 # node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
@@ -651,17 +654,16 @@ async def read_gpu_power_restore_records(
 def _uncapped_run_threshold_watts(record: GpuPowerRestoreRecord, default_watts: float | None) -> float:
     """The limit at which the job counts as having run uncapped.
 
-    ``MIN_POWER_LIMIT_RATIO`` of the card default — the same line the backend guard kills the
+    ``PEARL_UNCAPPED_RATIO`` of the card default — the same line the backend guard kills the
     filler at (``PEARL_POWER_LIMIT_APPLIED_FLOOR_RATIO``, lium-io-backend
-    ``default_job/runner.py``) and the line ``GpuPowerLimitCheck`` scores against, so a node is
-    never penalized for a run the guard would have let live. Kept unrounded for that reason: a
+    ``default_job/runner.py``), so a node is never penalized for a run the guard would have let live. Kept unrounded for that reason: a
     5090 pinned at 517 W is 0.8991 of its 575 W default, which the guard passes. The observed
     host guards sit one point above this line (0.91 of default, 4090 409/450, 5090 518/575).
     Falls back to the miner's own pre-cap limit when the GPU does not report a default.
     """
     if default_watts is None or default_watts <= 0:
         return record.watts
-    return MIN_POWER_LIMIT_RATIO * default_watts
+    return PEARL_UNCAPPED_RATIO * default_watts
 
 
 def detect_cap_revert(

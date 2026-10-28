@@ -120,6 +120,17 @@ def test_the_line_is_not_rounded_below_the_backend_kill_ratio() -> None:
     assert _observe(watts=518, capped_to_watts=402, found=518, default=575) is not None
 
 
+@pytest.mark.parametrize(("found", "is_revert"), [(360, False), (380, False), (404, False), (405, True)])
+def test_the_uncapped_line_stays_at_90_percent_under_an_80_percent_host_floor(
+    monkeypatch: pytest.MonkeyPatch, found: int, is_revert: bool
+) -> None:
+    # DAH-5302 lowers the host floor to 0.8; Pearl's line is the backend guard's 0.9, not that floor
+    import services.gpu_power_limit as gpl
+
+    monkeypatch.setattr(gpl, "MIN_POWER_LIMIT_RATIO", 0.8)
+    assert (_observe(watts=409, capped_to_watts=315, found=found) is not None) is is_revert
+
+
 def test_cap_that_never_lowered_the_limit_is_not_a_revert() -> None:
     # A miner running below our target is capped upwards; reading our own target back at
     # restore time is not the host raising it.
