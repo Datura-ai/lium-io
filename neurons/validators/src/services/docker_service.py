@@ -559,6 +559,9 @@ _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
+# DAH-5019: a filler's rm takes 1-2 s, but on some hosts its killed processes take 12-60 s to exit (GPU teardown)
+# and dockerd waits for that; the customer needs only that they are exiting, so the settle step reads it this soon
+_FILLER_ONLY_RM_TIMEOUT_SECONDS = 5
 # failure_step of a customer create whose filler (our own container) is still alive after the kill:
 # not `container_cleanup`, which the backend counts against the provider's node
 FILLER_REMOVAL_STUCK_STEP = "filler_removal_stuck"
@@ -4443,13 +4446,23 @@ class DockerService:
         """
         own_ids = list(own_ids)
         command = _remove_and_list_containers_command(targets, volumes_to_remove)
+        fillers_only = bool(stale_containers) and all(
+            name.startswith(FILLER_CONTAINER_PREFIX) for name in stale_containers
+        )
+        # a volume rm cut short would be left on the host: only a removal without one is settled early
+        rm_timeout = (
+            _FILLER_ONLY_RM_TIMEOUT_SECONDS
+            if fillers_only and not volumes_to_remove
+            else _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+        )
+        rm_deadline = min(cleanup_deadline, asyncio.get_running_loop().time() + rm_timeout)
         started = time.monotonic()
         timeout_error: TimeoutError | None = None
         try:
             # asyncssh's timeout= bounds only the command, not its channel open
-            async with asyncio.timeout_at(cleanup_deadline):
+            async with asyncio.timeout_at(rm_deadline):
                 result = await (_MarkOwnRemovalsOnSubmit(ssh_client, own_ids) if own_ids else ssh_client).run(
-                    command, check=False, timeout=_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+                    command, check=False, timeout=rm_timeout
                 )
         except TimeoutError as exc:
             timeout_error = exc
@@ -4476,7 +4489,7 @@ class DockerService:
             )
         )
         if timeout_error is not None:
-            if stale_containers and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in stale_containers):
+            if fillers_only:
                 return await self._settle_stuck_filler_removal(
                     ssh_client, default_extra, stale_containers, targets, timeout_error
                 )
@@ -4544,8 +4557,7 @@ class DockerService:
         the removal, and the create goes on. Otherwise the create fails at its own step,
         FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours."""
         error = (
-            f"[clean_existing_containers] docker rm -fv of filler {fillers} did not finish in "
-            f"{_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            f"[clean_existing_containers] docker rm -fv of filler {fillers} did not finish in time"
         )
         try:
             # asyncssh's timeout= bounds only the command, not its channel open
