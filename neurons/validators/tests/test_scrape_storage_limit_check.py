@@ -272,6 +272,24 @@ def test_a_docker_root_on_a_loop_device_without_direct_io_is_reported(
     assert ("loop3" in payload["vc_detail"]) == bool(reason_code)
 
 
+def test_a_non_utf8_mount_entry_keeps_the_mount_test_pass(tmp_path: Path) -> None:
+    # Arrange: an unrelated mount point with a raw latin-1 byte, docker's data root on /dev/loop3 without dio
+    (tmp_path / "mounts").write_bytes(
+        b"/dev/sdb1 /mnt/caf\xe9 ext4 rw 0 0\n/dev/loop3 /var/lib/docker xfs rw,relatime 0 0\n"
+    )
+    (tmp_path / "sys" / "loop3" / "loop").mkdir(parents=True)
+    (tmp_path / "sys" / "loop3" / "loop" / "dio").write_text("0\n")
+    host = FakeDockerHost()
+
+    # Act
+    payload = _check(host, tmp_path)
+
+    # Assert
+    assert payload["vc_verdict"] == "pass"
+    assert payload["vc_reason_code"] == "DOCKER_ROOT_LOOP_NO_DIO"
+    assert host.volumes == set() and host.containers == set()
+
+
 @pytest.mark.parametrize(
     "probe_output", ["", "lium-vloopback-ok-not\n", "lium-vloopback-ok\nsomething else\n"]
 )

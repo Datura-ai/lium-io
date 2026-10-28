@@ -1217,7 +1217,7 @@ def docker_root_loop_without_dio(docker_root_dir):
     # the loop device under docker's data root when it runs buffered (no direct I/O), else "":
     # heavy container writes then stall Docker itself
     try:
-        with open(HOST_MOUNTS_PATH) as mounts_file:
+        with open(HOST_MOUNTS_PATH, errors="surrogateescape") as mounts_file:
             mounts_text = mounts_file.read()
     except OSError:
         return ""
