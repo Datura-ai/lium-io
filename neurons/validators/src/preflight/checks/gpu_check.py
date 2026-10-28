@@ -5,7 +5,7 @@ import logging
 from preflight.base import PreflightCheck, CheckResult, CheckStatus
 from preflight.utils import get_gpu_info
 from preflight.constants import GPU_MODEL_RATES
-from services.gpu_spec_table import normalize_gpu_model
+from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +56,9 @@ class GPUCheck(PreflightCheck):
 
             logger.debug(f"GPU model: {gpu_model} (NVML: {raw_gpu_model}), count: {gpu_count}")
 
-            # Check 1: GPU model support
-            if gpu_model not in GPU_MODEL_RATES:
+            # Check 1: GPU model support; an unknown NVIDIA model is scored as its reference model (DAH-5088)
+            vram_mb = gpu_details[0].get("memory_total_mb") if gpu_details else None
+            if gpu_model not in GPU_MODEL_RATES and not reference_gpu_model(gpu_model, vram_mb):
                 return CheckResult(
                     name=self.name,
                     status=CheckStatus.FAILED,
