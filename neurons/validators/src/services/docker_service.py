@@ -7544,7 +7544,20 @@ class DockerService:
                 # A build that printed "process timed out" and failed carries BUILD_FAILED_RC= too;
                 # only the streamer's bare sentinel is a timeout.
                 if stream_timed_out(err):
-                    return CustomBuildOutcome(False, "build_timeout", f"docker build exceeded {timeout_s} s")
+                    # The build was cut off, so it shipped no tail: read the log file still in the DinD
+                    # container, so the renter sees the step that was running when the time ran out.
+                    reason = f"docker build exceeded {timeout_s} s"
+                    try:
+                        res = await ssh_client.run(
+                            f"/usr/bin/docker exec {shlex.quote(dind_name)} "
+                            f"tail -n {CUSTOM_BUILD_LOG_SHIPPED_LINES} {CUSTOM_BUILD_LOG_FILE}",
+                            check=False,
+                            timeout=setup_timeout_s,
+                        )
+                        tail = custom_build_log_tail(res.stdout if res.exit_status == 0 else None)
+                    except Exception:
+                        tail = None
+                    return CustomBuildOutcome(False, "build_timeout", f"{tail}\n{reason}" if tail else reason)
                 if CUSTOM_BUILD_FAILED_MARKER not in (err or ""):
                     logger.error(
                         _m(

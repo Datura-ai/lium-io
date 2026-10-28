@@ -488,6 +488,33 @@ async def test_A12_sysbox_unavailable_aborts_before_build(svc, monkeypatch):
     assert not any("docker build" in c for c in esl.seen)
 
 
+@pytest.mark.asyncio
+async def test_A6_build_timeout_carries_the_step_that_was_running(svc, monkeypatch):
+    """A timed-out build ships no tail itself; the renter still gets the last lines from the build
+    log in the DinD container, then the timeout line."""
+    ssh_client = _make_dind_ssh()
+    base_run = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if "tail -n" in cmd and "/tmp/lium-build.log" in cmd:
+            ssh_client.calls.append(cmd)
+            return _ssh_result(stdout="#5 [2/3] RUN pip install flash-attn\n#5 12.3 Building wheel\n")
+        return await base_run(cmd, **kw)
+
+    ssh_client.run = _run
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN pip install flash-attn\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert ok is False
+    assert step == "build_timeout"
+    assert tail.startswith("#5 [2/3] RUN pip install flash-attn")
+    assert tail.endswith("docker build exceeded 1200 s")
+
+
 # ------------------------------------------------------------------
 # A.13 — egress firewall failure → build_egress_setup, NO build attempted
 # ------------------------------------------------------------------
