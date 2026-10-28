@@ -88,10 +88,10 @@ class StorageEventReporter:
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
-        if event_type == "diagnostic":
+        if event_type in ("diagnostic", "log"):
             message = event.get("message")
             if isinstance(message, str) and message:
-                if self._diagnostic_detail is None:
+                if event_type == "diagnostic" and self._diagnostic_detail is None:
                     self._diagnostic_detail = message[:2000]
                 # Kept until a PUT succeeds, so throttled or failed updates do not drop them.
                 self._pending_logs = _newest_within_bytes(
