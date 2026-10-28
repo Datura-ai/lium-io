@@ -216,8 +216,11 @@ async def test_a_create_waits_out_a_miner_that_refuses_connections_while_it_rest
 
 
 @pytest.mark.asyncio
-async def test_a_create_retries_a_key_submit_that_timed_out_while_the_miner_restarted(mocker, miner_service):
-    # 28 Oct pod 8ef42052: the submit hit the old central-miner pod during a redeploy and timed out
+async def test_a_timed_out_key_submit_fails_the_create_instead_of_skipping_the_miners_rental_hook(
+    mocker, miner_service
+):
+    # review: a timeout may or may not have run the miner's rental hook (it stops other workloads), so neither a
+    # resubmit with the hook nor one without it is safe
     executor_id = str(uuid4())
     _wire_common_mocks(mocker, miner_service, executor_id)
     accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
@@ -227,27 +230,24 @@ async def test_a_create_retries_a_key_submit_that_timed_out_while_the_miner_rest
 
     await miner_service._handle_container(_make_create_payload(executor_id))
 
-    create_mock.assert_awaited_once()
+    create_mock.assert_not_awaited()
+    assert miner_service._make_rest_request.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_a_retry_after_a_timed_out_submit_does_not_rerun_the_miners_rental_hook(
-    mocker, miner_service
-):
-    # a timed-out submit may have reached the miner and run its rental hook; a refused one did not
+async def test_a_resubmit_after_a_refused_submit_still_runs_the_miners_rental_hook(mocker, miner_service):
+    # a refused submit never reached the miner, so the hook has not run yet
     executor_id = str(uuid4())
     _wire_common_mocks(mocker, miner_service, executor_id)
     accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
-    miner_service._make_rest_request.side_effect = [_refused(), asyncio.TimeoutError(), accepted]
+    miner_service._make_rest_request.side_effect = [_refused(), accepted]
     mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
-    mocker.patch(
-        "services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock())
-    )
+    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
 
     await miner_service._handle_container(_make_create_payload(executor_id))
 
     calls = miner_service._make_rest_request.await_args_list
-    assert [c.kwargs["json_data"]["is_rental_request"] for c in calls] == [True, True, False]
+    assert [c.kwargs["json_data"]["is_rental_request"] for c in calls] == [True, True]
 
 
 @pytest.mark.asyncio

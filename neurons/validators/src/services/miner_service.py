@@ -2194,9 +2194,8 @@ class MinerService:
                 _m("Sent SSH key to miner via REST API.", extra=get_extra_info(default_extra)),
             )
 
-            # A restarting miner refuses connections for about a minute, and a request caught by the
-            # old pod going away hangs until the timeout. A create waits that out instead of failing
-            # the renter's pod; a resubmitted key is harmless, the removal drops every copy.
+            # A restarting miner refuses connections for about a minute. A create waits that out instead of
+            # failing the renter's pod; a resubmitted key is harmless, the removal drops every copy.
             deadline = time.monotonic() + MINER_RESTART_WAIT_S
             while True:
                 # The miner accepts a signed timestamp for 10 s only, so each attempt signs anew.
@@ -2213,13 +2212,11 @@ class MinerService:
                         operation_name="SSH key submit",
                     )
                     break
-                except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-                    is_create = isinstance(payload, ContainerCreateRequest)
-                    if not is_create or time.monotonic() >= deadline:
+                except aiohttp.ClientConnectorError:
+                    # refused: it never reached the miner, so its rental hook did not run and a resubmit must
+                    # run it. A timeout may have run it, and the hook is not idempotent: that create fails.
+                    if not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
                         raise
-                    if isinstance(e, asyncio.TimeoutError):
-                        # it may have reached the miner and run its rental hook; do not run it again
-                        ssh_request.is_rental_request = False
                     await asyncio.sleep(MINER_RESTART_RETRY_S)
 
             if status != 200 or response_data is None:
