@@ -277,6 +277,24 @@ class RentalVerificationCheck:
                         "clear_verified_job_info": True,
                     },
                 )
+            elif (response.error or "").endswith("visible: []"):
+                # an empty kernel list means the container's /proc view is stale, not that the cards changed
+                event = render_message(
+                    Msg.GPU_LIST_EMPTY,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "verified": False,
+                        "executor_uuid": executor.uuid,
+                        "error": response.error,
+                        "details": response.details or {},
+                    },
+                )
+                return CheckResult(
+                    passed=False,  # Fatal check - halt validation
+                    event=event,
+                    updates={},
+                )
             else:
                 # Verification failed - this is fatal
                 event = render_message(

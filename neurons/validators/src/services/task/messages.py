@@ -2031,7 +2031,8 @@ class NvlinkFaultMessages:
             "The GPUs report an uncorrectable NVLink error state: NCCL NVLink SHARP (NVLS) and other "
             "multi-GPU jobs fail. Check the host `dmesg` for NVRM Xid lines and `nvidia-smi nvlink -e`. "
             "Stop the workloads, reset the GPUs (`nvidia-smi -r`) and restart nvidia-fabricmanager, or "
-            "reboot. If the errors come back, service the board."
+            "reboot. Then restart the executor container (`docker restart executor-executor-1`) so it "
+            "sees the GPUs again. If the errors come back, service the board."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2068,6 +2069,19 @@ class RentalVerificationMessages:
         category="policy",
         impact="Validation halted",
         remediation="Check executor health with backend or review rental status",
+    )
+    # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
+    GPU_LIST_EMPTY = MessageTemplate(
+        event="Rental verification failed",
+        reason="RENTAL_NOT_VERIFIED",
+        severity="error",
+        category="policy",
+        impact="Validation halted",
+        remediation=(
+            "The executor container sees no GPU in /proc/driver/nvidia/gpus, usually after a GPU reset "
+            "(`nvidia-smi -r`) or an NVIDIA driver reload while it kept running. Restart it "
+            "(`docker restart executor-executor-1`) or reboot the host."
+        ),
     )
     GPU_RUNTIME_NVML_MISMATCH = MessageTemplate(
         event="GPU runtime health check failed",
