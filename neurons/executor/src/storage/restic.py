@@ -709,7 +709,10 @@ class ResticStorageRunner:
             + json.dumps({field: state.get(field) for field in fields})
         )
         # Docker's OOMKilled can miss a kill; the kernel log settles OOM against an outside SIGKILL
-        self._events.log(kernel_kill_note(self._helper_id))
+        note = kernel_kill_note(self._helper_id)
+        self._events.log(note)
+        if "oom-kill:" in note:  # the kernel's OOM kill that Docker's flag missed
+            return f"{action} ran out of memory"
         if state.get("OOMKilled") is False:
             return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
         return f"{action} helper was killed (often out of memory)"

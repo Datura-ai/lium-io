@@ -744,6 +744,15 @@ def test_exit_code_three_with_snapshot_is_completed_partial(
     assert '"result_quality":"PARTIAL"' in output.getvalue()
 
 
+HELPER_ID = "4f2a" + "0" * 60
+OOM_KILL_DMESG = f"""[1000.1] restic invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=1000
+[1000.2] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=docker-{HELPER_ID}.scope,mems_allowed=0,\
+oom_memcg=/system.slice/docker-{HELPER_ID}.scope,task_memcg=/system.slice/docker-{HELPER_ID}.scope,task=restic,pid=4242,uid=0
+[1000.3] Memory cgroup out of memory: Killed process 4242 (restic) total-vm:9000000kB, anon-rss:4100000kB, file-rss:0kB
+[1000.4] oom_reaper: reaped process 4242 (restic), now anon-rss:0kB
+"""
+
+
 class _KilledPopen(_FakePopen):
     def wait(self) -> int:
         return 137
@@ -751,17 +760,19 @@ class _KilledPopen(_FakePopen):
 
 @pytest.mark.parametrize("action", ["backup", "restore"])
 @pytest.mark.parametrize(
-    ("oom_killed", "message"),
+    ("oom_killed", "kernel_log", "message"),
     [
-        (True, " ran out of memory"),
-        (False, " helper was killed (Docker recorded no out-of-memory kill)"),
-        (None, " helper was killed (often out of memory)"),  # docker inspect failed
-        ("", " helper was killed (often out of memory)"),  # docker inspect printed nothing
+        (True, "", " ran out of memory"),
+        (False, "", " helper was killed (Docker recorded no out-of-memory kill)"),
+        (False, OOM_KILL_DMESG, " ran out of memory"),  # the kernel's OOM kill that Docker's flag missed
+        (None, OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect failed
+        ("", OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect printed nothing
     ],
 )
-def test_killed_helper_reports_oom_only_when_docker_says_so(
+def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
     monkeypatch: pytest.MonkeyPatch,
     oom_killed: bool | str | None,
+    kernel_log: str,
     message: str,
     action: str,
 ) -> None:
@@ -776,7 +787,7 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
             inspection = json.dumps({"Id": HELPER_ID, "State": state})
             return SimpleNamespace(returncode=0, stdout=inspection if oom_killed != "" else "", stderr="")
         if command[0] == "dmesg":
-            return SimpleNamespace(returncode=0, stdout=OOM_KILL_DMESG, stderr="")
+            return SimpleNamespace(returncode=0, stdout=kernel_log, stderr="")
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"id": SNAPSHOT_ID}]), stderr="")
 
     monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)  # restore's empty-target check
@@ -808,20 +819,14 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
     assert ("docker state" in log) is (oom_killed is not True)
     if oom_killed is False:
         assert '"ExitCode": 137' in log
-        assert "kernel: " + " | ".join(OOM_KILL_DMESG.splitlines()[1:3]) in log
+        kernel_line = "kernel: " + " | ".join(OOM_KILL_DMESG.splitlines()[1:3])
+        assert (kernel_line in log) is bool(kernel_log)
     elif oom_killed is True:
         assert not any(c[0] == "dmesg" for c in calls)
     else:
         assert "kernel: no helper container ID to match" in log
 
 
-HELPER_ID = "4f2a" + "0" * 60
-OOM_KILL_DMESG = f"""[1000.1] restic invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=1000
-[1000.2] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=docker-{HELPER_ID}.scope,mems_allowed=0,\
-oom_memcg=/system.slice/docker-{HELPER_ID}.scope,task_memcg=/system.slice/docker-{HELPER_ID}.scope,task=restic,pid=4242,uid=0
-[1000.3] Memory cgroup out of memory: Killed process 4242 (restic) total-vm:9000000kB, anon-rss:4100000kB, file-rss:0kB
-[1000.4] oom_reaper: reaped process 4242 (restic), now anon-rss:0kB
-"""
 
 
 def test_kernel_kill_lines_match_the_helper_container_only() -> None:
