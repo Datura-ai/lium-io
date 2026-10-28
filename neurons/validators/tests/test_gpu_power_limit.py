@@ -1,6 +1,8 @@
+import json
 import time
 from unittest.mock import AsyncMock
 
+import neurons.validators.src.services.gpu_power_limit as gpl
 import pytest
 from neurons.validators.src.services.gpu_power_limit import (
     POWER_STATE_CMD,
@@ -45,7 +47,7 @@ class FakeRedis:
     def __init__(self, initial: dict[str, str] | None = None):
         self.store: dict[str, str] = dict(initial or {})
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.store[key] = value
 
     async def get(self, key: str) -> str | None:
@@ -130,3 +132,26 @@ async def test_pod_index_delete_failure_after_successful_restore(require_complet
         assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID) == 1
     # Assert: the record was deleted after restoration, but the stale index remains visible.
     assert redis.store == {_pod_index_key(POD_ID): '["GPU-a"]'}
+
+
+@pytest.mark.asyncio
+async def test_rental_start_raise_keeps_the_80_percent_tier_and_records_each_pod_gpu(monkeypatch) -> None:
+    states = {
+        "GPU-tier": gpl.GpuPowerState(current_watts=298, min_watts=100, max_watts=450, default_watts=350),
+        "GPU-low": gpl.GpuPowerState(current_watts=200, min_watts=100, max_watts=450, default_watts=350),
+        "GPU-other-pod": gpl.GpuPowerState(current_watts=298, min_watts=100, max_watts=450, default_watts=350),
+    }
+    monkeypatch.setattr(gpl, "_query_power_state", AsyncMock(return_value=states))
+    set_side_by_side = AsyncMock(return_value=1)
+    monkeypatch.setattr(gpl, "_set_side_by_side", set_side_by_side)
+    redis = FakeRedis()
+
+    raised = await gpl.raise_low_power_limits_to_default(
+        AsyncMock(), "ex-1", ["GPU-tier", "GPU-low"], redis=redis, pod_id="pod-1"
+    )
+
+    assert raised == 1
+    assert [gpu.gpu_uuid for gpu in set_side_by_side.await_args.args[1]] == ["GPU-low"]  # 85 % is left alone
+    assert json.loads(redis.store[gpl.rental_start_ratio_key("ex-1", "GPU-tier")]) == {"pod_id": "pod-1", "ratio": 0.8514}
+    assert json.loads(redis.store[gpl.rental_start_ratio_key("ex-1", "GPU-low")]) == {"pod_id": "pod-1", "ratio": 1.0}
+    assert gpl.rental_start_ratio_key("ex-1", "GPU-other-pod") not in redis.store  # another pod's GPU

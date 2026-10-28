@@ -87,9 +87,16 @@ _POD_INDEX_KEY_PREFIX = "gpu_power_restore_pod:"
 # (backend marks owner="lium" from STARTING, but the snapshot is taken at cycle start) — the check
 # must not uncap it. Comfortably above the backend's 15-minute STARTING/STOPPING transitional window.
 STALE_CAP_GRACE_SECONDS = 30 * 60
-# Floor enforced by GpuPowerLimitCheck. Doubles as the raise trigger at rental start: a limit
-# below this can't be a legitimate miner setting (the check would zero-score it anyway).
-MIN_POWER_LIMIT_RATIO = 0.9
+# Floor enforced by GpuPowerLimitCheck: the optional 80 % tier (owner, 28 Oct 2026), shown to
+# renters by the backend's Reduced power limit badge. Doubles as the raise trigger at rental start:
+# a limit below this can't be a legitimate miner setting (the check would zero-score it anyway).
+MIN_POWER_LIMIT_RATIO = 0.8
+# Floor while a GPU is rented, unless it was already lower when the rental started: a host must
+# not cut a renter's power below 90 % mid-rental, since the renter rented it without the badge.
+RENTED_MIN_POWER_LIMIT_RATIO = 0.9
+_RENTAL_START_RATIO_KEY_PREFIX = "gpu_power_rental_start_ratio:"
+# Outlives any rental; a record counts only while the pod it names is rented.
+_RENTAL_START_RATIO_TTL_SECONDS = 365 * 24 * 3600
 # GPUs restored (or raised) at the same time. One verified set is three nvidia-smi round trips
 # (-pm 1, -pl, readback), about 1.8 s on a loaded host; done one GPU after another an 8-GPU PEARL
 # node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
@@ -174,6 +181,10 @@ _UNREADABLE_READBACK = GpuPowerReadback(watts=None, persistence_enabled=None)
 
 def _restore_key(gpu_uuid: str) -> str:
     return f"{_RESTORE_KEY_PREFIX}{gpu_uuid}"
+
+
+def rental_start_ratio_key(executor_id: str, gpu_uuid: str) -> str:
+    return f"{_RENTAL_START_RATIO_KEY_PREFIX}{executor_id}:{gpu_uuid}"
 
 
 def _pod_index_key(pod_id: str) -> str:
@@ -663,6 +674,8 @@ async def raise_low_power_limits_to_default(
     log_extra: dict[str, object] | None = None,
     *,
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
+    redis: RedisService | None = None,
+    pod_id: str | None = None,
 ) -> int:
     """State-free last-resort net for rental start: lift every GPU sitting below
     ``MIN_POWER_LIMIT_RATIO`` x its default limit back to the default.
@@ -677,12 +690,56 @@ async def raise_low_power_limits_to_default(
     run between the probe and this call, so the probe's power state can be minutes old. Outside a
     bootstrap restore the create calls it beside the volume create and again right before the
     customer's container starts; that second call is the create's last power read.
+
+    With ``redis`` and ``pod_id``, each of the pod's GPUs gets its limit / default as the rental
+    starts (1.0 once raised) recorded under the pod, so GpuPowerLimitCheck holds a rented GPU at
+    min(that, RENTED_MIN_POWER_LIMIT_RATIO) for as long as the pod is rented.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
+    try:
+        return await _raise_below_floor(ssh, executor_id, gpu_uuids, state_by_uuid, log_extra, concurrency)
+    finally:
+        if redis is not None and pod_id:
+            await _record_rental_start_ratios(redis, executor_id, pod_id, gpu_uuids, state_by_uuid, log_extra)
+
+
+async def _record_rental_start_ratios(
+    redis: RedisService,
+    executor_id: str,
+    pod_id: str,
+    gpu_uuids: list[str] | None,
+    state_by_uuid: dict[str, GpuPowerState],
+    log_extra: dict[str, object] | None,
+) -> None:
+    for gpu_uuid in gpu_uuids or list(state_by_uuid):
+        state = state_by_uuid.get(gpu_uuid)
+        if state is None or state.default_watts is None or state.default_watts <= 0:
+            continue
+        ratio = state.current_watts / state.default_watts
+        if ratio < MIN_POWER_LIMIT_RATIO:
+            ratio = 1.0  # raised to its default just above
+        try:
+            await redis.set(
+                rental_start_ratio_key(executor_id, gpu_uuid),
+                json.dumps({"pod_id": pod_id, "ratio": round(ratio, 4)}),
+                ex=_RENTAL_START_RATIO_TTL_SECONDS,
+            )
+        except Exception as exc:
+            _log(logging.ERROR, f"gpu power raise: rental-start ratio not recorded: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
+
+
+async def _raise_below_floor(
+    ssh: asyncssh.SSHClientConnection,
+    executor_id: str,
+    gpu_uuids: list[str] | None,
+    state_by_uuid: dict[str, GpuPowerState],
+    log_extra: dict[str, object] | None,
+    concurrency: int,
+) -> int:
     target_uuids: list[str] = gpu_uuids if gpu_uuids else list(state_by_uuid)
     below_floor: list[_BelowFloorGpu] = []
     for gpu_uuid in target_uuids:

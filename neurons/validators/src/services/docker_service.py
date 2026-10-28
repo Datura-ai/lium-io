@@ -7754,6 +7754,8 @@ class DockerService:
             payload.gpu_uuids or None,
             log_extra=default_extra,
             concurrency=concurrency,
+            redis=self.redis_service,
+            pod_id=payload.pod_id,
         )
 
     async def _run_create_steps_after_reply(

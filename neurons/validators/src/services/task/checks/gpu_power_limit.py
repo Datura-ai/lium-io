@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -7,9 +8,11 @@ from pydantic import BaseModel
 from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
+    RENTED_MIN_POWER_LIMIT_RATIO,
     STALE_CAP_GRACE_SECONDS,
     GpuPowerRestoreRecord,
     read_gpu_power_restore_records,
+    rental_start_ratio_key,
     restore_tracked_gpu_power_limits,
 )
 
@@ -76,6 +79,7 @@ class GpuPowerLimitCheck:
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
         rejected: list[GpuPowerMeasurement] = []
+        floors = await self._rented_floors(ctx)
 
         for index, detail in enumerate(ctx.state.gpu_details or []):
             current_limit = _to_float(detail.get("power_limit"))
@@ -99,7 +103,7 @@ class GpuPowerLimitCheck:
             measurement.power_limit_ratio = round(ratio, 4)
             measurements.append(measurement)
 
-            if ratio < MIN_POWER_LIMIT_RATIO:
+            if ratio < floors.get(measurement.uuid or "", floors.get("", MIN_POWER_LIMIT_RATIO)):
                 rejected.append(measurement)
 
         if rejected:
@@ -124,7 +128,8 @@ class GpuPowerLimitCheck:
                     "score": 0.0,
                     "job_score": 0.0,
                     "score_warning": (
-                        " WARNING: GPU power limit is below 90% of the default power limit"
+                        " WARNING: GPU power limit is below 80% of the default power limit,"
+                        " or was lowered below 90% during a rental"
                     ),
                 },
             )
@@ -161,6 +166,44 @@ class GpuPowerLimitCheck:
             },
         )
         return CheckResult(passed=True, event=event)
+
+    async def _rented_floors(self, ctx: Context) -> dict[str, float]:
+        """Per-GPU floor while the node is rented, by GPU uuid; "" is the floor for any other GPU.
+
+        A GPU whose rental-start record names a pod rented now keeps min(its ratio then,
+        RENTED_MIN_POWER_LIMIT_RATIO), never under MIN_POWER_LIMIT_RATIO, so a renter who rented
+        it in the 80 % tier keeps that cap and nobody else's power drops mid-rental. Other GPUs
+        get MIN_POWER_LIMIT_RATIO when every rented pod has a record (they are not rented: a split
+        node's free bundle), else RENTED_MIN_POWER_LIMIT_RATIO (a rental from before the records).
+        Unrented node, or Redis did not answer: {} = MIN_POWER_LIMIT_RATIO everywhere; our own
+        outage must not zero a node.
+        """
+        rented_data = ctx.state.rented_data
+        rented = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        if rented is None or not rented.pods:
+            return {}
+        uuids = [str(detail.get("uuid")) for detail in ctx.state.gpu_details or [] if detail.get("uuid")]
+        try:
+            raw = await ctx.services.redis.mget([rental_start_ratio_key(ctx.executor.uuid, u) for u in uuids])
+        except Exception:
+            return {}
+        rented_pod_ids = {pod.pod_id for pod in rented.pods}
+        floors: dict[str, float] = {}
+        recorded_pods: set[str] = set()
+        for gpu_uuid, value in zip(uuids, raw):
+            if not value:
+                continue
+            try:
+                record = json.loads(value)
+                pod_id, ratio = str(record["pod_id"]), float(record["ratio"])
+            except (ValueError, TypeError, KeyError):
+                continue  # a corrupt record proves nothing: the GPU takes the "" floor
+            if pod_id in rented_pod_ids:
+                recorded_pods.add(pod_id)
+                # 0.005 slack: the record is read from nvidia-smi in whole watts, the check from the scrape
+                floors[gpu_uuid] = max(MIN_POWER_LIMIT_RATIO, min(RENTED_MIN_POWER_LIMIT_RATIO, ratio - 0.005))
+        floors[""] = MIN_POWER_LIMIT_RATIO if rented_pod_ids <= recorded_pods else RENTED_MIN_POWER_LIMIT_RATIO
+        return floors
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]
