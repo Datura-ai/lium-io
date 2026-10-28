@@ -61,6 +61,7 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     PostRentalGpuRecheckCheck,
+    ProviderMaintenanceCheck,
     ProviderSideLoadCheck,
     RegistryPullCheck,
     RentalProbeCheck,
@@ -355,6 +356,10 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                # DAH-4709: an idle node inside its provider maintenance window fails here, before the
+                # ports, registry pull, download speed, VerifyX and rental probe; a rented one passes on to
+                # TenantEnforcementCheck, which reads its pods first.
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
@@ -503,6 +508,7 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),

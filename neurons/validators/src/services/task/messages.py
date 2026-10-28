@@ -521,6 +521,17 @@ class GpuLossHoldMessages:
         "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
         "a node keeps the cards it was first verified with.",
     )
+    SET_REPLACED = MessageTemplate(
+        event="The node came back with a different set of GPUs",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="The new GPUs are verified and kept for this node, but it is hidden and takes no new rentals until "
+        "they read clean for the hold window (see hold_until); it scores 0 meanwhile",
+        remediation="Every GPU UUID changed, as when a VM host gets other cards on a restart. Keep the same GPUs "
+        "passed through to this node across restarts (`nvidia-smi -L` before and after must match) and find why "
+        "the host restarted. Nothing to re-register: the node is listed again on its own after the hold window.",
+    )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
         reason="GPU_LOST_PENDING",
@@ -968,6 +979,24 @@ class DuplicateExecutorMessages:
         impact="Score set to 0 for this cycle; the other executor keeps it",
         remediation="Each physical GPU earns under one executor. Register every machine once.",
     )
+
+class ProviderMaintenanceMessages:
+    IN_WINDOW = MessageTemplate(
+        event="Node in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation="The provider scheduled maintenance on this node; it is validated as usual once the window ends.",
+    )
+    NONE = MessageTemplate(
+        event="Node not in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE_NONE",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
 
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(

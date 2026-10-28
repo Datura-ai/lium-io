@@ -454,3 +454,15 @@ async def test_an_idle_node_without_sysbox_keeps_only_the_idle_reason(monkeypatc
 
     # unchanged: the idle reasons only, never the rented one
     assert _codes(result) == ["no_unrented_capacity_for_gpu_count", "sysbox_not_enabled"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_rented", [False, True])
+async def test_a_node_in_a_maintenance_window_earns_nothing_rented_or_not(is_rented):
+    result = await _incentive().calculate_executor_score(
+        _idle_flagship(gpu_count=4, is_rented=is_rented, is_in_maintenance=True)
+    )
+
+    assert _codes(result)[0] == "provider_maintenance"
+    assert result.mining_score == 0
+    assert result.eligible_for_rental_share is False
