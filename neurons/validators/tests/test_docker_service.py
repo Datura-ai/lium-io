@@ -283,7 +283,7 @@ def create_mock_port_dict(
 def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
-    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock())
+    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock())
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
@@ -8089,7 +8089,7 @@ async def test_a_sigkill_whose_container_is_gone_still_goes_out_as_container_van
 async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(monkeypatch, docker_run_fails):
     # an edit mounts the pod's volume by name and Docker routes it to the plugin that made it
     # (`vloopback:latest` for every rental before v2): no plugin command, no volume create or rm
-    svc = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock()), attestation_service=Mock())
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock()), attestation_service=Mock())
     svc._read_host_pid_max = AsyncMock(return_value=4_194_304)
     payload = _edit_payload()
     ssh = _ssh_recording()

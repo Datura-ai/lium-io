@@ -210,6 +210,19 @@ async def test_rental_start_retry_after_a_partial_write_records_the_live_limit(m
     assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": 0.8}
 
 
+@pytest.mark.asyncio
+async def test_rental_start_partial_write_failure_records_no_gpu(monkeypatch) -> None:
+    # all of a pod's records in one transaction: a refused create leaves none behind to mix with a retry
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    redis = SharedFakeRedis()
+    redis.fail_next_set_of = {gpl.rental_start_ratio_key("ex-1", "GPU-1")}
+    with pytest.raises(gpl.GpuPowerRestoreStateError):
+        await _rental_start(monkeypatch, redis, _power(350, 350))
+    assert not any(key.startswith("gpu_power_rental_start_ratio:") for key in redis.store)
+    await _rental_start(monkeypatch, redis, _power(350, 280))  # host lowered GPU-1 before the retry
+    assert [_ratio(redis, gpu)["ratio"] for gpu in ("GPU-0", "GPU-1")] == [1.0, 0.8]  # one snapshot
+
+
 @pytest.mark.parametrize(("pod_on_host", "ratio"), [(True, 1.0), (False, 0.8514)])
 @pytest.mark.asyncio
 async def test_rental_start_of_a_pod_already_on_the_host_records_stock(monkeypatch, pod_on_host, ratio) -> None:

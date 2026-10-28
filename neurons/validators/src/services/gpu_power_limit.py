@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 import asyncssh
 from payload_models.payloads import GpuPowerLimit
 from pydantic import BaseModel, ValidationError
-from services.redis_service import RedisService
+from services.redis_service import RedisService, RedisWrites
 
 from core.utils import _m, get_extra_info
 
@@ -746,7 +746,7 @@ async def _record_rental_start_ratios(
     except Exception as exc:
         # without the old records a reboot could replace its rental's start with today's limit
         raise GpuPowerRestoreStateError("GPU power rental-start records could not be read") from exc
-    unrecorded: list[str] = []
+    writes = RedisWrites()
     for gpu_uuid, key, old in zip(uuids, keys, existing):
         if rental_record_pod_id(old) == pod_id:
             continue  # a reboot or edit of the same rental keeps the limit it started on
@@ -757,13 +757,12 @@ async def _record_rental_start_ratios(
         if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
             # raised to its default just above, or a running rental from before the records: it stays at 90 %
             ratio = 1.0
-        try:
-            await redis.set(key, json.dumps({"pod_id": pod_id, "ratio": round(ratio, 4)}), ex=RENTAL_START_RATIO_TTL_SECONDS)
-        except Exception as exc:
-            _log(logging.ERROR, f"gpu power raise: rental-start ratio not recorded: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
-            unrecorded.append(gpu_uuid)
-    if unrecorded:
-        raise GpuPowerRestoreStateError(f"GPU power rental-start ratio not recorded for {', '.join(unrecorded)}")
+        writes.set(key, json.dumps({"pod_id": pod_id, "ratio": round(ratio, 4)}), ex=RENTAL_START_RATIO_TTL_SECONDS)
+    try:
+        # one MULTI/EXEC: a pod's GPUs are recorded together or not at all, so a retry never mixes starts
+        await redis.write_atomically(writes)
+    except Exception as exc:
+        raise GpuPowerRestoreStateError(f"GPU power rental-start ratios not recorded: {exc}") from exc
 
 
 async def _raise_below_floor(

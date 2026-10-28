@@ -195,7 +195,7 @@ class RecordingRentalDockerFactory:
 @pytest.fixture
 def docker_service():
     ssh_service = Mock()
-    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock())
+    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock())
     attestation_service = Mock()
     lock = AsyncMock()
     lock.__aenter__ = AsyncMock(return_value=lock)

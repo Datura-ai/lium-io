@@ -41,7 +41,7 @@ from services.docker_service import (
 def svc():
     # local fixtures rather than imports, which pyflakes reads as names every parameter below
     # redefines (F811); same services test_deploy_optimizations / test_docker_service build
-    return DockerService(ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None), mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock()), attestation_service=Mock())
+    return DockerService(ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None), mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock()), attestation_service=Mock())
 
 
 @pytest.fixture
