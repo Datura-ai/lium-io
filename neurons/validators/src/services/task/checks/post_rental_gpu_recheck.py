@@ -8,11 +8,7 @@ rental; on the node's next unrented cycle this check runs the all-cards matmul a
 on every card, whatever the MATMUL_ALLCARDS_* / GPU_FAULT_PROBE_* flags say. A failure fails the node and keeps the marker; a pass
 clears it.
 
-A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker, and so
-does the backend's renter_hardware_fault_executor_ids (hardware-fault reports from two distinct renters):
-a GeForce card has no ECC or row-remap counters, so a renter's report is the only signal it gives.
-A pass sets a cleared key for MARKER_TTL_SECONDS: the backend list cannot tell a new report from the
-old one, so new renter reports on that node go unseen until the cleared key expires.
+A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker.
 
 A cycle with a filler skips the recheck; after FILLER_SKIP_LIMIT such skips the check removes the
 node's Lium fillers and probes anyway, so a node that always runs a filler cannot skip it for good.
@@ -84,24 +80,6 @@ def marker_key(miner_hotkey: str, executor_uuid: str) -> str:
     return f"{POST_RENTAL_GPU_RECHECK_PREFIX}:{miner_hotkey}:{executor_uuid}"
 
 
-def cleared_key(miner_hotkey: str, executor_uuid: str) -> str:
-    return f"{POST_RENTAL_GPU_RECHECK_PREFIX}_cleared:{miner_hotkey}:{executor_uuid}"
-
-
-def _renter_reported(ctx: Context) -> bool:
-    """Listed by the backend for renter hardware-fault reports, under this hotkey."""
-    rented_data = ctx.state.rented_data
-    uuid = str(ctx.executor.uuid)
-    if not rented_data or uuid not in rented_data.renter_hardware_fault_executor_ids:
-        return False
-    rented = rented_data.executors.get(uuid)
-    owner = rented_data.executor_owner_hotkeys.get(uuid) or (
-        rented.miner_hotkey if rented else None
-    )
-    # an unknown owner applies nothing: a report must not land on a node listed under another hotkey
-    return owner == ctx.miner_hotkey
-
-
 async def record_marker(ctx: Context, marker: RecheckMarker) -> None:
     """Remember what a rented cycle flagged. Never raises: the caller's verdict must not depend on Redis."""
     if settings.DRY_RUN:
@@ -148,7 +126,7 @@ class PostRentalGpuRecheckCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         key = marker_key(ctx.miner_hotkey, ctx.executor.uuid)
-        marker = await self._find_marker(ctx, key)
+        marker = await self._read_marker(ctx, key)
         if marker is None:
             return CheckResult(
                 passed=True, event=render_message(Msg.NO_MARKER, ctx=ctx, check_id=self.check_id)
@@ -172,7 +150,9 @@ class PostRentalGpuRecheckCheck:
                 self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
                 return CheckResult(
                     passed=True,
-                    event=render_message(Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what),
+                    event=render_message(
+                        Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what
+                    ),
                 )
 
         probes = await self._run_every_card_probes(ctx, what)
@@ -204,23 +184,6 @@ class PostRentalGpuRecheckCheck:
         )
 
     @staticmethod
-    async def _recently_cleared(ctx: Context) -> bool:
-        try:
-            return (
-                await ctx.services.redis.get(cleared_key(ctx.miner_hotkey, ctx.executor.uuid))
-                is not None
-            )
-        except Exception:  # noqa: BLE001 — unreadable: do not re-mark a node that may have just passed
-            return True
-
-    async def _find_marker(self, ctx: Context, key: str) -> RecheckMarker | None:
-        """The stored marker, else a new one for a renter report not already cleared by a pass."""
-        marker = await self._read_marker(ctx, key)
-        if marker is None and _renter_reported(ctx) and not await self._recently_cleared(ctx):
-            marker = await self._record_renter_report_marker(ctx)
-        return marker
-
-    @staticmethod
     async def _remove_fillers(ctx: Context) -> list[str]:
         rented_data = ctx.state.rented_data
         if (
@@ -229,13 +192,6 @@ class PostRentalGpuRecheckCheck:
         ):
             return []
         return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
-
-    @staticmethod
-    async def _record_renter_report_marker(ctx: Context) -> RecheckMarker:
-        marker = RecheckMarker(source="renter_report", verdict="renter_reported")
-        await record_marker(ctx, marker)
-        # DRY_RUN writes nothing: the recheck still sees what it would require this cycle
-        return marker
 
     @staticmethod
     async def _read_marker(ctx: Context, key: str) -> RecheckMarker | None:
@@ -257,10 +213,6 @@ class PostRentalGpuRecheckCheck:
             return
         try:
             await ctx.services.redis.delete(key)
-            # the backend keeps listing a node for its whole report window: a pass holds off re-marking
-            await ctx.services.redis.set(
-                cleared_key(ctx.miner_hotkey, ctx.executor.uuid), "1", ex=MARKER_TTL_SECONDS
-            )
         except Exception as exc:  # noqa: BLE001 — the pass stands; the recheck repeats next cycle
             what["marker_clear_error"] = str(exc)
 

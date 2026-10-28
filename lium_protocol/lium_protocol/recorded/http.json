@@ -68,9 +68,6 @@
         "provider_email_held_executor_ids": [
           "9c8d7e6f-5a4b-4c3d-8e2f-1a0b9c8d7e6f"
         ],
-        "renter_hardware_fault_executor_ids": [
-          "9c8d7e6f-5a4b-4c3d-8e2f-1a0b9c8d7e6f"
-        ],
         "maintenance_executor_ids": [
           "3e2f1a0b-9c8d-4e7f-8a6b-5c4d3e2f1a0b"
         ],

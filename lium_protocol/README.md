@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 17 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.16.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.0.0`) is semver over the wire.
 
 ## Using it
 
@@ -34,7 +34,7 @@ Field types are what a receiver must accept: a field one peer sends and the othe
 
 ## The contract
 
-`snapshots/lium_protocol.v1.json` is the JSON Schema of every model above, committed. `python -m lium_protocol.schema --check` exits 1 with a unified diff when the models no longer match it; CI runs it on every pull request (`.github/workflows/test.yml`, job `protocol`). A wire change is therefore a diff in that file, reviewed as such — regenerate it with `python -m lium_protocol.schema --write` and commit it next to the model change.
+`snapshots/lium_protocol.v2.json` is the JSON Schema of every model above, committed. `python -m lium_protocol.schema --check` exits 1 with a unified diff when the models no longer match it; CI runs it on every pull request (`.github/workflows/test.yml`, job `protocol`). A wire change is therefore a diff in that file, reviewed as such — regenerate it with `python -m lium_protocol.schema --write` and commit it next to the model change.
 
 Compatibility rules for a change:
 
@@ -61,6 +61,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `1.15.0` — `RestoreContainerRequest.recovery` (optional, default false): a re-dispatch of a restore that may already be running (after a reconnect or a redelivered create); the validator does not report its dispatch failure. An older validator ignores it.
 - `1.17.0` — `RentedExecutorsResponse.maintenance_executor_ids` (optional, default empty): the nodes inside a running provider maintenance window; the validator pays them no incentive from either pool, rented or not. `RentedExecutorsResponse.maintenance_windows_by_executor` (optional, default empty): executor_id → `MaintenanceWindow` (UTC `starting_at`, `expiring_at`, half-open); the validator fails a node with `PROVIDER_MAINTENANCE` when its cycle started inside the window.
 - `1.16.0` — `ResetPodGpuRequest` (backend → validator; `local_volume_path` optional, needed for a pod with an encrypted volume) and its answer `PodGpuResetResult` with `GpuResetErrorCode` and `GpuResetOutcome` (a renter resets their pod's GPUs; the validator stops the container, runs `nvidia-smi -r -i` on the pod's GPUs only and starts it again).
+- `2.0.0` — `RentedExecutorsResponse.renter_hardware_fault_executor_ids` removed: the validator no longer reads it and the backend never sent it. Both sides ignore unknown keys, so a 1.x peer that still sends or expects it keeps working.
 - `1.0.0` — first release.
 
 ## Tests
