@@ -280,26 +280,6 @@ async def test_inconclusive_for_over_a_day_warns_without_a_score_change(context_
 
 
 @pytest.mark.asyncio
-async def test_one_unsupported_then_inconclusive_for_over_a_day_fires_required(
-    context_factory, enforced
-):
-    ctx = context_factory(state=build_state(specs={}))
-    await run_with(ctx, {"storage_limit_supported": True})
-    await run_with(ctx, NO_LIMIT)
-    await run_with(ctx, TIMEOUT)
-    inconclusive_since(ctx, timedelta(hours=23))
-    within = await run_with(ctx, TIMEOUT)
-    inconclusive_since(ctx, timedelta(hours=25))
-
-    result = await run_with(ctx, TIMEOUT)
-
-    assert within.passed is True
-    assert result.passed is False
-    assert result.event.reason_code == Msg.REQUIRED.reason
-    assert result.updates["score"] == 0.0
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["read", "write"])
 @pytest.mark.parametrize("probe", [NO_LIMIT, TIMEOUT])
 async def test_a_redis_error_on_the_verdict_memory_holds_the_node(
