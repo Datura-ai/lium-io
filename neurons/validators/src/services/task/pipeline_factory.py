@@ -5,6 +5,7 @@ including context setup and check instantiation.
 """
 
 import logging
+import time
 import uuid
 from typing import cast
 
@@ -52,6 +53,7 @@ from .checks import (
     GpuUsageCheck,
     GpuVramPrecheck,
     HardwareIdentityCheck,
+    IdleDiskWriteCheck,
     InspectorRentedCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
@@ -61,12 +63,15 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     PostRentalGpuRecheckCheck,
+    ProviderMaintenanceCheck,
     ProviderSideLoadCheck,
     RegistryPullCheck,
     RentalProbeCheck,
     RentalVerificationCheck,
     RentedGpuDropCheck,
+    RentedPodNetworkCheck,
     RentedPodResourcesCheck,
+    RentedThroughputCheck,
     ScoreCheck,
     SpecChangeCheck,
     SshdAuthLogCheck,
@@ -74,6 +79,7 @@ from .checks import (
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
     SshdBootstrapCheck,
+    PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
     TenantEnforcementCheck,
@@ -165,6 +171,7 @@ class PipelineFactory:
         gpu_attestation_passed: bool | None = None,
         first_pass: bool = False,
         encrypted_private_key: str | None = None,
+        task_started_at: float | None = None,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -177,6 +184,7 @@ class PipelineFactory:
             public_key: Public key for SSH
             encrypted_private_key: the same key as the backend sent it, for the rental probe's
                 create_container / delete_container calls (DAH-3436); None disables the probe
+            task_started_at: time.monotonic() at the executor task's start, which its timeout counts from
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
@@ -213,6 +221,7 @@ class PipelineFactory:
 
         return Context(
             pipeline_id=pipeline_id,
+            started_at_monotonic=task_started_at or time.monotonic(),
             executor=executor_info,
             miner_hotkey=miner_info.miner_hotkey,
             miner_coldkey=miner_info.miner_coldkey,
@@ -260,7 +269,6 @@ class PipelineFactory:
                 # constant when the backend is unreachable (shared config empty).
                 nvml_digest_map=shared_client.config.nvml_ml_digests or LIB_NVIDIA_ML_DIGESTS,
                 nvml_invalid_drivers=shared_client.config.nvml_invalid_drivers,
-                inspector_enabled=settings.ENABLE_INSPECTOR,
                 port_private_key=private_key,
                 port_public_key=public_key,
                 job_batch_id=miner_info.job_batch_id,
@@ -353,6 +361,10 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                # DAH-4709: an idle node inside its provider maintenance window fails here, before the
+                # ports, registry pull, download speed, VerifyX and rental probe; a rented one passes on to
+                # TenantEnforcementCheck, which reads its pods first.
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
@@ -385,9 +397,13 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
+                RentedPodNetworkCheck(),
+                # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
+                RentedThroughputCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
@@ -418,6 +434,8 @@ class PipelineFactory:
                 # `nvidia-smi -L`. Last before scoring: it needs the verified ports, the GPU list and
                 # the rented/filler state every check above settled. Flag-gated, off by default.
                 RentalProbeCheck(),
+                # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
+                IdleDiskWriteCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -498,6 +516,7 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
@@ -505,6 +524,9 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
+                RentedPodNetworkCheck(),
+                # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
+                RentedThroughputCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 LocalVerifyCheck(),
@@ -517,6 +539,7 @@ class PipelineFactory:
                             RegistryPullCheck(),
                             ContainerDownloadSpeedCheck(),
                             SysboxRequiredCheck(),
+                            PidHostRequiredCheck(),
                             RentalVerificationCheck(),
                         ],
                         [
@@ -530,6 +553,8 @@ class PipelineFactory:
                     ]
                 ),
                 RentalProbeCheck(),
+                # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
+                IdleDiskWriteCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -577,6 +602,7 @@ class PipelineFactory:
                 ProviderSideLoadCheck(),
                 # DAH-4564: read-only docker inspect + /proc read — safe in dry run.
                 RentedPodResourcesCheck(),
+                RentedPodNetworkCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),
@@ -604,6 +630,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
                 ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).

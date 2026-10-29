@@ -4,11 +4,12 @@ import json
 import logging
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from core.config import settings
 from core.utils import _m
+from protocol.vc_protocol.compute_requests import LIVE_FILLER_RUN_STATUSES
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
 from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
@@ -40,6 +41,10 @@ DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS = 60 * 60
 # claim on those slots, the queued ids take turns for the rest (least recently sent first) and never
 # fewer than REAPED_POD_STATES_FLOOR of them, so a node with 256 rented pods still moves its queue.
 REAPED_POD_STATE_RETENTION_SECONDS = 24 * 60 * 60
+# How long after its rental closed a volume is still the delete's to remove, not the low-disk sweep's.
+ENDED_RENTAL_VOLUME_GRACE = timedelta(hours=1)
+# A volume_<uuid> neither a pod nor a filler run is known by is removed only after this long.
+UNKNOWN_VOLUME_MIN_AGE = timedelta(days=7)
 REAPED_POD_STATES_KEY_PREFIX = "reaped_pod_states:"
 REAPED_POD_STATES_FLOOR = 32
 
@@ -112,12 +117,22 @@ class StaleContainerCleanupCheck:
         # BEFORE the reclaim below on purpose: the reclaim measures free disk itself, so garbage
         # freed here can be the difference between keeping the node's ~190 GB cache and losing it.
         swept_download_temporaries: int | None = None
+        removed_orphan_volumes: int | None = None
         now: float = time.monotonic()
         last_sweep_at: float = self._last_sweep_at.get(ctx.executor.uuid, float("-inf"))
         if now - last_sweep_at >= DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS:
             swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
                 ssh_client=ctx.ssh,
                 executor_uuid=ctx.executor.uuid,
+            )
+            # A volume_<uuid> whose container is gone and whose pod or filler run is over is never read
+            # again; same hourly throttle, since each candidate costs backend lookups. Before the
+            # reclaim below, which measures free disk itself: the renter's leftovers go first.
+            removed_orphan_volumes = await ctx.services.container_cleanup.remove_orphan_rental_volumes(
+                ssh_client=ctx.ssh,
+                rented_data=ctx.state.rented_data,
+                executor_uuid=ctx.executor.uuid,
+                is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
             )
             self._last_sweep_at[ctx.executor.uuid] = now
 
@@ -142,6 +157,7 @@ class StaleContainerCleanupCheck:
                 "first_sight_grace": first_sight,
                 "rented_list_unknown": rented_list_unknown,
                 "reclaimed_cache_volumes": reclaimed_cache_volumes,
+                "removed_orphan_volumes": removed_orphan_volumes,
                 "swept_download_temporaries": swept_download_temporaries,
             },
         )
@@ -205,6 +221,33 @@ class StaleContainerCleanupCheck:
                 )
             )
             return True
+
+
+async def _is_orphan_volume(ctx: Context, volume_id: str, age: timedelta) -> bool:
+    """Whether the backend says the pod or filler run this volume belongs to is over.
+
+    Any doubt keeps the volume: no answer, a live rental or run, or a pod with no closed rental.
+    A uuid neither knows (a pod row long gone, a foreign name) goes only once the volume is
+    UNKNOWN_VOLUME_MIN_AGE old.
+    """
+    backend = ctx.services.backend
+    pod = await backend.get_pod_rental_active(volume_id)
+    if pod is None or pod.active:
+        return False
+    if pod.rental_closed_at is not None:
+        closed_at: datetime = pod.rental_closed_at
+        if closed_at.tzinfo is None:
+            # the backend writes a naive UTC timestamp
+            closed_at = closed_at.replace(tzinfo=UTC)
+        return datetime.now(UTC) - closed_at >= ENDED_RENTAL_VOLUME_GRACE
+    if pod.status is not None:
+        return False
+    filler = await backend.get_filler_run_active(volume_id)
+    if filler is None or filler.active:
+        return False
+    if filler.status is not None:
+        return filler.status not in LIVE_FILLER_RUN_STATUSES
+    return age >= UNKNOWN_VOLUME_MIN_AGE
 
 
 def pod_id_of_container(name: str) -> str | None:

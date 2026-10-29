@@ -141,8 +141,9 @@ class Settings(BaseSettings):
     )
     # DAH-2977: also keep the top-N official templates warm (the backend lists them with
     # `pre_pull: true` when asked). Pulled one per refresh sweep, only while the node is
-    # idle. Off by default: the loop then behaves exactly as before and never asks.
-    PRE_PULL_TEMPLATES_ENABLED: bool = Field(env="PRE_PULL_TEMPLATES_ENABLED", default=False)
+    # idle. On by default since DAH-3604 (rollout step 3); PRE_PULL_TEMPLATES_ENABLED=false
+    # in .env opts a node out, and the loop then behaves exactly as before and never asks.
+    PRE_PULL_TEMPLATES_ENABLED: bool = Field(env="PRE_PULL_TEMPLATES_ENABLED", default=True)
     # Free space the docker root must keep after a pre-pull; least-recently-used
     # pre-pulled images are evicted first to stay above it.
     PRE_PULL_MIN_FREE_GB: int = Field(env="PRE_PULL_MIN_FREE_GB", default=200)
@@ -152,7 +153,6 @@ class Settings(BaseSettings):
     # send every executor to the registry at once.
     PRE_PULL_START_JITTER_SECONDS: int = Field(env="PRE_PULL_START_JITTER_SECONDS", default=15 * 60)
 
-    ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
     TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
     SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")
 
@@ -163,7 +163,8 @@ class Settings(BaseSettings):
     ENABLE_GPU_ATTESTATION: bool = Field(env="ENABLE_GPU_ATTESTATION", default=False)
     # NVIDIA attestation SDK arch tag routing the evidence at NRAS ("HOPPER", "BLACKWELL").
     GPU_ATTESTATION_ARCH: str = Field(env="GPU_ATTESTATION_ARCH", default="HOPPER")
-    # dstack guest marker; also what the dstack SDK talks to for TDX quotes.
+    # dstack guest marker; also what the dstack SDK talks to for TDX quotes. TDX quotes are
+    # served exactly when it exists (inside a dstack CVM); a bare-metal executor has none.
     DSTACK_SOCKET_PATH: str = Field(env="DSTACK_SOCKET_PATH", default="/var/run/dstack.sock")
     # G3 enforcement phase: reject SSH-key uploads without a validator attestation
     # nonce. Leave off until the validator fleet mints nonces (migration order:
