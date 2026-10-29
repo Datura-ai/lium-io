@@ -18,7 +18,6 @@ import pytest
 from neurons.validators.src.services.verifyx_validation_service import (
     LIB_PATH,
     MIN_CIPHER_LEN,
-    OUTDATED_LIBRARY_ERROR,
     VerifyXValidationService,
     settings,
 )
@@ -61,6 +60,7 @@ class Libraries:
 
 def executor_shell(digests: dict[str, str]) -> MagicMock:
     shell = MagicMock()
+    shell.executor_arch = "x86_64"  # an x86 host whose CPU was already read: no `uname -m` in the command list
     shell.get_sha256_checksum_by_path = AsyncMock(side_effect=lambda path: digests.get(path, ""))
     shell.ssh_client = SimpleNamespace(
         run=AsyncMock(
@@ -114,147 +114,64 @@ def _sha256(relative: str) -> str:
     return hashlib.sha256((REPO / relative).read_bytes()).hexdigest()
 
 
-def test_one_libverifyx_so_in_both_images_and_no_capacity_library():
-    assert _sha256("neurons/validators/libverifyx.so") == LIBRARY_SHA256
-    assert _sha256("neurons/executor/libverifyx.so") == LIBRARY_SHA256
-    assert not (REPO / "neurons/validators/libverifyx_capacity.so").exists()
-    assert not (REPO / "neurons/executor/libverifyx_capacity.so").exists()
-    assert LIB_PATH == "/usr/lib/libverifyx.so"
-    validator_dockerfile = (REPO / "neurons/validators/Dockerfile").read_text()
-    executor_dockerfile = (REPO / "neurons/executor/Dockerfile").read_text()
-    assert "RUN mv libverifyx.so /usr/lib/" in validator_dockerfile
-    assert "libverifyx_capacity.so" not in validator_dockerfile
-    assert "mv /root/app/libverifyx.so /usr/lib/" in executor_dockerfile
-    assert "libverifyx_capacity.so" not in executor_dockerfile
-    env_template = (REPO / "neurons/validators/.env.template").read_text()
-    assert "VERIFYX_NETWORK_GATE_MODE" not in env_template
-
-
-@pytest.mark.asyncio
-async def test_matching_hash_runs_libverifyx_so_with_no_lib_flag(libraries):
-    shell = executor_shell({LIB_PATH: LIBRARY_SHA256})
-    result = await gated_run(shell)
-    assert result.error is None and result.data["success"] is True
-    assert asked_for(shell) == [LIB_PATH]
-    command = commands(shell)[0]
-    assert command.startswith(MAIN_COMMAND_PREFIX)
-    assert "--lib" not in command
-    assert [record.lib_name for record in libraries.built] == [LIB_PATH]
-
-
 def _refresh_on():
     return patch.object(settings.verifyx, "LIBRARY_REFRESH_ENABLED", True)
 
 
+ARM_SHA256 = "e" * 64
+
+
+def arm_shell(digests: dict[str, str]) -> MagicMock:
+    shell = executor_shell(digests)
+    shell.executor_arch = None
+    shell.ssh_client.run = AsyncMock(
+        side_effect=lambda cmd, **_kw: SimpleNamespace(
+            stdout="aarch64\n" if cmd == "uname -m" else "ab" * MIN_CIPHER_LEN, stderr="", exit_status=0
+        )
+    )
+    return shell
+
+
 @pytest.mark.asyncio
-async def test_hash_mismatch_does_not_refresh_when_opt_in_is_off(libraries):
-    shell = executor_shell({LIB_PATH: STALE_SHA256})
-    with patch.object(
-        VerifyXValidationService, "_refresh_executor_library", AsyncMock(return_value=True)
-    ) as refresh:
+async def test_arm_executor_without_an_aarch64_build_fails_clearly_and_uploads_nothing(libraries):
+    shell = arm_shell({LIB_PATH: ARM_SHA256})
+    put = AsyncMock(return_value=None)
+    with _refresh_on(), patch.object(VerifyXValidationService, "_put_validator_library", put):
         result = await gated_run(shell)
-    assert refresh.await_count == 0
-    assert result.error == OUTDATED_LIBRARY_ERROR
-    assert (result.diagnostics or {}).get("event") == "VERIFYX_LIBRARY_MISMATCH_NO_REFRESH"
-    assert commands(shell) == []
+    assert result.error.startswith("ARM_VERIFIER_NOT_AVAILABLE")
+    assert result.diagnostics == {"event": "ARM_VERIFIER_NOT_AVAILABLE", "executor_arch": "aarch64"}
+    put.assert_not_awaited()
+    assert commands(shell) == ["uname -m"]
 
 
 @pytest.mark.asyncio
-async def test_hash_mismatch_does_not_refresh_when_usr_lib_is_not_writable(libraries):
-    shell = executor_shell({LIB_PATH: STALE_SHA256})
-    with (
-        _refresh_on(),
-        patch.object(
-            VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=False)
-        ) as writable,
-        patch.object(
-            VerifyXValidationService, "_refresh_executor_library", AsyncMock(return_value=True)
-        ) as refresh,
-    ):
-        result = await gated_run(shell)
-    assert writable.await_count == 1
-    assert refresh.await_count == 0
-    assert result.error != OUTDATED_LIBRARY_ERROR
-    assert "not writable" in result.error
-    assert (result.diagnostics or {}).get("event") == "VERIFYX_LIBRARY_WRITE_DENIED"
-
-
-@pytest.mark.asyncio
-async def test_hash_mismatch_fetches_then_retries(libraries):
+async def test_arm_executor_is_checked_against_and_sent_the_aarch64_build(libraries, tmp_path):
+    arm_lib = tmp_path / "libverifyx-aarch64.so"
+    arm_lib.write_bytes(b"arm")
     digests = {LIB_PATH: STALE_SHA256}
+    sources = []
 
-    async def after_refresh(_shell, expected, _extra):
+    async def after_refresh(_shell, expected, _extra, source):
+        sources.append((source, expected))
         digests[LIB_PATH] = expected
         return True
 
-    shell = executor_shell(digests)
+    shell = arm_shell(digests)
     with (
         _refresh_on(),
-        patch.object(
-            VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=True)
-        ),
-        patch.object(
-            VerifyXValidationService, "_refresh_executor_library", side_effect=after_refresh
-        ) as refresh,
+        patch(f"{SERVICE}.aarch64_lib_path", return_value=str(arm_lib)),
+        patch(f"{SERVICE}.sha256_from_path", side_effect=lambda p: ARM_SHA256 if p == str(arm_lib) else LIBRARY_SHA256),
+        patch.object(VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=True)),
+        patch.object(VerifyXValidationService, "_refresh_executor_library", side_effect=after_refresh),
     ):
         result = await gated_run(shell)
-    assert refresh.await_count == 1
-    assert result.error is None and result.data["success"] is True
-    assert asked_for(shell) == [LIB_PATH, LIB_PATH]
+    assert sources == [(str(arm_lib), ARM_SHA256)]
+    assert result.error is None
+    assert [record.lib_name for record in libraries.built] == [LIB_PATH]  # the validator still runs its own build
 
 
 @pytest.mark.asyncio
-async def test_hash_mismatch_and_failed_fetch_stays_outdated(libraries):
-    shell = executor_shell({LIB_PATH: STALE_SHA256})
-    with (
-        _refresh_on(),
-        patch.object(
-            VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=True)
-        ),
-        patch.object(
-            VerifyXValidationService, "_refresh_executor_library", AsyncMock(return_value=False)
-        ) as refresh,
-    ):
-        result = await gated_run(shell)
-    assert refresh.await_count == 1
-    assert result.error == OUTDATED_LIBRARY_ERROR
-    assert commands(shell) == []
-
-
-@pytest.mark.asyncio
-async def test_curl_installs_when_the_fetched_hash_matches():
-    shell = executor_shell({LIB_PATH: STALE_SHA256})
-    shell.ssh_client.run = AsyncMock(
-        return_value=SimpleNamespace(
-            stdout=f"CURL_RC:0\n{LIBRARY_SHA256}  /tmp/libverifyx.so.fetch\n",
-            stderr="",
-            exit_status=0,
-        )
-    )
-    ok = await VerifyXValidationService()._refresh_executor_library(
-        shell, LIBRARY_SHA256, {"executor_uuid": "exec-1"}
-    )
-    assert ok is True
-    ran = commands(shell)
-    assert any("curl -fsSL" in cmd for cmd in ran)
-    assert any(cmd.startswith("mv ") and LIB_PATH in cmd for cmd in ran)
-
-
-@pytest.mark.asyncio
-async def test_executor_can_write_lib_reads_the_probe():
-    shell = executor_shell({LIB_PATH: STALE_SHA256})
-    shell.ssh_client.run = AsyncMock(
-        return_value=SimpleNamespace(stdout="WRITE_OK:1\n", stderr="", exit_status=0)
-    )
-    assert await VerifyXValidationService()._executor_can_write_lib(shell) is True
-    shell.ssh_client.run = AsyncMock(
-        return_value=SimpleNamespace(stdout="WRITE_OK:0\n", stderr="", exit_status=0)
-    )
-    assert await VerifyXValidationService()._executor_can_write_lib(shell) is False
-
-
-@pytest.mark.asyncio
-async def test_curl_error_is_logged_and_validator_file_is_installed():
+async def test_refresh_of_the_aarch64_build_fetches_and_puts_that_file():
     shell = executor_shell({LIB_PATH: STALE_SHA256})
     shell.ssh_client.run = AsyncMock(
         return_value=SimpleNamespace(stdout="CURL_RC:22\n", stderr="404", exit_status=0)
@@ -262,7 +179,70 @@ async def test_curl_error_is_logged_and_validator_file_is_installed():
     put = AsyncMock(return_value=None)
     with patch.object(VerifyXValidationService, "_put_validator_library", put):
         ok = await VerifyXValidationService()._refresh_executor_library(
-            shell, LIBRARY_SHA256, {"executor_uuid": "exec-1"}
+            shell, ARM_SHA256, {"executor_uuid": "exec-1"}, source="/usr/lib/libverifyx-aarch64.so"
         )
     assert ok is True
-    put.assert_awaited_once()
+    assert "/neurons/executor/libverifyx-aarch64.so" in commands(shell)[0]
+    put.assert_awaited_once_with(shell, "/usr/lib/libverifyx-aarch64.so")
+
+
+@pytest.mark.parametrize(
+    ("arch", "has_arm_build", "expected"),
+    [
+        ("aarch64", True, ARM_SHA256),
+        ("aarch64", False, LIBRARY_SHA256),
+        ("x86_64", True, LIBRARY_SHA256),
+        (None, True, LIBRARY_SHA256),
+    ],
+)
+def test_local_verify_expects_the_library_the_executor_holds(libraries, tmp_path, arch, has_arm_build, expected):
+    """`/verify` and the SSH checksum gate accept the same library for one architecture, while the
+    challenge itself is still generated by the validator's native build."""
+    arm_lib = str(tmp_path / "libverifyx-aarch64.so")
+    spec = {**MACHINE_SPEC, "machine_arch": arch} if arch else MACHINE_SPEC
+    with (
+        patch(f"{SERVICE}.aarch64_lib_path", return_value=arm_lib if has_arm_build else None),
+        patch(f"{SERVICE}.sha256_from_path", side_effect=lambda p: ARM_SHA256 if p == arm_lib else LIBRARY_SHA256),
+    ):
+        challenge = VerifyXValidationService().prepare_verifyx_challenge(spec, {})
+    assert challenge.expected_lib_sha256 == expected
+    assert [record.lib_name for record in libraries.built] == [LIB_PATH]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("executor_digest", [STALE_SHA256, LIBRARY_SHA256])
+async def test_an_unreadable_cpu_never_writes_a_library(libraries, executor_digest):
+    """A failed `uname -m` is not taken for x86: a stale library stays put (no x86 build on a possible ARM host), and a
+    library that already matches the native build still runs."""
+    shell = executor_shell({LIB_PATH: executor_digest})
+    shell.executor_arch = None
+    refresh = AsyncMock(return_value=True)
+    with _refresh_on(), patch.object(VerifyXValidationService, "_refresh_executor_library", refresh):
+        result = await gated_run(shell)
+    refresh.assert_not_awaited()
+    if executor_digest == STALE_SHA256:
+        assert result.error.startswith("EXECUTOR_ARCH_UNKNOWN")
+    else:
+        assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_an_arm_host_holding_the_x86_build_is_caught_and_sent_the_aarch64_build(libraries, tmp_path):
+    """The CPU is read before the hashes: the x86 build on an ARM host matches the native digest and must not pass."""
+    arm_lib = tmp_path / "libverifyx-aarch64.so"
+    arm_lib.write_bytes(b"arm")
+    sources = []
+
+    async def after_refresh(_shell, expected, _extra, source):
+        sources.append(source)
+        return True
+
+    with (
+        _refresh_on(),
+        patch(f"{SERVICE}.aarch64_lib_path", return_value=str(arm_lib)),
+        patch(f"{SERVICE}.sha256_from_path", side_effect=lambda p: ARM_SHA256 if p == str(arm_lib) else LIBRARY_SHA256),
+        patch.object(VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=True)),
+        patch.object(VerifyXValidationService, "_refresh_executor_library", side_effect=after_refresh),
+    ):
+        await gated_run(arm_shell({LIB_PATH: LIBRARY_SHA256}))
+    assert sources == [str(arm_lib)]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import stat
 import sys
 from collections.abc import Mapping
@@ -19,7 +20,13 @@ from storage.restic import (
 from storage.workspace import WorkspaceResolutionError, WorkspaceResolver
 
 
+def _cancel_on_sigterm(signum: int, frame: object) -> None:
+    # Raising unwinds through ResticStorageRunner's finally, which removes the helper container.
+    raise StorageOperationCancelled("storage runner received SIGTERM")
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, _cancel_on_sigterm)
     arguments = _parse_arguments()
     event_writer: JsonEventWriter | None = None
     try:

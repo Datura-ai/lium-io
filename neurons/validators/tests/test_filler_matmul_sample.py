@@ -1,4 +1,6 @@
 import json
+import zlib
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,18 +38,26 @@ class SamplingValidationService:
         )
 
 
+_real_cycle_index = capability._filler_cycle_index
+
+
 @pytest.fixture(autouse=True)
-def no_sample_count_carried_between_tests():
-    capability._filler_cycles_since_sample.clear()
-    capability._filler_samples_taken.clear()
-    yield
-    capability._filler_cycles_since_sample.clear()
-    capability._filler_samples_taken.clear()
+def clock_cycle(monkeypatch):
+    """The wall-clock cycle, starting where this node's offset makes cycle+offset == 0."""
+    cycle = {"now": 0}
+    monkeypatch.setattr(capability, "_filler_cycle_index", lambda ctx: cycle["now"])
+    return cycle
 
 
-async def _filler_cycles(context_factory, service, cycles: int, specs=None) -> list:
+def _offset(uuid: str) -> int:
+    return zlib.crc32(uuid.encode())
+
+
+async def _filler_cycles(context_factory, service, cycles: int, specs=None, clock=None) -> list:
     results = []
-    for _ in range(cycles):
+    for i in range(cycles):
+        if clock is not None:
+            clock["now"] = i - _offset("executor-123")
         state = build_state(
             specs=specs or {"gpu": {"count": 1}},
             rented_data=RentedExecutorsResponse(
@@ -62,7 +72,8 @@ async def _filler_cycles(context_factory, service, cycles: int, specs=None) -> l
 
 
 @pytest.mark.asyncio
-async def test_no_sample_runs_by_default(context_factory):
+async def test_no_sample_runs_when_off(context_factory, monkeypatch):
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 0)
     service = SamplingValidationService()
 
     results = await _filler_cycles(context_factory, service, 5)
@@ -71,25 +82,61 @@ async def test_no_sample_runs_by_default(context_factory):
     assert all(r.event.what_we_saw == {"filler_container": "filler_active"} for r in results)
 
 
+def test_sampling_is_on_by_default_about_once_a_day():
+    # prod does not set it, so the default is what runs
+    assert type(capability.settings).model_fields["FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES"].default == 96
+
+
 @pytest.mark.asyncio
-async def test_every_nth_filler_cycle_runs_a_small_sample(context_factory, monkeypatch):
+async def test_every_nth_filler_cycle_runs_a_small_sample(
+    context_factory, monkeypatch, clock_cycle
+):
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 3)
     service = SamplingValidationService()
 
-    results = await _filler_cycles(context_factory, service, 7)
+    results = await _filler_cycles(context_factory, service, 7, clock=clock_cycle)
 
-    assert service.budgets == [capability.settings.FILLER_MATMUL_SAMPLE_VRAM_MB] * 2
-    assert service.probe_all_cards == [False, False]
+    assert service.budgets == [capability.settings.FILLER_MATMUL_SAMPLE_VRAM_MB] * 3
+    assert service.probe_all_cards == [False] * 3
     assert ["matmul_sample" in r.event.what_we_saw for r in results] == [
-        False,
-        False,
         True,
         False,
         False,
         True,
         False,
+        False,
+        True,
     ]
-    assert results[2].event.what_we_saw["matmul_sample"]["passed"] is True
+    assert results[0].event.what_we_saw["matmul_sample"]["passed"] is True
+
+
+def _due(uuid: str, cycle: int) -> bool:
+    ctx = SimpleNamespace(executor=SimpleNamespace(uuid=uuid))
+    return capability._filler_matmul_sample_due(ctx, cycle)
+
+
+def test_each_node_is_sampled_once_every_n_cycles_from_the_clock(monkeypatch):
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 96)
+    uuids = [f"executor-{i}" for i in range(50)]
+    start = 1_000_000
+
+    for uuid in uuids:
+        due = [_due(uuid, start + c) for c in range(96)]
+        assert due.count(True) == 1
+        # same node and cycle give the same answer: nothing in memory, so a restart changes nothing
+        assert due == [_due(uuid, start + c) for c in range(96)]
+    # nodes are spread over the day, not all sampled in one cycle
+    assert len({next(c for c in range(96) if _due(u, start + c)) for u in uuids}) > 10
+
+
+def test_the_cycle_comes_from_the_job_batch_id_then_the_wall_clock(monkeypatch):
+    cycle_s = capability.settings.BLOCKS_FOR_JOB * capability.SECONDS_PER_BLOCK
+    monkeypatch.setattr(capability.time, "time", lambda: 10 * cycle_s + 1)
+    batch = datetime.fromtimestamp(7 * cycle_s + 5).strftime("%Y-%m-%d %H:%M:%S")
+
+    assert _real_cycle_index(SimpleNamespace(config=SimpleNamespace(job_batch_id=batch))) == 7
+    for unset in (None, "Unknown"):
+        assert _real_cycle_index(SimpleNamespace(config=SimpleNamespace(job_batch_id=unset))) == 10
 
 
 @pytest.mark.asyncio
@@ -132,12 +179,12 @@ def _cards(count: int) -> dict:
 
 @pytest.mark.asyncio
 async def test_samples_rotate_over_every_claimed_card_within_the_budget(
-    context_factory, monkeypatch
+    context_factory, monkeypatch, clock_cycle
 ):
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
     service = SamplingValidationService()
 
-    results = await _filler_cycles(context_factory, service, 4, specs=_cards(3))
+    results = await _filler_cycles(context_factory, service, 4, specs=_cards(3), clock=clock_cycle)
 
     assert service.gpu_uuids == ["GPU-0", "GPU-1", "GPU-2", "GPU-0"]
     assert service.budgets == [capability.settings.FILLER_MATMUL_SAMPLE_VRAM_MB] * 4

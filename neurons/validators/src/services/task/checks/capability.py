@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import logging
+import time
+import zlib
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import SECONDS_PER_BLOCK
 from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
@@ -17,12 +21,6 @@ if TYPE_CHECKING:
     from services.matrix_validation_service import ValidationResult
 
 logger = logging.getLogger(__name__)
-
-# Cycles since the last matmul sample on a filler-only node, per (miner hotkey, executor uuid).
-# Per process: a validator restart starts the count again.
-_filler_cycles_since_sample: dict[tuple[str, str], int] = {}
-# Samples taken so far, per node: picks the next card in rotation.
-_filler_samples_taken: dict[tuple[str, str], int] = {}
 
 
 class CapabilityCheck:
@@ -49,8 +47,9 @@ class CapabilityCheck:
         filler_container = get_filler_only_container(ctx)
         if filler_container:
             what_filler: dict = {"filler_container": filler_container}
-            if _filler_matmul_sample_due(ctx):
-                what_filler["matmul_sample"] = await _filler_matmul_sample(ctx, specs)
+            cycle = _filler_cycle_index(ctx)
+            if _filler_matmul_sample_due(ctx, cycle):
+                what_filler["matmul_sample"] = await _filler_matmul_sample(ctx, specs, cycle)
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -295,21 +294,30 @@ def _failure_template(result: ValidationResult | None) -> MessageTemplate:
     return Msg.VERIFY_FAILED
 
 
-def _filler_matmul_sample_due(ctx: Context) -> bool:
-    """Every FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES-th filler-only cycle of this node; never when 0."""
+def _filler_cycle_index(ctx: Context) -> int:
+    """The job cycle (BLOCKS_FOR_JOB blocks), from the cycle's job_batch_id (its job block time) so
+    every check of one cycle agrees; the wall clock when the id is unset or does not parse."""
+    try:
+        at = datetime.strptime(ctx.config.job_batch_id, "%Y-%m-%d %H:%M:%S").timestamp()
+    except (TypeError, ValueError):
+        at = time.time()
+    return int(at) // (settings.BLOCKS_FOR_JOB * SECONDS_PER_BLOCK)
+
+
+def _filler_sample_offset(ctx: Context) -> int:
+    return zlib.crc32(ctx.executor.uuid.encode())
+
+
+def _filler_matmul_sample_due(ctx: Context, cycle: int) -> bool:
+    """Once every FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES cycles per node; never when 0. Chosen from
+    the clock and the executor uuid, not a counter, so validator restarts do not reset it."""
     every = settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES
     if every <= 0:
         return False
-    key = (ctx.miner_hotkey, ctx.executor.uuid)
-    cycles = _filler_cycles_since_sample.get(key, 0) + 1
-    if cycles < every:
-        _filler_cycles_since_sample[key] = cycles
-        return False
-    _filler_cycles_since_sample[key] = 0
-    return True
+    return (cycle + _filler_sample_offset(ctx)) % every == 0
 
 
-async def _filler_matmul_sample(ctx: Context, specs: dict) -> dict:
+async def _filler_matmul_sample(ctx: Context, specs: dict, cycle: int) -> dict:
     """A filler-only node skips the matmul for as long as the filler runs, so a card that left the
     node after the filler started is never challenged. This runs the same challenge on a small VRAM
     budget beside the filler and records the answer. A record only: the filler holds the cards, so
@@ -322,10 +330,9 @@ async def _filler_matmul_sample(ctx: Context, specs: dict) -> dict:
     details = (specs.get("gpu") or {}).get("details") or []
     gpu_uuid = None
     if details:
-        key = (ctx.miner_hotkey, ctx.executor.uuid)
-        taken = _filler_samples_taken.get(key, 0)
-        _filler_samples_taken[key] = taken + 1
-        card_index = taken % len(details)
+        every = max(settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES, 1)
+        sample_index = (cycle + _filler_sample_offset(ctx)) // every
+        card_index = sample_index % len(details)
         gpu_uuid = details[card_index].get("uuid") or ""
         sample.update(card_index=card_index, card_count=len(details), gpu_uuid=gpu_uuid)
     try:

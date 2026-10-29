@@ -5,7 +5,7 @@ import json
 import tempfile
 import re
 
-from workspace_mount import VolumeAccess, detect_volume_access
+from workspace_mount import VolumeAccess, detect_volume_access, load_secrets_file
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -173,8 +173,9 @@ def docker_base_command(args, volumes=None, volume_args=None, entrypoint=None, i
         command.extend(["--entrypoint", entrypoint])
     command.extend(
         [
-            "-e", f"AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key}",
-            "-e", f"AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key}",
+            # values come from this process's env (load_secrets_file), never the command line
+            "-e", "AWS_ACCESS_KEY_ID",
+            "-e", "AWS_SECRET_ACCESS_KEY",
             "-e", "AWS_DEFAULT_REGION=us-east-1",
             "daturaai/aws-cli",
         ]
@@ -416,14 +417,13 @@ if __name__ == "__main__":
     parser.add_argument('--source-volume', type=str, help='Source volume to backup')
     parser.add_argument('--backup-path', type=str, help='Backup path')
     parser.add_argument('--api-url', type=str, help='API URL')
-    parser.add_argument('--auth-token', type=str, help='Authentication token')
+    parser.add_argument('--secrets-file', type=str, required=True, help='0600 JSON file with the auth token and S3 keys; deleted on read')
     parser.add_argument('--source-volume-path', type=str, help='Source volume path')
     parser.add_argument('--backup-target-path', type=str, help='Backup target path')
     parser.add_argument('--backup-log-id', type=str, help='Backup log ID')
     parser.add_argument('--backup-volume-name', type=str, help='Backup volume name')
-    parser.add_argument('--backup-volume-iam_user_access_key', type=str, help='Backup volume IAM user access key')
-    parser.add_argument('--backup-volume-iam_user_secret_key', type=str, help='Backup volume IAM user secret key')
 
     args = parser.parse_args()
+    args.auth_token = load_secrets_file(args.secrets_file)
     backup_storage(args)
     logger.info("Backup storage script completed")

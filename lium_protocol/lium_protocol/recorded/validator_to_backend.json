@@ -619,6 +619,29 @@
         "workload_kind": "CUSTOMER_RENTAL",
         "msg": "pip install jupyterlab failed"
       }
+    },
+    {
+      "expect": "PodGpuResetResult",
+      "message": {
+        "message_type": "PodGpuResetResult",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "request_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "ok": true,
+        "error_code": null,
+        "container_restarted": true,
+        "gpus": [
+          {
+            "index": 1,
+            "uuid": "GPU-1a2b3c4d-0000-4000-8000-000000000001",
+            "result": "reset",
+            "detail": null
+          }
+        ],
+        "detail": null
+      }
     }
   ]
 }

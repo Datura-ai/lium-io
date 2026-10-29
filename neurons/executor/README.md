@@ -11,6 +11,8 @@ Before the first command, the machine needs:
 - **Docker Engine installed and running** — `docker ps` works. The Sysbox installer below refuses to run without it (`lium mine` runs the Docker install script too, but only after this step, and it is a no-op on a machine that already has Docker);
 - **a public IP** with the service port (`8080`) and the node SSH port (`2200`) reachable, and the hotkey (SS58 address) of your registered provider account — see the [Provider Quickstart](https://docs.lium.io/providers/quickstart).
 
+**GB300 and other ARM (Grace) hosts are not supported yet:** validators cannot verify an aarch64 node, so it earns nothing. The installer and the executor image are being made ready for aarch64; this note will say when ARM nodes can be added.
+
 RAM, disk (including the 1.5× VRAM rule for the idle incentive) and the recommended XFS storage setup are in the [Node Quickstart requirements](https://docs.lium.io/providers/nodes/quickstart#requirements).
 
 Install [Sysbox](https://docs.lium.io/providers/nodes/sysbox) first — validators reject a node without the `sysbox-runc` runtime. The installer below also sets up the NVIDIA Container Toolkit:
@@ -33,7 +35,7 @@ The script installs the [`lium`](https://github.com/Datura-ai/lium) CLI and runs
 2. runs `scripts/install_executor_on_ubuntu.sh` (Docker Engine and the compose plugin), then checks prerequisites — `nvidia-smi`, `nvidia-container-cli`, `docker info`,
 3. renders `neurons/executor/.env` from `.env.template` with the hotkey and the ports — you are prompted for the service port (`8080`), the node SSH port (`2200`), an optional public SSH port and an optional renting port range; pass `--auto` to accept the defaults without prompts,
 4. starts the executor with `docker compose up -d` and waits for the container to report `healthy`,
-5. runs the validator's own check against the node (`daturaai/lium-validator:latest`).
+5. runs the validator's own check against the node (`daturaai/compute-subnet-validator:preflight`).
 
 At the end it prints the node's endpoint, GPU type and count, and a `provider.lium.io/nodes?action=add&…` link that pre-fills the **Add Node** form in the [Provider Portal](https://provider.lium.io) with those values. Other options: `-d/--dir` (checkout directory, default `compute-subnet`) and `-b/--branch` (default `main`); `lium mine --help` lists them.
 
@@ -109,6 +111,7 @@ Note: Please use either **RENTING_PORT_RANGE** or **RENTING_PORT_MAPPINGS** and 
 Optional, commented out in the template (`src/core/config.py` has the defaults):
 
 - **COMPUTE_REST_API_URL**: the Lium backend the executor pre-pulls its GPU's cache template image from (default `https://lium.io/api`; empty disables the pre-pull)
+- **PRE_PULL_TEMPLATES_ENABLED**: on an idle node, also pull the most-rented official template images so rentals start faster; this uses disk (keeps `PRE_PULL_MIN_FREE_GB` free) and bandwidth (default `true`; set `false` to opt this node out)
 - **CACHE_TEMPLATE_REFRESH_SECONDS**: how often the template digest is re-checked (default `900`)
 - **CONTAINER_SIGNATURE_MAX_AGE_SECONDS**: maximum clock skew accepted on signed pod-metrics and pod-log requests (default `300`; keep the host on NTP rather than widening this)
 - **EXECUTOR_LOCAL_VERIFY_ENABLED**: answer the validator's one-call `POST /verify` (the verification suite from one signed intent, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused, and so is an intent that does not name this host's `MINER_HOTKEY_SS58_ADDRESS`) instead of 404 (default `false`; the validator falls back to its SSH checks either way)

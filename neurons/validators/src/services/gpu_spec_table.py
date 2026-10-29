@@ -46,7 +46,11 @@ Pre-check policy:
     - Models in KNOWN_UNRANGED -> passthrough with code='unranged'.
     - Models in neither -> raises UnsupportedGpuModelError.
 """
+
 from __future__ import annotations
+
+from services.const import GPU_MODEL_RATES
+from services.gpu_reference_table import pick_reference
 
 # Per-window bounds are nominal × [VRAM_FLOOR_RATIO, VRAM_CEIL_RATIO].
 # See the module docstring for why 0.90 / 1.05 (NVML under-reporting + vendor drift).
@@ -61,107 +65,108 @@ VRAM_CEIL_RATIO = 1.05
 #   Multi-variant cards list one nominal size per real SKU (flagged `# multi-variant`).
 GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Blackwell data-center
-    "NVIDIA B300 SXM6 AC":                                [294912],        # 288 GB; observed: 275040
-    "NVIDIA B200":                                        [196608],        # 192 GB; observed: 183359 (49140 ~48GB outlier rejected)
+    "NVIDIA B300 SXM6 AC": [294912],  # 288 GB; observed: 275040
+    "NVIDIA B200": [196608],  # 192 GB; observed: 183359 (49140 ~48GB outlier rejected)
     # Hopper data-center
-    "NVIDIA H200":                                        [144384],        # 141 GB; observed: 143771
-    "NVIDIA H200 NVL":                                    [144384],        # 141 GB; observed: 143771
-    "NVIDIA H100 80GB HBM3":                              [81920],         # 80 GB; observed: 81559
-    "NVIDIA H100 NVL":                                    [96256],         # 94 GB; observed: 95830
-    "NVIDIA H100 PCIe":                                   [81920],         # 80 GB; observed: 81559
-    "NVIDIA H800 80GB HBM3":                              [81920],         # 80 GB
-    "NVIDIA H800 NVL":                                    [96256],         # 94 GB
-    "NVIDIA H800 PCIe":                                   [81920],         # 80 GB
+    "NVIDIA H200": [144384],  # 141 GB; observed: 143771
+    "NVIDIA H200 NVL": [144384],  # 141 GB; observed: 143771
+    "NVIDIA H100 80GB HBM3": [81920],  # 80 GB; observed: 81559
+    "NVIDIA H100 NVL": [96256],  # 94 GB; observed: 95830
+    "NVIDIA H100 PCIe": [81920],  # 80 GB; observed: 81559
+    "NVIDIA H800 80GB HBM3": [81920],  # 80 GB
+    "NVIDIA H800 NVL": [96256],  # 94 GB
+    "NVIDIA H800 PCIe": [81920],  # 80 GB
     # Blackwell consumer
-    "NVIDIA GeForce RTX 5090":                            [32768],         # 32 GB; observed: 32607
-    "NVIDIA GeForce RTX 5090 D":                          [32768],         # 32 GB; China SKU
-    "NVIDIA GeForce RTX 5080":                            [16384],         # 16 GB
-    "NVIDIA GeForce RTX 5070 Ti":                         [16384],         # 16 GB
-    "NVIDIA GeForce RTX 5070":                            [12288],         # 12 GB
-    "NVIDIA GeForce RTX 5060 Ti":                         [8192, 16384],   # 8/16 GB multi-variant
-    "NVIDIA GeForce RTX 5060":                            [8192],          # 8 GB
+    "NVIDIA GeForce RTX 5090": [32768],  # 32 GB; observed: 32607
+    "NVIDIA GeForce RTX 5090 D": [32768],  # 32 GB; China SKU
+    "NVIDIA GeForce RTX 5080": [16384],  # 16 GB
+    "NVIDIA GeForce RTX 5070 Ti": [16384],  # 16 GB
+    "NVIDIA GeForce RTX 5070": [12288],  # 12 GB
+    "NVIDIA GeForce RTX 5060 Ti": [8192, 16384],  # 8/16 GB multi-variant
+    "NVIDIA GeForce RTX 5060": [8192],  # 8 GB
     # Ada consumer
-    "NVIDIA GeForce RTX 4090":                            [24576],         # 24 GB; observed: 24564 (99.6%), 23028 (0.4%)
-    "NVIDIA GeForce RTX 4090 D":                          [24576],         # 24 GB
-    "NVIDIA GeForce RTX 4080 SUPER":                      [16384],         # 16 GB
-    "NVIDIA GeForce RTX 4080":                            [16384],         # 16 GB
-    "NVIDIA GeForce RTX 4070 Ti SUPER":                   [16384],         # 16 GB
-    "NVIDIA GeForce RTX 4070 Ti":                         [12288],         # 12 GB
-    "NVIDIA GeForce RTX 4070 SUPER":                      [12288],         # 12 GB
-    "NVIDIA GeForce RTX 4070":                            [12288],         # 12 GB
-    "NVIDIA GeForce RTX 4060 Ti":                         [8192, 16384],   # 8/16 GB multi-variant
-    "NVIDIA GeForce RTX 4060":                            [8192],          # 8 GB
+    "NVIDIA GeForce RTX 4090": [24576],  # 24 GB; observed: 24564 (99.6%), 23028 (0.4%)
+    "NVIDIA GeForce RTX 4090 D": [24576],  # 24 GB
+    "NVIDIA GeForce RTX 4080 SUPER": [16384],  # 16 GB
+    "NVIDIA GeForce RTX 4080": [16384],  # 16 GB
+    "NVIDIA GeForce RTX 4070 Ti SUPER": [16384],  # 16 GB
+    "NVIDIA GeForce RTX 4070 Ti": [12288],  # 12 GB
+    "NVIDIA GeForce RTX 4070 SUPER": [12288],  # 12 GB
+    "NVIDIA GeForce RTX 4070": [12288],  # 12 GB
+    "NVIDIA GeForce RTX 4060 Ti": [8192, 16384],  # 8/16 GB multi-variant
+    "NVIDIA GeForce RTX 4060": [8192],  # 8 GB
     # Blackwell pro / Ada pro / Quadro-class
-    "NVIDIA RTX PRO 2000 Blackwell":                      [16384],         # 16 GB; observed: 16311
-    "NVIDIA RTX PRO 4000 Blackwell":                      [24576],         # 24 GB
-    "NVIDIA RTX PRO 4500 Blackwell":                      [32768],         # 32 GB
-    "NVIDIA RTX PRO 4500 Blackwell Server Edition":       [32768],         # 32 GB
-    "NVIDIA RTX PRO 5000 Blackwell":                      [49152, 73728],  # 48/72 GB multi-variant
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition":       [98304],         # 96 GB; observed: 97887
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":  [98304],         # 96 GB; observed: 97887
-    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [86016],         # 84 GB; China SKU, 448-bit bus
-    "NVIDIA RTX 6000D":                                   [86016],         # 84 GB; China SKU, 448-bit bus
-    "NVIDIA RTX 4500 Ada Generation":                     [24576],         # 24 GB; observed: 23034
-    "NVIDIA RTX 5000 Ada Generation":                     [32768],         # 32 GB
-    "NVIDIA RTX 5880 Ada Generation":                     [49152],         # 48 GB
-    "NVIDIA RTX 6000 Ada Generation":                     [49152],         # 48 GB; observed: 49140 (92%), 46068 (8%)
+    "NVIDIA RTX PRO 2000 Blackwell": [16384],  # 16 GB; observed: 16311
+    "NVIDIA RTX PRO 4000 Blackwell": [24576],  # 24 GB
+    "NVIDIA RTX PRO 4500 Blackwell": [32768],  # 32 GB
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": [32768],  # 32 GB
+    "NVIDIA RTX PRO 5000 Blackwell": [49152, 73728],  # 48/72 GB multi-variant
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": [98304],  # 96 GB; observed: 97887
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": [98304],  # 96 GB; observed: 97887
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": [98304],  # 96 GB
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [86016],  # 84 GB; China SKU, 448-bit bus
+    "NVIDIA RTX 6000D": [86016],  # 84 GB; China SKU, 448-bit bus
+    "NVIDIA RTX 4500 Ada Generation": [24576],  # 24 GB; observed: 23034
+    "NVIDIA RTX 5000 Ada Generation": [32768],  # 32 GB
+    "NVIDIA RTX 5880 Ada Generation": [49152],  # 48 GB
+    "NVIDIA RTX 6000 Ada Generation": [49152],  # 48 GB; observed: 49140 (92%), 46068 (8%)
     # Lovelace data-center
-    "NVIDIA L4":                                          [24576],         # 24 GB; observed: 23034
-    "NVIDIA L40S":                                        [49152],         # 48 GB; observed: 46068 (91%), 49140 (9%)
-    "NVIDIA L40":                                         [49152],         # 48 GB; observed: 46068 (75%), 49140 (25%)
+    "NVIDIA L4": [24576],  # 24 GB; observed: 23034
+    "NVIDIA L40S": [49152],  # 48 GB; observed: 46068 (91%), 49140 (9%)
+    "NVIDIA L40": [49152],  # 48 GB; observed: 46068 (75%), 49140 (25%)
     # Ampere data-center
-    "NVIDIA A100 80GB PCIe":                              [81920],         # 80 GB; observed: 81920
-    "NVIDIA A100-SXM4-80GB":                              [81920],         # 80 GB; observed: 81920
-    "NVIDIA A800 80GB PCIe":                              [81920],         # 80 GB
-    "NVIDIA A10 Tensor Core GPU":                         [24576],         # 24 GB
+    "NVIDIA A100 80GB PCIe": [81920],  # 80 GB; observed: 81920
+    "NVIDIA A100-SXM4-80GB": [81920],  # 80 GB; observed: 81920
+    "NVIDIA A800 80GB PCIe": [81920],  # 80 GB
+    "NVIDIA A10 Tensor Core GPU": [24576],  # 24 GB
     # Only 8 GB is a factory SKU; 40/64 GB come from the community driver unlock.
-    "NVIDIA CMP 170HX":                                   [8192, 40960, 65536], # 8/40/64 GB multi-variant
+    "NVIDIA CMP 170HX": [8192, 40960, 65536],  # 8/40/64 GB multi-variant
     # Ampere pro
-    "NVIDIA RTX A6000":                                   [49152],         # 48 GB; observed: 49140
-    "NVIDIA RTX A5000":                                   [24576],         # 24 GB; observed: 24564
-    "NVIDIA RTX A4500":                                   [20480],         # 20 GB
-    "NVIDIA RTX A4000":                                   [16384],         # 16 GB; observed: 16376 (71%), 15352 (29%)
-    "NVIDIA RTX A2000":                                   [6144, 12288],   # 6/12 GB multi-variant
+    "NVIDIA RTX A6000": [49152],  # 48 GB; observed: 49140
+    "NVIDIA RTX A5000": [24576],  # 24 GB; observed: 24564
+    "NVIDIA RTX A4500": [20480],  # 20 GB
+    "NVIDIA RTX A4000": [16384],  # 16 GB; observed: 16376 (71%), 15352 (29%)
+    "NVIDIA RTX A2000": [6144, 12288],  # 6/12 GB multi-variant
     # Turing data-center / pro
-    "NVIDIA T4 Tensor Core GPU":                          [16384],         # 16 GB
-    "NVIDIA Tesla V100 Tensor Core GPU":                  [16384, 32768],  # 16/32 GB multi-variant
-    "NVIDIA Quadro RTX 8000":                             [49152],         # 48 GB
-    "NVIDIA Quadro RTX 6000":                             [24576],         # 24 GB
-    "NVIDIA Quadro RTX 5000":                             [16384],         # 16 GB
-    "NVIDIA TITAN V":                                     [12288],         # 12 GB
-    "NVIDIA TITAN RTX":                                   [24576],         # 24 GB
+    "NVIDIA T4 Tensor Core GPU": [16384],  # 16 GB
+    "NVIDIA Tesla V100 Tensor Core GPU": [16384, 32768],  # 16/32 GB multi-variant
+    "NVIDIA Quadro RTX 8000": [49152],  # 48 GB
+    "NVIDIA Quadro RTX 6000": [24576],  # 24 GB
+    "NVIDIA Quadro RTX 5000": [16384],  # 16 GB
+    "NVIDIA TITAN V": [12288],  # 12 GB
+    "NVIDIA TITAN RTX": [24576],  # 24 GB
     # Ampere consumer
-    "NVIDIA GeForce RTX 3090 Ti":                         [24576],         # 24 GB
-    "NVIDIA GeForce RTX 3090":                            [24576],         # 24 GB; observed: 24576
-    "NVIDIA GeForce RTX 3080 Ti":                         [12288],         # 12 GB
-    "NVIDIA GeForce RTX 3080":                            [10240, 12288],  # 10/12 GB multi-variant
-    "NVIDIA GeForce RTX 3070 Ti":                         [8192],          # 8 GB; observed: 8192
-    "NVIDIA GeForce RTX 3070":                            [8192],          # 8 GB
-    "NVIDIA GeForce RTX 3060 Ti":                         [8192],          # 8 GB
-    "NVIDIA GeForce RTX 3060":                            [8192, 12288],   # 8/12 GB multi-variant
-    "NVIDIA GeForce RTX 3060 Laptop GPU":                 [6144],          # 6 GB
-    "NVIDIA GeForce RTX 3050":                            [6144, 8192],    # 6/8 GB multi-variant
+    "NVIDIA GeForce RTX 3090 Ti": [24576],  # 24 GB
+    "NVIDIA GeForce RTX 3090": [24576],  # 24 GB; observed: 24576
+    "NVIDIA GeForce RTX 3080 Ti": [12288],  # 12 GB
+    "NVIDIA GeForce RTX 3080": [10240, 12288],  # 10/12 GB multi-variant
+    "NVIDIA GeForce RTX 3070 Ti": [8192],  # 8 GB; observed: 8192
+    "NVIDIA GeForce RTX 3070": [8192],  # 8 GB
+    "NVIDIA GeForce RTX 3060 Ti": [8192],  # 8 GB
+    "NVIDIA GeForce RTX 3060": [8192, 12288],  # 8/12 GB multi-variant
+    "NVIDIA GeForce RTX 3060 Laptop GPU": [6144],  # 6 GB
+    "NVIDIA GeForce RTX 3050": [6144, 8192],  # 6/8 GB multi-variant
     # Turing consumer
-    "NVIDIA GeForce RTX 2080 Ti":                         [11264],         # 11 GB
-    "NVIDIA GeForce RTX 2080 SUPER":                      [8192],          # 8 GB
-    "NVIDIA GeForce RTX 2070 SUPER":                      [8192],          # 8 GB
-    "NVIDIA GeForce RTX 2060 SUPER":                      [8192],          # 8 GB
-    "NVIDIA GeForce RTX 2060":                            [6144, 12288],   # 6/12 GB multi-variant
-    "NVIDIA GeForce GTX 1660 Ti":                         [6144],          # 6 GB
-    "NVIDIA GeForce GTX 1660 SUPER":                      [6144],          # 6 GB
-    "NVIDIA GeForce GTX 1660":                            [6144],          # 6 GB
+    "NVIDIA GeForce RTX 2080 Ti": [11264],  # 11 GB
+    "NVIDIA GeForce RTX 2080 SUPER": [8192],  # 8 GB
+    "NVIDIA GeForce RTX 2070 SUPER": [8192],  # 8 GB
+    "NVIDIA GeForce RTX 2060 SUPER": [8192],  # 8 GB
+    "NVIDIA GeForce RTX 2060": [6144, 12288],  # 6/12 GB multi-variant
+    "NVIDIA GeForce GTX 1660 Ti": [6144],  # 6 GB
+    "NVIDIA GeForce GTX 1660 SUPER": [6144],  # 6 GB
+    "NVIDIA GeForce GTX 1660": [6144],  # 6 GB
     # Pascal
-    "NVIDIA Tesla P100":                                  [12288, 16384],  # 12/16 GB multi-variant
-    "NVIDIA Tesla P40":                                   [24576],         # 24 GB
-    "NVIDIA Quadro P4000":                                [8192],          # 8 GB
-    "NVIDIA TITAN Xp":                                    [12288],         # 12 GB
-    "NVIDIA GeForce GTX 1080 Ti":                         [11264],         # 11 GB
-    "NVIDIA GeForce GTX 1080":                            [8192],          # 8 GB
-    "NVIDIA GeForce GTX 1070 Ti":                         [8192],          # 8 GB
-    "NVIDIA GeForce GTX 1070":                            [8192],          # 8 GB
-    "NVIDIA GeForce GTX 1060":                            [3072, 6144],    # 3/6 GB multi-variant (rare 5GB SKU not covered)
+    "NVIDIA Tesla P100": [12288, 16384],  # 12/16 GB multi-variant
+    "NVIDIA Tesla P40": [24576],  # 24 GB
+    "NVIDIA Quadro P4000": [8192],  # 8 GB
+    "NVIDIA TITAN Xp": [12288],  # 12 GB
+    "NVIDIA GeForce GTX 1080 Ti": [11264],  # 11 GB
+    "NVIDIA GeForce GTX 1080": [8192],  # 8 GB
+    "NVIDIA GeForce GTX 1070 Ti": [8192],  # 8 GB
+    "NVIDIA GeForce GTX 1070": [8192],  # 8 GB
+    "NVIDIA GeForce GTX 1060": [3072, 6144],  # 3/6 GB multi-variant (rare 5GB SKU not covered)
     # Maxwell
-    "NVIDIA Tesla M40":                                   [12288, 24576],  # 12/24 GB multi-variant
+    "NVIDIA Tesla M40": [12288, 24576],  # 12/24 GB multi-variant
 }
 # `NVIDIA B300 SXM6 PC` (provider-observed on real hardware, 21 Sep 2026: memory.total 275040 MiB on all
 # 8 GPUs — the AC row's observed total, inside the [0.90, 1.05] band for both names; not in NVIDIA's
@@ -186,19 +191,19 @@ KNOWN_UNRANGED: set[str] = set()
 # UnsupportedGpuModelError until added here).
 NORMALIZATION_MAP: dict[str, str] = {
     # Tesla V100 family — CUDA reports "Tesla V100-..." in some driver versions
-    "Tesla V100-SXM2-16GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-SXM2-32GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-PCIE-16GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-PCIE-32GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
+    "Tesla V100-SXM2-16GB": "NVIDIA Tesla V100 Tensor Core GPU",
+    "Tesla V100-SXM2-32GB": "NVIDIA Tesla V100 Tensor Core GPU",
+    "Tesla V100-PCIE-16GB": "NVIDIA Tesla V100 Tensor Core GPU",
+    "Tesla V100-PCIE-32GB": "NVIDIA Tesla V100 Tensor Core GPU",
     # H100 — some driver/OS combos report without the "NVIDIA " prefix
-    "Tesla H100 80GB HBM3":                 "NVIDIA H100 80GB HBM3",
+    "Tesla H100 80GB HBM3": "NVIDIA H100 80GB HBM3",
     # T4 / A10 — CUDA sometimes drops the "Tensor Core GPU" suffix
-    "Tesla T4":                             "NVIDIA T4 Tensor Core GPU",
-    "NVIDIA T4":                            "NVIDIA T4 Tensor Core GPU",
-    "NVIDIA A10":                           "NVIDIA A10 Tensor Core GPU",
+    "Tesla T4": "NVIDIA T4 Tensor Core GPU",
+    "NVIDIA T4": "NVIDIA T4 Tensor Core GPU",
+    "NVIDIA A10": "NVIDIA A10 Tensor Core GPU",
     # A10G is the AWS-only SKU of the A10 (GA102, 24 GB GDDR6; g5 instances report it as
     # "NVIDIA A10G"). Rentable as an A10; A10's rate is 0.0, so no incentive either way.
-    "NVIDIA A10G":                          "NVIDIA A10 Tensor Core GPU",
+    "NVIDIA A10G": "NVIDIA A10 Tensor Core GPU",
     # Add observed CUDA names here as production logs surface them.
 }
 
@@ -226,7 +231,23 @@ def vram_window_for_size(nominal_mb: int) -> tuple[int, int]:
     return (round(nominal_mb * VRAM_FLOOR_RATIO), round(nominal_mb * VRAM_CEIL_RATIO))
 
 
-def matmul_probe_vram_mb(model: str | None) -> int | None:
+def reference_gpu_model(name: str | None, vram_mb: int | None) -> str | None:
+    """The known model whose tables (rate, base, caps, price anchor) a card is scored by (DAH-5088).
+
+    A known name is its own reference. An unknown NVIDIA name gets the model
+    services.gpu_reference_table picks for its reported VRAM, the same one lium-platform lists it
+    as; None otherwise. The name is self-reported, so an unknown name never earns more than the
+    cheapest honest card of that VRAM.
+    """
+    canonical = normalize_gpu_model(name)
+    if canonical in GPU_MODEL_RATES:
+        return canonical
+    if not canonical.startswith("NVIDIA "):
+        return None
+    return pick_reference(vram_mb)
+
+
+def matmul_probe_vram_mb(model: str | None, reported_vram_mb: int | None = None) -> int | None:
     """VRAM (MB) to size the all-cards work-proof from — registry-derived and floored to usable.
 
     Normalizes the CUDA-reported name, takes the SMALLEST nominal size for a multi-variant model
@@ -235,12 +256,15 @@ def matmul_probe_vram_mb(model: str | None) -> int | None:
     observed up to ~6.7% below the marketing nominal (e.g. B200 reports 183359 on a 192 GB card,
     L40S 46068 on 48 GB); sizing the matmul from the raw nominal would ask an honest B200/B300/L40S
     to allocate past its usable VRAM and OOM (DAH-2671). The floor is registry-derived, NOT host
-    self-report, so a spoofing host still cannot shrink its own challenge. Returns None for unknown
-    models — the caller then skips rather than guessing. Keeps registry sizing in this one module.
+    self-report, so a spoofing host still cannot shrink its own challenge. An unknown model scored as a
+    reference model (DAH-5088) has no registry size, so it is sized from `reported_vram_mb`, floored the
+    same way. Returns None for other unknown models — the caller then skips rather than guessing.
     """
     canonical = normalize_gpu_model(model)
     sizes = GPU_VRAM_SIZES_MB.get(canonical)
     if not sizes:
+        if reported_vram_mb and reference_gpu_model(canonical, reported_vram_mb):
+            return round(reported_vram_mb * VRAM_FLOOR_RATIO)
         return None
     return round(min(sizes) * VRAM_FLOOR_RATIO)
 
