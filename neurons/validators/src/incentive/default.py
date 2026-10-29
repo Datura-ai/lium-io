@@ -209,16 +209,16 @@ class DefaultIncentive(BaseIncentive):
         # Fallback for deployments using the legacy/default incentive algorithm
         # directly. The active rental_price algorithm handles this before it
         # calls into DefaultIncentive.
-        if job_result.is_new_rentals_paused and not job_result.is_rented:
+        if job_result.is_in_maintenance or (job_result.is_new_rentals_paused and not job_result.is_rented):
             logger.info(
                 _m(
-                    "Executor excluded from mining pool - paused for new rentals",
+                    "Executor excluded from mining pool - paused for new rentals or in maintenance",
                     extra=get_extra_info(
                         {
                             "executor_id": str(job_result.executor_info.uuid),
                             "gpu_model": job_result.gpu_model,
                             "gpu_count": job_result.gpu_count,
-                            "reason": "new_rentals_paused",
+                            "reason": "provider_maintenance" if job_result.is_in_maintenance else "new_rentals_paused",
                             "score": 0,
                             "pool": "none",
                         }

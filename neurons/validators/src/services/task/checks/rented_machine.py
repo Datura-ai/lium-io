@@ -29,6 +29,7 @@ from services.gpu_reset import renter_gpu_reset_in_progress
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)
@@ -226,6 +227,10 @@ class TenantEnforcementCheck:
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
+        # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
+        # is the provider's work, not POD_NOT_RUNNING, and is not recovered.
+        maintenance_window = maintenance_window_at_cycle_start(ctx)
+
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
@@ -260,6 +265,9 @@ class TenantEnforcementCheck:
             else:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
+                if maintenance_window is not None:
+                    ssh_pub_keys = []
+                    continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
                     stale_what = {
@@ -344,6 +352,19 @@ class TenantEnforcementCheck:
             if ssh_pub_keys is None:
                 # dockerd refused the keys read
                 ssh_pub_keys = []
+
+        if maintenance_window is not None:
+            return with_pod_states(
+                maintenance_failure(
+                    ctx,
+                    self.check_id,
+                    maintenance_window,
+                    extra,
+                    default_extra=extra,
+                    rented=True,
+                    ssh_pub_keys=ssh_pub_keys,
+                )
+            )
 
         container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)
