@@ -326,10 +326,18 @@ class RentedThroughputCheck:
         )
         stdout = result.stdout or ""
         pressure = parse_disk_pressure(stdout) if settings.DISK_PRESSURE_CHECK_ENABLED else None
-        if PROBE_SKIPPED_MARKER in stdout:
+        marker_sent = any(line.strip() == PROBE_SKIPPED_MARKER for line in stdout.splitlines())
+        if marker_sent and skip_under_pressure and pressure is not None and pressure.pressure:
             # DAH-5244: no container beside a Docker root whose sync already stalls; nothing measured, the
             # streaks stand (a node already at two failures stays zeroed until a measured pass)
             return self._unprobed_reading(result, pressure), "none", "none"
+        unsolicited_marker = PROBE_SKIPPED_MARKER in stdout
+        if unsolicited_marker:
+            # only the command this reading sent, and only under the pressure it read, leaves the probe out;
+            # a marker from anywhere else grants nothing and the rest of the output is judged as always
+            logger.warning(
+                _m("Rented throughput: unsolicited skip marker in the output", extra=get_extra_info(ctx.default_extra))
+            )
         endpoints = parse_download_speed(stdout)
         disk = parse_disk(stdout)
         net_mbps, disk_busy = parse_busy(stdout)
@@ -366,6 +374,8 @@ class RentedThroughputCheck:
             # shadow: what the disk side would be with the gate enforced, next to what it is
             reading["disk_pressure"] = pressure.as_spec()
             reading["disk_verdict_shadow"] = "none" if pressure.pressure else disk_side
+        if unsolicited_marker:
+            reading["unsolicited_skip_marker"] = True
         if result.error_type is not None:
             reading["error"] = f"{result.error_type}: {(result.error_message or '')[-200:]}"
         return reading, net, disk_side

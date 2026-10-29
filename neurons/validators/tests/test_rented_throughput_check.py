@@ -3,6 +3,7 @@ download check never looks at a rented node."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -565,3 +566,46 @@ async def test_a_skip_redis_refuses_to_record_runs_the_probe():
         res = await RentedThroughputCheck().run(ctx)
     assert res.passed and res.event.reason_code == Msg.OK.reason
     assert len(runner.commands) == 1 and "lium_dp_skipped" not in runner.commands[0]
+
+
+# a slow disk whose output the host ended with the marker, pressure read or not
+FORGED = snaps() + _pressure(stalled=True) + disk(secs=30.0) + FAST + "lium_dp_skipped\n"
+
+
+@pytest.mark.parametrize(
+    "read_pressure, enforce, recorded, output, disk_verdict",
+    [
+        (True, False, None, FORGED, "fail"),  # enforcement off: no skip offered
+        (False, True, None, FORGED, "fail"),  # reading off: no skip offered
+        (True, True, "refused", FORGED, "fail"),  # the reservation Redis refused to record
+        (True, True, {"at": 0, "probe_skips_in_a_row": 3}, FORGED, "fail"),  # the budget is spent
+        (True, True, None, snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST + "lium_dp_skipped\n", "fail"),
+        (True, True, None, SKIPPED, "none"),  # the skip the validator offered, under the pressure it read
+    ],
+    ids=["enforcement_off", "reading_off", "reservation_refused", "budget_spent", "no_pressure_read", "offered"],
+)
+async def test_a_skip_marker_the_validator_did_not_offer_grants_nothing(
+    read_pressure, enforce, recorded, output, disk_verdict
+):
+    # the host's output cannot grant a skip: the marker counts only in the reading whose command carried it and
+    # whose sync stalled; anywhere else it is noise and the rest of the output is judged
+    class ReadOnlyRedis(FakeRedis):
+        async def set(self, key, value, ex=None):
+            raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
+
+    redis = ReadOnlyRedis() if recorded == "refused" else FakeRedis()
+    redis.store[f"rented_throughput:{EXECUTOR.uuid}"] = json.dumps(recorded if isinstance(recorded, dict) else {"at": 0})
+    with flags(read_pressure=read_pressure, enforce_pressure=enforce), patch.dict(module._UNSAVED, clear=True):
+        runner = FakeRunner(output)
+        ctx = make_context(
+            state=build_state(rented_data=rented(), sysbox_runtime=True),
+            runner=runner,
+            services=build_services(redis=redis),
+        )
+        res = await RentedThroughputCheck().run(ctx)
+
+    what = res.event.what_we_saw
+    assert what["disk_verdict"] == disk_verdict
+    assert (what.get("probe_skipped") == "disk pressure") is (disk_verdict == "none")
+    assert what.get("unsolicited_skip_marker", False) is (disk_verdict == "fail")
+    assert res.event.reason_code == (Msg.UNMEASURED.reason if disk_verdict == "none" else Msg.SLOW_ONCE.reason)

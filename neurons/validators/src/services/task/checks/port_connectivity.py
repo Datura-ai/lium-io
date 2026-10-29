@@ -4,7 +4,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
-from protocol.vc_protocol.compute_requests import RentedExecutor
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
+from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.executor_connectivity.models import PortVerificationResult
 from services.redis_service import VerifiedPortsMemory
 
@@ -29,6 +30,9 @@ VERIFIED_PORTS_MEMORY_TTL_SECONDS = 24 * 3600
 DISK_PRESSURE_DEFERRALS_TTL_SECONDS = 24 * 3600
 # the two snapshots, the syncfs poll cap and a margin for the sysfs walk
 DISK_PRESSURE_READ_TIMEOUT_SECONDS = SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS + 15
+# executor uuid -> a completed check Redis refused to record; the older memory still in Redis may not be
+# republished until a later completed check is saved (the module outlives the per-cycle check instance)
+_UNSAVED_COMPLETED: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -36,8 +40,10 @@ class _PressureGate:
     """DAH-5244: the host disk reading before the port check and what the gate makes of it."""
 
     reading: DiskPressureReading | None = None
-    # rented by someone other than the owner, or running our filler: the writer is not the miner
+    # a rental not contracted as a self-rent, or a Lium-owned filler: the writer is not the node's operator
     deferral_eligible: bool = False
+    self_rent: bool = False
+    default_job_owner: str | None = None
     memory: VerifiedPortsMemory | None = None
     # the validator's own DinD probe found sysbox within its memory's lifetime (never the host's scrape)
     sysbox_verified: bool = False
@@ -52,6 +58,8 @@ class _PressureGate:
         return {
             "disk_pressure": self.reading.as_spec(),
             "disk_pressure_eligible": self.deferral_eligible,
+            "disk_pressure_self_rent": self.self_rent,
+            "default_job_owner": self.default_job_owner,
             "has_verified_ports_memory": self.memory is not None,
             "disk_pressure_would_defer": self.would_defer,
             "disk_pressure_deferrals_in_a_row": self.deferrals_in_a_row,
@@ -88,7 +96,7 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
-        gate = await self._disk_pressure_gate(ctx, rented_executor, filler_ports)
+        gate = await self._disk_pressure_gate(ctx, rented_data, rented_executor, filler_ports)
         if gate.deferred:
             return await self._deferred(ctx, gate, extra, busy_ports=set(rented_ports) | set(filler_ports))
 
@@ -265,10 +273,17 @@ class PortConnectivityCheck:
 
     @staticmethod
     def _port_setup_fingerprint(ctx: Context) -> str:
-        return f"{ctx.executor.address}|{ctx.executor.port_range}|{ctx.executor.port_mappings}"
+        # every input of the port selector: a memory from another setup is not republished
+        return (
+            f"{ctx.executor.address}|{ctx.executor.port_range}|{ctx.executor.port_mappings}|{ctx.executor.ssh_port}"
+        )
 
     async def _disk_pressure_gate(
-        self, ctx: Context, rented_executor: RentedExecutor | None, filler_ports: list[int]
+        self,
+        ctx: Context,
+        rented_data: RentedExecutorsResponse | None,
+        rented_executor: RentedExecutor | None,
+        filler_ports: list[int],
     ) -> _PressureGate:
         # read the host disk right before the check's containers; defer only with pressure, an eligible
         # node, a memory to republish, deferrals left and the deferral on record in Redis - any Redis
@@ -276,9 +291,12 @@ class PortConnectivityCheck:
         if not settings.DISK_PRESSURE_CHECK_ENABLED:
             return _PressureGate()
         reading = await self._read_disk_pressure(ctx)
-        deferral_eligible = (
-            rented_executor is not None and not rented_executor.owner_flag
-        ) or bool(filler_ports)
+        self_rent = rented_executor is not None and rented_executor.self_rent
+        default_job_owner = rented_data.get_default_job_owner(ctx.executor.uuid) if rented_data else None
+        # the backend says whose filler it is: the provider's own default job is the provider's writer
+        deferral_eligible = (rented_executor is not None and not self_rent) or (
+            bool(filler_ports) and default_job_owner == DEFAULT_JOB_OWNER_LIUM
+        )
         enforce = settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED
         memory = None
         sysbox_verified = False
@@ -304,6 +322,15 @@ class PortConnectivityCheck:
             and memory is not None
             and deferrals < DISK_PRESSURE_MAX_DEFERRALS
         )
+        if would_defer and ctx.executor.uuid in _UNSAVED_COMPLETED:
+            # the memory in Redis is older than the last completed check
+            logger.info(
+                _m(
+                    "deferral_blocked: unsaved completed check",
+                    extra=get_extra_info({**ctx.default_extra, "disk_pressure": reading.as_spec()}),
+                )
+            )
+            would_defer = False
         deferred = enforce and would_defer
         if deferred:
             # the bound lives in this counter: a deferral Redis did not record (reachable, refusing writes)
@@ -320,15 +347,25 @@ class PortConnectivityCheck:
                     _m("disk pressure deferral not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
                 )
                 deferred = False
-        return _PressureGate(
+        gate = _PressureGate(
             reading=reading,
             deferral_eligible=deferral_eligible,
+            self_rent=self_rent,
+            default_job_owner=default_job_owner,
             memory=memory,
             sysbox_verified=sysbox_verified,
             deferrals_in_a_row=deferrals,
             would_defer=would_defer,
             deferred=deferred,
         )
+        # its own line per reading: the port event repeats and LoggerSink drops a repeat to DEBUG
+        logger.info(
+            _m(
+                "DISK_PRESSURE_READING",
+                extra=get_extra_info({**ctx.default_extra, **gate.fields(), "disk_pressure_deferred": deferred}),
+            )
+        )
+        return gate
 
     @staticmethod
     async def _read_disk_pressure(ctx: Context) -> DiskPressureReading:
@@ -346,10 +383,9 @@ class PortConnectivityCheck:
     async def _record_completed_check(
         self, ctx: Context, result: PortVerificationResult, gate: _PressureGate
     ) -> None:
-        # a completed check (any status, an empty result included) is what the next deferral republishes;
-        # the streak of deferrals ends here and nowhere earlier, so a timed-out check cannot reopen it
-        if gate.reading is None:
-            return
+        # a completed check (any status, an empty result included) is what the next deferral republishes,
+        # with the reading off too; the streak of deferrals ends here and nowhere earlier, so a timed-out
+        # check cannot reopen it
         try:
             redis = ctx.services.redis
             await redis.record_verified_ports(
@@ -371,7 +407,9 @@ class PortConnectivityCheck:
                 )
             else:
                 await redis.clear_disk_pressure_deferrals(ctx.miner_hotkey, ctx.executor.uuid, shadow=True)
+            _UNSAVED_COMPLETED.discard(ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 - a safety net; never fail the port check over it
+            _UNSAVED_COMPLETED.add(ctx.executor.uuid)
             logger.warning(
                 _m("verified ports not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
             )
@@ -489,7 +527,13 @@ class PortConnectivityCheck:
                 )
             elif result.sysbox_measured is False:
                 await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            if not rented or sysbox_now or result.dind_ok:
+            if not rented:
+                if result.sysbox_measured is None and not sysbox_now:
+                    # DAH-5244: a deferred cycle republishes this memory, so a cycle an unrented node ends
+                    # without sysbox forgets it - the next deferral may not pass SysboxRequired on it
+                    await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+                return False
+            if sysbox_now or result.dind_ok:
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it

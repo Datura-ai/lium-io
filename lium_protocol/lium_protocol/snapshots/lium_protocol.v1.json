@@ -4837,6 +4837,11 @@
           },
           "title": "Pods",
           "type": "array"
+        },
+        "self_rent": {
+          "default": false,
+          "title": "Self Rent",
+          "type": "boolean"
         }
       },
       "required": [
@@ -5091,6 +5096,11 @@
           },
           "title": "Rented Ports",
           "type": "array"
+        },
+        "self_rent": {
+          "default": false,
+          "title": "Self Rent",
+          "type": "boolean"
         }
       },
       "required": [
@@ -6187,7 +6197,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.17.0",
+  "protocol_version": "1.18.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
