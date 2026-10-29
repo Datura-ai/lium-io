@@ -5,12 +5,13 @@ from dataclasses import replace
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.const import PORT_VERIFY_FIRST_MISS_TTL_SECONDS
+from services.const import MIN_PORT_COUNT, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .port_count import split_port_requirement
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        split_need = split_port_requirement(ctx.state)
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
@@ -61,6 +63,8 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
+            # a rented node is exempt from the split requirement (PortCountCheck), so only the floor applies
+            min_ports=split_need[1] if split_need and not rented_executor else MIN_PORT_COUNT,
         )
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)

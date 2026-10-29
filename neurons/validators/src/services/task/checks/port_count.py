@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -9,6 +10,8 @@ from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
+
+logger = logging.getLogger(__name__)
 
 
 def port_count_below_listing_floor(state: ContextState) -> int | None:
@@ -91,8 +94,9 @@ class PortCountCheck:
     check_id = "executor.validate.port_count"
     fatal = True
 
-    async def run(self, ctx: Context) -> CheckResult:
-        rented_data = ctx.state.rented_data
+    @staticmethod
+    def _count(ctx: Context, rented_data) -> tuple[int, bool, ContextState]:
+        """(port count, rented, state with the published port specs) as `rented_data` sees the node."""
         # The probe skips our idle filler's ports, but a rental removes the filler (create-time
         # cleanup) and frees them, so they join both the count and verified_ports, the set the
         # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
@@ -116,8 +120,24 @@ class PortCountCheck:
                 "port_mappings": ctx.executor.port_mappings,
             },
         )
+        return port_count, is_rented, updated_state
+
+    async def run(self, ctx: Context) -> CheckResult:
+        port_count, is_rented, updated_state = self._count(ctx, ctx.state.rented_data)
 
         split_need = split_port_requirement(ctx.state)
+        if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
+            # a rent or filler that started after the cycle's rental snapshot holds ports the probe found
+            # busy; re-read the backend once before failing, and a backend that does not answer keeps it
+            try:
+                fresh = await ctx.services.backend.get_rented_executors_now()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Rented-executors re-read failed; the split port verdict stands: %s", exc)
+                fresh = None
+            if fresh is not None:
+                port_count, is_rented, updated_state = self._count(ctx, fresh)
+                updated_state = replace(updated_state, rented_data=fresh)
+
         # below MIN_PORT_COUNT the plain floor below reports it; a rented node keeps its exemption
         if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
             max_splits, required = split_need

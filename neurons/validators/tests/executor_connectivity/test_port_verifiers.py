@@ -127,3 +127,20 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
     # each of the 2 attempts: one probe plus REPROBE_ROUNDS re-probes, then the attempt fails
     assert port_tester.test_many.await_count == 2 * (1 + BatchVerifier.REPROBE_ROUNDS)
     assert result.successful == [] and result.failed == ports
+
+
+@pytest.mark.asyncio
+async def test_batch_reprobes_past_the_floor_up_to_the_ports_a_split_node_needs(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
+    calls = []
+
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return (probed[:20], probed[20:]) if len(calls) == 1 else (probed, [])
+
+    verifier, _ = _batch_verifier(mocker, late_listeners)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=24)
+
+    assert calls == [ports, ports[20:]]
+    assert len(result.successful) == 24

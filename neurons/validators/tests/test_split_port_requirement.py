@@ -78,3 +78,43 @@ async def test_non_split_node_needs_only_the_plain_floor():
 async def test_rented_split_node_keeps_its_exemption():
     result = await PortCountCheck().run(_ctx(MIN_PORT_COUNT, rented=True))
     assert result.passed is True
+
+
+def _rented_now(*, pods: bool = False, filler_ports: list[int] | None = None) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8001",
+                pods=[RentedPod(pod_id="pod-1", container_name="container_pod-1", rented_ports=[65000])]
+                if pods
+                else [],
+            )
+        },
+        filler_ports_by_executor={"executor-123": filler_ports} if filler_ports else {},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rent_that_started_after_the_snapshot_keeps_the_rented_exemption():
+    ctx = _ctx(8 * MIN_PORT_COUNT - 3)
+    ctx.services.backend.get_rented_executors_now.return_value = _rented_now(pods=True)
+    result = await PortCountCheck().run(ctx)
+    assert result.passed is True
+    assert result.updates["state"].rented_data.executors["executor-123"].pods
+
+
+@pytest.mark.asyncio
+async def test_a_filler_that_started_after_the_snapshot_counts_its_ports():
+    ctx = _ctx(8 * MIN_PORT_COUNT - 3)
+    ctx.services.backend.get_rented_executors_now.return_value = _rented_now(filler_ports=[61000, 61001, 61002])
+    result = await PortCountCheck().run(ctx)
+    assert result.passed is True
+    assert result.updates["port_count"] == 8 * MIN_PORT_COUNT
+
+
+@pytest.mark.asyncio
+async def test_no_fresh_rental_data_keeps_the_failure():
+    ctx = _ctx(8 * MIN_PORT_COUNT - 3)  # the helper's backend answers None
+    assert (await PortCountCheck().run(ctx)).passed is False

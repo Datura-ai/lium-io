@@ -2,7 +2,7 @@ import random
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
@@ -35,6 +35,7 @@ class ConnectivityOrchestrator:
         unavailable_ports: list[int] | None,
         ssh_client,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
     ) -> PortVerificationResult:
         log_ctx = {
             **(log_ctx or {}),
@@ -69,6 +70,7 @@ class ConnectivityOrchestrator:
             ssh_client=ssh_client,
             host=executor_info.address,
             log_ctx=log_ctx,
+            min_ports=min_ports,
         )
 
         successful = list(probe_result.successful)

@@ -1,6 +1,7 @@
 import logging
 
 from core.utils import _m, get_extra_info
+from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.models import PortPair, PortProbeResult
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
 
@@ -27,13 +28,16 @@ class PortProbe:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
     ) -> PortProbeResult:
+        """`min_ports`: the verified ports PortCountCheck needs to list the node (more for a split node)."""
         log_ctx = log_ctx or {}
         batch = await self.batch_verifier.verify(
             ports,
             ssh_client=ssh_client,
             host=host,
             log_ctx=log_ctx,
+            min_ports=min_ports,
         )
         if batch.external_blocked:
             # the other tiers probe from the validator too, so they would pass the same host
@@ -50,7 +54,7 @@ class PortProbe:
                 ports,
                 ssh_client=ssh_client,
                 host=host,
-                max_ports=50,
+                max_ports=max(50, min_ports),
                 log_ctx=log_ctx,
             )
             tier = "semi_batch"
@@ -63,7 +67,7 @@ class PortProbe:
                 ports,
                 ssh_client=ssh_client,
                 host=host,
-                max_ports=10,
+                max_ports=max(10, min_ports),
                 log_ctx=log_ctx,
             )
             tier = "fallback"

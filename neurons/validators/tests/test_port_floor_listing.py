@@ -62,7 +62,7 @@ class HostNetworkBatch:
         self.reachable = reachable
         self.calls: list[list[PortPair]] = []
 
-    async def verify(self, ports, *, ssh_client, host, log_ctx=None):
+    async def verify(self, ports, *, ssh_client, host, log_ctx=None, min_ports=3):
         self.calls.append(list(ports))
         return BatchResult(list(ports[: self.reachable]), list(ports[self.reachable :]))
 

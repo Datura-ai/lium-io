@@ -134,3 +134,11 @@ async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
 
     assert result.status == "no_ports"
     assert result.port_ranges == (PortRangeResult(first=9000, last=9001, declared=2, probed=0, answered=0),)
+
+
+def test_declared_ports_counts_one_pair_per_external_port():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    info = _executor_info(port_mappings=str([[9000, 40000]] * 8 + [[9001, 40000], [9002, 40001]]))
+
+    assert declared_ports(info) == [PortPair(9000, 40000), PortPair(9002, 40001)]

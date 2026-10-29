@@ -44,8 +44,9 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
     ) -> BatchResult:
-        """Verify ports with retries."""
+        """Verify ports with retries; refused ports are re-probed until `min_ports` answer."""
         log_ctx = log_ctx or {}
         timeout_sec = 60
         max_attempts = 2
@@ -63,7 +64,7 @@ class BatchVerifier:
 
             try:
                 attempt_result = await asyncio.wait_for(
-                    self._attempt(ports, token, container_name, ssh_client, host, log_ctx),
+                    self._attempt(ports, token, container_name, ssh_client, host, log_ctx, min_ports),
                     timeout=timeout_sec
                 )
                 if attempt_result.successful:
@@ -112,6 +113,7 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
     ) -> BatchResult:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
@@ -136,9 +138,9 @@ class BatchVerifier:
                 )
                 first_round = successful
                 # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
-                # re-probe the refused ports while the count is below PortCountCheck's floor (the failure condition)
+                # re-probe the refused ports while the count is below what PortCountCheck needs to list the node
                 for round_no in range(1, self.REPROBE_ROUNDS + 1):
-                    if not failed or len(reached or []) + len(successful) >= MIN_PORT_COUNT:
+                    if not failed or len(reached or []) + len(successful) >= min_ports:
                         break
                     await asyncio.sleep(self.REPROBE_DELAY_SEC)
                     late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)

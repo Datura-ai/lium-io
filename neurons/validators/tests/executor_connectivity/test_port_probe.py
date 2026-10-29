@@ -90,3 +90,19 @@ async def test_port_probe_falls_through_to_fallback_when_batch_and_semi_empty(mo
     batch.verify.assert_called_once()
     semi.verify.assert_called_once()
     fallback.verify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_port_probe_fallback_tests_every_port_a_split_node_needs(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(30)]
+    batch = mocker.Mock()
+    batch.verify = mocker.AsyncMock(return_value=BatchResult([], ports))
+    semi = mocker.Mock()
+    semi.verify = mocker.AsyncMock(return_value=([], ports))
+    fallback = mocker.Mock()
+    fallback.verify = mocker.AsyncMock(return_value=(ports[:24], []))
+
+    await PortProbe(batch, semi, fallback).probe(ports, ssh_client=mocker.Mock(), host="127.0.0.1", min_ports=24)
+
+    assert batch.verify.call_args.kwargs["min_ports"] == 24
+    assert fallback.verify.call_args.kwargs["max_ports"] == 24

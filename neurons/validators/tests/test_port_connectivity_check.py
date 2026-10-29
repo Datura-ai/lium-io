@@ -116,6 +116,7 @@ class DummyConnectivityService:
         rented_pod_names: list[str] | None = None,
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
+        min_ports: int = 3,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with
@@ -125,6 +126,7 @@ class DummyConnectivityService:
             "sysbox_runtime": sysbox_runtime,
             "rented_ports": rented_ports,
             "filler_ports": filler_ports,
+            "min_ports": min_ports,
         }
 
         if self.verified_port_count:
@@ -274,6 +276,18 @@ async def test_port_connectivity_passes_filler_ports_as_exclusions(context_facto
 
     assert connectivity_service.called_with["filler_ports"] == [40001, 40003]
     assert connectivity_service.called_with["rented_ports"] == []
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_asks_the_probe_for_every_port_an_idle_split_node_needs(context_factory):
+    connectivity_service = DummyConnectivityService(success=True, verified_port_count=3)
+    services = build_services(redis=DummyRedis(), backend=DummyBackendService(), connectivity=connectivity_service)
+    state = build_state(gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=1)
+    ctx = context_factory(services=services, config=build_context_config(job_batch_id="batch-123"), state=state)
+
+    await PortConnectivityCheck().run(ctx)
+
+    assert connectivity_service.called_with["min_ports"] == 24
 
 
 @pytest.mark.asyncio

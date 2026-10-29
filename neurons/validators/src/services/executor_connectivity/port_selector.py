@@ -11,13 +11,18 @@ MAX_PORT = 65535
 
 
 def declared_ports(executor_info: ExecutorSSHInfo) -> list[PortPair]:
-    """Every port pair the executor declares, ssh port excluded, sorted by internal port."""
-    return [
-        PortPair(internal, external)
-        for internal, external in get_all_ports(
-            executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port
-        )
-    ]
+    """Every port pair the executor declares, ssh port excluded, sorted by internal port.
+
+    One pair per external port (the lowest internal wins): a renter reaches a pod through the
+    external port, so a repeated pair or two mappings onto one external port is one usable port,
+    and probing it twice would count it twice.
+    """
+    by_external: dict[int, PortPair] = {}
+    for internal, external in get_all_ports(
+        executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port
+    ):
+        by_external.setdefault(external, PortPair(internal, external))
+    return list(by_external.values())
 
 
 def tally_port_ranges(
