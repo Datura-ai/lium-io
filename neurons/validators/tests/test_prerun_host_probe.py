@@ -611,16 +611,14 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
 
 
 _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
-# the create's own pod left over from an earlier attempt: another pod's container is never a create's to remove
-_OWN_POD_ID = "00000000-0000-0000-0000-0000000000aa"
-_OWN_POD_LEFTOVER_REMOVAL = _remove_and_list_containers_command([f"pod_{_OWN_POD_ID}"], [f"volume_{_OWN_POD_ID}"])
+_POD_OLD_REMOVAL = _remove_and_list_containers_command(["pod_old"], ["volume_old"])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("containers", "active_volume_names", "docker_rm_exit", "ps_after_rm", "listing_after_rm_exit", "removals"),
     [
-        (("filler_x", f"pod_{_OWN_POD_ID}"), ["volume_x"], 0, f"pod_{_OWN_POD_ID}", 0, [_FILLER_X_REMOVAL, _OWN_POD_LEFTOVER_REMOVAL]),  # a pod beside the filler
+        (("filler_x", "pod_old"), ["volume_x"], 0, "pod_old", 0, [_FILLER_X_REMOVAL, _POD_OLD_REMOVAL]),  # a pod beside the filler
         (("filler_x",), [], 0, "", 0, [_remove_and_list_containers_command(["filler_x"], ["volume_x"])]),  # the filler's volume
         (("filler_x",), ["volume_x"], 0, "filler_x\n", 0, [_FILLER_X_REMOVAL]),  # the filler survived the rm
         (("filler_x",), ["volume_x"], 1, "", 0, [_FILLER_X_REMOVAL]),  # the rm failed although the filler is gone
@@ -642,7 +640,7 @@ async def test_customer_create_relists_after_any_other_removal(
     )
 
     result = await _run_create_container(
-        svc, _deploy_payload(pod_id=_OWN_POD_ID, active_volume_names=active_volume_names)
+        svc, _deploy_payload(active_volume_names=active_volume_names)
     )
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")

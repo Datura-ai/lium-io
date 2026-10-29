@@ -4213,6 +4213,27 @@ class DockerService:
             removed_cleanly_without_volume_rm=removed_cleanly and not volumes_to_remove,
         )
 
+    async def _pod_containers_being_created(self, miner_hotkey: str, executor_id: str, default_extra: dict) -> set[str]:
+        """`pod_<id>` of every create pending (add_pending_pod) or in flight on this node; empty when Redis
+        cannot be read, so the sweep then removes what main always did."""
+        try:
+            pending = await self.redis_service.get_pending_pods(miner_hotkey, executor_id)
+            inflight = await self.redis_service.inflight_backend_creates()
+        except Exception as exc:  # noqa: BLE001 — logged; the sweep goes on as before
+            logger.warning(
+                _m(
+                    "Could not read the node's creates in progress; sweeping without them",
+                    extra=get_extra_info({**default_extra, "error": f"{type(exc).__name__}: {exc}"}),
+                )
+            )
+            return set()
+        pod_ids = {str(item.get("pod_id")) for item in pending if item.get("pod_id")}
+        pod_ids |= {
+            pod_id for pod_id, create in inflight.items()
+            if create.executor_id == executor_id and create.miner_hotkey == miner_hotkey
+        }
+        return {f"{POD_CONTAINER_PREFIX}{pod_id}" for pod_id in pod_ids}
+
     async def clean_existing_containers(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -4228,10 +4249,14 @@ class DockerService:
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
         refuse_before_removal: Callable[[list[str]], None] | None = None,
+        miner_hotkey: str | None = None,
+        executor_id: str | None = None,
     ) -> list[str]:
-        """Force-remove this pod's own container and stale filler_ containers (and their volumes); returns the names removed.
+        """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
-        Another pod's `pod_*` is never removed here, listed or not (DAH-5392).
+        DAH-5392: with ``miner_hotkey`` and ``executor_id``, another pod's `pod_*` whose create is still
+        pending or in flight on this node is never stale: the backend lists a pod only once its
+        ContainerCreated lands, so a second renter's create on a split node would remove the first's.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
@@ -4282,19 +4307,23 @@ class DockerService:
             active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
             active_volume_set = set(active_volume_names) if active_volume_names else set()
             removed_id_by_filler_name = removed_at_ssh_connect or {}
-            # DAH-5392: of the `pod_*` containers only this pod's own (and its parked twin) is a create's to
-            # remove. The backend lists a renter's pod only once its ContainerCreated lands, so on a split
-            # node a second renter's create would otherwise remove the first one's new container; an
-            # orphan of an ended rental is StaleContainerCleanupCheck's to reap.
-            own_pod_names = {pod_name, f"{pod_name}{EDIT_PARKED_SUFFIX}"}
             pod_containers = [
                 name for name in all_names
-                if name in own_pod_names
+                if name == pod_name
+                or name.startswith(POD_CONTAINER_PREFIX)
                 or (name.startswith(FILLER_CONTAINER_PREFIX) and not keep_every_filler)
             ]
+            being_created: set[str] = set()
+            if miner_hotkey and executor_id and any(
+                name.startswith(POD_CONTAINER_PREFIX) and name not in active_set and name != pod_name
+                for name in pod_containers
+            ):
+                being_created = await self._pod_containers_being_created(miner_hotkey, executor_id, default_extra)
+                being_created |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in being_created}
+                being_created -= {pod_name, f"{pod_name}{EDIT_PARKED_SUFFIX}"}
             stale_containers = []
             for name in pod_containers:
-                if name in active_set:
+                if name in active_set or name in being_created:
                     continue
                 removed_id = removed_id_by_filler_name.get(name)
                 # the same instance (or one listed without an ID) was removed at SSH connect
@@ -8789,6 +8818,8 @@ class DockerService:
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
                     refuse_before_removal=lambda names: _refuse_filler_beside_unlisted_pod(payload, names),
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, so the listings

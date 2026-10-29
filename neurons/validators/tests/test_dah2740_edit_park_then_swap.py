@@ -441,9 +441,9 @@ def test_the_cycle_cleanup_protects_the_parked_twin_of_every_rented_pod():
 
 @pytest.mark.asyncio
 async def test_a_sibling_create_sweep_keeps_the_parked_twin_of_an_active_pod(svc):
-    """clean_existing_containers with the backend's active names: pod_x__prev survives while pod_x is active;
-    the create's own __prev leftover goes, another pod's is never its to remove (DAH-5392)."""
-    listing = "pod_active\npod_active__prev\npod_gone__prev\npod_gone\npod_new__prev\n"
+    """clean_existing_containers with the backend's active names: pod_x__prev survives while pod_x is active,
+    an unrelated __prev leftover does not."""
+    listing = "pod_active\npod_active__prev\npod_gone__prev\npod_gone\n"
     ssh = AsyncMock()
     ssh.run = AsyncMock(side_effect=lambda cmd, *a, **k: _ssh_result(stdout=listing) if "docker ps -a" in cmd else _ssh_result())
 
@@ -451,7 +451,7 @@ async def test_a_sibling_create_sweep_keeps_the_parked_twin_of_an_active_pod(svc
 
     rm = next(c for c in [call.args[0] for call in ssh.run.await_args_list] if c.startswith("/usr/bin/docker rm -fv"))
     assert "pod_active__prev" not in rm and "pod_active" not in rm.replace("pod_active__prev", "")
-    assert "pod_new__prev" in rm and "pod_gone" not in rm
+    assert "pod_gone__prev" in rm and "pod_gone" in rm
 
 
 @pytest.mark.asyncio
