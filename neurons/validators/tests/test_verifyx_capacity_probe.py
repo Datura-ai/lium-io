@@ -148,7 +148,7 @@ async def _run_check(
     # `success` (True or False) is what the check reads, as after `evaluate_verifyx_capture`.
     verifyx_service = DummyVerifyXService(success=True, updated_specs=verification_result)
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs=specs if specs is not None else {"gpu": {"count": 8}, "network": {}},
         rented_data=_rented_data_with_ema("executor-123", download=prev_ema, upload=prev_upload),
@@ -589,3 +589,78 @@ async def test_scrape_network_block_is_empty_and_only_verifyx_keys_leave_the_che
     }
     for stale_key in ("download_speed", "upload_speed", "ema_download_speed", "ema_upload_speed"):
         assert stale_key not in specs["network"]
+
+
+def test_an_evaluation_only_judgement_does_not_count_the_fallback():
+    """The liumd shadow judges with `record_tally=False`: same stats, nothing counted in the live
+    network-gate tally. The default (live SSH / local verify) still counts it."""
+    from neurons.validators.src.services import verifyx_validation_service as service
+
+    payload = {"network_execution": _cloudflare_unreachable_payload()}
+    before = service.NETWORK_GATE_TALLY.probe_fallback
+
+    quiet, _ = _verify_network_test(_challenge_data(), copy.deepcopy(payload), record_tally=False)
+    assert service.NETWORK_GATE_TALLY.probe_fallback == before
+    counted, _ = _verify_network_test(_challenge_data(), copy.deepcopy(payload))
+    assert service.NETWORK_GATE_TALLY.probe_fallback == before + 1
+    assert quiet == counted and quiet["cloudflare_fallback"] is True
+
+
+_XET_OK = {
+    "status": "success",
+    "success": True,
+    "speed_mbps": 900.0,
+    "pkg": PACKAGE["pkg"],
+    "bytes_downloaded": PACKAGE["size"],
+    "hash": PACKAGE["hash"],
+}
+
+
+@pytest.mark.parametrize(
+    "record_tally, xet_execution, message, logged",
+    [
+        (True, None, "VerifyX Cloudflare probe failed", True),
+        (False, None, "VerifyX Cloudflare probe failed", False),
+        (True, _XET_OK, "VerifyX Xet execution passed", True),
+        (False, _XET_OK, "VerifyX Xet execution passed", False),
+        (True, {"status": "failed", "error": "boom"}, "VerifyX Xet execution failed", True),
+        (False, {"status": "failed", "error": "boom"}, "VerifyX Xet execution failed", False),
+    ],
+    ids=[
+        "live-fallback",
+        "shadow-fallback",
+        "live-xet-pass",
+        "shadow-xet-pass",
+        "live-xet-fail",
+        "shadow-xet-fail",
+    ],
+)
+def test_evaluation_only_judgement_emits_no_unmarked_fallback_or_xet_log(
+    caplog, record_tally, xet_execution, message, logged
+):
+    """The fallback warning and the Xet logs carry no transport marker, so the liumd shadow
+    (`record_tally=False`) must not emit them; its marked speed line and shadow record carry the
+    same facts. Live judgements still log them, and the returned verdict is identical."""
+    challenge = {
+        **_challenge_data(),
+        "xet_challenge": {"download": {**PACKAGE, "url": "https://x"}},
+    }
+    response = {"network_execution": _cloudflare_unreachable_payload()}
+    if xet_execution is not None:
+        response["xet_execution"] = dict(xet_execution)
+    payload = {"challenge_data": challenge, "response_data": response}
+
+    def judge(tally: bool) -> dict:
+        with (
+            patch(f"{SERVICE}._verify_memory_test", return_value=({"success": True}, [])),
+            patch(f"{SERVICE}._verify_storage_test", return_value=({"success": True}, [])),
+        ):
+            return _perform_verification_checks(copy.deepcopy(payload), record_tally=tally)
+
+    reference = judge(True)
+    caplog.clear()
+    with caplog.at_level("INFO", logger=SERVICE):
+        result = judge(record_tally)
+
+    assert any(message in r.getMessage() for r in caplog.records) is logged
+    assert result == reference

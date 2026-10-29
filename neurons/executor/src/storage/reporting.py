@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import random
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -8,6 +10,12 @@ from uuid import UUID
 import requests
 
 from storage.models import ReporterResource, ReporterSpec, StorageAction
+
+# One progress PUT per interval at most; a hot loop of PUTs tripped the CloudFront WAF rate rule.
+PROGRESS_MIN_INTERVAL_SECONDS = 10.0
+RETRY_BACKOFF_CAP_SECONDS = 60.0
+# Queued log lines stay well under the WAF's 64 KB body limit, leaving room for the rest of the payload.
+PENDING_LOGS_MAX_BYTES = 32_000
 
 
 class ReportingLeaseExpired(RuntimeError):
@@ -45,6 +53,9 @@ class StorageEventReporter:
         self._cancel_requested = False
         self._restic_failure_detail: str | None = None
         self._diagnostic_detail: str | None = None
+        self._next_progress_at = self._clock()
+        self._progress_failures = 0
+        self._pending_logs: list[str] = []
 
     @property
     def cancel_requested(self) -> bool:
@@ -63,23 +74,30 @@ class StorageEventReporter:
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
-            if self._state.stage == "PREPARING" and self._restore_has_started():
+            if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
+            elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
+                # restic is running and scanning the snapshot; no file restored yet.
+                self._state.stage = "SCANNING"
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
+            return
+        if event_type == "rerun":
+            self._restic_failure_detail = self._diagnostic_detail = None
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
-        if event_type == "diagnostic":
+        if event_type in ("diagnostic", "log"):
             message = event.get("message")
             if isinstance(message, str) and message:
-                if self._diagnostic_detail is None:
+                if event_type == "diagnostic" and self._diagnostic_detail is None:
                     self._diagnostic_detail = message[:2000]
-                self._put(
-                    self._progress_payload(status="IN_PROGRESS", logs=[message[:2000]]),
-                    terminal=False,
+                # Kept until a PUT succeeds, so throttled or failed updates do not drop them.
+                self._pending_logs = _newest_within_bytes(
+                    [*self._pending_logs, message[:2000]][-20:]
                 )
+                self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
         if event_type == "result":
             status = event.get("status")
@@ -165,7 +183,6 @@ class StorageEventReporter:
         self,
         *,
         status: str,
-        logs: list[str] | None = None,
         result_quality: str | None = None,
         snapshot_id: str | None = None,
         exit_code: int | None = None,
@@ -186,10 +203,13 @@ class StorageEventReporter:
             "exit_code": exit_code,
             "error_code": error_code,
             "error_message": error_message,
-            "logs": logs,
+            "logs": list(self._pending_logs) or None,
         }
 
     def _put(self, payload: Mapping[str, object], *, terminal: bool) -> None:
+        # Progress state is cumulative, so a skipped update is carried by the next one.
+        if not terminal and self._clock() < self._next_progress_at:
+            return
         retry_delay_seconds = 1.0
         while True:
             try:
@@ -204,6 +224,9 @@ class StorageEventReporter:
                 response.raise_for_status()
                 body = response.json()
                 self._last_success_at = self._clock()
+                self._next_progress_at = self._last_success_at + PROGRESS_MIN_INTERVAL_SECONDS
+                self._progress_failures = 0
+                self._pending_logs = []
                 if isinstance(body, Mapping) and body.get("cancel_requested") is True:
                     self._cancel_requested = True
                 return
@@ -218,15 +241,51 @@ class StorageEventReporter:
                         "storage operation stopped because progress reporting was unavailable"
                     ) from error
                 if not terminal:
+                    self._progress_failures += 1
+                    backoff_seconds = min(
+                        PROGRESS_MIN_INTERVAL_SECONDS * 2 ** min(self._progress_failures - 1, 3),
+                        RETRY_BACKOFF_CAP_SECONDS,
+                    )
+                    self._next_progress_at = self._clock() + backoff_seconds * random.uniform(
+                        0.5, 1.0
+                    )
                     return
-                self._sleeper(min(retry_delay_seconds, remaining_seconds))
-                retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
+                self._sleeper(
+                    min(retry_delay_seconds * random.uniform(0.5, 1.0), remaining_seconds)
+                )
+                retry_delay_seconds = min(retry_delay_seconds * 2, RETRY_BACKOFF_CAP_SECONDS)
 
-    def _url(self) -> str:
+    def renew_credentials(self) -> dict[str, str] | None:
+        """DAH-4945: fresh scoped credentials for this backup's repository, or None if refused"""
+        if self._spec.resource is not ReporterResource.BACKUP:
+            return None
+        for attempt in range(3):
+            try:
+                response = self._session.post(
+                    self._url("credentials"),
+                    headers={"Authorization": f"Bearer {self._spec.auth_token}"},
+                    timeout=30,
+                )
+                if getattr(response, "status_code", None) in (401, 404, 409, 410):
+                    return None
+                response.raise_for_status()
+                body = response.json()
+                keys = ("access_key_id", "secret_access_key", "session_token")
+                if isinstance(body, Mapping) and all(
+                    _optional_string(body.get(key)) for key in keys
+                ):
+                    return {key: body[key] for key in keys}
+                return None
+            except (requests.RequestException, ValueError):
+                if attempt < 2:
+                    self._sleeper(5.0 * (attempt + 1))
+        return None
+
+    def _url(self, endpoint: str = "progress") -> str:
         resource_path = (
             "backup-logs" if self._spec.resource is ReporterResource.BACKUP else "restore-logs"
         )
-        return f"{self._spec.api_url}/{resource_path}/{self._operation_id}/progress"
+        return f"{self._spec.api_url}/{resource_path}/{self._operation_id}/{endpoint}"
 
 
 def _first_integer(value: Mapping[str, object], *keys: str) -> int | None:
@@ -248,3 +307,14 @@ def _optional_string(value: object) -> str | None:
 
 def _optional_integer(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _newest_within_bytes(lines: list[str]) -> list[str]:
+    kept: list[str] = []
+    size = 0
+    for line in reversed(lines):
+        size += len(json.dumps(line))
+        if size > PENDING_LOGS_MAX_BYTES:
+            break
+        kept.append(line)
+    return kept[::-1]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import StrEnum
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -16,17 +15,15 @@ class PortPair:
 class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
-    # the tiers that produced `successful`, joined with "+" when a top-up merged two
     tier: str = "batch"
-    # False when every batch attempt failed to start, timed out or raised mid-test
-    batch_completed: bool = False
 
 
 @dataclass(frozen=True)
 class BatchResult:
     successful: list[PortPair]
     failed: list[PortPair]
-    completed: bool
+    # DAH-4537: the validator reached the sampled ports but the outside prober reached none of them
+    external_blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,36 +72,15 @@ class PortRangeResult:
     declared: int
     probed: int
     answered: int
-    # 1: the lowest-300 pass every host gets; 2: the spread pass run only when still below 3 after the top-up
-    pass_number: int = 1
 
     def as_dict(self) -> dict[str, object]:
         label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
         return {
-            "pass": self.pass_number,
             "range": label,
             "declared": self.declared,
             "probed": self.probed,
             "answered": self.answered,
         }
-
-
-class SecondPass(StrEnum):
-    """Why pass two did or did not run (PORT_PROBE_TOPUP_BELOW_FLOOR on)."""
-
-    NOT_NEEDED = "not_needed"  # MIN_PORT_COUNT or more verified after DinD and the top-up
-    SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never completed
-    NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
-    RAN = "ran"
-    BATCH_FAILED = "batch_failed"  # pass two's own batch container didn't complete
-
-
-@dataclass(frozen=True)
-class SecondPassRun:
-    outcome: SecondPass
-    probed: list[PortPair] = field(default_factory=list)
-    answered: list[PortPair] = field(default_factory=list)
-    failed: list[PortPair] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -120,13 +96,15 @@ class PortVerificationResult:
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
     dind_error: DindLogCause | None = None
-    # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending: pass
-    # one's tallies, then pass two's when it ran.
+    # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending.
     port_ranges: tuple[PortRangeResult, ...] = ()
-    second_pass: SecondPass | None = None
     probe_tier: str | None = None
     # len(get_all_ports(...)) for the executor's declared range or mappings; None when they could not be parsed
     declared_port_count: int | None = None
+    # ticket-0494: the DinD probe's own sysbox reading, before any fallback. True/False only when the
+    # probe reached its container with sysbox-runc requested; None when it never reached the container
+    # or did not test sysbox. PortConnectivityCheck remembers a True and forgets on a False.
+    sysbox_measured: bool | None = None
 
 
 @dataclass(frozen=True)

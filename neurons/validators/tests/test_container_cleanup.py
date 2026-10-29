@@ -69,7 +69,7 @@ def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_
 
 def _rented_data(executor_uuid: str, pods: list[str]):
     """Build a RentedExecutorsResponse-like mock."""
-    pod_mocks = [MagicMock(container_name=name) for name in pods]
+    pod_mocks = [RentedPod(pod_id=f"pod-{i}", container_name=name) for i, name in enumerate(pods)]
     executor_mock = MagicMock(pods=pod_mocks)
     resp = MagicMock()
     resp.executors = {executor_uuid: executor_mock}
@@ -790,3 +790,25 @@ def test_get_rented_containers_answers_the_dind_volume_sweep_like_listed_contain
     names = ContainerCleanup()._get_rented_containers(rented_data, EXECUTOR_UUID)
 
     assert names == listed_container_names(rented_data)
+
+
+@pytest.mark.parametrize("validator_dry_run", [False, True])
+def test_pipeline_factory_cleanup_dry_run_follows_validator_dry_run(monkeypatch, validator_dry_run):
+    """DAH-4330: no separate cleanup toggle; cleanup only reports under the validator's DRY_RUN."""
+    from core.config import settings
+    from services.task import pipeline_factory as pipeline_factory_module
+
+    monkeypatch.setattr(pipeline_factory_module, "InspectorValidationService", MagicMock)
+    monkeypatch.setattr(settings, "DRY_RUN", validator_dry_run)
+    factory = pipeline_factory_module.PipelineFactory(*(MagicMock() for _ in range(7)))
+
+    assert factory.container_cleanup.dry_run is validator_dry_run
+    assert not hasattr(settings, "CONTAINER_CLEANUP_DRY_RUN")
+
+
+def test_listed_container_names_protects_the_pod_container_of_an_unnamed_pod():
+    # DAH-4315: the backend lists a new pod before it records the container name
+    names = listed_container_names(_rented_data(EXECUTOR_UUID, [""]))
+
+    assert "pod_pod-0" in names and "pod_pod-0__prev" in names
+    assert "" not in names and "__prev" not in names

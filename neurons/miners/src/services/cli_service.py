@@ -567,7 +567,7 @@ class CliService:
         try:
             payload = {'price_per_gpu': price_per_gpu}
             self.executor_dao.update(address, port, payload)
-            self.logger.info(f"✅ Successfully updated price for executor {address}:{port} to {price_per_gpu} USD/hour")
+            self.logger.info(f"✅ Saved a price of {price_per_gpu} USD/hour for executor {address}:{port}")
             return True
         except Exception as e:
             self.logger.error(f"Failed to update executor price: %s", str(e))

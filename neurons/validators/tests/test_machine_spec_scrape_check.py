@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 from datetime import datetime, UTC
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -308,8 +309,7 @@ async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(cont
 async def test_machine_spec_scrape_runs_the_uploaded_binary_when_no_source_was_delivered(
     context_factory,
 ):
-    # With ENABLE_SCRAPE_SOURCE_DELIVERY off the config carries no source, so UploadFilesCheck
-    # uploaded the binary and it is what runs.
+    # A config that carries no source: UploadFilesCheck uploaded the binary and it is what runs.
     # Arrange
     runner = DummySSHCommandRunner(
         result=make_command_result(success=True, stdout=FERNET_TOKEN)
@@ -376,7 +376,7 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
     assert "psutil" in result.event.what_we_saw["fallback_from"]["stderr_tail"]
 
 
-@pytest.mark.parametrize("duration_ms", [60_001, 240_000])
+@pytest.mark.parametrize("duration_ms", [120_001, 240_000])
 @pytest.mark.asyncio
 async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_slow(
     duration_ms, context_factory
@@ -441,9 +441,11 @@ async def test_machine_spec_scrape_finds_the_payload_among_other_stdout_lines(
     assert result.updates["state"].gpu_count == 1
 
 
+# a full scrape, and ones slowed by the vloopback mount test and its cleanup
+@pytest.mark.parametrize("duration_ms", [15_000, 75_000, 105_000])
 @pytest.mark.asyncio
 async def test_machine_spec_scrape_falls_back_when_the_stdin_payload_will_not_decrypt(
-    context_factory,
+    context_factory, duration_ms
 ):
     # The failure mode a probe cannot see: the modules import, the scrape runs, and the token it
     # produces is not one this validator can read.
@@ -453,7 +455,7 @@ async def test_machine_spec_scrape_falls_back_when_the_stdin_payload_will_not_de
     )
     runner = DummySSHCommandRunner(
         results=[
-            make_command_result(success=True, stdout=UNREADABLE_TOKEN, duration_ms=15_000),
+            make_command_result(success=True, stdout=UNREADABLE_TOKEN, duration_ms=duration_ms),
             make_command_result(success=True, stdout=FERNET_TOKEN),
         ]
     )
@@ -598,6 +600,110 @@ async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_scrape_repor
     assert result.event.what_we_saw["delivery"] == "stdin"
     assert len(runner.calls) == 1
     assert ssh_client.sftp_client.put_called_with is None
+
+
+# ── ticket-0331: the vloopback mount test in SCRAPE_OK, report-only ──────
+
+MOUNT_FAILED = {
+    "verdict": "fail",
+    "reason_code": "VLOOPBACK_MOUNT_FAILED",
+    "detail": "docker: Error response from daemon: error setting up ID-mapped mount on path 206/fs",
+    "runtime": "sysbox-runc",
+}
+PASSED = {"verdict": "pass", "reason_code": "", "detail": "", "runtime": "default"}
+FORGED_FAIL = {
+    "verdict": "fail",
+    "reason_code": "R" * 100_000,
+    "detail": "x" * 100_000,
+    "runtime": {"nested": "dict"},
+    "extra": "yes",
+}
+
+
+async def _scrape_ok_event_for(context_factory, extra_specs: dict[str, Any]):
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    # the backend opted executor-123 into GPU splitting
+    rented_data = SimpleNamespace(gpu_splitting_config={"executor-123": 2}, network_ema={})
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data={**RAW_SPECS, **extra_specs})),
+        config=build_context_config(machine_scrape_filename="scrape.sh", machine_scrape_timeout=300, obfuscation_keys={}),
+        state=build_state(remote_dir="/remote/path", rented_data=rented_data),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+    return await MachineSpecScrapeCheck().run(ctx)
+
+
+@pytest.mark.parametrize(
+    ("extra_specs", "expected_summary"),
+    [
+        (
+            {"storage_limit_supported": True, "vloopback_check": PASSED},
+            {"supported": True, "vloopback": PASSED},
+        ),
+        (
+            {"storage_limit_supported": True, "vloopback_check": MOUNT_FAILED},
+            {"supported": True, "vloopback": MOUNT_FAILED},
+        ),
+        (
+            {"storage_limit_supported": False, "storage_limit_scrape_error": "Storage limit is not supported."},
+            {"supported": False, "detail": "Storage limit is not supported."},
+        ),
+        # host-sent fields reach the event only as strings of at most 300 characters; unknown fields are dropped
+        (
+            {"storage_limit_supported": True, "vloopback_check": FORGED_FAIL},
+            {
+                "supported": True,
+                "vloopback": {
+                    "verdict": "fail",
+                    "reason_code": "R" * 300,
+                    "detail": "x" * 300,
+                    "runtime": None,
+                },
+            },
+        ),
+        (
+            {"storage_limit_supported": False, "storage_limit_scrape_error": "e" * 100_000, "vloopback_check": PASSED},
+            {"supported": False, "detail": "e" * 300, "vloopback": PASSED},
+        ),
+        ({"storage_limit_supported": True, "vloopback_check": "notadict"}, {"supported": True}),
+        # an executor on a scrape from before the vloopback test
+        ({"storage_limit_supported": True}, {"supported": True}),
+        ({}, {"supported": False}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_reports_the_vloopback_verdict(context_factory, extra_specs, expected_summary):
+    # Act
+    result = await _scrape_ok_event_for(context_factory, extra_specs)
+
+    # Assert
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+    assert result.event.what_we_saw["storage_limit"] == expected_summary
+
+
+@pytest.mark.asyncio
+async def test_a_failed_vloopback_test_changes_no_stored_spec(context_factory):
+    # Act
+    result = await _scrape_ok_event_for(
+        context_factory, {"storage_limit_supported": True, "vloopback_check": MOUNT_FAILED}
+    )
+
+    # Assert
+    specs = result.updates["state"].specs
+    assert specs["storage_limit_supported"] is True
+    assert "storage_limit_scrape_error" not in specs
+    assert "vloopback_check" not in specs
+    assert result.updates["state"].supports_gpu_splitting is True
+
+
+@pytest.mark.asyncio
+async def test_a_provider_reported_port_grace_marker_is_dropped(context_factory):
+    # DAH-3698: the marker is PortConnectivityCheck's; a provider-sent one would bypass the split-remainder port gate
+    result = await _scrape_ok_event_for(context_factory, {"port_verify_first_miss": True})
+
+    assert "port_verify_first_miss" not in result.updates["state"].specs
 
 
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the

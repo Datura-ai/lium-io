@@ -7,6 +7,7 @@ import aiohttp
 import pytest
 from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
+from tenacity import wait_none
 
 from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
@@ -183,6 +184,16 @@ async def test_post_success(reset_session, client):
 
         assert result is not None
         assert result.data == "created"
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_sends_loopback_plugin_only_when_given(client):
+    with patch.object(client, "post", AsyncMock(return_value=None)) as post:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, loopback_plugin="vloopback:v2")
+
+    assert "loopback_plugin" not in post.await_args_list[0].kwargs["json_data"]
+    assert post.await_args_list[1].kwargs["json_data"]["loopback_plugin"] == "vloopback:v2"
 
 
 @pytest.mark.asyncio
@@ -471,3 +482,14 @@ def test_get_filler_containers_prefers_list_field_and_falls_back_to_legacy():
     assert old_backend.get_filler_containers("exec-single") == ["filler_only"]
     assert old_backend.get_filler_container("exec-single") == "filler_only"
     assert old_backend.get_filler_containers("exec-unknown") == []
+
+
+@pytest.mark.asyncio
+async def test_get_all_rented_executors_returns_none_after_three_empty_answers(client):
+    """The retried read gives None after three empty answers."""
+    rented_read_mock = AsyncMock(return_value=None)
+    with patch.object(BackendClient, "get_rented_executors_now", rented_read_mock):
+        result = await BackendClient.get_all_rented_executors.retry_with(wait=wait_none())(client)
+
+    assert result is None
+    assert rented_read_mock.await_count == 3

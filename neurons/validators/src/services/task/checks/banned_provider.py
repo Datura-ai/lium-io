@@ -66,6 +66,7 @@ class BannedProviderCheck:
                 miner_hotkey=ctx.miner_hotkey,
                 miner_coldkey=ctx.miner_coldkey,
                 gpu_uuids=uuids_to_match_bans_against(gpu_uuids, kernel_uuids),
+                executor_uuid=ctx.executor.uuid,
             )
         )
         # what flipping enforcement changes: a kernel UUID on the ban list (hotkey/coldkey bans

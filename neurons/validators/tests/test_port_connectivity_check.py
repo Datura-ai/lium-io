@@ -1,7 +1,13 @@
+import dataclasses
+
 import pytest
 from core.config import settings
 
-from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from neurons.validators.src.protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
 from neurons.validators.src.services.executor_connectivity.models import (
     DindLogCause,
     PortPair,
@@ -23,6 +29,17 @@ class DummyRedis:
         self.dind_miss_on_record = dind_miss_on_record
         self.recorded_misses: list[tuple[str, str, int]] = []
         self.cleared_misses: list[tuple[str, str]] = []
+        # ticket-0494: executors whose last DinD probe that reached the container found sysbox
+        self.sysbox_verified: dict[tuple[str, str], int] = {}
+
+    async def record_sysbox_verified(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> None:
+        self.sysbox_verified[(miner_hotkey, executor_id)] = ttl_seconds
+
+    async def clear_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> None:
+        self.sysbox_verified.pop((miner_hotkey, executor_id), None)
+
+    async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
+        return (miner_hotkey, executor_id) in self.sysbox_verified
 
     async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str) -> bool:
         return self.renting_in_progress_value
@@ -36,6 +53,14 @@ class DummyRedis:
     async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
         self.cleared_misses.append((miner_hotkey, executor_id))
         self.dind_miss_on_record = False
+
+    # DAH-3698: first failed port verification inside the window
+    port_miss_on_record: bool = False
+
+    async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        first = not self.port_miss_on_record
+        self.port_miss_on_record = True
+        return first
 
 
 # Mock backend service
@@ -59,7 +84,7 @@ class DummyConnectivityService:
         dind_ok: bool | None = None,
         dind_error: DindLogCause | None = None,
         port_ranges: tuple[PortRangeResult, ...] = (),
-        second_pass: str | None = None,
+        sysbox_measured: bool | None = None,
     ):
         """
         Args:
@@ -71,8 +96,8 @@ class DummyConnectivityService:
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
         self.dind_error = dind_error
+        self.sysbox_measured = sysbox_measured
         self.port_ranges = port_ranges
-        self.second_pass = second_pass
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
@@ -130,7 +155,7 @@ class DummyConnectivityService:
             elapsed_sec=1.0,
             dind_error=self.dind_error,
             port_ranges=self.port_ranges,
-            second_pass=self.second_pass,
+            sysbox_measured=self.sysbox_measured,
         )
 
 
@@ -457,29 +482,18 @@ async def test_port_connectivity_carries_the_dind_probe_cause_into_state(context
     assert "dind_error" not in result.updates["default_extra"]
 
 
-@pytest.mark.parametrize(
-    "second_pass, noted",
-    [
-        ("not_needed", False),
-        ("ran", False),
-        ("batch_failed", False),
-        ("skipped_batch_failed", "batch container didn't complete"),
-    ],
-)
 @pytest.mark.parametrize("success", [True, False])
 @pytest.mark.asyncio
-async def test_port_connectivity_event_carries_the_range_tallies_and_the_second_pass(
-    context_factory, success, second_pass, noted
-):
+async def test_port_connectivity_event_carries_the_range_tallies(context_factory, success):
     ranges = (
         PortRangeResult(first=40000, last=44999, declared=5000, probed=209, answered=0),
-        PortRangeResult(first=60000, last=64999, declared=5000, probed=30, answered=30, pass_number=2),
+        PortRangeResult(first=60000, last=64999, declared=5000, probed=30, answered=30),
     )
     services = build_services(
         redis=DummyRedis(renting_in_progress=False),
         backend=DummyBackendService(),
         connectivity=DummyConnectivityService(
-            success=success, verified_port_count=30 if success else 0, port_ranges=ranges, second_pass=second_pass
+            success=success, verified_port_count=30 if success else 0, port_ranges=ranges
         ),
     )
     ctx = context_factory(
@@ -489,17 +503,272 @@ async def test_port_connectivity_event_carries_the_range_tallies_and_the_second_
     result = await PortConnectivityCheck().run(ctx)
 
     expected = [
-        {"pass": 1, "range": "40000-44999", "declared": 5000, "probed": 209, "answered": 0},
-        {"pass": 2, "range": "60000-64999", "declared": 5000, "probed": 30, "answered": 30},
+        {"range": "40000-44999", "declared": 5000, "probed": 209, "answered": 0},
+        {"range": "60000-64999", "declared": 5000, "probed": 30, "answered": 30},
     ]
     assert result.event.context["port_ranges"] == expected
-    assert result.event.context["second_pass"] == second_pass
-    assert ("second_pass_note" in result.event.context) is bool(noted)
-    if noted:
-        assert noted in result.event.context["second_pass_note"]
     assert "port_ranges" not in result.updates["default_extra"]
-    assert "second_pass" not in result.updates["default_extra"]
     if not success:
         assert result.event.what_we_saw["port_ranges"] == expected
-        assert result.event.what_we_saw["second_pass"] == second_pass
-        assert ("second_pass_note" in result.event.what_we_saw) is bool(noted)
+
+
+# ticket-0494: a rented executor whose scrape timed out (sysbox False) and whose DinD probe never
+# reached its container keeps the sysbox an earlier probe verified.
+
+
+def _rented_state(*, scrape_sysbox: bool = False):
+    rented = RentedExecutor(
+        miner_hotkey="miner-hotkey",
+        executor_ip_address="127.0.0.1",
+        executor_ip_port="22",
+        pods=[RentedPod(pod_id="pod-1", container_name="container_pod-1", rented_ports=[40010, 40011])],
+    )
+    return build_state(
+        sysbox_runtime=scrape_sysbox,
+        rented_data=RentedExecutorsResponse(executors={"executor-123": rented}),
+    )
+
+
+def _verified_ctx(context_factory, *, redis_service, state, dind_ok: bool, sysbox_measured: bool | None):
+    services = build_services(
+        redis=redis_service,
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True,
+            sysbox_runtime=False,
+            verified_port_count=100,
+            dind_ok=dind_ok,
+            sysbox_measured=sysbox_measured,
+        ),
+    )
+    return context_factory(services=services, config=build_context_config(job_batch_id="batch-123"), state=state)
+
+
+@pytest.mark.asyncio
+async def test_rented_node_keeps_verified_sysbox_when_the_dind_probe_is_refused(context_factory):
+    """Scrape says no sysbox, the probe was refused by the busy host, an earlier probe verified
+    sysbox: the cycle keeps sysbox, so the rented sysbox multiplier stays 1. Before ticket-0494 both
+    fallbacks keyed off the scrape's False and the node scored 0 for the cycle."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    ctx = _verified_ctx(
+        context_factory, redis_service=redis_service, state=_rented_state(), dind_ok=False, sysbox_measured=None
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].sysbox_runtime is True
+    assert result.updates["state"].specs["sysbox_runtime"] is True
+    assert result.updates["default_extra"]["sysbox_from_last_verified"] is True
+    assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
+
+
+@pytest.mark.asyncio
+async def test_rented_node_probe_that_reached_its_container_without_sysbox_is_a_verdict(context_factory):
+    """The probe reached its container with sysbox-runc and it failed: no sysbox for the cycle, and
+    the earlier pass is forgotten so a later refused probe does not bring it back."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    ctx = _verified_ctx(
+        context_factory, redis_service=redis_service, state=_rented_state(), dind_ok=True, sysbox_measured=False
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].sysbox_runtime is False
+    assert "sysbox_from_last_verified" not in result.updates["default_extra"]
+    assert redis_service.sysbox_verified == {}
+
+
+@pytest.mark.asyncio
+async def test_rented_node_without_a_verified_sysbox_keeps_the_current_behaviour(context_factory):
+    """No pass on record: a refused probe on a rented node still records no sysbox."""
+    redis_service = DummyRedis()
+    ctx = _verified_ctx(
+        context_factory, redis_service=redis_service, state=_rented_state(), dind_ok=False, sysbox_measured=None
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].sysbox_runtime is False
+    assert "sysbox_from_last_verified" not in result.updates["default_extra"]
+
+
+@pytest.mark.asyncio
+async def test_unrented_node_does_not_read_the_verified_sysbox(context_factory):
+    """Only a rented node uses the memory; an unrented one is re-measured as before."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    ctx = _verified_ctx(
+        context_factory, redis_service=redis_service, state=build_state(), dind_ok=False, sysbox_measured=None
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].sysbox_runtime is False
+
+
+@pytest.mark.asyncio
+async def test_probe_that_verifies_sysbox_is_remembered_with_the_ttl(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "SYSBOX_VERIFIED_TTL_SECONDS", 4321)
+    redis_service = DummyRedis()
+    ctx = _verified_ctx(
+        context_factory, redis_service=redis_service, state=build_state(), dind_ok=True, sysbox_measured=True
+    )
+
+    await PortConnectivityCheck().run(ctx)
+
+    assert redis_service.sysbox_verified == {("miner-hotkey", "executor-123"): 4321}
+
+
+@pytest.mark.asyncio
+async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
+    class BrokenRedis(DummyRedis):
+        async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
+            raise ConnectionError("redis down")
+
+    ctx = _verified_ctx(
+        context_factory, redis_service=BrokenRedis(), state=_rented_state(), dind_ok=False, sysbox_measured=None
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates["state"].sysbox_runtime is False
+
+
+# DAH-3698: one failed port verification must not zero a split remainder's idle pay.
+
+
+def _port_ctx(context_factory, redis_service, *, success: bool, connectivity=None, specs=None):
+    services = build_services(
+        redis=redis_service,
+        backend=DummyBackendService(),
+        connectivity=connectivity
+        or DummyConnectivityService(success=success, verified_port_count=8 if success else 0),
+    )
+    return context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(specs=specs or {}),
+        rented=False,
+    )
+
+
+class PartialConnectivityService(DummyConnectivityService):
+    """`ok` of 8 probed ports answered; the rest failed. Status is "ok" from one answering port up."""
+
+    def __init__(self, ok: int):
+        super().__init__(success=ok > 0, verified_port_count=ok)
+        self.ok = ok
+
+    async def verify_ports(self, *args, **kwargs) -> PortVerificationResult:
+        result = await super().verify_ports(*args, **kwargs)
+        failed = tuple(PortPair(9000 + i, 9000 + i) for i in range(8 - self.ok))
+        return dataclasses.replace(result, failed_ports=failed, selected_ports=result.successful_ports + failed)
+
+
+class BrokenPortMissRedis(DummyRedis):
+    async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        raise ConnectionError("redis down")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok", [0, 1, 2, 7])
+async def test_a_partial_port_loss_is_a_miss_first_forgiven_then_counted(context_factory, ok):
+    redis_service = DummyRedis()
+
+    first = await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=False, connectivity=PartialConnectivityService(ok))
+    )
+    second = await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=False, connectivity=PartialConnectivityService(ok))
+    )
+
+    assert first.updates["state"].specs.get("port_verify_first_miss") is True
+    assert "port_verify_first_miss" not in second.updates["state"].specs
+    assert len(second.updates["state"].specs["verified_ports"]) == ok
+
+
+@pytest.mark.asyncio
+async def test_every_probed_port_answering_keeps_the_miss_on_record(context_factory):
+    redis_service = DummyRedis()
+    redis_service.port_miss_on_record = True
+
+    await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=True, connectivity=PartialConnectivityService(8))
+    )
+
+    assert redis_service.port_miss_on_record is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("redis_service", "success"),
+    [
+        pytest.param(DummyRedis(), False, id="repeated_failure"),
+        pytest.param(DummyRedis(), True, id="ok"),
+        pytest.param(BrokenPortMissRedis(), False, id="redis_error_on_failure"),
+        pytest.param(BrokenPortMissRedis(), True, id="redis_error_on_ok"),
+    ],
+)
+async def test_a_grace_marker_in_the_providers_specs_never_survives(context_factory, redis_service, success):
+    redis_service.port_miss_on_record = True  # a repeat, so this cycle earns no grace of its own
+
+    result = await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=success, specs={"port_verify_first_miss": True})
+    )
+
+    assert "port_verify_first_miss" not in result.updates["state"].specs
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_failed_port_verification_is_marked_for_grace(context_factory):
+    redis_service = DummyRedis()
+
+    first = await PortConnectivityCheck().run(_port_ctx(context_factory, redis_service, success=False))
+    second = await PortConnectivityCheck().run(_port_ctx(context_factory, redis_service, success=False))
+
+    assert first.updates["state"].specs.get("port_verify_first_miss") is True
+    assert "port_verify_first_miss" not in second.updates["state"].specs
+
+
+@pytest.mark.asyncio
+async def test_a_passing_port_verification_keeps_the_miss_on_record(context_factory):
+    redis_service = DummyRedis()
+    redis_service.port_miss_on_record = True
+
+    ok = await PortConnectivityCheck().run(_port_ctx(context_factory, redis_service, success=True))
+
+    assert "port_verify_first_miss" not in ok.updates["state"].specs
+    assert redis_service.port_miss_on_record is True
+
+
+@pytest.mark.asyncio
+async def test_alternating_pass_and_failure_earns_grace_only_once(context_factory):
+    # success -> failure -> success -> failure inside the window: only the first failure is forgiven
+    redis_service = DummyRedis()
+    marks = []
+    for success in (True, False, True, False):
+        result = await PortConnectivityCheck().run(_port_ctx(context_factory, redis_service, success=success))
+        marks.append(result.updates["state"].specs.get("port_verify_first_miss") is True)
+
+    assert marks == [False, True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_a_persisting_port_miss_restarts_the_window_instead_of_earning_fresh_grace():
+    import asyncio
+
+    from fakeredis.aioredis import FakeRedis
+    from services.redis_service import RedisService
+
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis()
+    service.lock = asyncio.Lock()
+    key = "port_verify_miss:hk:ex"
+
+    assert await service.record_port_verify_miss("hk", "ex", 3600) is True
+    await service.redis.expire(key, 5)  # the window nearly over
+    assert await service.record_port_verify_miss("hk", "ex", 3600) is False
+    assert await service.redis.ttl(key) > 3000

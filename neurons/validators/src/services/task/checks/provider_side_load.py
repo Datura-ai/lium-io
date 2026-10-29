@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 from services.const import LIUM_INFRA_CONTAINER_PREFIXES
 
 from .cpu_truth import advertised_cpu_count
@@ -19,6 +21,8 @@ from .gpu_usage import (
 from ..messages import ProviderSideLoadMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+logger = logging.getLogger(__name__)
 
 # DAH-2734: floors above which the host's own workload is judged as taking the machine from
 # Lium. Set well above a provider's own housekeeping (nginx, fail2ban, the OS baseline): the
@@ -248,6 +252,9 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
     stack_ids: set[str] = executor_stack_container_ids(specs)
+    if settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED and stack_excuse_is_over_its_cap(specs):
+        # like the name tier: over the cap the whole tier excuses nothing
+        stack_ids = set()
     containers.update(stack_ids)
     containers.update(infra_container_names(specs, stack_ids))
     containers.discard("")
@@ -274,6 +281,19 @@ def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
     # an empty id is "the scrape did not say", never a container to excuse
     ids.discard("")
     return ids
+
+
+def executor_stack_excuse(specs: dict[str, Any]) -> tuple[int, float]:
+    """How many containers the executor's image digest excuses, and the cores they held in the
+    scrape window. Any container started from that image carries the digest, so this tier is as
+    free to claim as a name: the stack is two containers, and what they hold is the scrape."""
+    stack_ids = executor_stack_container_ids(specs)
+    rows = [row for row in docker_containers(specs) if row.container_id in stack_ids]
+    return len(rows), round(sum(row.cpu_percent or 0.0 for row in rows) / 100, 2)
+
+
+def stack_excuse_is_over_its_cap(specs: dict[str, Any]) -> bool:
+    return executor_stack_excuse(specs)[1] > settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CORES
 
 
 def compute_provider_side_load(
@@ -444,7 +464,24 @@ class ProviderSideLoadCheck:
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented: bool = rented_executor is not None and len(rented_executor.pods) > 0
+        stack_containers, stack_cores = executor_stack_excuse(ctx.state.specs or {})
+        if stack_excuse_is_over_its_cap(ctx.state.specs or {}):
+            logger.warning(
+                _m(
+                    "PROVIDER_SIDE_LOAD_STACK_EXCUSE_HIGH",
+                    extra=get_extra_info(
+                        {
+                            **ctx.default_extra,
+                            "executor_stack_containers": stack_containers,
+                            "executor_stack_cores": stack_cores,
+                            "capped": settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED,
+                        }
+                    ),
+                )
+            )
         return {
+            "executor_stack_containers": stack_containers,
+            "executor_stack_cores": stack_cores,
             "executor_uuid": ctx.executor.uuid,
             "provider_cpu_cores": provider_side_load.cpu_cores,
             "provider_disk_gb": (
@@ -476,10 +513,6 @@ class ProviderSideLoadCheck:
         )
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.PROVIDER_SIDE_LOAD_CHECK_ENABLED:
-            event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
-            return CheckResult(passed=True, event=event)
-
         lium_container_keys = await lium_containers(ctx)
         provider_side_load = await self.measure_provider_side_load(ctx, lium_container_keys)
         if not provider_side_load.is_measured:

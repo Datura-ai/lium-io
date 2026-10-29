@@ -2,10 +2,10 @@
 
 **[Provider Documentation](https://docs.lium.io/providers)** — docs.lium.io calls a miner a *provider*, the
 central miner the *self-hosted provider* ([setup guide](https://docs.lium.io/providers/self-hosted-provider)),
-and an executor a *node*. Most providers do not run this service themselves: opting into the
-[Lium.io Central Provider Server](https://docs.lium.io/providers/provider-configuration) from the
-[Provider Portal](https://provider.lium.io) lets Lium run it for you, and nodes are then set up with
-`lium mine` ([Node Quickstart](https://docs.lium.io/providers/nodes/quickstart)).
+and an executor a *node*. Most providers do not run this service: the
+[Lium.io Central Provider Server](https://docs.lium.io/providers/provider-configuration) runs it for them and is
+ON by default in the [Provider Portal](https://provider.lium.io); nodes are set up with `lium mine`
+([Node Quickstart](https://docs.lium.io/providers/nodes/quickstart)).
 
 ## Overview
 
@@ -272,7 +272,14 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py show-contrac
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py current-contract-version
 ```
 
-`show-contract-versions` lists the collateral contract versions with their addresses; `current-contract-version` prints the one this miner uses. (`migrate-validator-hotkey` is a one-off data migration for a past validator hotkey change and is not part of normal operation.)
+`show-contract-versions` lists the collateral contract versions with their addresses; `current-contract-version` prints the one this miner uses.
+
+`migrate-validator-hotkey` is the data step of a validator hotkey rotation, run once per miner after the config pair swap (`DEFAULT_VALIDATOR_HOTKEY=<new>`, `VALIDATOR_NEXT_HOTKEY=<old>`): it re-keys this miner's executor rows from the previous validator hotkey to the active one. The defaults read those two settings; `--from-hotkey` / `--to-hotkey` name them explicitly and `--dry-run` prints the row count without changing anything. Lium announces the rotation date; the current swap (to `5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9`) is pending.
+
+```shell
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey --dry-run
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey
+```
 
 ### Finalizing a Reclaim Request
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from core.config import settings
 from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES
 
 from ..messages import MessageTemplate, render_message
@@ -29,10 +28,6 @@ class SysboxRequiredCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.REQUIRE_SYSBOX_FOR_UNRENTED:
-            event = render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
-            return CheckResult(passed=True, event=event)
-
         # Determine rental status the same way as port_count.py / rented_machine.py.
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None

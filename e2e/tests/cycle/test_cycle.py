@@ -136,9 +136,9 @@ def test_unreachable_miner_fails_the_job_fast(services):
 
 
 def test_sysbox_gate_names_its_reason(services):
-    """REQUIRE_SYSBOX_FOR_UNRENTED is off in the stack (no sysbox on a CI box or a Lium pod). The check that enforces
-    it must still be in the pipeline and, when on, refuse an unrented executor with SYSBOX_REQUIRED_MISSING — the
-    verdict seen on staging. Asserted at the check level: flipping the flag mid-process is not supported."""
+    """Sysbox is always required for an unrented executor, but a CI box or a Lium pod cannot run it and the GPU-less
+    scrape halts the pipeline before the check. So the check is asserted at this level: it is in the pipeline and its
+    refusal is SYSBOX_REQUIRED_MISSING, the verdict seen on staging."""
     checks = PipelineFactory.build_checks()
     assert any(isinstance(c, SysboxRequiredCheck) for c in checks), [type(c).__name__ for c in checks]
     assert SysboxRequiredMessages.SYSBOX_MISSING.reason == "SYSBOX_REQUIRED_MISSING"

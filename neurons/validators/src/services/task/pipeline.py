@@ -27,7 +27,7 @@ from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .models import ValidationEvent
-from .runner import SSHCommandRunner
+from .runner import SSHCommandResult, SSHCommandRunner
 
 @runtime_checkable
 class PodRecoverer(Protocol):
@@ -39,13 +39,16 @@ class PodRecoverer(Protocol):
     # DAH-3436: the rental probe rents the node through the same two entry points a renter's pod
     # takes (miner_service hands the backend's requests to these), so there is one start path and
     # one teardown path to keep correct. `private_key` is the Fernet-encrypted key as the backend
-    # sends it; both decrypt it themselves.
+    # sends it; both decrypt it themselves. `beside_fillers`: the probe's create on a node running
+    # a filler, which leaves the filler and its GPU power cap alone.
     async def create_container(
         self,
         payload: Any,
         executor_info: ExecutorSSHInfo,
         keypair: Any,
         private_key: str,
+        *,
+        beside_fillers: bool = False,
     ) -> Any: ...
 
     async def delete_container(
@@ -104,19 +107,25 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    verifyx_enabled: bool = False
-    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
     # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
     # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
     machine_scrape_source: Optional[str] = None
-    # DAH-3011: True only for a never-validated executor's first, unscored verification AND with
-    # FIRST_PASS_FAST_PATH_ENABLED on (resolved in PipelineFactory.build_context). The capability
+    # DAH-3011: True only for a never-validated executor's first, unscored verification
+    # (set in PipelineFactory.build_context). The capability
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
     # scored cycle; every other check is the same.
     first_pass: bool = False
+
+
+@dataclass(frozen=True)
+class MemoryHealthRead:
+    """One NVML-only memory read (gpu_memory_health.read_memory_health): the SSH run and its report."""
+
+    run: SSHCommandResult
+    report: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -167,6 +176,7 @@ class ContextState:
     # ExecutorSpecRequest.pod_states.
     pod_states: list[PodContainerState] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
+    memory_health: MemoryHealthRead | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
     # DAH-2265 Plan 2: advisory result of the cached-template verification check.
@@ -193,12 +203,14 @@ class CheckResult(BaseModel):
     # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
     # when the node has no live rental). None = fall back to the check's class default.
     fatal: bool | None = None
+    # Events of checks this one ran inside itself, reported before its own (the scrape's GPU_LOST hold).
+    extra_events: list[ValidationEvent] = []
 
 
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
-    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
@@ -233,6 +245,9 @@ class Context(BaseModel):
     # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
+    # Set by GpuFingerprintCheck (legacy rule) when an idle node's whole GPU set was replaced: the reset drops the
+    # anchor, so the next passing cycle anchors the new cards (whole_set_replaced).
+    gpu_reanchor: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
@@ -254,6 +269,21 @@ class Context(BaseModel):
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
+    # False only once InspectorRentedCheck counts a blind streak at the limit under enforcement;
+    # the score gate lives in calculate_scores for the same reason as above.
+    inspector_blind_streak_passed: bool = True
+    # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
+    # enforcement; the score gate lives in calculate_scores for the same reason as above.
+    rented_pod_resources_passed: bool = True
+    # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
+    # score gate lives in calculate_scores.
+    rented_throughput_passed: bool = True
+    # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_attestation_identity_passed: bool = True
+    # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
+    # rented pod under enforcement.
+    inspector_host_write_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -295,10 +325,10 @@ class StatusChangeTracker:
 
     def __init__(self, max_entries: int = 200_000):
         self.max_entries = max_entries
-        self._last: OrderedDict[tuple[str, str, str], tuple[str, str, str]] = OrderedDict()
+        self._last: OrderedDict[tuple[str, str, str], tuple[str, ...]] = OrderedDict()
 
     def changed(
-        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]
+        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, ...]
     ) -> bool:
         # the miner reports its executor UUIDs: keyed without the hotkey, one miner could replay another
         # provider's UUID and move that provider's lines between INFO and DEBUG
@@ -359,10 +389,19 @@ class LoggerSink:
             str(event.context.get("miner_hotkey") or ""),
             executor_uuid,
             event.check_id,
-            (event.event, event.reason_code, event.severity),
+            (event.event, event.reason_code, event.severity, _vloopback_outcome(event)),
         )
         # The run's last event carries the per-step summary; it stays at INFO as one line per run.
         return not changed and "steps_total_s" not in event.what_we_saw
+
+
+def _vloopback_outcome(event: ValidationEvent) -> str:
+    # SCRAPE_OK stays SCRAPE_OK when the vloopback mount test fails, so its verdict joins the outcome
+    storage_limit = event.what_we_saw.get("storage_limit")
+    vloopback = storage_limit.get("vloopback") if isinstance(storage_limit, dict) else None
+    if not isinstance(vloopback, dict):
+        return ""
+    return f"{vloopback.get('verdict')}:{vloopback.get('reason_code')}"
 
 
 def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
@@ -589,6 +628,9 @@ class Pipeline:
                         )
                     )
 
+                for extra_event in res.extra_events:
+                    await self.sink.emit(extra_event)
+                    events.append(extra_event)
                 await self.sink.emit(res.event)
                 events.append(res.event)
 

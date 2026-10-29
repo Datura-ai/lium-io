@@ -7,7 +7,13 @@ from datetime import datetime, UTC
 from typing import NamedTuple, Optional
 from docker.models.containers import Container
 
-from config import settings, WATCHTOWER_ENDPOINT_URL, WATCHTOWER_VALIDATOR_HOTKEY
+from config import (
+    settings,
+    WATCHTOWER_ENDPOINT_URL,
+    WATCHTOWER_USER_AGENT,
+    WATCHTOWER_VALIDATOR_HOTKEY,
+    WATCHTOWER_VALIDATOR_NEXT_HOTKEY,
+)
 from logger import get_logger, _m
 from models import WatchtowerDigestResponse
 
@@ -237,17 +243,33 @@ def container_image_digest(client: docker.DockerClient, container: Container) ->
         return None
 
 
+def trusted_validator_hotkeys() -> tuple[str, ...]:
+    """The validator hotkeys a digest signature is checked against, the active one first, no blanks or repeats.
+
+    Two during the hotkey rotation (config.py): the digest is signed by whichever wallet the platform
+    holds, and an executor must keep updating across the swap.
+    """
+    hotkeys: list[str] = []
+    for hotkey in (WATCHTOWER_VALIDATOR_HOTKEY, WATCHTOWER_VALIDATOR_NEXT_HOTKEY):
+        hotkey = (hotkey or "").strip()
+        if hotkey and hotkey not in hotkeys:
+            hotkeys.append(hotkey)
+    return tuple(hotkeys)
+
+
 def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
     """
-    Verify the signature of the watchtower digest response.
+    Verify the signature of the watchtower digest response against every trusted validator hotkey.
 
     Raises:
         Exception: If signature verification fails
     """
     try:
-        keypair = bittensor.Keypair(ss58_address=WATCHTOWER_VALIDATOR_HOTKEY)
         signing_data = f"{payload.digest}:{payload.timestamp}"
-        is_valid = keypair.verify(signing_data, payload.signature)
+        is_valid = any(
+            bittensor.Keypair(ss58_address=hotkey).verify(signing_data, payload.signature)
+            for hotkey in trusted_validator_hotkeys()
+        )
 
         # Verify that the timestamp is not too far in the future or past (e.g., within 5 minutes)
         now = int(datetime.now(UTC).timestamp())
@@ -259,7 +281,7 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
 
         if not is_valid:
             raise Exception(
-                f"Invalid signature from validator {WATCHTOWER_VALIDATOR_HOTKEY}"
+                f"Invalid signature: not signed by a trusted validator hotkey ({', '.join(trusted_validator_hotkeys())})"
             )
 
     except Exception as e:
@@ -278,7 +300,8 @@ def fetch_verified_digest() -> Optional[str]:
     try:
         response = requests.get(
             WATCHTOWER_ENDPOINT_URL,
-            timeout=30
+            headers={"User-Agent": WATCHTOWER_USER_AGENT},
+            timeout=30,
         )
         response.raise_for_status()
 
@@ -650,7 +673,7 @@ def main():
         "image": settings.WATCHTOWER_IMAGE,
         "interval": settings.WATCHTOWER_INTERVAL,
         "endpoint": WATCHTOWER_ENDPOINT_URL,
-        "validator_hotkey": WATCHTOWER_VALIDATOR_HOTKEY
+        "validator_hotkeys": list(trusted_validator_hotkeys()),
     }))
 
     while True:

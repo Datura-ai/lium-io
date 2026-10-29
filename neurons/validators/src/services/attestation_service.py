@@ -3,7 +3,6 @@ import binascii
 import hashlib
 import json
 import logging
-import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any
@@ -11,6 +10,7 @@ from typing import Annotated, Any
 import aiohttp
 import asyncssh
 from datura.requests.miner_requests import ExecutorSSHInfo
+from datura.requests.validator_requests import fresh_upload_nonce
 from fastapi import Depends
 
 from core.config import settings
@@ -53,7 +53,8 @@ class AttestationNonce:
 
     @classmethod
     def issue(cls) -> "AttestationNonce":
-        return cls(value_hex=secrets.token_hex(32))
+        # dated, so the executor can refuse it once stale (I-78); still 32 hex bytes for the TDX channel
+        return cls(value_hex=fresh_upload_nonce())
 
     @property
     def value_bytes(self) -> bytes:
@@ -87,7 +88,7 @@ class AttestationService:
     Validates executor authenticity for Intel TDX deployments by verifying a pre-generated
     quote supplied alongside the executor's SSH host key.
 
-    If attestation is disabled (default), this service becomes a no-op and simply returns
+    If TDX_VERIFIER_URL is unset (default), this service becomes a no-op and simply returns
     the host key policy when possible.
     """
 
@@ -97,8 +98,7 @@ class AttestationService:
         self,
         redis_service: Annotated[RedisService | None, Depends(RedisService)] = None,
     ) -> None:
-        self.enabled: bool = bool(
-            settings.ENABLE_TDX_ATTESTATION and settings.TDX_VERIFIER_URL)
+        self.enabled: bool = bool(settings.TDX_VERIFIER_URL)
         self.verifier_url: str | None = settings.TDX_VERIFIER_URL
         self.quote_timeout: int = 60
         # Injected by FastAPI DI or passed explicitly (ioc / validator core).
@@ -280,6 +280,30 @@ class AttestationService:
         # Warn-only telemetry window: size the blast radius before enforcing.
         logger.warning(_m("TCB enforcement warning (not enforced)", extra=extra))
 
+    def _is_retryable_reject(
+        self,
+        verifier_payload: dict,
+        expected_report_hex: str,
+        nonce: AttestationNonce | None,
+    ) -> bool:
+        """is_valid/quote_verified false while report_data (and nonce) match: worth one retry."""
+        # dstack verifier v0.5.11 verify_cvm maps an internal failure to HTTP 200,
+        # is_valid=false, report_data=null, reason "Internal error: ...".
+        if not verifier_payload.get("is_valid") and str(
+            verifier_payload.get("reason") or ""
+        ).startswith("Internal error:"):
+            return True
+        details = verifier_payload.get("details")
+        if not isinstance(details, dict):
+            return False
+        if verifier_payload.get("is_valid") and details.get("quote_verified"):
+            return False
+        expected = self._normalise_report_data(expected_report_hex)
+        returned = self._normalise_report_data(details.get("report_data"))
+        if not (expected and returned and returned.startswith(expected)):
+            return False
+        return nonce is None or returned[32:64] == nonce.value_bytes
+
     def _validate_verifier_response(
         self,
         verifier_payload: dict,
@@ -305,8 +329,21 @@ class AttestationService:
         )
 
         if not (is_valid and quote_verified and report_matches):
+            reason = str(verifier_payload.get("reason") or "")[:300]
+            flags = f"is_valid={is_valid} quote_verified={quote_verified} report_data_match={report_matches}"
+            logger.warning(_m(
+                "Verifier rejected TDX quote",
+                extra=get_extra_info({
+                    "executor": f"{executor.address}:{executor.port}",
+                    "is_valid": is_valid,
+                    "quote_verified": quote_verified,
+                    "report_data_match": report_matches,
+                    "verifier_reason": reason,
+                }),
+            ))
             raise AttestationError(
-                f"Verifier rejected TDX quote for executor {executor.address}:{executor.port}"
+                f"Verifier rejected TDX quote for executor {executor.address}:{executor.port} "
+                f"({flags}, reason={reason!r})"
             )
 
         # G3 — the quote must echo the issued challenge in report_data[32:64].
@@ -564,6 +601,17 @@ class AttestationService:
 
         expected_report = self._expected_report_data(executor.ssh_host_key)
         verifier_payload = await self._call_verifier(quote.strip(), executor)
+        if self._is_retryable_reject(verifier_payload, expected_report, nonce):
+            # The quote binds our host key/nonce but the verifier said no: seen as a
+            # transient dstack-verifier fault (41-57s collateral fetch), so ask once more.
+            logger.warning(_m(
+                "Verifier rejected a quote that binds our report_data; retrying once",
+                extra=get_extra_info({
+                    "executor": f"{executor.address}:{executor.port}",
+                    "verifier_reason": str(verifier_payload.get("reason") or "")[:300],
+                }),
+            ))
+            verifier_payload = await self._call_verifier(quote.strip(), executor)
         self._validate_verifier_response(verifier_payload, expected_report, executor, nonce=nonce)
 
         details = verifier_payload.get("details", {})

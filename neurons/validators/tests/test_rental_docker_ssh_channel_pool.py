@@ -19,7 +19,11 @@ from pathlib import Path
 import docker
 import paramiko
 import pytest
-from services.rental_docker_sdk import _create_docker_api_client_with_rental_ssh_adapter
+from services.rental_docker_sdk import (
+    _DOCKER_SDK_SSH_ADAPTER_LOCK,
+    RentalDockerSdkClientFactory,
+    _create_docker_api_client_with_rental_ssh_adapter,
+)
 
 BASE_URL = "ssh://root@203.0.113.10:2222"
 RAW_STREAM_BYTES = b"bytes of the exec stream"
@@ -69,6 +73,13 @@ class _FakeDockerHost:
         # what reached dockerd on a hijacked channel after the upgrade, set at the stream's end
         self._stream_input: bytes | None = None
         self._stream_ended = threading.Event()
+        # what each SSH connect / channel open saw: the adapter lock's state and the open timeout
+        self.adapter_lock_held_at_connect: list[bool] = []
+        self.adapter_lock_held_at_open: list[bool] = []
+        self.open_session_timeouts: list[float | None] = []
+        # cleared, the host accepts the session but never answers a channel open
+        self.open_session_gate = threading.Event()
+        self.open_session_gate.set()
 
     def is_active(self) -> bool:
         return True
@@ -76,7 +87,10 @@ class _FakeDockerHost:
     def set_keepalive(self, interval):
         pass
 
-    def open_session(self) -> _FakeChannel:
+    def open_session(self, timeout=None) -> _FakeChannel:
+        self.open_session_timeouts.append(timeout)
+        self.adapter_lock_held_at_open.append(_DOCKER_SDK_SSH_ADAPTER_LOCK.locked())
+        self.open_session_gate.wait(timeout=10)
         near_end, daemon_end = socket.socketpair()
         channel = _FakeChannel(fileno=near_end.detach())
         self.channels.append(channel)
@@ -128,9 +142,10 @@ class _FakeDockerHost:
                     return
                 if "/hold/" in path:
                     self._hold.wait(timeout=10)
-                body = json.dumps(
-                    {"host": self.name, "channel": channel_number, "path": path}
-                ).encode()
+                answer = {"host": self.name, "channel": channel_number, "path": path}
+                if path.endswith("/version"):
+                    answer["ApiVersion"] = "1.45"
+                body = json.dumps(answer).encode()
                 daemon_end.sendall(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                     + f"Content-Length: {len(body)}\r\n\r\n".encode()
@@ -160,7 +175,7 @@ class _FakeSSHClient:
         pass
 
     def connect(self, **params):
-        pass
+        self._host.adapter_lock_held_at_connect.append(_DOCKER_SDK_SSH_ADAPTER_LOCK.locked())
 
     def get_transport(self) -> _FakeDockerHost:
         return self._host
@@ -169,15 +184,31 @@ class _FakeSSHClient:
         pass
 
 
-def _rental_api_client(monkeypatch, tmp_path: Path, host: _FakeDockerHost):
+class _RoutingSSHClient(_FakeSSHClient):
+    """Each build's SSH session lands on the fake host named by the address it connects to."""
+
+    def __init__(self, hosts: dict[str, _FakeDockerHost]):
+        self._hosts = hosts
+        self._host = None
+
+    def connect(self, **params):
+        self._host = self._hosts[params["hostname"]]
+        super().connect(**params)
+
+
+def _rental_api_client(monkeypatch, tmp_path: Path, host: _FakeDockerHost, version="1.45"):
     """The validator's docker-py APIClient with the rental adapter, its SSH session on `host`."""
     monkeypatch.setattr(paramiko, "SSHClient", lambda: _FakeSSHClient(host))
+    return _build_client(tmp_path, BASE_URL, version)
+
+
+def _build_client(tmp_path: Path, base_url: str, version):
     return _create_docker_api_client_with_rental_ssh_adapter(
         docker_module=docker,
         key_path=tmp_path / "id_executor",
         known_hosts_path=tmp_path / "known_hosts",
-        base_url=BASE_URL,
-        version="1.45",
+        base_url=base_url,
+        version=version,
         timeout=5,
         use_ssh_client=False,
     )
@@ -261,3 +292,56 @@ def test_two_clients_of_one_host_never_share_a_pool(monkeypatch, tmp_path):
     second_api.close()
     first_rent_host.close()
     second_rent_host.close()
+
+
+def test_client_build_connects_and_reads_the_daemon_version_outside_the_adapter_lock(
+    monkeypatch, tmp_path, host
+):
+    api = _rental_api_client(monkeypatch, tmp_path, host, version=None)
+
+    assert api.api_version == "1.45"
+    assert host.adapter_lock_held_at_connect == [False]
+    assert host.adapter_lock_held_at_open == [False]
+    assert host.open_session_timeouts == [15]
+    api.close()
+
+
+def test_a_host_that_never_opens_a_channel_does_not_hold_another_hosts_client_build(
+    monkeypatch, tmp_path
+):
+    # 11 Oct 2026 (ticket-0486): one silent host held the adapter lock through paramiko's 1 h
+    # open_session wait, every other rental's client build queued behind it, and by the time they
+    # ran the executors had purged the validator's 15-minute key, so all failed at ssh_connect
+    silent_host = _FakeDockerHost("silent")
+    silent_host.open_session_gate.clear()
+    healthy_host = _FakeDockerHost("healthy")
+    monkeypatch.setattr(
+        paramiko,
+        "SSHClient",
+        lambda: _RoutingSSHClient({"203.0.113.10": silent_host, "203.0.113.11": healthy_host}),
+    )
+
+    factory = RentalDockerSdkClientFactory(timeout=5)
+
+    def build(base_url: str):
+        # the factory's own client build, the one every rental's connect runs in a docker-sdk thread
+        return factory._create_api_client(
+            base_url, tmp_path / "id_executor", tmp_path / "known_hosts", []
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        stuck_build = pool.submit(build, "ssh://root@203.0.113.10:2222")
+        while not silent_host.open_session_timeouts:
+            # a build that raised instead of waiting fails here, not as a hang
+            assert not stuck_build.done(), stuck_build.exception()
+            threading.Event().wait(0.01)
+
+        healthy_api = build("ssh://root@203.0.113.11:2222")
+
+        assert healthy_api.api_version == "1.45"
+        assert not stuck_build.done()
+        silent_host.open_session_gate.set()
+        stuck_build.result(timeout=10).close()
+    healthy_api.close()
+    silent_host.close()
+    healthy_host.close()

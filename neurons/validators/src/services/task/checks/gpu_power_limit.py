@@ -103,15 +103,6 @@ class GpuPowerLimitCheck:
                 rejected.append(measurement)
 
         if rejected:
-            lium_gpu_uuids = self._rejected_gpus_under_lium_filler(ctx, rejected)
-            if lium_gpu_uuids:
-                event = render_message(
-                    Msg.SKIPPED_ACTIVE_LIUM_FILLER,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={"executor_uuid": ctx.executor.uuid, "gpu_uuids": lium_gpu_uuids},
-                )
-                return CheckResult(passed=True, event=event)
             stale_cap_event = await self._rescue_stale_lium_caps(ctx, rejected)
             if stale_cap_event is not None:
                 return CheckResult(passed=True, event=stale_cap_event)
@@ -139,8 +130,9 @@ class GpuPowerLimitCheck:
             )
 
         if incomplete:
+            # No reading is no proof of a full limit: a host that hides the value from NVML fails.
             event = render_message(
-                Msg.DATA_INCOMPLETE,
+                Msg.DATA_INCOMPLETE_REJECTED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -149,7 +141,15 @@ class GpuPowerLimitCheck:
                     "incomplete_gpus": _dump_measurements(incomplete),
                 },
             )
-            return CheckResult(passed=True, event=event)
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={
+                    "score": 0.0,
+                    "job_score": 0.0,
+                    "score_warning": " WARNING: GPU power limit could not be read",
+                },
+            )
 
         event = render_message(
             Msg.LIMIT_OK,
@@ -161,29 +161,6 @@ class GpuPowerLimitCheck:
             },
         )
         return CheckResult(passed=True, event=event)
-
-    @staticmethod
-    def _rejected_gpus_under_lium_filler(
-        ctx: Context, rejected: list[GpuPowerMeasurement]
-    ) -> list[str]:
-        """The rejected GPU uuids when every one of them runs a Lium default job, else [].
-
-        Keyed on the GPU, not the executor: the same GPUs can be reported under two executor ids
-        while the filler runs under one, and the other id must not fail for our cap. Any rejected
-        GPU that is not a Lium filler GPU keeps the normal verdict.
-        """
-        rented_data = ctx.state.rented_data
-        if rented_data is None:
-            return []
-        rejected_uuids = [measurement.uuid for measurement in rejected if measurement.uuid]
-        if len(rejected_uuids) < len(rejected):
-            return []
-        if all(
-            rented_data.get_gpu_default_job_owner(uuid) == DEFAULT_JOB_OWNER_LIUM
-            for uuid in rejected_uuids
-        ):
-            return rejected_uuids
-        return []
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]

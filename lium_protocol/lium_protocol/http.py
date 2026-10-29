@@ -55,6 +55,13 @@ class ManualRentalInfo(pydantic.BaseModel):
     gpu_count: int
 
 
+class MaintenanceWindow(pydantic.BaseModel):
+    """A provider maintenance window, UTC, half-open: [starting_at, expiring_at)."""
+
+    starting_at: datetime
+    expiring_at: datetime
+
+
 class FillerRevenueByGpuConfig(pydantic.BaseModel):
     """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
     over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
@@ -84,17 +91,28 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}
     spot_executor_ids: list[str] = []
-    # the subset of spot_executor_ids whose provider chose the Spot tier (not demoted, force-spot,
-    # pinned or in a no-incentive rental); only these may take spot-node pay
+    # the subset of spot_executor_ids that may take spot-node pay: set to Spot by the provider, or
+    # demoted for penalties; never a banned hotkey, pin or no-incentive rental
     provider_spot_executor_ids: list[str] = []
     new_rentals_paused_executor_ids: list[str] = []
     # DAH-2703: executor_ids whose filler container was destroyed during create
     filler_create_kill_executor_ids: list[str] = []
     provider_discord_connected_executor_ids: list[str] | None = None
+    # executor_ids the backend keeps unlisted until the provider confirms an e-mail address
+    provider_email_held_executor_ids: list[str] = []
+    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters
+    renter_hardware_fault_executor_ids: list[str] = []
+    # executor_ids inside a running provider maintenance window: no incentive from either pool, rented or not
+    maintenance_executor_ids: list[str] = []
+    # executor_id → its maintenance window; the validator fails a node whose cycle started inside it
+    maintenance_windows_by_executor: dict[str, MaintenanceWindow] = {}
     default_job_owner_by_executor: dict[str, str] = {}  # executor_id → "miner" | "lium"
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
     # average filler revenue per GPU configuration, read by the spot-node pay and the secure floor
     filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
+    # executor_id → the hotkey its node is listed under (pool hotkey for a custodied account), for
+    # every listed executor; the validator's verified record treats a write by any other hotkey as foreign
+    executor_owner_hotkeys: dict[str, str] = {}
 
 
 class PodRentalActiveResponse(pydantic.BaseModel):

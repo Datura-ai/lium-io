@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
 import asyncssh
@@ -9,6 +10,7 @@ from neurons.validators.src.services.task.checks.rented_machine import (
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
 )
+from neurons.validators.src.services.const import POD_CONTAINER_NAME_GRACE_MINUTES
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from neurons.validators.src.services.task.pipeline import Context
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
@@ -79,12 +81,14 @@ def build_rented_data(
             pod_id=c.get("pod_id", "pod-123"),
             container_name=c.get("name", "container"),
             rented_ports=[],
+            created_at=c.get("created_at"),
+            status=c.get("status"),
         )
         for c in containers
     ]
 
     executor = RentedExecutor(
-        miner_hotkey="test-miner",
+        miner_hotkey="miner-hotkey",
         executor_ip_address="127.0.0.1",
         executor_ip_port="22",
         pods=pods,
@@ -1201,6 +1205,20 @@ async def test_pod_states_reports_running_for_a_healthy_rented_pod(context_facto
 
 
 @pytest.mark.asyncio
+async def test_a_pod_stopped_by_its_renters_gpu_reset_is_not_penalised(context_factory):
+    # DAH-4658: the reset stops the container for a moment; only the pod named on the mark is spared
+    pods = {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]}
+    for marked_pod, spared in (("pod-1", True), ("pod-2", False)):
+        ctx = _tenant_ctx(context_factory, DummySSHClient(pod_running=False), pods)
+        ctx.services.redis.gpu_reset_marks = AsyncMock(return_value=[{"pod_id": marked_pod, "kind": "gpu_reset"}])
+
+        result = await TenantEnforcementCheck().run(ctx)
+
+        assert result.passed is spared
+        assert (result.event.reason_code == Msg.POD_NOT_RUNNING.reason) is not spared
+
+
+@pytest.mark.asyncio
 async def test_pod_states_reports_exited_when_inspect_shows_a_stopped_container(context_factory):
     # DummySSHClient answers docker inspect with Status=exited; the rental is still open, so
     # the cycle also fails with POD_NOT_RUNNING as before.
@@ -1437,3 +1455,122 @@ async def test_pod_states_is_untouched_when_the_executor_is_not_rented(context_f
 
     assert result.event.reason_code == Msg.NOT_RENTED.reason
     assert "state" not in result.updates
+
+
+# DAH-4315: the backend lists a new pod before it records its container name.
+UNNAMED_POD = {"containers": [{"name": "", "pod_id": "53a68595"}]}
+
+
+def _unnamed_pod_ctx(context_factory, ssh_client, gpu_processes, backend=None, pods=UNNAMED_POD):
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend or DummyBackendClient(active=True),
+    )
+    state = build_state(
+        gpu_processes=gpu_processes,
+        gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
+        gpu_model="NVIDIA RTX 4090",
+        rented_data=build_rented_data("executor-123", pods),
+    )
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=ssh_client,
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+
+def test_rented_pod_without_a_container_name_resolves_to_its_pod_container():
+    for unset in ("", None):
+        pod = RentedPod(pod_id="53a68595", container_name=unset)
+        assert pod.container_name_pending
+        assert pod.docker_container_name == "pod_53a68595"
+    named = RentedPod(pod_id="53a68595", container_name="pod_other")
+    assert not named.container_name_pending
+    assert named.docker_container_name == "pod_other"
+
+
+@pytest.mark.asyncio
+async def test_unnamed_pod_owns_the_gpu_process_in_its_pod_container(context_factory):
+    ctx = _unnamed_pod_ctx(
+        context_factory,
+        DummySSHClient(pod_running=True),
+        [{"container_name": "pod_53a68595", "pid": 1234}],
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+
+
+@pytest.mark.asyncio
+async def test_unnamed_pod_still_fails_a_gpu_process_in_another_container(context_factory):
+    ctx = _unnamed_pod_ctx(
+        context_factory,
+        DummySSHClient(pod_running=True),
+        [{"container_name": "pod_someone_else", "pid": 1234}],
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert not result.passed
+    assert result.event.reason_code == Msg.GPU_OUTSIDE_TENANT.reason
+
+
+@pytest.mark.asyncio
+async def test_unnamed_pod_never_runs_a_docker_filter_on_an_empty_name(context_factory):
+    ssh = DummySSHClient(pod_running=True)
+    ctx = _unnamed_pod_ctx(context_factory, ssh, [])
+
+    await TenantEnforcementCheck().run(ctx)
+
+    ps_commands = [c for c in ssh.commands_called if "docker ps" in c]
+    assert ps_commands == ["/usr/bin/docker ps -q -f name=pod_53a68595"]
+    assert not any(c.rstrip().endswith("name=") for c in ssh.commands_called)
+
+
+@pytest.mark.asyncio
+async def test_unnamed_pod_whose_container_is_not_up_yet_is_not_penalised(context_factory):
+    backend = DummyBackendClient(active=True)
+    ctx = _unnamed_pod_ctx(context_factory, DummySSHClient(pod_running=False), [], backend)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert "clear_verified_job_reason" not in result.updates
+    assert _pod_states(result) == {"53a68595": "unknown"}
+    assert backend.called_with == []
+
+
+@pytest.mark.asyncio
+async def test_unnamed_pod_still_not_up_after_the_grace_is_not_running(context_factory):
+    created_at = datetime.now(UTC) - timedelta(minutes=POD_CONTAINER_NAME_GRACE_MINUTES + 1)
+    pods = {"containers": [{"name": "", "pod_id": "53a68595", "created_at": created_at}]}
+    ssh = DummySSHClient(pod_running=False)
+    ctx = _unnamed_pod_ctx(context_factory, ssh, [], DummyBackendClient(active=True), pods)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert not result.passed
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_unnamed_pod_whose_create_is_still_running_after_the_grace_is_not_penalised(context_factory):
+    # a custom-Dockerfile build keeps the pod PENDING with no container for longer than the grace
+    created_at = datetime.now(UTC) - timedelta(minutes=POD_CONTAINER_NAME_GRACE_MINUTES + 20)
+    pods = {"containers": [{"name": "", "pod_id": "53a68595", "created_at": created_at, "status": "PENDING"}]}
+    ssh = DummySSHClient(pod_running=False)
+    ctx = _unnamed_pod_ctx(context_factory, ssh, [], DummyBackendClient(active=True), pods)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert "clear_verified_job_reason" not in result.updates

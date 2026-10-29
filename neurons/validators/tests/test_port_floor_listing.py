@@ -62,9 +62,9 @@ class HostNetworkBatch:
         self.reachable = reachable
         self.calls: list[list[PortPair]] = []
 
-    async def verify(self, ports, *, ssh_client, host, log_ctx=None, max_attempts=2):
+    async def verify(self, ports, *, ssh_client, host, log_ctx=None):
         self.calls.append(list(ports))
-        return BatchResult(list(ports[: self.reachable]), list(ports[self.reachable :]), completed=True)
+        return BatchResult(list(ports[: self.reachable]), list(ports[self.reachable :]))
 
 
 class PublishedPorts:
@@ -318,63 +318,6 @@ async def test_stale_pod_with_enough_ports_is_unchanged(context_factory, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_topup_flag_reprobes_the_failed_ports_through_published_ports(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
-    batch, semi, fallback = HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()
-    ctx = run_context(context_factory, connectivity(batch, semi, fallback))
-
-    _, ctx = await apply(ctx, PortConnectivityCheck())
-    count_result, ctx = await apply(ctx, PortCountCheck())
-
-    # semi-batch gets the ports the batch failed, never the two it reached
-    assert semi.calls[0][0] == PortPair(40002, 40002)
-    assert len(semi.calls[0]) == 50
-    assert fallback.calls == []
-    assert ctx.state.verified_port_count == 52
-    assert ctx.default_extra["probe_tier"] == "batch+semi_batch"
-    assert count_result.passed is True
-    assert ctx.state.specs["available_port_count"] == 52
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("reachable", [MIN_PORT_COUNT, MIN_PORT_COUNT + 1])
-async def test_topup_leaves_a_batch_at_the_floor_alone(context_factory, monkeypatch, reachable):
-    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
-    batch, semi = HostNetworkBatch(reachable=reachable), PublishedPorts()
-    ctx = run_context(context_factory, connectivity(batch, semi, PublishedPorts()))
-
-    _, ctx = await apply(ctx, PortConnectivityCheck())
-    count_result, _ = await apply(ctx, PortCountCheck())
-
-    assert semi.calls == []
-    assert ctx.state.verified_port_count == reachable
-    assert ctx.default_extra["probe_tier"] == "batch"
-    assert count_result.passed is True
-    assert "listing_check" not in count_result.event.what_we_saw
-
-
-@pytest.mark.asyncio
-async def test_topup_falls_through_to_the_sequential_tier_when_semi_batch_reaches_nothing(
-    context_factory, monkeypatch
-):
-    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
-
-    class NothingPublished(PublishedPorts):
-        async def verify(self, ports, *, ssh_client, host, max_ports, log_ctx=None):
-            self.calls.append(list(ports[:max_ports]))
-            return [], list(ports[:max_ports])
-
-    batch, semi, fallback = HostNetworkBatch(reachable=1), NothingPublished(), PublishedPorts()
-    ctx = run_context(context_factory, connectivity(batch, semi, fallback))
-
-    _, ctx = await apply(ctx, PortConnectivityCheck())
-
-    assert len(fallback.calls[0]) == 10
-    assert ctx.state.verified_port_count == 11
-    assert ctx.default_extra["probe_tier"] == "batch+fallback"
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "pod_order",
     [("pod-live", "pod-stale"), ("pod-stale", "pod-live")],
@@ -534,23 +477,7 @@ async def test_a_malformed_port_range_keeps_a_rented_node_on_its_rented_score(co
 
 
 @pytest.mark.asyncio
-async def test_topup_runs_when_the_dind_miss_takes_a_batch_of_three_below_the_floor(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
-    batch, semi = HostNetworkBatch(reachable=MIN_PORT_COUNT), PublishedPorts()
-    ctx = run_context(context_factory, connectivity(batch, semi, PublishedPorts(), dind=DindFails()))
-
-    _, ctx = await apply(ctx, PortConnectivityCheck())
-
-    # the DinD port (the batch's first) failed, so 2 were left and the -p tiers got the failed ports
-    assert len(semi.calls) == 1
-    assert semi.calls[0][0] == PortPair(40003, 40003)
-    assert ctx.state.verified_port_count == 2 + 50
-    assert ctx.default_extra["probe_tier"] == "batch+semi_batch"
-    assert ctx.default_extra["dind_ok"] is False
-
-
-@pytest.mark.asyncio
-async def test_a_dind_miss_on_a_batch_of_three_publishes_two_with_the_topup_flag_off(context_factory):
+async def test_a_dind_miss_on_a_batch_of_three_publishes_two(context_factory):
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=MIN_PORT_COUNT), PublishedPorts(), PublishedPorts(), dind=DindFails()),
@@ -631,3 +558,29 @@ async def test_a_range_next_to_empty_mappings_is_named_while_the_event_says_no_p
     what = count_result.event.what_we_saw
     assert what["port_range"] == DECLARED_RANGE
     assert (what["probed_port_count"], what["declared_port_count"]) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented(context_factory):
+    """A 6-port node whose idle filler holds 2 ports and answers 2 of the other 4 passes with 4,
+    and a rent can allocate them: a rental removes the filler and frees its ports (prod 22 Oct,
+    declared ranges of 6-11). The platform's rent guard (verify 2) and prepare_ports_data take
+    `verified_ports` minus the pods' busy ports, so the filler ports must be in that list too."""
+    rented_data = RentedExecutorsResponse(
+        executors={}, filler_ports_by_executor={"executor-123": [2004, 2001]}
+    )
+    state = build_state(
+        verified_port_count=2, specs={"verified_ports": [2003, 2005]}, rented_data=rented_data
+    )
+    ctx = context_factory(state=state)
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is True
+    specs = result.updates["state"].specs
+    assert result.updates["port_count"] == specs["available_port_count"] == 4
+    # probed ports first (rental verification uses [0]), then the filler's
+    assert specs["verified_ports"] == [2003, 2005, 2001, 2004]
+    # rent path: no pod holds a port (a filler creates none), so all 4 are free to allocate
+    busy_pod_ports: set[int] = set()
+    assert len(set(specs["verified_ports"]) - busy_pod_ports) >= MIN_PORT_COUNT

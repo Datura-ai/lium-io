@@ -142,6 +142,10 @@ class FakeRedis:
         self._touch()
         return self.store.get(key)
 
+    async def mget(self, keys: list[str]):
+        self._touch()
+        return [self.store.get(key) for key in keys]
+
     def _set_hook(self, key: str):
         if key in self.fail_next_set_of:
             self.fail_next_set_of.discard(key)
@@ -157,6 +161,13 @@ class FakeRedis:
         self._set_hook(key)
         self.store[key] = value
         self.ttl[key] = ex
+
+    async def pttl(self, key: str) -> int:
+        self._touch()
+        if key not in self.store:
+            return -2
+        ttl = self.ttl.get(key)
+        return -1 if ttl is None else ttl * 1000
 
     async def write_atomically(self, writes):
         """`RedisService.write_atomically`: all of `writes` or none. `fail_delete_of` names keys whose
@@ -222,6 +233,10 @@ class FakeRedis:
         if key in self.store or key in self.hashes:
             self.ttl[key] = seconds
 
+    async def persist(self, key: str):
+        self._touch()
+        self.ttl.pop(key, None)
+
 
 def default_executor() -> ExecutorSSHInfo:
     return ExecutorSSHInfo(
@@ -249,8 +264,6 @@ def build_context_config(**overrides) -> ContextConfig:
         max_gpu_count=None,
         gpu_model_rates={},
         nvml_digest_map={},
-        verifyx_enabled=False,
-        inspector_enabled=False,
         port_private_key=None,
         port_public_key=None,
         job_batch_id="batch-1",

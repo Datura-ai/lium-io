@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import DUPLICATED_MACHINE_SET
 
@@ -16,11 +15,14 @@ logger = get_logger(__name__)
 CYCLE_CHECK_ID = "executor.cycle.duplicate_across_miners"
 # Loki key for the cycle-level verdicts below, enforced or observed.
 ACROSS_MINERS_OUTCOME = "DUPLICATE_ACROSS_MINERS"
+GPU_ALIAS_OUTCOME = "GPU_ALIAS_SAME_MINER"
+GPU_ALIAS_CHECK_ID = "executor.cycle.gpu_alias_same_miner"
 
 MATCH_SSH_ENDPOINT = "ssh_endpoint"
 MATCH_EXECUTOR_UUID = "executor_uuid"
 MATCH_IP_PORT = "ip_port"
 MATCH_GPU_UUID = "gpu_uuid"
+MATCH_SSH_HOST_KEY = "ssh_host_key"
 
 
 class DuplicateExecutorCheck:
@@ -49,15 +51,6 @@ class DuplicateExecutorCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "miner_hotkey": ctx.miner_hotkey,
             }
-            if settings.DUPLICATE_EXECUTOR_DRY_RUN:
-                event = render_message(
-                    Msg.DUPLICATE_OBSERVED,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what=what,
-                )
-                return CheckResult(passed=True, event=event)
-
             event = render_message(
                 Msg.DUPLICATE,
                 ctx=ctx,
@@ -131,6 +124,8 @@ def _log(duplicate: AcrossMinersDuplicate, result: JobResult, default_extra: dic
             if duplicate.enforced
             else "Executor scored under two miner hotkeys this cycle (observe mode, both keep the score)"
         )
+    elif duplicate.matched_on == MATCH_SSH_HOST_KEY:
+        message = "One verified SSH host key answered on two endpoints this cycle (logged only)"
     else:
         message = "Executor reported under two miner hotkeys this cycle on a node-reported key (logged only)"
     logger.warning(
@@ -165,15 +160,15 @@ def keep_one_miner_per_executor(
     Scored copies from different hotkeys that the validator reached on the same SSH endpoint
     (address and ssh_port) are one machine: each request installs its own fresh key, so a
     passing login there means that machine admitted that hotkey. One hotkey keeps the score
-    (`_keeper`; `rental_hotkeys` maps a rented executor UUID to the hotkey its rental names); the copies of the others are logged with every hotkey involved and, with
-    DUPLICATE_EXECUTOR_DRY_RUN off, score 0 with EXECUTOR_DUPLICATE_ACROSS_MINERS.
+    (`_keeper`; `rental_hotkeys` maps a rented executor UUID to the hotkey its rental names); the copies of the others are logged with every hotkey involved and score 0 with
+    EXECUTOR_DUPLICATE_ACROSS_MINERS.
 
     Matches on what the node itself reports (executor UUID, listed ip:port, GPU UUIDs) are
-    logged only, never zeroed: any miner can report another node's values. One hotkey's own
+    logged only, never zeroed: any miner can report another node's values. So is one verified
+    SSH host key on two endpoints, which also covers two copies under one hotkey. One hotkey's own
     repeats are left to MinerService, unscored copies have nothing to pay twice, and a result
     the validator did not log in for (a forced pass, `ssh_port` 0) proves no endpoint.
     """
-    enforce = not settings.DUPLICATE_EXECUTOR_DRY_RUN
     scored = [
         (hotkey, result)
         for hotkey in sorted(job_results)
@@ -203,7 +198,7 @@ def keep_one_miner_per_executor(
                 other_hotkeys=tuple(sorted(hotkeys - {hotkey})),
                 matched_on=MATCH_SSH_ENDPOINT,
                 kept_by=kept_by,
-                enforced=enforce,
+                enforced=True,
             )
             duplicates.append(duplicate)
             _log(duplicate, result, default_extra)
@@ -239,14 +234,93 @@ def keep_one_miner_per_executor(
             duplicates.append(duplicate)
             _log(duplicate, result, default_extra)
 
-    if enforce:
-        for result, kept_by, shares_row, what in zeroed:
-            result.score = 0
-            result.job_score = 0
-            result.failure_reason_code = Msg.ACROSS_MINERS.reason
-            result.validation_event = render_message(
-                Msg.ACROSS_MINERS, ctx=None, check_id=CYCLE_CHECK_ID, what=what
+    # The endpoint match above is one address and port. One sshd reached through a second port or a
+    # relay address is the same machine on two endpoints, under one hotkey or two: the host key the
+    # validator pinned and verified for the login is the same. Logged only: an image that ships its
+    # host keys would give every node built from it one key.
+    by_host_key: dict[str, list[tuple[str, JobResult]]] = defaultdict(list)
+    for hotkey, result in scored:
+        host_key = (result.executor_info.ssh_host_key or "").strip()
+        if result.ssh_host_key_verified and host_key and result.executor_info.ssh_port > 0:
+            by_host_key[host_key].append((hotkey, result))
+    for _, copies in sorted(by_host_key.items()):
+        if len({_ssh_endpoint(result) for _, result in copies}) < 2:
+            continue
+        hotkeys = {hotkey for hotkey, _ in copies}
+        for hotkey, result in copies:
+            duplicate = AcrossMinersDuplicate(
+                executor_uuid=str(result.executor_info.uuid),
+                hotkey=hotkey,
+                other_hotkeys=tuple(sorted(hotkeys - {hotkey})),
+                matched_on=MATCH_SSH_HOST_KEY,
+                kept_by=None,
+                enforced=False,
             )
-            result.duplicate_kept_by = kept_by
-            result.duplicate_shares_kept_row = shares_row
+            duplicates.append(duplicate)
+            _log(duplicate, result, default_extra)
+
+    for result, kept_by, shares_row, what in zeroed:
+        result.score = 0
+        result.job_score = 0
+        result.failure_reason_code = Msg.ACROSS_MINERS.reason
+        result.validation_event = render_message(
+            Msg.ACROSS_MINERS, ctx=None, check_id=CYCLE_CHECK_ID, what=what
+        )
+        result.duplicate_kept_by = kept_by
+        result.duplicate_shares_kept_row = shares_row
     return duplicates
+
+
+def keep_one_executor_per_gpu(
+    job_results: dict[str, list[JobResult]],
+    default_extra: dict | None = None,
+) -> list[tuple[str, JobResult]]:
+    """One miner's GPU earns under one of its executors per cycle.
+
+    Scored executors of one hotkey that report a shared GPU UUID are one set of cards listed
+    more than once. The rented copy keeps the score, else the lowest executor UUID; a rented copy
+    is never zeroed. The others are logged and score 0. Returns the (hotkey, result) pairs that
+    lost the score.
+    """
+    aliases: list[tuple[str, JobResult]] = []
+    for hotkey in sorted(job_results):
+        by_gpu: dict[str, list[JobResult]] = defaultdict(list)
+        for result in job_results[hotkey]:
+            if result.is_successful:
+                for gpu_uuid in _gpu_uuids(result):
+                    by_gpu[gpu_uuid].append(result)
+        seen: set[int] = set()
+        for gpu_uuid, copies in sorted(by_gpu.items()):
+            if len({str(r.executor_info.uuid).lower() for r in copies}) < 2:
+                continue
+            keeper = min(copies, key=lambda r: (not r.is_rented, str(r.executor_info.uuid).lower()))
+            for result in copies:
+                if result is keeper or result.is_rented or id(result) in seen:
+                    continue
+                seen.add(id(result))
+                aliases.append((hotkey, result))
+                what = {
+                    "executor_uuid": str(result.executor_info.uuid),
+                    "kept_by_executor_uuid": str(keeper.executor_info.uuid),
+                    "gpu_uuid": gpu_uuid,
+                    "miner_hotkey": hotkey,
+                }
+                logger.warning(
+                    _m(
+                        "One miner reported the same GPU under two executors this cycle; one executor keeps the score",
+                        extra=get_extra_info(
+                            {
+                                **(default_extra or {}),
+                                "outcome": GPU_ALIAS_OUTCOME,
+                                **what,
+                            }
+                        ),
+                    )
+                )
+                result.score = 0
+                result.job_score = 0
+                result.failure_reason_code = Msg.GPU_ALIAS.reason
+                result.validation_event = render_message(
+                    Msg.GPU_ALIAS, ctx=None, check_id=GPU_ALIAS_CHECK_ID, what=what
+                )
+    return aliases

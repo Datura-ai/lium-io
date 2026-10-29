@@ -1,4 +1,5 @@
 import importlib.util
+import ipaddress
 from typing import Optional
 from bittensor_wallet import Keypair
 from pydantic import Field
@@ -15,6 +16,11 @@ logger = get_logger(__name__)
 # at another validator at runtime. Non-prod images bake a different anchor in at
 # build time — docker_build.sh writes core/config_override.py.
 _BUILTIN_VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
+# The hotkey the Lium validator swaps to (owner, 22 Sep 2026). Accepted as `next` from this release
+# on, so the fleet is ready before the chain swap; the swap release makes it `current` and drops the
+# address above. Applies to the built-in anchor only: a build with core/config_override.py names
+# its own `next` (or none) — a staging executor keeps trusting staging's validator alone.
+_BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58 = "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"
 
 
 def _resolve_validator_hotkey() -> str:
@@ -40,17 +46,22 @@ VALIDATOR_HOTKEY_SS58 = _resolve_validator_hotkey()
 
 # DAH-3394: the validator hotkey is being rotated. A release that trusts only the new hotkey
 # would be refused by every executor that has not restarted onto it yet, so this release accepts
-# two: `current` (above) and `next`, the hotkey the validator swaps to. `next` is empty until the
-# new hotkey exists; it is then set here or in config_override at build time — like `current`,
-# never from the environment: the set of signers an executor trusts is fixed by the image, not by
-# whoever writes its .env. With `next` empty the executor behaves exactly as before.
-VALIDATOR_NEXT_HOTKEY_SS58 = ""
-try:
-    from core.config_override import _VALIDATOR_NEXT_HOTKEY_SS58
-    VALIDATOR_NEXT_HOTKEY_SS58 = _VALIDATOR_NEXT_HOTKEY_SS58
-except ImportError:
-    # no override module (the default build) or one that names only `current`
-    pass
+# two: `current` (above) and `next`, the hotkey the validator swaps to. Like `current`, `next` is
+# never read from the environment: the set of signers an executor trusts is fixed by the image,
+# not by whoever writes its .env. The default build takes the built-in pair; a build with a
+# config_override module takes `_VALIDATOR_NEXT_HOTKEY_SS58` from it, or none.
+def _resolve_validator_next_hotkey() -> str:
+    if importlib.util.find_spec("core.config_override") is None:
+        return _BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58
+    try:
+        from core.config_override import _VALIDATOR_NEXT_HOTKEY_SS58
+    except ImportError:
+        # an override that names only `current` (a staging or e2e build): one trusted signer
+        return ""
+    return _VALIDATOR_NEXT_HOTKEY_SS58
+
+
+VALIDATOR_NEXT_HOTKEY_SS58 = _resolve_validator_next_hotkey()
 
 
 def _validator_hotkeys(current: str, next_: str) -> dict[str, str]:
@@ -72,6 +83,30 @@ def _validator_hotkeys(current: str, next_: str) -> dict[str, str]:
 
 VALIDATOR_HOTKEYS_SS58: dict[str, str] = _validator_hotkeys(VALIDATOR_HOTKEY_SS58, VALIDATOR_NEXT_HOTKEY_SS58)
 
+# I-78: the addresses the prod validator reaches executors from (the prod VPC's two NAT gateways).
+# A key uploaded through /upload_ssh_key logs in only from these, so a copy of the hotkey can no
+# longer buy a root shell from anywhere else. Fixed by the image like the hotkeys; a non-prod build
+# names its own in config_override (_VALIDATOR_SSH_SOURCES, written by docker_build.sh from
+# VALIDATOR_SSH_SOURCES; absent or "" = no pin).
+_BUILTIN_VALIDATOR_SSH_SOURCES = "54.163.250.18,13.223.237.157"
+
+
+def _resolve_validator_ssh_sources() -> str:
+    if importlib.util.find_spec("core.config_override") is None:
+        sources = _BUILTIN_VALIDATOR_SSH_SOURCES
+    else:
+        try:
+            from core.config_override import _VALIDATOR_SSH_SOURCES as sources
+        except ImportError:
+            sources = ""
+    # a malformed from= makes sshd refuse the key: fail the build, not every login on the fleet
+    for source in filter(None, sources.split(",")):
+        ipaddress.ip_network(source)
+    return sources
+
+
+VALIDATOR_SSH_SOURCES = _resolve_validator_ssh_sources()
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     PROJECT_NAME: str = "compute-subnet-executor"
@@ -81,6 +116,8 @@ class Settings(BaseSettings):
     SSH_PUBLIC_PORT: Optional[int] = Field(env="SSH_PUBLIC_PORT", default=None)
 
     MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
+    # `lium mine --register` writes the portal account's claim here; the portal requires it of a pool-hotkey node
+    MINER_ACCOUNT_CLAIM: Optional[str] = Field(env="MINER_ACCOUNT_CLAIM", default=None)
     DEFAULT_MINER_HOTKEY: str = Field(
         env="DEFAULT_MINER_HOTKEY",
         default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
@@ -104,8 +141,9 @@ class Settings(BaseSettings):
     )
     # DAH-2977: also keep the top-N official templates warm (the backend lists them with
     # `pre_pull: true` when asked). Pulled one per refresh sweep, only while the node is
-    # idle. Off by default: the loop then behaves exactly as before and never asks.
-    PRE_PULL_TEMPLATES_ENABLED: bool = Field(env="PRE_PULL_TEMPLATES_ENABLED", default=False)
+    # idle. On by default since DAH-3604 (rollout step 3); PRE_PULL_TEMPLATES_ENABLED=false
+    # in .env opts a node out, and the loop then behaves exactly as before and never asks.
+    PRE_PULL_TEMPLATES_ENABLED: bool = Field(env="PRE_PULL_TEMPLATES_ENABLED", default=True)
     # Free space the docker root must keep after a pre-pull; least-recently-used
     # pre-pulled images are evicted first to stay above it.
     PRE_PULL_MIN_FREE_GB: int = Field(env="PRE_PULL_MIN_FREE_GB", default=200)
@@ -115,7 +153,6 @@ class Settings(BaseSettings):
     # send every executor to the registry at once.
     PRE_PULL_START_JITTER_SECONDS: int = Field(env="PRE_PULL_START_JITTER_SECONDS", default=15 * 60)
 
-    ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
     TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
     SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")
 
@@ -126,12 +163,20 @@ class Settings(BaseSettings):
     ENABLE_GPU_ATTESTATION: bool = Field(env="ENABLE_GPU_ATTESTATION", default=False)
     # NVIDIA attestation SDK arch tag routing the evidence at NRAS ("HOPPER", "BLACKWELL").
     GPU_ATTESTATION_ARCH: str = Field(env="GPU_ATTESTATION_ARCH", default="HOPPER")
-    # dstack guest marker; also what the dstack SDK talks to for TDX quotes.
+    # dstack guest marker; also what the dstack SDK talks to for TDX quotes. TDX quotes are
+    # served exactly when it exists (inside a dstack CVM); a bare-metal executor has none.
     DSTACK_SOCKET_PATH: str = Field(env="DSTACK_SOCKET_PATH", default="/var/run/dstack.sock")
     # G3 enforcement phase: reject SSH-key uploads without a validator attestation
     # nonce. Leave off until the validator fleet mints nonces (migration order:
     # executors accept optional nonce first, then validators send, then this).
     REQUIRE_ATTESTATION_NONCE: bool = Field(env="REQUIRE_ATTESTATION_NONCE", default=False)
+    # I-78: a dated upload nonce (datura fresh_upload_nonce) older or newer than this is refused, so a
+    # captured upload signature is worth at most this window. Symmetric for host clock drift.
+    UPLOAD_NONCE_MAX_AGE_SECONDS: int = Field(env="UPLOAD_NONCE_MAX_AGE_SECONDS", default=600)
+    # Refuse an SSH-key upload unless the validator signed it for this executor's
+    # MINER_HOTKEY_SS58_ADDRESS. Off: a missing or different miner hotkey is only logged
+    # ("ssh_key_miner_binding"). Turn on once the validator, miner and executor fleet send it.
+    REQUIRE_MINER_BOUND_SSH_KEY: bool = Field(env="REQUIRE_MINER_BOUND_SSH_KEY", default=False)
     # DAH-3200: the backend signs `timestamp = int(time.time())` into every /containers/{name}
     # request (utilization and logs). A signed request older or newer than this many seconds is
     # refused, so a captured one cannot be replayed for the life of the container. Symmetric so a
@@ -147,6 +192,9 @@ class Settings(BaseSettings):
     EXECUTOR_UPLOADED_KEY_TTL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_TTL_S", default=900, ge=1)
     # How often the purge looks at authorized_keys; a key lives at most TTL + this.
     EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S", default=60, ge=1)
+    # I-78: off by default until approved; about 5% of nodes relay inbound ssh (sshd sees the relay,
+    # not the validator) and would fail. Safe as an env value: whoever writes this .env is root on the host.
+    EXECUTOR_SSH_SOURCE_PIN: bool = Field(env="EXECUTOR_SSH_SOURCE_PIN", default=False)
 
     # liumd phase 1 (DAH-2834): `POST /verify` runs the verification suite locally from one
     # validator-signed intent instead of 25–40 SSH commands. Off: the route answers 404 and

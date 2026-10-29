@@ -11,22 +11,24 @@ from typing import Any, Literal
 from core.config import settings
 
 from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
+from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
-from .rented_gpu_drop import RentedGpuDropCheck
+from .gpu_loss_hold import GpuLossHoldCheck
+from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
 
-# DAH-2794: how long a failed stdin attempt may have taken and still be worth retrying with the
-# binary. Above a full scrape (~15 s on a real box, so a payload that will not decrypt is only
-# knowable around then), below the point where the retry stops fitting: 60 s here + 300 s upload
-# + 300 s scrape = 660 s against the 780 s per-executor timeout. The upload gets one attempt for
-# exactly that reason.
-STDIN_FAILURE_RETRY_WINDOW_MS = 60_000
+# How long a failed stdin attempt may have taken and still be worth retrying with the binary.
+# Above a full scrape (~15 s on a real box, plus up to ~90 s for the vloopback mount test and its
+# cleanup, so a payload that will not decrypt is only knowable around then), below the point where
+# the retry stops fitting: 120 s here + 300 s upload + 300 s scrape = 720 s against the 780 s
+# per-executor timeout. The upload gets one attempt for exactly that reason.
+STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
@@ -252,7 +254,7 @@ def _no_gpu_report_specs(stdout: str, obfuscation_keys: dict[str, str] | None) -
     return specs if isinstance(specs.get("gpu"), dict) else {**specs, "gpu": {}}
 
 
-async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
+async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> list[ValidationEvent]:
     # A scrape that lists no GPU (card 0 lost, the only card lost, the driver down) fails here, and
     # this check is fatal, so RentedGpuDropCheck never runs on that cycle: hand it the empty scrape.
     gpu = specs["gpu"]
@@ -264,12 +266,19 @@ async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
         gpu_details=[],
     )
     try:
-        await RentedGpuDropCheck().run(ctx.model_copy(update={"state": state}))
+        lost_ctx = ctx.model_copy(update={"state": state})
+        await RentedGpuDropCheck().run(lost_ctx)
+        # DAH-4457: the hold starts here too, so the next clean scrape does not list the node again at once.
+        # This failed scrape ends the run before GpuLossHoldCheck, so its GPU_LOST entry rides on the scrape's
+        # result: without it a node whose driver died stayed listed for as long as the scrape kept failing.
+        hold_result = await GpuLossHoldCheck().run(lost_ctx)
+        return [hold_result.event] if hold_result.event.is_availability_error else []
     except Exception:
         logger.warning(
             _m("RENTED_GPU_DROP_ON_SCRAPE_FAILURE_ERROR", extra=get_extra_info(ctx.default_extra)),
             exc_info=True,
         )
+        return []
 
 
 @dataclass(frozen=True)
@@ -313,6 +322,32 @@ def _interconnect_summary(specs: dict[str, Any]) -> dict[str, Any] | None:
     summary = {key: value for key, value in interconnect.items() if key != "matrix"}
     if specs.get("interconnect_scrape_error"):
         summary["scrape_error"] = specs["interconnect_scrape_error"]
+    return summary
+
+
+VLOOPBACK_TEXT_FIELDS = ("verdict", "reason_code", "detail", "runtime")
+# the host sends these fields; a modified scrape can send any type or length, so the validator keeps
+# only strings, cut to the scrape's own detail cap
+VLOOPBACK_TEXT_CAP = 300
+
+
+def _host_text(value: Any) -> str | None:
+    return value[:VLOOPBACK_TEXT_CAP] if isinstance(value, str) else None
+
+
+def _vloopback_fields(vloopback: dict[str, Any]) -> dict[str, Any]:
+    return {field: _host_text(vloopback.get(field)) for field in VLOOPBACK_TEXT_FIELDS}
+
+
+def _storage_limit_summary(specs: dict[str, Any], vloopback: Any) -> dict[str, Any]:
+    # the storage-limit verdict and the vloopback mount test's own verdict, in the validator's own log
+    supported = bool(specs.get("storage_limit_supported", False))
+    summary: dict[str, Any] = {"supported": supported}
+    scrape_error = specs.get("storage_limit_scrape_error")
+    if not supported and scrape_error:
+        summary["detail"] = str(scrape_error)[:VLOOPBACK_TEXT_CAP]
+    if isinstance(vloopback, dict):
+        summary["vloopback"] = _vloopback_fields(vloopback)
     return summary
 
 
@@ -446,8 +481,18 @@ class MachineSpecScrapeCheck:
 
         if not scrape_run.success or not scrape_run.stdout.strip():
             failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            # DAH-4658: every card is missing; held only when each one is a GPU the renter resets
+            if failure.scrape_error == "no_gpu_details" and await missing_gpus_under_reset(ctx, []):
+                event = render_message(
+                    Msg.SCRAPE_GPU_RESET_IN_PROGRESS,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={**what, "held_reason_code": failure.template.reason, **failure.cause_event_fields()},
+                )
+                return CheckResult(passed=False, event=event)
+            gpu_lost_events: list[ValidationEvent] = []
             if failure.scrape_error == "no_gpu_details":
-                await _report_rented_gpu_loss(
+                gpu_lost_events = await _report_rented_gpu_loss(
                     ctx, _no_gpu_report_specs(scrape_run.stdout, ctx.config.obfuscation_keys)
                 )
             reset = _host_gpu_fault_reset(ctx, failure, self.check_id)
@@ -466,13 +511,15 @@ class MachineSpecScrapeCheck:
                     **({"host_gpu_fault_reset": True} if reset else {}),
                 },
             )
-            return CheckResult(passed=False, event=event, updates=reset)
+            return CheckResult(passed=False, event=event, updates=reset, extra_events=gpu_lost_events)
 
         try:
             decrypted = _decrypt_payload(ctx, scrape_run.stdout)
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
+            # DAH-3698: PortConnectivityCheck's grace marker is validator-owned; a provider must never report it
+            specs.pop("port_verify_first_miss", None)
 
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
@@ -491,6 +538,8 @@ class MachineSpecScrapeCheck:
             gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
             gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
             supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
+            # the vloopback mount test is reported in this event only; the stored specs do not carry it
+            vloopback = specs.pop("vloopback_check", None)
 
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,
@@ -509,6 +558,8 @@ class MachineSpecScrapeCheck:
                     "network": specs.get("network"),
                     # DAH-2922: the NVLink/P2P verdict per cycle, without the 8x8 matrix
                     "interconnect": _interconnect_summary(specs),
+                    # whether rentals with a disk limit get one here, and the vloopback mount test's verdict
+                    "storage_limit": _storage_limit_summary(specs, vloopback),
                 },
                 extra=extra_info,
             )

@@ -16,6 +16,7 @@ from services.executor_connectivity.models import (
     PortPair,
 )
 from services.ssh_service import SSHService
+from services.node_host import public_host_sock
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,12 @@ DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_ME
 # for the same host condition (watchtower/src/watchtower.py RUNTIME_PROBE_NVIDIA_MISMATCH).
 _HOOK_LINE_START = "nvidia-container-cli:"
 _SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
+
+# /proc/self/uid_map inside the sysbox probe container (G21), logged as `uid_map` on "Sysbox check ok"
+UID_MAP_USER_NAMESPACE = "user_namespace"
+UID_MAP_IDENTITY = "identity"
+UID_MAP_UNREADABLE = "unreadable"
+
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
     (
         "nvml error: driver/library version mismatch",
@@ -271,10 +278,43 @@ class DindVerifier:
             error_msg = "sysbox check timed out after 30s"
         else:
             if result.exit_status == 0:
-                logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
-                return True
+                uid_map = await self._read_uid_map(ssh)
+                logger.info(_m("Sysbox check ok", extra=get_extra_info({**log_ctx, "uid_map": uid_map})))
+                return self._user_namespace_allows_sysbox(uid_map, log_ctx)
             error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
         logger.warning(_m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+        return False
+
+    @staticmethod
+    async def _read_uid_map(ssh: SSHClientConnection) -> str:
+        """`user_namespace`, `identity` or `unreadable` for /proc/self/uid_map inside the sysbox probe container.
+
+        Sysbox always runs a container in a user namespace; runc, privileged or not, keeps the host's identity
+        map (`0 0 4294967295`). The `docker` that started this container is the node's own binary, so
+        hello-world passing does not show sysbox ran it.
+        """
+        try:
+            result = await asyncio.wait_for(ssh.run("cat /proc/self/uid_map"), timeout=10)
+        except (asyncio.TimeoutError, asyncssh.Error, OSError):
+            return UID_MAP_UNREADABLE
+        fields = (result.stdout or "").split() if isinstance(result.stdout, str) else []
+        if result.exit_status != 0 or len(fields) < 3:
+            return UID_MAP_UNREADABLE
+        if fields[:3] == ["0", "0", "4294967295"]:
+            return UID_MAP_IDENTITY
+        return UID_MAP_USER_NAMESPACE
+
+    @staticmethod
+    def _user_namespace_allows_sysbox(uid_map: str, log_ctx: dict[str, Any]) -> bool:
+        """False only for the identity map (logged as SYSBOX_IDENTITY_UID_MAP). True for a user namespace
+        and for an unreadable map (logged as SYSBOX_UID_MAP_UNREADABLE: no answer decides nothing).
+        """
+        if uid_map == UID_MAP_USER_NAMESPACE:
+            return True
+        if uid_map == UID_MAP_UNREADABLE:
+            logger.warning(_m("SYSBOX_UID_MAP_UNREADABLE", extra=get_extra_info(log_ctx)))
+            return True
+        logger.warning(_m("SYSBOX_IDENTITY_UID_MAP", extra=get_extra_info(log_ctx)))
         return False
 
     async def _diagnose_unanswered_container(
@@ -350,6 +390,7 @@ class DindVerifier:
                 connection = await asyncssh.connect(
                     host=host,
                     port=port.external,
+                    **await public_host_sock(host, port.external, attempt_timeout_seconds),
                     username="root",
                     client_keys=[pkey],
                     known_hosts=None,

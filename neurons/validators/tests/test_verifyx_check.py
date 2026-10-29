@@ -73,15 +73,12 @@ class DummyVerifyXService:
                 return MockVerifyXResponse(data=data)
 
 @pytest.mark.parametrize(
-    "verifyx_enabled,has_specs,verify_success,error_msg,updated_specs,expected_pass,expected_reason",
+    "has_specs,verify_success,error_msg,updated_specs,expected_pass,expected_reason",
     [
-        # VerifyX disabled - should pass without calling service
-        (False, True, True, "", {}, True, Msg.DISABLED.reason),
-        # VerifyX enabled but no specs - should fail
-        (True, False, True, "", {}, False, Msg.NO_SPECS.reason),
+        # No specs - should fail
+        (False, True, "", {}, False, Msg.NO_SPECS.reason),
         # VerifyX succeeds with updated specs
         (
-            True,
             True,
             True,
             "",
@@ -90,16 +87,15 @@ class DummyVerifyXService:
             Msg.VERIFY_SUCCESS.reason,
         ),
         # VerifyX succeeds without network data → EMA=0 < threshold → fails
-        (True, True, True, "", {}, False, Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason),
+        (True, True, "", {}, False, Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason),
         # VerifyX fails with error message
-        (True, True, False, "Checksum mismatch", {}, False, Msg.VERIFY_FAILED.reason),
+        (True, False, "Checksum mismatch", {}, False, Msg.VERIFY_FAILED.reason),
         # VerifyX fails with data errors
-        (True, True, False, "", {}, False, Msg.VERIFY_FAILED.reason),
+        (True, False, "", {}, False, Msg.VERIFY_FAILED.reason),
     ],
 )
 @pytest.mark.asyncio
 async def test_verifyx_check(
-    verifyx_enabled,
     has_specs,
     verify_success,
     error_msg,
@@ -116,7 +112,7 @@ async def test_verifyx_check(
     )
 
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=verifyx_enabled)
+    config = build_context_config()
 
     # Setup specs
     base_specs = {"gpu": {"count": 2}, "cpu": {"cores": 8}} if has_specs else {}
@@ -133,10 +129,7 @@ async def test_verifyx_check(
     assert result.event.reason_code == expected_reason
 
     # Verify service interactions based on scenario
-    if not verifyx_enabled:
-        # Service should not be called when disabled
-        assert verifyx_service.called_with is None
-    elif not has_specs:
+    if not has_specs:
         # Service should not be called when no specs
         assert verifyx_service.called_with is None
     else:
@@ -202,7 +195,7 @@ async def test_verifyx_failure_classes_pick_per_class_template(
         MockVerifyXResponse(error="failure", diagnostics=diagnostics)
     )
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(specs={"gpu": {"count": 1}})
     ctx = context_factory(services=services, config=config, state=state)
 
@@ -227,7 +220,7 @@ async def test_verifyx_failure_without_diagnostics_falls_back_to_generic_templat
         MockVerifyXResponse(error="opaque failure", diagnostics=None)
     )
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(specs={"gpu": {"count": 1}})
     ctx = context_factory(services=services, config=config, state=state)
 
@@ -260,7 +253,7 @@ async def test_verifyx_skips_active_filler_and_reuses_prev_ema(context_factory):
         updated_specs={"network": {"download_speed": 500.0, "upload_speed": 100.0}},
     )
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs={"gpu": {"count": 1}},
         rented_data=RentedExecutorsResponse(
@@ -289,11 +282,40 @@ async def test_verifyx_skips_active_filler_and_reuses_prev_ema(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_verifyx_probes_never_measured_node_under_active_filler(context_factory):
+    """A filler that starts before the first stored EMA must not leave the node unmeasured."""
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"network": {"download_speed": 510.0, "upload_speed": 100.0}},
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config()
+    state = build_state(
+        specs={"gpu": {"count": 8}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+            network_ema={},
+        ),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code != Msg.FILLER_SKIPPED.reason
+    assert verifyx_service.called_with is not None
+    network = result.updates["state"].specs["network"]
+    assert network["ema_verifyx_download_speed"] == pytest.approx(510.0)
+
+
+@pytest.mark.asyncio
 async def test_verifyx_failure_without_prev_ema_leaves_specs_empty(context_factory):
     """No prior EMA anywhere — failure branch must not fabricate a state update."""
     verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs={"gpu": {"count": 1}},
         rented_data=RentedExecutorsResponse(executors={}, banned_guids=[], network_ema={}),
@@ -311,7 +333,7 @@ async def test_verifyx_failure_without_rented_data_does_not_update_state(context
     """rented_data is None — failure branch must not attempt to read from it."""
     verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(specs={"gpu": {"count": 1}}, rented_data=None)
     ctx = context_factory(services=services, config=config, state=state)
 
@@ -327,7 +349,7 @@ async def test_verifyx_success_ema_below_threshold_fails_check(context_factory):
     # prev_ema=110, current=0 → new EMA = 0.5*0 + 0.5*110 = 55 < 100
     verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs={"gpu": {"count": 1}},
         rented_data=_rented_data_with_ema("executor-123", download=110.0),
@@ -350,7 +372,7 @@ async def test_verifyx_success_ema_at_threshold_passes(context_factory):
         updated_specs={"network": {"download_speed": 100.0, "upload_speed": 50.0}},
     )
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(specs={"gpu": {"count": 1}}, rented_data=None)
     ctx = context_factory(services=services, config=config, state=state)
 
@@ -364,7 +386,7 @@ async def test_verifyx_success_null_network_bootstraps_ema_to_zero_and_fails(con
     """First run: verifyx passes but network failed → EMA=0.0 < threshold → check fails."""
     verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(specs={"gpu": {"count": 1}}, rented_data=None)
     ctx = context_factory(services=services, config=config, state=state)
 
@@ -381,7 +403,7 @@ async def test_verifyx_success_null_network_decays_prev_ema(context_factory):
     """Verifyx passes but network failed → EMA decays: compute_ema(prev, 0.0) = 0.5 × prev."""
     verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs={"gpu": {"count": 1}},
         rented_data=_rented_data_with_ema("executor-123", download=500.0, upload=100.0),
@@ -409,7 +431,7 @@ async def test_verifyx_success_null_network_repeated_decays_below_threshold(cont
     for _ in range(5):
         verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
         services = build_services(verifyx=verifyx_service)
-        config = build_context_config(verifyx_enabled=True)
+        config = build_context_config()
         state = build_state(
             specs={"gpu": {"count": 1}},
             rented_data=_rented_data_with_ema("executor-123", download=ema),
@@ -442,7 +464,7 @@ async def test_verifyx_upload_failure_feeds_the_download_ema_the_measured_downlo
         success=True, updated_specs={"network": _upload_failed_network_stats(2100.0)}
     )
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs={"gpu": {"count": 1}},
         rented_data=_rented_data_with_ema("executor-123", download=2000.0, upload=900.0),
@@ -475,7 +497,7 @@ async def test_verifyx_repeated_upload_failures_keep_the_download_ema_above_the_
             success=True, updated_specs={"network": _upload_failed_network_stats(2100.0)}
         )
         services = build_services(verifyx=verifyx_service)
-        config = build_context_config(verifyx_enabled=True)
+        config = build_context_config()
         state = build_state(
             specs={"gpu": {"count": 1}},
             rented_data=_rented_data_with_ema("executor-123", download=ema, upload=900.0),
@@ -499,7 +521,7 @@ async def _run_ema_cycle(
     network = {"download_speed": download, "upload_speed": upload, "package_download_speed": 700.0}
     verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": network})
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs={"gpu": {"count": 1}},
         rented_data=_rented_data_with_ema(
@@ -629,7 +651,7 @@ async def test_verifyx_keeps_the_scrapes_disk_breakdown(context_factory):
         updated_specs={"hard_disk": {"total": 1000, "used": 400, "free": 600}, "network": {}},
     )
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(
         specs={
             "gpu": {"count": 1},
@@ -641,11 +663,29 @@ async def test_verifyx_keeps_the_scrapes_disk_breakdown(context_factory):
     # Act
     result = await VerifyXCheck().run(ctx)
 
-    # Assert — VerifyX wins on the fields it measures, the breakdown survives
+    # Assert — the scrape's figures win (they release the filler caches), the breakdown survives
     hard_disk = result.updates["state"].specs["hard_disk"]
-    assert hard_disk["total"] == 1000
+    assert hard_disk["total"] == 999
+    assert hard_disk["used"] == 399
     assert hard_disk["images"] == 120
     assert hard_disk["volumes"] == 250
+
+
+@pytest.mark.asyncio
+async def test_verifyx_fills_the_disk_totals_a_failed_scrape_left_out(context_factory):
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"hard_disk": {"total": 1000, "used": 400, "free": 600}, "network": {}},
+    )
+    ctx = context_factory(
+        services=build_services(verifyx=verifyx_service),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}, "hard_disk": {"disk_type": "nvme"}}),
+    )
+
+    hard_disk = (await VerifyXCheck().run(ctx)).updates["state"].specs["hard_disk"]
+
+    assert (hard_disk["free"], hard_disk["disk_type"]) == (600, "nvme")
 
 
 @pytest.mark.asyncio
@@ -656,7 +696,7 @@ async def test_verifyx_success_path_emits_no_verifyx_failed_log(
     updated_specs = {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}, "network": {"download_speed": 500.0, "upload_speed": 100.0}}
     verifyx_service = DummyVerifyXService(success=True, updated_specs=updated_specs)
     services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
+    config = build_context_config()
     state = build_state(specs={"gpu": {"count": 1}, "cpu": {"cores": 4}})
     ctx = context_factory(services=services, config=config, state=state)
 

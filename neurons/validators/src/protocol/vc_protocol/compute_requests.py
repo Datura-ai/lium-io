@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, RootModel, ValidationError, field_validator
 
-from services.const import FILLER_CONTAINER_PREFIX
+from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +15,12 @@ GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
 GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
 # DAH-2671: the rental-verification container was created with `--cpus=<advertised>` and the host's
 # Docker daemon rejected the count — the machine has fewer physical cores than the miner reported.
-# Unlike the two GPU faults above this is spec fraud, not a broken runtime, and it is rolled out
-# shadow-first (see RENTAL_CPU_LIMIT_* in core/config.py).
+# Unlike the two GPU faults above this is spec fraud, not a broken runtime; it zeroes the score.
 CPU_QUOTA_EXCEEDS_HOST_REASON = "CPU_QUOTA_EXCEEDS_HOST"
+
+
+def _executor_key(executor_id: Any) -> str:
+    return str(executor_id).strip().lower()
 
 
 class Error(BaseModel, extra="allow"):
@@ -54,6 +57,23 @@ class RentedPod(BaseModel):
     # pod with an ssh_port whatever its status, and counts only RUNNING (or None = backend predates
     # the field) pods towards the our-own-outage share.
     status: str | None = None
+
+    @field_validator("container_name", mode="before")
+    @classmethod
+    def _container_name_not_null(cls, value: Any) -> Any:
+        # DAH-4315: the backend lists a new pod before it records the container's name.
+        return "" if value is None else value
+
+    @property
+    def container_name_pending(self) -> bool:
+        """True while the backend has not recorded the pod's container name yet."""
+        return not self.container_name.strip()
+
+    @property
+    def docker_container_name(self) -> str:
+        """The pod's container on the node: the recorded name, else the `pod_<pod_id>` it is
+        created as (DAH-4315). Never empty, so it is safe in a `docker ps -f name=` filter."""
+        return self.container_name.strip() or f"{POD_CONTAINER_PREFIX}{self.pod_id}"
 
     @field_validator("ssh_port")
     @classmethod
@@ -118,6 +138,10 @@ class ManualRentalInfo(BaseModel):
     gpu_count: int
 
 
+# the window the backend takes each filler average over
+FILLER_REVENUE_WINDOW_HOURS = 24
+
+
 class FillerRevenueByGpuConfig(BaseModel):
     """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
     over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
@@ -126,6 +150,13 @@ class FillerRevenueByGpuConfig(BaseModel):
     gpu_count: int
     usd_per_gpu_hour: float
     gpu_hours: float  # the filler GPU-hours the average was taken over
+
+
+class MaintenanceWindow(BaseModel):
+    """A provider maintenance window, UTC, half-open: [starting_at, expiring_at)."""
+
+    starting_at: datetime
+    expiring_at: datetime
 
 
 class RentedExecutorsResponse(BaseModel):
@@ -150,8 +181,8 @@ class RentedExecutorsResponse(BaseModel):
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
-    # The subset of spot_executor_ids whose provider chose the Spot tier: no demotion, force-spot
-    # hotkey, pin or no-incentive rental put it there. Only these may take spot-node pay. Defaults
+    # The subset of spot_executor_ids that may take spot-node pay: set to Spot by the provider, or
+    # demoted for penalties; never a banned hotkey, pin or no-incentive rental. Defaults
     # to empty so a backend that does not send it pays no spot node.
     provider_spot_executor_ids: list[str] = []
     new_rentals_paused_executor_ids: list[str] = []  # executor_ids paused from unrented incentives
@@ -160,14 +191,23 @@ class RentedExecutorsResponse(BaseModel):
     # probe has nothing to check. Additive with an empty default: an older backend penalizes nobody.
     filler_create_kill_executor_ids: list[str] = []
     provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
+    # executor_ids that earn nothing from either pool until the provider confirms an e-mail address: a new
+    # node the backend keeps unlisted, and a listed node once the provider's e-mail grace is over. Listing
+    # and rentals are untouched. A held new node is also absent from the Discord list above.
+    # Additive with an empty default: an older backend names nobody.
+    provider_email_held_executor_ids: list[str] = []
+    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters in the
+    # backend's report window (DAH-4482): each owes a post-rental GPU recheck. Additive with an empty default.
+    renter_hardware_fault_executor_ids: list[str] = []
+    # executor_ids inside a running provider maintenance window (DAH-4709): no incentive from either pool,
+    # rented or not. Additive with an empty default: an older backend names nobody.
+    maintenance_executor_ids: list[str] = []
+    # executor_id → its maintenance window (DAH-4709): a node whose cycle started inside it fails
+    # PROVIDER_MAINTENANCE. Additive with an empty default: an older backend names no window.
+    maintenance_windows_by_executor: dict[str, MaintenanceWindow] = {}
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).
     default_job_owner_by_executor: dict[str, str] = {}
-    # gpu_uuid → "miner" | "lium" for the GPUs an active default job runs on. The same GPUs can be
-    # reported under more than one executor id, and the job runs under only one of them, so the
-    # power-limit exemption reads this map. Empty for a backend that predates the field: the
-    # executor-keyed map above still applies.
-    default_job_owner_by_gpu: dict[str, str] = {}
     # executor_id → specs to force-pass against. Present only for executors carrying a pod flagged
     # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
     # field force-passes nobody (fail-closed) rather than everybody.
@@ -175,6 +215,12 @@ class RentedExecutorsResponse(BaseModel):
     # Average filler revenue per GPU configuration: what the spot-node pay and the secure floor are
     # measured against. Defaults to empty so an older backend pays spot nodes nothing, as before.
     filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
+    # executor_id → the hotkey the backend lists the executor under. Only that hotkey may take over a
+    # verified record stored under the bare executor id (RedisService.get_verified_job_info).
+    executor_owner_hotkeys: dict[str, str] = {}
+    # executor_ids of the nodes of banned pool accounts, listed as soon as a node is added, so a node
+    # added after an account ban fails the ban check in its first cycle. An older backend bans none.
+    banned_executor_ids: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
@@ -193,14 +239,33 @@ class RentedExecutorsResponse(BaseModel):
             return entry.usd_per_gpu_hour
         return None
 
+    def get_filler_revenue_usd_per_hour(self, base_model: str | None, min_gpu_hours: float) -> float | None:
+        """What Lium's fillers earned per hour in total on a GPU model, over every configuration with a
+        usable sample (the trailing 24 hours of each average); None when there is none."""
+        if not base_model:
+            return None
+        totals: list[float] = [
+            entry.usd_per_gpu_hour * entry.gpu_hours / FILLER_REVENUE_WINDOW_HOURS
+            for entry in self.filler_revenue_by_gpu_config
+            if entry.base_model == base_model
+            and entry.gpu_hours >= min_gpu_hours
+            and entry.usd_per_gpu_hour > 0
+            and math.isfinite(entry.usd_per_gpu_hour)
+            and math.isfinite(entry.gpu_hours)
+        ]
+        return sum(totals) if totals else None
+
     def is_provider_banned(
         self,
         *,
         miner_hotkey: str,
         miner_coldkey: str | None = None,
         gpu_uuids: list[str] | None = None,
+        executor_uuid: str | None = None,
     ) -> bool:
         if miner_hotkey in self.banned_hotkeys:
+            return True
+        if executor_uuid and _executor_key(executor_uuid) in {_executor_key(i) for i in self.banned_executor_ids}:
             return True
         if miner_coldkey and miner_coldkey in self.banned_coldkeys:
             return True
@@ -280,9 +345,6 @@ class RentedExecutorsResponse(BaseModel):
 
     def get_default_job_owner(self, executor_uuid: str) -> str | None:
         return self.default_job_owner_by_executor.get(str(executor_uuid))
-
-    def get_gpu_default_job_owner(self, gpu_uuid: str) -> str | None:
-        return self.default_job_owner_by_gpu.get(str(gpu_uuid))
 
     def get_manual_rental_info(self, executor_uuid: str) -> "ManualRentalInfo | None":
         """Specs to force-pass this executor against, or None if it is not a manual rental."""

@@ -24,11 +24,10 @@ def tally_port_ranges(
     declared: Iterable[PortPair],
     probed: Iterable[PortPair],
     answered: Iterable[PortPair],
-    pass_number: int = 1,
 ) -> tuple[PortRangeResult, ...]:
-    """Declared, probed and answered counts per declared range for one pass, ascending.
+    """Declared, probed and answered counts per declared range, ascending.
 
-    Counts distinct external ports in 1-65535, and only answers among this pass's probes, so a
+    Counts distinct external ports in 1-65535, and only answers among the probes, so a
     duplicated port or two mappings sharing one external port are counted once and
     `answered <= probed <= declared` holds in every tally. Ports are grouped into
     PORT_RANGE_BUCKET_WIDTH-wide buckets, and each tally names the lowest and highest declared port
@@ -48,38 +47,13 @@ def tally_port_ranges(
             declared=len(ports),
             probed=sum(e in probed_ext for e in ports),
             answered=sum(e in answered_ext for e in ports),
-            pass_number=pass_number,
         )
 
     return tuple(tally(ports) for _, ports in sorted(buckets.items()))
 
 
-def spread_ports(ports: list[PortPair], size: int) -> list[PortPair]:
-    """At most `size` of `ports` (sorted ascending), evenly spaced, always including the last one.
-
-    All of them when they fit. Deterministic: the same list gives the same picks.
-    """
-    if size <= 0:
-        return []
-    if len(ports) <= size:
-        return list(ports)
-    if size == 1:
-        return [ports[-1]]
-    last = len(ports) - 1
-    return [ports[i * last // (size - 1)] for i in range(size)]
-
-
 class PortSelector:
-    """Selects which ports to verify.
-
-    Pass one (`select`) is the lowest `size` free declared ports, the check every host gets. Pass
-    two (`select_spread`) runs with PORT_PROBE_TOPUP_BELOW_FLOOR on, when fewer than MIN_PORT_COUNT
-    are verified after the top-up, which re-probes only pass one's ports: up to `size` ports spread evenly over the free declared ports pass one did not test, always including the
-    highest. On 40000-65535 pass two probes every 84th or 85th port from 40300 up, so a block
-    forwarded at the top verifies 3 ports when it is 170 ports or wider, and a block anywhere above
-    pass one's ports when it is 254 ports or wider. For the same declaration and rental set both
-    passes probe the same ports every cycle, so a node does not flap.
-    """
+    """Selects which ports to verify: the lowest `size` free declared ports."""
 
     def select(
         self,
@@ -92,20 +66,3 @@ class PortSelector:
         already taken by pods or fillers."""
         available_ports = [p for p in declared if p.external not in unavailable_ports]
         return available_ports[:size]
-
-    def select_spread(
-        self,
-        declared: list[PortPair],
-        size: int,
-        unavailable_ports: set[int],
-        pass_one_ports: Iterable[PortPair],
-    ) -> list[PortPair]:
-        """Pass two: up to `size` free declared ports that pass one did not test, spread evenly."""
-        pass_one_external = {p.external for p in pass_one_ports}
-        untested_free_ports = [
-            p
-            for p in declared
-            if p.external not in unavailable_ports and p.external not in pass_one_external
-        ]
-        return spread_ports(untested_free_ports, size)
-

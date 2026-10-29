@@ -14,6 +14,8 @@ context creation, an allocation the card or the container's limits refuse, a wor
 setup) is an error, not a fault: the validator does not penalise what it could not measure.
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
+`--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
+`flags`) or error, exit 0.
 """
 
 from __future__ import annotations
@@ -752,6 +754,18 @@ def _device_count(mp) -> int:
     return reply["count"]
 
 
+NVML_FI_DEV_GET_GPU_RECOVERY_ACTION = 230
+
+
+def nvml_recovery_action(handle):
+    import pynvml
+
+    field = pynvml.nvmlDeviceGetFieldValues(handle, [NVML_FI_DEV_GET_GPU_RECOVERY_ACTION])[0]
+    if field.nvmlReturn != pynvml.NVML_SUCCESS:
+        raise pynvml.NVMLError(field.nvmlReturn)  # driver older than R570 or card without the field
+    return field.value.uiVal
+
+
 def nvml_snapshot() -> dict:
     """Per-GPU counters that move when hardware faults: uncorrected ECC, remapped rows, recovery action."""
     try:
@@ -777,7 +791,7 @@ def nvml_snapshot() -> dict:
                     ),
                 ),
                 ("remapped_rows", lambda h: list(pynvml.nvmlDeviceGetRemappedRows(h))),
-                ("recovery_action", lambda h: pynvml.nvmlDeviceGetGpuRecoveryAction(h)),
+                ("recovery_action", nvml_recovery_action),
             ):
                 try:
                     value = read(handle)
@@ -878,6 +892,49 @@ def nvml_faults(before: dict, after: dict) -> list[str]:
         if a.get("recovery_action"):
             faults.append(f"gpu {a['index']}: NVML recovery action {a['recovery_action']} required")
     return faults
+
+
+# nvmlDeviceGpuRecoveryAction_t (nvml.h); 0 is none
+RECOVERY_ACTIONS = {
+    1: "GPU_RESET",
+    2: "NODE_REBOOT",
+    3: "DRAIN_P2P",
+    4: "DRAIN_AND_RESET",
+    5: "RECOVER_IMEX_DOMAIN",
+    6: "BUS_RESET",
+    7: "SYSTEM_REBOOT",
+}
+
+
+def nvml_health(snapshot: dict) -> tuple[list[str], list[str]]:
+    """The standing memory faults of each card in one snapshot (`--nvml-only`), not changes across
+    a run, as (flags, warnings). Flags: uncorrected ECC since the driver loaded, a failed row remap,
+    and a pending remap or recovery action on a card with uncorrectable remapped rows or uncorrected
+    ECC. A pending remap or recovery action from correctable errors alone is only a warning: that
+    card still works."""
+    flags, warnings = [], []
+    for gpu in snapshot.get("gpus") or []:
+        name = f"gpu {gpu.get('index')} ({gpu.get('uuid')})"
+        if gpu.get("ecc_uncorrected"):
+            flags.append(
+                f"{name}: {gpu['ecc_uncorrected']} uncorrected ECC error(s) since the driver loaded"
+            )
+        rows = gpu.get("remapped_rows")
+        uncorrectable = bool(gpu.get("ecc_uncorrected")) or bool(
+            rows and len(rows) >= 2 and rows[1]
+        )
+        reset_needed_target = flags if uncorrectable else warnings
+        if rows and len(rows) >= 4:
+            _, _, is_pending, has_failed = rows[:4]
+            if is_pending:
+                reset_needed_target.append(f"{name}: row remap pending (needs a GPU reset)")
+            if has_failed:
+                flags.append(f"{name}: row remap failed")
+        action = gpu.get("recovery_action")
+        if action:
+            name_of_action = RECOVERY_ACTIONS.get(action, action)
+            reset_needed_target.append(f"{name}: NVML recovery action {name_of_action} required")
+    return flags, warnings
 
 
 def xid_lines() -> dict:
@@ -998,6 +1055,15 @@ def _exit_code(process):
     return process.exitcode
 
 
+def print_nvml_health_report(mp) -> None:
+    """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults."""
+    snapshot = nvml_snapshot_forked(mp)
+    flags, warnings = nvml_health(snapshot)
+    status = "error" if not snapshot.get("available") else "flagged" if flags else "ok"
+    report = {"status": status, "flags": flags, "warnings": warnings, "nvml": snapshot}
+    print(JSON_MARKER, json.dumps(report, sort_keys=True))
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -1009,6 +1075,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--device", type=int, action="append", help="probe only this index (repeatable)"
     )
+    parser.add_argument(
+        "--nvml-only",
+        action="store_true",
+        help="read the cards' standing memory health from NVML; no CUDA, safe beside a rental",
+    )
     args = parser.parse_args(argv)
 
     started = time.perf_counter()
@@ -1016,6 +1087,9 @@ def main(argv: list[str]) -> int:
     # every CUDA call happens in a forked worker (one per GPU, plus one to count them): a crash or hang
     # in the driver takes the worker, not the verdict, and the parent never initialises CUDA itself
     mp = multiprocessing.get_context("fork")
+    if args.nvml_only:
+        print_nvml_health_report(mp)
+        return 0
     try:
         indices = args.device if args.device else list(range(_device_count(mp)))
         if not indices:

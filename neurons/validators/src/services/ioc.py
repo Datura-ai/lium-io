@@ -8,6 +8,7 @@ from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
+from services.executor_connectivity.external_probe import external_port_probe
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -45,7 +46,7 @@ async def initiate_services():
         orchestrator=ConnectivityOrchestrator(
             PortSelector(),
             PortProbe(
-                BatchVerifier(port_tester, runner),
+                BatchVerifier(port_tester, runner, external_port_probe()),
                 SemiBatchVerifier(port_tester, runner),
                 FallbackVerifier(port_tester, runner),
             ),

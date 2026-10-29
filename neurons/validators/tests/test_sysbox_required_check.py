@@ -16,7 +16,6 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
-from core.config import settings
 from services.executor_connectivity.models import DindLogCause
 from tests.helpers import build_state
 
@@ -66,18 +65,6 @@ async def test_sysbox_present_passes(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.SYSBOX_OK.reason
-
-
-@pytest.mark.asyncio
-async def test_disabled_flag_skips_enforcement(context_factory, monkeypatch):
-    """With the kill-switch off, no-sysbox unrented executors are not rejected."""
-    monkeypatch.setattr(settings, "REQUIRE_SYSBOX_FOR_UNRENTED", False)
-    ctx = context_factory(state=build_state(sysbox_runtime=False))
-
-    result = await SysboxRequiredCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.DISABLED.reason
 
 
 @pytest.mark.asyncio

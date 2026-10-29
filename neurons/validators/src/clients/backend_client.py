@@ -329,12 +329,15 @@ class BackendClient:
         stop=stop_after_attempt(3),
         wait=wait_fixed(30),
         retry=retry_if_result(lambda x: x is None),
+        # without this, tenacity raises RetryError after the last None
+        retry_error_callback=lambda retry_state: None,
     )
     async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
         """Fetch all rented executors with their ports from the backend.
 
         Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
-        cannot start. A check that asks mid-cycle uses `get_rented_executors_now` instead.
+        cannot start. None when all three fail. A check that asks mid-cycle uses
+        `get_rented_executors_now` instead.
         """
         return await self.get_rented_executors_now()
 
@@ -466,6 +469,7 @@ class BackendClient:
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
+        loopback_plugin: str | None = None,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -485,6 +489,9 @@ class BackendClient:
                 probe with `--cpus=<cpu_count>`, so a host claiming more cores than it physically has
                 is rejected by its own Docker daemon (CPU_QUOTA_EXCEEDS_HOST) rather than only in a
                 paying customer's rent (DAH-2671). None omits the flag.
+            loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
+                probes that plugin; without it (or on an older backend, which ignores it) only the
+                legacy plugin is probed. None omits the field.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -508,6 +515,9 @@ class BackendClient:
         # stored specs. Omitted when unset so an unchanged backend keeps the pre-DAH-2671 behaviour.
         if cpu_count is not None:
             json_data["cpu_count"] = cpu_count
+
+        if loopback_plugin is not None:
+            json_data["loopback_plugin"] = loopback_plugin
 
         if executor_id:
             json_data["executor_id"] = executor_id

@@ -34,6 +34,7 @@ from services.task.availability import (
     SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE,
 )
 from services.task.checks.rented_pod_ssh import ConnectOutcome, tcp_connect_fault
+from services.node_host import node_owner
 from services.task.models import JobResult, build_msg
 
 from core.utils import _m, get_extra_info
@@ -81,12 +82,16 @@ async def probe_rented_pods(
     if not targets:
         return {}
     limit = asyncio.Semaphore(concurrency)
+    owners = {str(uuid).lower(): executor.miner_hotkey for uuid, executor in rented.executors.items()}
 
-    async def probe(host: str, port: int) -> ConnectOutcome:
+    async def probe(executor_uuid: str, host: str, port: int) -> ConnectOutcome:
         async with limit:
-            return await tcp_connect_fault(host, port, timeout)
+            with node_owner(owners.get(executor_uuid)):  # a hostname node's DNS counts against its miner
+                return await tcp_connect_fault(host, port, timeout)
 
-    outcomes = await asyncio.gather(*(probe(host, port) for _, _, host, port, _ in targets))
+    outcomes = await asyncio.gather(
+        *(probe(executor_uuid, host, port) for executor_uuid, _, host, port, _ in targets)
+    )
     fleet_ok = fleet_is_ok(
         outcome.result
         for (*_, status), outcome in zip(targets, outcomes, strict=True)

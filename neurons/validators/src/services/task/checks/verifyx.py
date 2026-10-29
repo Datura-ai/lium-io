@@ -31,6 +31,12 @@ _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 # Keyed by (miner hotkey, executor uuid): two miners can list the same executor uuid.
 MAX_KEPT_UPLOAD_PROBES = 8
 _kept_upload_probes: dict[tuple[str, str], int] = {}
+# The same host can make the Cloudflare download fail too (block speed.cloudflare.com), and then
+# the gated number is the package download, a fixed file a LAN cache can serve. Probes in a row
+# gated on the package reading are counted the same way; past this many each one is logged, and
+# the missing capacity reading is fed as the 0 it is.
+MAX_PACKAGE_FALLBACK_PROBES = 8
+_package_fallback_probes: dict[tuple[str, str], int] = {}
 
 
 @dataclass(frozen=True)
@@ -46,11 +52,11 @@ class ColdSampleRetry:
 
 
 class VerifyXCheck:
-    """Run the optional VerifyX hardware probe and update specs with its findings.
+    """Run the VerifyX hardware probe and update specs with its findings.
 
-    This preserves the legacy feature flag behaviour: when VerifyX is enabled we block on
-    its success, otherwise the check becomes a no-op. Documenting it here lets us debate
-    the value of the external probe independently from the rest of the pipeline.
+    The check blocks on the probe's success. It always runs (DAH-4328 removed the
+    ENABLE_VERIFYX setting, on everywhere since Sep 2025); only an idle filler-only node
+    with a stored EMA skips it, keeping that EMA.
     """
 
     check_id = "gpu.validate.verifyx"
@@ -63,13 +69,6 @@ class VerifyXCheck:
         return result.error
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not ctx.config.verifyx_enabled:
-            event = render_message(
-                Msg.DISABLED,
-                ctx=ctx,
-                check_id=self.check_id,
-            )
-            return CheckResult(passed=True, event=event)
         verifyx_service = ctx.services.verifyx
         specs = ctx.state.specs
         if not specs:
@@ -81,7 +80,10 @@ class VerifyXCheck:
             return CheckResult(passed=False, event=event)
 
         filler_container = _get_filler_only_container(ctx)
-        if filler_container:
+        stored_ema = _stored_network_ema(ctx)
+        # A never-measured node is probed even under a filler: with no EMA to reuse it would
+        # score 0 every cycle and stay hidden for as long as the filler runs.
+        if filler_container and stored_ema and stored_ema.ema_verifyx_download_speed is not None:
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -194,6 +196,10 @@ class VerifyXCheck:
                 updated_specs["network"] = {}
             download_speed = verifyx_network.get("download_speed")
             cloudflare_fallback = bool(verifyx_network.get("cloudflare_fallback"))
+            package_gated = _is_package_reading_gated(ctx, cloudflare_fallback)
+            if cloudflare_fallback and not package_gated:
+                capacity = verifyx_network.get("capacity_download_speed")
+                download_speed = capacity if _is_positive_number(capacity) else 0.0
             upload_blocked = _upload_kept_within_cap(
                 ctx, bool(verifyx_network.get("cloudflare_upload_fallback"))
             )
@@ -205,7 +211,7 @@ class VerifyXCheck:
                 download_speed,
                 prev_ema.ema_verifyx_download_speed if prev_ema else None,
                 unavailable_readings,
-                keep_previous_on_none=cloudflare_fallback,
+                keep_previous_on_none=package_gated,
             )
             _feed_ema(
                 ctx,
@@ -220,11 +226,14 @@ class VerifyXCheck:
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
             # measures only its own df-derived fields, so overwriting the dict wholesale would drop
             # the scrape's docker usage breakdown on every node where VerifyX runs.
+            # The scrape's own total/used/free win: they count the filler's preallocated run volume
+            # as free (a rental removes it), and VerifyX's raw df put it back as used, so an idle
+            # node listed terabytes less free disk until the next cycle without VerifyX.
             if "hard_disk" in sanitized:
                 verifyx_hard_disk = sanitized.get("hard_disk")
                 scraped_hard_disk = updated_specs.get("hard_disk")
                 if isinstance(verifyx_hard_disk, dict) and isinstance(scraped_hard_disk, dict):
-                    updated_specs["hard_disk"] = {**scraped_hard_disk, **verifyx_hard_disk}
+                    updated_specs["hard_disk"] = {**verifyx_hard_disk, **scraped_hard_disk}
                 else:
                     updated_specs["hard_disk"] = verifyx_hard_disk
 
@@ -260,16 +269,12 @@ class VerifyXCheck:
 
             updated_state = replace(ctx.state, specs=updated_specs)
 
-            never_measured = prev_ema is None or prev_ema.ema_verifyx_download_speed is None
-            if ema_download is None:
+            gate = download_gate(ema_download, prev_ema, first_pass=ctx.config.first_pass)
+            if gate == "unseeded":
                 # A malformed download reading on a never-measured host: there is no EMA to keep
                 # and none to gate on. The event says why; the next sample seeds it.
                 return CheckResult(passed=True, event=event, updates={"state": updated_state})
-            if (
-                ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
-                and ctx.config.first_pass
-                and never_measured
-            ):
+            if gate == "deferred":
                 # DAH-3011: the first pass is never scored, and a fresh node's single cold sample fails
                 # this gate 14 % of the time (DAH-2959). Publish the raw sample, leave the EMA unseeded
                 # so the first SCORED cycle bootstraps from a warm sample and enforces the gate, and say
@@ -287,7 +292,7 @@ class VerifyXCheck:
                 event.what_we_saw["min_download_speed_mbps"] = MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
                 return CheckResult(passed=True, event=event, updates={"state": updated_state})
 
-            if ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+            if gate == "too_slow":
                 slow_event = render_message(
                     Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
                     ctx=ctx,
@@ -399,6 +404,46 @@ def _feed_ema(
     return ema
 
 
+def gated_download_ema(verifyx_network: dict, prev_ema: NetworkEMA | None) -> float | None:
+    """The download EMA the gate reads for one judged probe: what `_feed_ema` stores for the
+    download direction, computed from the stored EMA without writing anything."""
+    prev = prev_ema.ema_verifyx_download_speed if prev_ema else None
+    reading = verifyx_network.get("download_speed")
+    if reading is None and verifyx_network.get("cloudflare_fallback"):
+        return prev
+    return _ema_if_gated(prev, reading)
+
+
+def download_gate(
+    ema_download: float | None, prev_ema: NetworkEMA | None, *, first_pass: bool
+) -> Literal["unseeded", "deferred", "too_slow", "pass"]:
+    """The download-EMA floor's decision. `unseeded`, `deferred` and `pass` pass the check.
+
+    `deferred` (DAH-3011): a first pass on a never-measured host below the floor; the EMA is left
+    unseeded so the first scored cycle enforces it."""
+    if ema_download is None:
+        return "unseeded"
+    if ema_download >= MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+        return "pass"
+    never_measured = prev_ema is None or prev_ema.ema_verifyx_download_speed is None
+    if first_pass and never_measured:
+        return "deferred"
+    return "too_slow"
+
+
+def verifyx_verdict(
+    result_data: dict | None, prev_ema: NetworkEMA | None, *, first_pass: bool
+) -> bool:
+    """Whether `VerifyXCheck.run` passes one judged probe result (`VerifyXResponse.data`) against
+    the stored EMA `prev_ema`, with no state, EMA or tally written. The cold-sample retry, which
+    takes a second sample, is not part of it."""
+    if not (result_data and result_data.get("success")):
+        return False
+    network = result_data.get("network") or {}
+    ema_download = gated_download_ema(network, prev_ema)
+    return download_gate(ema_download, prev_ema, first_pass=first_pass) != "too_slow"
+
+
 def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:
     """`upload_blocked`, until this host's upload EMA has been kept MAX_KEPT_UPLOAD_PROBES probes
     in a row; a probe that does not keep it starts the count again."""
@@ -414,6 +459,26 @@ def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:
         _m(
             "VerifyX upload EMA kept too many probes in a row on Cloudflare's 429, feeding the 0",
             extra=get_extra_info({**ctx.default_extra, "kept_upload_probes": kept}),
+        )
+    )
+    return False
+
+
+def _is_package_reading_gated(ctx: Context, cloudflare_fallback: bool) -> bool:
+    """Whether this probe's package reading is the gated one: `cloudflare_fallback`, except past
+    MAX_PACKAGE_FALLBACK_PROBES in a row. A probe Cloudflare answered starts the count again."""
+    key = (ctx.miner_hotkey, ctx.executor.uuid)
+    if not cloudflare_fallback:
+        _package_fallback_probes.pop(key, None)
+        return False
+    probes = _package_fallback_probes.get(key, 0) + 1
+    _package_fallback_probes[key] = probes
+    if probes <= MAX_PACKAGE_FALLBACK_PROBES:
+        return True
+    logger.warning(
+        _m(
+            "VERIFYX_PACKAGE_FALLBACK_STREAK",
+            extra=get_extra_info({**ctx.default_extra, "package_fallback_probes": probes}),
         )
     )
     return False
@@ -459,8 +524,6 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     `rented_data` present is required — without the backend's answer every executor looks
     never-measured, and a backend blip must not double VerifyX for the whole fleet.
     """
-    if not settings.VERIFYX_COLD_SAMPLE_RETRY_ENABLED:
-        return False
     if ctx.state.rented_data is None:
         return False
     if prev_ema is not None and prev_ema.ema_verifyx_download_speed is not None:

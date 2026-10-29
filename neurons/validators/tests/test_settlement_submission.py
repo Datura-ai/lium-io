@@ -434,7 +434,6 @@ def test_a_deregistered_hotkeys_share_goes_to_the_verified_burner_not_to_everyon
 
 
 def test_the_verified_burner_is_the_first_slot_only_with_its_own_coldkey(monkeypatch):
-    monkeypatch.setattr("core.config.settings.ENABLE_NEW_BURN_LOGIC", True)
     monkeypatch.setattr("core.config.settings.NEW_BURNERS", [47, 47])
     monkeypatch.setattr("core.config.settings.BURNER_COLDKEYS", {47: "cold-47"})
     burner = MagicMock(uid=47, hotkey="burn-hk", coldkey="cold-47")

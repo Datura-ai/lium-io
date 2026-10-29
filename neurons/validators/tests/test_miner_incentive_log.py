@@ -9,7 +9,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
-    MissingFlagshipCapability,
+    MissingFull8xCapability,
     PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
@@ -27,7 +27,9 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_tier",
         "provider_discord_not_connected",
         "new_rentals_paused",
+        "provider_maintenance",
         "miner_default_job",
+        "hotkey_excluded_from_scoring",
         "gpu_model_not_eligible_for_unrented_incentive",
         "price_above_market_p90_soft_limit",
         "no_unrented_capacity_for_gpu_count",
@@ -38,10 +40,12 @@ def test_reason_enum_pins_the_stable_code_contract():
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
+        "provider_email_not_confirmed",
         "spot_without_lium_filler",
         "spot_no_filler_revenue_for_gpu_config",
         "spot_no_headroom_at_burn_cap",
         "validation_failed",
+        "rented_sysbox_not_confirmed",
     }
 
 
@@ -91,6 +95,11 @@ def _job(**overrides) -> JobResult:
             "Discord",
         ),
         (
+            lambda job: MinerLogLine.no_payout_because_email_not_confirmed(job),
+            "provider_email_not_confirmed",
+            "A listed node stays listed and rented. Other listing and incentive requirements still apply.",
+        ),
+        (
             lambda job: MinerLogLine.no_payout_because_paused_for_new_rentals(job),
             "new_rentals_paused",
             "paused for new rentals",
@@ -99,6 +108,11 @@ def _job(**overrides) -> JobResult:
             lambda job: MinerLogLine.no_payout_because_running_own_default_job(job),
             "miner_default_job",
             "own default job",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_hotkey_excluded_from_scoring(job),
+            "hotkey_excluded_from_scoring",
+            "excludes this hotkey from scoring",
         ),
         (
             lambda job: MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job),
@@ -133,9 +147,14 @@ def _job(**overrides) -> JobResult:
             "sysbox",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            lambda job: MinerLogLine.no_payout_because_rented_sysbox_not_confirmed(job),
+            "rented_sysbox_not_confirmed",
+            "rented node",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job,
-                MissingFlagshipCapability(
+                MissingFull8xCapability(
                     ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
                 ),
             ),
@@ -152,10 +171,22 @@ def _job(**overrides) -> JobResult:
         ),
         (
             lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
-                job, PortLimitedRemainder(available_port_count=2, required_port_count=3)
+                job, PortLimitedRemainder(
+                    available_port_count=2, required_port_count=4, free_split_count=4, paid_split_count=0, unpaid_gpu_count=4
+                )
             ),
             "port_limited_remainder",
             "2 free port",
+        ),
+        (
+            # below one whole split: no port remedy (DAH-3698 F15)
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(
+                    available_port_count=3, required_port_count=3, free_split_count=0, paid_split_count=0, unpaid_gpu_count=2
+                )
+            ),
+            "port_limited_remainder",
+            "fewer than its minimum rental",
         ),
     ],
 )

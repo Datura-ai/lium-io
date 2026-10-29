@@ -25,7 +25,7 @@ from dependencies.auth import (
     verify_simple_validator_signature,
     verify_validator_auth_from_headers,
 )
-from services.executor_service import ExecutorService
+from services.executor_service import RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS, ExecutorService
 from services.ssh_service import MinerSSHService
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,8 @@ async def submit_ssh_pubkey(
             request.validator_signature,
             request.executor_id,
             nonce=request.nonce,
+            validator_miner_signature=request.validator_miner_signature,
+            is_rental_request=request.is_rental_request,
         )
         executors = registration.accepted
 
@@ -137,7 +139,7 @@ async def submit_ssh_pubkey(
                                 "executor_port": executors[0].port,
                                 "uuid": str(executors[0].uuid),
                             },
-                            timeout=aiohttp.ClientTimeout(total=5)
+                            timeout=aiohttp.ClientTimeout(total=RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS)
                         ) as resp:
                             if resp.status != 200:
                                 logger.error(f"RENTAL_REQUEST_HOOK returned status {resp.status}: {await resp.text()}")

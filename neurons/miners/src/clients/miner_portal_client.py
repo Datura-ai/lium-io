@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from typing import NoReturn, Union
 
 import tenacity
@@ -42,6 +43,7 @@ from protocol.miner_portal_request import (
 logger = logging.getLogger(__name__)
 
 CONNECT_INTERVAL = 1
+MAX_CONNECT_BACKOFF = 90
 
 
 class MinerPortalClient:
@@ -91,9 +93,12 @@ class MinerPortalClient:
     async def run_forever(self) -> NoReturn:
         asyncio.create_task(self.handle_send_messages())
 
+        failures = 0
         while True:
             try:
-                async for ws in self.connect():
+                # one connection per pass: the async-for form reconnects with the headers signed at the first
+                # connect, which the portal refuses (403) once they are older than its 10 s window
+                async with self.connect() as ws:
                     try:
                         logger.info(
                             _m(
@@ -103,6 +108,7 @@ class MinerPortalClient:
                         )
 
                         self.ws = ws
+                        failures = 0
                         async for raw_msg in ws:
                             await self.handle_message(raw_msg)
                     except Exception as e:
@@ -127,7 +133,9 @@ class MinerPortalClient:
                     ),
                     exc_info=True,
                 )
-                await asyncio.sleep(CONNECT_INTERVAL)
+                # back off while the portal is down, so a fleet of miners does not retry it every second
+                failures += 1
+                await asyncio.sleep(random.uniform(0, min(MAX_CONNECT_BACKOFF, CONNECT_INTERVAL * 2**failures)))
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(3),
