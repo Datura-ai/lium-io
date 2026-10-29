@@ -396,7 +396,8 @@ async def test_verifyx_success_null_network_bootstraps_ema_to_zero_and_fails(con
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(0.0)
-    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == pytest.approx(0.0)
+    # a missing upload on a never-measured host stays unseeded
+    assert "ema_verifyx_upload_speed" not in result.updates["state"].specs["network"]
 
 
 @pytest.mark.asyncio
@@ -728,8 +729,8 @@ async def test_verifyx_success_path_emits_no_verifyx_failed_log(
         (None, 5.0, False, False, True, 2.5),
         (0.0, 5.0, False, False, True, 2.5),
         (float("nan"), 5.0, False, False, True, 5.0),
-        # a never-measured upload with no sample is not failed; a 0.0 sample is judged
-        (None, None, False, True, True, 0.0),
+        # a never-measured upload with no sample stays unseeded, not failed; a 0.0 sample is judged
+        (None, None, False, True, True, None),
         (0.0, None, False, False, True, 0.0),
         # an active filler skips the probe only when the stored upload EMA is at the floor
         (4.0, 5.0, True, False, True, 4.5),
@@ -759,50 +760,39 @@ async def test_verifyx_upload_floor(
     assert result.passed is expected_pass
     assert (service.called_with is not None) == expected_probe
     network = result.updates["state"].specs["network"]
-    assert network["ema_verifyx_upload_speed"] == pytest.approx(expected_ema)
+    ema = None if expected_ema is None else pytest.approx(expected_ema)
+    assert network.get("ema_verifyx_upload_speed") == ema
     if expected_probe:
         gate = result.event.what_we_saw["network_gate"]
         assert gate["upload_floor_mbps"] == 10.0
-        assert gate["ema_upload"] == pytest.approx(expected_ema)
+        assert gate["ema_upload"] == ema
     if not expected_pass:
         assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
         assert result.event.what_we_saw["direction"] == "upload"
-        assert result.event.what_we_saw["ema_verifyx_upload_speed"] == pytest.approx(expected_ema)
+        assert result.event.what_we_saw["ema_verifyx_upload_speed"] == ema
 
 
-async def _upload_cycles(context_factory, prev_upload, network_per_cycle):
-    """Consecutive VerifyXCheck.run cycles, each fed the previous cycle's upload EMA."""
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prev_upload,uploads,expected",
+    [
+        # recovery once the EMA reaches the floor
+        (2.0, [12.0] * 3, [(False, 7.0), (False, 9.5), (True, 10.75)]),
+        # a host blocking its own upload (0.0) cannot turn 4 -> 0 -> 0 into a pass
+        (5.0, [4.0, 0.0, 0.0], [(False, 4.5), (False, 2.25), (False, 1.125)]),
+        # missing readings on a never-measured upload leave it unseeded, never a synthetic 0
+        (None, [None] * 3, [(True, None)] * 3),
+    ],
+)
+async def test_verifyx_upload_floor_transitions(context_factory, prev_upload, uploads, expected):
     outcomes = []
-    for network in network_per_cycle:
+    for upload in uploads:
         result = await _run_ema_cycle(
-            context_factory, download=2100.0, prev_upload=prev_upload, **network
+            context_factory, download=2100.0, upload=upload, prev_upload=prev_upload
         )
-        prev_upload = result.updates["state"].specs["network"]["ema_verifyx_upload_speed"]
-        outcomes.append((result.passed, pytest.approx(prev_upload)))
-    return outcomes
-
-
-@pytest.mark.asyncio
-async def test_verifyx_upload_floor_recovers_once_the_ema_reaches_the_floor(context_factory):
-    cycles = [{"upload": 12.0}] * 3
-
-    assert await _upload_cycles(context_factory, 2.0, cycles) == [
-        (False, 7.0),
-        (False, 9.5),
-        (True, 10.75),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_verifyx_upload_zero_errors_keep_a_slow_upload_failing(context_factory):
-    """A host that blocks its own upload (probe reads 0.0) cannot turn 4 -> 0 -> 0 into a pass."""
-    cycles = [{"upload": 4.0}, {"upload": 0.0}, {"upload": 0.0}]
-
-    assert await _upload_cycles(context_factory, 5.0, cycles) == [
-        (False, 4.5),
-        (False, 2.25),
-        (False, 1.125),
-    ]
+        prev_upload = result.updates["state"].specs["network"].get("ema_verifyx_upload_speed")
+        outcomes.append((result.passed, prev_upload))
+    assert outcomes == expected
 
 
 @pytest.mark.asyncio
@@ -870,6 +860,8 @@ async def test_verifyx_upload_floor_not_judged_on_a_first_pass_never_measured_up
         (None, 5.0, False, False),
         (0.0, 5.0, False, False),
         (None, None, False, True),
+        (0.0, None, False, False),
+        (None, None, True, True),
         (0.0, 5.0, True, False),
         (0.0, 10.0, True, True),
     ],

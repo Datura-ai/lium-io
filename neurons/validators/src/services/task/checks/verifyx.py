@@ -228,14 +228,16 @@ class VerifyXCheck:
             upload_reading = _fallback_upload_reading(
                 verifyx_network.get("upload_speed"), upload_blocked
             )
+            prev_upload = prev_ema.ema_verifyx_upload_speed if prev_ema else None
+            # A missing reading on a never-measured upload leaves it unseeded, not a synthetic 0.0.
             ema_upload = _feed_ema(
                 ctx,
                 updated_specs["network"],
                 "upload",
                 upload_reading,
-                prev_ema.ema_verifyx_upload_speed if prev_ema else None,
+                prev_upload,
                 unavailable_readings,
-                keep_previous_on_none=upload_blocked,
+                keep_previous_on_none=upload_blocked or prev_upload is None,
             )
 
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
@@ -493,11 +495,12 @@ def verifyx_verdict(
     ema_download = gated_download_ema(network, prev_ema)
     if download_gate(ema_download, prev_ema, first_pass=first_pass) == "too_slow":
         return False
-    # shortcut: assumes a 429 is within MAX_KEPT_UPLOAD_PROBES (the verdict holds no count).
+    # The verdict holds no count: a 429 is read as within MAX_KEPT_UPLOAD_PROBES, and the shadow
+    # skips the probes past it (liumd_shadow "upload_fallback_cap").
     upload_fallback = bool(network.get("cloudflare_upload_fallback"))
     upload = _fallback_upload_reading(network.get("upload_speed"), upload_fallback)
     prev_upload = prev_ema.ema_verifyx_upload_speed if prev_ema else None
-    kept = upload is None and upload_fallback
+    kept = upload is None and (upload_fallback or prev_upload is None)
     ema_upload = prev_upload if kept else _ema_if_gated(prev_upload, upload)
     return not upload_too_slow(ema_upload, upload, prev_ema, first_pass=first_pass)
 
