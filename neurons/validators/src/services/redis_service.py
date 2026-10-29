@@ -109,6 +109,8 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
+# DAH-3698: a port verification that failed once inside the window (first-miss grace, as DAH-3597)
+PORT_VERIFY_MISS_PREFIX = "port_verify_miss"
 # ticket-0494: one key per executor while its last DinD probe that reached the container found sysbox.
 SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 # One key per executor: when this validator first found it without its recommended default image
@@ -421,6 +423,17 @@ class RedisService:
     async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
         """Forget the recorded miss: the probe reached its container again."""
         await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
+
+    async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        """Record a failed port verification; True when none was on record (the first inside the window).
+        A repeat restarts the window, so a miss that persists earns no fresh grace when it would have expired.
+        A passing verification does not clear it: only the window running out does."""
+        key = f"{PORT_VERIFY_MISS_PREFIX}:{miner_hotkey}:{executor_id}"
+        async with self.lock:
+            if await self.redis.set(key, "1", ex=ttl_seconds, nx=True):
+                return True
+            await self.redis.expire(key, ttl_seconds)
+            return False
 
     @staticmethod
     def _sysbox_verified_key(miner_hotkey: str, executor_id: str) -> str:

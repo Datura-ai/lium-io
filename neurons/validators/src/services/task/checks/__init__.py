@@ -5,6 +5,7 @@ from .capability import CapabilityCheck
 from .collateral_status import CollateralStatusCheck
 from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
+from .disk_space import DiskSpaceCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
@@ -37,6 +38,7 @@ from .idle_disk_write import IdleDiskWriteCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
+from .rented_pod_network import RentedPodNetworkCheck
 from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
@@ -63,6 +65,7 @@ __all__ = [
     "CollateralStatusCheck",
     "CpuTruthCheck",
     "DiskHealthCheck",
+    "DiskSpaceCheck",
     "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",
@@ -81,6 +84,7 @@ __all__ = [
     "GpuVramPrecheck",
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
+    "RentedPodNetworkCheck",
     "RentedPodResourcesCheck",
     "RentedThroughputCheck",
     "SshdAuthLogCheck",

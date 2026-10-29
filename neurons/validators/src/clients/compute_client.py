@@ -85,6 +85,7 @@ from clients.subtensor_client import SubtensorClient
 from services.docker_service import create_steps_after_reply, inflight_creates
 from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
+from services.task.inspector_verdict import canonical_sha256
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
     BackendCommand,
@@ -111,6 +112,8 @@ WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 # the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
 MAX_FRAME_BYTES = 4 * 1024 * 1024
+# room left for the delivery stamps send_model adds to an event report
+EVENT_REPORT_MAX_BYTES = MAX_FRAME_BYTES - 64 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 BACKEND_CREATE_TRACKING_RETRY_SECONDS = 5
@@ -120,7 +123,9 @@ _retiring_backend_create_records: set[asyncio.Task] = set()
 # pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
 # so the backend loses the validator for seconds, not the whole startup.
 CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
-CONNECTOR_LEAD_LOCK_TTL_SECONDS = 15
+# The old pod is SIGKILLed holding the lock, so the backend loses the validator for what is left of the TTL plus the
+# reconnect (12-14 s at 15 s, 29 Oct); 6 s keeps that under the backend's 10 s rent wait (lium-platform DAH-5174).
+CONNECTOR_LEAD_LOCK_TTL_SECONDS = 6
 CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
 
 
@@ -143,6 +148,48 @@ class OutgoingMessages(list[DeliveryStamps]):
             responses.append(message.model_dump_json())
         super().append(message)
         self.appended.set()
+
+
+def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
+    """Keeps the leading findings of an oversized report that fit one frame; counts the rest.
+
+    Not split into several requests: the backend stores each request as one row, one per cycle.
+    """
+    findings = (event.report or {}).get("findings")
+    if not isinstance(findings, list):
+        return event
+    if len(event.model_dump_json().encode()) <= EVENT_REPORT_MAX_BYTES:
+        return event
+    empty = {**event.report, "findings": [], "findings_omitted": len(findings)}
+    room = EVENT_REPORT_MAX_BYTES - len(
+        event.model_copy(update={"report": empty}).model_dump_json().encode()
+    )
+    kept = 0
+    for finding in findings:
+        # json.dumps escapes non-ASCII and adds spaces, so it never undercounts the compact frame
+        room -= len(json.dumps(finding).encode()) + 1
+        if room < 0:
+            break
+        kept += 1
+    report = {**event.report, "findings": findings[:kept], "findings_omitted": len(findings) - kept}
+    logger.warning(
+        _m(
+            "Trimmed an event report to fit one frame",
+            extra=get_extra_info({
+                "executor_id": event.executor_id,
+                "miner_hotkey": event.miner_hotkey,
+                "findings_kept": kept,
+                "findings_omitted": len(findings) - kept,
+            }),
+        )
+    )
+    update = {"report": report}
+    verdict = event.context.get("verdict")
+    if isinstance(verdict, dict) and "report_sha256" in verdict:
+        # the verdict hashed the full report; it must match the report actually stored
+        verdict = {**verdict, "report_sha256": canonical_sha256(report)}
+        update["context"] = {**event.context, "verdict": verdict}
+    return event.model_copy(update=update)
 
 
 class FrameTooBig(Exception):
@@ -468,7 +515,7 @@ class ComputeClient:
                         )
 
                         async with self.lock:
-                            self.message_queue.append(inspector_event)
+                            self.message_queue.append(fit_event_report(inspector_event))
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         # DAH-4658: the renter is resetting the node's GPUs, or did a moment ago; what a reset can
                         # cause is the renter's doing, never the provider's fault (an unreadable mark sends it)
@@ -596,6 +643,8 @@ class ComputeClient:
                                     extra=get_extra_info({
                                         **self.logging_extra,
                                         "message_type": type(log_to_send).__name__,
+                                        "executor_id": getattr(log_to_send, "executor_id", None),
+                                        "miner_hotkey": getattr(log_to_send, "miner_hotkey", None),
                                         "size": exc.size,
                                     }),
                                 )
