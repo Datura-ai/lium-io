@@ -26,6 +26,19 @@ def port_count_below_listing_floor(state: ContextState) -> int | None:
     return available if available < MIN_PORT_COUNT else None
 
 
+def split_port_requirement(state: ContextState) -> tuple[int, int] | None:
+    """(max splits, ports needed) for a node offered as GPU splits, else None.
+
+    DAH-3698 (owner, 29 Oct 2026): a split node lists only with MIN_PORT_COUNT free verified ports
+    for each of its gpu_count // gpu_splitting_min_count splits, so every split can be rented at once.
+    """
+    min_count = state.gpu_splitting_min_count
+    if not state.supports_gpu_splitting or not min_count or min_count <= 0:
+        return None
+    max_splits = (state.gpu_count or 0) // min_count
+    return max_splits, max(max_splits * MIN_PORT_COUNT, MIN_PORT_COUNT)
+
+
 def hidden_from_renters_text(available_port_count: int) -> str:
     return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
 
@@ -103,6 +116,32 @@ class PortCountCheck:
                 "port_mappings": ctx.executor.port_mappings,
             },
         )
+
+        split_need = split_port_requirement(ctx.state)
+        # below MIN_PORT_COUNT the plain floor below reports it; a rented node keeps its exemption
+        if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
+            max_splits, required = split_need
+            event = render_message(
+                Msg.INSUFFICIENT_PORTS,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    **port_floor_what(updated_state, port_count),
+                    "required": required,
+                    "max_splits": max_splits,
+                    "gpu_splitting_min_count": ctx.state.gpu_splitting_min_count,
+                },
+                remediation=(
+                    f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
+                    f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
+                    "then `docker compose up -d` in neurons/executor."
+                ),
+            )
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={"port_count": port_count, "state": updated_state},
+            )
 
         if not is_rented and port_count < MIN_PORT_COUNT:
             # DAH-2991: when the shortfall is our own leftover — an orphaned rental container the
