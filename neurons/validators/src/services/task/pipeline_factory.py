@@ -61,6 +61,7 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     PostRentalGpuRecheckCheck,
+    ProviderMaintenanceCheck,
     ProviderSideLoadCheck,
     RegistryPullCheck,
     RentalProbeCheck,
@@ -262,7 +263,6 @@ class PipelineFactory:
                 # constant when the backend is unreachable (shared config empty).
                 nvml_digest_map=shared_client.config.nvml_ml_digests or LIB_NVIDIA_ML_DIGESTS,
                 nvml_invalid_drivers=shared_client.config.nvml_invalid_drivers,
-                inspector_enabled=settings.ENABLE_INSPECTOR,
                 port_private_key=private_key,
                 port_public_key=public_key,
                 job_batch_id=miner_info.job_batch_id,
@@ -355,6 +355,10 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                # DAH-4709: an idle node inside its provider maintenance window fails here, before the
+                # ports, registry pull, download speed, VerifyX and rental probe; a rented one passes on to
+                # TenantEnforcementCheck, which reads its pods first.
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
@@ -503,6 +507,7 @@ class PipelineFactory:
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
+                ProviderMaintenanceCheck(),
                 SshdBootstrapCheck(),
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),

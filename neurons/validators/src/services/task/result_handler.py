@@ -12,7 +12,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
-from services.gpu_spec_table import normalize_gpu_model
+from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
@@ -142,6 +142,11 @@ class ResultHandler:
             parts = gpu_model_count.split(":")
             gpu_model = parts[0]
             gpu_count = int(parts[1])
+        # DAH-5088: the result is scored under its reference model's key (rate, base, caps, price
+        # anchor, per-type pool); the card's own name stays in the published specs.
+        gpu_details = context.state.gpu_details or []
+        capacity_mb = gpu_details[0].get("capacity") if gpu_details else None
+        gpu_model = reference_gpu_model(gpu_model, capacity_mb) or gpu_model
 
         is_spot = bool(
             context.state.rented_data
@@ -154,6 +159,10 @@ class ResultHandler:
         is_new_rentals_paused = bool(
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
+        )
+        is_in_maintenance = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.maintenance_executor_ids
         )
         is_provider_email_held = bool(
             context.state.rented_data
@@ -260,6 +269,7 @@ class ResultHandler:
             is_spot=is_spot,
             is_on_spot_pay_list=is_on_spot_pay_list,
             is_new_rentals_paused=is_new_rentals_paused,
+            is_in_maintenance=is_in_maintenance,
             is_provider_banned=context.is_provider_banned,
             provider_discord_connected=provider_discord_connected,
             is_provider_email_held=is_provider_email_held,
@@ -391,7 +401,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     anchor_broken=context.gpu_anchor_broken,
-                    reanchor=context.gpu_reanchor,
+                    reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                 )
             else:
                 await self.redis_service.set_verified_job_info(

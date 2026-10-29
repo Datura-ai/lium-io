@@ -107,7 +107,6 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None

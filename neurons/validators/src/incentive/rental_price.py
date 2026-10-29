@@ -570,6 +570,8 @@ class RentalPriceIncentive(DefaultIncentive):
             exclusions.append(MinerLogLine.no_payout_because_discord_not_connected(job_result))
         if job_result.is_new_rentals_paused and not job_result.is_rented:
             exclusions.append(MinerLogLine.no_payout_because_paused_for_new_rentals(job_result))
+        if job_result.is_in_maintenance:
+            exclusions.append(MinerLogLine.no_payout_because_provider_maintenance(job_result))
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
             exclusions.append(MinerLogLine.no_payout_because_running_own_default_job(job_result))
         if job_result.is_hotkey_excluded_from_scoring:

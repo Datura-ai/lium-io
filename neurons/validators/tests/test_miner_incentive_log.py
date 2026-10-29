@@ -27,6 +27,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_tier",
         "provider_discord_not_connected",
         "new_rentals_paused",
+        "provider_maintenance",
         "miner_default_job",
         "hotkey_excluded_from_scoring",
         "gpu_model_not_eligible_for_unrented_incentive",

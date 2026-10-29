@@ -247,7 +247,6 @@ class Settings(BaseSettings):
     # before it (none for a never-measured node) instead of one moved by its sample. A passing
     # cycle without the recommended image cached does not seed a never-measured node; a node with
     # a stored EMA publishes its sample on every passing cycle. See verifyx_ema_hold_reason.
-    ENABLE_INSPECTOR: bool = True
     # Rented cycles in a row in which the inspector saw nothing (error, failed canary, stopped or
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.
@@ -271,6 +270,9 @@ class Settings(BaseSettings):
     )
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
+    # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
+    # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
+    POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
     # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
     # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
     # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker
@@ -475,9 +477,6 @@ class Settings(BaseSettings):
     # sequential matmul. It always runs and logs the verdict (DAH-4257 shadow, flag removed);
     # ENFORCEMENT lets a fault zero the score and stays off until the owner decides.
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
-    # DAH-5048 — the NVLink multicast probe always runs on all-NVLink boards and logs NVLINK_FAULT; ENFORCEMENT
-    # lets a fault fail the node. Shadow first: the false-fail count on healthy boards is unknown yet.
-    NVLINK_FAULT_ENFORCEMENT_ENABLED: bool = Field(env="NVLINK_FAULT_ENFORCEMENT_ENABLED", default=False)
     # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
     # row remap, a required recovery action) fails the node like a GPU ban until the host resets or
     # replaces it. On: a broken card faults renters' jobs. Off is the kill switch back to flag-only.
@@ -770,11 +769,6 @@ class Settings(BaseSettings):
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
-
-    # A rented node missing from its miner's answer for ONE cycle is mostly a key upload that missed the miner's 10 s
-    # window: 86 of the 347 RENTED_EXECUTOR_NOT_LISTED rows on 19 Oct were back in the next answer. On: the row is
-    # written from the second consecutive miss. Off by default: provider scoring, enabling it is the penalty owners' call.
-    RENTED_NOT_LISTED_ONE_CYCLE_GRACE: bool = Field(env="RENTED_NOT_LISTED_ONE_CYCLE_GRACE", default=False)
 
     # DAH-2958 — express lane for never-validated executors. A new node is published only by
     # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and
