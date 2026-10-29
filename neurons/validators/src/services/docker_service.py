@@ -711,11 +711,14 @@ def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
     marker_path = loopback_plugin_probe_marker_path(loopback_plugin_alias)
     if marker_path is None:
         return state
-    # "true" only once the setup script's probe volume mounted on the plugin; an enabled plugin
-    # still being probed, or whose probe was cut short, reads "unverified" and goes through setup
+    # "true" only once the setup script's probe volume mounted on this pinned build (the marker
+    # holds its digest); an enabled plugin still being probed, whose probe was cut short, or probed
+    # as an earlier build reads "unverified" and goes through setup
+    digest = LOOPBACK_PLUGIN_BUILDS[loopback_plugin_alias].digest
     return (
         f'state="$( {state})"; '
-        f'if [ "$state" = true ] && [ ! -f {shlex.quote(marker_path)} ]; then echo unverified; else echo "$state"; fi'
+        f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != {shlex.quote(digest)} ]; '
+        'then echo unverified; else echo "$state"; fi'
     )
 
 

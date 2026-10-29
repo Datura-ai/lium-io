@@ -38,13 +38,11 @@ def loopback_plugin_probe_marker_path(alias: str) -> str | None:
     # the setup script writes it once a probe volume mounted on this plugin; an enabled plugin
     # without it is not handed out (the probe may have been cut short, or the plugin enabled by
     # hand). None for v2 and the legacy plugin, which run no probe. Lives beside the lock, so an
-    # executor restart costs one probe. Named after the pinned digest, so a newly pinned build is
-    # probed again on an already probed node.
+    # executor restart costs one probe. The path is read by the backend's health check too, so it
+    # stays fixed; the file holds the pinned digest, so a newly pinned build is probed again.
     if alias != LOOPBACK_PLUGIN_V3_ALIAS:
         return None
-    build = LOOPBACK_PLUGIN_BUILDS[alias]
-    digest = build.digest.replace(":", "-").replace("/", "-")
-    return f"/run/lock/lium-loopback-{build.generation}-{digest}.probe-ok"
+    return f"/run/lock/lium-loopback-{LOOPBACK_PLUGIN_BUILDS[alias].generation}.probe-ok"
 
 
 # Executed by the executor's Python, not the validator's filesystem. Docker's plugin metadata
@@ -72,6 +70,13 @@ def run_docker(*args):
 def call(*args):
     return run_docker("plugin", *args)
 
+def probe_marker_holds(expected_digest):
+    try:
+        with open(marker_path) as marker:
+            return marker.read().strip() == expected_digest
+    except OSError:
+        return False
+
 def mount_probe_volume():
     # install and enable mount nothing, and a host may refuse what the plugin asks of its loop
     # device (direct I/O, 4096-byte sectors): one probe volume is mounted before the plugin is
@@ -79,16 +84,30 @@ def mount_probe_volume():
     # 1g: the plugin's mkfs.xfs refuses anything under 300 MB; sparse, so a host with little
     # free disk is not refused by the reservation instead of by its loop device
     name = "lium-loopback-probe-" + generation
+    # named, so a `docker run` cut off by its timeout (the daemon keeps the container running)
+    # is removed before its volume; else the volume stays in use and the plugin cannot be disabled
+    container = name + "-" + str(os.getpid())
+    started = False
     try:
         created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", name)
         if created.returncode:
             raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
-        mounted = run_docker("run", "--rm", "--network", "none", "-v", name + ":/mnt", probe_image,
-                             "sh", "-c", "echo probe > /mnt/probe && sync")
+        started = True
+        mounted = run_docker("run", "--rm", "--name", container, "--network", "none", "-v", name + ":/mnt",
+                             probe_image, "sh", "-c", "echo probe > /mnt/probe && sync")
         if mounted.returncode:
             raise RuntimeError("probe volume mount failed: " + mounted.stderr.strip()[-300:])
     finally:
-        run_docker("volume", "rm", "-f", name)
+        leftovers = []
+        if started:
+            removed = run_docker("rm", "-f", container)
+            # --rm already took a container whose sync finished: "no such container" is not a leftover
+            if removed.returncode and "no such container" not in removed.stderr.lower():
+                leftovers.append("container " + container)
+        if run_docker("volume", "rm", "-f", name).returncode:
+            leftovers.append("volume " + name)
+        if leftovers:
+            print("probe cleanup left " + ", ".join(leftovers), file=sys.stderr)
 
 def disable_plugin(plugin_id):
     # the backend's health check may hold a volume on the plugin for a moment: retry
@@ -140,9 +159,10 @@ try:
             plugin = inspect()
         if not plugin or plugin["Id"] != plugin_id or plugin["Enabled"] is not True:
             raise RuntimeError("verified plugin remains disabled")
-        if probe_image and not os.path.exists(marker_path):
+        if probe_image and not probe_marker_holds(digest):
             # also for a plugin found enabled: an enabled plugin without the marker was never proven
-            # to mount (a probe cut short by the validator's deadline, one enabled by hand)
+            # to mount (a probe cut short by the validator's deadline, one enabled by hand); a marker
+            # of another build means this one was never probed here
             try:
                 mount_probe_volume()
             except BaseException as error:
@@ -152,7 +172,8 @@ try:
                 except RuntimeError as disable_error:
                     reason += "; " + str(disable_error)
                 raise RuntimeError(reason) from None
-            open(marker_path, "w").close()
+            with open(marker_path, "w") as marker:
+                marker.write(digest)
         print("verified plugin ready")
 except Exception as error:
     # Do not echo a remote banner, registry credentials, or arbitrary filesystem contents.

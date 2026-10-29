@@ -13,6 +13,7 @@ from core.config import settings
 from payload_models.payloads import ContainerCreateRequest
 from services import docker_service as docker_service_module
 from services.loopback_plugin_setup import (
+    LOOPBACK_PLUGIN_BUILDS,
     loopback_plugin_probe_marker_path,
     loopback_plugin_setup_command,
 )
@@ -591,21 +592,29 @@ async def test_create_container_probe_failure_takes_the_per_command_path(svc, mo
 
 @pytest.mark.parametrize(
     "enabled, marker, expected",
-    [("true", True, "true"), ("true", False, "unverified"), ("false", False, "false")],
-    ids=["probed", "enabled-unprobed", "disabled"],
+    [
+        ("true", "current", "true"),
+        ("true", None, "unverified"),
+        ("true", "old", "unverified"),
+        ("false", None, "false"),
+    ],
+    ids=["probed", "enabled-unprobed", "enabled-probed-as-old-build", "disabled"],
 )
 def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marker(
     tmp_path, enabled, marker, expected
 ):
     # an enabled v3 is handed out by the fast path only once the setup script's probe volume mounted
     # on it: a probe cut short by the validator's deadline leaves the plugin enabled without the
-    # marker, and the next create must probe again instead of renting on it (reread, 27.10)
+    # marker, and the next create must probe again instead of renting on it (reread, 27.10). The
+    # marker holds the digest of the build it was written for: another build's marker does not count
     docker = tmp_path / "docker"
     docker.write_text(f"#!/bin/sh\necho {enabled}\n")
     docker.chmod(0o700)
     marker_path = tmp_path / "probe-ok"
-    if marker:
-        marker_path.touch()
+    if marker == "current":
+        marker_path.write_text(LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest)
+    elif marker == "old":
+        marker_path.write_text("sha256:" + "0" * 64)
     command = (
         docker_service_module._loopback_plugin_state_command("vloopback:v3")
         .replace("/usr/bin/docker", str(docker))
