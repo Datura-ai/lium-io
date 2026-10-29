@@ -217,6 +217,9 @@ class Settings(BaseSettings):
     # is zeroed (every pool, spot pay and referral), and the share they would have taken is
     # left to burn. Empty (the default) changes nothing. Burner hotkeys are never affected.
     SCORING_EXCLUDED_HOTKEYS: str = Field(env="SCORING_EXCLUDED_HOTKEYS", default="")
+    # Comma-separated miner hotkeys whose unrented (idle) executors earn no incentive, same format
+    # and effect as SCORING_EXCLUDED_HOTKEYS but only while not rented; rented GPUs score as usual.
+    IDLE_INCENTIVE_EXCLUDED_HOTKEYS: str = Field(env="IDLE_INCENTIVE_EXCLUDED_HOTKEYS", default="")
 
     # DAH-2251 — referral incentive paid via emission, to referrer hotkeys weighted by
     # the backend's epoch-stable EMA feed. There is no funding wallet, so unlike the
@@ -775,6 +778,9 @@ class Settings(BaseSettings):
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
+
+    def get_idle_incentive_excluded_hotkeys(self) -> set[str]:
+        return {s.strip() for s in self.IDLE_INCENTIVE_EXCLUDED_HOTKEYS.split(",") if s.strip()}
 
     # DAH-2958 — express lane for never-validated executors. A new node is published only by
     # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and

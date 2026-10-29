@@ -65,8 +65,8 @@ class JobResult(BaseModel):
     is_new_rentals_paused: bool = False
     is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False
-    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS: no incentive from any pool, set
-    # by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
+    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS (or, while unrented, in
+    # IDLE_INCENTIVE_EXCLUDED_HOTKEYS): no incentive from any pool, set by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
     is_hotkey_excluded_from_scoring: bool = False
     provider_discord_connected: bool = True
     is_provider_email_held: bool = False
