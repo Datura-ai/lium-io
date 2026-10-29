@@ -9,6 +9,7 @@ from unittest.mock import patch
 import asyncssh
 import pytest
 from neurons.validators.src.services.task.checks.rented_pod_network import (
+    _SOCKET_AWK,
     RentedPodNetworkCheck,
     parse_summary,
     read_command,
@@ -37,13 +38,14 @@ TABLE += "".join(
 def test_read_command_summarises_a_real_table(tmp_path):
     table = tmp_path / "nf_conntrack"
     table.write_text(TABLE)
-    out = subprocess.run(
+    result = subprocess.run(
         ["sh", "-c", read_command(["172.17.0.2", "172.17.0.4"], table=str(table))],
         capture_output=True,
         text=True,
         check=True,
-    ).stdout
-    pods = parse_summary(out, {"172.17.0.2": "pod_a", "172.17.0.4": "pod_b"})
+    )
+    assert result.stderr == "SOURCE conntrack\n"
+    pods = parse_summary(result.stdout, {"172.17.0.2": "pod_a", "172.17.0.4": "pod_b"})
     a, b = pods
     assert a == {
         "container": "pod_a",
@@ -128,18 +130,19 @@ async def test_truncated_summary_is_flagged(context_factory):
     assert result.event.what_we_saw["truncated"] is True
 
 
-def test_read_command_without_table_exits_3(tmp_path):
-    res = subprocess.run(["sh", "-c", read_command(["172.17.0.2"], table=str(tmp_path / "x"))])
-    assert res.returncode == 3
-
-
-def _ssh(summary="", table_exit=0, inspect="/pod_1 172.17.0.2\n", raise_exc=None):
+def _ssh(
+    summary="",
+    table_exit=0,
+    inspect="/pod_1 123 172.17.0.2\n",
+    raise_exc=None,
+    stderr="SOURCE conntrack\n",
+):
     async def run(cmd, *args, **kwargs):
         if raise_exc is not None:
             raise raise_exc
         if cmd.startswith("/usr/bin/docker inspect"):
             return SimpleNamespace(exit_status=0, stdout=inspect, stderr="")
-        return SimpleNamespace(exit_status=table_exit, stdout=summary, stderr="")
+        return SimpleNamespace(exit_status=table_exit, stdout=summary, stderr=stderr)
 
     return SimpleNamespace(run=run)
 
@@ -172,6 +175,7 @@ async def test_summary_below_limit(context_factory):
     result = await _run(_ctx(context_factory, _ssh("S 172.17.0.2 9 3 5 3\n")))
     assert result.passed is True
     assert result.event.reason_code == Msg.SUMMARY.reason
+    assert result.event.what_we_saw["source"] == "conntrack"
     assert result.event.what_we_saw["pods"][0]["unreplied_destinations"] == 3
 
 
@@ -227,3 +231,118 @@ async def test_executor_outside_host_pid_namespace_is_unread(context_factory, pi
 async def test_not_rented(context_factory):
     result = await _run(_ctx(context_factory, _ssh(), pods=False))
     assert result.event.reason_code == Msg.NOT_RENTED.reason
+
+
+@pytest.fixture
+def socket_tables(tmp_path):
+    root = tmp_path / "proc"
+    for pid in (1, 123):
+        (root / str(pid) / "ns").mkdir(parents=True)
+        (root / str(pid) / "ns/net").symlink_to(f"net:[{pid}]")
+    net = root / "123/net"
+    net.mkdir()
+    (root / "1/net").mkdir()
+    rows = [("tcp", f"{i:02X}0200C0", "02", "0016") for i in range(1, 41)]
+    rows += [
+        ("tcp", "08080808", "01", "01BB"),
+        ("tcp", "09090909", "0A", "0016"),
+        ("tcp", "00000000", "02", "0016"),
+        ("tcp6", "0000000000000000FFFF0000010200C0", "02", "0016"),
+        ("tcp6", "B80D0120000000000000000001000000", "01", "01BB"),
+        ("tcp6", "b80d0120000000000000000001000000", "01", "01BB"),
+        ("tcp6", "0" * 32, "02", "0016"),
+        ("udp", "016433C6", "07", "0035"),
+        ("udp6", "B80D0120000000000000000002000000", "01", "0035"),
+    ]
+    for table in ("tcp", "tcp6", "udp", "udp6"):
+        (root / "1/net" / table).touch()
+        (net / table).write_text(
+            "  sl local_address rem_address st\n"
+            + "".join(
+                f" {i}: 00000000:1234 {address}:{port} {state} 0:0 0:0 0 0\n"
+                for i, (kind, address, state, port) in enumerate(rows)
+                if kind == table
+            )
+        )
+    return root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["summary", "ipv6_disabled", "host_network", "not_read", "no_pid", "truncated"]
+)
+async def test_socket_source(context_factory, socket_tables, monkeypatch, mode):
+    root = socket_tables
+    pid = 123
+    if mode == "host_network":
+        (root / "123/ns/net").unlink()
+        (root / "123/ns/net").symlink_to("net:[1]")
+    elif mode == "not_read":
+        (root / "123/net/tcp6").unlink()
+    elif mode == "ipv6_disabled":
+        for table_pid in (1, 123):
+            for table in ("tcp6", "udp6"):
+                (root / str(table_pid) / "net" / table).unlink()
+    elif mode == "no_pid":
+        pid = 0
+    elif mode == "truncated":
+        monkeypatch.setattr(
+            "neurons.validators.src.services.task.checks.rented_pod_network._MAX_KEYS", 5
+        )
+    command = read_command(
+        [], table=str(root / "absent"), pids_by_name={"pod_1": pid}, proc_root=str(root)
+    ).replace("awk -v m=", "mawk -v m=")
+    remote = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=True)
+    calls = []
+    ssh = _ssh(remote.stdout, inspect=f"/pod_1 {pid}\n", stderr=remote.stderr)
+
+    async def run(cmd, **kwargs):
+        calls.append(cmd)
+        return await ssh.run(cmd, **kwargs)
+
+    result = await _run(_ctx(context_factory, SimpleNamespace(run=run)), limit=40)
+    assert result.passed is True
+    assert len(calls) == 2 and "{{.State.Pid}}" in calls[0]
+    assert f"pod_1:{pid}" in calls[1]
+    event = result.event.what_we_saw
+    assert event["source"] == "sockets"
+    assert "TCP SYN_SENT only" in event["unreplied_scope"]
+    if mode in ("host_network", "not_read", "no_pid"):
+        assert result.event.reason_code == Msg.UNREAD.reason
+        assert event["skipped_pods"] == [{"container": "pod_1", "reason": mode}]
+        assert "pods" not in event and remote.stdout == ""
+    elif mode == "truncated":
+        assert event["truncated"] is True and remote.stdout.startswith("T\n")
+        pod = event["pods"][0]
+        assert pod["flows"] == 46
+        assert pod["destinations"] + pod["unreplied_destinations"] <= 5
+    else:
+        assert result.event.reason_code == Msg.FANOUT.reason
+        flows, unreplied, destinations = (42, 40, 42) if mode == "ipv6_disabled" else (46, 41, 44)
+        assert set(remote.stdout.splitlines()) == {
+            f"S pod_1 {flows} {unreplied} {destinations} 40",
+            f"P pod_1 22 {unreplied}",
+        }
+        assert event["pods"][0]["top_unreplied_ports"] == [{"port": "22", "flows": unreplied}]
+
+
+@pytest.mark.parametrize(
+    ("encoded", "decoded"),
+    [
+        ("016433C6", "198.51.100.1"),
+        ("B80D012078563412EFCDAB9001000000", "2001:0db8:1234:5678:90ab:cdef:0000:0001"),
+        ("0000000000000000FFFF0000010200C0", "192.0.2.1"),
+        ("0000000000000000FFFF000000000000", ""),
+        ("00000000", ""),
+        ("0" * 32, ""),
+    ],
+)
+def test_socket_hex_decoding(encoded, decoded):
+    result = subprocess.run(
+        ["mawk", "-v", f"encoded={encoded}", _SOCKET_AWK + "BEGIN{print address(encoded)}"],
+        input="",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == decoded
