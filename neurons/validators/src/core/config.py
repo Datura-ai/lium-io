@@ -431,6 +431,10 @@ class Settings(BaseSettings):
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.
     RENTED_POD_RESOURCES_CHECK_ENABLED: bool = Field(env="RENTED_POD_RESOURCES_CHECK_ENABLED", default=True)
+    # RentedPodNetworkCheck logs a pod's network summary as a warning for review from this count up.
+    RENTED_POD_OUTBOUND_FANOUT_DESTINATIONS: int = Field(
+        env="RENTED_POD_OUTBOUND_FANOUT_DESTINATIONS", default=256, gt=0
+    )
     # The per-pod incident mark expires this long after the last cycle that saw the fault.
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
     # DAH-4457: a node whose GPU dropped out stays hidden (GPU_LOST availability entry, no new rentals) until its
@@ -623,12 +627,6 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
-
-    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
-    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
-    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
-        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
-    )
 
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns

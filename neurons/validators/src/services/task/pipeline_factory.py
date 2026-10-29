@@ -70,6 +70,7 @@ from .checks import (
     RentalProbeCheck,
     RentalVerificationCheck,
     RentedGpuDropCheck,
+    RentedPodNetworkCheck,
     RentedPodResourcesCheck,
     RentedThroughputCheck,
     ScoreCheck,
@@ -401,6 +402,7 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
+                RentedPodNetworkCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
@@ -525,6 +527,7 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
+                RentedPodNetworkCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
@@ -603,6 +606,7 @@ class PipelineFactory:
                 ProviderSideLoadCheck(),
                 # DAH-4564: read-only docker inspect + /proc read — safe in dry run.
                 RentedPodResourcesCheck(),
+                RentedPodNetworkCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),
