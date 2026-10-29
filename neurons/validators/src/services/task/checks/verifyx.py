@@ -22,6 +22,7 @@ from .network_ema import compute_ema
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS = 10.0
 _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 # A host can bring on a real Cloudflare 429 by flooding speed.cloudflare.com from its own IP just
@@ -213,11 +214,14 @@ class VerifyXCheck:
                 unavailable_readings,
                 keep_previous_on_none=package_gated,
             )
-            _feed_ema(
+            upload_reading = _fallback_upload_reading(
+                verifyx_network.get("upload_speed"), upload_blocked
+            )
+            ema_upload = _feed_ema(
                 ctx,
                 updated_specs["network"],
                 "upload",
-                _fallback_upload_reading(verifyx_network.get("upload_speed"), upload_blocked),
+                upload_reading,
                 prev_ema.ema_verifyx_upload_speed if prev_ema else None,
                 unavailable_readings,
                 keep_previous_on_none=upload_blocked,
@@ -258,7 +262,7 @@ class VerifyXCheck:
                 event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
             if unavailable_readings:
                 event.what_we_saw["unavailable_speed_readings"] = unavailable_readings
-            network_gate = _network_gate(verifyx_network, prev_ema, ema_download)
+            network_gate = _network_gate(verifyx_network, prev_ema, ema_download, ema_upload)
             if network_gate is not None:
                 event.what_we_saw["network_gate"] = network_gate
                 NETWORK_GATE_TALLY.record(
@@ -298,12 +302,30 @@ class VerifyXCheck:
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
+                        "direction": "download",
                         "ema_verifyx_download_speed": ema_download,
                         "min_download_speed_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
                     },
                 )
                 if cold_sample_retry is not None:
                     slow_event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
+                if network_gate is not None:
+                    slow_event.what_we_saw["network_gate"] = network_gate
+                return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
+
+            if upload_too_slow(
+                ema_upload, upload_reading, prev_ema, first_pass=ctx.config.first_pass
+            ):
+                slow_event = render_message(
+                    Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "direction": "upload",
+                        "ema_verifyx_upload_speed": ema_upload,
+                        "min_upload_speed_mbps": MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS,
+                    },
+                )
                 if network_gate is not None:
                     slow_event.what_we_saw["network_gate"] = network_gate
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
@@ -431,6 +453,26 @@ def download_gate(
     return "too_slow"
 
 
+def upload_too_slow(
+    ema_upload: float | None,
+    upload_reading: object,
+    prev_ema: NetworkEMA | None,
+    *,
+    first_pass: bool,
+) -> bool:
+    """The upload-EMA floor, judged only on a probe that measured a positive upload: a missing
+    reading, a 0.0 or a Cloudflare 429 never fails it. Like the download floor, a first pass on a
+    never-measured upload is not judged."""
+    if ema_upload is None or not (
+        _is_positive_number(upload_reading) and _is_speed_reading(upload_reading)
+    ):
+        return False
+    if ema_upload >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS:
+        return False
+    never_measured = prev_ema is None or prev_ema.ema_verifyx_upload_speed is None
+    return not (first_pass and never_measured)
+
+
 def verifyx_verdict(
     result_data: dict | None, prev_ema: NetworkEMA | None, *, first_pass: bool
 ) -> bool:
@@ -441,7 +483,12 @@ def verifyx_verdict(
         return False
     network = result_data.get("network") or {}
     ema_download = gated_download_ema(network, prev_ema)
-    return download_gate(ema_download, prev_ema, first_pass=first_pass) != "too_slow"
+    if download_gate(ema_download, prev_ema, first_pass=first_pass) == "too_slow":
+        return False
+    upload = network.get("upload_speed")
+    prev_upload = prev_ema.ema_verifyx_upload_speed if prev_ema else None
+    ema_upload = _ema_if_gated(prev_upload, upload)
+    return not upload_too_slow(ema_upload, upload, prev_ema, first_pass=first_pass)
 
 
 def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:
@@ -502,7 +549,9 @@ def _ema_if_gated(prev: float | None, reading: object) -> float | None:
     return compute_ema(prev, reading if reading is not None else 0.0)
 
 
-def _network_gate(verifyx_network: dict, prev_ema, ema_gated: float | None) -> dict:
+def _network_gate(
+    verifyx_network: dict, prev_ema, ema_gated: float | None, ema_upload: float | None
+) -> dict:
     """DAH-2774 record: the floor read against the package and the capacity reading."""
     prev = prev_ema.ema_verifyx_download_speed if prev_ema else None
     package = verifyx_network.get("package_download_speed")
@@ -514,6 +563,9 @@ def _network_gate(verifyx_network: dict, prev_ema, ema_gated: float | None) -> d
         "ema_package": _ema_if_gated(prev, package),
         "ema_capacity": ema_gated,
         "cloudflare_fallback": bool(verifyx_network.get("cloudflare_fallback")),
+        "upload_floor_mbps": MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS,
+        "upload_speed": verifyx_network.get("upload_speed"),
+        "ema_upload": ema_upload,
     }
 
 

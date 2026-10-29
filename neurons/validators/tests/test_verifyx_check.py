@@ -711,3 +711,67 @@ async def test_verifyx_success_path_emits_no_verifyx_failed_log(
     assert not any(
         "VerifyX validation failed" in rec.getMessage() for rec in caplog.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "upload,prev_upload,expected_pass",
+    [
+        # F-1654: download fine, upload 4 Mbps on a known host -> EMA 4.5 < 10 fails
+        (4.0, 5.0, False),
+        # at and above the floor passes
+        (10.0, 10.0, True),
+        (60.0, 900.0, True),
+        # no upload reading (or a 0.0) is no measurement: never fails on the upload floor
+        (None, 5.0, True),
+        (0.0, 5.0, True),
+        # a malformed upload keeps the previous EMA and is not judged
+        (float("nan"), 5.0, True),
+    ],
+)
+async def test_verifyx_upload_floor(context_factory, upload, prev_upload, expected_pass):
+    result = await _run_ema_cycle(
+        context_factory, download=2100.0, upload=upload, prev_upload=prev_upload
+    )
+
+    assert result.passed is expected_pass
+    gate = result.event.what_we_saw["network_gate"]
+    assert gate["upload_floor_mbps"] == 10.0
+    if not expected_pass:
+        assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+        assert result.event.what_we_saw["direction"] == "upload"
+        assert result.event.what_we_saw["ema_verifyx_upload_speed"] == pytest.approx(4.5)
+        assert gate["ema_upload"] == pytest.approx(4.5)
+
+
+@pytest.mark.asyncio
+async def test_verifyx_upload_floor_not_judged_on_a_first_pass_never_measured_upload(
+    context_factory,
+):
+    network = {"download_speed": 2000.0, "upload_speed": 4.0}
+    verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": network})
+    ctx = context_factory(
+        services=build_services(verifyx=verifyx_service),
+        config=build_context_config(first_pass=True),
+        state=build_state(
+            specs={"gpu": {"count": 1}},
+            rented_data=_rented_data_with_ema("executor-123", download=2000.0, upload=None),
+        ),
+    )
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+
+
+@pytest.mark.parametrize(
+    "upload,prev_upload,expected",
+    [(4.0, 5.0, False), (60.0, 900.0, True), (None, 5.0, True), (0.0, 5.0, True)],
+)
+def test_verifyx_verdict_applies_the_upload_floor(upload, prev_upload, expected):
+    from neurons.validators.src.services.task.checks.verifyx import verifyx_verdict
+
+    prev = NetworkEMA(ema_verifyx_download_speed=2000.0, ema_verifyx_upload_speed=prev_upload)
+    data = {"success": True, "network": {"download_speed": 2100.0, "upload_speed": upload}}
+
+    assert verifyx_verdict(data, prev, first_pass=False) is expected
