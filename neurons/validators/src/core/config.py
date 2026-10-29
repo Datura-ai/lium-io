@@ -550,6 +550,12 @@ class Settings(BaseSettings):
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5320: IdleDiskWriteCheck, last in the pipeline, writes the same 256 MiB with fsync on idle and filler nodes
+    # once a day per node (skipped while the docker root disk already moves DISK_BUSY_MB_PER_S) and logs
+    # IDLE_DISK_WRITE with a shadow verdict against DISK_MIN_MB_PER_S. Logged only; ENFORCE_ENABLED is read by nothing
+    # yet (the follow-up zeroes the score on a slow disk).
+    IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
+    IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and

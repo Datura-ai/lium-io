@@ -1623,6 +1623,17 @@ class RentedThroughputMessages:
     )
 
 
+class IdleDiskWriteMessages:
+    # DAH-5320: shadow only; the reading itself is the IDLE_DISK_WRITE log line
+    LOGGED = MessageTemplate(
+        event="Idle node disk write speed logged (not enforced)",
+        reason="IDLE_DISK_WRITE_LOGGED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 VERIFYX_DEBUG_DOC_URL = (
     "https://github.com/Datura-ai/lium-io/blob/main/docs/lium-io/verifyx-debug.md"
 )
