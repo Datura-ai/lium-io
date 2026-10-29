@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -43,14 +44,18 @@ def split_port_requirement(state: ContextState) -> tuple[int, int] | None:
     return max_splits, max(max_splits * MIN_PORT_COUNT, MIN_PORT_COUNT)
 
 
-def split_port_shortfall(state: ContextState) -> tuple[int, tuple[int, int]] | None:
-    """(published `available_port_count`, split_port_requirement) when a split node has the plain
-    floor but not MIN_PORT_COUNT ports per split, else None (below the floor, the floor reports it)."""
+def split_port_shortfall(
+    state: ContextState, freed_ports: Iterable[int] = ()
+) -> tuple[int, tuple[int, int]] | None:
+    """(published `available_port_count` plus `freed_ports` not already verified, split_port_requirement)
+    when a split node has the plain floor but not MIN_PORT_COUNT ports per split, else None (below the
+    floor, the floor reports it). `freed_ports`: declared ports the probe skipped for a rental now closed."""
     need = split_port_requirement(state)
     available: Any = state.specs.get("available_port_count")
     if not need or not isinstance(available, int) or isinstance(available, bool):
         return None
-    return (available, need) if MIN_PORT_COUNT <= available < need[1] else None
+    total = available + len(set(freed_ports) - set(state.specs.get("verified_ports") or []))
+    return (total, need) if MIN_PORT_COUNT <= available and total < need[1] else None
 
 
 def split_ports_event(

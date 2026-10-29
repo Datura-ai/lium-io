@@ -24,6 +24,7 @@ from ...const import (
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
+from services.executor_connectivity.port_selector import declared_ports
 from services.gpu_reset import renter_gpu_reset_in_progress
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
@@ -294,7 +295,11 @@ class TenantEnforcementCheck:
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
                     # node whose every listed pod is stale is idle and needs them, with or without the floor flag
-                    split_short = split_port_shortfall(ctx.state)
+                    # the probe skipped the listed pods' ports; with every pod stale they are free again
+                    declared_external = {pair.external for pair in declared_ports(ctx.executor)}
+                    split_short = split_port_shortfall(
+                        ctx.state, {port for p in rented_pods for port in p.rented_ports} & declared_external
+                    )
                     if split_short is not None and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
                         event = split_ports_event(
                             ctx, self.check_id, ctx.state, *split_short, what={"stale_pod": stale_what}, extra=extra

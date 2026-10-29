@@ -595,7 +595,8 @@ async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented
     [
         ("stale", 2, "INSUFFICIENT_PORTS"),
         ("stale", 3, "INSUFFICIENT_PORTS"),
-        ("stale", 23, "INSUFFICIENT_PORTS"),
+        ("stale", 22, "INSUFFICIENT_PORTS"),
+        ("stale", 23, None),  # the stale pod's own freed port makes 24
         ("stale", 24, None),
         ("live", 2, None),
         ("live", 3, None),
@@ -668,3 +669,50 @@ async def test_a_split_node_with_every_port_open_passes_when_its_only_listed_pod
     assert count_result.passed is True
     assert ctx.state.specs["available_port_count"] >= 24
     assert tenant_result.passed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_port, passed", [(40023, True), (40022, False)])
+async def test_a_split_node_declaring_exactly_its_split_target_counts_the_stale_pods_freed_ports(
+    context_factory, last_port, passed
+):
+    """8 GPUs, one per split: 24 ports. The stale rental held 40000-40002, which the probe skips; its container
+    is gone and the rental closed, so those ports count again. One declared port fewer stays short."""
+    from dataclasses import replace
+
+    rented = RentedExecutorsResponse(
+        executors={
+            EXECUTOR_UUID: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8001",
+                pods=[
+                    RentedPod(
+                        pod_id="pod-stale",
+                        container_name="container_pod-stale",
+                        rented_ports=[40000, 40001, 40002],
+                    )
+                ],
+            )
+        }
+    )
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=24), PublishedPorts(), PublishedPorts()),
+        rented_data=rented,
+        ssh=PerPodSSHClient(running=set()),
+        backend=PerPodBackendClient(active=set()),
+        port_range=f"40000-{last_port}",
+    )
+    ctx = ctx.model_copy(
+        update={"state": replace(ctx.state, gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=1)}
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert ctx.state.specs["available_port_count"] == last_port - 40000 + 1 - 3  # probe skipped the rented three
+    assert tenant_result.passed is passed
+    if not passed:
+        assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
