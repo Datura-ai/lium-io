@@ -8,7 +8,7 @@ import math
 import re
 import shlex
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal, NamedTuple
 
 import aiohttp
@@ -414,14 +414,21 @@ class RegistryPullCheck:
     async def run(self, ctx: Context) -> CheckResult:
         if not settings.REGISTRY_PULL_CHECK_ENABLED:
             return self._skipped(ctx, "REGISTRY_PULL_CHECK_ENABLED is off")
-        if _is_rented(ctx):
-            return self._skipped(ctx, "rented")
         try:
             last_state = await self._load(ctx)
         except _RedisUnreadable:
             # without the last reading the interval cannot be honoured; pulling every cycle would spend
             # the node's Docker Hub quota, so this cycle has no verdict
             return self._skipped(ctx, "last pull reading unreadable in Redis")
+        if _is_rented(ctx):
+            # no pull beside a renter's pod, but a split node with free GPUs is still a move target, so the
+            # last reading's store is published. Saving the same record again renews its TTL, so a rental past
+            # _REDIS_TTL_SECONDS keeps it; `at` is unchanged, so the pull schedule is too
+            result = self._skipped(ctx, "rented")
+            if last_state is None:
+                return result
+            await self._save(ctx, last_state)
+            return _with_image_store(ctx, last_state, result)
 
         now = time.time()
         if last_state is None:
@@ -429,9 +436,13 @@ class RegistryPullCheck:
             last_state = _ProbeState(at=now, outcome=_SCHEDULED)
             await self._save(ctx, last_state)
         if now < last_state.next_due_at(ctx.executor.uuid):
-            return self._verdict(ctx, last_state, probed=False)
+            return _with_image_store(ctx, last_state, self._verdict(ctx, last_state, probed=False))
 
         reading = await self._pull(ctx)
+        if reading.driver is None and last_state.reading.get("driver"):
+            # a pull whose `docker info` said nothing (not run, daemon unreadable) keeps the last read store, so
+            # one bad cycle does not take the node off the many-layers move targets until the next pull
+            reading = replace(reading, driver=last_state.reading["driver"])
         failures = last_state.failures_in_a_row
         no_verdict: NoVerdict | None = None
         hub_control: DockerHubControl | None = None
@@ -455,7 +466,7 @@ class RegistryPullCheck:
             hub_control=hub_control,
         )
         await self._save(ctx, state)
-        return self._verdict(ctx, state, probed=True)
+        return _with_image_store(ctx, state, self._verdict(ctx, state, probed=True))
 
     async def _read_docker_hub_control(
         self, ctx: Context, now: float, *, pull_started: float
@@ -587,6 +598,19 @@ class RegistryPullCheck:
             what["last"] = last
         event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
+
+
+def _with_image_store(ctx: Context, state: _ProbeState, result: CheckResult) -> CheckResult:
+    """DAH-5159: the node's last read image store rides executor.specs["docker_image_store"] to the backend, which
+    moves a many-layer image Sysbox 0.7.1 cannot start on the classic store only to a "containerd" node. An unknown
+    store (no reading yet, a daemon the CLI could not reach) publishes no key."""
+    store = state.reading.get("image_store")
+    if not store:
+        return result
+    specs = {**(ctx.state.specs or {}), "docker_image_store": store}
+    return result.model_copy(
+        update={"updates": {**result.updates, "state": replace(ctx.state, specs=specs)}}
+    )
 
 
 def _state_key(ctx: Context) -> str:
