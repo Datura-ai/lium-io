@@ -1,7 +1,8 @@
 """Spot-node pay (ENABLE_SPOT_NODE_PAY) and the secure floor (ENABLE_SECURE_FILLER_REVENUE_FLOOR).
 
 Spot: an idle spot node running Lium fillers is paid min(1.0 x its GPU configuration's average
-filler revenue per GPU-hour, its secure rate before cap dilution), outside the buckets.
+filler revenue per GPU-hour, its secure rate before cap dilution), outside the buckets, and a GPU
+model's spot nodes together at most what its fillers earn per hour (DAH-5128).
 Secure floor: an idle secure node's cap-diluted rate is raised to 1.0 x that average, even
 above its listed rate. The two factors are separate constants. No cap (owner rule): spot pay and floor top-ups are paid on top of the
 burn-capped rental share, up to the whole incentive pool. Both flags off reproduce the old
@@ -78,9 +79,20 @@ def _node(uuid: str, **overrides) -> JobResult:
     return JobResult(**fields)
 
 
+# what the GPU model's fillers earn per hour, more than any test's spot nodes are paid together
+AMPLE_FILLER_EARNINGS = 1_000_000.0
+
+
 def _spot(uuid: str = "spot-1", **overrides) -> JobResult:
     return _node(
-        uuid, **{"is_spot": True, "is_on_spot_pay_list": True, "has_lium_filler": True, **overrides}
+        uuid,
+        **{
+            "is_spot": True,
+            "is_on_spot_pay_list": True,
+            "has_lium_filler": True,
+            "filler_revenue_usd_per_hour": AMPLE_FILLER_EARNINGS,
+            **overrides,
+        },
     )
 
 
@@ -215,6 +227,83 @@ async def test_spot_is_paid_the_filler_side_when_it_is_lower(spot_pay_on):
     assert spot.mining_score == 0
     assert _codes(spot) == []
     _assert_pool_pays_exactly(incentive)
+
+
+@pytest.mark.asyncio
+async def test_one_spot_node_keeps_its_rate_while_the_model_earns_more(spot_pay_on):
+    spot = _spot(filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=8 * 2.0)
+
+    incentive = await _run([spot])
+
+    assert spot.spot_pool_multiplier == pytest.approx(1.0)
+    assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
+    _assert_pool_pays_exactly(incentive)
+
+
+@pytest.mark.asyncio
+async def test_spot_nodes_of_a_model_share_what_its_fillers_earn(spot_pay_on, caplog):
+    # Fish: n $/h of B300 filler earnings is split across all spot nodes, not paid per node
+    earnings = 8 * 2.0
+    spots = [_spot(f"spot-{i}", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=earnings) for i in range(4)]
+    secure = _node("secure-1")
+
+    incentive = await _run([*spots, secure])
+
+    assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(earnings)
+    for spot in spots:
+        assert spot.spot_pool_multiplier == pytest.approx(0.25)
+        assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 / 4)
+    assert secure.effective_rate == pytest.approx(HOURLY_RATE)
+    assert _logged(spots[0], SPOT_LINE)[0]["spot_pool_multiplier"] == pytest.approx(0.25)
+    [model_line] = [r for r in caplog.records if r.getMessage().startswith("Spot pay shares the GPU model's filler earnings")]
+    assert model_line.msg.extra["spot_pool_multiplier"] == pytest.approx(0.25)
+    assert model_line.msg.extra["filler_revenue_usd_per_hour"] == pytest.approx(earnings)
+    assert model_line.msg.extra["spot_gpu_count"] == 4 * 8
+    _assert_pool_pays_exactly(incentive)
+
+
+@pytest.mark.asyncio
+async def test_a_model_s_spot_pool_does_not_dilute_another_model(spot_pay_on):
+    a100 = "NVIDIA A100-SXM4-80GB"
+    config = IncentiveConfig(
+        rental_incentive_gpu_types=["H100", "A100"],
+        max_unrented_gpus={"H100": {8: BUCKET_CAP}, "A100": {8: BUCKET_CAP}},
+        rental_prices_per_hour={H100: HOURLY_RATE, a100: HOURLY_RATE},
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
+    )
+    crowded = [_spot(f"h-{i}", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=8.0) for i in range(2)]
+    alone = _spot("a-1", gpu_model=a100, filler_revenue_per_gpu_hour=2.0)
+
+    await _run([*crowded, alone], config)
+
+    assert crowded[0].spot_pool_multiplier == pytest.approx(8.0 / 32.0)
+    assert alone.spot_pool_multiplier == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_spot_without_measured_model_earnings_gets_zero(spot_pay_on):
+    spot = _spot(filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=None)
+
+    await _run([spot])
+
+    assert spot.effective_rate == 0
+    assert spot.incentive == 0
+
+
+def test_model_earnings_add_every_usable_configuration():
+    rented = RentedExecutorsResponse(
+        executors={},
+        filler_revenue_by_gpu_config=[
+            FillerRevenueByGpuConfig(base_model="B300", gpu_count=8, usd_per_gpu_hour=3.0, gpu_hours=480.0),
+            FillerRevenueByGpuConfig(base_model="B300", gpu_count=1, usd_per_gpu_hour=2.0, gpu_hours=48.0),
+            FillerRevenueByGpuConfig(base_model="B300", gpu_count=2, usd_per_gpu_hour=9.0, gpu_hours=1.0),
+            FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=1.0, gpu_hours=480.0),
+        ],
+    )
+
+    # 3 x 480 / 24 + 2 x 48 / 24; the 1 GPU-hour sample is under the minimum
+    assert rented.get_filler_revenue_usd_per_hour("B300", 24.0) == pytest.approx(60.0 + 4.0)
+    assert rented.get_filler_revenue_usd_per_hour("B200", 24.0) is None
 
 
 @pytest.mark.asyncio
@@ -423,6 +512,7 @@ def test_the_live_gpu_denominator_counts_rented_spot_only_when_it_earns(monkeypa
     monkeypatch.setattr(settings, "ENABLE_SPOT_RENTAL_INCENTIVE", flag_on)
     spot = _spot(is_rented=True)
     spot.executor_info.port = 8081
+    spot.executor_info.ssh_port = 2222  # its own machine: one SSH endpoint under two hotkeys is a duplicate
     results = {"hk-spot": [spot], "hk-secure": [_node("secure-1", is_rented=True)]}
 
     assert settle_cycle_results(results, {}) == {H100: gpus}
@@ -1334,7 +1424,9 @@ async def test_a_spot_node_on_the_pay_list_is_paid(context_factory, spot_pay_on)
     assert result.is_on_spot_pay_list is True
     await _run([result, _node("secure-1")])
     assert result.spot_pay_candidate is True
-    assert result.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
+    # the model's fillers earned 2.0 x 100 GPU-hours over 24 h: less than 8 GPUs at 2.0 an hour
+    assert result.filler_revenue_usd_per_hour == pytest.approx(2.0 * 100 / 24)
+    assert result.effective_rate * result.gpu_count == pytest.approx(2.0 * 100 / 24)
     assert result.incentive > 0
     assert _codes(result) == []
 

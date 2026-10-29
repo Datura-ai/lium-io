@@ -81,6 +81,12 @@ def _ssh_client(*, inspect_exit: int = 0, inspect_raises: bool = False):
         return _ssh_result(exit_status=0)
 
     client.run = AsyncMock(side_effect=_side)
+
+    # a bounded command opens its channel with create_process; route it through run so it is recorded
+    async def _create_process(command: str):
+        return Mock(wait=lambda: client.run(command), wait_closed=AsyncMock())
+
+    client.create_process = _create_process
     return client
 
 

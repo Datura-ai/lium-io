@@ -70,7 +70,7 @@ async def test_unreadable_node_is_an_inspector_unreadable_event_not_a_pass(conte
         )
     )
     ctx = context_factory(
-        config=build_context_config(inspector_enabled=True),
+        config=build_context_config(),
         services=build_services(inspector=service),
         state=build_state(rented_data=_rented_data("executor-123")),
     )
