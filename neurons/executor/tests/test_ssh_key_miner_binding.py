@@ -167,6 +167,6 @@ def test_default_miner_hotkey_refused(client, miner_kp, validator_kp, monkeypatc
 
 
 def test_accepted_hotkeys_never_take_an_empty_or_portal_pool():
-    assert accepted_miner_hotkeys("5Own", "", "5Portal") == {"5Own"}
-    assert accepted_miner_hotkeys("5Own", "5Portal", "5Portal") == {"5Own"}
-    assert accepted_miner_hotkeys("5Own", "5Pool", "5Portal") == {"5Own", "5Pool"}
+    assert accepted_miner_hotkeys(own="5Own", pool="", shared_portal_hotkey="5Portal") == {"5Own"}
+    assert accepted_miner_hotkeys(own="5Own", pool="5Portal", shared_portal_hotkey="5Portal") == {"5Own"}
+    assert accepted_miner_hotkeys(own="5Own", pool="5Pool", shared_portal_hotkey="5Portal") == {"5Own", "5Pool"}

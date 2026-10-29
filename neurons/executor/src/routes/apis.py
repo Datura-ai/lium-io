@@ -269,7 +269,9 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
 
 def _accepted_miner_hotkeys() -> set[str]:
     return accepted_miner_hotkeys(
-        settings.MINER_HOTKEY_SS58_ADDRESS, settings.LIUM_POOL_HOTKEY, settings.DEFAULT_MINER_HOTKEY
+        own=settings.MINER_HOTKEY_SS58_ADDRESS,
+        pool=settings.LIUM_POOL_HOTKEY,
+        shared_portal_hotkey=settings.DEFAULT_MINER_HOTKEY,
     )
 
 
