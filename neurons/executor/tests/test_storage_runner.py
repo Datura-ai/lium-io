@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
@@ -226,6 +227,59 @@ def test_backup_repository_probe_retries_transient_access_denied(
         "init",
     ]
     assert clock.now == 2.0
+    assert '"event":"heartbeat"' in event_output.getvalue()
+
+
+def test_backup_repository_probe_retries_closed_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    clock = _RetryClock()
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error='Stat: Head "https://bucket/restic/config": Connection closed by foreign host',
+            ),
+            _repository_command_result(0, standard_output="[]"),
+        ]
+    )
+
+    def slow_restic(*args: object, **kwargs: object) -> object:
+        clock.now += 900.0  # restic's own retries outlast the readiness window
+        return repository_command_sequence(*args, **kwargs)
+
+    monkeypatch.setattr("storage.restic.subprocess.run", slow_restic)
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    runner._ensure_repository_for_backup()
+
+    assert [command[2] for command in repository_command_sequence.commands] == [
+        "snapshots",
+        "snapshots",
+    ]
+
+
+def test_slow_repository_probe_keeps_heartbeating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    event_output = io.StringIO()
+    event_writer = JsonEventWriter(
+        str(OPERATION_ID), 0, heartbeat_interval_seconds=0.0, output=event_output
+    )
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path), event_writer=event_writer)
+
+    def slow_probe(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        time.sleep(1.5)
+        return _repository_command_result(0, standard_output="[]")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", slow_probe)
+    runner._ensure_repository_for_backup()
+
     assert '"event":"heartbeat"' in event_output.getvalue()
 
 

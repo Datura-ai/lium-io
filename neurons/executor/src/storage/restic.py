@@ -246,6 +246,16 @@ class ResticStorageRunner:
             retry_deadline=repository_readiness_deadline,
             accepted_exit_codes=(0, 10),
         )
+        if repository_probe.returncode not in (0, 10) and _connection_closed(
+            self._redacted_repository_failure_detail(repository_probe)
+        ):
+            # restic already spent ~15 min retrying, past the readiness window; probe once more on a fresh one.
+            repository_probe = self._run_repository_command_with_retry(
+                ["snapshots", "--json"],
+                repository_command_name="probe",
+                retry_deadline=time.monotonic() + 180.0,
+                accepted_exit_codes=(0, 10),
+            )
         if repository_probe.returncode == 0:
             return
         if repository_probe.returncode != 10:
@@ -289,12 +299,7 @@ class ResticStorageRunner:
         retry_delay_seconds = 2.0
         while True:
             self._raise_if_cancellation_requested()
-            repository_command_result = subprocess.run(
-                self._restic_command(restic_arguments),
-                env=self._environment,
-                capture_output=True,
-                text=True,
-            )
+            repository_command_result = self._run_repository_command(restic_arguments)
             if repository_command_result.returncode in accepted_exit_codes:
                 return repository_command_result
 
@@ -321,6 +326,36 @@ class ResticStorageRunner:
             self._wait_before_repository_retry(wait_seconds)
             # Avoid hammering S3 while still checking readiness at least every 30 seconds.
             retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
+
+    def _run_repository_command(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        # restic retries S3 for ~15 min on its own; heartbeat meanwhile so the backend does not mark the run stale.
+        # shortcut: on cancellation the read-only restic child is left to exit by itself; use Popen if that matters.
+        results: queue.Queue[subprocess.CompletedProcess[str] | BaseException] = queue.Queue()
+
+        def run() -> None:
+            try:
+                results.put(
+                    subprocess.run(
+                        self._restic_command(restic_arguments),
+                        env=self._environment,
+                        capture_output=True,
+                        text=True,
+                    )
+                )
+            except BaseException as error:  # noqa: BLE001 - re-raised in the caller's thread
+                results.put(error)
+
+        threading.Thread(target=run, name="restic-repository-command", daemon=True).start()
+        while True:
+            try:
+                result = results.get(timeout=1.0)
+            except queue.Empty:
+                self._events.heartbeat_if_due()
+                self._raise_if_cancellation_requested()
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            return result
 
     def _redacted_repository_failure_detail(
         self,
@@ -943,6 +978,11 @@ def _is_retryable_repository_failure(failure_detail: str) -> bool:
     # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
     normalized_detail = "".join(failure_detail.casefold().split())
     return any(marker in normalized_detail for marker in retryable_failure_markers)
+
+
+def _connection_closed(failure_detail: str) -> bool:
+    # 28-29 Oct: 7 auto backups failed the probe on S3 "Connection closed by foreign host" in hourly bursts.
+    return "connection closed by foreign host" in failure_detail.casefold()
 
 
 def _transient_upload_failure(error_text: str) -> bool:
