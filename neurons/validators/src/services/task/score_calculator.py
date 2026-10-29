@@ -8,6 +8,7 @@ from typing import Tuple
 
 from core.config import settings, shared_client
 from services.executor_image_policy import ImageVerdict
+from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
 from services.task.pipeline import Context
 
 
@@ -47,9 +48,14 @@ def calculate_scores(
         warning_messages.append("Required executor image is outdated")
 
     # Machine price check
+    # DAH-5088: no cap for an unknown model priced like a reference (the backend's worker skips it too): the
+    # cheapest same-memory model is a payout floor, not a fair price; the soft limit still gates its idle pay
+    gpu_details = getattr(ctx.state, "gpu_details", None) or []
+    capacity_mb = gpu_details[0].get("capacity") if gpu_details else None
+    referenced = reference_gpu_model(gpu_model, capacity_mb) not in (None, normalize_gpu_model(gpu_model))
     base_price = shared_client.config.machine_prices.get(gpu_model, 0)
     max_price_rate = shared_client.config.machine_max_price_rate
-    if price_per_gpu and price_per_gpu > base_price * max_price_rate:
+    if price_per_gpu and not referenced and price_per_gpu > base_price * max_price_rate:
         actual_score = 0.0
         warning_messages.append(
             f"GPU price exceeds the limit. limit: {base_price * max_price_rate}, actual: {price_per_gpu}"
@@ -60,8 +66,7 @@ def calculate_scores(
     # on. Non-CVM executors (no quote) are untouched — omitted-quote bypass by a
     # known CVM is rejected upstream by the attestation ratchet.
     if (
-        settings.ENABLE_TDX_ATTESTATION
-        and settings.ENABLE_TCB_ENFORCEMENT
+        settings.ENABLE_TCB_ENFORCEMENT
         and ctx.executor.tdx_quote
         and not ctx.tdx_attestation_passed
     ):
@@ -99,6 +104,12 @@ def calculate_scores(
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("Host pinned or throttled a rented pod below its deployed CPUs")
+
+    # Rented throughput gate: same mechanics.
+    if not ctx.rented_throughput_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("A rented pod gets far too little network or disk throughput")
 
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the
     # score there; shadow leaves the flag True.

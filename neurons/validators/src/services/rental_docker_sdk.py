@@ -407,11 +407,9 @@ class RentalDockerSdkClient:
         api_client,
         *,
         pull_timeout_seconds: int | float | None = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
-        transport_retry_enabled: bool = False,
     ):
         self._api_client = api_client
         self._pull_timeout_seconds = pull_timeout_seconds
-        self._transport_retry_enabled = transport_retry_enabled
 
     async def login(self, *, username: str, password: str, image: str) -> None:
         # docker-py stores the credential under docker.io unless the registry
@@ -433,7 +431,11 @@ class RentalDockerSdkClient:
     async def pull(self, *, image: str) -> None:
         timeout_seconds = self._normalized_pull_timeout_seconds()
         try:
-            pull_call = _in_docker_thread(self._pull_sync, image)
+            # a pull is idempotent (dockerd keeps finished layers), so a dropped SSH channel
+            # mid-stream gets the same one re-open + retry as other calls, inside the one deadline
+            pull_call = self._retry_once_on_transport_drop(
+                operation="pull", attempt=lambda: _in_docker_thread(self._pull_sync, image)
+            )
             if timeout_seconds is not None:
                 await asyncio.wait_for(
                     pull_call,
@@ -676,6 +678,18 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
 
+    async def container_log_tail(self, *, container_name: str, lines: int) -> str:
+        """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
+        try:
+            raw = await _in_docker_thread(
+                self._api_client.logs, container_name, stdout=True, stderr=True, tail=lines
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK container logs failed", exc)
+            ) from exc
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
+
     async def container_image_id(self, *, container: str) -> str:
         """The image ID (`sha256:…`) the container was created from; a later tag move does not change it."""
         try:
@@ -803,14 +817,14 @@ class RentalDockerSdkClient:
 
         Budget per call: the first attempt with its own timeout, one re-open bounded by
         `_DOCKER_SSH_REOPEN_TIMEOUT_SECONDS`, one more attempt with the same timeout — never a
-        third. Any other failure, and every failure while the flag is off, propagates unchanged;
+        third. Any other failure propagates unchanged;
         `rental_docker_error_class` still names it for the failure event.
         """
         started = time.monotonic()
         try:
             return await attempt()
         except Exception as exc:
-            if not self._transport_retry_enabled or not is_rental_docker_transport_error(exc):
+            if not is_rental_docker_transport_error(exc):
                 raise
             first_error = exc
 
@@ -1173,8 +1187,9 @@ class RentalDockerSdkClient:
             raise
         existing_driver = info.get("Driver") if isinstance(info, dict) else None
         wanted_driver = driver or "local"
-        # a plugin driver is inspected as `<alias>:<tag>` while it is requested as `<alias>`
-        if isinstance(existing_driver, str) and existing_driver.split(":", 1)[0] == wanted_driver.split(":", 1)[0]:
+        # a plugin driver is inspected as `<alias>:<tag>` while it may be requested as `<alias>`,
+        # which is `<alias>:latest`; another tag is another plugin (vloopback:v2 beside vloopback)
+        if isinstance(existing_driver, str) and _with_default_tag(existing_driver) == _with_default_tag(wanted_driver):
             return True
         raise RentalDockerOperationError(
             "Docker SDK create volume refused after a transport retry: a volume named "
@@ -1242,8 +1257,6 @@ class RentalDockerSdkClientFactory:
     api_client_factory: Callable[..., object] | None = None
     timeout: int = 60
     pull_timeout_seconds: int = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
-    # DOCKER_TRANSPORT_RETRY_ENABLED: a bool, or a callable read once per connect (the settings flag)
-    transport_retry_enabled: bool | Callable[[], bool] = False
 
     @asynccontextmanager
     async def connect(
@@ -1274,12 +1287,6 @@ class RentalDockerSdkClientFactory:
             raise RentalDockerConnectionError(
                 _wrap_error_message("Docker SDK client construction failed", exc)
             ) from exc
-        transport_retry_enabled = (
-            bool(self.transport_retry_enabled())
-            if callable(self.transport_retry_enabled)
-            else bool(self.transport_retry_enabled)
-        )
-
         with tempfile.TemporaryDirectory(prefix="lium-rental-docker-ssh-") as temp_dir:
             ssh_home = Path(temp_dir)
             ssh_dir = ssh_home / ".ssh"
@@ -1314,7 +1321,7 @@ class RentalDockerSdkClientFactory:
                 except Exception as exc:
                     # the client asks the daemon for its version: a drop there costs one more
                     # connect (nothing on the host has changed yet), never a third
-                    if not transport_retry_enabled or not is_rental_docker_transport_error(exc):
+                    if not is_rental_docker_transport_error(exc):
                         raise
                     logger.warning(
                         _m(
@@ -1337,7 +1344,6 @@ class RentalDockerSdkClientFactory:
             client = RentalDockerSdkClient(
                 api_client,
                 pull_timeout_seconds=self.pull_timeout_seconds,
-                transport_retry_enabled=transport_retry_enabled,
             )
             try:
                 yield client
@@ -1964,6 +1970,10 @@ def _raise_pull_event_error(event) -> None:
     from docker.errors import APIError
 
     raise APIError("Docker image pull failed", explanation=str(message))
+
+
+def _with_default_tag(driver: str) -> str:
+    return driver if ":" in driver else f"{driver}:latest"
 
 
 def _is_docker_not_found_error(exc: Exception) -> bool:

@@ -76,7 +76,6 @@ jobs:
           BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
           SQLALCHEMY_DATABASE_URI: sqlite:///test.db
           ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
-          ENABLE_TDX_ATTESTATION: True
           TDX_VERIFIER_URL: http://localhost:8000/verify
         run: pdm run pytest tests/ -v --tb=short --strict-markers
 
@@ -181,32 +180,6 @@ jobs:
       - name: Run tests
         run: python -m pytest tests -v --tb=short
 
-  lint:
-    # ruff format is the repo's pre-commit hook (.pre-commit-config.yaml, same version pin)
-    # and CI never ran it. REPORT-ONLY: on 6 Sep 2026 main had 207/301 validators, 30/51
-    # executor and 20/43 miners files unformatted, so gating would block every PR until one
-    # `ruff format` commit per package lands; drop continue-on-error and add `lint` to
-    # tests-ok after that. `ruff check` is left out: it has open findings too.
-    name: ruff format (${{ matrix.package }})
-    needs: route
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        package: [validators, executor, miners]
-    steps:
-      # `matrix` is not available in a job-level `if`, so the skip sits on the steps
-      - if: needs.route.outputs[matrix.package] == 'true'
-        uses: actions/checkout@v4
-      - if: needs.route.outputs[matrix.package] == 'true'
-        uses: astral-sh/ruff-action@v3
-        continue-on-error: true
-        with:
-          version: "0.5.1"
-          args: format --check
-          src: neurons/${{ matrix.package }}
-
   ruff-check:
     # DAH-2972: gate the rule families that are at zero after the dead-code sweep (DAH-2971) so
     # it cannot regress: F (pyflakes: unused imports/variables, redefinitions, undefined names)
@@ -228,8 +201,7 @@ jobs:
   tests-ok:
     # the one context to require in the ruleset; lium-io requires no status check today.
     # A package whose job was skipped as unchanged passes, and so does a skipped e2e-gate
-    # (a PR that touches no neuron); a failed or cancelled one fails this. `lint` joins
-    # once the packages are formatted (see above).
+    # (a PR that touches no neuron); a failed or cancelled one fails this.
     name: tests-ok
     needs: [route, validators, executor, miners, ruff-check, protocol, e2e]
     if: always()
@@ -241,7 +213,8 @@ jobs:
   # The subnet loop end to end on one runner (e2e/README.md): the PR's executor on its own dockerd, the PR's miner that
   # owns it, and the PR's validator services signing in, installing keys, scraping, walking the check pipeline,
   # publishing the verdict, then renting a container and tearing it down — plus every refusal a spoofer must hit.
-  # Routed like the package jobs: runs when any neuron, datura/, .github/ or e2e/ changed, skipped otherwise, and
+  # Routed like the package jobs: runs when any neuron, datura/, .github/ or e2e/ changed (a change only under a
+  # neuron's own tests/ directory does not count: the stack never runs those), skipped otherwise, and
   # reported through tests-ok either way. gate.sh puts a hard timeout on every step, runs every suite even after a
   # failure, and always leaves e2e/artifacts (timings, summary.md, junit per suite, compose logs, the suites' JSON
   # dumps) — uploaded on every run and summarised in one sticky PR comment. Reproduce: make -C e2e e2e-full.

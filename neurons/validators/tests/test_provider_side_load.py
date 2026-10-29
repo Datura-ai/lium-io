@@ -161,10 +161,9 @@ def _rented_state(specs: dict[str, object]) -> ContextState:
 
 
 @contextmanager
-def provider_load_gate(*, enforce: bool = True, check_enabled: bool = True, stack_cap: bool = False):
+def provider_load_gate(*, enforce: bool = True, stack_cap: bool = False):
     """DAH-2734 ships shadow-first, like every other money-withholding gate."""
     with patch("neurons.validators.src.services.task.checks.provider_side_load.settings") as s:
-        s.PROVIDER_SIDE_LOAD_CHECK_ENABLED = check_enabled
         s.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED = enforce
         s.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CORES = 8.0
         s.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED = stack_cap
@@ -247,17 +246,6 @@ async def test_unmeasurable_signal_never_withholds_money(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.NOT_MEASURABLE.reason
     assert result.updates == {}
-
-
-@pytest.mark.asyncio
-async def test_disabled_check_skips_entirely(context_factory):
-    ctx = context_factory(state=_rented_state(SN13_SPECS))
-
-    with provider_load_gate(enforce=True, check_enabled=False):
-        result = await ProviderSideLoadCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.SKIPPED.reason
 
 
 @pytest.mark.asyncio

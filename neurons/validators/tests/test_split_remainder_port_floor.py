@@ -1,13 +1,13 @@
-"""DAH-3698 — the free remainder of a partially rented split node earns no idle pay when the
-node has fewer free ports than the marketplace floor.
+"""DAH-3698 — the free remainder of a partially rented split node earns idle pay only for the
+minimum-size splits that have a usable, unique free port (owner rule, 26 Oct 2026), and nothing
+below the marketplace floor of MIN_PORT_COUNT free ports.
 
 `PortCountCheck` exempts a rented executor from `MIN_PORT_COUNT` (the tenant already holds the
 ports), so a part-rented split node with 2 free ports still reaches scoring, and DAH-2467 then
 pays its free GPUs from the unrented pool. The platform lists a node only with
 `available_port_count >= MIN_PORT_COUNT` and the rent path refuses a pod below it, so nobody
-can rent that remainder. The remainder is still expanded (the rented portion keeps earning in
-the mining pool) but forfeits the unrented incentive with a named reason once
-ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is on; off (the default) only logs the shortfall.
+can rent that remainder. Above the floor each simultaneous renter of a minimum-size split needs its
+own port, so a remainder with fewer ports than splits is paid for as many splits as it has ports.
 """
 
 import logging
@@ -21,7 +21,6 @@ from incentive.rental_price import RentalPriceIncentive
 from services.const import DEFAULT_JOB_OWNER_LIUM, MIN_PORT_COUNT
 from services.task_service import JobResult
 
-from core.config import settings
 
 H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
 MINER_HOTKEY = "miner-hotkey-1"
@@ -34,6 +33,7 @@ def _make_job(
     rented_gpu_count: int | None = 4,
     is_rented: bool = True,
     spec: dict | None = None,
+    min_count: int = 1,
 ) -> JobResult:
     if spec is None:
         spec = {}
@@ -60,7 +60,7 @@ def _make_job(
         is_rented=is_rented,
         rented_gpu_count=rented_gpu_count,
         supports_gpu_splitting=True,
-        gpu_splitting_min_count=1,
+        gpu_splitting_min_count=min_count,
         collateral_deposited=True,
         sysbox_runtime=True,
     )
@@ -96,12 +96,14 @@ def test_remainder_with_two_free_ports_is_port_limited():
     # Assert
     assert limited is not None
     assert limited.available_port_count == 2
-    assert limited.required_port_count == MIN_PORT_COUNT
+    assert limited.required_port_count == 4
+    assert limited.paid_split_count == 0  # below the rent path's floor no split is rentable
+    assert limited.unpaid_gpu_count == 4
 
 
-def test_remainder_at_the_floor_is_not_port_limited():
-    # Arrange — exactly MIN_PORT_COUNT free ports: the platform lists it and the rent path accepts it.
-    incentive = _build_incentive(_make_job(available_port_count=MIN_PORT_COUNT))
+def test_remainder_with_a_port_per_split_is_not_port_limited():
+    # Arrange — 4 free 1-GPU splits, 4 free ports: every split can be rented at once.
+    incentive = _build_incentive(_make_job(available_port_count=4))
     incentive._expand_partially_rented_split_results()
     _, remainder = incentive.job_results[MINER_HOTKEY]
 
@@ -177,49 +179,8 @@ async def _score(job: JobResult, rental_share: float = 0.1) -> RentalPriceIncent
 
 
 @pytest.mark.asyncio
-async def test_default_settings_pay_the_port_limited_remainder_exactly_as_before(caplog):
-    # Rollout contract (SO §70): a money-path gate ships in shadow mode. With the settings object
-    # untouched (no monkeypatch of the flag) a 2-port remainder must receive the same idle pay
-    # as the computation the gate never sees — the same node with MIN_PORT_COUNT free ports —
-    # and the scorer must say so in the shadow line. Precondition, not the assertion: the
-    # settings object as the test process resolved it carries the shipped default.
-    assert settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is False, (
-        "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is on in this environment — "
-        "the default-off contract cannot be measured here"
-    )
-
-    # Arrange — the baseline: an identical node at the floor, which no gate touches.
-    baseline_job = _make_job(available_port_count=MIN_PORT_COUNT, gpu_count=8, rented_gpu_count=4)
-    baseline = await _score(baseline_job)
-    assert baseline_job.incentive_idle > 0  # the baseline really pays the free GPUs
-
-    # Act — the prod case under default settings.
-    job = _make_job(available_port_count=2, gpu_count=8, rented_gpu_count=4)
-    with caplog.at_level(logging.INFO):
-        incentive = await _score(job)
-
-    # Assert — every payout figure equals the unflagged computation.
-    assert job.incentive_idle == pytest.approx(baseline_job.incentive_idle)
-    assert job.incentive_rented == pytest.approx(baseline_job.incentive_rented)
-    assert job.incentive == pytest.approx(baseline_job.incentive)
-    assert job.mining_score == pytest.approx(baseline_job.mining_score)
-    assert incentive.unrented_count_by_bucket == baseline.unrented_count_by_bucket
-    assert _reason_codes(job) == _reason_codes(baseline_job)
-    assert ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value not in _reason_codes(job)
-
-    # …and the shortfall is still visible: one shadow line, not enforced, with the reason code.
-    breach = _port_floor_breach_lines(caplog)
-    assert len(breach) == 1
-    assert breach[0].extra["enforced"] is False
-    assert breach[0].extra["reason"] == ZeroIncentiveReason.PORT_LIMITED_REMAINDER
-    assert breach[0].extra["available_port_count"] == 2
-    assert "shadow only - flag off" in breach[0].message
-
-
-@pytest.mark.asyncio
 async def test_port_limited_remainder_earns_no_idle_pay_and_the_rented_portion_is_unchanged(monkeypatch):
     # Arrange — 8-GPU split node, 4 rented, 2 free ports; rental share pinned for determinism.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", True)
     job = _make_job(available_port_count=2, gpu_count=8, rented_gpu_count=4)
     incentive = _build_incentive(job)
     monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
@@ -244,16 +205,15 @@ async def test_port_limited_remainder_earns_no_idle_pay_and_the_rented_portion_i
     assert _reason_codes(job) == [ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value]
     reason = job.zero_incentive_reasons[0]
     assert reason.context["available_port_count"] == 2
-    assert reason.context["required_port_count"] == MIN_PORT_COUNT
+    assert reason.context["required_port_count"] == 4  # one per free split
     assert "2 free port" in reason.message_for_miner
     assert "port_limited_remainder" in job.full_log_text
 
 
 @pytest.mark.asyncio
 async def test_remainder_with_enough_ports_is_paid_as_before(monkeypatch):
-    # Arrange — the same node with 3 free ports: DAH-2467 behaviour unchanged.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", True)
-    job = _make_job(available_port_count=MIN_PORT_COUNT, gpu_count=8, rented_gpu_count=4)
+    # Arrange — the same node with a free port for each of its 4 free 1-GPU splits: DAH-2467 unchanged.
+    job = _make_job(available_port_count=4, gpu_count=8, rented_gpu_count=4)
     incentive = _build_incentive(job)
     monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
 
@@ -269,33 +229,9 @@ async def test_remainder_with_enough_ports_is_paid_as_before(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_flag_off_only_logs_the_shortfall(monkeypatch, caplog):
-    # Arrange — shadow mode: the payout is unchanged and the would-be exclusion is logged.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", False)
-    job = _make_job(available_port_count=2, gpu_count=8, rented_gpu_count=4)
-    incentive = _build_incentive(job)
-    monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
-
-    # Act
-    with caplog.at_level(logging.INFO):
-        await incentive.calculate_mining_scores()
-
-    # Assert — payout unchanged, no reason shipped, one shadow line with the dashboard fields.
-    assert job.incentive_idle == pytest.approx(0.1)
-    assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 4
-    assert ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value not in _reason_codes(job)
-    breach = _port_floor_breach_lines(caplog)
-    assert len(breach) == 1
-    assert "shadow only - flag off" in breach[0].message
-    assert breach[0].extra["enforced"] is False
-    assert breach[0].extra["pool"] == "rental_kept_shadow"
-
-
-@pytest.mark.asyncio
 async def test_enforced_log_line_names_the_reason_and_the_pool(monkeypatch, caplog):
     # Arrange — the mitigation for the pay change: the scorer's structured line carries the reason
     # code so Loki / the provider dashboard (DAH-3699) can explain the zero.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", True)
     job = _make_job(available_port_count=2, gpu_count=8, rented_gpu_count=4)
     incentive = _build_incentive(job)
     monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
@@ -310,7 +246,8 @@ async def test_enforced_log_line_names_the_reason_and_the_pool(monkeypatch, capl
     assert "shadow only" not in breach[0].message
     assert breach[0].extra["executor_id"] == "exec-split-ports"
     assert breach[0].extra["available_port_count"] == 2
-    assert breach[0].extra["required_port_count"] == MIN_PORT_COUNT
+    assert breach[0].extra["required_port_count"] == 4
+    assert breach[0].extra["paid_split_count"] == 0
     assert breach[0].extra["enforced"] is True
     assert breach[0].extra["pool"] == "rental_excluded"
 
@@ -321,3 +258,141 @@ def _port_floor_breach_lines(caplog) -> list:
         if hasattr(r.msg, "extra")
         and r.msg.extra.get("reason") == ZeroIncentiveReason.PORT_LIMITED_REMAINDER
     ]
+
+
+# ── one port per minimum-size split (owner rule, 26 Oct 2026) ─────────────────
+
+
+async def _score_split(ports, *, gpu_count, rented, min_count=1, spec_extra=None):
+    job = _make_job(available_port_count=ports, gpu_count=gpu_count, rented_gpu_count=rented, min_count=min_count)
+    job.spec.update(spec_extra or {})
+    incentive = await _score(job)
+    return job, incentive
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ports", "paid_gpus"),
+    [(8, 8), (7, 7), (MIN_PORT_COUNT, MIN_PORT_COUNT), (MIN_PORT_COUNT - 1, 0)],
+)
+async def test_8x1_remainder_is_paid_one_split_per_free_port(ports, paid_gpus):
+    # 9 GPUs offered as 1-GPU splits, 1 rented: 8 free splits need 8 free ports for 8 renters.
+    job, incentive = await _score_split(ports, gpu_count=9, rented=1)
+
+    assert incentive.unrented_count_by_bucket.get(("H200", 1)) == (paid_gpus or None)
+    assert job.gpu_count == 9  # the merged row still reports the whole node
+    if paid_gpus == 8:
+        assert ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value not in _reason_codes(job)
+    else:
+        assert _reason_codes(job) == [ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value]
+        assert job.zero_incentive_reasons[0].context["paid_split_count"] == paid_gpus
+        assert job.zero_incentive_reasons[0].context["gpu_count"] == 8 - paid_gpus
+    assert (job.incentive_idle > 0) is (paid_gpus > 0)
+
+
+@pytest.mark.asyncio
+async def test_partial_remainder_is_paid_pro_rata_against_a_fully_ported_twin():
+    full, full_incentive = await _score_split(8, gpu_count=9, rented=1)
+    partial, partial_incentive = await _score_split(7, gpu_count=9, rented=1)
+    key = ("H200", 1)
+    assert partial_incentive._weighted_rate_sum_by_bucket[key] == pytest.approx(
+        full_incentive._weighted_rate_sum_by_bucket[key] * 7 / 8
+    )
+    assert partial.mining_score == pytest.approx(full.mining_score)  # the rented GPU is untouched
+
+
+@pytest.mark.parametrize(
+    ("ports", "unpaid_gpus"),
+    [(4, None), (3, 2), (2, 8)],
+)
+def test_4x2_remainder_needs_a_port_per_2_gpu_split(ports, unpaid_gpus):
+    # 10 GPUs in 2-GPU splits, 2 rented: 8 free GPUs are 4 splits, so 4 ports pay them all.
+    incentive = _build_incentive(_make_job(available_port_count=ports, gpu_count=10, rented_gpu_count=2, min_count=2))
+    incentive._expand_partially_rented_split_results()
+    _, remainder = incentive.job_results[MINER_HOTKEY]
+
+    limited = incentive._port_limited_remainder(remainder)
+
+    assert (limited.unpaid_gpu_count if limited else None) == unpaid_gpus
+
+
+def test_leftover_gpus_below_one_split_ride_with_the_last_paid_split():
+    # 5 free GPUs in 2-GPU splits = 2 splits (the 5th GPU joins a 3-GPU rental); 3 ports pay all
+    incentive = _build_incentive(_make_job(available_port_count=3, gpu_count=8, rented_gpu_count=3, min_count=2))
+    incentive._expand_partially_rented_split_results()
+    _, remainder = incentive.job_results[MINER_HOTKEY]
+    assert incentive._port_limited_remainder(remainder) is None
+
+
+@pytest.mark.parametrize(
+    ("rented", "unpaid_gpus"),
+    [(8, 2), (2, None), (1, None)],
+    ids=["below_min", "equal_min", "above_min"],
+)
+def test_remainder_below_one_whole_split_earns_no_idle_pay(rented, unpaid_gpus):
+    # 10-GPU node, 8-GPU minimum, 3 free ports: 2 free GPUs are no rentable split, 8 and 9 are one
+    incentive = _build_incentive(
+        _make_job(available_port_count=3, gpu_count=10, rented_gpu_count=rented, min_count=8)
+    )
+    incentive._expand_partially_rented_split_results()
+    _, remainder = incentive.job_results[MINER_HOTKEY]
+
+    limited = incentive._port_limited_remainder(remainder)
+
+    assert (limited.unpaid_gpu_count if limited else None) == unpaid_gpus
+    if limited:
+        assert limited.paid_split_count == 0
+
+
+def test_ports_held_by_the_rental_are_not_free_ports():
+    # PortCountCheck publishes only ports no pod holds: 6 verified free on a node whose tenant
+    # holds 3 more. The 6 free ones are all the 8 free splits can use.
+    incentive = _build_incentive(
+        _make_job(spec={"available_port_count": 6, "verified_ports": [20001, 20002, 20003, 20004, 20005, 20006]},
+                  gpu_count=9, rented_gpu_count=1)
+    )
+    incentive._expand_partially_rented_split_results()
+    _, remainder = incentive.job_results[MINER_HOTKEY]
+    limited = incentive._port_limited_remainder(remainder)
+    assert limited is not None
+    assert (limited.available_port_count, limited.paid_split_count, limited.unpaid_gpu_count) == (6, 6, 2)
+
+
+def test_colliding_ports_count_once():
+    # two mappings publish the same external port: it can serve one renter only
+    incentive = _build_incentive(
+        _make_job(spec={"available_port_count": 8, "verified_ports": [20001, 20001, 20002, 20002, 20003, 20004, 20005, 20006]},
+                  gpu_count=9, rented_gpu_count=1)
+    )
+    incentive._expand_partially_rented_split_results()
+    _, remainder = incentive.job_results[MINER_HOTKEY]
+    limited = incentive._port_limited_remainder(remainder)
+    assert limited is not None
+    assert (limited.available_port_count, limited.paid_split_count) == (6, 6)
+
+
+@pytest.mark.asyncio
+async def test_a_first_failed_port_verification_does_not_cost_the_remainder():
+    # PortConnectivityCheck marks the first failed verification inside its window; the gate skips it
+    job, incentive = await _score_split(0, gpu_count=9, rented=1, spec_extra={"port_verify_first_miss": True})
+    assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 8
+    assert ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value not in _reason_codes(job)
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_failed_verification_counts():
+    job, incentive = await _score_split(0, gpu_count=9, rented=1)
+    assert incentive.unrented_count_by_bucket.get(("H200", 1)) is None
+    assert _reason_codes(job) == [ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value]
+
+
+@pytest.mark.asyncio
+async def test_partial_log_line_carries_the_split_counts(caplog):
+    with caplog.at_level(logging.INFO):
+        await _score_split(5, gpu_count=9, rented=1)
+    breach = _port_floor_breach_lines(caplog)
+    assert len(breach) == 1
+    extra = breach[0].extra
+    assert (extra["available_port_count"], extra["required_port_count"]) == (5, 8)
+    assert (extra["free_split_count"], extra["paid_split_count"], extra["unpaid_gpu_count"]) == (8, 5, 3)
+    assert extra["pool"] == "rental_partial"

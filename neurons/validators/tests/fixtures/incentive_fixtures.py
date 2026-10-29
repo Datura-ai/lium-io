@@ -1,3 +1,4 @@
+import itertools
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -48,6 +49,9 @@ def mock_settings(monkeypatch):
 
 @pytest.fixture
 def create_job_result():
+    # each result is its own machine: one SSH endpoint under two hotkeys is a duplicate and scores 0 (DAH-4881)
+    ssh_ports = itertools.count(2200)
+
     def _factory(
         score: float = 1.0,
         job_score: float = 1.0,
@@ -69,7 +73,7 @@ def create_job_result():
             address="192.168.1.100",
             port=8080,
             ssh_username="root",
-            ssh_port=22,
+            ssh_port=next(ssh_ports),
             port_mappings="[]",
             port_range="40000-50000",
             python_path="/usr/bin/python3",
@@ -149,6 +153,10 @@ def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_se
     validator.miner_service = MagicMock()
     validator.miner_service.request_job_to_miner = AsyncMock()
     validator.miner_service.publish_machine_specs = AsyncMock()
+    validator.miner_service.publish_new_executors_at_pass = AsyncMock()
+    # sync() asks the express lane (built in initiate_services) which job-file directories to keep
+    validator.express_lane = MagicMock()
+    validator.express_lane.directories_in_use = MagicMock(return_value=())
     validator.backend_client = MagicMock()
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=[])
     validator.last_job_run_blocks = 0

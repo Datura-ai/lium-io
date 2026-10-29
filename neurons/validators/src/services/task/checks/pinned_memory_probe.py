@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from core.config import settings
 from ..messages import PinnedMemoryProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .capability import get_filler_only_container, lium_workload_live_now
 
 # Stdlib-only, shipped over stdin like the kernel-fault probe (DAH-3035): nothing to upload or update.
 PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "pinned_memory_probe.py"
@@ -24,6 +26,8 @@ OUTPUT_TAIL_CHARS = 800
 MAX_FAULT_LINES = 16
 MAX_FAULT_CHARS = 300
 MAX_GPUS = 16
+# what the probe reports for a card whose copy never finished inside the budget
+HUNG_COPY_FAULT_SUFFIX = ": worker hung during copy"
 
 
 class PinnedMemoryProbeCheck:
@@ -40,6 +44,10 @@ class PinnedMemoryProbeCheck:
     check, which keeps the node unrentable. Wrong data, a copy error, a copy that hangs or a
     driver error naming a broken GPU (BROKEN_GPU_CODES) counts as a fault. A probe that could not run (no libcuda, a
     context or allocation refused, a memlock limit) passes with PINNED_MEMORY_PROBE_UNKNOWN.
+
+    A Lium filler holds the cards, so the probe skips a filler-only node the way the kernel-fault probe does,
+    and a copy that only hung is re-checked against the backend's live workload the way CapabilityCheck does:
+    on 19 Oct a copy hung on an honest 8x B200 beside our own filler.
     """
 
     check_id = "gpu.validate.pinned_memory"
@@ -50,6 +58,16 @@ class PinnedMemoryProbeCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
             )
+
+        filler_container = get_filler_only_container(ctx)
+        if filler_container:
+            event = render_message(
+                Msg.FILLER_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"filler_container": filler_container},
+            )
+            return CheckResult(passed=True, event=event)
 
         command = f"{shlex.quote(ctx.executor.python_path)} -I -"
         run = await ctx.runner.run(
@@ -94,6 +112,25 @@ class PinnedMemoryProbeCheck:
                 else ""
             )
             what["error"] = (error or "fault")[: MAX_FAULT_LINES * MAX_FAULT_CHARS]
+            # wrong data is never waived; only a copy that hung may have lost the card to a Lium workload
+            if _only_hung_copies(faults):
+                lium_workload = await lium_workload_live_now(ctx)
+                if lium_workload is not None:
+                    event = render_message(
+                        Msg.WORKLOAD_SKIPPED,
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        what={
+                            **what,
+                            "workload": lium_workload.kind,
+                            "containers": list(lium_workload.container_names),
+                        },
+                    )
+                    return CheckResult(
+                        passed=True,
+                        event=event,
+                        updates={"state": replace(ctx.state, rented_data=lium_workload.snapshot)},
+                    )
             event = render_message(Msg.PROBE_FAILED, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=False, event=event)
         what["error"] = _cap(report.get("error")) or f"probe status {_cap(status)!r}"
@@ -113,6 +150,14 @@ def _parse_report(stdout: str) -> dict[str, Any] | None:
                 return None
             return parsed if isinstance(parsed, dict) else None
     return None
+
+
+def _only_hung_copies(faults: Any) -> bool:
+    return (
+        isinstance(faults, list)
+        and bool(faults)
+        and all(isinstance(fault, str) and fault.endswith(HUNG_COPY_FAULT_SUFFIX) for fault in faults)
+    )
 
 
 def _cap(value: Any) -> Any:
