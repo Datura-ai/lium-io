@@ -282,6 +282,28 @@ def test_manual_rental_forced_pass_marks_spot_when_executor_in_spot_ids():
     assert results[0].is_on_spot_pay_list is False
 
 
+def test_manual_rental_forced_pass_marks_maintenance_when_executor_in_maintenance_ids():
+    """A manual rental on a node inside a provider maintenance window earns nothing, as ResultHandler
+    marks it: the synthetic result carries is_in_maintenance from rented_data."""
+    # Arrange
+    payload = make_payload()
+    rented_data = RentedExecutorsResponse(
+        executors={EXECUTOR_UUID: make_rented_executor()},
+        manual_rental_executors={
+            EXECUTOR_UUID: ManualRentalInfo(gpu_model="NVIDIA H200", gpu_count=8)
+        },
+        maintenance_executor_ids=[EXECUTOR_UUID],
+    )
+    service = make_miner_service()
+
+    # Act
+    results = service._build_manual_rental_results(payload, rented_data, existing=[])
+
+    # Assert
+    assert len(results) == 1
+    assert results[0].is_in_maintenance is True
+
+
 def test_manual_rental_forced_pass_marks_provider_chosen_spot_from_the_provider_list():
     """A manual rental on a node in provider_spot_executor_ids carries that, as ResultHandler's
     results do, so the incentive layer can pay it as a rented spot node."""

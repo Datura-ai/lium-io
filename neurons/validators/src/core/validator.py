@@ -121,6 +121,7 @@ def settle_cycle_results(
                 and not (
                     job_result.is_new_rentals_paused and not job_result.is_rented
                 )
+                and not job_result.is_in_maintenance
             ):
                 total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
     return total_gpu_model_count_map
@@ -497,7 +498,7 @@ class Validator:
                 # request jobs
                 jobs = [
                     asyncio.create_task(
-                        self.miner_service.request_job_to_miner(
+                        self.request_wave_job(
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
@@ -1375,6 +1376,12 @@ class Validator:
                 ),
             )
         )
+
+    async def request_wave_job(self, **kwargs) -> dict | None:
+        """One miner's wave request; its new executors that passed are listed now, not at the cycle's end."""
+        job = await self.miner_service.request_job_to_miner(**kwargs)
+        await self.miner_service.publish_new_executors_at_pass(job)
+        return job
 
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""

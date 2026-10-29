@@ -247,7 +247,6 @@ class Settings(BaseSettings):
     # before it (none for a never-measured node) instead of one moved by its sample. A passing
     # cycle without the recommended image cached does not seed a never-measured node; a node with
     # a stored EMA publishes its sample on every passing cycle. See verifyx_ema_hold_reason.
-    ENABLE_INSPECTOR: bool = True
     # Rented cycles in a row in which the inspector saw nothing (error, failed canary, stopped or
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.
@@ -432,6 +431,10 @@ class Settings(BaseSettings):
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.
     RENTED_POD_RESOURCES_CHECK_ENABLED: bool = Field(env="RENTED_POD_RESOURCES_CHECK_ENABLED", default=True)
+    # RentedPodNetworkCheck logs a pod's network summary as a warning for review from this count up.
+    RENTED_POD_OUTBOUND_FANOUT_DESTINATIONS: int = Field(
+        env="RENTED_POD_OUTBOUND_FANOUT_DESTINATIONS", default=256, gt=0
+    )
     # The per-pod incident mark expires this long after the last cycle that saw the fault.
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
     # DAH-4457: a node whose GPU dropped out stays hidden (GPU_LOST availability entry, no new rentals) until its
@@ -478,9 +481,6 @@ class Settings(BaseSettings):
     # sequential matmul. It always runs and logs the verdict (DAH-4257 shadow, flag removed);
     # ENFORCEMENT lets a fault zero the score and stays off until the owner decides.
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
-    # DAH-5048 — the NVLink multicast probe always runs on all-NVLink boards and logs NVLINK_FAULT; ENFORCEMENT
-    # lets a fault fail the node. Shadow first: the false-fail count on healthy boards is unknown yet.
-    NVLINK_FAULT_ENFORCEMENT_ENABLED: bool = Field(env="NVLINK_FAULT_ENFORCEMENT_ENABLED", default=False)
     # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
     # row remap, a required recovery action) fails the node like a GPU ban until the host resets or
     # replaces it. On: a broken card faults renters' jobs. Off is the kill switch back to flag-only.
@@ -554,6 +554,12 @@ class Settings(BaseSettings):
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5320: IdleDiskWriteCheck, last in the pipeline, writes the same 256 MiB with fsync on idle and filler nodes
+    # once a day per node (skipped while the docker root disk already moves DISK_BUSY_MB_PER_S) and logs
+    # IDLE_DISK_WRITE with a shadow verdict against DISK_MIN_MB_PER_S. Logged only; ENFORCE_ENABLED is read by nothing
+    # yet (the follow-up zeroes the score on a slow disk).
+    IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
+    IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and
@@ -627,12 +633,6 @@ class Settings(BaseSettings):
     # are read first. Set to True to enforce.
     ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
         env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
-    )
-
-    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
-    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
-    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
-        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
 
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
@@ -782,11 +782,6 @@ class Settings(BaseSettings):
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
-
-    # A rented node missing from its miner's answer for ONE cycle is mostly a key upload that missed the miner's 10 s
-    # window: 86 of the 347 RENTED_EXECUTOR_NOT_LISTED rows on 19 Oct were back in the next answer. On: the row is
-    # written from the second consecutive miss. Off by default: provider scoring, enabling it is the penalty owners' call.
-    RENTED_NOT_LISTED_ONE_CYCLE_GRACE: bool = Field(env="RENTED_NOT_LISTED_ONE_CYCLE_GRACE", default=False)
 
     # DAH-2958 — express lane for never-validated executors. A new node is published only by
     # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and
