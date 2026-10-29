@@ -4229,7 +4229,9 @@ class DockerService:
         removed_at_ssh_connect: dict[str, str] | None = None,
         refuse_before_removal: Callable[[list[str]], None] | None = None,
     ) -> list[str]:
-        """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
+        """Force-remove this pod's own container and stale filler_ containers (and their volumes); returns the names removed.
+
+        Another pod's `pod_*` is never removed here, listed or not (DAH-5392).
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
@@ -4280,10 +4282,14 @@ class DockerService:
             active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
             active_volume_set = set(active_volume_names) if active_volume_names else set()
             removed_id_by_filler_name = removed_at_ssh_connect or {}
+            # DAH-5392: of the `pod_*` containers only this pod's own (and its parked twin) is a create's to
+            # remove. The backend lists a renter's pod only once its ContainerCreated lands, so on a split
+            # node a second renter's create would otherwise remove the first one's new container; an
+            # orphan of an ended rental is StaleContainerCleanupCheck's to reap.
+            own_pod_names = {pod_name, f"{pod_name}{EDIT_PARKED_SUFFIX}"}
             pod_containers = [
                 name for name in all_names
-                if name == pod_name
-                or name.startswith(POD_CONTAINER_PREFIX)
+                if name in own_pod_names
                 or (name.startswith(FILLER_CONTAINER_PREFIX) and not keep_every_filler)
             ]
             stale_containers = []

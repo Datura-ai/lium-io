@@ -3379,8 +3379,8 @@ async def test_clean_containers_active_siblings_not_removed(docker_service, retr
 
 
 @pytest.mark.asyncio
-async def test_clean_containers_stale_pods_removed(docker_service, retry_ssh_mock):
-    """Stale pod_ containers not in active list should be cleaned up."""
+async def test_clean_containers_other_pods_kept_even_unlisted(docker_service, retry_ssh_mock):
+    """DAH-5392: only the create's own pod_ container goes; an unlisted one is another create's or the reaper's."""
     # Arrange
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
@@ -3395,13 +3395,49 @@ async def test_clean_containers_stale_pods_removed(docker_service, retry_ssh_moc
         active_container_names=["pod_active_sibling"],
     )
 
-    # Assert — target + stale orphan removed; active sibling and non-pod container kept
+    # Assert — target removed; unlisted pod, active sibling and non-pod container kept
     rm_command = retry_ssh_mock.call_args_list[0][0][1]
     assert "pod_target" in rm_command
-    assert "pod_stale_orphan" in rm_command
+    assert "pod_stale_orphan" not in rm_command
     assert "pod_active_sibling" not in rm_command
     # non-pod containers are never touched
     assert "some_other_container" not in rm_command
+
+
+@pytest.mark.asyncio
+async def test_concurrent_creates_on_a_split_node_keep_each_others_container(docker_service, retry_ssh_mock):
+    """DAH-5392: two renters' creates on one node, each sent before the other's ContainerCreated landed
+    (so neither names the other in active_container_names). The slower create's sweep lists the host
+    after the faster one's `docker run` and must not remove that new container."""
+    host: set[str] = set()
+
+    async def run(command, *args, **kwargs):
+        await asyncio.sleep(0)
+        return _make_ssh_run_result("".join(f"{name}\n" for name in sorted(host)))
+
+    async def rm(_ssh_client, command, *args, **kwargs):
+        for name in list(host):
+            if name in command.split():
+                host.discard(name)
+
+    retry_ssh_mock.side_effect = rm
+    first_running = asyncio.Event()
+
+    async def create(pod_name: str, wait_for: asyncio.Event | None = None) -> None:
+        if wait_for is not None:
+            await wait_for.wait()
+        await docker_service.clean_existing_containers(
+            ssh_client=Mock(run=run), default_extra={}, pod_name=pod_name, active_container_names=[]
+        )
+        host.add(pod_name)  # `docker run`
+
+    async def fast() -> None:
+        await create("pod_renter_a")
+        first_running.set()
+
+    await asyncio.gather(fast(), create("pod_renter_b", wait_for=first_running))
+
+    assert host == {"pod_renter_a", "pod_renter_b"}
 
 
 @pytest.mark.asyncio
@@ -3452,8 +3488,8 @@ async def test_clean_containers_removes_young_unknown_filler(docker_service, ret
 
 
 @pytest.mark.asyncio
-async def test_clean_containers_none_fallback_removes_all_pods(docker_service, retry_ssh_mock):
-    """When active_container_names is None (old backend), all pod_ containers are removed."""
+async def test_clean_containers_none_fallback_removes_only_own_pod(docker_service, retry_ssh_mock):
+    """When active_container_names is None (old backend), only the create's own pod_ container is removed."""
     # Arrange
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
@@ -3468,10 +3504,10 @@ async def test_clean_containers_none_fallback_removes_all_pods(docker_service, r
         active_container_names=None,
     )
 
-    # Assert — old behavior: all pod_ containers removed, non-pod containers untouched
+    # Assert — DAH-5392: another pod's container is never removed, non-pod containers untouched
     rm_command = retry_ssh_mock.call_args_list[0][0][1]
     assert "pod_target" in rm_command
-    assert "pod_other_pod" in rm_command
+    assert "pod_other_pod" not in rm_command
     assert "some_container" not in rm_command
 
 
@@ -3497,7 +3533,7 @@ async def test_clean_containers_targeted_volume_rm(docker_service, retry_ssh_moc
     assert retry_ssh_mock.call_count == 2
     volume_command = retry_ssh_mock.call_args_list[1][0][1]
     assert "volume_target" in volume_command
-    assert "volume_stale" in volume_command
+    assert "volume_stale" not in volume_command
     assert "volume_active_sibling" not in volume_command
     assert "volume prune" not in volume_command
 
@@ -3524,7 +3560,7 @@ async def test_clean_containers_empty_active_list_uses_targeted_volume_rm(docker
     assert retry_ssh_mock.call_count == 2
     volume_command = retry_ssh_mock.call_args_list[1][0][1]
     assert "volume_target" in volume_command
-    assert "volume_stale" in volume_command
+    assert "volume_stale" not in volume_command
     assert "volume prune" not in volume_command
 
 

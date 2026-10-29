@@ -169,7 +169,7 @@ async def _run_like_asyncssh(answer, open_s: float | None, command_s: float, tim
 
 
 @pytest.mark.asyncio
-async def test_a_sweep_beside_fillers_removes_stale_pods_but_no_filler(
+async def test_a_sweep_beside_fillers_removes_its_own_pod_but_no_filler(
     docker_service, retry_ssh_mock
 ):
     # the rental probe beside a filler: the backend lists no filler to it, and none may go
@@ -186,7 +186,7 @@ async def test_a_sweep_beside_fillers_removes_stale_pods_but_no_filler(
 
     assert "filler_a" not in removed
     rm_command = retry_ssh_mock.call_args_list[0][0][1]
-    assert "pod_stale" in rm_command
+    assert "pod_target" in rm_command and "pod_stale" not in rm_command
     assert "filler_a" not in rm_command and "volume_a" not in rm_command
 
 
