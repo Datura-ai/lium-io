@@ -36,9 +36,10 @@ _RESERVE_SECONDS = (
     SNAPSHOT_TIMEOUT_SECONDS + _RENTED_REREAD_TIMEOUT_SECONDS + WRITE_TIMEOUT_SECONDS + _AFTER_CHECK_SLACK_SECONDS
 )
 _REDIS_PREFIX = "idle_disk_write"
-# DAH-5385: the last reading, sent in the specs every cycle (the backend keeps only the latest specs) for filler start
-_READING_PREFIX = "idle_disk_write_mb_per_s"
+# DAH-5385: the last reading, sent in the specs every cycle (the backend keeps only the latest specs) for filler start;
+# also the Redis key prefix it is kept under
 SPECS_KEY = "idle_disk_write_mb_per_s"
+_READING_TTL_SECONDS = 3 * INTERVAL_SECONDS
 
 
 class IdleDiskWriteCheck:
@@ -87,7 +88,7 @@ class IdleDiskWriteCheck:
         disk = parse_disk(result.stdout or "")
         verdict = None
         if disk.mb_per_s is not None:
-            await ctx.services.redis.set(_reading_key(ctx), str(disk.mb_per_s), ex=3 * INTERVAL_SECONDS)
+            await ctx.services.redis.set(_reading_key(ctx), str(disk.mb_per_s), ex=_READING_TTL_SECONDS)
             verdict = "fail" if disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S else "pass"
         gpu_details = ctx.state.gpu_details or ctx.state.specs.get("gpu", {}).get("details", [])
         logger.info(
@@ -160,13 +161,18 @@ class IdleDiskWriteCheck:
 
 
 def _reading_key(ctx: Context) -> str:
-    return f"{_READING_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+    return f"{SPECS_KEY}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
 
 
 async def _last_reading(ctx: Context) -> float | None:
     try:
-        raw = await ctx.services.redis.get(_reading_key(ctx))
-        return float(raw) if raw is not None else None
+        key = _reading_key(ctx)
+        raw = await ctx.services.redis.get(key)
+        if raw is None:
+            return None
+        # a filler node that stays busy goes unmeasured for days: the reading lives until it is replaced
+        await ctx.services.redis.set(key, raw, ex=_READING_TTL_SECONDS)
+        return float(raw)
     except Exception:  # noqa: BLE001 — no reading is sent as none: the backend then allows every filler
         return None
 

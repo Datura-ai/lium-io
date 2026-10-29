@@ -179,6 +179,24 @@ async def test_the_last_reading_goes_to_the_backend_every_cycle_until_the_next()
             assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
 
 
+async def test_a_node_left_unmeasured_for_days_keeps_its_reading():
+    with flags() as clock:
+        ctx, _, redis = make_ctx(clock, due=False)
+        key = f"{module.SPECS_KEY}:miner-hotkey:{EXECUTOR.uuid}"
+        redis.store[key] = "13.0"
+        expiries = []
+        real_set = redis.set
+
+        async def set_(k, v, ex=None):
+            expiries.append((k, ex))
+            await real_set(k, v, ex)
+
+        redis.set = set_
+        res = await IdleDiskWriteCheck().run(ctx)
+    assert res.updates["state"].specs[module.SPECS_KEY] == 13.0
+    assert (key, module._READING_TTL_SECONDS) in expiries
+
+
 async def test_skips_a_node_rented_at_cycle_start_or_since():
     with flags() as clock:
         ctx, runner, _ = make_ctx(clock, rented_data=POD)
