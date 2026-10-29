@@ -36,6 +36,9 @@ LAST_SCORED_RESULT_TTL_SECONDS = 60 * 60
 # DAH-4698: creates the backend sent that are running in this connector right now, by pod id; what is left when a
 # connector starts was cut off by the restart (a redeploy recreates the connector mid-create)
 INFLIGHT_BACKEND_CREATES_KEY = "inflight_backend_creates"
+# DAH-5380: a renter's ContainerCreated sent but not yet answered by the backend's rent-finished, by pod id; resent
+# after a reconnect, since a backend restart can drop it after the send and leave the pod PENDING
+UNACKED_CONTAINER_CREATED_KEY = "unacked_container_created"
 BACKEND_COMMAND_PREFIX = "backend_command:"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
@@ -642,6 +645,8 @@ class RedisService:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
         else:
             await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
+        # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
+        await self.remove_unacked_container_created(pod_id)
 
     async def claim_backend_command(self, command_id: str, claim: str) -> BackendCommand | None:
         key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
@@ -695,6 +700,20 @@ class RedisService:
 
     async def remove_inflight_backend_create(self, pod_id: str) -> None:
         await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+
+    async def add_unacked_container_created(self, pod_id: str, message_json: str) -> None:
+        await self.hset(UNACKED_CONTAINER_CREATED_KEY, pod_id, message_json)
+
+    async def remove_unacked_container_created(self, pod_id: str) -> None:
+        await self.hdel(UNACKED_CONTAINER_CREATED_KEY, pod_id)
+
+    async def unacked_container_created(self) -> dict[str, str]:
+        """pod id -> the ContainerCreated JSON the backend has not answered yet"""
+        raw = await self.hgetall(UNACKED_CONTAINER_CREATED_KEY)
+        return {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in raw.items()
+        }
 
     async def inflight_backend_creates(self) -> dict[str, InflightBackendCreate]:
         """pod id -> the create the backend sent for it"""

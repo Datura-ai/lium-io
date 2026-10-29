@@ -334,6 +334,7 @@ class ComputeClient:
             raise AuthenticationError("auth request received failed response", response.errors)
 
         self.ws = ws
+        await self.resend_unacked_container_created()
 
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
@@ -1040,6 +1041,53 @@ class ComputeClient:
             finally:
                 await self._untrack_backend_create_for_restart_report(job_request.pod_id)
 
+    async def _keep_until_rent_finished(self, created: ContainerCreated) -> None:
+        """DAH-5380: a backend restart can close the socket right after the send, losing the report and leaving the
+        pod PENDING; kept until rent-finished (remove_pending_pod) so the next connection resends it."""
+        redis_service = self.miner_service.redis_service
+        try:
+            # a filler's flag is already cleared here: the backend sends it no rent-finished
+            if await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, created.pod_id):
+                await redis_service.add_unacked_container_created(created.pod_id, created.model_dump_json())
+        except Exception as exc:  # best-effort: losing it only loses the resend
+            self._log_unacked_container_created_error(created.pod_id, exc)
+
+    async def resend_unacked_container_created(self) -> None:
+        redis_service = self.miner_service.redis_service
+        try:
+            unacked = await redis_service.unacked_container_created()
+        except Exception as exc:
+            self._log_unacked_container_created_error(None, exc)
+            return
+        for pod_id, message_json in unacked.items():
+            try:
+                created = ContainerCreated.model_validate_json(message_json)
+                if not await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id):
+                    # the pending flag expired or was wiped: the backend no longer waits on this create
+                    await redis_service.remove_unacked_container_created(pod_id)
+                    continue
+            except Exception as exc:
+                self._log_unacked_container_created_error(pod_id, exc)
+                continue
+            async with self.lock:
+                if any(isinstance(m, ContainerCreated) and m.pod_id == pod_id for m in self.message_queue):
+                    continue  # never left: the queue sends it
+                self.message_queue.append(created)
+            logger.warning(
+                _m(
+                    "Resending a created-container report the backend did not answer",
+                    extra=get_extra_info({**self.logging_extra, "pod_id": pod_id}),
+                )
+            )
+
+    def _log_unacked_container_created_error(self, pod_id: str | None, exc: Exception) -> None:
+        logger.error(
+            _m(
+                "Failed to keep or resend an unanswered created-container report",
+                extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, "error": str(exc)}),
+            )
+        )
+
     async def _track_backend_create_for_restart_report(self, job_request: ContainerCreateRequest) -> None:
         # best-effort: a Redis error loses only the restart report, never the create itself
         try:
@@ -1195,6 +1243,8 @@ class ComputeClient:
                 )
             )
 
+            if isinstance(response, ContainerCreated):
+                await self._keep_until_rent_finished(response)
             async with self.lock:
                 self.message_queue.append(response)
         elif isinstance(job_request, ContainerDeleteRequest):
