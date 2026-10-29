@@ -24,7 +24,6 @@ from ...const import (
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
-from services.executor_connectivity.port_selector import declared_ports
 from services.gpu_reset import renter_gpu_reset_in_progress
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
@@ -295,12 +294,13 @@ class TenantEnforcementCheck:
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
                     # node whose every listed pod is stale is idle and needs them, with or without the floor flag
-                    # the probe skipped the listed pods' ports; with every pod stale they are free again
-                    declared_external = {pair.external for pair in declared_ports(ctx.executor)}
-                    split_short = split_port_shortfall(
-                        ctx.state, {port for p in rented_pods for port in p.rented_ports} & declared_external
-                    )
+                    split_short = split_port_shortfall(ctx.state)
                     if split_short is not None and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                        # the probe skipped the stale pods' ports: re-probe them all, only answering ports count
+                        split_short = await _reprobe_split_shortfall(ctx, split_short)
+                    else:
+                        split_short = None
+                    if split_short is not None:
                         event = split_ports_event(
                             ctx, self.check_id, ctx.state, *split_short, what={"stale_pod": stale_what}, extra=extra
                         )
@@ -795,6 +795,35 @@ async def _recover_pod_after_stale_vloopback_mount(
             )
         )
         return False
+
+
+async def _reprobe_split_shortfall(
+    ctx: Context, split_short: tuple[int, tuple[int, int]]
+) -> tuple[int, tuple[int, int]] | None:
+    """Re-probe a split node whose every listed pod is stale, ports those pods held included; on any
+    error the shortfall stands, since an unprobed port is never credited."""
+    rented_data = ctx.state.rented_data
+    try:
+        result = await ctx.services.connectivity.verify_ports(
+            ctx.ssh,
+            ctx.miner_hotkey,
+            ctx.executor,
+            ctx.state.sysbox_runtime,
+            rented_ports=[],
+            filler_ports=rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else [],
+            log_ctx={
+                "pipeline_id": ctx.pipeline_id,
+                "job_batch_id": ctx.config.job_batch_id,
+                "miner_hotkey": ctx.miner_hotkey,
+                "executor_uuid": ctx.executor.uuid,
+                "executor_ip": ctx.executor.address,
+            },
+            min_ports=split_short[1][1],
+        )
+    except Exception:
+        logger.warning(_m("SPLIT_PORT_REPROBE_FAILED", extra=get_extra_info(ctx.default_extra)), exc_info=True)
+        return split_short
+    return split_port_shortfall(ctx.state, len(result.successful_ports))
 
 
 async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:

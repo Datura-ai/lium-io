@@ -595,8 +595,7 @@ async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented
     [
         ("stale", 2, "INSUFFICIENT_PORTS"),
         ("stale", 3, "INSUFFICIENT_PORTS"),
-        ("stale", 22, "INSUFFICIENT_PORTS"),
-        ("stale", 23, None),  # the stale pod's own freed port makes 24
+        ("stale", 23, "INSUFFICIENT_PORTS"),
         ("stale", 24, None),
         ("live", 2, None),
         ("live", 3, None),
@@ -671,13 +670,23 @@ async def test_a_split_node_with_every_port_open_passes_when_its_only_listed_pod
     assert tenant_result.passed is True
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("last_port, passed", [(40023, True), (40022, False)])
-async def test_a_split_node_declaring_exactly_its_split_target_counts_the_stale_pods_freed_ports(
-    context_factory, last_port, passed
-):
-    """8 GPUs, one per split: 24 ports. The stale rental held 40000-40002, which the probe skips; its container
-    is gone and the rental closed, so those ports count again. One declared port fewer stays short."""
+class Firewalled:
+    """Every probe tier answers on each port except the `blocked` ones."""
+
+    def __init__(self, blocked: set[int]):
+        self.blocked = blocked
+        self.calls: list[list[PortPair]] = []
+
+    async def verify(self, ports, *, max_ports=None, **_):
+        tested = list(ports if max_ports is None else ports[:max_ports])
+        self.calls.append(tested)
+        ok = [p for p in tested if p.external not in self.blocked]
+        bad = [p for p in tested if p.external in self.blocked]
+        return BatchResult(ok, bad) if max_ports is None else (ok, bad)
+
+
+def stale_split_ctx(context_factory, probe, last_port):
+    """8 GPUs, one per split (24 ports), declaring 40000-<last_port>; its only rental, on 40000-40002, closed."""
     from dataclasses import replace
 
     rented = RentedExecutorsResponse(
@@ -698,21 +707,50 @@ async def test_a_split_node_declaring_exactly_its_split_target_counts_the_stale_
     )
     ctx = run_context(
         context_factory,
-        connectivity(HostNetworkBatch(reachable=24), PublishedPorts(), PublishedPorts()),
+        connectivity(probe, probe, probe),
         rented_data=rented,
         ssh=PerPodSSHClient(running=set()),
         backend=PerPodBackendClient(active=set()),
         port_range=f"40000-{last_port}",
     )
-    ctx = ctx.model_copy(
+    return ctx.model_copy(
         update={"state": replace(ctx.state, gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=1)}
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_port, passed", [(40023, True), (40022, False)])
+async def test_a_split_node_declaring_exactly_its_split_target_counts_the_stale_pods_freed_ports(
+    context_factory, last_port, passed
+):
+    """The probe skips the stale rental's 40000-40002; with every pod stale the node is re-probed, those ports
+    answer and count. One declared port fewer stays short."""
+    probe = Firewalled(blocked=set())
+    ctx = stale_split_ctx(context_factory, probe, last_port)
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    probes_before = len(probe.calls)
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert ctx.state.specs["available_port_count"] == last_port - 40000 + 1 - 3  # probe skipped the rented three
+    assert len(probe.calls) > probes_before  # re-probed
+    assert {40000, 40001, 40002} <= {p.external for call in probe.calls[probes_before:] for p in call}
+    assert tenant_result.passed is passed
+    if not passed:
+        assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_stale_split_nodes_freed_ports_that_no_longer_answer_are_not_credited(context_factory):
+    """Reviewer's case: 40000-40023 declared, the closed rental's 40000-40002 now firewalled. The other 21
+    answer; the re-probe finds the three dead, so the node is still short of its 24."""
+    ctx = stale_split_ctx(context_factory, Firewalled(blocked={40000, 40001, 40002}), 40023)
 
     _, ctx = await apply(ctx, PortConnectivityCheck())
     _, ctx = await apply(ctx, PortCountCheck())
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
-    assert ctx.state.specs["available_port_count"] == last_port - 40000 + 1 - 3  # probe skipped the rented three
-    assert tenant_result.passed is passed
-    if not passed:
-        assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+    assert ctx.state.specs["available_port_count"] == 21
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
