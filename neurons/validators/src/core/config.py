@@ -770,11 +770,6 @@ class Settings(BaseSettings):
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
 
-    # A rented node missing from its miner's answer for ONE cycle is mostly a key upload that missed the miner's 10 s
-    # window: 86 of the 347 RENTED_EXECUTOR_NOT_LISTED rows on 19 Oct were back in the next answer. On: the row is
-    # written from the second consecutive miss. Off by default: provider scoring, enabling it is the penalty owners' call.
-    RENTED_NOT_LISTED_ONE_CYCLE_GRACE: bool = Field(env="RENTED_NOT_LISTED_ONE_CYCLE_GRACE", default=False)
-
     # DAH-2958 — express lane for never-validated executors. A new node is published only by
     # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and
     # then for the slowest miner in the fleet (2–9 min): node add → AVAILABLE p50 21.4 min over
