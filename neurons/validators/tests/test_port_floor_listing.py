@@ -584,3 +584,20 @@ async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented
     # rent path: no pod holds a port (a filler creates none), so all 4 are free to allocate
     busy_pod_ports: set[int] = set()
     assert len(set(specs["verified_ports"]) - busy_pod_ports) >= MIN_PORT_COUNT
+
+
+@pytest.mark.asyncio
+async def test_an_externally_unreachable_idle_node_cannot_pass_the_floor_on_filler_ports(context_factory):
+    """DAH-4537 review: a firewalled idle node whose filler holds 3 ports fails INSUFFICIENT_PORTS;
+    the filler's ports sit behind the same firewall, so the rent guard must not allocate them."""
+    rented_data = RentedExecutorsResponse(
+        executors={}, filler_ports_by_executor={"executor-123": [2001, 2002, 2003]}
+    )
+    state = build_state(
+        verified_port_count=0, specs={"verified_ports": []}, rented_data=rented_data, externally_unreachable=True
+    )
+    result = await PortCountCheck().run(context_factory(state=state))
+
+    assert result.passed is False
+    assert result.updates["port_count"] == 0
+    assert result.updates["state"].specs["verified_ports"] == []

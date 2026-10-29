@@ -171,6 +171,8 @@ class ContextState:
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
     # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause.
     dind_probe_error: DindLogCause | None = None
+    # the outside prober could not reach the ports: our filler's ports are behind the same firewall
+    externally_unreachable: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.

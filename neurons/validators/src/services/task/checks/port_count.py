@@ -84,7 +84,8 @@ class PortCountCheck:
         # cleanup) and frees them, so they join both the count and verified_ports, the set the
         # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
         probed = list((ctx.state.specs or {}).get("verified_ports") or [])
-        held = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
+        # an outside-unreachable node's filler ports are firewalled too, so they cannot lift it over the floor
+        held = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data and not ctx.state.externally_unreachable else []
         filler_ports = sorted(set(held) - set(probed))
         verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
         port_count = ctx.state.verified_port_count + len(filler_ports)
