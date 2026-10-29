@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterable
 
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -13,16 +14,23 @@ MAX_PORT = 65535
 def declared_ports(executor_info: ExecutorSSHInfo) -> list[PortPair]:
     """Every port pair the executor declares, ssh port excluded, sorted by internal port.
 
-    One pair per external port and per internal port (the first, lowest internal wins): a renter
-    reaches a pod through the external port and the rental binds the internal one, so a repeated
-    port on either side is one usable port, and probing it twice would count it twice.
+    One pair per external port and per internal port: a renter reaches a pod through the external
+    port and the rental binds the internal one, so a repeated port on either side is one usable
+    port, and probing it twice would count it twice. An external port keeps only the internal port
+    the backend binds for it (its first mapping in declared order), so a verified port is never
+    rented onto a different internal port than the one probed.
     """
+    rental_internal: dict[int, int] = {}
+    for internal, external in json.loads(executor_info.port_mappings or "[]"):
+        rental_internal.setdefault(int(external), int(internal))
     pairs: list[PortPair] = []
     seen_internal: set[int] = set()
     seen_external: set[int] = set()
     for internal, external in get_all_ports(
         executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port
     ):
+        if rental_internal.get(external, internal) != internal:
+            continue
         if internal in seen_internal or external in seen_external:
             continue
         seen_internal.add(internal)
