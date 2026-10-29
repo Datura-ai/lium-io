@@ -37,6 +37,7 @@ from .idle_disk_write import IdleDiskWriteCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
+from .rented_pod_network import RentedPodNetworkCheck
 from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
@@ -81,6 +82,7 @@ __all__ = [
     "GpuVramPrecheck",
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
+    "RentedPodNetworkCheck",
     "RentedPodResourcesCheck",
     "RentedThroughputCheck",
     "SshdAuthLogCheck",
