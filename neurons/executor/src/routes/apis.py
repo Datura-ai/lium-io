@@ -549,7 +549,7 @@ async def local_verify(request: Request):
     Auth is the validator hotkey signature every validator-facing route here uses
     (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
     (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
-    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
+    window. (An image without the route answers 422 from MinerMiddleware;
     the validator treats every non-200 as "use SSH".)
     """
     intent = await _admit_verify_intent(request)
