@@ -12,7 +12,7 @@ which only a keyless dev build honours). `host` writes:
 - `/etc/liumd/validator_hotkeys`: the validator hotkeys this image trusts (`core.config`, fixed at
   build like the executor's own trust anchor), one SS58 per line;
 - `/etc/liumd/miner_hotkey`: `MINER_HOTKEY_SS58_ADDRESS`;
-- `/etc/liumd/pool_hotkey`: `LIUM_POOL_HOTKEY` (empty = liumd accepts only the miner hotkey);
+- `/etc/liumd/pool_hotkey`: `LIUM_POOL_HOTKEY`, empty when it is `DEFAULT_MINER_HOTKEY` (empty = liumd accepts only the miner hotkey);
 - `/etc/liumd/ports.json`: `{"port_range", "port_mappings", "ssh_port"}` from `RENTING_PORT_RANGE`,
   `RENTING_PORT_MAPPINGS` and `SSH_PORT`;
 - and makes sure `/var/lib/liumd/nonces` exists, writable by root only.
@@ -133,7 +133,10 @@ def main(argv: list[str]) -> int:
             nonce_dir=NONCE_DIR,
             validator_hotkeys=VALIDATOR_HOTKEYS_SS58,
             miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
-            pool_hotkey=settings.LIUM_POOL_HOTKEY,
+            # liumd knows no portal hotkey: drop it here, as accepted_miner_hotkeys does
+            pool_hotkey=""
+            if settings.LIUM_POOL_HOTKEY.strip() == settings.DEFAULT_MINER_HOTKEY
+            else settings.LIUM_POOL_HOTKEY,
             port_range=settings.RENTING_PORT_RANGE,
             port_mappings=settings.RENTING_PORT_MAPPINGS,
             ssh_port=settings.SSH_PORT,

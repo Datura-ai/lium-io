@@ -158,3 +158,16 @@ def test_the_wrapper_hands_the_image_manifest_to_the_binary(tmp_path):
     )
 
     assert out.stdout.strip() == "/etc/liumd/children.json|unset|run"
+
+
+def test_a_pool_equal_to_the_portal_hotkey_reaches_liumd_as_no_pool(tmp_path, monkeypatch):
+    """liumd knows no portal hotkey of its own; the executor drops one here, as accepted_miner_hotkeys does."""
+    import core.config as config
+
+    monkeypatch.setattr(hf, "ETC_DIR", tmp_path / "etc")
+    monkeypatch.setattr(hf, "NONCE_DIR", tmp_path / "nonces")
+    monkeypatch.setattr(config.settings, "LIUM_POOL_HOTKEY", config.settings.DEFAULT_MINER_HOTKEY)
+
+    assert hf.main(["host"]) == 0
+
+    assert (tmp_path / "etc/pool_hotkey").read_text() == "\n"
