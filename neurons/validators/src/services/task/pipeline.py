@@ -107,7 +107,6 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
@@ -204,6 +203,8 @@ class CheckResult(BaseModel):
     # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
     # when the node has no live rental). None = fall back to the check's class default.
     fatal: bool | None = None
+    # Events of checks this one ran inside itself, reported before its own (the scrape's GPU_LOST hold).
+    extra_events: list[ValidationEvent] = []
 
 
 class Context(BaseModel):
@@ -627,6 +628,9 @@ class Pipeline:
                         )
                     )
 
+                for extra_event in res.extra_events:
+                    await self.sink.emit(extra_event)
+                    events.append(extra_event)
                 await self.sink.emit(res.event)
                 events.append(res.event)
 

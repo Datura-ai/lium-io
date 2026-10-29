@@ -1342,7 +1342,6 @@ async def test_delete_container_redis_failures_still_deleted(
 ):
     # Arrange: redis is down — rented-machine cleanup and the inspector lookup both raise;
     # the container is already removed, so the undeploy must still succeed (DAH-2345)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     docker_service.redis_service.remove_rented_machine = AsyncMock(
         side_effect=Exception("redis down")
@@ -2391,7 +2390,6 @@ def _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
 
 @pytest.mark.asyncio
 async def test_create_customer_rental_starts_inspector_collector(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2521,60 +2519,6 @@ async def test_create_steps_after_reply_past_the_timeout_are_cancelled_and_close
     assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01) is True
 
 
-@pytest.mark.asyncio
-async def test_create_customer_rental_skips_inspector_collector_when_disabled(
-    docker_service,
-    monkeypatch,
-):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", False)
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    lifecycle_spy = AsyncMock()
-    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
-
-    pod_id = str(uuid4())
-    payload = ContainerCreateRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=pod_id,
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        docker_image="daturaai/dlph:test",
-        user_public_keys=["ssh-ed25519 test-key"],
-        gpu_uuids=["GPU-test"],
-        cpu_count=1,
-        memory_gb=1,
-        volume_limit_gb=2,
-        storage_limit_gb=1,
-        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
-        pod_mapping=[],
-        active_container_names=[],
-        active_volume_names=[],
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-
-    result = await docker_service.create_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    await _drain_create_steps_after_reply(payload.pod_id)
-    lifecycle_spy.assert_not_awaited()
-    inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
-    )
-    assert inspector_step.skipped is True
-
-
 def _cvm_socket_payload(workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerCreateRequest:
     return ContainerCreateRequest(
         miner_hotkey="miner",
@@ -2690,7 +2634,6 @@ async def test_create_container_no_quote_socket_for_filler_on_cvm_node(docker_se
 
 @pytest.mark.asyncio
 async def test_create_filler_starts_inspector_collector(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2745,7 +2688,6 @@ async def test_delete_last_customer_rental_stops_inspector_collector(
     retry_ssh_mock,
     monkeypatch,
 ):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2829,7 +2771,6 @@ async def test_delete_last_filler_stops_inspector_collector(
     retry_ssh_mock,
     monkeypatch,
 ):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -4681,6 +4622,97 @@ async def test_rental_create_removes_the_failed_container_before_the_stale_mount
 
     assert container_id == "cid"
     assert events == ["run", "rm pod_test", "run"]
+
+
+@contextlib.asynccontextmanager
+async def _another_create_live(pod_id: str, live: bool):
+    """Hold a second, separate create for the pod (its own task) while the body runs."""
+    registered, release = asyncio.Event(), asyncio.Event()
+
+    async def other_create():
+        with docker_service_module.inflight_creates.track(pod_id):
+            registered.set()
+            await release.wait()
+
+    other = asyncio.create_task(other_create()) if live else None
+    if other:
+        await registered.wait()
+    try:
+        yield
+    finally:
+        release.set()
+        if other:
+            await other
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "conflict_name, live_creates, expected_events",
+    [
+        # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
+        ("pod_test", 1, ["run", "rm pod_test", "run"]),
+        # the earlier attempt is still live (its start may fail later and clean up by name): touch nothing
+        ("pod_test", 2, ["run"]),
+        ("pod_other", 1, ["run"]),
+    ],
+)
+async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
+    docker_service, monkeypatch, conflict_name, live_creates, expected_events,
+):
+    events: list[str] = []
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            if events.count("run") == 1:
+                raise Exception(
+                    f'409 Client Error: Conflict ("Conflict. The container name "/{conflict_name}" '
+                    'is already in use by container "25b3b093".")'
+                )
+            return "cid"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        # production registers one create twice: the job runner, then the miner handler
+        with registry.track("test"), registry.track("test"):
+            run = docker_service._run_rental_docker_create_with_port_retry(
+                docker_client=FakeRentalClient(),
+                ssh_client=Mock(),
+                run_spec=ContainerRunSpec(image="img", name="pod_test"),
+                container_name="pod_test",
+                default_extra={},
+                pod_id="test",
+            )
+            if "rm pod_test" in expected_events:
+                assert await run == "cid"
+            else:
+                with pytest.raises(Exception, match="already in use"):
+                    await run
+    assert events == expected_events
+    assert not registry.is_running("test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_creates, removed", [(1, True), (2, False)])
+async def test_failed_create_without_container_id_removes_by_name_only_when_no_other_create_is_live(
+    docker_service, monkeypatch, live_creates, removed,
+):
+    monkeypatch.setattr(
+        docker_service, "capture_failed_container_diagnostics", AsyncMock(return_value=Mock(container_missing=False))
+    )
+    ssh_commands = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        with registry.track("test"), registry.track("test"):
+            await docker_service.cleanup_failed_container_creation(
+                ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
+            )
+    assert any("rm -fv pod_test" in str(call) for call in ssh_commands.call_args_list) is removed
 
 
 @pytest.mark.asyncio
@@ -7880,6 +7912,26 @@ async def test_a_key_injection_that_fails_on_an_exiting_image_names_the_image(
     assert "sleep infinity" in error
     # the exec's own text is kept for ops
     assert error.endswith(f"Exec error: {_EXEC_KILLED_BY_EXIT}")
+
+
+@pytest.mark.asyncio
+async def test_a_filler_that_exits_at_start_sends_its_log_tail_as_its_own_detail_field(
+    docker_service, monkeypatch
+) -> None:
+    docker_service.rental_docker_client_factory.client.container_log_tail = AsyncMock(
+        return_value="error: missing --pool\n"
+    )
+
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="exited", running=False, exit_code=1),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+    )
+
+    detail_fields = json.loads(result.detail.split(" >>> ", 1)[1])
+    assert detail_fields["container_logs_tail"] == "error: missing --pool"
+    assert "missing --pool" not in detail_fields["error"]
 
 
 @pytest.mark.asyncio

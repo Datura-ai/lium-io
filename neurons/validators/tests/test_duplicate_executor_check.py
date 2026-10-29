@@ -1,7 +1,5 @@
 import pytest
 
-from core.config import settings
-
 from neurons.validators.src.services.redis_service import DUPLICATED_MACHINE_SET
 from neurons.validators.src.services.task.checks.duplicate_executor import DuplicateExecutorCheck
 from neurons.validators.src.services.task.messages import DuplicateExecutorMessages as Msg
@@ -40,7 +38,6 @@ def _make_ctx(redis_service, context_factory, miner_hotkey: str = "miner-hotkey"
 
 @pytest.mark.asyncio
 async def test_duplicate_enforce_mode_fails_and_clears(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "DUPLICATE_EXECUTOR_DRY_RUN", False)
     redis_service = FakeRedis()
     ctx = _make_ctx(redis_service, context_factory)
     elem = f"{ctx.miner_hotkey}:{ctx.executor.uuid}"

@@ -70,6 +70,7 @@ from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
+from services.task.checks.duplicate_executor import _gpu_uuids
 from services.task.availability import (
     availability_errors,
     build_executor_unreachable_by_miner_event,
@@ -359,6 +360,8 @@ class MinerService:
         # per miner hotkey, the rented executor uuids it left out of its previous answer (RENTED_NOT_LISTED_ONE_CYCLE_GRACE).
         # shortcut: in memory, so a restart costs one extra cycle before a real outage is reported.
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
+        # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
+        self.published_gpu_uuids: dict[str, set[str]] = {}
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -464,6 +467,49 @@ class MinerService:
         for executor_id in [e for e, lane in self.in_flight.items() if lane == CYCLE_DONE]:
             del self.in_flight[executor_id]
 
+    async def publish_new_executors_at_pass(self, job: dict | None) -> None:
+        """A wave result that passed, for an executor no cycle has published yet, is published as
+        soon as its miner answers, spec-only like the express lane's (no scored_at): at the cycle's
+        end it waited for the slowest miner in the fleet, 9-14 min (a node verified at 17:51 was
+        listed at 18:03). The cycle still scores and publishes it as today. Never fails the wave."""
+        if not job:
+            return
+        try:
+            validated = await self.redis_service.get_validated_executors()
+            if not validated:
+                # cold set (fresh box or Redis wipe): every executor would look new; the cycle publishes
+                return
+            new = [
+                result
+                for result in job.get("results", [])
+                if result.is_successful
+                and not result.is_rented
+                and result.executor_info.uuid not in validated
+            ]
+            if not new:
+                return
+            await self.publish_machine_specs(
+                new, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+            logger.info(
+                _m(
+                    "[sync] New executors published at pass, ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [r.executor_info.uuid for r in new],
+                        }
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[sync] Could not publish new executors at pass; the cycle publishes them",
+                    extra=get_extra_info({"error": str(exc)}),
+                )
+            )
+
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
         return public_key.decode("utf-8") if isinstance(public_key, bytes) else public_key
@@ -520,7 +566,7 @@ class MinerService:
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
         (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
         try:
-            return await self._route_job_to_miner(
+            job = await self._route_job_to_miner(
                 payload,
                 encrypted_files,
                 rented_data,
@@ -529,6 +575,9 @@ class MinerService:
                 executor_id=executor_id,
                 first_pass=first_pass,
             )
+            if executor_id is None:
+                await self.publish_gpu_set_changes(job)
+            return job
         finally:
             if executor_id is None:
                 self._stop_awaiting_wave_list(payload)
@@ -718,6 +767,7 @@ class MinerService:
             # exempt the node from spot-tier or Discord exclusions.
             is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
             is_on_spot_pay_list = is_spot and executor_uuid in (rented_data.provider_spot_executor_ids or [])
+            is_in_maintenance = executor_uuid in (rented_data.maintenance_executor_ids or [])
             discord_connected_ids = rented_data.provider_discord_connected_executor_ids
             provider_discord_connected = (
                 True if discord_connected_ids is None else executor_uuid in discord_connected_ids
@@ -754,6 +804,7 @@ class MinerService:
                     is_spot=is_spot,
                     is_on_spot_pay_list=is_on_spot_pay_list,
                     provider_discord_connected=provider_discord_connected,
+                    is_in_maintenance=is_in_maintenance,
                 )
             )
 
@@ -1092,6 +1143,56 @@ class MinerService:
         await self.redis_service.request_forced_validation_cycle()
         logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
 
+    async def publish_gpu_set_changes(self, job: dict | None) -> None:
+        """Publish at once a passed node that lost a GPU UUID since the spec last published for it.
+
+        The backend rents the GPU UUIDs of the spec it has, and the cycle publishes only once every
+        miner is done (up to ~15 min later); until then every rent of such a node fails the gpu_flags
+        guard (a card back under a new UUID, 27 Oct). Spec-only like the express lane, scored_at None;
+        the cycle's publish overwrites it. A UUID another of the miner's executors reports too waits for
+        the cycle's duplicate pass.
+        """
+        try:
+            if not job or not job.get("miner_coldkey"):
+                return
+            results: list[JobResult] = job.get("results") or []
+            changed = []
+            for result in results:
+                published = self.published_gpu_uuids.get(str(result.executor_info.uuid).lower())
+                current = set(_gpu_uuids(result))
+                if not (published and current and result.is_successful) or published <= current:
+                    continue
+                elsewhere = {
+                    uuid
+                    for other in results
+                    if other is not result and other.is_successful
+                    for uuid in _gpu_uuids(other)
+                }
+                if not current & elsewhere:
+                    changed.append(result)
+            if not changed:
+                return
+            logger.info(
+                _m(
+                    "Publishing nodes whose GPU UUIDs changed ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [str(result.executor_info.uuid) for result in changed],
+                        }
+                    ),
+                ),
+            )
+            await self.publish_machine_specs(
+                changed, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+        except Exception as exc:
+            # never costs the miner its cycle result: the cycle still publishes the node
+            logger.error(
+                _m("Early publish of changed GPU UUIDs failed", extra=get_extra_info({"error": str(exc)})),
+                exc_info=True,
+            )
+
     async def publish_machine_specs(
         self,
         results: list[JobResult],
@@ -1197,6 +1298,9 @@ class MinerService:
                     exc_info=True,
                 )
                 continue
+            # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
+            if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
+                self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
             if settings.POD_STATES_REPORT_ENABLED:
                 await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
@@ -2152,12 +2256,15 @@ class MinerService:
                         log_extra=default_extra,
                         operation_name="SSH key submit",
                     )
-                    break
+                    # A request held up by the restart reaches the new miner after the signature aged out.
+                    stale = status == 401 and "too old" in str(response_data)
+                    if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
+                        break
                 except aiohttp.ClientConnectorError:
                     is_create = isinstance(payload, ContainerCreateRequest)
                     if not is_create or time.monotonic() >= deadline:
                         raise
-                    await asyncio.sleep(MINER_RESTART_RETRY_S)
+                await asyncio.sleep(MINER_RESTART_RETRY_S)
 
             if status != 200 or response_data is None:
                 error_msg = "Failed to submit SSH key"

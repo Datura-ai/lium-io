@@ -201,6 +201,28 @@ async def test_rental_verification_failed():
 
 
 @pytest.mark.asyncio
+async def test_rental_verification_empty_kernel_gpu_list_says_restart_the_executor():
+    """An empty kernel GPU list is a stale executor container, so the remediation must say restart it."""
+    error = "GPU 'GPU-4edea549-e08e-fdc6-09f2-b3c7880cc708' requested by tenant not present on executor; visible: []"
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=False, error=error, details={"docker_stderr": error})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FAILED.reason
+    assert "docker restart executor-executor-1" in result.event.remediation
+    assert result.event.what_we_saw["error"] == error
+
+
+@pytest.mark.asyncio
 async def test_rental_verification_nvml_mismatch_clears_verified_job_info():
     """Exact GPU runtime mismatch should mark the executor unhealthy."""
     stderr = (
@@ -694,6 +716,7 @@ async def test_rental_verification_filler_ssh_transport_error_fails_without_rech
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
+    assert result.event.severity == "error"
     assert backend_client.filler_run_active_calls == []
 
 
@@ -978,8 +1001,7 @@ def _cpu_quota_response() -> ExecutorHealthCheckResponse:
 
 
 @pytest.mark.asyncio
-async def test_cpu_quota_verdict_is_observe_only_in_shadow():
-    """CHECK on, ENFORCEMENT off: the daemon-rejected count is logged but the score is untouched."""
+async def test_cpu_quota_verdict_zeroes_score():
     backend_client = DummyBackendClient(response=_cpu_quota_response())
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
@@ -987,30 +1009,7 @@ async def test_cpu_quota_verdict_is_observe_only_in_shadow():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = False
-        result = await RentalVerificationCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON
-    assert result.updates == {}
-    assert result.event.what_we_saw["advertised_cpu_count"] == 176
-    assert "Range of CPUs is from" in result.event.what_we_saw["stderr"]
-
-
-@pytest.mark.asyncio
-async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
-    backend_client = DummyBackendClient(response=_cpu_quota_response())
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         result = await RentalVerificationCheck().run(ctx)
 
     assert result.passed is False
@@ -1031,8 +1030,7 @@ async def test_advertised_cpu_count_is_sent_to_the_backend():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 44
@@ -1053,29 +1051,10 @@ async def test_fake_present_population_does_not_cap_the_advertised_count():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44, present=176))
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 176
-
-
-@pytest.mark.asyncio
-async def test_cpu_count_is_not_sent_when_the_check_is_disabled():
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 44}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state)
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = False
-        await RentalVerificationCheck().run(ctx)
-
-    assert backend_client.called_with["cpu_count"] is None
 
 
 @pytest.mark.asyncio
@@ -1092,8 +1071,7 @@ async def test_cpu_count_is_not_sent_for_a_tdx_host():
     executor.tdx_quote = '{"quote": "..."}'
     ctx = make_context(executor=executor, services=services, state=state)
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] is None
@@ -1125,7 +1103,6 @@ async def test_rental_verification_filler_create_kill_enforcement_fails():
     assert backend_client.called_with is None
 
 
-@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_rental_verification_filler_create_kill_ignored_for_a_customer_rental():
     """A paying customer's pod is never punished for the node's default-job history."""

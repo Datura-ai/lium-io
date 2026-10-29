@@ -326,6 +326,19 @@ DPHN_CACHE_FREE_MARGIN_GB = 50
 # most this share of the node's real free disk. The backend puts its size in the name
 # (engy_cache_hf_<N>gb_...): the wire CacheVolume has no size field.
 FILLER_CACHE_MAX_FREE_DISK_SHARE = 0.3
+# DAH-5192: a FILLER's run volume (/root, preallocated) when its Engy checkpoint is in the mounted cache
+# (/root/models): the weights are not in it, so it needs room only for kernels, logs and scratch. The
+# backend's size (1900 GB for kimi-k3) still applies when the cache is refused. Tune here.
+FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE = 100
+# DAH-5192: an Engy checkpoint over FILLER_CACHE_MAX_FREE_DISK_SHARE of free disk is cached only when the node
+# still has this much free beside it. The backend gives kimi-k3 only to a node with 1900 + 100 GB free
+# (strategies.py required_free_disk_gb), and the cache stays used: with less beside it, the node never fits
+# the model again and the cache is dead disk. Below it the run re-downloads into its own volume.
+ENGY_CACHE_MIN_FREE_BESIDE_GB = 2000
+# DAH-5192: an Engy cache volume holding less than this share of its checkpoint (size in its name) is a
+# partial download, e.g. one a rental interrupted. It is kept and remounted, so the next run resumes it file
+# by file, but what is still missing is charged like a download.
+ENGY_CACHE_COMPLETE_SHARE = 0.98
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
 # container lives until the sweep above collects it, so the bound follows that grace with one cycle
@@ -435,6 +448,9 @@ TDX_WHITELIST = {
             # DAH-4631 — the same runner digest with EXECUTOR_SSH_SOURCE_PIN added to init_script.sh
             # (lium-io#1677). Version 6.
             "ae7ff74c04eb0626f7cd16822693298f2202650eba9e59b9daebe77a4e018c52": 6,
+            # DAH-5243 — runner sha256:f8421a1d… (executor-v1.156, 2026-10-26)
+            # includes /miner-identity for portal registration. Measured files unchanged.
+            "0cc30085543511090db2952809f104dd30ec7d8630abb9fc4cde8590068ec104": 7,
             # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
             # that runner bakes the STAGING validator hotkey via config_override.py and answers every
             # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.

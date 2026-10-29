@@ -37,7 +37,8 @@ DISK_HELPERS = {
     "get_docker_disk_usage",
     "cache_volume_bytes",
     "ENGY_CACHE_VOLUME_PREFIX",
-    "FILLER_CACHE_VOLUME_PREFIXES",
+    "FILLER_VOLUME_LABEL_KEY",
+    "FILLER_VOLUME_LABEL_VALUE",
     "release_filler_cache",
 }
 
@@ -81,7 +82,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_images": (45079943748 + 2000000000) // 1024,
         "hard_disk_containers": (282628096 + 1024) // 1024,
         "hard_disk_volumes": 5454000000 // 1024,
-        "filler_cache_kb": 0,
+        "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
     }
 
@@ -109,7 +110,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
         "hard_disk_volumes": 0,
-        "filler_cache_kb": 0,
+        "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
     }
 
@@ -449,8 +450,9 @@ def test_disk_usage_survives_a_silent_docker_socket(scrape: dict, monkeypatch) -
     assert asked == ["/proc/1/root/var/lib/docker"]
 
 
-def test_filler_cache_volumes_are_reported_as_free_disk(scrape: dict) -> None:
-    # Arrange — DAH-5014: an engy checkpoint and a dolphin cache next to a renter's volume
+def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
+    # Arrange — an engy checkpoint and a dolphin cache next to a renter's volume. Kept across rentals
+    # (Fish 26 Oct), so a renter is listed the free disk beside them, not the disk they hold.
     _stub_docker_api(
         scrape,
         {
@@ -478,26 +480,91 @@ def test_filler_cache_volumes_are_reported_as_free_disk(scrape: dict) -> None:
     hard_disk.update(scrape["get_docker_disk_usage"]())
     scrape["release_filler_cache"](hard_disk)
 
-    # Assert — the cache moved from used to free and out of the volumes breakdown
+    # Assert — used/free untouched, the caches counted in the volumes breakdown
     assert hard_disk == {
         "hard_disk_total": 4000 * 1024**2,
-        "hard_disk_used": 60 * 1024**2,
-        "hard_disk_free": 3940 * 1024**2,
-        "hard_disk_utilization": 1.5,
+        "hard_disk_used": 1600 * 1024**2,
+        "hard_disk_free": 2400 * 1024**2,
+        "hard_disk_utilization": 40.0,
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
-        "hard_disk_volumes": 10 * 1024**2,
+        "hard_disk_volumes": 1550 * 1024**2,
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
     }
 
 
+def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeypatch) -> None:
+    # Arrange — an idle node running our filler: its preallocated 1900 GB run volume (labelled by the
+    # filler create) and a renter-style volume without the label
+    v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
+    blocks = {f"{v2_dir}/volume_filler": 1900 * 1024**3 // 512, f"{v2_dir}/volume_other": 10 * 1024**3 // 512}
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=lambda p: SimpleNamespace(st_blocks=blocks[p])))
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {"LayersSize": 0, "Containers": [], "Volumes": []},
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {
+                "Volumes": [
+                    {"Name": "volume_filler", "Driver": "vloopback:v2", "Labels": {"io.lium.workload": "filler"}},
+                    {"Name": "volume_other", "Driver": "vloopback:v2", "Labels": None},
+                ]
+            },
+        },
+    )
+    hard_disk = {
+        "hard_disk_total": 4000 * 1024**2,
+        "hard_disk_used": 1950 * 1024**2,
+        "hard_disk_free": 2050 * 1024**2,
+        "hard_disk_utilization": 48.75,
+    }
+
+    # Act
+    hard_disk.update(scrape["get_docker_disk_usage"]())
+    scrape["release_filler_cache"](hard_disk)
+
+    # Assert — only the filler's volume moved from used to free
+    assert hard_disk["hard_disk_free"] == 3950 * 1024**2
+    assert hard_disk["hard_disk_used"] == 50 * 1024**2
+    assert hard_disk["hard_disk_volumes"] == 10 * 1024**2
+
+
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:
     # Arrange — the host half of the scrape failed, the docker half did not
-    hard_disk = {"hard_disk_volumes": 0, "filler_cache_kb": 5}
+    hard_disk = {"hard_disk_volumes": 0, "filler_run_volume_kb": 5}
 
     # Act
     scrape["release_filler_cache"](hard_disk)
 
     # Assert
     assert hard_disk == {"hard_disk_volumes": 0}
+
+
+def test_a_capability_check_is_named_and_removed_even_when_it_times_out() -> None:
+    # DAH-5192: `--rm` never fires for a container a killed client created but never started
+    removed: list[list[str]] = []
+
+    def timing_out_run(command, **kwargs):
+        raise TimeoutError(command)
+
+    scrape = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {"CAPABILITY_CHECK_NAME_PREFIX", "run_capability_check"},
+        {
+            "os": os,
+            "subprocess": SimpleNamespace(run=timing_out_run, PIPE=-1),
+            "run_storage_probe": lambda command, timeout: removed.append(command),
+            "VLOOPBACK_CLEANUP_TIMEOUT_SECONDS": 10,
+        },
+    )
+
+    with pytest.raises(TimeoutError) as raised:
+        scrape["run_capability_check"](["docker", "run", "--rm", "--gpus", "all", "img", "nvidia-smi"])
+
+    command = raised.value.args[0]
+    name = command[command.index("--name") + 1]
+    assert command[:3] == ["docker", "run", "--rm"] and name.startswith("lium_capability_check_")
+    assert removed == [["docker", "rm", "-f", name]]
