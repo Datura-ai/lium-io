@@ -74,18 +74,24 @@ class StorageEventReporter:
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
-            if self._state.stage == "PREPARING" and self._restore_has_started():
+            if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
+            elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
+                # restic is running and scanning the snapshot; no file restored yet.
+                self._state.stage = "SCANNING"
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
+            return
+        if event_type == "rerun":
+            self._restic_failure_detail = self._diagnostic_detail = None
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
-        if event_type == "diagnostic":
+        if event_type in ("diagnostic", "log"):
             message = event.get("message")
             if isinstance(message, str) and message:
-                if self._diagnostic_detail is None:
+                if event_type == "diagnostic" and self._diagnostic_detail is None:
                     self._diagnostic_detail = message[:2000]
                 # Kept until a PUT succeeds, so throttled or failed updates do not drop them.
                 self._pending_logs = _newest_within_bytes(

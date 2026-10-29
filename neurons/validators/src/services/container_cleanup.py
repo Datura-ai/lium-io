@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import re
+from datetime import UTC, datetime, timedelta
 import shlex
 from typing import Awaitable, Callable, Optional
 
@@ -39,6 +40,13 @@ DPHN_CACHE_RECLAIM_FREE_FLOOR_GB = DPHN_CACHE_LISTING_FLOOR_GB
 # Remove at most this many per pass; GC runs each cycle, so a backlog drains
 # over a few passes without a huge `docker volume rm` command.
 VOLUME_RM_MAX_PER_PASS = 200
+
+# A rental's own volume is created as volume_<pod uuid>; nothing else on the host is named so.
+POD_VOLUME_NAME_PATTERN = re.compile(r"^volume_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+# Backend lookups go per candidate volume; a backlog drains over a few passes.
+ORPHAN_VOLUME_LOOKUPS_PER_PASS = 50
+# Wall-clock budget for those lookups, well inside the executor task timeout; the rest wait a pass.
+ORPHAN_VOLUME_LOOKUP_BUDGET_SECONDS = 30
 
 
 # DAH-2805: how long an abandoned download temporary may sit before the sweep removes it. The window
@@ -203,6 +211,8 @@ class ContainerCleanup:
     def __init__(self, stale_threshold_minutes: int = FILLER_CONTAINER_GRACE_MINUTES, dry_run: bool = False):
         self.stale_threshold_minutes = stale_threshold_minutes
         self.dry_run = dry_run
+        # per executor: the last orphan-volume candidate examined, so a capped pass resumes after it
+        self._orphan_volume_cursor: dict[str, str] = {}
 
     def _get_rented_containers(
         self, rented_data: Optional[RentedExecutorsResponse], executor_uuid: str
@@ -489,6 +499,116 @@ class ContainerCleanup:
             logger.warning(_m("DPHN cache reclaim failed", extra=extra | {"error": str(e)}))
             return 0
 
+    async def remove_orphan_rental_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        rented_data: Optional[RentedExecutorsResponse],
+        executor_uuid: str,
+        is_orphan: Callable[[str, timedelta], Awaitable[bool]],
+    ) -> int:
+        """Remove `volume_<uuid>` volumes whose pod or filler run is over and whose container is gone.
+
+        The orphan reaper removes a `volume_<id>` only together with its container, and the dangling
+        prune only matches anonymous (64-hex) names, so a named volume whose container was already
+        gone (a delete whose volume removal failed, a filler stopped without it) stayed for good.
+        A candidate must be a `volume_<uuid>` no container (running or stopped) mounts, and not a pod
+        or filler the fleet snapshot lists: the snapshot carries every pod status but BROKEN and
+        DELETING, so a stopped or failed-reboot pod keeps its volume. ``is_orphan(uuid, age)`` then
+        decides from the backend, ``age`` being the time since the volume was created. Returns how
+        many volumes were removed.
+        """
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            if rented_list_unknown_reason(rented_data) is not None:
+                return 0
+            dangling: Optional[list[str]] = await self._get_dangling_volumes(ssh_client)
+            listed_names: set[str] = listed_container_names(rented_data)
+            listed_pod_ids: set[str] = {
+                pod.pod_id for executor in rented_data.executors.values() for pod in executor.pods
+            }
+            candidates: list[str] = sorted(
+                name
+                for name in dangling or []
+                if (match := POD_VOLUME_NAME_PATTERN.match(name))
+                and match[1] not in listed_pod_ids
+                and f"{POD_CONTAINER_PREFIX}{match[1]}" not in listed_names
+                and f"{FILLER_CONTAINER_PREFIX}{match[1]}" not in listed_names
+            )
+            # resume after the last pass's batch, wrapping around, so volumes that are kept or cannot
+            # be dated never starve the ones behind them
+            after: str = self._orphan_volume_cursor.get(executor_uuid, "")
+            candidates = ([n for n in candidates if n > after] + [n for n in candidates if n <= after])[
+                :ORPHAN_VOLUME_LOOKUPS_PER_PASS
+            ]
+            if not candidates:
+                return 0
+            self._orphan_volume_cursor[executor_uuid] = candidates[-1]
+
+            ages: dict[str, timedelta] = await self._volume_ages(ssh_client, candidates)
+            orphans: list[str] = []
+            # a pass cut off by the budget resumes AT the in-flight candidate, so a slow one is not
+            # skipped behind faster ones; only a first candidate that eats the whole budget is passed
+            self._orphan_volume_cursor[executor_uuid] = candidates[0]
+            try:
+                async with asyncio.timeout(ORPHAN_VOLUME_LOOKUP_BUDGET_SECONDS):
+                    for name in candidates:
+                        if name in ages and await is_orphan(name.removeprefix("volume_"), ages[name]):
+                            orphans.append(name)
+                        self._orphan_volume_cursor[executor_uuid] = name
+            except TimeoutError:
+                logger.info(
+                    _m("Orphan volume lookups hit the pass budget; resuming next pass", extra=extra)
+                )
+            if not orphans:
+                return 0
+            if self.dry_run:
+                logger.info(
+                    _m(
+                        f"[DRY RUN] Would remove {len(orphans)} orphan rental volume(s)",
+                        extra=extra | {"volumes": orphans, "dry_run": True},
+                    )
+                )
+                return 0
+
+            await ssh_client.run(DockerCommand.volume_remove(*orphans))
+            # `volume_remove` ends in `|| true`: re-list to report only what is really gone
+            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, ("volume_",)))
+            removed: list[str] = [name for name in orphans if name not in surviving]
+            if removed:
+                logger.info(
+                    _m(f"Removed {len(removed)} orphan rental volume(s)", extra=extra | {"volumes": removed})
+                )
+            return len(removed)
+        except Exception as e:
+            logger.warning(_m("Orphan rental volume removal failed", extra=extra | {"error": str(e)}))
+            return 0
+
+    async def _volume_ages(self, ssh_client: asyncssh.SSHClientConnection, names: list[str]) -> dict[str, timedelta]:
+        # time since each volume was created, by the host's clock; a volume it cannot date is left out
+        quoted = " ".join(shlex.quote(name) for name in names)
+        result = await ssh_client.run(
+            f"date +%s; /usr/bin/docker volume inspect --format '{{{{.Name}}}} {{{{.CreatedAt}}}}' {quoted}"
+        )
+        lines = (result.stdout or "").splitlines()
+        if not lines or not lines[0].strip().isdigit():
+            return {}
+        now = datetime.fromtimestamp(int(lines[0].strip()), UTC)
+        ages: dict[str, timedelta] = {}
+        for line in lines[1:]:
+            name, _, created = line.strip().partition(" ")
+            try:
+                ages[name] = now - datetime.fromisoformat(created.strip())
+            except ValueError:
+                continue
+        return ages
+
+    async def _get_dangling_volumes(self, ssh_client) -> Optional[list[str]]:
+        # every volume no container (in any state) references; None if listing failed
+        result = await ssh_client.run(DockerCommand.volume_ls_dangling())
+        if result.exit_status != 0:
+            return None
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
     async def _has_running_filler_or_pod(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
         # A cache a live filler still mounts is in use; a live rental keeps it (two name filters OR).
         result = await ssh_client.run(
@@ -617,10 +737,9 @@ class ContainerCleanup:
 
     async def get_dangling_anonymous_volumes(self, ssh_client) -> Optional[list[str]]:
         # anonymous (64-hex) volumes referenced by no container; None if listing failed
-        result = await ssh_client.run(DockerCommand.volume_ls_dangling())
-        if result.exit_status != 0:
+        names = await self._get_dangling_volumes(ssh_client)
+        if names is None:
             return None
-        names = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
         return [name for name in names if ANON_VOLUME_NAME_PATTERN.match(name)]
 
     async def force_remove_health_checks(

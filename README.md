@@ -57,7 +57,7 @@ Per GPU host (the full list is in the [Node Quickstart](https://docs.lium.io/pro
 - **GPU:** an NVIDIA model on the [supported list](https://docs.lium.io/providers/architecture#supported-gpus) (the validator's source of truth is `GPU_MODEL_RATES` in [`neurons/validators/src/services/const.py`](neurons/validators/src/services/const.py)), with the driver installed (`nvidia-smi` works).
 - **Docker Engine**, installed and running.
 - **Network:** a public IP and at least **100 Mbps download**, as measured by the validator.
-- **Hardware:** at least 8 GB RAM and 140 GB free disk before the first install (100 GB once the node's images are pulled). For idle pay, total disk must be at least **1.5× total GPU VRAM**.
+- **Hardware:** at least 8 GB RAM and 140 GB free disk before the first install (100 GB once the node's images are pulled). For idle pay, total disk must be at least **1.5× total GPU VRAM**. The node removes the volumes of ended rentals by itself, and below 100 GB free or above 90% used also the images no container uses.
 - **A registered hotkey** on Subnet 51 (below). Keep your coldkey off the server.
 
 ### Ports
