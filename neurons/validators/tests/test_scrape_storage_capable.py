@@ -1,7 +1,8 @@
 """DAH-1997 (26 Oct plan): the storage limit and who must build it, as machine_scrape.py decides.
 
 The limit counts only for overlay2 on xfs mounted with pquota (and a `--storage-opt size=` container that runs);
-a probe that timed out gives no verdict (None), not "no limit". A host is capable of building the limit when
+a probe that timed out, or whose container did not run after the setup passed, gives no verdict (None), not "no
+limit". A host is capable of building the limit when
 `lium gpu-splitting setup` could place its xfs image file: on the local filesystem with the most free space, other
 than docker's own mount, 100 GiB left after a reserve of max(10%, 20 GiB); otherwise it keeps the warning only.
 """
@@ -91,12 +92,37 @@ def test_a_missing_driver_filesystem_or_pquota_is_not_supported_even_if_the_cont
     assert missing in detail
 
 
-def test_a_container_that_does_not_run_is_not_supported(tmp_path):
+def test_a_container_that_does_not_run_after_the_setup_passed_gives_no_verdict(tmp_path):
+    # image, NVIDIA hook or daemon trouble is not a disk finding (Mikhail, 29 Oct)
     scrape = namespace(
-        tmp_path, DOCKER_XFS_PQUOTA, OVERLAY2, run=lambda *a, **k: SimpleNamespace(returncode=125)
+        tmp_path,
+        DOCKER_XFS_PQUOTA,
+        OVERLAY2,
+        run=lambda *a, **k: SimpleNamespace(returncode=125, stderr="pull access denied\n"),
     )
 
-    assert scrape["check_storage_limit_ability"]() == (False, "Storage limit is not supported.")
+    assert scrape["check_storage_limit_ability"]() == (
+        None,
+        "Test container exited 125: pull access denied",
+    )
+
+
+@pytest.mark.parametrize(
+    "info, mounts",
+    [({"DockerRootDir": "/var/lib/docker"}, DOCKER_XFS_PQUOTA), (OVERLAY2, "")],
+)  # docker info without a driver, no mount covering the data root
+def test_a_setup_docker_or_the_mounts_do_not_describe_gives_no_verdict(tmp_path, info, mounts):
+    supported, detail = namespace(tmp_path, mounts, info)["check_storage_limit_ability"]()
+
+    assert supported is None
+    assert detail.startswith("Storage limit setup unknown")
+
+
+def test_the_probe_container_needs_no_gpu():
+    command = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", {"COMMANDS"}, {})["COMMANDS"]
+
+    assert "--gpus" not in command["CHECK_STORAGE_LIMIT_ABILITY"]
+    assert command["CHECK_STORAGE_LIMIT_ABILITY"][-1] == "/usr/bin/true"
 
 
 def test_a_timed_out_probe_gives_no_verdict(tmp_path):

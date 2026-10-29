@@ -101,11 +101,11 @@ COMMANDS = {
         "--gpus", "all",
         "daturaai/compute-subnet-executor:latest", "nvidia-smi"
     ],
+    # no GPU: image, NVIDIA hook or GPU trouble is not a disk finding
     "CHECK_STORAGE_LIMIT_ABILITY": [
         "docker", "run", "--rm",
         "--storage-opt", "size=1g",
-        "--gpus", "all",
-        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+        "daturaai/compute-subnet-executor:latest", "/usr/bin/true"
     ],
 }
 
@@ -1257,41 +1257,48 @@ def get_sysbox_version() -> str | None:
 PROJECT_QUOTA_MOUNT_OPTIONS = frozenset({"pquota", "prjquota"})
 
 
-def storage_limit_setup_gap(docker_info: dict, mounts_text: str) -> str:
-    """Why docker cannot enforce a per-container disk limit: '' only for the overlay2 storage driver on an xfs
-    data root mounted with project quota (DAH-1997, 26 Oct plan); otherwise the first thing missing."""
+def storage_limit_setup_gap(docker_info: dict, mounts_text: str) -> tuple[bool | None, str]:
+    """Whether docker can enforce a per-container disk limit: (True, '') only for the overlay2 storage driver on an
+    xfs data root mounted with project quota (DAH-1997, 26 Oct plan); (False, the first thing missing) for a
+    confirmed gap; (None, why) when docker or the mounts did not say."""
     driver = docker_info.get("Driver") or ""
+    if not driver:
+        return None, "docker info did not report a storage driver"
     if driver != "overlay2":
-        return f"docker storage driver is {driver or 'unknown'}, not overlay2"
+        return False, f"docker storage driver is {driver}, not overlay2"
     docker_root_dir = docker_info.get("DockerRootDir") or "/var/lib/docker"
     covering = covering_mount(mounts_text, docker_root_dir)
-    if covering is None or covering.fstype != "xfs":
-        return f"{docker_root_dir} is on {covering.fstype if covering else 'an unknown filesystem'}, not xfs"
+    if covering is None:
+        return None, f"no mount found covering {docker_root_dir}"
+    if covering.fstype != "xfs":
+        return False, f"{docker_root_dir} is on {covering.fstype}, not xfs"
     if not PROJECT_QUOTA_MOUNT_OPTIONS & set(covering.options):
-        return f"{covering.mount_point} (xfs) is not mounted with pquota"
-    return ""
+        return False, f"{covering.mount_point} (xfs) is not mounted with pquota"
+    return True, ""
 
 
 def check_storage_limit_ability() -> tuple[bool | None, str]:
     """
     Checks if the system supports limiting the storage size of a container: overlay2 on xfs with pquota, and a
-    `--storage-opt size=` container that runs. None when the probe gave no verdict (timed out, crashed) - that is
-    not a finding that the limit is missing.
+    `--storage-opt size=` container that runs. None when the probe gave no verdict (timed out, crashed, the
+    container exited nonzero after the setup passed) - that is not a finding that the limit is missing.
     """
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
         with open(HOST_MOUNTS_PATH) as mounts_file:
-            gap = storage_limit_setup_gap(docker_api_get("/info") or {}, mounts_file.read())
-        if gap:
+            setup, gap = storage_limit_setup_gap(docker_api_get("/info") or {}, mounts_file.read())
+        if setup is False:
             return False, f"Storage limit is not supported: {gap}."
+        if setup is None:
+            return None, f"Storage limit setup unknown: {gap}."
 
         result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Storage limit is supported."
-        else:
-            return False, "Storage limit is not supported."
+        stderr = (result.stderr or "").strip()[:300]
+        return None, f"Test container exited {result.returncode}: {stderr}"
 
     except subprocess.TimeoutExpired:
         return None, "Test command timed out."
@@ -1301,7 +1308,7 @@ def check_storage_limit_ability() -> tuple[bool | None, str]:
 
 
 def run_checks_concurrently(checks):
-    # Each capability test is a `docker run --gpus all` that takes seconds and shares nothing with
+    # Each capability test is a `docker run` that takes seconds and shares nothing with
     # the other, so they run side by side instead of one after the other; each keeps its own timeout.
     results = [None] * len(checks)
     threads = [

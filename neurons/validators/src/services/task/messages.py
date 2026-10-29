@@ -431,6 +431,12 @@ class GpuThermalThrottleMessages:
     )
 
 
+# the scrape's disk-limit test container, without a GPU
+STORAGE_LIMIT_TEST = (
+    "`sudo docker run --rm --storage-opt size=1g daturaai/compute-subnet-executor:latest /usr/bin/true`"
+)
+
+
 class StorageLimitMessages:
     MISSING = MessageTemplate(
         event="Docker cannot limit a container's disk",
@@ -442,8 +448,7 @@ class StorageLimitMessages:
         "fills their disk fills the host's Docker storage and takes the host and every pod on it down",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
         "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check that `docker info` shows Storage Driver "
-        "overlay2 and that `sudo docker run --rm --storage-opt size=1g --gpus all "
-        "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
+        "overlay2 and that " + STORAGE_LIMIT_TEST + " works.",
     )
     REQUIRED = MessageTemplate(
         event="Node rejected: Docker cannot limit a container's disk",
@@ -452,33 +457,31 @@ class StorageLimitMessages:
         # an availability error: the backend hides the node at once instead of at the hourly staleness sweep, so a
         # node whose rental just ended is not re-rented on an uncapped disk in between (only unrented nodes get it)
         category=AVAILABILITY_CATEGORY,
-        impact="Job skipped; score set to 0 and the node hidden from new rentals until the host enforces a "
-        "per-container storage limit",
+        impact="Job skipped; score set to 0 and the node hidden from new rentals after two failed disk-limit tests "
+        "in a row, until the host passes the test",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
         "pquota): https://docs.lium.io/providers/nodes/docker-storage . The node passes again on the next "
-        "validation once `docker info` shows Storage Driver overlay2 and `sudo docker run --rm --storage-opt size=1g --gpus all "
-        "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
+        "validation once `docker info` shows Storage Driver overlay2 and " + STORAGE_LIMIT_TEST + " works.",
     )
     INCONCLUSIVE = MessageTemplate(
-        event="Node held: the disk-limit test did not finish",
+        event="Node held: the disk-limit test has no result yet",
         reason="STORAGE_LIMIT_INCONCLUSIVE",
-        severity="error",
-        # hidden at once like REQUIRED: without a verdict the node could otherwise take a whole-host rental uncapped
+        severity="warning",
+        # hidden at once: without a verdict the node could otherwise take a whole-host rental uncapped
         category=AVAILABILITY_CATEGORY,
-        impact="Job skipped; score set to 0 and the node hidden from new rentals until the disk-limit test gives its "
-        "first result (the test timed out or crashed, see detail; this is not a finding that the limit is missing)",
-        remediation="Usually a busy host or a slow image pull: the node passes again on the next validation once "
-        "`sudo docker run --rm --storage-opt size=1g --gpus all daturaai/compute-subnet-executor:latest nvidia-smi` "
-        "finishes quickly.",
+        impact="Score not changed; the node is hidden from new rentals until the disk-limit test gives a result "
+        "(it has none on record, see detail; this is not a finding that the limit is missing)",
+        remediation="Usually a busy host or a slow image pull: the node is listed again on the next validation "
+        "once " + STORAGE_LIMIT_TEST + " finishes quickly.",
     )
     INCONCLUSIVE_LONG = MessageTemplate(
-        event="The disk-limit test has not finished for over 24 hours",
+        event="The disk-limit test has had no result for over 24 hours",
         reason="STORAGE_LIMIT_INCONCLUSIVE_LONG",
         severity="warning",
         category="env",
         impact="Score not changed: the node keeps its last disk-limit result (see inconclusive_since, detail)",
-        remediation="Usually a busy host or a slow image pull: check that `sudo docker run --rm --storage-opt size=1g "
-        "--gpus all daturaai/compute-subnet-executor:latest nvidia-smi` finishes within 30 seconds.",
+        remediation="Usually a busy host or a slow image pull: check that " + STORAGE_LIMIT_TEST + " finishes within "
+        "30 seconds.",
     )
     OK = MessageTemplate(
         event="Docker limits a container's disk",
