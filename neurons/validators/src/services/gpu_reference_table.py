@@ -6,16 +6,6 @@ The same file, byte for byte, is in lium-platform
 pays an unknown card as one model. Edit both copies together: a test in each repo pins its sha256.
 """
 
-import re
-
-# a datacenter chip code (A100, H200, L40S, GB300); consumer, SXM4 and memory tokens do not match
-GPU_FAMILY_TOKEN = re.compile(r"[A-Z]{1,2}\d{1,4}[A-Z]?")
-
-# a same-family size above a card's VRAM is its reference only up to this multiple: real variants step
-# by half (40/80, 16/32 GB; an A100 40GB PCIe reports 40536 MiB, so 2x plus the 10% band), and a
-# self-reported family name on a small card earns nothing above that
-FAMILY_SIZE_ABOVE_MAX_RATIO = 2.2
-
 # a reported VRAM within this ratio of a nominal size is the same memory
 REFERENCE_VRAM_BAND = (0.90, 1.10)
 
@@ -117,40 +107,33 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
 }
 
 
-def gpu_family(name: str | None) -> str | None:
-    """The chip code of an NVIDIA name (`NVIDIA A100-SXM4-40GB` -> `A100`); None when it has none."""
-    for token in re.split(r"[ -]", name or ""):
-        if GPU_FAMILY_TOKEN.fullmatch(token):
-            return token
-    return None
-
-
-def _closest(sizes: list[tuple[int, float, str]], vram_mib: float, above: bool = False) -> str | None:
-    low, high = REFERENCE_VRAM_BAND
-    in_band = [(price, model) for size, price, model in sizes if low <= size / vram_mib <= high]
-    if in_band:
-        return min(in_band)[1]
-    below = [(-size, price, model) for size, price, model in sizes if size < vram_mib]
-    if below:
-        return min(below)[2]
-    above_sizes = [s for s in sizes if above and s[0] <= FAMILY_SIZE_ABOVE_MAX_RATIO * vram_mib]
-    return min(above_sizes)[2] if above_sizes else None
+# A real smaller variant of a candidate, with no rate or price of its own: name -> (reference, nominal VRAM in
+# GB). It takes that reference only at its own memory, like a known name. No rule by family name: a renamed
+# card would step up to a bigger model of the family (lium-io#1959 review).
+GPU_VARIANT_REFERENCES: dict[str, tuple[str, int]] = {
+    "NVIDIA A100-PCIE-40GB": ("NVIDIA A100 80GB PCIe", 40),
+    "NVIDIA A100-SXM4-40GB": ("NVIDIA A100 80GB PCIe", 40),
+}
 
 
 def pick_reference(vram_mib: float | None, name: str | None = None) -> str | None:
-    """The reference of an unknown card. A same-family candidate first (`gpu_family` of `name`): the
-    cheapest within REFERENCE_VRAM_BAND of `vram_mib` (MiB, as nvidia-smi reports it), else the
-    cheapest of the largest size below, else the cheapest of the smallest size above, up to
-    FAMILY_SIZE_ABOVE_MAX_RATIO; so a 40 GB A100 is an A100 80GB PCIe, never a mining card of the
-    same memory. With no family candidate, the same rule over every candidate but never a size above.
-    A price tie goes to the first name. None for an unknown VRAM or no candidate."""
+    """A GPU_VARIANT_REFERENCES `name` reporting its own size (within REFERENCE_VRAM_BAND) gets its reference.
+    Else the cheapest candidate with a nominal size within REFERENCE_VRAM_BAND of `vram_mib` (MiB, as
+    nvidia-smi reports it), else the cheapest with the largest size below it; a price tie goes to
+    the first name. None for an unknown VRAM or one below every candidate."""
     if not vram_mib or vram_mib <= 0:
         return None
+    low, high = REFERENCE_VRAM_BAND
+    reference, size_gb = GPU_VARIANT_REFERENCES.get(name or "", (None, 0))
+    if reference and low <= size_gb * 1024 / vram_mib <= high:
+        return reference
     sizes = [
         (size_gb * 1024, price, model)
         for model, (price, sizes_gb) in GPU_REFERENCE_TABLE.items()
         for size_gb in sizes_gb
     ]
-    family = gpu_family(name)
-    kin = [size for size in sizes if family and gpu_family(size[2]) == family]
-    return _closest(kin, vram_mib, above=True) or _closest(sizes, vram_mib)
+    in_band = [(price, model) for size, price, model in sizes if low <= size / vram_mib <= high]
+    if in_band:
+        return min(in_band)[1]
+    below = [(-size, price, model) for size, price, model in sizes if size < vram_mib]
+    return min(below)[2] if below else None

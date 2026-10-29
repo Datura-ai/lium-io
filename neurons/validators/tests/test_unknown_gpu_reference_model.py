@@ -1,9 +1,9 @@
 """DAH-5088: an unknown NVIDIA model passes validation and is scored as its reference model.
 
-The reference is picked in services/gpu_reference_table.py, inside the card's chip family (A100,
-H100, ...) first: the cheapest model whose nominal VRAM is within 0.90-1.10x of the card's reported
-VRAM, else the cheapest with the largest size below it, else (family only, up to 2.2x) the smallest
-size above; else none (still unsupported).
+A real smaller variant listed in services/gpu_reference_table.py (A100 40GB) at its own memory gets
+its listed reference. Any other name gets the cheapest model whose nominal VRAM is within 0.90-1.10x
+of the card's reported VRAM, else the cheapest with the largest size below it, else none (still
+unsupported).
 """
 
 import hashlib
@@ -35,7 +35,7 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "0c4dba9675d7e9df8980fc5337aa8ab491e9e7f003f643346cd35f35fc142a89"
+GPU_REFERENCE_TABLE_SHA256 = "a9deb3a1245d039c6739fa1d0cf888965d0987ef96766ffd987a56e091489aec"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = list(GPU_REFERENCE_TABLE)
 
@@ -90,21 +90,20 @@ def test_the_reference_matches_the_backends(vram_mb, reference):
     assert reference_gpu_model(UNKNOWN, vram_mb) == reference
 
 
-# the same cases as lium-platform's src/test/test_unknown_gpu_reference_model.py (MiB, as nvidia-smi reports): a card of a known family is
-# referenced inside it before any other model of its memory; a size above its own only up to 2.2x
-FAMILY_CASES = [
-    # the 29 Oct 2026 prod card, a memory-only match made it a CMP 170HX mining card
+# the same cases as lium-platform's src/test/test_unknown_gpu_reference_model.py: a real smaller variant at its own
+# memory gets its reference; any other name, a renamed one included, gets the memory-only pick
+VARIANT_CASES = [
+    # the 29 Oct 2026 prod card, the memory-only pick made it a CMP 170HX mining card
     ("NVIDIA A100-SXM4-40GB", 40960, "NVIDIA A100 80GB PCIe"),
     ("NVIDIA A100-PCIE-40GB", 40536, "NVIDIA A100 80GB PCIe"),
-    ("NVIDIA H100 SXM5 64GB", 65536, "NVIDIA H100 PCIe"),
-    ("NVIDIA Tesla V100-SXM2-16GB", 16384, "NVIDIA Tesla V100 Tensor Core GPU"),
-    # a family name on a far smaller card earns its memory's reference, not the family's
-    ("NVIDIA A100 X", 8192, "NVIDIA GeForce GTX 1080"),
+    ("NVIDIA A100-SXM4-40GB", 8192, "NVIDIA GeForce GTX 1080"),
+    ("NVIDIA H200 80GB", 81920, "NVIDIA A800 80GB PCIe"),
+    ("NVIDIA B300 X", 143771, "NVIDIA H200 NVL"),
 ]
 
 
-@pytest.mark.parametrize(("name", "vram_mb", "reference"), FAMILY_CASES)
-def test_a_card_of_a_known_family_is_referenced_inside_it(name, vram_mb, reference):
+@pytest.mark.parametrize(("name", "vram_mb", "reference"), VARIANT_CASES)
+def test_only_a_listed_variant_at_its_own_memory_steps_off_the_memory_pick(name, vram_mb, reference):
     assert reference_gpu_model(name, vram_mb) == reference
 
 
