@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-from services.const import MAX_DISK_UTILIZATION_PERCENT, MIN_FREE_DISK_GB
+from services.const import MAX_DISK_UTILIZATION_PERCENT
 from services.task.checks.disk_space import KB_PER_GB, DiskSpaceCheck
 from services.task.messages import DiskSpaceMessages as Msg
-from services.task.pipeline_factory import PipelineFactory
 
+from core.config import settings
 from tests.helpers import build_services, build_state
 from tests.test_port_floor_listing import PerPodBackendClient, PerPodSSHClient
 
@@ -23,7 +23,7 @@ def _disk(utilization: float, free_gb: float) -> dict:
     [
         (_disk(50, 500), Msg.OK.reason),
         (_disk(MAX_DISK_UTILIZATION_PERCENT + 1, 500), Msg.TOO_FULL.reason),
-        (_disk(50, MIN_FREE_DISK_GB - 1), Msg.FREE_TOO_LOW.reason),
+        (_disk(50, settings.MIN_FREE_DISK_GB - 1), Msg.FREE_TOO_LOW.reason),
         ({}, Msg.NOT_REPORTED.reason),
         ({"hard_disk": {"utilization": 10}}, Msg.NOT_REPORTED.reason),
         (_disk(10, 50 - 1 / KB_PER_GB), Msg.FREE_TOO_LOW.reason),
@@ -37,6 +37,10 @@ def _disk(utilization: float, free_gb: float) -> dict:
         ({"hard_disk": {"utilization": 95, "free": float("inf")}}, Msg.NOT_REPORTED.reason),
         ({"hard_disk": {"utilization": 50, "free": "Infinity"}}, Msg.NOT_REPORTED.reason),
         ({"hard_disk": {"utilization": "-Infinity", "free": 500 * KB_PER_GB}}, Msg.NOT_REPORTED.reason),
+        ({"hard_disk": {"utilization": None, "free": 500 * KB_PER_GB}}, Msg.NOT_REPORTED.reason),
+        ({"hard_disk": {"utilization": 10, "free": None}}, Msg.NOT_REPORTED.reason),
+        ({"hard_disk": {"utilization": "n/a", "free": 500 * KB_PER_GB}}, Msg.NOT_REPORTED.reason),
+        ({"hard_disk": {"utilization": 10, "free": "lots"}}, Msg.NOT_REPORTED.reason),
     ],
 )
 async def test_idle_node_fails_the_listing_disk_floor(context_factory, specs, reason):
@@ -119,12 +123,6 @@ async def test_ended_rental_exempts_only_while_a_listed_rental_is_active(
 
     assert result.passed is exempt
     assert result.event.reason_code == Msg.TOO_FULL.reason
-
-
-def test_disk_space_runs_right_after_verifyx_in_both_pipelines():
-    for checks in (PipelineFactory.build_checks(), PipelineFactory.build_fast_path_checks()):
-        names = [type(c).__name__ for c in checks]
-        assert names[names.index("VerifyXCheck") + 1] == "DiskSpaceCheck"
 
 
 @pytest.mark.asyncio

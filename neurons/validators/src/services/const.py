@@ -132,10 +132,9 @@ GPU_WEDGE_SWEEP_MEMORY_MAX_MIB = 16  # teardown sweep, nvidia-smi memory.used
 GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is removed
 
 MIN_PORT_COUNT = 3
-# DAH-4961: the disk floor the renter listing used to apply itself (lium-platform daos/executor.py, prod
-# EXECUTORS_FILTER_MIN_GB=50); an idle node past it now fails validation instead of being hidden.
+# DAH-4961: the disk floor the renter listing used to apply itself; an idle node past it now fails
+# validation instead of being hidden. The free-space floor is settings.MIN_FREE_DISK_GB (per environment).
 MAX_DISK_UTILIZATION_PERCENT = 90
-MIN_FREE_DISK_GB = 50
 BATCH_PORT_VERIFICATION_SIZE = 300
 # Declared ports are tallied per bucket of this width (by external port), so a wide range
 # forwarded only in part shows which part answered; at most 14 tallies over 1-65535

@@ -588,6 +588,8 @@ class Settings(BaseSettings):
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
+    # DiskSpaceCheck: free-space floor for an idle node, matching the renter listing of the same environment
+    MIN_FREE_DISK_GB: int = Field(env="MIN_FREE_DISK_GB", default=50, ge=0)
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and

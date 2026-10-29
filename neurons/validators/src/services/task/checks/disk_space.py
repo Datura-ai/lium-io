@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from services.const import MAX_DISK_UTILIZATION_PERCENT, MIN_FREE_DISK_GB
+from services.const import MAX_DISK_UTILIZATION_PERCENT
+
+from core.config import settings
 
 from ..messages import DiskSpaceMessages as Msg
 from ..messages import render_message
@@ -23,11 +25,11 @@ async def _any_listed_rental_active(ctx: Context, pods: list) -> bool:
 
 
 def _as_float(value: Any) -> float:
-    # the listing read a null or unparsable figure as 0
+    # a null or unparsable figure is not a reading (NaN), so it fails as NOT_REPORTED
     try:
-        return float(value) if value is not None else 0.0
+        return float(value)
     except (TypeError, ValueError):
-        return 0.0
+        return math.nan
 
 
 class DiskSpaceCheck:
@@ -45,13 +47,13 @@ class DiskSpaceCheck:
         hard_disk = (ctx.state.specs or {}).get("hard_disk")
         what: dict[str, Any] = {
             "max_utilization_percent": MAX_DISK_UTILIZATION_PERCENT,
-            "required_free_gb": MIN_FREE_DISK_GB,
+            "required_free_gb": settings.MIN_FREE_DISK_GB,
         }
         utilization = free_kb = math.nan
         if isinstance(hard_disk, dict) and "utilization" in hard_disk and "free" in hard_disk:
             utilization = _as_float(hard_disk.get("utilization"))
             free_kb = _as_float(hard_disk.get("free"))
-        # a missing figure, NaN or Infinity (which compare false both ways) is not a reading
+        # a missing, null, unparsable, NaN or Infinity figure is not a reading
         if not (math.isfinite(utilization) and math.isfinite(free_kb)):
             template = Msg.NOT_REPORTED
         else:
@@ -59,7 +61,7 @@ class DiskSpaceCheck:
             what.update(utilization_percent=utilization, free_gb=round(free_kb / KB_PER_GB, 1))
             if utilization > MAX_DISK_UTILIZATION_PERCENT:
                 template = Msg.TOO_FULL
-            elif free_kb < MIN_FREE_DISK_GB * KB_PER_GB:
+            elif free_kb < settings.MIN_FREE_DISK_GB * KB_PER_GB:
                 template = Msg.FREE_TOO_LOW
             else:
                 return CheckResult(
