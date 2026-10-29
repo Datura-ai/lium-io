@@ -20,6 +20,7 @@ from neurons.validators.tests.helpers import (
     build_state,
 )
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
+from services.task.availability import AvailabilityErrorCode, availability_errors
 from services.task.checks import gpu_thermal_throttle
 from services.task.checks.gpu_thermal_throttle import GpuThermalThrottleCheck
 from services.task.checks.rented_gpu_drop import RentedGpuDropCheck
@@ -308,6 +309,65 @@ async def test_a_replaced_marked_gpu_is_cleared(context_factory):
 
     assert result.passed is True
     assert await redis.get(_hold_key(context_factory)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["graphics_speed", "max_graphics_speed", "clocks_event_reasons"])
+async def test_a_busy_reading_missing_a_field_keeps_the_hold(context_factory, missing):
+    # review: a reading judge_gpu cannot judge is not a clean one
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, rented=True, redis=redis)
+    row = h100()
+    del row[missing]
+
+    result = await run(context_factory, row, redis=redis)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+async def test_a_row_without_a_uuid_drops_no_mark_as_replaced(context_factory):
+    # review: one row with no uuid does not make the whole marked set look replaced
+    redis = FakeRedis()
+    await run(
+        context_factory,
+        {**COLLAPSED_ROW, "uuid": "GPU-a"},
+        {**COLLAPSED_ROW, "uuid": "GPU-b"},
+        rented=True,
+        redis=redis,
+    )
+    no_uuid = h100(gpu_utilization=0)
+    del no_uuid["uuid"]
+
+    result = await run(context_factory, no_uuid, h100(uuid="GPU-a", gpu_utilization=0), redis=redis)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-a", "GPU-b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [False, True])
+async def test_a_collapse_fail_hides_the_node_at_once(context_factory, held):
+    # review: an availability entry as GpuLossHoldCheck's, on a fresh collapse and on a held cycle
+    redis = FakeRedis()
+    if held:
+        await run(context_factory, COLLAPSED_ROW, rented=True, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW if held else COLLAPSED_ROW, redis=redis)
+
+    assert result.passed is False
+    [entry] = availability_errors([result.event])
+    assert entry.reason_code == AvailabilityErrorCode.GPU_THERMAL_COLLAPSE
+    assert (entry.reach_source, entry.reach_target) == ("validator", "gpu")
+    assert entry.what_we_saw.get("held_from_rental", False) is held
+
+
+@pytest.mark.asyncio
+async def test_a_rented_collapse_warning_is_no_availability_entry(context_factory):
+    result = await run(context_factory, COLLAPSED_ROW, rented=True)
+
+    assert availability_errors([result.event]) == []
 
 
 @pytest.mark.asyncio

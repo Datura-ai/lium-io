@@ -18,7 +18,8 @@ driver that lacks the calls, leaves the fields missing and the GPU is not judged
 
 A GPU whose clock is below ``MIN_CLOCK_RATIO`` of its max WITH a thermal or hardware slowdown bit set has
 collapsed (ticket-0492: 345 MHz of 1980 at 95 C): on a node that is not rented the check fails (fatal, score 0,
-GPU_THERMAL_COLLAPSE) until the host fixes its cooling, so it is not listed to the next renter. A rented node
+GPU_THERMAL_COLLAPSE, an availability entry that hides it at once) until the host fixes its cooling, so it is
+not listed to the next renter. A rented node
 only gets the warning, so this check never touches a running rental. Every other finding (a thermal bit at a
 near-full clock, a low clock with no slowdown bit) is the non-fatal GPU_THERMAL_THROTTLE warning, score
 unchanged. It runs right after the scrape, before the rented short-circuit (TenantEnforcementCheck), so rented
@@ -28,8 +29,9 @@ A collapse is remembered, so the node cannot pass on an idle card (28 Oct, 8x H2
 on every rented cycle, read idle and scored 1.0 the cycle after the renter left). Every collapse, rented or not,
 writes the collapsed UUIDs to Redis (``gpu_thermal_hold:<hotkey>:<executor uuid>``, THERMAL_HOLD_SECONDS from the
 last collapse). An unrented cycle with marked GPUs still unproven fails as a collapse does (held_from_rental). A
-marked GPU is cleared by a busy reading that is not collapsed, or when the scrape no longer lists it (replaced); the reading is the scrape's, taken before the matmul,
-so on an idle node only a filler or the host's own load at scrape time clears it, otherwise the TTL does. A dry run
+marked GPU is cleared by a busy reading that is not collapsed and carries the clocks and reasons judge_gpu needs, or
+when a scrape whose every row has a UUID no longer lists it (replaced); the reading is the scrape's, taken before
+the matmul, so on an idle node only a filler or the host's own load at scrape time clears it, otherwise the TTL does. A dry run
 writes nothing; a Redis that cannot be read is no hold.
 """
 
@@ -43,6 +45,7 @@ from typing import Any
 from core.config import settings
 from core.utils import _m, get_extra_info
 
+from ..availability import ReachSource, ReachTarget
 from ..messages import GpuThermalThrottleMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -118,6 +121,18 @@ def judge_gpu(detail: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _judgeable_busy(detail: dict[str, Any]) -> bool:
+    """A busy reading with every field judge_gpu needs to see a collapse."""
+    utilization = _to_number(detail.get("gpu_utilization"))
+    return (
+        utilization is not None
+        and utilization >= MIN_UTILIZATION_PCT
+        and _to_number(detail.get("graphics_speed")) is not None
+        and bool(_to_number(detail.get("max_graphics_speed")))
+        and _to_number(detail.get("clocks_event_reasons")) is not None
+    )
+
+
 class GpuThermalThrottleCheck:
     """Warn about a busy GPU held below its clock by a thermal/hardware slowdown; fail an unrented node on a collapse."""
 
@@ -144,6 +159,10 @@ class GpuThermalThrottleCheck:
         held, since = await self._update_hold(ctx, collapsed)
         if (collapsed or held) and not rented:
             what: dict[str, Any] = {
+                # an availability entry, as GpuLossHoldCheck's: the backend hides the node this cycle
+                "reach_source": str(ReachSource.VALIDATOR),
+                "reach_target": str(ReachTarget.GPU),
+                "executor_uuid": ctx.executor.uuid,
                 "gpus": throttled,
                 "collapsed_count": len(collapsed),
                 "min_clock_ratio": MIN_CLOCK_RATIO,
@@ -194,15 +213,16 @@ class GpuThermalThrottleCheck:
         marked = {uuid for uuid in mark.get("gpus") or [] if isinstance(uuid, str)}
         collapsed_uuids = {f["uuid"] for f in collapsed if isinstance(f["uuid"], str)}
         details = [detail for detail in ctx.state.gpu_details or [] if isinstance(detail, dict)]
-        busy = {
-            detail.get("uuid")
-            for detail in details
-            if (_to_number(detail.get("gpu_utilization")) or 0) >= MIN_UTILIZATION_PCT
-        }
-        present = {detail.get("uuid") for detail in details}
-        # a marked card the scrape no longer lists was replaced (a lost card is GpuLossHoldCheck's)
-        marked_now = marked & present if present else marked
-        held = (marked_now - (busy - collapsed_uuids)) | collapsed_uuids
+        # only a busy reading judge_gpu can judge proves a card; one missing a clock or the reasons is not clean
+        proven = {detail.get("uuid") for detail in details if _judgeable_busy(detail)}
+        present = [detail.get("uuid") for detail in details]
+        # a marked card the scrape no longer lists was replaced (a lost card is GpuLossHoldCheck's);
+        # a row without a uuid could be any marked card, so then none counts as replaced
+        if present and all(isinstance(uuid, str) and uuid for uuid in present):
+            marked_now = marked & set(present)
+        else:
+            marked_now = marked
+        held = (marked_now - (proven - collapsed_uuids)) | collapsed_uuids
         since = mark.get("since") if marked else datetime.now(UTC).isoformat()
         # A dry run shares Redis with the live validator, so it leaves the live hold alone.
         if settings.DRY_RUN or (held == marked and not collapsed_uuids):
