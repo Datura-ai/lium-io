@@ -221,6 +221,7 @@ class ResticStorageRunner:
         self._snapshot_empty = False
         self._last_error_text = ""
         self._helper_state: Mapping[str, object] = {}
+        self._helper_id = ""
 
     def run(self) -> ResticResult:
         if self._operation.engine is StorageEngine.RESTIC:
@@ -624,7 +625,10 @@ class ResticStorageRunner:
         finally:
             output_reader.join(timeout=1)
             if helper:
-                self._helper_state = self._remove_helper_container()
+                inspection = self._remove_helper_container()
+                state = inspection.get("State")
+                self._helper_state = state if isinstance(state, dict) else {}
+                self._helper_id = str(inspection.get("Id") or "")
 
     def _raise_if_credentials_expired(self, error_text: str) -> None:
         # restic 0.19 retries an expired session for 15 minutes before failing; stop it now
@@ -679,10 +683,10 @@ class ResticStorageRunner:
                 subprocess.run([self._docker_binary, "rm", "--force", fields[0]], capture_output=True, text=True)
 
     def _remove_helper_container(self) -> Mapping[str, object]:
-        """Remove the helper container; return its docker State ({} when it could not be read)."""
+        """Remove the helper container; return its docker inspect object ({} when it could not be read)."""
         name = self._helper_container_name()
         inspection = subprocess.run(
-            [self._docker_binary, "inspect", "--format", "{{json .State}}", name],
+            [self._docker_binary, "inspect", "--format", "{{json .}}", name],
             capture_output=True,
             text=True,
         )
@@ -704,6 +708,11 @@ class ResticStorageRunner:
             f"{action} helper exited 137; docker state "
             + json.dumps({field: state.get(field) for field in fields})
         )
+        # Docker's OOMKilled can miss a kill; the kernel log settles OOM against an outside SIGKILL
+        note = kernel_kill_note(self._helper_id)
+        self._events.log(note)
+        if "oom-kill:" in note:  # the kernel's OOM kill that Docker's flag missed
+            return f"{action} ran out of memory"
         if state.get("OOMKilled") is False:
             return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
         return f"{action} helper was killed (often out of memory)"
@@ -963,6 +972,36 @@ def _error_text(payload: Mapping[str, object]) -> str:
     item = payload.get("item")
     # restic repeats the file name in the message ("open /workspace/ExpiredToken.java: permission denied")
     return message.replace(item, "") if isinstance(item, str) and item else message
+
+
+def kernel_kill_lines(dmesg: str, container_id: str) -> list[str]:
+    """The kernel's OOM kill lines for this container: its oom-kill line (matched by container ID, since docker
+    reports PID 0 after exit) and the "Killed process" line printed right after it."""
+    lines = dmesg.splitlines()
+    found: list[str] = []
+    for index, line in enumerate(lines):
+        if "oom-kill:" in line and container_id in line:
+            found.append(line)
+            if index + 1 < len(lines) and "Killed process" in lines[index + 1]:
+                found.append(lines[index + 1])
+    return found
+
+
+def kernel_kill_note(container_id: str) -> str:
+    """One log line naming the kernel's kill of the helper, or saying there was none; never raises."""
+    if not container_id:
+        return "kernel: no helper container ID to match"
+    try:
+        dmesg = subprocess.run(["dmesg", "--kernel", "--nopager"], capture_output=True, text=True, timeout=5)
+    except Exception as error:  # noqa: BLE001 - diagnostics only
+        return f"kernel: dmesg unreadable ({type(error).__name__})"
+    if dmesg.returncode != 0:
+        return f"kernel: dmesg unreadable (exit {dmesg.returncode})"
+    # the kill happened seconds ago; a bounded tail keeps a long-running host's ring buffer cheap
+    found = kernel_kill_lines("\n".join(dmesg.stdout.splitlines()[-2000:]), container_id)
+    if not found:
+        return "kernel: no kernel kill line for the helper"
+    return "kernel: " + " | ".join(found)
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:
