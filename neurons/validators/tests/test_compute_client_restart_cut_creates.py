@@ -235,3 +235,39 @@ async def test_an_unanswered_container_created_is_dropped_once_its_pending_flag_
 
     assert client.message_queue == []
     assert await redis_service.unacked_container_created() == {}
+
+
+@pytest.mark.parametrize(
+    ("saved_success", "pending", "expected"),
+    [
+        # created, report unanswered: the startup sweep leaves it to the replay
+        (True, True, ContainerCreated),
+        # no saved success: the create was cut off, reported failed as before
+        (False, True, FailedContainerRequest),
+        # a saved success whose pending flag is gone is never replayed, so the create is reported failed
+        (True, False, FailedContainerRequest),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_startup_sweep_leaves_a_saved_success_to_the_replay(saved_success, pending, expected) -> None:
+    redis_service = _redis_service()
+    if saved_success:
+        client = await _create_and_send_container_created(redis_service)
+    else:
+        client = _client(redis_service)
+        client.message_queue = OutgoingMessages()
+        client.lock = asyncio.Lock()
+        await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1")
+    if not pending:
+        await redis_service.hdel("pending_pods_prefix", "miner-hk:exec-1")
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL)
+
+    await client.fail_creates_cut_off_by_restart()
+    await client.resend_unacked_container_created()
+
+    assert len(client.message_queue) == 1
+    assert isinstance(client.message_queue[0], expected)
+    assert await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1") == (expected is ContainerCreated)
+    if expected is ContainerCreated:
+        assert await redis_service.inflight_backend_creates() == {}
+    assert (await redis_service.unacked_container_created() != {}) == (expected is ContainerCreated)

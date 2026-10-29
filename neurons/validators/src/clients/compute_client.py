@@ -1052,6 +1052,14 @@ class ComputeClient:
         except Exception as exc:  # best-effort: losing it only loses the resend
             self._log_unacked_container_created_error(created.pod_id, exc)
 
+    async def _replayable_success(self, pod_id: str, message_json: str) -> bool:
+        """a saved ContainerCreated the next reconnect will resend: readable and its pod still pending"""
+        try:
+            created = ContainerCreated.model_validate_json(message_json)
+        except pydantic.ValidationError:
+            return False
+        return await self.miner_service.redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id)
+
     async def resend_unacked_container_created(self) -> None:
         redis_service = self.miner_service.redis_service
         try:
@@ -1158,7 +1166,14 @@ class ComputeClient:
         delete for 30 min. Each one is reported failed now, which frees the node, and its flag is cleared."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
+        unacked = await redis_service.unacked_container_created()
         for pod_id, create in creates.items():
+            if pod_id in unacked and await self._replayable_success(pod_id, unacked[pod_id]):
+                # DAH-5380: it was created, only the report is unanswered; the reconnect replays it, so its pending
+                # flag and saved success stay and only the stale inflight record goes (no running create owns it:
+                # the sweep runs before this connector accepts one)
+                await redis_service.remove_inflight_backend_create(pod_id)
+                continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
             self.message_queue.append(
