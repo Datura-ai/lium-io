@@ -513,12 +513,19 @@ class GpuLossHoldMessages:
         severity="error",
         # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
         category=AVAILABILITY_CATEGORY,
-        impact="The node is hidden and takes no new rentals until its GPUs read clean for the hold window "
-        "(see hold_until); an idle node scores 0 meanwhile, a rental already on it is not touched",
+        impact="The node is hidden and takes no new rentals until every GPU reads clean again and passes a load "
+        "test on every card; an idle node scores 0 meanwhile, a rental already on it is not touched",
         remediation="A card fell out of NVML (see faults, missing_uuids, nvml_error_code). Run `nvidia-smi` and "
         "`dmesg | grep -i xid` on the host; 'Unknown Error' or Xid 79 ('fallen off the bus') means the card must "
-        "be reseated, reset or replaced. The node is listed again once every card has read clean for the hold "
-        "window.",
+        "be reseated, reset or replaced. On the first check that sees every GPU again while the node is not "
+        "rented, every card is load-tested, and the node is listed again when they pass.",
+    )
+    CLEAN_AGAIN = MessageTemplate(
+        event="Every GPU is listed again; each card is load-tested before the node is listed",
+        reason="GPU_LOST_CLEAN_AGAIN",
+        severity="info",
+        category="env",
+        impact="Proceed; the node is listed if every card passes the load test in this check",
     )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
@@ -589,7 +596,7 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Score set to 0",
         remediation=(
-            "A GPU showed a fault during the last rental, and after it at least one card failed the "
+            "A GPU showed a fault (during a rental, or it dropped out), and after it at least one card failed the "
             "all-cards matmul or the kernel-fault probe. Check `nvidia-smi -q` and the host `dmesg` for NVRM "
             "Xid lines; reset the card (`nvidia-smi -r`) or reboot the host, replace a card that still fails, "
             "and wait one cycle."

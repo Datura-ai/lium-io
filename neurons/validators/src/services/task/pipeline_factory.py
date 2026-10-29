@@ -417,7 +417,8 @@ class PipelineFactory:
                 # passes the matmul but cannot DMA pinned memory). On by default, shadow (logged only) until enforcement is enabled.
                 PinnedMemoryProbeCheck(),
                 # DAH-4482: a node the rented health read flagged proves every card before it re-lists.
-                # Rented nodes halted above, so this only runs unrented. Off by default: logs only.
+                # Rented nodes halted above, so this only runs unrented. Also the every-card load test a node owes
+                # after a GPU dropout (GpuLossHoldCheck) before it re-lists.
                 PostRentalGpuRecheckCheck(),
                 # a sticky NVLink fault leaves every single-GPU check passing; NVLS cannot bind (23 Oct)
                 NvlinkFaultCheck(),

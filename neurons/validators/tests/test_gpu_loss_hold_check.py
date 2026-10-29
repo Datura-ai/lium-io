@@ -15,10 +15,12 @@ from neurons.validators.src.services.task.checks import (
     GpuLossHoldCheck,
     GpuModelValidCheck,
     MachineSpecScrapeCheck,
+    PostRentalGpuRecheckCheck,
     RentedGpuDropCheck,
     TenantEnforcementCheck,
     gpu_loss_hold,
     machine_spec_scrape,
+    post_rental_gpu_recheck,
     rented_gpu_drop,
 )
 from neurons.validators.src.services.task.messages import GpuLossHoldMessages as Msg
@@ -33,6 +35,8 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
+from tests.test_gpu_fault_probe_check import FakeRunner, probe_stdout
+from tests.test_post_rental_gpu_recheck import FakeValidation, _all_cards
 from tests.helpers import (
     FakeRedis,
     build_context_config,
@@ -44,6 +48,7 @@ from tests.helpers import (
 MODEL = "NVIDIA GeForce RTX 3090"
 UUIDS = [f"GPU-a0a{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
 LOST_CARD = {"listed": UUIDS[:3], "scrape_error": "NVMLError(999)"}
+RECHECK_KEY = post_rental_gpu_recheck.marker_key("miner-hotkey", default_executor().uuid)
 # the scrape listed one card twice: a possible glitch, judged again next cycle (`confirm_first`)
 DUPLICATED = {"listed": UUIDS[:3] + [UUIDS[0]]}
 
@@ -130,7 +135,7 @@ async def test_a_lost_card_on_a_rented_node_hides_it_and_the_cycle_fails_its_gpu
     # the same scrape still fails the fatal GPU check after it, verification reset included, as before
     model = await GpuModelValidCheck().run(ctx)
     assert not model.passed and model.event.reason_code == "GPU_DETAILS_MISMATCH"
-    assert redis.ttl[gpu_loss_hold._key(ctx)] == gpu_loss_hold.settings.GPU_LOSS_HOLD_SECONDS
+    assert redis.ttl[gpu_loss_hold._key(ctx)] == gpu_loss_hold.GPU_LOSS_MARK_TTL_SECONDS
 
 
 @pytest.mark.asyncio
@@ -144,7 +149,7 @@ async def test_a_rented_node_whose_card_reads_clean_again_stays_hidden_but_keeps
 
     # hidden, and not fatal under a live rental: the rented check still runs and the renter is not touched
     assert not result.passed and not _fatal(result) and _hidden(result)
-    assert result.event.what_we_saw["hold_until"]
+    assert "hold_until" not in result.event.what_we_saw
     assert result.event.event == Msg.LOST.event
 
 
@@ -166,45 +171,92 @@ async def test_an_nvml_loss_code_over_a_full_card_list_is_fatal_on_an_idle_node(
 @pytest.mark.asyncio
 async def test_old_marks_without_since_still_hold(context_factory):
     redis = FakeRedis()
-    ctx = _ctx(context_factory, redis, pods=())
+    ctx = _ctx(context_factory, redis)
     old = {"held": True, "last_seen": "2026-10-17T00:00:00+00:00"}
     redis.store[gpu_loss_hold._key(ctx)] = json.dumps(old)
 
     result = await GpuLossHoldCheck().run(ctx)
 
-    assert not result.passed and _fatal(result) and result.event.what_we_saw["since"]
+    assert not result.passed and _hidden(result) and result.event.what_we_saw["since"]
 
 
 @pytest.mark.asyncio
-async def test_after_the_rental_ends_the_held_node_fails_at_once(context_factory):
-    redis = FakeRedis()
-    await _cycle(context_factory, redis, **LOST_CARD)
-
-    result = await _cycle(context_factory, redis, pods=())
-
-    assert not result.passed and _fatal(result) and _hidden(result)
-
-
-@pytest.mark.asyncio
-async def test_a_lost_card_on_an_idle_node_hides_it(context_factory):
-    redis = FakeRedis()
-
-    lost = await _cycle(context_factory, redis, pods=(), **LOST_CARD)
-    clean = await _cycle(context_factory, redis, pods=())
-
-    assert _hidden(lost) and _hidden(clean) and _fatal(clean)
-
-
-@pytest.mark.asyncio
-async def test_the_node_is_listed_again_once_the_hold_ran_out(context_factory):
+async def test_after_the_rental_ends_the_first_clean_read_ends_the_hold_and_owes_the_load_test(context_factory):
     redis = FakeRedis()
     ctx = _ctx(context_factory, redis, **LOST_CARD)
     await GpuLossHoldCheck().run(ctx)
-    del redis.store[gpu_loss_hold._key(ctx)]  # Redis expired the hold
 
-    result = await _cycle(context_factory, redis)
+    result = await _cycle(context_factory, redis, pods=())
 
-    assert result.passed and result.event.reason_code == Msg.OK.reason and not _hidden(result)
+    assert result.passed and result.event.reason_code == Msg.CLEAN_AGAIN.reason and not _hidden(result)
+    assert gpu_loss_hold._key(ctx) not in redis.store
+    assert json.loads(redis.store[RECHECK_KEY])["source"] == "gpu_loss_hold"
+
+
+@pytest.mark.asyncio
+async def test_a_dropout_keeps_the_node_hidden_while_cards_are_missing_with_no_timer(context_factory):
+    """Regression: a node hidden for a fixed window, or listed again because a window ran out while a card was
+    still missing."""
+    redis = FakeRedis()
+
+    cycles = [await _cycle(context_factory, redis, pods=(), **LOST_CARD) for _ in range(5)]
+
+    assert all(_hidden(c) and not c.passed for c in cycles)
+    assert all("hold_until" not in c.event.what_we_saw for c in cycles)
+    assert not hasattr(gpu_loss_hold.settings, "GPU_LOSS_HOLD_SECONDS")
+    assert RECHECK_KEY not in redis.store  # the load test is owed once the cards are back
+
+
+def _hold_then_load_test_pipeline(context_factory, redis, *, all_cards, probe):
+    ctx = _ctx(context_factory, redis, pods=())
+    validation = FakeValidation(all_cards)
+    ctx = ctx.model_copy(
+        update={"services": build_services(redis=redis, validation=validation), "runner": FakeRunner(probe)}
+    )
+    return ctx, validation, Pipeline([GpuLossHoldCheck(), PostRentalGpuRecheckCheck()], _ListSink())
+
+
+@pytest.mark.asyncio
+async def test_the_first_clean_read_load_tests_every_card_the_same_cycle_and_a_pass_lists_the_node(context_factory):
+    redis = FakeRedis()
+    await _cycle(context_factory, redis, pods=(), **LOST_CARD)
+    ctx, validation, pipeline = _hold_then_load_test_pipeline(
+        context_factory, redis, all_cards=_all_cards("", "", "", ""), probe=probe_stdout("ok")
+    )
+
+    ok, events, _ = await pipeline.run(ctx)
+
+    assert ok and validation.calls == 1
+    assert [e.reason_code for e in events] == [Msg.CLEAN_AGAIN.reason, "POST_RENTAL_GPU_RECHECK_PASSED"]
+    assert availability_errors(events) == []
+    assert gpu_loss_hold._key(ctx) not in redis.store and RECHECK_KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_card_failing_the_load_test_keeps_the_node_out_until_a_clean_read_passes_it(context_factory):
+    redis = FakeRedis()
+    await _cycle(context_factory, redis, pods=(), **LOST_CARD)
+    ctx, _, pipeline = _hold_then_load_test_pipeline(
+        context_factory, redis, all_cards=_all_cards("", "", "exit_status=1", ""), probe=probe_stdout("ok")
+    )
+
+    ok, events, _ = await pipeline.run(ctx)
+
+    assert not ok and events[-1].reason_code == "POST_RENTAL_GPU_RECHECK_FAILED"
+    assert RECHECK_KEY in redis.store  # still owed: the next clean read tests every card again
+    # the card drops again: hidden again
+    again = await _cycle(context_factory, redis, pods=(), **LOST_CARD)
+    assert _hidden(again) and not again.passed
+
+
+def test_no_fixed_hold_duration_in_the_provider_facing_texts():
+    texts = [
+        getattr(t, field) or ""
+        for t in vars(Msg).values()
+        if hasattr(t, "remediation")
+        for field in ("event", "impact", "remediation")
+    ]
+    assert texts and not any(word in text for text in texts for word in ("hold window", "hold_until", "2 hours"))
 
 
 @pytest.mark.asyncio
@@ -269,11 +321,11 @@ async def test_another_miners_rental_on_the_same_uuid_does_not_shield_or_hold_th
     redis = FakeRedis()
     await _cycle(context_factory, redis, **LOST_CARD)
 
-    # the rental belongs to another hotkey, so this miner's node counts as idle and fails
+    # the rental belongs to another hotkey, so this miner's node counts as idle: its clean read owes the load test
     result = await _cycle(context_factory, redis, owner="another-hotkey")
 
-    assert _hidden(result) and _fatal(result)
-    assert all(key.startswith("gpu_loss_hold:miner-hotkey:") for key in redis.store)
+    assert result.event.reason_code == Msg.CLEAN_AGAIN.reason
+    assert not any(key.startswith("gpu_loss_hold:") for key in redis.store) and RECHECK_KEY in redis.store
 
 
 @pytest.mark.asyncio
@@ -443,7 +495,7 @@ async def test_fewer_cards_after_a_set_change_is_still_a_dropout_and_held(contex
     result = await _cycle(context_factory, redis, listed=OTHER_CARDS[:3], count=3, pods=())
 
     assert not result.passed and _hidden(result)
-    assert redis.ttl[gpu_loss_hold._key(_ctx(context_factory, redis, pods=()))] == gpu_loss_hold.settings.GPU_LOSS_HOLD_SECONDS
+    assert redis.ttl[gpu_loss_hold._key(_ctx(context_factory, redis, pods=()))] == gpu_loss_hold.GPU_LOSS_MARK_TTL_SECONDS
 
 
 @pytest.mark.asyncio

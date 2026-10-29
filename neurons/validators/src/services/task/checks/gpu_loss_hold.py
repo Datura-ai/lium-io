@@ -1,4 +1,5 @@
-"""GPU_LOST — a node whose GPU dropped out is hidden and takes no new rentals until the card stays back.
+"""GPU_LOST — a node whose GPU dropped out is hidden and takes no new rentals until every card reads clean again and
+passes a load test on every card.
 
 A card that falls out of NVML ('Unknown Error', lost, fallen off the bus) can read clean on the next scrape and drop
 out again an hour later, while a renter's container on it keeps failing. The fatal GPU checks after the scrape
@@ -8,16 +9,21 @@ was listed again on its first clean scrape, and a rented one passed the rented c
 Every cycle this check judges the scrape with `judge_rented_gpus` (the rental's GPU count, the driver's count, the
 anchored UUID set, the NVML error code; an idle node counts as renting one GPU). A full set of other cards
 (`full_set_changed`) is no fault, rented or idle: it is judged without the anchor, and GpuFingerprintCheck
-re-anchors it the same cycle. A fault puts the node on a hold of
-GPU_LOSS_HOLD_SECONDS, renewed by every faulty cycle; weak evidence (`confirm_first`) starts the hold only when the
-cycle before also showed a fault. Every cycle in the hold carries a GPU_LOST availability entry: the backend hides
-the node and refuses new rentals, and leaves `active`, billing and a rental already on the node alone. The first
-cycle after the hold ran out carries none, and the node is listed again.
+re-anchors it the same cycle. A fault (fewer cards, a card missing, an NVML error) puts the node on a hold; weak
+evidence (`confirm_first`) starts it only when the cycle before also showed a fault. Every held cycle carries a
+GPU_LOST availability entry: the backend hides the node and refuses new rentals, and leaves `active`, billing and a
+rental already on the node alone.
+
+No timer ends the hold. The first unrented cycle whose scrape reads clean ends it and owes the every-card load test
+(PostRentalGpuRecheckCheck: the all-cards matmul and the kernel-fault probe), which runs later in that same cycle: a
+pass lists the node; a failure fails the cycle and keeps the test owed for the next one, and a card that drops again
+starts a new hold. A clean cycle under a live rental keeps the node hidden (the test cannot run beside the renter's
+pod) until a clean unrented cycle.
 
 The check's own verdict: a cycle that shows the fault goes on (the fatal GPU checks after it judge it as before,
 verification reset included), except an NVML loss code over a full card list, which no later check fails: that is
-fatal here on an idle node. A clean cycle inside the hold fails: fatally on an idle node; not under a live
-rental, as BannedGpuCheck, so the renter's pod keeps being verified and billed.
+fatal here on an idle node. Under a live rental a held cycle is not fatal, as BannedGpuCheck, so the renter's pod
+keeps being verified and billed.
 
 The hold is keyed by miner hotkey and executor UUID (the UUID is the miner's word, so one miner cannot hold another's
 node). A dry run reads it and writes nothing. A Redis that cannot be read is no hold: the verdict never rests on Redis
@@ -29,7 +35,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from services.redis_service import GPU_ANCHOR_KEY
 
@@ -41,6 +47,7 @@ from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import full_set_changed, split_uuids
+from .post_rental_gpu_recheck import MARKER_TTL_SECONDS, RecheckMarker, record_marker
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -56,6 +63,9 @@ logger = logging.getLogger(__name__)
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
+# shortcut: not a hold window, only how long Redis keeps the mark of a node no cycle sees any more (every held cycle
+# renews it, like the load-test marker); the hold itself ends only on a clean read.
+GPU_LOSS_MARK_TTL_SECONDS = MARKER_TTL_SECONDS
 
 
 def _key(ctx: Context) -> str:
@@ -118,7 +128,7 @@ def judge_scrape(ctx: Context, pods: list) -> GpuDrop | None:
 
 
 class GpuLossHoldCheck:
-    """Hide a node whose GPU dropped out, until its cards have read clean for GPU_LOSS_HOLD_SECONDS.
+    """Hide a node whose GPU dropped out, until its cards read clean and pass the every-card load test.
 
     See the module docstring for the rule. Runs right after the scrape, before the fatal GPU checks and the
     rented short-circuit, so rented and idle nodes are judged alike.
@@ -164,7 +174,7 @@ class GpuLossHoldCheck:
                 ctx,
                 key,
                 mark,
-                settings.GPU_LOSS_HOLD_SECONDS if mark.is_held else GPU_LOSS_CONFIRM_SECONDS,
+                GPU_LOSS_MARK_TTL_SECONDS if mark.is_held else GPU_LOSS_CONFIRM_SECONDS,
             )
             what = {
                 "faults": drop.faults,
@@ -191,10 +201,21 @@ class GpuLossHoldCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
-        return self._lost(ctx, mark, {"faults": []}, fatal=not pods)
+        if pods:
+            # clean, but the load test cannot run beside the renter's pod: hidden until an unrented clean cycle
+            await self._save(ctx, key, mark, GPU_LOSS_MARK_TTL_SECONDS)
+            return self._lost(ctx, mark, {"faults": []}, fatal=False)
+        # the first clean unrented read ends the hold; the every-card load test later in this cycle lists it or not
+        await record_marker(ctx, RecheckMarker(source="gpu_loss_hold", verdict="gpu_lost"))
+        await self._forget(ctx, key)
+        return CheckResult(
+            passed=True,
+            event=render_message(
+                Msg.CLEAN_AGAIN, ctx=ctx, check_id=self.check_id, what={"since": mark.since}
+            ),
+        )
 
     def _lost(self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool) -> CheckResult:
-        last_seen = datetime.fromisoformat(mark.last_seen)
         event = render_message(
             Msg.LOST,
             ctx=ctx,
@@ -206,9 +227,6 @@ class GpuLossHoldCheck:
                 **what,
                 "since": mark.since,
                 "last_seen": mark.last_seen,
-                "hold_until": (
-                    last_seen + timedelta(seconds=settings.GPU_LOSS_HOLD_SECONDS)
-                ).isoformat(),
             },
         )
         return CheckResult(passed=False, event=event, fatal=fatal)
