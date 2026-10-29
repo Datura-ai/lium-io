@@ -520,6 +520,17 @@ class GpuLossHoldMessages:
         "be reseated, reset or replaced. On the first check that sees every GPU again while the node is not "
         "rented, every card is load-tested, and the node is listed again when they pass.",
     )
+    # DAH-5393: same code as LOST (an availability error that is never silenced as our own outage)
+    POD_GPUS_GONE = MessageTemplate(
+        event="A rented pod on this node was made for GPUs the node no longer has",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="The node is hidden, takes no new rentals and scores 0 while the pod has none of its GPUs",
+        remediation="The node came back with other GPUs while a pod made for the old ones was running (see "
+        "missing_uuids). The pod cannot use the new cards until it is recreated; the node is verified on its new "
+        "cards on the first check after that, or after the rental ends.",
+    )
     CLEAN_AGAIN = MessageTemplate(
         event="Every GPU is listed again; each card is load-tested before the node is listed",
         reason="GPU_LOST_CLEAN_AGAIN",

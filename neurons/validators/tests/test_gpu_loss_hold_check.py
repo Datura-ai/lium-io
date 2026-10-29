@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -77,7 +78,9 @@ def _ctx(
     pods=(4,),
     owner="miner-hotkey",
     anchor=UUIDS,
+    pod_gpus=None,
 ):
+    """`pod_gpus`: the GPUs the host's docker record gives each pod's container (default: the listed cards)."""
     executor = default_executor()
     specs: dict = {"gpu": {"count": count, "details": _details(listed)}}
     if scrape_error is not None:
@@ -103,7 +106,22 @@ def _ctx(
         executor=executor,
         verified={"spec": f"{MODEL}:4", "uuids": ",".join(anchor)},
         config=build_context_config(gpu_model_rates={MODEL: 1.0}),
+        ssh=_DockerHost(listed if pod_gpus is None else pod_gpus, [f"container_pod{n}" for n in range(1, len(pods) + 1)]),
     )
+
+
+class _DockerHost:
+    """The host's `docker inspect` of the pods' containers: each given `gpus` (None = cannot be read)."""
+
+    def __init__(self, gpus, names):
+        self.gpus, self.names, self.calls = gpus, names, []
+
+    async def run(self, cmd, timeout=None):
+        self.calls.append(cmd)
+        if self.gpus is None:
+            raise OSError("ssh lost")
+        request = [{"Driver": "nvidia", "DeviceIDs": list(self.gpus), "Capabilities": [["gpu"]]}]
+        return SimpleNamespace(stdout="".join(f'"/{n}" {json.dumps(request)}\n' for n in self.names))
 
 
 async def _cycle(context_factory, redis, **kwargs):
@@ -552,11 +570,14 @@ async def test_fewer_cards_after_a_set_change_is_still_a_dropout_and_held(contex
 
 
 @pytest.mark.asyncio
-async def test_a_set_change_under_a_rental_posts_the_renters_incident_and_the_node_stays_listed(context_factory):
-    """The renter hears about the swap through the rented GPU-drop report for the pod; the node is not hidden."""
+async def test_a_set_change_under_a_rental_posts_the_renters_incident_and_a_pod_on_the_old_cards_stays_unavailable(
+    context_factory,
+):
+    """The renter hears about the swap through the rented GPU-drop report; the pod still made for the old cards has
+    no GPU, so the cycle fails (score 0, node hidden) and nothing re-anchors until the pod is recreated."""
     rented_gpu_drop._LOCAL_MARKS.clear()
     redis = FakeRedis()
-    ctx = _ctx(context_factory, redis, listed=OTHER_CARDS, pods=(4,))
+    ctx = _ctx(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
     ctx.services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
         recorded=True, delivery="notified"
     )
@@ -569,5 +590,67 @@ async def test_a_set_change_under_a_rental_posts_the_renters_incident_and_the_no
     assert call.args[0] == _pod(1, 4).pod_id and call.kwargs["state"] == "fault"
     assert call.kwargs["missing_uuids"] == sorted(UUIDS)
     assert incident.passed and not _hidden(incident)
-    assert hold.passed and not _hidden(hold)
+    assert not hold.passed and _fatal(hold) and _hidden(hold)
+    assert hold.event.event == Msg.POD_GPUS_GONE.event
+    assert hold.event.what_we_saw["missing_uuids"] == sorted(UUIDS)
+    assert "docker inspect" in ctx.ssh.calls[0] and "exec" not in ctx.ssh.calls[0]
     rented_gpu_drop._LOCAL_MARKS.clear()
+
+
+HELD_BY_A_DROPOUT = {
+    "held": True, "since": "2026-10-29T10:28:46+00:00", "last_seen": "2026-10-29T10:28:46+00:00", "replaced": False,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pods", [pytest.param((), id="idle"), pytest.param((4,), id="rented-pod-recreated")])
+async def test_a_dropout_hold_ends_when_the_node_is_back_with_a_full_set_of_other_cards(context_factory, pods):
+    """A hold an earlier dropout left must not keep a node back with a full new set hidden for the whole rental."""
+    redis = FakeRedis()
+    ctx = _ctx(context_factory, redis, listed=OTHER_CARDS, pods=pods)
+    redis.store[gpu_loss_hold._key(ctx)] = json.dumps(HELD_BY_A_DROPOUT)
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert result.passed and not _hidden(result) and gpu_loss_hold._key(ctx) not in redis.store
+    fingerprint = await GpuFingerprintCheck().run(ctx)
+    assert fingerprint.passed and fingerprint.updates == {"gpu_reanchor": True}
+
+
+@pytest.mark.asyncio
+async def test_a_pod_on_the_old_cards_keeps_the_node_back_and_drops_the_dropout_hold(context_factory):
+    redis = FakeRedis()
+    ctx = _ctx(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+    redis.store[gpu_loss_hold._key(ctx)] = json.dumps(HELD_BY_A_DROPOUT)
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert not result.passed and _fatal(result) and _hidden(result)
+    assert gpu_loss_hold._key(ctx) not in redis.store
+    # the pod recreated on the new cards: the next cycle passes and re-anchors
+    cured = _ctx(context_factory, redis, listed=OTHER_CARDS, pods=(4,))
+    assert (await GpuLossHoldCheck().run(cured)).passed
+    assert (await GpuFingerprintCheck().run(cured)).updates == {"gpu_reanchor": True}
+
+
+@pytest.mark.asyncio
+async def test_a_pod_that_cannot_be_read_after_a_set_change_is_not_taken_as_served(context_factory):
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,))
+    ctx.ssh.gpus = None  # the SSH read fails
+
+    unread = await GpuLossHoldCheck().run(ctx)
+
+    assert not unread.passed and _hidden(unread) and unread.event.what_we_saw["pods_unread"] == ["container_pod1"]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_given_every_gpu_is_served_by_the_new_cards(context_factory):
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,))
+    all_gpus = [{"Driver": "nvidia", "Count": -1, "Capabilities": [["gpu"]]}]
+
+    async def run(cmd, timeout=None):
+        return SimpleNamespace(stdout=f'"/container_pod1" {json.dumps(all_gpus)}\n')
+
+    ctx.ssh.run = run
+
+    assert (await GpuLossHoldCheck().run(ctx)).passed
