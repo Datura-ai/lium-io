@@ -161,6 +161,7 @@ async def test_finding_is_fatal_only_without_a_live_rental(context_factory, rent
     result = await _run(ctx)
     assert result.passed is False
     assert result.fatal is (not rented)
+    assert result.updates == {"hardware_identity_passed": False}
 
     nxt = _Next()
     await Pipeline(checks=[HardwareIdentityCheck(), nxt], sink=AsyncMock()).run(ctx)

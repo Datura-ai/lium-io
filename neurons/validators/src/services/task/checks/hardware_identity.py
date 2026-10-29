@@ -164,5 +164,11 @@ class HardwareIdentityCheck:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
 
         event = render_message(Msg.SPOOFED, ctx=ctx, check_id=self.check_id, what=what)
-        # like the ban checks: a node with a live pod keeps being verified (TenantEnforcementCheck still runs)
-        return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx))
+        # like the ban checks: a node with a live pod keeps being verified (TenantEnforcementCheck still runs);
+        # the flag zeroes its score in calculate_scores
+        return CheckResult(
+            passed=False,
+            event=event,
+            fatal=not has_live_rental(ctx),
+            updates={"hardware_identity_passed": False},
+        )
