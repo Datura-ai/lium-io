@@ -324,6 +324,7 @@ async def test_create_local_volume_falls_back_to_the_enabled_old_plugin_when_v2_
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
     monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
     ssh_client = _plugin_host(v2_state=v2_state, install=install)
 
@@ -348,6 +349,7 @@ async def test_create_local_volume_falls_back_to_the_enabled_previous_plugin_bef
 ):
     monkeypatch.setattr(docker_service_module.logger, "warning", Mock())
     monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
     ssh_client = _plugin_host(v2_state="absent", previous_state="true", old_state=old_state)
 
@@ -481,7 +483,7 @@ async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_
     assert [volume["driver"] for volume in created] == ["vloopback:v3"]
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
     assert commands[-1] == _bounded(
-        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v3"), 60
+        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v3"), 150
     )
     assert all("vloopback:v3" in command for command in commands if "plugin" in command)
 
@@ -611,3 +613,25 @@ def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marke
 
     assert state.stdout.strip() == expected
     assert "probe-ok" not in docker_service_module._loopback_plugin_state_command("vloopback:v2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "v3_enabled, alias, budget",
+    [(True, "vloopback:v3", "150"), (False, "vloopback:v2", "60")],
+)
+async def test_plugin_setup_runs_under_the_probed_budget_only_for_the_generation_that_probes(
+    docker_service, monkeypatch, v3_enabled, alias, budget
+):
+    # the direct-I/O setup also mounts a probe volume, so it gets more host time than a plain install
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", v3_enabled)
+    ssh_client = _plugin_host(v2_state="true", previous_state="true")
+
+    created = await asyncio.wait_for(_create_volume(docker_service, ssh_client, None), timeout=5)
+
+    assert [volume["driver"] for volume in created] == [alias]
+    setup_commands = [
+        call.args[0] for call in ssh_client.run.await_args_list if "python3 " in call.args[0]
+    ]
+    assert len(setup_commands) == 1
+    assert setup_commands[0].startswith(f"timeout -k 5 {budget} ")

@@ -1,23 +1,30 @@
 """Prepare the pinned loopback plugin without triggering old dockerd's digest-download panic."""
 
 import shlex
+from typing import NamedTuple
 
 from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE
 from services.const import LOOPBACK_PLUGIN_ALIAS, LOOPBACK_PLUGIN_V3_ALIAS
 
-# alias -> (image tag, pinned manifest digest, generation); the generation names the plugin's
-# DATA_DIR / STATE_DIR / lock on the host, so two generations never share a directory
+
+class LoopbackPluginBuild(NamedTuple):
+    tag: str
+    digest: str
+    # names the plugin's DATA_DIR / STATE_DIR / lock on the host, so two generations never share a directory
+    generation: str
+
+
 LOOPBACK_PLUGIN_BUILDS = {
-    LOOPBACK_PLUGIN_ALIAS: (
+    LOOPBACK_PLUGIN_ALIAS: LoopbackPluginBuild(
         "daturaai/docker-volume-loopback:1.0.0-lium1",
         "sha256:99eacc306478ae5d03188474d07973078b66109077caa49618c57da211a71309",
         "v2",
     ),
     # DAH-5101: losetup --direct-io=on --sector-size 4096 --nooverlap, data files in whole sectors
-    LOOPBACK_PLUGIN_V3_ALIAS: (
-        "daturaai/docker-volume-loopback:1.0.0-lium6",
-        "sha256:192e711fa97face949acb8b57edae8a32baa7d37e29e2a176c8b351458377a4d",
+    LOOPBACK_PLUGIN_V3_ALIAS: LoopbackPluginBuild(
+        "daturaai/docker-volume-loopback:1.0.0-lium7",
+        "sha256:5e297f3efcd2a331e67d006f8d1c1638e855f545d1ea14d2f7a02758cda9e631",
         "v3",
     ),
 }
@@ -34,7 +41,7 @@ def loopback_plugin_probe_marker_path(alias: str) -> str | None:
     # executor restart costs one probe.
     if alias != LOOPBACK_PLUGIN_V3_ALIAS:
         return None
-    return f"/run/lock/lium-loopback-{LOOPBACK_PLUGIN_BUILDS[alias][2]}.probe-ok"
+    return f"/run/lock/lium-loopback-{LOOPBACK_PLUGIN_BUILDS[alias].generation}.probe-ok"
 
 
 # Executed by the executor's Python, not the validator's filesystem. Docker's plugin metadata
@@ -124,8 +131,7 @@ try:
         for name, value in (("DATA_DIR", data_dir), ("STATE_DIR", state_dir)):
             if [entry for entry in env if entry.startswith(name + "=")] != [name + "=" + value]:
                 raise RuntimeError("data/state directories do not match this Docker data root")
-        enabled_here = not plugin["Enabled"]
-        if enabled_here:
+        if not plugin["Enabled"]:
             call("enable", plugin_id)
             plugin = inspect()
         if not plugin or plugin["Id"] != plugin_id or plugin["Enabled"] is not True:

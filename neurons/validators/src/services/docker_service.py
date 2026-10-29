@@ -691,6 +691,10 @@ class VolumeSizingResult:
 # `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
 # whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
 _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
+# the direct-I/O generation also mounts a probe volume (volume create + mkfs, a helper-image run that
+# may pull, a sync) before it writes its marker; on a host whose dockerd starts containers slowly the
+# install budget alone cut the probe short, and every new-volume rental re-ran it until one finished
+_LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS = 150
 # how much longer than the host's `timeout` the validator waits: for a connection that stops answering
 _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS = 10
 _PROBE_OUTPUT_LOG_CAP = 512
@@ -726,7 +730,7 @@ class NoUsableLoopbackPluginError(Exception):
     def __init__(self, current_plugin_unusable_reason: str, current_alias: str, old_plugin_states: dict[str, str]):
         # "plugin vloopback" + "disabled" is what the stats classifier files as volume.plugin_disabled
         states = ", ".join(f"plugin {alias} state {state}" for alias, state in old_plugin_states.items())
-        generation = LOOPBACK_PLUGIN_BUILDS[current_alias][2]
+        generation = LOOPBACK_PLUGIN_BUILDS[current_alias].generation
         super().__init__(
             f"no usable vloopback plugin on host ({generation}: {current_plugin_unusable_reason}; old {states})"
         )
@@ -6552,7 +6556,7 @@ class DockerService:
                 ssh_client, timeout, log_extra, "v2 disabled by LOOPBACK_PLUGIN_V2_ENABLED"
             )
         current_alias = current_loopback_plugin_alias()
-        generation = LOOPBACK_PLUGIN_BUILDS[current_alias][2]
+        generation = LOOPBACK_PLUGIN_BUILDS[current_alias].generation
         if host_probe is not None and host_probe.loopback_plugin_enabled:
             return current_alias
         root = host_probe.docker_root_dir if host_probe else await self.get_docker_root_dir(ssh_client)
@@ -6563,10 +6567,15 @@ class DockerService:
             reason = "Docker data root unknown"
         else:
             try:
+                setup_timeout = (
+                    _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
+                    if loopback_plugin_probe_marker_path(current_alias)
+                    else _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
+                )
                 result = await _run_with_host_timeout(
                     ssh_client,
                     loopback_plugin_setup_command(root, current_alias),
-                    _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS,
+                    setup_timeout,
                 )
                 if result.exit_status == 0:
                     return current_alias
