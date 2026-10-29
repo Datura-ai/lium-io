@@ -167,7 +167,7 @@ class RentedPodNetworkCheck:
         if (
             source == "sockets"
             and result.exit_status == 0
-            and not any(x.startswith("S ") for x in lines)
+            and not set(names_by_key).issubset(x.split()[1] for x in lines if x.startswith("S "))
         ):
             return self._unread(ctx, reason="no connection table or socket table on this host")
         if result.exit_status != 0:  # a failed read is no evidence of inactivity

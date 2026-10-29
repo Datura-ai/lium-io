@@ -154,14 +154,17 @@ def _ssh(
     return SimpleNamespace(run=run)
 
 
-def _ctx(context_factory, ssh, pods=True, pid_mode="host"):
+def _ctx(context_factory, ssh, pods=True, pid_mode="host", names=("pod_1",)):
     rented = RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
                 miner_hotkey="miner-hotkey",
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="22",
-                pods=[RentedPod(pod_id="1", container_name="pod_1", status="RUNNING")]
+                pods=[
+                    RentedPod(pod_id=str(i), container_name=n, status="RUNNING")
+                    for i, n in enumerate(names, 1)
+                ]
                 if pods
                 else [],
             )
@@ -219,10 +222,15 @@ async def test_many_unreplied_destinations_warn_but_pass(context_factory):
         _ssh(table_exit=3, inspect="/pod_1 0 172.17.0.2\n"),
         _ssh(inspect="/pod_1 <no value>\n"),
         _ssh(raise_exc=asyncssh.ConnectionLost("gone")),
+        _ssh(
+            table_exit=3,
+            inspect="/pod_1 4242 172.17.0.2\n/pod_2 4343 172.17.0.3\n",
+            sockets="S 4242 1 0 1 0 0\n",
+        ),
     ],
 )
 async def test_unreadable_never_fails(context_factory, ssh):
-    result = await _run(_ctx(context_factory, ssh))
+    result = await _run(_ctx(context_factory, ssh, names=("pod_1", "pod_2")))
     assert result.passed is True
     assert result.event.reason_code == Msg.UNREAD.reason
 
