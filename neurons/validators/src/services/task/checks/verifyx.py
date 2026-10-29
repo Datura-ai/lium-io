@@ -57,7 +57,8 @@ class VerifyXCheck:
 
     The check blocks on the probe's success. It always runs (DAH-4328 removed the
     ENABLE_VERIFYX setting, on everywhere since Sep 2025); only an idle filler-only node
-    with a stored EMA skips it, keeping that EMA.
+    with a stored download EMA and an upload EMA that is absent or at the floor skips it,
+    keeping that EMA.
     """
 
     check_id = "gpu.validate.verifyx"
@@ -84,7 +85,17 @@ class VerifyXCheck:
         stored_ema = _stored_network_ema(ctx)
         # A never-measured node is probed even under a filler: with no EMA to reuse it would
         # score 0 every cycle and stay hidden for as long as the filler runs.
-        if filler_container and stored_ema and stored_ema.ema_verifyx_download_speed is not None:
+        # A stored upload EMA below the floor is probed too: skipping would pass it while the
+        # filler runs, and a fresh sample is what lets it recover.
+        if (
+            filler_container
+            and stored_ema
+            and stored_ema.ema_verifyx_download_speed is not None
+            and (
+                stored_ema.ema_verifyx_upload_speed is None
+                or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
+            )
+        ):
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -460,17 +471,14 @@ def upload_too_slow(
     *,
     first_pass: bool,
 ) -> bool:
-    """The upload-EMA floor, judged only on a probe that measured a positive upload: a missing
-    reading, a 0.0 or a Cloudflare 429 never fails it. Like the download floor, a first pass on a
-    never-measured upload is not judged."""
-    if ema_upload is None or not (
-        _is_positive_number(upload_reading) and _is_speed_reading(upload_reading)
-    ):
-        return False
-    if ema_upload >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS:
+    """The upload-EMA floor. A 0.0 is a judged sample (a host can block its own upload), and a
+    missing, malformed or Cloudflare-429 reading judges the EMA it leaves, so an established
+    below-floor upload keeps failing. Only a never-measured upload with no usable sample, or on a
+    first pass, is not judged."""
+    if ema_upload is None or ema_upload >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS:
         return False
     never_measured = prev_ema is None or prev_ema.ema_verifyx_upload_speed is None
-    return not (first_pass and never_measured)
+    return not (never_measured and (first_pass or not _is_speed_reading(upload_reading)))
 
 
 def verifyx_verdict(
@@ -485,9 +493,12 @@ def verifyx_verdict(
     ema_download = gated_download_ema(network, prev_ema)
     if download_gate(ema_download, prev_ema, first_pass=first_pass) == "too_slow":
         return False
-    upload = network.get("upload_speed")
+    # shortcut: assumes a 429 is within MAX_KEPT_UPLOAD_PROBES (the verdict holds no count).
+    upload_fallback = bool(network.get("cloudflare_upload_fallback"))
+    upload = _fallback_upload_reading(network.get("upload_speed"), upload_fallback)
     prev_upload = prev_ema.ema_verifyx_upload_speed if prev_ema else None
-    ema_upload = _ema_if_gated(prev_upload, upload)
+    kept = upload is None and upload_fallback
+    ema_upload = prev_upload if kept else _ema_if_gated(prev_upload, upload)
     return not upload_too_slow(ema_upload, upload, prev_ema, first_pass=first_pass)
 
 

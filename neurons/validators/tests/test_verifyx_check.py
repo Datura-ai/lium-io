@@ -3,6 +3,7 @@ import logging
 import pytest
 
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
+from neurons.validators.src.services.task.checks import verifyx as verifyx_module
 from neurons.validators.src.services.task.messages import (
     VERIFYX_DEBUG_DOC_URL,
     VerifyXMessages as Msg,
@@ -715,33 +716,130 @@ async def test_verifyx_success_path_emits_no_verifyx_failed_log(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "upload,prev_upload,expected_pass",
+    "upload,prev_upload,filler,expected_pass,expected_probe,expected_ema",
     [
         # F-1654: download fine, upload 4 Mbps on a known host -> EMA 4.5 < 10 fails
-        (4.0, 5.0, False),
+        (4.0, 5.0, False, False, True, 4.5),
         # at and above the floor passes
-        (10.0, 10.0, True),
-        (60.0, 900.0, True),
-        # no upload reading (or a 0.0) is no measurement: never fails on the upload floor
-        (None, 5.0, True),
-        (0.0, 5.0, True),
-        # a malformed upload keeps the previous EMA and is not judged
-        (float("nan"), 5.0, True),
+        (10.0, 10.0, False, True, True, 10.0),
+        (60.0, 900.0, False, True, True, 480.0),
+        (60.0, 60.0, False, True, True, 60.0),
+        # a missing reading or a 0.0 lowers the EMA and is judged; a malformed one keeps it, judged
+        (None, 5.0, False, False, True, 2.5),
+        (0.0, 5.0, False, False, True, 2.5),
+        (float("nan"), 5.0, False, False, True, 5.0),
+        # a never-measured upload with no sample is not failed; a 0.0 sample is judged
+        (None, None, False, True, True, 0.0),
+        (0.0, None, False, False, True, 0.0),
+        # an active filler skips the probe only when the stored upload EMA is at the floor
+        (4.0, 5.0, True, False, True, 4.5),
+        (10.0, 10.0, True, True, False, 10.0),
+        (60.0, 60.0, True, True, False, 60.0),
+        # recovery under a filler: the below-floor node is probed and its good reading counts
+        (60.0, 5.0, True, True, True, 32.5),
     ],
 )
-async def test_verifyx_upload_floor(context_factory, upload, prev_upload, expected_pass):
-    result = await _run_ema_cycle(
-        context_factory, download=2100.0, upload=upload, prev_upload=prev_upload
+async def test_verifyx_upload_floor(
+    context_factory, upload, prev_upload, filler, expected_pass, expected_probe, expected_ema
+):
+    rented = _rented_data_with_ema("executor-123", download=2000.0, upload=prev_upload)
+    rented.filler_containers_by_executor = {"executor-123": "filler_active"} if filler else {}
+    service = DummyVerifyXService(
+        success=True,
+        updated_specs={"network": {"download_speed": 2100.0, "upload_speed": upload}},
+    )
+    ctx = context_factory(
+        services=build_services(verifyx=service),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}}, rented_data=rented),
     )
 
+    result = await VerifyXCheck().run(ctx)
+
     assert result.passed is expected_pass
-    gate = result.event.what_we_saw["network_gate"]
-    assert gate["upload_floor_mbps"] == 10.0
+    assert (service.called_with is not None) == expected_probe
+    network = result.updates["state"].specs["network"]
+    assert network["ema_verifyx_upload_speed"] == pytest.approx(expected_ema)
+    if expected_probe:
+        gate = result.event.what_we_saw["network_gate"]
+        assert gate["upload_floor_mbps"] == 10.0
+        assert gate["ema_upload"] == pytest.approx(expected_ema)
     if not expected_pass:
         assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
         assert result.event.what_we_saw["direction"] == "upload"
-        assert result.event.what_we_saw["ema_verifyx_upload_speed"] == pytest.approx(4.5)
-        assert gate["ema_upload"] == pytest.approx(4.5)
+        assert result.event.what_we_saw["ema_verifyx_upload_speed"] == pytest.approx(expected_ema)
+
+
+async def _upload_cycles(context_factory, prev_upload, network_per_cycle):
+    """Consecutive VerifyXCheck.run cycles, each fed the previous cycle's upload EMA."""
+    outcomes = []
+    for network in network_per_cycle:
+        result = await _run_ema_cycle(
+            context_factory, download=2100.0, prev_upload=prev_upload, **network
+        )
+        prev_upload = result.updates["state"].specs["network"]["ema_verifyx_upload_speed"]
+        outcomes.append((result.passed, pytest.approx(prev_upload)))
+    return outcomes
+
+
+@pytest.mark.asyncio
+async def test_verifyx_upload_floor_recovers_once_the_ema_reaches_the_floor(context_factory):
+    cycles = [{"upload": 12.0}] * 3
+
+    assert await _upload_cycles(context_factory, 2.0, cycles) == [
+        (False, 7.0),
+        (False, 9.5),
+        (True, 10.75),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_verifyx_upload_zero_errors_keep_a_slow_upload_failing(context_factory):
+    """A host that blocks its own upload (probe reads 0.0) cannot turn 4 -> 0 -> 0 into a pass."""
+    cycles = [{"upload": 4.0}, {"upload": 0.0}, {"upload": 0.0}]
+
+    assert await _upload_cycles(context_factory, 5.0, cycles) == [
+        (False, 4.5),
+        (False, 2.25),
+        (False, 1.125),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kept_before,prev_upload,expected_pass,expected_ema",
+    [
+        # within MAX_KEPT_UPLOAD_PROBES the 429 keeps the stored EMA, and that EMA is judged
+        (0, 5.0, False, 5.0),
+        (verifyx_module.MAX_KEPT_UPLOAD_PROBES - 1, 5.0, False, 5.0),
+        (0, 10.0, True, 10.0),
+        (verifyx_module.MAX_KEPT_UPLOAD_PROBES - 1, 10.0, True, 10.0),
+        # past the cap the probe's 0.0 is fed and judged
+        (verifyx_module.MAX_KEPT_UPLOAD_PROBES, 5.0, False, 2.5),
+        (verifyx_module.MAX_KEPT_UPLOAD_PROBES, 10.0, False, 5.0),
+    ],
+)
+async def test_verifyx_upload_floor_across_the_429_fallback_cap(
+    context_factory, kept_before, prev_upload, expected_pass, expected_ema
+):
+    verifyx_module._kept_upload_probes[("miner-hotkey", "executor-123")] = kept_before
+    network = {"download_speed": 2100.0, "upload_speed": 0.0, "cloudflare_upload_fallback": True}
+    ctx = context_factory(
+        services=build_services(
+            verifyx=DummyVerifyXService(success=True, updated_specs={"network": network})
+        ),
+        config=build_context_config(),
+        state=build_state(
+            specs={"gpu": {"count": 1}},
+            rented_data=_rented_data_with_ema("executor-123", download=2000.0, upload=prev_upload),
+        ),
+    )
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    ema = result.updates["state"].specs["network"]["ema_verifyx_upload_speed"]
+    assert ema == pytest.approx(expected_ema)
 
 
 @pytest.mark.asyncio
@@ -765,13 +863,24 @@ async def test_verifyx_upload_floor_not_judged_on_a_first_pass_never_measured_up
 
 
 @pytest.mark.parametrize(
-    "upload,prev_upload,expected",
-    [(4.0, 5.0, False), (60.0, 900.0, True), (None, 5.0, True), (0.0, 5.0, True)],
+    "upload,prev_upload,fallback,expected",
+    [
+        (4.0, 5.0, False, False),
+        (60.0, 900.0, False, True),
+        (None, 5.0, False, False),
+        (0.0, 5.0, False, False),
+        (None, None, False, True),
+        (0.0, 5.0, True, False),
+        (0.0, 10.0, True, True),
+    ],
 )
-def test_verifyx_verdict_applies_the_upload_floor(upload, prev_upload, expected):
+def test_verifyx_verdict_applies_the_upload_floor(upload, prev_upload, fallback, expected):
     from neurons.validators.src.services.task.checks.verifyx import verifyx_verdict
 
     prev = NetworkEMA(ema_verifyx_download_speed=2000.0, ema_verifyx_upload_speed=prev_upload)
-    data = {"success": True, "network": {"download_speed": 2100.0, "upload_speed": upload}}
+    network = {"download_speed": 2100.0, "upload_speed": upload}
+    if fallback:
+        network["cloudflare_upload_fallback"] = True
+    data = {"success": True, "network": network}
 
     assert verifyx_verdict(data, prev, first_pass=False) is expected
