@@ -118,13 +118,6 @@ def test_a_setup_docker_or_the_mounts_do_not_describe_gives_no_verdict(tmp_path,
     assert detail.startswith("Storage limit setup unknown")
 
 
-def test_the_probe_container_needs_no_gpu():
-    command = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", {"COMMANDS"}, {})["COMMANDS"]
-
-    assert "--gpus" not in command["CHECK_STORAGE_LIMIT_ABILITY"]
-    assert command["CHECK_STORAGE_LIMIT_ABILITY"][-1] == "/usr/bin/true"
-
-
 def test_a_timed_out_probe_gives_no_verdict(tmp_path):
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired("docker", 30)

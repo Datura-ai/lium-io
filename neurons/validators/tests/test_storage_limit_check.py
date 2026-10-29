@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from neurons.validators.tests.helpers import build_state
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
-from services.task.availability import availability_errors
+from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
 from services.task.checks.rented_machine import TenantEnforcementCheck
 from services.task.checks.storage_limit import StorageLimitCheck
 from services.task.messages import StorageLimitMessages as Msg
@@ -294,3 +294,27 @@ async def test_a_lost_verdict_memory_holds_without_a_zero(context_factory, enfor
     assert held(result)
     if fault != "write":  # a write error still read the last verdict
         assert ctx.state.specs["storage_limit_supported"] is not True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cycles",
+    [
+        [NO_LIMIT],  # STORAGE_LIMIT_MISSING
+        [NO_LIMIT, NO_LIMIT],  # STORAGE_LIMIT_REQUIRED
+        [UNKNOWN],  # STORAGE_LIMIT_INCONCLUSIVE
+        [PASS, UNKNOWN, "backdate", UNKNOWN],  # STORAGE_LIMIT_INCONCLUSIVE_LONG
+    ],
+)
+async def test_every_hold_survives_an_outage_cycle(context_factory, enforced, cycles):
+    # an outage cycle keeps only NODE_GPU_FAULT_CODES; a dropped hold would leave the node rentable uncapped
+    ctx, capable = new_ctx(context_factory)
+    for cycle in cycles:
+        if cycle == "backdate":
+            inconclusive_since(ctx, timedelta(hours=25))
+            continue
+        result = await run_with(ctx, {**cycle, **capable})
+
+    codes = [error.reason_code for error in availability_errors([result.event])]
+    assert codes
+    assert set(codes) <= NODE_GPU_FAULT_CODES

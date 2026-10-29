@@ -63,6 +63,9 @@ class AvailabilityErrorCode(StrEnum):
     STORAGE_LIMIT_REQUIRED = "STORAGE_LIMIT_REQUIRED"
     # ... or whose disk-limit probe has never given a verdict
     STORAGE_LIMIT_INCONCLUSIVE = "STORAGE_LIMIT_INCONCLUSIVE"
+    # ... held from new rentals after one failed probe, or after over 24 h without a verdict
+    STORAGE_LIMIT_MISSING = "STORAGE_LIMIT_MISSING"
+    STORAGE_LIMIT_INCONCLUSIVE_LONG = "STORAGE_LIMIT_INCONCLUSIVE_LONG"
 
 
 # Faults of the node itself (its cards, its Docker storage): never a sign of our own outage, never silenced with one.
@@ -72,6 +75,8 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
         AvailabilityErrorCode.STORAGE_LIMIT_REQUIRED,
         AvailabilityErrorCode.STORAGE_LIMIT_INCONCLUSIVE,
+        AvailabilityErrorCode.STORAGE_LIMIT_MISSING,
+        AvailabilityErrorCode.STORAGE_LIMIT_INCONCLUSIVE_LONG,
     }
 )
 
