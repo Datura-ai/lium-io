@@ -999,6 +999,16 @@ def custom_build_log_tail(output: str | None) -> str | None:
     return tail[-CUSTOM_BUILD_LOG_TAIL_MAX_CHARS:]
 
 
+def custom_build_export_timeout(
+    size_bytes: int | None, floor_s: int, elapsed_s: float, min_bytes_per_s: int, budget_s: int
+) -> int:
+    """Seconds the image export may take: the image's size at `min_bytes_per_s`, never below
+    `floor_s` (the build timeout, what the export always had) and never past what is left of
+    `budget_s` after `elapsed_s` (the backend fails a pod still PENDING after 1 h)."""
+    scaled = math.ceil(size_bytes / min_bytes_per_s) if size_bytes else 0
+    return max(floor_s, min(scaled, int(budget_s - elapsed_s)))
+
+
 def stream_timed_out(err: str | None) -> bool:
     """True only when stderr is the streamer's own timeout sentinel and nothing else."""
     return (err or "").strip().lower() == STREAM_TIMEOUT_STDERR.lower()
@@ -7214,6 +7224,7 @@ class DockerService:
         """
         from core.config import settings
 
+        started = time.monotonic()
         pod_id = payload.pod_id
         image_tag = self._custom_build_image_tag(pod_id)
         dind_name = self._dind_container_name(pod_id)
@@ -7556,7 +7567,28 @@ class DockerService:
                 return CustomBuildOutcome(False, "docker_build", custom_build_log_tail(err))
 
             # 7. Export the image from DinD and load it onto the host daemon so
-            #    the rental `docker run` (host-side) can use it.
+            #    the rental `docker run` (host-side) can use it. The export takes
+            #    longer than the build for big images (a 940 s build did not export
+            #    in 1200 s), so its timeout follows the image's size.
+            size_bytes = None
+            try:
+                size_res = await ssh_client.run(
+                    f"/usr/bin/docker exec {shlex.quote(dind_name)} "
+                    f"docker image inspect -f '{{{{.Size}}}}' {shlex.quote(image_tag)}",
+                    check=False,
+                    timeout=setup_timeout_s,
+                )
+                if size_res.exit_status == 0:
+                    size_bytes = int((size_res.stdout or "").strip())
+            except Exception:
+                size_bytes = None  # unknown size: the export keeps the build timeout
+            export_timeout_s = custom_build_export_timeout(
+                size_bytes,
+                timeout_s,
+                time.monotonic() - started,
+                int(settings.CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND),
+                int(settings.CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS),
+            )
             await self.stream_log(
                 f"Loading built image {image_tag} onto host", "success", log_tag
             )
@@ -7569,13 +7601,13 @@ class DockerService:
                 command=export_cmd,
                 log_tag=log_tag,
                 log_text=f"Exporting custom image {image_tag}",
-                log_extra={**default_extra, "build_image_tag": image_tag},
-                timeout=timeout_s,
+                log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
+                timeout=export_timeout_s,
                 raise_exception=False,
             )
             if not ok:
                 if stream_timed_out(err):
-                    return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {timeout_s} s")
+                    return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {export_timeout_s} s")
                 # The stderr here is the HOST daemon's `docker load` (paths, disk state), not the
                 # renter's build: it goes to ops, the renter gets a fixed reason.
                 logger.error(

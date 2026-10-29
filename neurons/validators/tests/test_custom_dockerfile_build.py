@@ -35,7 +35,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     PayloadPortMapping,
 )
-from services.docker_service import DockerService
+from services.docker_service import DockerService, custom_build_export_timeout
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -653,3 +653,52 @@ def test_A17e_a_stack_trace_longer_than_the_tail_still_reaches_the_renter_with_i
         "#5 [2/3] RUN pip install nope",
         "ERROR: failed to solve: pip install nope did not complete",
     ]
+
+
+# ------------------------------------------------------------------
+# A.20 — the image export's timeout follows the built image's size
+# ------------------------------------------------------------------
+
+
+def test_A20_export_timeout_scales_with_image_size_within_the_pending_budget():
+    gib = 1024**3
+    # unknown or small image: the build timeout, as before
+    assert custom_build_export_timeout(None, 1200, 950, 10 * 1024**2, 3300) == 1200
+    assert custom_build_export_timeout(2 * gib, 1200, 950, 10 * 1024**2, 3300) == 1200
+    # a 20 GiB image at 10 MiB/s needs 2048 s, more than the build timeout
+    assert custom_build_export_timeout(20 * gib, 1200, 950, 10 * 1024**2, 3300) == 2048
+    # never past what is left of the budget, never below the build timeout
+    assert custom_build_export_timeout(40 * gib, 1200, 950, 10 * 1024**2, 3300) == 2350
+    assert custom_build_export_timeout(40 * gib, 1200, 3000, 10 * 1024**2, 3300) == 1200
+
+
+@pytest.mark.asyncio
+async def test_A20b_a_large_image_gets_a_size_scaled_export_timeout(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    inner_run = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if "docker image inspect -f" in cmd:
+            ssh_client.calls.append(cmd)
+            return _ssh_result(stdout=str(20 * 1024**3))
+        return await inner_run(cmd, **kw)
+
+    ssh_client.run = _run
+    timeouts = {}
+    esl = _make_esl()
+
+    async def _esl(**kwargs):
+        if "docker save" in kwargs["command"]:
+            timeouts["export"] = kwargs["timeout"]
+        return await esl(**kwargs)
+
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step, _tail = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert ok is True and step is None
+    assert any("docker image inspect -f" in c for c in ssh_client.calls)
+    assert timeouts["export"] == 2048  # 20 GiB at the default 10 MiB/s, not the 1200 s build timeout

@@ -829,6 +829,20 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS", default=1200,
         description="Hard timeout for `docker build` of a custom-dockerfile pod (seconds).",
     )
+    CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND: int = Field(
+        env="CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND", default=10 * 1024 * 1024, gt=0,
+        description=(
+            "Slowest image export (DinD `docker save | docker load` onto the host) the export timeout allows "
+            "for: the timeout is the built image's size at this rate, never below the build timeout."
+        ),
+    )
+    CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS", default=3300, gt=0,
+        description=(
+            "Ceiling for setup + build + export of one custom-dockerfile pod. The backend fails a pod "
+            "still PENDING after 1 h, so a size-scaled export never runs past this."
+        ),
+    )
     CUSTOM_DOCKERFILE_MAX_BYTES: int = Field(
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,
         description="Defense-in-depth cap on dockerfile_content size; route is authoritative.",
