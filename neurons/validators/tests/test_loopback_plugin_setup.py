@@ -114,9 +114,11 @@ def _setup_arguments(
     arguments[-2] = str(tmp_path / "setup.lock")
     if arguments[-1]:
         arguments[-1] = str(tmp_path / "probe-ok")
-        marker_content = {"current": digest, "old": "sha256:" + "0" * 64, "empty": ""}
+        marker_content = {
+            "current": digest.encode(), "old": b"sha256:" + b"0" * 64, "empty": b"", "binary": b"\xff",
+        }
         if overrides.get("marker_before"):
-            (tmp_path / "probe-ok").write_text(marker_content[str(overrides["marker_before"])])
+            (tmp_path / "probe-ok").write_bytes(marker_content[str(overrides["marker_before"])])
     return arguments
 
 
@@ -250,7 +252,7 @@ async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it
 
 @pytest.mark.parametrize("disable_exit", [0, 1], ids=["disable-ok", "disable-refused"])
 @pytest.mark.parametrize("run_exit", [0, 1], ids=["probe-ok", "probe-failed"])
-@pytest.mark.parametrize("marker_before", ["empty", "old", "current"])
+@pytest.mark.parametrize("marker_before", ["empty", "old", "binary", "current"])
 def test_setup_removes_a_marker_of_another_build_before_it_can_fail(
     tmp_path: Path, marker_before: str, run_exit: int, disable_exit: int
 ) -> None:

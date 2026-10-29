@@ -74,7 +74,8 @@ def probe_marker_holds(expected_digest):
     try:
         with open(marker_path) as marker:
             return marker.read().strip() == expected_digest
-    except OSError:
+    except (OSError, UnicodeError):
+        # a marker the host cannot even decode is as stale as one of another build: drop it
         return False
 
 # one volume and one container per generation: the lock serialises setups, so a stable name lets
