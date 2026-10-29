@@ -244,7 +244,11 @@ def test_backup_repository_probe_retries_closed_connection(
         ]
     )
 
-    monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
+    def slow_restic(*args: object, **kwargs: object) -> object:
+        clock.now += 900.0  # restic's own retries outlast the readiness window
+        return repository_command_sequence(*args, **kwargs)
+
+    monkeypatch.setattr("storage.restic.subprocess.run", slow_restic)
     monkeypatch.setattr("storage.restic.time.monotonic", clock)
     monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
     runner._ensure_repository_for_backup()
