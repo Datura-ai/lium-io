@@ -30,9 +30,10 @@ VERIFIED_PORTS_MEMORY_TTL_SECONDS = 24 * 3600
 DISK_PRESSURE_DEFERRALS_TTL_SECONDS = 24 * 3600
 # the two snapshots, the syncfs poll cap and a margin for the sysfs walk
 DISK_PRESSURE_READ_TIMEOUT_SECONDS = SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS + 15
-# executor uuid -> a completed check Redis refused to record; the older memory still in Redis may not be
-# republished until a later completed check is saved (the module outlives the per-cycle check instance)
-_UNSAVED_COMPLETED: set[str] = set()
+# (miner hotkey, executor uuid) whose latest completed check this process put on record in full - the ports
+# and the sysbox memory both; only such a memory is republished, so a check Redis refused, or a restart with an
+# older verdict still in Redis, means a real check first (the module outlives the per-cycle check instance)
+_SAVED_COMPLETED: set[tuple[str, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -293,9 +294,10 @@ class PortConnectivityCheck:
         reading = await self._read_disk_pressure(ctx)
         self_rent = rented_executor is not None and rented_executor.self_rent
         default_job_owner = rented_data.get_default_job_owner(ctx.executor.uuid) if rented_data else None
-        # the backend says whose filler it is: the provider's own default job is the provider's writer
-        deferral_eligible = (rented_executor is not None and not self_rent) or (
-            bool(filler_ports) and default_job_owner == DEFAULT_JOB_OWNER_LIUM
+        # the backend says whose filler it is: the provider's own default job is the provider's writer; a
+        # self-rent vetoes the node whatever else runs on it
+        deferral_eligible = not self_rent and (
+            rented_executor is not None or (bool(filler_ports) and default_job_owner == DEFAULT_JOB_OWNER_LIUM)
         )
         enforce = settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED
         memory = None
@@ -322,11 +324,11 @@ class PortConnectivityCheck:
             and memory is not None
             and deferrals < DISK_PRESSURE_MAX_DEFERRALS
         )
-        if would_defer and ctx.executor.uuid in _UNSAVED_COMPLETED:
-            # the memory in Redis is older than the last completed check
+        if would_defer and (ctx.miner_hotkey, ctx.executor.uuid) not in _SAVED_COMPLETED:
+            # the memory in Redis may be older than the last completed check
             logger.info(
                 _m(
-                    "deferral_blocked: unsaved completed check",
+                    "deferral_blocked: no completed check saved by this process",
                     extra=get_extra_info({**ctx.default_extra, "disk_pressure": reading.as_spec()}),
                 )
             )
@@ -407,9 +409,9 @@ class PortConnectivityCheck:
                 )
             else:
                 await redis.clear_disk_pressure_deferrals(ctx.miner_hotkey, ctx.executor.uuid, shadow=True)
-            _UNSAVED_COMPLETED.discard(ctx.executor.uuid)
+            _SAVED_COMPLETED.add((ctx.miner_hotkey, ctx.executor.uuid))
         except Exception as e:  # noqa: BLE001 - a safety net; never fail the port check over it
-            _UNSAVED_COMPLETED.add(ctx.executor.uuid)
+            _SAVED_COMPLETED.discard((ctx.miner_hotkey, ctx.executor.uuid))
             logger.warning(
                 _m("verified ports not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
             )
@@ -537,6 +539,8 @@ class PortConnectivityCheck:
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
+            # the sysbox memory may now be older than this check: a deferral would republish it
+            _SAVED_COMPLETED.discard((ctx.miner_hotkey, ctx.executor.uuid))
             logger.warning(
                 _m(
                     "last verified sysbox unavailable",

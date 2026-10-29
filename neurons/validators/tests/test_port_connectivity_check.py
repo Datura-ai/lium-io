@@ -15,6 +15,7 @@ from neurons.validators.src.services.task.checks import (
     port_connectivity as port_connectivity_module,
 )
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
+from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
 from core.config import settings
@@ -696,7 +697,15 @@ def _self_rented_state(*, filler_owner: str | None = None):
     )
 
 
-def _gate_ctx(context_factory, *, redis_service, state, reading: str, connectivity=None, executor=None):
+@pytest.fixture(autouse=True)
+def fresh_saved_completed(monkeypatch):
+    # the module-level set outlives the check instance; a test starts as a freshly started validator does
+    monkeypatch.setattr(port_connectivity_module, "_SAVED_COMPLETED", set())
+
+
+def _gate_ctx(
+    context_factory, *, redis_service, state, reading: str, connectivity=None, executor=None, miner_hotkey="miner-hotkey"
+):
     connectivity = connectivity or DummyConnectivityService(success=True, sysbox_runtime=True, verified_port_count=100)
     services = build_services(redis=redis_service, backend=DummyBackendService(), connectivity=connectivity)
     ctx = context_factory(
@@ -705,16 +714,19 @@ def _gate_ctx(context_factory, *, redis_service, state, reading: str, connectivi
         state=state,
         runner=FakeRunner(reading),
         executor=executor,
+        miner_hotkey=miner_hotkey,
     )
     return ctx, connectivity
 
 
 def _remember(redis_service, ctx, pairs=MEMORY_PAIRS):
-    redis_service.verified_ports[("miner-hotkey", "executor-123")] = {
+    # a completed check this validator process saved: the memory in Redis and the readiness to republish it
+    redis_service.verified_ports[(ctx.miner_hotkey, "executor-123")] = {
         "identity": PortConnectivityCheck._port_setup_fingerprint(ctx),
         "pairs": pairs,
         "ttl": 86400,
     }
+    port_connectivity_module._SAVED_COMPLETED.add((ctx.miner_hotkey, "executor-123"))
 
 
 @pytest.mark.asyncio
@@ -964,8 +976,17 @@ async def test_a_deferred_cycle_is_marked_in_the_state_and_a_completed_one_is_no
         (lambda: _filler_state(owner="miner"), False),
         (lambda: _filler_state(owner=None), False),  # a backend that names no owner
         (lambda: _self_rented_state(filler_owner="miner"), False),
+        (lambda: _self_rented_state(filler_owner="lium"), False),  # the self-rent veto outranks the filler
     ],
-    ids=["rental", "self_rent", "lium_filler", "miner_filler", "unowned_filler", "self_rent_and_miner_filler"],
+    ids=[
+        "rental",
+        "self_rent",
+        "lium_filler",
+        "miner_filler",
+        "unowned_filler",
+        "self_rent_and_miner_filler",
+        "self_rent_and_lium_filler",
+    ],
 )
 async def test_only_a_third_party_rental_or_a_lium_filler_may_defer(context_factory, monkeypatch, state_builder, eligible):
     # owner_flag is not read: the backend sends it False for every rental
@@ -980,22 +1001,137 @@ async def test_only_a_third_party_rental_or_a_lium_filler_may_defer(context_fact
     assert (result.event.reason_code == Msg.VERIFY_DEFERRED.reason) is eligible
 
 
+class WriteRefusingRedis(DummyRedis):
+    # Redis reachable, reads fine, writes refused (maxmemory + noeviction) while `refuse_writes` is on
+    refuse_writes = False
+
+    async def record_verified_ports(self, miner_hotkey, executor_id, identity, pairs, ttl_seconds):
+        if self.refuse_writes:
+            raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
+        await super().record_verified_ports(miner_hotkey, executor_id, identity, pairs, ttl_seconds)
+
+
+async def _complete(context_factory, redis_service, *, miner_hotkey="miner-hotkey", success=True):
+    connectivity = DummyConnectivityService(success=success, verified_port_count=100 if success else 0)
+    ctx, _ = _gate_ctx(
+        context_factory, redis_service=redis_service, state=_rented_state(), reading=QUICK, connectivity=connectivity,
+        miner_hotkey=miner_hotkey,
+    )
+    return await PortConnectivityCheck().run(ctx)
+
+
+async def _pressured(context_factory, redis_service, *, miner_hotkey="miner-hotkey", state=None):
+    ctx, connectivity = _gate_ctx(
+        context_factory, redis_service=redis_service, state=state or _rented_state(), reading=STALLED,
+        miner_hotkey=miner_hotkey,
+    )
+    result = await PortConnectivityCheck().run(ctx)
+    return result.event.reason_code == Msg.VERIFY_DEFERRED.reason and connectivity.called_with is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_first", [True, False], ids=["blocked_then_other_saves", "other_saves_then_blocked"])
+async def test_two_miners_reporting_one_uuid_do_not_change_each_others_permission_to_defer(
+    context_factory, monkeypatch, blocked_first
+):
+    # the uuid is the miner's word; Redis scopes the memory by (miner, executor) and so must the readiness
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = WriteRefusingRedis()
+
+    async def block_miner_a():
+        await _complete(context_factory, redis_service, miner_hotkey="miner-a")  # the success on record
+        redis_service.refuse_writes = True
+        await _complete(context_factory, redis_service, miner_hotkey="miner-a", success=False)  # not recorded
+        redis_service.refuse_writes = False
+
+    if blocked_first:
+        await block_miner_a()
+        await _complete(context_factory, redis_service, miner_hotkey="miner-b")
+    else:
+        await _complete(context_factory, redis_service, miner_hotkey="miner-b")
+        await block_miner_a()
+
+    assert await _pressured(context_factory, redis_service, miner_hotkey="miner-a") is False
+    assert await _pressured(context_factory, redis_service, miner_hotkey="miner-b") is True
+    assert redis_service.verified_ports[("miner-a", "executor-123")]["pairs"] == [
+        (8000 + i, 8000 + i) for i in range(100)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_restarted_validator_runs_the_check_before_it_trusts_the_memory_in_redis(
+    context_factory, monkeypatch
+):
+    # the refused zero-port check is forgotten with the process; the older success in Redis is not a verdict
+    # this process saw saved, so the first pressured cycle is a real check
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = WriteRefusingRedis()
+    await _complete(context_factory, redis_service)
+    redis_service.refuse_writes = True
+    await _complete(context_factory, redis_service, success=False)
+    redis_service.refuse_writes = False
+    monkeypatch.setattr(port_connectivity_module, "_SAVED_COMPLETED", set())  # the restart
+
+    checked_after_restart = not await _pressured(context_factory, redis_service)
+    deferred_once_saved = await _pressured(context_factory, redis_service)
+
+    assert checked_after_restart and deferred_once_saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ports_saved, sysbox_forgotten",
+    [(True, True), (True, False), (False, True), (False, False)],
+    ids=["ok_ok", "ports_ok_sysbox_fail", "ports_fail_sysbox_ok", "fail_fail"],
+)
+async def test_a_filler_node_that_lost_sysbox_defers_only_when_both_memories_were_updated(
+    context_factory, monkeypatch, ports_saved, sysbox_forgotten
+):
+    # SysboxRequired rejected the completed no-sysbox cycle; a deferral on a memory the update of which failed
+    # would pass it one cycle later
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+
+    class PartlyRefusingRedis(WriteRefusingRedis):
+        refuse_sysbox_clear = False
+
+        async def clear_sysbox_verified(self, miner_hotkey, executor_id):
+            if self.refuse_sysbox_clear:
+                raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
+            await super().clear_sysbox_verified(miner_hotkey, executor_id)
+
+    redis_service = PartlyRefusingRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    ctx, _ = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=QUICK)
+    _remember(redis_service, ctx)
+    redis_service.refuse_writes = not ports_saved
+    redis_service.refuse_sysbox_clear = not sysbox_forgotten
+    def without_sysbox():
+        return DummyConnectivityService(success=True, sysbox_runtime=False, verified_port_count=100, dind_ok=True)
+
+    ctx, _ = _gate_ctx(
+        context_factory, redis_service=redis_service, state=_filler_state(), reading=QUICK, connectivity=without_sysbox()
+    )
+    completed = await PortConnectivityCheck().run(ctx)
+    redis_service.refuse_writes = redis_service.refuse_sysbox_clear = False
+    ctx, connectivity = _gate_ctx(
+        context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED, connectivity=without_sysbox()
+    )
+
+    pressured = await PortConnectivityCheck().run(ctx)
+
+    completed_sysbox = await SysboxRequiredCheck().run(context_factory(state=completed.updates["state"]))
+    pressured_sysbox = await SysboxRequiredCheck().run(context_factory(state=pressured.updates["state"]))
+    assert completed_sysbox.passed is False and pressured_sysbox.passed is False
+    assert (pressured.event.reason_code == Msg.VERIFY_DEFERRED.reason) is (ports_saved and sysbox_forgotten)
+    assert (connectivity.called_with is None) is (ports_saved and sysbox_forgotten)
+
+
 @pytest.mark.asyncio
 async def test_a_completed_check_redis_refused_to_record_blocks_the_deferral_until_one_is_saved(
     context_factory, monkeypatch
 ):
     # the older success stays in Redis while the latest completed check rejected every port
     monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
-    monkeypatch.setattr(port_connectivity_module, "_UNSAVED_COMPLETED", set())
-
-    class WriteRefusingRedis(DummyRedis):
-        refuse_writes = False
-
-        async def record_verified_ports(self, miner_hotkey, executor_id, identity, pairs, ttl_seconds):
-            if self.refuse_writes:
-                raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
-            await super().record_verified_ports(miner_hotkey, executor_id, identity, pairs, ttl_seconds)
-
     redis_service = WriteRefusingRedis()
     ctx, _ = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=QUICK)
     await PortConnectivityCheck().run(ctx)  # the success on record
