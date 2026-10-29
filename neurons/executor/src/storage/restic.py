@@ -298,12 +298,7 @@ class ResticStorageRunner:
         retry_delay_seconds = 2.0
         while True:
             self._raise_if_cancellation_requested()
-            repository_command_result = subprocess.run(
-                self._restic_command(restic_arguments),
-                env=self._environment,
-                capture_output=True,
-                text=True,
-            )
+            repository_command_result = self._run_repository_command(restic_arguments)
             if repository_command_result.returncode in accepted_exit_codes:
                 return repository_command_result
 
@@ -330,6 +325,36 @@ class ResticStorageRunner:
             self._wait_before_repository_retry(wait_seconds)
             # Avoid hammering S3 while still checking readiness at least every 30 seconds.
             retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
+
+    def _run_repository_command(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        # restic retries S3 for ~15 min on its own; heartbeat meanwhile so the backend does not mark the run stale.
+        # shortcut: on cancellation the read-only restic child is left to exit by itself; use Popen if that matters.
+        results: queue.Queue[subprocess.CompletedProcess[str] | BaseException] = queue.Queue()
+
+        def run() -> None:
+            try:
+                results.put(
+                    subprocess.run(
+                        self._restic_command(restic_arguments),
+                        env=self._environment,
+                        capture_output=True,
+                        text=True,
+                    )
+                )
+            except BaseException as error:  # noqa: BLE001 - re-raised in the caller's thread
+                results.put(error)
+
+        threading.Thread(target=run, name="restic-repository-command", daemon=True).start()
+        while True:
+            try:
+                result = results.get(timeout=1.0)
+            except queue.Empty:
+                self._events.heartbeat_if_due()
+                self._raise_if_cancellation_requested()
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            return result
 
     def _redacted_repository_failure_detail(
         self,
