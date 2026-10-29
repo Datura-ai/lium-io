@@ -539,6 +539,9 @@ class InspectorValidationService:
             message = Msg.FAILED_SSH_TRANSPORT if process is None else Msg.VALIDATION_ERROR
 
         executor_stderr = await self._capture_stderr(process)
+        if message is Msg.FAILED_INTERACTIVE and "tetragon socket did not appear" in (executor_stderr or ""):
+            # a host-kernel wedge after a container recreate, not the node's verdict: say reboot
+            message = Msg.SENSOR_HOST_WEDGED
         return self._failure_response(
             error=error,
             message=message,

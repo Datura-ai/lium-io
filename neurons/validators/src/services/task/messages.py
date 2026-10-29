@@ -1206,6 +1206,19 @@ class InspectorMessages:
             "Read executor_stderr in the validation event and inspect libinspector on the executor."
         ),
     )
+    SENSOR_HOST_WEDGED = MessageTemplate(
+        event="Inspector sensor could not start on this host",
+        reason="INSPECTOR_SENSOR_HOST_WEDGED",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation=(
+            "Tetragon never opened its socket. On 6.8 kernels this follows the executor container "
+            "being recreated (image update) when the host kernel wedges releasing the old sensor's "
+            "eBPF probes (hung kworkers in bpf_kprobe_multi_link_release in dmesg); Docker then "
+            "slowly stops responding. Reboot the host."
+        ),
+    )
 
 
 class TenantEnforcementMessages:

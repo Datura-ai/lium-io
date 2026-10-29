@@ -6,6 +6,10 @@ import sys
 from typing import Any, TextIO
 
 LIBINSPECTOR_PATH = "/usr/lib/libinspector.so"
+# Tetragon (spawned by libinspector.so) inherits this env. Classic kprobes instead of kprobe_multi:
+# on 6.8 kernels releasing many kprobe_multi links at once (the executor container recreated on an
+# image update) can wedge ftrace_shutdown/synchronize_rcu_tasks and hang the host (28 Oct, 36112e9e).
+os.environ.setdefault("TETRAGON_DISABLE_KPROBE_MULTI", "true")
 
 
 class InspectorExecutor:
