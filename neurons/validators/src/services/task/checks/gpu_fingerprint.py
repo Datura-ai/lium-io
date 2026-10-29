@@ -27,6 +27,14 @@ def cards_replaced(anchor: list[str], current: list[str], rented: bool, spot: bo
     return spot or not set(anchor) & set(current)
 
 
+def replacement_reanchors(ctx: Context, anchor: list[str], current: list[str], rented: bool) -> bool:
+    """cards_replaced on the same GPU model: another model keeps the old `spec`, so SpecChangeCheck would fail
+    it every cycle. GpuFingerprintCheck and GpuLossHoldCheck take this one decision."""
+    spec, new_spec = (ctx.verified or {}).get("spec"), ctx.state.gpu_model_count
+    same_model = not (spec and new_spec and spec != new_spec)
+    return same_model and cards_replaced(anchor, current, rented=rented, spot=is_spot(ctx))
+
+
 def is_spot(ctx: Context) -> bool:
     """The backend lists the node on the Spot tier; no backend data reads as not Spot."""
     rented_data = ctx.state.rented_data
@@ -120,11 +128,7 @@ class GpuFingerprintCheck:
                 from .gpu_loss_hold import rented_pods  # gpu_loss_hold imports this module
 
                 # still a reset (score 0 this cycle); replaced cards become the anchor now
-                # another GPU model keeps the old `spec`, so SpecChangeCheck would fail it every cycle
-                spec, new_spec = verified.get("spec"), ctx.state.gpu_model_count
-                reanchor = cards_replaced(
-                    anchor, current, rented=bool(rented_pods(ctx)), spot=is_spot(ctx)
-                ) and not (spec and new_spec and spec != new_spec)
+                reanchor = replacement_reanchors(ctx, anchor, current, rented=bool(rented_pods(ctx)))
                 event = render_message(
                     Msg.UUID_REPLACED if reanchor else Msg.UUID_CHANGED,
                     ctx=ctx,
