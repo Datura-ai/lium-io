@@ -550,6 +550,15 @@ class Settings(BaseSettings):
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5244: before its port-check container (and the rented-throughput probe) the validator times `sync -f` on
+    # the host's Docker root - the wait every `docker run` pays while a tenant's dirty pages sit on that filesystem
+    # - and reads the Docker-root disk and host Dirty around it (services/task/host_disk.py). CHECK_ENABLED takes
+    # the reading, logs it and sends it to the backend (specs.disk_pressure). ENFORCEMENT additionally lets a node
+    # rented by someone else, or running our filler, keep its last verified ports and sysbox instead of a port
+    # check into the stall (DISK_PRESSURE_MAX_DEFERRALS cycles in a row at most), and leaves out the
+    # rented-throughput probe container under pressure. Shadow by default: a week of readings decides the flip.
+    DISK_PRESSURE_CHECK_ENABLED: bool = Field(env="DISK_PRESSURE_CHECK_ENABLED", default=True)
+    DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED: bool = Field(env="DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", default=False)
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and

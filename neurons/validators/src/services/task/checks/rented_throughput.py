@@ -12,6 +12,15 @@ from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 from core.config import settings
 from core.utils import _m, get_extra_info
 
+from ..host_disk import (
+    DEVICE_MARKER,
+    DOCKER_ROOT_DEVICES,
+    SNAPSHOT_SECONDS,
+    SYNCFS_POLL_SECONDS,
+    DiskPressureReading,
+    disk_pressure_probe,
+    parse_disk_pressure,
+)
 from ..messages import RentedThroughputMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -28,8 +37,10 @@ logger = logging.getLogger(__name__)
 
 DISK_PROBE_BYTES = 256 * 1024 * 1024
 DISK_TIMEOUT_SECONDS = 60
-# the 2 s busy window, the disk probe (direct, then buffered) and both fetches
-COMMAND_TIMEOUT_SECONDS = 260
+# the 2 s busy window, the disk-pressure reading (2 s snapshots, syncfs poll cap), the disk probe (direct, then
+# buffered) and both fetches
+COMMAND_TIMEOUT_SECONDS = 260 + SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS
+PROBE_SKIPPED_MARKER = "lium_dp_skipped"
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
 BUSY_WINDOW_SECONDS = 2
@@ -42,18 +53,10 @@ _UNSAVED: dict[str, _State] = {}
 
 # The executor shares the host PID namespace but not its network (bridge, `pid: host`), so the NIC counters are
 # init's (/proc/1/net/dev), read only when /proc/1 is the host's; else no rx/tx and the network side is no verdict.
-# The devices under the docker root (the probe's writable layer) come from init's mountinfo through sysfs: the
-# device, its dm/md slaves and a partition's disk. Then bytes received and sent on the physical NICs and sectors
-# moved per whole disk (/proc/diskstats is not namespaced), twice BUSY_WINDOW_SECONDS apart, before the probe.
-_SNAPSHOT = (
-    "r=$(/usr/bin/docker info -f '{{.DockerRootDir}}' 2>/dev/null); "
-    'm=$(awk -v r="${r:-/var/lib/docker}" \'r==$5 || $5=="/" || index(r, $5 "/")==1 '
-    "{ if (length($5) >= n) { n=length($5); m=$3 } } END{print m}' /proc/1/mountinfo 2>/dev/null); "
-    'ds=; [ -n "$m" ] && ds=$(readlink -f /sys/dev/block/$m 2>/dev/null) && ds=${ds##*/}; '
-    "for i in 1 2 3 4; do n=; for d in $ds; do [ -e /sys/class/block/$d ] || continue; "
-    f'echo "{SNAP_MARKER}_device name=$d"; '
-    '[ -e /sys/class/block/$d/partition ] && p=$(readlink -f /sys/class/block/$d) && p=${p%/*} && n="$n ${p##*/}"; '
-    'n="$n $(ls /sys/class/block/$d/slaves 2>/dev/null)"; done; ds=$n; done; '
+# The devices under the docker root (the probe's writable layer) are host_disk.DOCKER_ROOT_DEVICES. Then bytes
+# received and sent on the physical NICs and sectors moved per whole disk (/proc/diskstats is not namespaced),
+# twice BUSY_WINDOW_SECONDS apart, before the probe.
+_SNAPSHOT = DOCKER_ROOT_DEVICES + (
     # Only physical NICs (a sysfs `device` link) are counted: disjoint, so a bond, bridge, VLAN or OVS port can neither
     # repeat nor hide an uplink. Without a host sysfs (this shell's own is the container's), names and bond members.
     'ph=$(for i in /proc/1/root/sys/class/net/*; do [ -e $i/device ] && [ "${i##*/}" != lo ] && '
@@ -87,8 +90,13 @@ _DISK_SCRIPT = (
 )
 
 
-def throughput_command(sysbox: bool) -> str:
-    return _SNAPSHOT + download_speed_command(sysbox, _DISK_SCRIPT + _FETCH_SCRIPT)
+def throughput_command(sysbox: bool, *, skip_under_pressure: bool = False) -> str:
+    """The busy snapshot, the disk-pressure reading, then the probe container; with skip_under_pressure the
+    container is left out when the reading shows pressure (the shell's `dp`), since its start would stall."""
+    probe = download_speed_command(sysbox, _DISK_SCRIPT + _FETCH_SCRIPT)
+    if skip_under_pressure:
+        probe = f'if [ "$dp" = 1 ]; then echo "{PROBE_SKIPPED_MARKER}"; else {probe}; fi'
+    return _SNAPSHOT + disk_pressure_probe() + probe
 
 
 @dataclass(frozen=True)
@@ -122,7 +130,7 @@ def parse_busy(stdout: str) -> tuple[float | None, float | None]:
     disk under the docker root). None = not measured; the disk side then has no verdict."""
     snaps, devices = [], set()
     for line in (stdout or "").splitlines():
-        if line.startswith(f"{SNAP_MARKER}_device name="):
+        if line.startswith(f"{DEVICE_MARKER} name="):
             devices.add(line.partition("=")[2].strip())
         elif line.startswith(f"{SNAP_MARKER} "):
             tokens = dict(t.partition("=")[::2] for t in line[len(SNAP_MARKER) :].split())
@@ -202,6 +210,11 @@ class RentedThroughputCheck:
     no verdict (a link or disk doing that much is not the defect); so is the network side without host NIC counters.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading. Non-fatal: the rental keeps running.
+
+    DAH-5244: the command also times `sync -f` on the Docker root (host_disk). Under
+    DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED a stalling sync leaves the probe container out - its start would wait
+    on the same pages - and both sides are no verdict; in shadow the probe runs and the reading says what the
+    verdict would have been (`disk_verdict_shadow`).
     """
 
     check_id = "host.validate.rented_throughput"
@@ -277,12 +290,20 @@ class RentedThroughputCheck:
 
     async def _measure_and_judge(self, ctx: Context) -> tuple[dict[str, Any], str, str]:
         """The reading and each side's verdict: "fail", "pass" or "none" (no verdict)."""
+        enforce_pressure = (
+            settings.DISK_PRESSURE_CHECK_ENABLED and settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED
+        )
         result = await ctx.runner.run(
-            throughput_command(bool(ctx.state.sysbox_runtime)),
+            throughput_command(bool(ctx.state.sysbox_runtime), skip_under_pressure=enforce_pressure),
             timeout=COMMAND_TIMEOUT_SECONDS,
             retryable=False,
         )
         stdout = result.stdout or ""
+        pressure = parse_disk_pressure(stdout) if settings.DISK_PRESSURE_CHECK_ENABLED else None
+        if PROBE_SKIPPED_MARKER in stdout:
+            # DAH-5244: no container beside a Docker root whose sync already stalls; nothing measured, the
+            # streaks stand (a node already at two failures stays zeroed until a measured pass)
+            return self._unprobed_reading(result, pressure), "none", "none"
         endpoints = parse_download_speed(stdout)
         disk = parse_disk(stdout)
         net_mbps, disk_busy = parse_busy(stdout)
@@ -315,9 +336,28 @@ class RentedThroughputCheck:
             "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,
             "disk_min_mb_per_s": settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S,
         }
+        if pressure is not None:
+            # shadow: what the disk side would be with the gate enforced, next to what it is
+            reading["disk_pressure"] = pressure.as_spec()
+            reading["disk_verdict_shadow"] = "none" if pressure.pressure else disk_side
         if result.error_type is not None:
             reading["error"] = f"{result.error_type}: {(result.error_message or '')[-200:]}"
         return reading, net, disk_side
+
+    @staticmethod
+    def _unprobed_reading(result: Any, pressure: DiskPressureReading | None) -> dict[str, Any]:
+        reading: dict[str, Any] = {
+            "endpoints": [],
+            "disk": asdict(DiskReading(error="not_probed")),
+            "network_verdict": "none",
+            "disk_verdict": "none",
+            "probe_skipped": "disk pressure",
+            "disk_pressure": pressure.as_spec() if pressure is not None else None,
+            "disk_verdict_shadow": "none",
+        }
+        if result.error_type is not None:
+            reading["error"] = f"{result.error_type}: {(result.error_message or '')[-200:]}"
+        return reading
 
     def _verdict(self, ctx: Context, state: _State, *, probed: bool) -> CheckResult:
         what: dict[str, Any] = {

@@ -1,23 +1,24 @@
-import json
 import asyncio
+import json
 import logging
 import math
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ValidationError
-from payload_models.payloads import WorkloadKind
-from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
-from redis.backoff import ExponentialBackoff
-from redis.asyncio.retry import Retry  # NOT redis.retry.Retry: the sync one silently never retries
 from datura.requests.miner_requests import ExecutorSSHInfo
+from payload_models.payloads import WorkloadKind
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
+from pydantic import BaseModel, ValidationError
+from redis.asyncio.retry import Retry  # NOT redis.retry.Retry: the sync one silently never retries
+from redis.backoff import ExponentialBackoff
+from services.const import GPU_MODEL_RATES
+
 from core.config import settings
 from core.utils import _m
-from services.const import GPU_MODEL_RATES
 
 MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
@@ -102,6 +103,11 @@ FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 # ticket-0494: one key per executor while its last DinD probe that reached the container found sysbox.
 SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
+# DAH-5244: one key per executor with the port pairs its last completed port check verified, under which
+# address/range/mappings, so a cycle deferred for disk pressure can republish them.
+VERIFIED_PORTS_PREFIX = "verified_ports"
+# DAH-5244: one key per executor counting port checks deferred in a row (":shadow" for the simulated count).
+DISK_PRESSURE_DEFERRALS_PREFIX = "disk_pressure_deferrals"
 # One key per executor: when this validator first found it without its recommended default image
 # (epoch seconds). Opens CachedTemplateVerificationCheck's fresh-node grace.
 CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
@@ -226,6 +232,11 @@ def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
     """The verified record is per (miner hotkey, executor id): an executor id is unique only per hotkey, so a
     hotkey that lists another's executor id writes, resets and marks only its own record."""
     return f"{miner_hotkey}:{executor_id}"
+
+
+class VerifiedPortsMemory(NamedTuple):
+    pairs: list[tuple[int, int]]
+    measured_at: float
 
 
 class RedisService:
@@ -415,6 +426,61 @@ class RedisService:
 
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
+
+    @staticmethod
+    def _verified_ports_key(miner_hotkey: str, executor_id: str) -> str:
+        return f"{VERIFIED_PORTS_PREFIX}:{miner_hotkey}:{executor_id}"
+
+    async def record_verified_ports(
+        self, miner_hotkey: str, executor_id: str, identity: str, pairs: list[tuple[int, int]], ttl_seconds: int
+    ) -> None:
+        """What a completed port check verified (an empty list included: a known failure is never replaced by an
+        older success), under `identity` (address, range, mappings); a republish never refreshes it."""
+        payload = {"identity": identity, "pairs": [list(p) for p in pairs], "measured_at": time.time()}
+        await self.set(self._verified_ports_key(miner_hotkey, executor_id), json.dumps(payload), ex=ttl_seconds)
+
+    async def last_verified_ports(
+        self, miner_hotkey: str, executor_id: str, identity: str
+    ) -> VerifiedPortsMemory | None:
+        """The last completed check's pairs when they were measured under the same identity, else None."""
+        raw = await self.get(self._verified_ports_key(miner_hotkey, executor_id))
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            if data["identity"] != identity:
+                return None
+            return VerifiedPortsMemory(
+                pairs=[(int(i), int(e)) for i, e in data["pairs"]], measured_at=float(data["measured_at"])
+            )
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    @staticmethod
+    def _disk_pressure_deferrals_key(miner_hotkey: str, executor_id: str, shadow: bool) -> str:
+        suffix = ":shadow" if shadow else ""
+        return f"{DISK_PRESSURE_DEFERRALS_PREFIX}{suffix}:{miner_hotkey}:{executor_id}"
+
+    async def disk_pressure_deferrals(self, miner_hotkey: str, executor_id: str, *, shadow: bool) -> int:
+        raw = await self.get(self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow))
+        try:
+            return int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    async def record_disk_pressure_deferral(
+        self, miner_hotkey: str, executor_id: str, *, shadow: bool, ttl_seconds: int
+    ) -> int:
+        """One more port check deferred (or, shadow, one that would have been); the new count."""
+        count = await self.disk_pressure_deferrals(miner_hotkey, executor_id, shadow=shadow) + 1
+        await self.set(
+            self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow), str(count), ex=ttl_seconds
+        )
+        return count
+
+    async def clear_disk_pressure_deferrals(self, miner_hotkey: str, executor_id: str, *, shadow: bool) -> None:
+        """A port check completed: the streak of deferrals ends."""
+        await self.delete(self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow))
 
     async def first_uncached_at(self, executor_id: str, now: float, ttl_seconds: int) -> float:
         """When this validator first found the executor without its recommended image (epoch s).

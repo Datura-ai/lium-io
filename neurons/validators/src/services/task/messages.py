@@ -1414,6 +1414,13 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    VERIFY_DEFERRED = MessageTemplate(
+        event="Port verification deferred: the Docker filesystem is backed up with a tenant's writes",
+        reason="PORT_VERIFY_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
 
 
 class PortCountMessages:

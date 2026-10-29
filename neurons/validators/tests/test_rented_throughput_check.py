@@ -71,7 +71,7 @@ def rented(hotkey: str = "miner-hotkey", status: str | None = None) -> RentedExe
 
 
 @contextmanager
-def flags():
+def flags(*, enforce_pressure: bool = False):
     fake = SimpleNamespace(
         RENTED_THROUGHPUT_CHECK_ENABLED=True,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
@@ -79,6 +79,8 @@ def flags():
         RENTED_THROUGHPUT_BUSY_MBPS=200.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
+        DISK_PRESSURE_CHECK_ENABLED=True,
+        DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED=enforce_pressure,
     )
     clock = Clock()
 
@@ -459,3 +461,55 @@ async def test_a_throughput_failed_node_earns_from_neither_pool(
     assert idle == (
         pytest.approx(0.1) if earns and rented_gpus == 1 else 0.0
     )  # rental-share (idle) pool
+
+
+# DAH-5244: the command times `sync -f` on the Docker root before the probe container. Enforced, a stalling sync
+# leaves the container out (its start would wait on the same pages): nothing measured, the streak stands. In shadow
+# the probe runs and the reading says what the verdict would have been.
+def _pressure(stalled: bool) -> str:
+    end = 120.0 if stalled else 100.3
+    rc = "" if stalled else "0"
+    return (
+        "lium_dp t=100.0 dirty=524288:1024 psi=1.00 io=nvme0n1:1000:100:200:10,\n"
+        "lium_dp t=102.0 dirty=1048576:2048 psi=3.50 io=nvme0n1:21000:200:700:60,\n"
+        f"lium_dp_sync start=100.0 end={end} rc={rc}\n"
+    )
+
+
+def test_command_leaves_the_probe_container_out_under_pressure_only_when_enforced():
+    shadow = throughput_command(True)
+    enforced = throughput_command(True, skip_under_pressure=True)
+    assert 'sync -f "$sr"' in shadow and "lium_dp_skipped" not in shadow
+    assert enforced.index("lium_dp_sync") < enforced.index('if [ "$dp" = 1 ]') < enforced.index("/usr/bin/docker run")
+    assert shadow.index("lium_tp_device") < shadow.index("sync -f") < shadow.index("/usr/bin/docker run")
+
+
+async def test_shadow_runs_the_probe_and_records_what_the_gate_would_say():
+    with flags():
+        ctx, runner = make_ctx(snaps() + _pressure(stalled=True) + disk(secs=30.0) + FAST)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert "lium_dp_skipped" not in runner.commands[0]
+    assert (net, disk_side) == ("pass", "fail")
+    assert reading["disk_pressure"]["pressure"] is True and reading["disk_pressure"]["syncfs_timed_out"] is True
+    assert reading["disk_verdict_shadow"] == "none"
+    with flags():
+        ctx, _ = make_ctx(snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST)
+        reading, _, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert reading["disk_pressure"]["pressure"] is False and reading["disk_verdict_shadow"] == "fail"
+
+
+async def test_enforced_pressure_is_no_verdict_on_both_sides_and_keeps_the_streak():
+    skipped = snaps() + _pressure(stalled=True) + "lium_dp_skipped\n"
+    with flags(enforce_pressure=True) as clock:
+        ctx, runner = make_ctx(SLOW_DISK, skipped, SLOW_DISK)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        under_pressure = await check.run(ctx)
+        assert under_pressure.passed and under_pressure.event.reason_code == Msg.SLOW_ONCE.reason
+        what = under_pressure.event.what_we_saw
+        assert what["probe_skipped"] == "disk pressure" and what["disk_verdict"] == what["network_verdict"] == "none"
+        assert what["disk_pressure"]["reason"] == "syncfs" and what["endpoints"] == []
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+    assert all("lium_dp_skipped" in cmd for cmd in runner.commands)

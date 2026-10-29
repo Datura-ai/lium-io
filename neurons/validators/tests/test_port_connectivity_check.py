@@ -1,6 +1,4 @@
 import pytest
-from core.config import settings
-
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -12,10 +10,14 @@ from neurons.validators.src.services.executor_connectivity.models import (
     PortRangeResult,
     PortVerificationResult,
 )
+from neurons.validators.src.services.redis_service import VerifiedPortsMemory
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
+from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state
+from tests.test_container_download_speed_check import FakeRunner
+from tests.test_host_disk import output as pressure_output
 
 
 # Mock result class matching DockerConnectionCheckResult
@@ -23,6 +25,8 @@ from tests.helpers import build_context_config, build_services, build_state
 class DummyRedis:
     def __init__(self, *, renting_in_progress: bool = False, dind_miss_on_record: bool = False):
         self.renting_in_progress_value = renting_in_progress
+        self.verified_ports = {}
+        self.deferrals = {}
         # DAH-3597: whether a DinD probe miss is already on record for the executor.
         self.dind_miss_on_record = dind_miss_on_record
         self.recorded_misses: list[tuple[str, str, int]] = []
@@ -38,6 +42,30 @@ class DummyRedis:
 
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return (miner_hotkey, executor_id) in self.sysbox_verified
+
+    # DAH-5244: the last completed check's ports and the deferral counters (real and shadow)
+    verified_ports: dict[tuple[str, str], dict] = {}
+    deferrals: dict[tuple[str, str, bool], int] = {}
+
+    async def record_verified_ports(self, miner_hotkey, executor_id, identity, pairs, ttl_seconds):
+        self.verified_ports[(miner_hotkey, executor_id)] = {"identity": identity, "pairs": pairs, "ttl": ttl_seconds}
+
+    async def last_verified_ports(self, miner_hotkey, executor_id, identity):
+        data = self.verified_ports.get((miner_hotkey, executor_id))
+        if data is None or data["identity"] != identity:
+            return None
+        return VerifiedPortsMemory(pairs=list(data["pairs"]), measured_at=1_790_000_000.0)
+
+    async def disk_pressure_deferrals(self, miner_hotkey, executor_id, *, shadow):
+        return self.deferrals.get((miner_hotkey, executor_id, shadow), 0)
+
+    async def record_disk_pressure_deferral(self, miner_hotkey, executor_id, *, shadow, ttl_seconds):
+        key = (miner_hotkey, executor_id, shadow)
+        self.deferrals[key] = self.deferrals.get(key, 0) + 1
+        return self.deferrals[key]
+
+    async def clear_disk_pressure_deferrals(self, miner_hotkey, executor_id, *, shadow):
+        self.deferrals.pop((miner_hotkey, executor_id, shadow), None)
 
     async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str) -> bool:
         return self.renting_in_progress_value
@@ -625,3 +653,183 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
 
     assert result.passed is True
     assert result.updates["state"].sysbox_runtime is False
+
+
+# DAH-5244: the host disk is read right before the port-check containers. A node rented by someone else, or
+# running our filler, whose Docker root stalls on `sync -f` keeps the ports its last completed check verified
+# instead of a check into the stall (enforced; at most 3 cycles in a row), and in shadow the check runs while
+# the event says what the gate would have done.
+STALLED = pressure_output(end=120.0, rc="")
+QUICK = pressure_output()
+MEMORY_PAIRS = [(40010, 40010), (40011, 40011), (40012, 40012)]
+
+
+def _filler_state():
+    return build_state(
+        sysbox_runtime=False,
+        rented_data=RentedExecutorsResponse(
+            executors={}, filler_ports_by_executor={"executor-123": [40010, 40011]}
+        ),
+    )
+
+
+def _owner_rented_state():
+    rented = RentedExecutor(
+        miner_hotkey="miner-hotkey",
+        executor_ip_address="127.0.0.1",
+        executor_ip_port="22",
+        pods=[RentedPod(pod_id="pod-1", container_name="container_pod-1", rented_ports=[40010])],
+        owner_flag=True,
+    )
+    return build_state(sysbox_runtime=False, rented_data=RentedExecutorsResponse(executors={"executor-123": rented}))
+
+
+def _gate_ctx(context_factory, *, redis_service, state, reading: str, connectivity=None):
+    connectivity = connectivity or DummyConnectivityService(success=True, sysbox_runtime=True, verified_port_count=100)
+    services = build_services(redis=redis_service, backend=DummyBackendService(), connectivity=connectivity)
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=state,
+        runner=FakeRunner(reading),
+    )
+    return ctx, connectivity
+
+
+def _remember(redis_service, ctx, pairs=MEMORY_PAIRS):
+    redis_service.verified_ports[("miner-hotkey", "executor-123")] = {
+        "identity": PortConnectivityCheck._identity(ctx),
+        "pairs": pairs,
+        "ttl": 86400,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_builder", [_rented_state, _filler_state], ids=["rented", "filler"])
+async def test_enforced_pressure_republishes_the_last_verified_ports_without_a_check(
+    context_factory, monkeypatch, state_builder
+):
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=state_builder(), reading=STALLED)
+    _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.VERIFY_DEFERRED.reason
+    assert connectivity.called_with is None
+    state = result.updates["state"]
+    assert state.verified_port_count == 3 and state.verified_port_pairs == MEMORY_PAIRS
+    assert state.specs["verified_ports"] == [40010, 40011, 40012]
+    assert state.sysbox_runtime is True and state.specs["sysbox_runtime"] is True  # the remembered sysbox
+    assert state.specs["disk_pressure"]["pressure"] is True and state.specs["disk_pressure"]["syncfs_timed_out"] is True
+    assert redis_service.deferrals[("miner-hotkey", "executor-123", False)] == 1
+    assert result.updates["default_extra"]["disk_pressure_deferrals_in_a_row"] == 1
+    # the memory is what it was: a republish never refreshes it
+    assert redis_service.verified_ports[("miner-hotkey", "executor-123")]["pairs"] == MEMORY_PAIRS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state_builder, remembered, reading",
+    [
+        (build_state, True, STALLED),  # idle: the writer would be the miner's
+        (_owner_rented_state, True, STALLED),  # self-rented
+        (_rented_state, False, STALLED),  # never verified under this identity
+        (_rented_state, True, QUICK),  # no pressure
+    ],
+    ids=["idle", "owner", "no_memory", "no_pressure"],
+)
+async def test_enforced_gate_runs_the_check_when_not_eligible_or_nothing_to_republish(
+    context_factory, monkeypatch, state_builder, remembered, reading
+):
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=state_builder(), reading=reading)
+    if remembered:
+        _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.VERIFY_OK.reason
+    assert connectivity.called_with is not None
+    assert result.updates["state"].specs["disk_pressure"]["pressure"] is (reading is STALLED)
+    # the completed check is the new memory and the streak is over
+    assert redis_service.verified_ports[("miner-hotkey", "executor-123")]["pairs"] == [
+        (8000 + i, 8000 + i) for i in range(100)
+    ]
+    assert ("miner-hotkey", "executor-123", False) not in redis_service.deferrals
+
+
+@pytest.mark.asyncio
+async def test_the_fourth_pressured_cycle_runs_the_check_and_ends_the_streak(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    deferred = []
+    for _ in range(5):
+        ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+        _remember(redis_service, ctx) if not redis_service.verified_ports else None
+        result = await PortConnectivityCheck().run(ctx)
+        deferred.append(connectivity.called_with is None)
+        assert result.passed
+    assert deferred == [True, True, True, False, True]
+
+
+@pytest.mark.asyncio
+async def test_a_remembered_identity_that_changed_is_not_republished(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+    _remember(redis_service, ctx)
+    redis_service.verified_ports[("miner-hotkey", "executor-123")]["identity"] = "10.0.0.1|40000-41000|"
+
+    await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with is not None
+
+
+@pytest.mark.asyncio
+async def test_shadow_runs_the_check_and_simulates_the_deferrals(context_factory):
+    redis_service = DummyRedis()
+    would_defer = []
+    for cycle in range(5):
+        ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+        if cycle == 0:
+            _remember(redis_service, ctx)
+        result = await PortConnectivityCheck().run(ctx)
+        assert result.passed and result.event.reason_code == Msg.VERIFY_OK.reason
+        assert connectivity.called_with is not None
+        would_defer.append(result.updates["state"].specs["disk_pressure"]["pressure"])
+    # the simulated streak: three "would defer", the forced fourth cycle clears it, then it starts again
+    assert would_defer == [True] * 5
+    assert redis_service.deferrals[("miner-hotkey", "executor-123", True)] == 1
+    assert ("miner-hotkey", "executor-123", False) not in redis_service.deferrals
+
+
+@pytest.mark.asyncio
+async def test_reading_off_leaves_the_check_and_the_memories_untouched(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "DISK_PRESSURE_CHECK_ENABLED", False)
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+    _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with is not None and len(ctx.runner.commands) == 0
+    assert "disk_pressure" not in result.updates["state"].specs
+    assert redis_service.verified_ports[("miner-hotkey", "executor-123")]["pairs"] == MEMORY_PAIRS
+
+
+@pytest.mark.asyncio
+async def test_a_reading_that_fails_is_not_pressure(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading="")
+    _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with is not None
+    assert result.updates["state"].specs["disk_pressure"] == {**result.updates["state"].specs["disk_pressure"], "error": "no_output", "pressure": False}
