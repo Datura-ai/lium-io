@@ -16,7 +16,8 @@ rental already on the node alone.
 
 No timer ends the hold. The first unrented cycle whose scrape reads clean ends it and owes the every-card load test
 (PostRentalGpuRecheckCheck: the all-cards matmul and the kernel-fault probe), which runs later in that same cycle: a
-pass lists the node; a failure fails the cycle and keeps the test owed for the next one, and a card that drops again
+pass lists the node; a failure, a cycle that skips the test (a filler) or gets no verdict fails the cycle and keeps
+the test owed for the next one, and a card that drops again
 starts a new hold. A clean cycle under a live rental keeps the node hidden (the test cannot run beside the renter's
 pod) until a clean unrented cycle.
 
@@ -47,7 +48,7 @@ from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import full_set_changed, split_uuids
-from .post_rental_gpu_recheck import MARKER_TTL_SECONDS, RecheckMarker, record_marker
+from .post_rental_gpu_recheck import MARKER_TTL_SECONDS, SOURCE_GPU_LOSS_HOLD, RecheckMarker, record_marker
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -206,7 +207,7 @@ class GpuLossHoldCheck:
             await self._save(ctx, key, mark, GPU_LOSS_MARK_TTL_SECONDS)
             return self._lost(ctx, mark, {"faults": []}, fatal=False)
         # the first clean unrented read ends the hold; the every-card load test later in this cycle lists it or not
-        await record_marker(ctx, RecheckMarker(source="gpu_loss_hold", verdict="gpu_lost"))
+        await record_marker(ctx, RecheckMarker(source=SOURCE_GPU_LOSS_HOLD, verdict="gpu_lost"))
         await self._forget(ctx, key)
         return CheckResult(
             passed=True,

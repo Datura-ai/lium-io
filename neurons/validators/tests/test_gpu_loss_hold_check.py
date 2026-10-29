@@ -24,6 +24,7 @@ from neurons.validators.src.services.task.checks import (
     rented_gpu_drop,
 )
 from neurons.validators.src.services.task.messages import GpuLossHoldMessages as Msg
+from neurons.validators.src.services.task.messages import PostRentalGpuRecheckMessages as RecheckMsg
 from neurons.validators.src.services.task.models import JobResult
 from neurons.validators.src.services.task.pipeline import CheckResult, Context, Pipeline, ValidationEvent
 from neurons.validators.src.services.task.runner import SSHCommandResult
@@ -247,6 +248,54 @@ async def test_a_card_failing_the_load_test_keeps_the_node_out_until_a_clean_rea
     # the card drops again: hidden again
     again = await _cycle(context_factory, redis, pods=(), **LOST_CARD)
     assert _hidden(again) and not again.passed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param("filler", id="skipped_under_a_filler"),
+        pytest.param("no_verdict", id="no_result"),
+        pytest.param("probe_error", id="probe_errors"),
+    ],
+)
+async def test_a_node_back_from_a_dropout_is_not_listed_until_the_load_test_has_passed(context_factory, case):
+    """Regression: the node listed on the cycle that skipped the every-card test (a filler) or got no result from it."""
+    redis = FakeRedis()
+    await _cycle(context_factory, redis, pods=(), **LOST_CARD)
+    all_cards = None if case == "no_verdict" else _all_cards("", "", "", "")
+    probe = "not json" if case == "probe_error" else probe_stdout("ok")
+    ctx, _, pipeline = _hold_then_load_test_pipeline(context_factory, redis, all_cards=all_cards, probe=probe)
+
+    filler = {"id": "filler"} if case == "filler" else None
+    with patch.object(post_rental_gpu_recheck, "get_filler_only_container", return_value=filler):
+        ok, events, _ = await pipeline.run(ctx)
+
+    assert not ok
+    assert events[-1].reason_code == RecheckMsg.WAITING_AFTER_GPU_LOSS.reason
+    assert events[-1].event == "GPUs back; waiting for the load test on every card"
+    assert json.loads(redis.store[RECHECK_KEY])["source"] == "gpu_loss_hold"  # still owed
+
+    # the next check runs it and passes: listed, no longer owed
+    ctx, validation, pipeline = _hold_then_load_test_pipeline(
+        context_factory, redis, all_cards=_all_cards("", "", "", ""), probe=probe_stdout("ok")
+    )
+    ok, events, _ = await pipeline.run(ctx)
+    assert ok and validation.calls == 1 and RECHECK_KEY not in redis.store
+    assert events[-1].reason_code == RecheckMsg.PASSED.reason
+
+
+@pytest.mark.asyncio
+async def test_a_post_rental_recheck_still_proceeds_on_a_skip(context_factory):
+    """Only the dropout marker blocks on a skip; an ordinary post-rental recheck keeps its behaviour."""
+    redis = FakeRedis()
+    redis.store[RECHECK_KEY] = json.dumps({"source": "gpu.validate.memory_health"})
+    ctx, _, _ = _hold_then_load_test_pipeline(context_factory, redis, all_cards=None, probe=probe_stdout("ok"))
+
+    with patch.object(post_rental_gpu_recheck, "get_filler_only_container", return_value={"id": "filler"}):
+        result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == RecheckMsg.FILLER_SKIPPED.reason
 
 
 def test_no_fixed_hold_duration_in_the_provider_facing_texts():

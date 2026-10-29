@@ -582,6 +582,15 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Proceed; the recheck runs again next cycle.",
     )
+    # a node back from a GPU dropout: no listing until the every-card test has passed
+    WAITING_AFTER_GPU_LOSS = MessageTemplate(
+        event="GPUs back; waiting for the load test on every card",
+        reason="POST_RENTAL_GPU_RECHECK_PENDING_AFTER_GPU_LOSS",
+        severity="warning",
+        category="env",
+        impact="Not listed until every card has passed the load test; it runs again on the next check",
+        remediation="Nothing to do while every GPU stays visible; the test runs again on the next check.",
+    )
     PASSED = MessageTemplate(
         event="Post-rental GPU recheck passed",
         reason="POST_RENTAL_GPU_RECHECK_PASSED",
