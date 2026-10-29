@@ -118,3 +118,34 @@ async def test_a_filler_that_started_after_the_snapshot_counts_its_ports():
 async def test_no_fresh_rental_data_keeps_the_failure():
     ctx = _ctx(8 * MIN_PORT_COUNT - 3)  # the helper's backend answers None
     assert (await PortCountCheck().run(ctx)).passed is False
+
+
+@pytest.mark.asyncio
+async def test_a_listed_split_node_is_hidden_at_23_ports_and_listed_again_at_24():
+    from neurons.validators.src.services.task.availability import availability_errors
+
+    def errors(result):
+        return [e.reason_code for e in availability_errors([result.event])]
+
+    # the backend skips a zero-score report, so only an availability entry takes the listing down
+    assert errors(await PortCountCheck().run(_ctx(24))) == []
+    short = await PortCountCheck().run(_ctx(23))
+    assert errors(short) == [PortCountMessages.INSUFFICIENT_PORTS.reason]
+    assert short.event.what_we_saw["reach_target"] == "executor_ports"
+    assert errors(await PortCountCheck().run(_ctx(24))) == []
+
+
+def test_split_port_entries_survive_and_do_not_count_toward_our_own_outage():
+    from neurons.validators.src.services.task.availability import silence_availability_errors_on_our_own_outage
+    from services.task.models import JobResult
+
+    short = [{"reason_code": "INSUFFICIENT_PORTS", "reach_source": "validator"}]
+    results = [JobResult.model_construct(availability_errors=list(short)) for _ in range(6)]
+    results += [
+        JobResult.model_construct(availability_errors=[{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}])
+        for _ in range(7)
+    ]
+
+    assert silence_availability_errors_on_our_own_outage(results) == 13
+    assert all(result.availability_errors == short for result in results[:6])
+    assert all(result.availability_errors is None for result in results[6:])

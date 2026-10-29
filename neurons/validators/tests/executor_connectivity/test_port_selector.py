@@ -142,3 +142,12 @@ def test_declared_ports_counts_one_pair_per_external_port():
     info = _executor_info(port_mappings=str([[9000, 40000]] * 8 + [[9001, 40000], [9002, 40001]]))
 
     assert declared_ports(info) == [PortPair(9000, 40000), PortPair(9002, 40001)]
+
+
+def test_declared_ports_counts_one_pair_per_internal_port():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    # 24 distinct external aliases onto three host ports: a rental can bind only three of them
+    info = _executor_info(port_mappings=str([[9000 + i % 3, 40000 + i] for i in range(24)]))
+
+    assert declared_ports(info) == [PortPair(9000, 40000), PortPair(9001, 40001), PortPair(9002, 40002)]

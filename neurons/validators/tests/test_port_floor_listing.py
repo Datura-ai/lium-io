@@ -584,3 +584,59 @@ async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented
     # rent path: no pod holds a port (a filler creates none), so all 4 are free to allocate
     busy_pod_ports: set[int] = set()
     assert len(set(specs["verified_ports"]) - busy_pod_ports) >= MIN_PORT_COUNT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce_floor", [True, False])
+@pytest.mark.parametrize(
+    "rental, ports, expected",
+    [
+        ("stale", 2, "INSUFFICIENT_PORTS"),
+        ("stale", 3, "INSUFFICIENT_PORTS"),
+        ("stale", 23, "INSUFFICIENT_PORTS"),
+        ("stale", 24, None),
+        ("live", 2, None),
+        ("live", 3, None),
+        ("live", 23, None),
+        ("live", 24, None),
+        ("unresolved", 2, None),
+        ("unresolved", 3, None),
+        ("unresolved", 23, None),
+        ("unresolved", 24, None),
+    ],
+)
+async def test_an_8_gpu_split_node_needs_its_ports_once_every_listed_pod_is_stale(
+    context_factory, monkeypatch, rental, ports, expected, enforce_floor
+):
+    from dataclasses import replace
+
+    if ports < MIN_PORT_COUNT and not enforce_floor:
+        expected = None  # the plain floor on a stale pod stays behind its flag
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", enforce_floor)
+
+    class NoRecordForSecondPod(PerPodBackendClient):
+        async def get_pod_rental_active(self, pod_id: str):
+            return None if pod_id == "pod-unknown" else await super().get_pod_rental_active(pod_id)
+
+    pods = {"stale": ("pod-stale",), "live": ("pod-stale", "pod-live"), "unresolved": ("pod-stale", "pod-unknown")}
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=ports), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods(*pods[rental]),
+        ssh=PerPodSSHClient(running={"container_pod-live"}),
+        backend=NoRecordForSecondPod(active={"pod-live"}),
+    )
+    ctx = ctx.model_copy(
+        update={"state": replace(ctx.state, gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=1)}
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert count_result.passed is True  # rented at the snapshot: exempt here
+    assert ctx.state.specs["available_port_count"] == ports
+    assert tenant_result.passed is (expected is None)
+    if expected:
+        assert tenant_result.event.reason_code == expected
+        assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-stale"

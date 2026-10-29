@@ -30,7 +30,13 @@ from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
-from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
+from .port_count import (
+    hidden_from_renters_text,
+    port_count_below_listing_floor,
+    port_floor_what,
+    split_port_shortfall,
+    split_ports_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -286,6 +292,20 @@ class TenantEnforcementCheck:
                     # The floor is enforced only when every listed pod is stale: a live rental on the same
                     # node is a real exemption, and this loop returns before it would reach later pods.
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
+                    # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
+                    # node whose every listed pod is stale is idle and needs them, with or without the floor flag
+                    split_short = split_port_shortfall(ctx.state)
+                    if split_short is not None and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                        event = split_ports_event(
+                            ctx, self.check_id, ctx.state, *split_short, what={"stale_pod": stale_what}, extra=extra
+                        )
+                        return with_pod_states(
+                            CheckResult(
+                                passed=False,
+                                event=event,
+                                updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
+                            )
+                        )
                     if (
                         port_count_below_floor is not None
                         and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD

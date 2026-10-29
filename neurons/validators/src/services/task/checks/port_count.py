@@ -8,6 +8,7 @@ from typing import Any
 from services.const import MIN_PORT_COUNT
 from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
+from ..availability import AVAILABILITY_CATEGORY, ReachSource, ReachTarget
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
 
@@ -40,6 +41,56 @@ def split_port_requirement(state: ContextState) -> tuple[int, int] | None:
         return None
     max_splits = (state.gpu_count or 0) // min_count
     return max_splits, max(max_splits * MIN_PORT_COUNT, MIN_PORT_COUNT)
+
+
+def split_port_shortfall(state: ContextState) -> tuple[int, tuple[int, int]] | None:
+    """(published `available_port_count`, split_port_requirement) when a split node has the plain
+    floor but not MIN_PORT_COUNT ports per split, else None (below the floor, the floor reports it)."""
+    need = split_port_requirement(state)
+    available: Any = state.specs.get("available_port_count")
+    if not need or not isinstance(available, int) or isinstance(available, bool):
+        return None
+    return (available, need) if MIN_PORT_COUNT <= available < need[1] else None
+
+
+def split_ports_event(
+    ctx: Context,
+    check_id: str,
+    state: ContextState,
+    port_count: int,
+    split_need: tuple[int, int],
+    *,
+    what: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+):
+    """INSUFFICIENT_PORTS for an idle split node short of its ports.
+
+    An availability entry, not a runtime event: the backend does not store a zero-score report, so
+    only an availability entry takes an already-listed node off the market; the next passing cycle
+    lists it again.
+    """
+    max_splits, required = split_need
+    return render_message(
+        Msg.INSUFFICIENT_PORTS,
+        ctx=ctx,
+        check_id=check_id,
+        category=AVAILABILITY_CATEGORY,
+        what={
+            "reach_source": str(ReachSource.VALIDATOR),
+            "reach_target": str(ReachTarget.EXECUTOR_PORTS),
+            **port_floor_what(state, port_count),
+            "required": required,
+            "max_splits": max_splits,
+            "gpu_splitting_min_count": state.gpu_splitting_min_count,
+            **(what or {}),
+        },
+        remediation=(
+            f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
+            f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
+            "then `docker compose up -d` in neurons/executor."
+        ),
+        extra=extra,
+    )
 
 
 def hidden_from_renters_text(available_port_count: int) -> str:
@@ -140,23 +191,7 @@ class PortCountCheck:
 
         # below MIN_PORT_COUNT the plain floor below reports it; a rented node keeps its exemption
         if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
-            max_splits, required = split_need
-            event = render_message(
-                Msg.INSUFFICIENT_PORTS,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    **port_floor_what(updated_state, port_count),
-                    "required": required,
-                    "max_splits": max_splits,
-                    "gpu_splitting_min_count": ctx.state.gpu_splitting_min_count,
-                },
-                remediation=(
-                    f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
-                    f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
-                    "then `docker compose up -d` in neurons/executor."
-                ),
-            )
+            event = split_ports_event(ctx, self.check_id, updated_state, port_count, split_need)
             return CheckResult(
                 passed=False,
                 event=event,

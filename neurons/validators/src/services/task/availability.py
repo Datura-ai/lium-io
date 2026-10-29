@@ -33,6 +33,8 @@ class ReachTarget(StrEnum):
     EXECUTOR_API = "executor_api"
     # A card on the node (GpuLossHoldCheck): the validator cannot reach it through NVML.
     GPU = "gpu"
+    # The node's renting ports (PortCountCheck): too few answer for every GPU split to be rented.
+    EXECUTOR_PORTS = "executor_ports"
 
 
 # The longest peer-supplied text a reading may keep: the node writes it, the portal shows it.
@@ -63,6 +65,9 @@ class AvailabilityErrorCode(StrEnum):
 NODE_GPU_FAULT_CODES = frozenset(
     {AvailabilityErrorCode.GPU_LOST, AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED}
 )
+# The node's own verdicts the outage guard never counts or silences: its card faults, and an idle
+# split node short of its renting ports (DAH-3698), a node policy rather than a reach failure.
+NODE_OWN_VERDICT_CODES = NODE_GPU_FAULT_CODES | {"INSUFFICIENT_PORTS"}
 
 
 def build_availability_event(
@@ -264,12 +269,12 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
     are silenced (``_is_the_validators_own_reading``).
     """
     checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
-    # a lost or broken GPU is the node's own fault, never our outage: not counted in the share
+    # the node's own verdicts (NODE_OWN_VERDICT_CODES) are never our outage: not counted in the share
     unreachable_results = [
         result
         for result in checked_results
         if any(
-            error.get("reason_code") not in NODE_GPU_FAULT_CODES
+            error.get("reason_code") not in NODE_OWN_VERDICT_CODES
             for error in result.availability_errors or []
         )
     ]
@@ -277,11 +282,11 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
         return 0
     for result in checked_results:
         # None means "this cycle did not check": the backend leaves the stored errors alone.
-        # A lost or broken GPU is the node's own fault: its entry stays, the node stays hidden.
+        # The node's own verdicts (NODE_OWN_VERDICT_CODES) stay, the node stays hidden.
         node_gpu_fault_entries = [
             error
             for error in result.availability_errors or []
-            if error.get("reason_code") in NODE_GPU_FAULT_CODES
+            if error.get("reason_code") in NODE_OWN_VERDICT_CODES
         ]
         result.availability_errors = node_gpu_fault_entries or None
     return len(checked_results)
