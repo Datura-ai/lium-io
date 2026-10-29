@@ -13,7 +13,14 @@ from services.const import MIN_PORT_COUNT
 from tests.helpers import build_state, make_context
 
 
-def _ctx(ports: int, *, gpu_count: int = 8, min_count: int | None = 1, rented: bool = False):
+def _ctx(
+    ports: int,
+    *,
+    gpu_count: int = 8,
+    min_count: int | None = 1,
+    rented: bool = False,
+    declared: int | None = None,
+):
     rented_data = None
     if rented:
         rented_data = RentedExecutorsResponse(
@@ -32,6 +39,7 @@ def _ctx(ports: int, *, gpu_count: int = 8, min_count: int | None = 1, rented: b
         )
     state = build_state(
         verified_port_count=ports,
+        declared_port_count=declared,
         gpu_count=gpu_count,
         supports_gpu_splitting=min_count is not None,
         gpu_splitting_min_count=min_count,
@@ -135,13 +143,34 @@ async def test_a_listed_split_node_is_hidden_at_23_ports_and_listed_again_at_24(
     assert errors(await PortCountCheck().run(_ctx(24))) == []
 
 
-def test_the_outage_guard_counts_and_silences_split_port_entries():
-    from neurons.validators.src.services.task.availability import silence_availability_errors_on_our_own_outage
+async def _guarded(declared: int) -> list:
+    """Six listed nodes verified at 23 ports, declaring `declared`, through the outage guard."""
+    from neurons.validators.src.services.task.availability import (
+        availability_errors,
+        silence_availability_errors_on_our_own_outage,
+    )
     from services.task.models import JobResult
 
-    # a fleet-wide probe failure on our side must not hide every split node
-    short = [{"reason_code": "INSUFFICIENT_PORTS", "reach_source": "validator"}]
-    results = [JobResult.model_construct(availability_errors=list(short)) for _ in range(6)]
+    results = []
+    for _ in range(6):
+        event = (await PortCountCheck().run(_ctx(23, declared=declared))).event
+        entries = [e.model_dump(mode="json") for e in availability_errors([event])]
+        results.append(JobResult.model_construct(availability_errors=entries))
+    silence_availability_errors_on_our_own_outage(results)
+    return results
 
-    assert silence_availability_errors_on_our_own_outage(results) == 6
-    assert all(result.availability_errors is None for result in results)
+
+@pytest.mark.asyncio
+async def test_the_outage_guard_counts_and_silences_a_split_probe_shortfall():
+    # enough ports declared, too few verified: a fleet-wide probe failure on our side must not hide every split node
+    assert all(result.availability_errors is None for result in await _guarded(declared=24))
+
+
+@pytest.mark.asyncio
+async def test_the_outage_guard_keeps_a_split_node_that_declares_too_few_ports():
+    # too few ports declared is the node's configuration, not our probe: the listing comes down
+    results = await _guarded(declared=23)
+    assert all(
+        [e["reason_code"] for e in result.availability_errors] == ["INSUFFICIENT_PORTS"]
+        for result in results
+    )

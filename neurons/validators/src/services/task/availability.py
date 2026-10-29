@@ -67,6 +67,24 @@ NODE_GPU_FAULT_CODES = frozenset(
 )
 
 
+def _is_the_nodes_own_fault(error: dict[str, Any]) -> bool:
+    """A lost or broken GPU, or a node that declares fewer ports than it needs (DAH-3698).
+
+    Neither depends on our probe, so neither is counted as our outage or silenced with one. A
+    probe that verified too few of enough declared ports stays a reach failure: counted, silenced.
+    """
+    if error.get("reason_code") in NODE_GPU_FAULT_CODES:
+        return True
+    seen = error.get("what_we_saw") or {}
+    declared, required = seen.get("declared_port_count"), seen.get("required")
+    return (
+        error.get("reason_code") == "INSUFFICIENT_PORTS"
+        and isinstance(declared, int)
+        and isinstance(required, int)
+        and declared < required
+    )
+
+
 def build_availability_event(
     *,
     code: AvailabilityErrorCode,
@@ -266,24 +284,19 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
     are silenced (``_is_the_validators_own_reading``).
     """
     checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
-    # a lost or broken GPU is the node's own fault, never our outage: not counted in the share
+    # the node's own faults are never our outage: not counted in the share
     unreachable_results = [
         result
         for result in checked_results
-        if any(
-            error.get("reason_code") not in NODE_GPU_FAULT_CODES
-            for error in result.availability_errors or []
-        )
+        if any(not _is_the_nodes_own_fault(error) for error in result.availability_errors or [])
     ]
     if not is_our_own_outage(len(unreachable_results), len(checked_results)):
         return 0
     for result in checked_results:
         # None means "this cycle did not check": the backend leaves the stored errors alone.
-        # A lost or broken GPU is the node's own fault: its entry stays, the node stays hidden.
-        node_gpu_fault_entries = [
-            error
-            for error in result.availability_errors or []
-            if error.get("reason_code") in NODE_GPU_FAULT_CODES
+        # The node's own faults stay, the node stays hidden.
+        own_fault_entries = [
+            error for error in result.availability_errors or [] if _is_the_nodes_own_fault(error)
         ]
-        result.availability_errors = node_gpu_fault_entries or None
+        result.availability_errors = own_fault_entries or None
     return len(checked_results)
