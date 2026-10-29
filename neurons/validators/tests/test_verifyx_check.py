@@ -719,25 +719,27 @@ async def test_verifyx_success_path_emits_no_verifyx_failed_log(
 @pytest.mark.parametrize(
     "upload,prev_upload,filler,expected_pass,expected_probe,expected_ema",
     [
-        # F-1654: download fine, upload 4 Mbps on a known host -> EMA 4.5 < 10 fails
-        (4.0, 5.0, False, False, True, 4.5),
+        # F-1654: download fine, upload 4 Mbps on a known host; the stored 5 is below the floor, so the
+        # reading is judged alone: 4 < 10 fails
+        (4.0, 5.0, False, False, True, 4.0),
         # at and above the floor passes
         (10.0, 10.0, False, True, True, 10.0),
         (60.0, 900.0, False, True, True, 480.0),
         (60.0, 60.0, False, True, True, 60.0),
-        # a missing reading or a 0.0 lowers the EMA and is judged; a malformed one keeps it, judged
+        # a missing reading lowers the EMA and is judged, a 0.0 is judged alone against a below-floor EMA;
+        # a malformed one keeps it, judged
         (None, 5.0, False, False, True, 2.5),
-        (0.0, 5.0, False, False, True, 2.5),
+        (0.0, 5.0, False, False, True, 0.0),
         (float("nan"), 5.0, False, False, True, 5.0),
         # a never-measured upload with no sample stays unseeded, not failed; a 0.0 sample is judged
         (None, None, False, True, True, None),
         (0.0, None, False, False, True, 0.0),
         # an active filler skips the probe only when the stored upload EMA is at the floor
-        (4.0, 5.0, True, False, True, 4.5),
+        (4.0, 5.0, True, False, True, 4.0),
         (10.0, 10.0, True, True, False, 10.0),
         (60.0, 60.0, True, True, False, 60.0),
         # recovery under a filler: the below-floor node is probed and its good reading counts
-        (60.0, 5.0, True, True, True, 32.5),
+        (60.0, 5.0, True, True, True, 60.0),
     ],
 )
 async def test_verifyx_upload_floor(
@@ -776,22 +778,27 @@ async def test_verifyx_upload_floor(
 @pytest.mark.parametrize(
     "prev_upload,uploads,expected",
     [
-        # recovery once the EMA reaches the floor
-        (2.0, [12.0] * 3, [(False, 7.0), (False, 9.5), (True, 10.75)]),
+        # a stored EMA below the floor predates it: a recovered 12 Mbps is judged alone and passes
+        (2.0, [12.0] * 3, [(True, 12.0, 12.0)] * 3),
         # a host blocking its own upload (0.0) cannot turn 4 -> 0 -> 0 into a pass
-        (5.0, [4.0, 0.0, 0.0], [(False, 4.5), (False, 2.25), (False, 1.125)]),
+        (5.0, [4.0, 0.0, 0.0], [(False, 4.0, 5.0), (False, 0.0, 5.0), (False, 0.0, 5.0)]),
+        # a stored EMA at the floor averages: one slow reading passes, then the next fails and keeps 12
+        (20.0, [4.0, 4.0, 4.0], [(True, 12.0, 12.0), (False, 8.0, 12.0), (False, 8.0, 12.0)]),
         # missing readings on a never-measured upload leave it unseeded, never a synthetic 0
-        (None, [None] * 3, [(True, None)] * 3),
+        (None, [None] * 3, [(True, None, None)] * 3),
     ],
 )
 async def test_verifyx_upload_floor_transitions(context_factory, prev_upload, uploads, expected):
+    """Round trip as the backend runs it: save_executor_into_db stores specs only on a passing
+    cycle, so a failed cycle's EMA never becomes the next cycle's stored one (review 5704509865)."""
+    stored = prev_upload
     outcomes = []
     for upload in uploads:
-        result = await _run_ema_cycle(
-            context_factory, download=2100.0, upload=upload, prev_upload=prev_upload
-        )
-        prev_upload = result.updates["state"].specs["network"].get("ema_verifyx_upload_speed")
-        outcomes.append((result.passed, prev_upload))
+        result = await _run_ema_cycle(context_factory, download=2100.0, upload=upload, prev_upload=stored)
+        ema = result.updates["state"].specs["network"].get("ema_verifyx_upload_speed")
+        if result.passed:
+            stored = ema
+        outcomes.append((result.passed, ema, stored))
     assert outcomes == expected
 
 
@@ -805,7 +812,7 @@ async def test_verifyx_upload_floor_transitions(context_factory, prev_upload, up
         (0, 10.0, True, 10.0),
         (verifyx_module.MAX_KEPT_UPLOAD_PROBES - 1, 10.0, True, 10.0),
         # past the cap the probe's 0.0 is fed and judged
-        (verifyx_module.MAX_KEPT_UPLOAD_PROBES, 5.0, False, 2.5),
+        (verifyx_module.MAX_KEPT_UPLOAD_PROBES, 5.0, False, 0.0),
         (verifyx_module.MAX_KEPT_UPLOAD_PROBES, 10.0, False, 5.0),
     ],
 )

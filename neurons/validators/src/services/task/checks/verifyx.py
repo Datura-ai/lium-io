@@ -235,7 +235,7 @@ class VerifyXCheck:
                 updated_specs["network"],
                 "upload",
                 upload_reading,
-                prev_upload,
+                _upload_ema_base(prev_upload, upload_reading),
                 unavailable_readings,
                 keep_previous_on_none=upload_blocked or prev_upload is None,
             )
@@ -501,8 +501,18 @@ def verifyx_verdict(
     upload = _fallback_upload_reading(network.get("upload_speed"), upload_fallback)
     prev_upload = prev_ema.ema_verifyx_upload_speed if prev_ema else None
     kept = upload is None and (upload_fallback or prev_upload is None)
-    ema_upload = prev_upload if kept else _ema_if_gated(prev_upload, upload)
+    ema_upload = prev_upload if kept else _ema_if_gated(_upload_ema_base(prev_upload, upload), upload)
     return not upload_too_slow(ema_upload, upload, prev_ema, first_pass=first_pass)
+
+
+def _upload_ema_base(prev_upload: float | None, reading: object) -> float | None:
+    """The stored upload EMA a measured reading averages with. The backend stores a node's specs only
+    on a passing cycle, so a stored upload EMA below the floor predates it (or can never be raised by
+    a failing cycle: 2 Mbps stays 2, and a steady 12 Mbps computes 7 every cycle, review 5704509865).
+    Such an EMA is dropped and the reading judged alone; any stored EMA at the floor is kept."""
+    if prev_upload is not None and prev_upload < MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS and _is_speed_reading(reading):
+        return None
+    return prev_upload
 
 
 def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:
