@@ -825,7 +825,9 @@ def _package_fallback_stats(
         "success": success,
         "cloudflare_fallback": True,
         "execution_time_ms": network_execution.get("execution_time_ms"),
-        **_cloudflare_upload_mark(network_execution),
+        # the download fell back on a Cloudflare fault, so the verifier never ran the upload: its 0.0
+        # is no measurement (review 5695182456); verifyx.py caps the kept probes at MAX_KEPT_UPLOAD_PROBES
+        **({} if _is_positive_number(upload_speed) else {"cloudflare_upload_fallback": True}),
     }
     return stats, errors
 
