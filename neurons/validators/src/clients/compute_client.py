@@ -115,7 +115,9 @@ CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 # pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
 # so the backend loses the validator for seconds, not the whole startup.
 CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
-CONNECTOR_LEAD_LOCK_TTL_SECONDS = 15
+# The old pod is SIGKILLed holding the lock, so the backend loses the validator for what is left of the TTL plus the
+# reconnect (12-14 s at 15 s, 29 Oct); 6 s keeps that under the backend's 10 s rent wait (lium-platform DAH-5174).
+CONNECTOR_LEAD_LOCK_TTL_SECONDS = 6
 CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
 
 
