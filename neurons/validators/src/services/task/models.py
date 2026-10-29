@@ -63,6 +63,7 @@ class JobResult(BaseModel):
     # force-spot by a penalty demotion; not a banned hotkey, pin or no-incentive rental. Gates spot-node pay.
     is_on_spot_pay_list: bool = False
     is_new_rentals_paused: bool = False
+    is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False
     # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS: no incentive from any pool, set
     # by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.

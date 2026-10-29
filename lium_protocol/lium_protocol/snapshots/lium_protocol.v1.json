@@ -3952,6 +3952,27 @@
       "title": "MachineSpecRequest",
       "type": "object"
     },
+    "MaintenanceWindow": {
+      "description": "A provider maintenance window, UTC, half-open: [starting_at, expiring_at).",
+      "properties": {
+        "expiring_at": {
+          "format": "date-time",
+          "title": "Expiring At",
+          "type": "string"
+        },
+        "starting_at": {
+          "format": "date-time",
+          "title": "Starting At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "starting_at",
+        "expiring_at"
+      ],
+      "title": "MaintenanceWindow",
+      "type": "object"
+    },
     "ManualRentalInfo": {
       "description": "Specs a special manual (bare-metal) rental is force-passed against; both fields drive the score.",
       "properties": {
@@ -4937,6 +4958,22 @@
           },
           "default": {},
           "title": "Gpu Splitting Config",
+          "type": "object"
+        },
+        "maintenance_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Maintenance Executor Ids",
+          "type": "array"
+        },
+        "maintenance_windows_by_executor": {
+          "additionalProperties": {
+            "$ref": "#/$defs/MaintenanceWindow"
+          },
+          "default": {},
+          "title": "Maintenance Windows By Executor",
           "type": "object"
         },
         "manual_rental_executors": {
@@ -6150,7 +6187,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.16.0",
+  "protocol_version": "1.17.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

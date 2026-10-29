@@ -521,6 +521,16 @@ class GpuLossHoldMessages:
         "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
         "a node keeps the cards it was first verified with.",
     )
+    SET_REPLACED = MessageTemplate(
+        event="The node came back with a different set of GPUs",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="The new GPUs are verified and kept for this node, but it is hidden and takes no new rentals until "
+        "they read clean for the hold window (see hold_until); it scores 0 meanwhile",
+        remediation="Nothing to do, and do not remove or re-add the node: it is listed again on its own once all "
+        "its GPUs have been present for 2 hours. To avoid this, pass the same GPUs through on every host restart.",
+    )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
         reason="GPU_LOST_PENDING",
@@ -969,6 +979,24 @@ class DuplicateExecutorMessages:
         remediation="Each physical GPU earns under one executor. Register every machine once.",
     )
 
+class ProviderMaintenanceMessages:
+    IN_WINDOW = MessageTemplate(
+        event="Node in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation="The provider scheduled maintenance on this node; it is validated as usual once the window ends.",
+    )
+    NONE = MessageTemplate(
+        event="Node not in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE_NONE",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(
         event="Collateral verified",
@@ -1039,13 +1067,6 @@ class InspectorMessages:
         severity="info",
         category="runtime",
         impact="No active customer rental on this executor",
-    )
-    DISABLED = MessageTemplate(
-        event="Inspector validation disabled",
-        reason="INSPECTOR_SKIPPED_DISABLED",
-        severity="info",
-        category="runtime",
-        impact="Inspector checks are disabled",
     )
     CLEAN = MessageTemplate(
         event="Inspector validation clean",
@@ -1601,6 +1622,17 @@ class RentedThroughputMessages:
     )
 
 
+class IdleDiskWriteMessages:
+    # DAH-5320: shadow only; the reading itself is the IDLE_DISK_WRITE log line
+    LOGGED = MessageTemplate(
+        event="Idle node disk write speed logged (not enforced)",
+        reason="IDLE_DISK_WRITE_LOGGED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 VERIFYX_DEBUG_DOC_URL = (
     "https://github.com/Datura-ai/lium-io/blob/main/docs/lium-io/verifyx-debug.md"
 )
@@ -1975,8 +2007,8 @@ class PinnedMemoryProbeMessages:
 
 
 class NvlinkFaultMessages:
-    """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED is the
-    enforced form; with NVLINK_FAULT_ENFORCEMENT_ENABLED off it renders as a warning that changes no score."""
+    """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED fails
+    the node until a probe passes again."""
 
     PROBE_OK = MessageTemplate(
         event="NVLink multicast probe passed",
@@ -1992,13 +2024,6 @@ class NvlinkFaultMessages:
         category="env",
         impact="Proceed",
     )
-    FILLER_SKIPPED = MessageTemplate(
-        event="NVLink multicast probe skipped for active filler",
-        reason="NVLINK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Active filler runtime preserved; the probe would compete with it on every GPU.",
-    )
     PROBE_FAILED = MessageTemplate(
         event="NVLink is faulted: multicast memory cannot be bound across the GPUs",
         reason="NVLINK_FAULT",
@@ -2009,7 +2034,8 @@ class NvlinkFaultMessages:
             "The GPUs report an uncorrectable NVLink error state: NCCL NVLink SHARP (NVLS) and other "
             "multi-GPU jobs fail. Check the host `dmesg` for NVRM Xid lines and `nvidia-smi nvlink -e`. "
             "Stop the workloads, reset the GPUs (`nvidia-smi -r`) and restart nvidia-fabricmanager, or "
-            "reboot. If the errors come back, service the board."
+            "reboot. Then restart the executor container (`docker restart executor-executor-1`) so it "
+            "sees the GPUs again. If the errors come back, service the board."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2046,6 +2072,19 @@ class RentalVerificationMessages:
         category="policy",
         impact="Validation halted",
         remediation="Check executor health with backend or review rental status",
+    )
+    # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
+    GPU_LIST_EMPTY = MessageTemplate(
+        event="Rental verification failed",
+        reason="RENTAL_NOT_VERIFIED",
+        severity="error",
+        category="policy",
+        impact="Validation halted",
+        remediation=(
+            "The executor container sees no GPU in /proc/driver/nvidia/gpus, usually after a GPU reset "
+            "(`nvidia-smi -r`) or an NVIDIA driver reload while it kept running. Restart it "
+            "(`docker restart executor-executor-1`) or reboot the host."
+        ),
     )
     GPU_RUNTIME_NVML_MISMATCH = MessageTemplate(
         event="GPU runtime health check failed",

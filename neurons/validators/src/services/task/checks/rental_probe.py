@@ -34,6 +34,7 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,6 @@ _MIN_TASK_SECONDS_LEFT_STANDING = 270
 # the gate's reads can eat into the create's share; below this the probe would fail on our own budget
 # and renew the hold, so the cycle reaches no verdict instead (review)
 _MIN_CREATE_DEADLINE_SECONDS = 60
-_TASK_TIMEOUT_MARGIN_SECONDS = 120
 # the outer cap on delete_container (DAH-3467, review): a stop with its 30 s grace, a `rm -f` that
 # outlives the Docker SDK's 60 s read timeout, the 60 s inspect window plus one 15 s inspect past
 # it and six "volume is in use" retries 5 s apart come to about 190 s on the inspect-confirmed
@@ -516,13 +516,9 @@ class RentalProbeCheck:
         return CheckResult(passed=True, event=event)
 
 
-def _task_seconds_left(ctx: Context) -> float:
-    return settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
-
-
 def _create_deadline_seconds(ctx: Context) -> float:
     """The create's deadline: the full one, or what is left after a usual teardown when the cycle is late."""
-    return min(_CREATE_DEADLINE_SECONDS, _task_seconds_left(ctx) - _USUAL_TEARDOWN_SECONDS)
+    return min(_CREATE_DEADLINE_SECONDS, task_seconds_left(ctx) - _USUAL_TEARDOWN_SECONDS)
 
 
 async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[str | None, dict[str, Any]]:
@@ -530,9 +526,9 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
     if rented_executor and rented_executor.pods:
         return "rented", {"pods": [pod.pod_id for pod in rented_executor.pods]}
-    task_seconds_left = _task_seconds_left(ctx)
-    if task_seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
-        return "too little cycle time left", {"task_seconds_left": int(task_seconds_left)}
+    seconds_left = task_seconds_left(ctx)
+    if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
+        return "too little cycle time left", {"task_seconds_left": int(seconds_left)}
 
     try:
         last_ok = await _last_ok_at(ctx)

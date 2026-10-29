@@ -357,7 +357,8 @@ class MinerService:
         # wave's list of the node's miner, or the wave could verify and publish the node again
         # under the same id once the lane let go of it.
         self.miners_awaiting_wave_list: dict[str, str] = {}
-        # per miner hotkey, the rented executor uuids it left out of its previous answer (RENTED_NOT_LISTED_ONE_CYCLE_GRACE).
+        # per miner hotkey, the rented executor uuids it left out of its previous answer (one-cycle grace: a
+        # single miss is mostly a key upload that missed the miner's 10 s window, so the row starts at the second).
         # shortcut: in memory, so a restart costs one extra cycle before a real outage is reported.
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
         # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
@@ -466,6 +467,49 @@ class MinerService:
         """Called by the cycle right after it recorded its published executors as validated."""
         for executor_id in [e for e, lane in self.in_flight.items() if lane == CYCLE_DONE]:
             del self.in_flight[executor_id]
+
+    async def publish_new_executors_at_pass(self, job: dict | None) -> None:
+        """A wave result that passed, for an executor no cycle has published yet, is published as
+        soon as its miner answers, spec-only like the express lane's (no scored_at): at the cycle's
+        end it waited for the slowest miner in the fleet, 9-14 min (a node verified at 17:51 was
+        listed at 18:03). The cycle still scores and publishes it as today. Never fails the wave."""
+        if not job:
+            return
+        try:
+            validated = await self.redis_service.get_validated_executors()
+            if not validated:
+                # cold set (fresh box or Redis wipe): every executor would look new; the cycle publishes
+                return
+            new = [
+                result
+                for result in job.get("results", [])
+                if result.is_successful
+                and not result.is_rented
+                and result.executor_info.uuid not in validated
+            ]
+            if not new:
+                return
+            await self.publish_machine_specs(
+                new, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+            logger.info(
+                _m(
+                    "[sync] New executors published at pass, ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [r.executor_info.uuid for r in new],
+                        }
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[sync] Could not publish new executors at pass; the cycle publishes them",
+                    extra=get_extra_info({"error": str(exc)}),
+                )
+            )
 
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
@@ -724,6 +768,7 @@ class MinerService:
             # exempt the node from spot-tier or Discord exclusions.
             is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
             is_on_spot_pay_list = is_spot and executor_uuid in (rented_data.provider_spot_executor_ids or [])
+            is_in_maintenance = executor_uuid in (rented_data.maintenance_executor_ids or [])
             discord_connected_ids = rented_data.provider_discord_connected_executor_ids
             provider_discord_connected = (
                 True if discord_connected_ids is None else executor_uuid in discord_connected_ids
@@ -760,6 +805,7 @@ class MinerService:
                     is_spot=is_spot,
                     is_on_spot_pay_list=is_on_spot_pay_list,
                     provider_discord_connected=provider_discord_connected,
+                    is_in_maintenance=is_in_maintenance,
                 )
             )
 
@@ -820,14 +866,12 @@ class MinerService:
         miner_returned_executors: list[ExecutorSSHInfo],
         executor_id: str | None,
     ) -> Iterator[tuple[str, RentedExecutor]]:
-        """The missing rented executors that get a row: with RENTED_NOT_LISTED_ONE_CYCLE_GRACE only those the
-        miner also left out of its previous answer."""
+        """The missing rented executors that get a row: only those the miner also left out of its previous
+        answer (one-cycle grace)."""
         for executor_uuid, rented_executor in self._missing_rented(
             payload, rented_data, miner_returned_executors, executor_id
         ):
-            if settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE and executor_uuid not in self.rented_missed_last_cycle.get(
-                payload.miner_hotkey, ()
-            ):
+            if executor_uuid not in self.rented_missed_last_cycle.get(payload.miner_hotkey, ()):
                 continue
             yield executor_uuid, rented_executor
 
@@ -881,7 +925,7 @@ class MinerService:
                 payload, rented_data, miner_returned_executors, executor_id
             )
         ]
-        if settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE and rented_data and executor_id is None:
+        if rented_data and executor_id is None:
             # this miner's misses replace its previous ones: a node it returned, or whose rental ended, drops out
             self.rented_missed_last_cycle[payload.miner_hotkey] = {
                 executor_uuid
@@ -2194,8 +2238,8 @@ class MinerService:
                 _m("Sent SSH key to miner via REST API.", extra=get_extra_info(default_extra)),
             )
 
-            # A restarting miner refuses connections for about a minute. Nothing has reached it
-            # yet, so a create waits that out instead of failing the renter's pod.
+            # A restarting miner refuses connections for about a minute. A create waits that out instead of
+            # failing the renter's pod; a resubmitted key is harmless, the removal drops every copy.
             deadline = time.monotonic() + MINER_RESTART_WAIT_S
             while True:
                 # The miner accepts a signed timestamp for 10 s only, so each attempt signs anew.
@@ -2211,12 +2255,16 @@ class MinerService:
                         log_extra=default_extra,
                         operation_name="SSH key submit",
                     )
-                    break
+                    # A request held up by the restart reaches the new miner after the signature aged out.
+                    stale = status == 401 and "too old" in str(response_data)
+                    if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
+                        break
                 except aiohttp.ClientConnectorError:
-                    is_create = isinstance(payload, ContainerCreateRequest)
-                    if not is_create or time.monotonic() >= deadline:
+                    # refused: it never reached the miner, so its rental hook did not run and a resubmit must
+                    # run it. A timeout may have run it, and the hook is not idempotent: that create fails.
+                    if not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
                         raise
-                    await asyncio.sleep(MINER_RESTART_RETRY_S)
+                await asyncio.sleep(MINER_RESTART_RETRY_S)
 
             if status != 200 or response_data is None:
                 error_msg = "Failed to submit SSH key"
@@ -2434,7 +2482,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             return self._handle_container_error(
                 payload=payload,
@@ -2547,7 +2595,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             logger.error(log_text)
 
@@ -2687,7 +2735,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             logger.error(log_text, exc_info=True)
 

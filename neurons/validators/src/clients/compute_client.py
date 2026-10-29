@@ -109,6 +109,8 @@ logger = logging.getLogger(__name__)
 # mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
+# the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
+MAX_FRAME_BYTES = 4 * 1024 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 BACKEND_CREATE_TRACKING_RETRY_SECONDS = 5
@@ -141,6 +143,12 @@ class OutgoingMessages(list[DeliveryStamps]):
             responses.append(message.model_dump_json())
         super().append(message)
         self.appended.set()
+
+
+class FrameTooBig(Exception):
+    def __init__(self, size: int):
+        super().__init__(f"frame of {size} bytes exceeds {MAX_FRAME_BYTES}")
+        self.size = size
 
 
 class AuthenticationError(Exception):
@@ -554,7 +562,11 @@ class ComputeClient:
         # stamped inside the retry so a message resent after a reconnect reports its own delay
         msg.forwarded_at = time.time()
         msg.queue_depth = len(self.message_queue)
-        await self.ws.send(msg.model_dump_json())
+        payload = msg.model_dump_json()
+        size = len(payload.encode())
+        if size > MAX_FRAME_BYTES:
+            raise FrameTooBig(size)
+        await self.ws.send(payload)
 
     async def handle_send_messages(self):
         while True:
@@ -575,6 +587,20 @@ class ComputeClient:
                             for create_id in self._restart_reported_create_ids.pop(log_to_send.pod_id, ()):
                                 await self._retire_backend_create_record(log_to_send.pod_id, create_id)
                     except Exception as exc:
+                        if isinstance(exc, FrameTooBig):
+                            # checked before the send: requeued, it went first on every reconnect and closed each new
+                            # socket with 1009. A 1009 close itself is not judged: it fails every later send too.
+                            logger.error(
+                                _m(
+                                    "Dropped a message the backend refuses as too big",
+                                    extra=get_extra_info({
+                                        **self.logging_extra,
+                                        "message_type": type(log_to_send).__name__,
+                                        "size": exc.size,
+                                    }),
+                                )
+                            )
+                            continue
                         async with self.lock:
                             self.message_queue.insert(0, log_to_send)
                         logger.error(
