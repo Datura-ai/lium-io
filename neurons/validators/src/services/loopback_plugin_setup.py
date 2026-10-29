@@ -23,8 +23,8 @@ LOOPBACK_PLUGIN_BUILDS = {
     ),
     # DAH-5101: losetup --direct-io=on --sector-size 4096 --nooverlap, data files in whole sectors
     LOOPBACK_PLUGIN_V3_ALIAS: LoopbackPluginBuild(
-        "daturaai/docker-volume-loopback:1.0.0-lium7",
-        "sha256:5e297f3efcd2a331e67d006f8d1c1638e855f545d1ea14d2f7a02758cda9e631",
+        "daturaai/docker-volume-loopback:1.0.0-lium8",
+        "sha256:1480f57dffb76ac9269cb5961bd0bd4650080723ba1d59f535ec16015745b140",
         "v3",
     ),
 }
