@@ -1415,6 +1415,42 @@ class PortConnectivityMessages:
     )
 
 
+class DiskSpaceMessages:
+    OK = MessageTemplate(
+        event="Disk space inspected",
+        reason="DISK_SPACE_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    NOT_REPORTED = MessageTemplate(
+        event="No disk usage reported",
+        reason="DISK_NOT_REPORTED",
+        severity="warning",
+        category="env",
+        impact="Score set to 0",
+        remediation="Make sure the executor can read its data disk (`df -h` on the host), then wait for the next validation.",
+    )
+    TOO_FULL = MessageTemplate(
+        event="Disk too full",
+        reason="DISK_TOO_FULL",
+        severity="warning",
+        category="env",
+        impact="Score set to 0",
+        remediation="Free disk space on the node: check `docker system df` and `df -h`, delete what you no longer "
+        "need, or grow the disk. The next validation reads the disk again.",
+    )
+    FREE_TOO_LOW = MessageTemplate(
+        event="Too little free disk space",
+        reason="DISK_FREE_TOO_LOW",
+        severity="warning",
+        category="env",
+        impact="Score set to 0",
+        remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
+        "longer need, or grow the disk. The next validation reads the disk again.",
+    )
+
+
 class PortCountMessages:
     PORT_COUNT_RECORDED = MessageTemplate(
         event="Port availability inspected",
