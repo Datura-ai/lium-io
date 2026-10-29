@@ -135,17 +135,13 @@ async def test_a_listed_split_node_is_hidden_at_23_ports_and_listed_again_at_24(
     assert errors(await PortCountCheck().run(_ctx(24))) == []
 
 
-def test_split_port_entries_survive_and_do_not_count_toward_our_own_outage():
+def test_the_outage_guard_counts_and_silences_split_port_entries():
     from neurons.validators.src.services.task.availability import silence_availability_errors_on_our_own_outage
     from services.task.models import JobResult
 
+    # a fleet-wide probe failure on our side must not hide every split node
     short = [{"reason_code": "INSUFFICIENT_PORTS", "reach_source": "validator"}]
     results = [JobResult.model_construct(availability_errors=list(short)) for _ in range(6)]
-    results += [
-        JobResult.model_construct(availability_errors=[{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}])
-        for _ in range(7)
-    ]
 
-    assert silence_availability_errors_on_our_own_outage(results) == 13
-    assert all(result.availability_errors == short for result in results[:6])
-    assert all(result.availability_errors is None for result in results[6:])
+    assert silence_availability_errors_on_our_own_outage(results) == 6
+    assert all(result.availability_errors is None for result in results)
