@@ -698,7 +698,7 @@ def _gate_ctx(context_factory, *, redis_service, state, reading: str, connectivi
 
 def _remember(redis_service, ctx, pairs=MEMORY_PAIRS):
     redis_service.verified_ports[("miner-hotkey", "executor-123")] = {
-        "identity": PortConnectivityCheck._identity(ctx),
+        "identity": PortConnectivityCheck._port_setup_fingerprint(ctx),
         "pairs": pairs,
         "ttl": 86400,
     }
@@ -853,3 +853,65 @@ async def test_a_reading_that_fails_is_not_pressure(context_factory, monkeypatch
 
     assert connectivity.called_with is not None
     assert result.updates["state"].specs["disk_pressure"] == {**result.updates["state"].specs["disk_pressure"], "error": "no_output", "pressure": False}
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_cycle_takes_sysbox_from_the_verified_memory_never_from_the_scrape(
+    context_factory, monkeypatch
+):
+    # the scrape is the host's own word; SysboxRequiredCheck fires on a filler-only node, so a deferral may not
+    # pass it on a value the validator's probe never confirmed
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    state = build_state(
+        sysbox_runtime=True,
+        rented_data=RentedExecutorsResponse(executors={}, filler_ports_by_executor={"executor-123": [40010]}),
+    )
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=state, reading=STALLED)
+    _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.VERIFY_DEFERRED.reason and connectivity.called_with is None
+    assert result.updates["state"].sysbox_runtime is False
+    assert result.updates["state"].specs["sysbox_runtime"] is False
+    assert result.updates["default_extra"]["sysbox_runtime"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_deferral_redis_refuses_to_record_runs_the_check(context_factory, monkeypatch):
+    # Redis reachable, reads fine, writes refused (maxmemory + noeviction): the streak could never grow
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+
+    class WriteRefusingRedis(DummyRedis):
+        async def record_disk_pressure_deferral(self, miner_hotkey, executor_id, *, shadow, ttl_seconds):
+            raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
+
+    redis_service = WriteRefusingRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+    _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.VERIFY_OK.reason
+    assert connectivity.called_with is not None
+    assert result.updates["state"].port_check_deferred is False
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_cycle_is_marked_in_the_state_and_a_completed_one_is_not(context_factory, monkeypatch):
+    # lium-io#1937's successor stores "last good ports" from the state: a republished cycle must be tellable apart
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, _ = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+    _remember(redis_service, ctx)
+
+    deferred = await PortConnectivityCheck().run(ctx)
+    completed = await PortConnectivityCheck().run(
+        _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=QUICK)[0]
+    )
+
+    assert deferred.event.reason_code == Msg.VERIFY_DEFERRED.reason
+    assert deferred.updates["state"].port_check_deferred is True
+    assert completed.event.reason_code == Msg.VERIFY_OK.reason
+    assert completed.updates["state"].port_check_deferred is False

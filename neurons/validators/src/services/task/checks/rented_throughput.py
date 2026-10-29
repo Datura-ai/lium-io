@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME
@@ -14,6 +14,7 @@ from core.utils import _m, get_extra_info
 
 from ..host_disk import (
     DEVICE_MARKER,
+    DISK_PRESSURE_MAX_DEFERRALS,
     DOCKER_ROOT_DEVICES,
     SNAPSHOT_SECONDS,
     SYNCFS_POLL_SECONDS,
@@ -90,10 +91,15 @@ _DISK_SCRIPT = (
 )
 
 
-def throughput_command(sysbox: bool, *, skip_under_pressure: bool = False) -> str:
-    """The busy snapshot, the disk-pressure reading, then the probe container; with skip_under_pressure the
-    container is left out when the reading shows pressure (the shell's `dp`), since its start would stall."""
+def throughput_command(
+    sysbox: bool, *, read_pressure: bool = True, skip_under_pressure: bool = False
+) -> str:
+    """The busy snapshot, the disk-pressure reading (read_pressure), then the probe container; with
+    skip_under_pressure the container is left out when the reading shows pressure (the shell's `dp`), since
+    its start would stall."""
     probe = download_speed_command(sysbox, _DISK_SCRIPT + _FETCH_SCRIPT)
+    if not read_pressure:
+        return _SNAPSHOT + probe
     if skip_under_pressure:
         probe = f'if [ "$dp" = 1 ]; then echo "{PROBE_SKIPPED_MARKER}"; else {probe}; fi'
     return _SNAPSHOT + disk_pressure_probe() + probe
@@ -174,6 +180,9 @@ class _State:
     disk_failures: int = 0
     reading: dict[str, Any] = field(default_factory=dict)
     measured: bool = False
+    # DAH-5244: readings in a row whose probe container was left out under disk pressure; at
+    # DISK_PRESSURE_MAX_DEFERRALS the probe runs regardless, so the sides are measured again
+    probe_skips_in_a_row: int = 0
 
     def next_due_at(self) -> float:
         if self.failures_in_a_row > 0:
@@ -191,6 +200,7 @@ class _State:
                 disk_failures=int(data.get("disk_failures", 0)),
                 reading=dict(data.get("reading") or {}),
                 measured=bool(data.get("measured")),
+                probe_skips_in_a_row=int(data.get("probe_skips_in_a_row", 0)),
             )
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
@@ -213,8 +223,9 @@ class RentedThroughputCheck:
 
     DAH-5244: the command also times `sync -f` on the Docker root (host_disk). Under
     DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED a stalling sync leaves the probe container out - its start would wait
-    on the same pages - and both sides are no verdict; in shadow the probe runs and the reading says what the
-    verdict would have been (`disk_verdict_shadow`).
+    on the same pages - and both sides are no verdict, DISK_PRESSURE_MAX_DEFERRALS readings in a row at most before
+    the probe runs regardless; in shadow the probe runs and the reading says what the verdict would have been
+    (`disk_verdict_shadow`).
     """
 
     check_id = "host.validate.rented_throughput"
@@ -251,7 +262,8 @@ class RentedThroughputCheck:
         if now < state.next_due_at():
             return self._verdict(ctx, state, probed=False)
 
-        reading, net, disk = await self._measure_and_judge(ctx)
+        skip_under_pressure = await self._reserve_probe_skip(ctx, key, state)
+        reading, net, disk = await self._measure_and_judge(ctx, skip_under_pressure=skip_under_pressure)
         net_failures, disk_failures = (
             _step(state.net_failures, net),
             _step(state.disk_failures, disk),
@@ -264,6 +276,7 @@ class RentedThroughputCheck:
             disk_failures=disk_failures,
             reading=reading,
             measured="none" not in (net, disk),
+            probe_skips_in_a_row=state.probe_skips_in_a_row + 1 if "probe_skipped" in reading else 0,
         )
         logger.info(
             _m(
@@ -288,13 +301,26 @@ class RentedThroughputCheck:
             _UNSAVED[ctx.executor.uuid] = state
         return self._verdict(ctx, state, probed=True)
 
-    async def _measure_and_judge(self, ctx: Context) -> tuple[dict[str, Any], str, str]:
+    async def _reserve_probe_skip(self, ctx: Context, key: str, state: _State) -> bool:
+        """Whether this reading may leave the probe container out under pressure: enforced, skips left,
+        and the skip already on record (a Redis that takes reads but refuses writes would never count it,
+        so the probe runs instead)."""
+        if not (settings.DISK_PRESSURE_CHECK_ENABLED and settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED):
+            return False
+        if state.probe_skips_in_a_row >= DISK_PRESSURE_MAX_DEFERRALS:
+            return False
+        return await self._save(ctx, key, replace(state, probe_skips_in_a_row=state.probe_skips_in_a_row + 1))
+
+    async def _measure_and_judge(
+        self, ctx: Context, *, skip_under_pressure: bool = False
+    ) -> tuple[dict[str, Any], str, str]:
         """The reading and each side's verdict: "fail", "pass" or "none" (no verdict)."""
-        enforce_pressure = (
-            settings.DISK_PRESSURE_CHECK_ENABLED and settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED
-        )
         result = await ctx.runner.run(
-            throughput_command(bool(ctx.state.sysbox_runtime), skip_under_pressure=enforce_pressure),
+            throughput_command(
+                bool(ctx.state.sysbox_runtime),
+                read_pressure=settings.DISK_PRESSURE_CHECK_ENABLED,
+                skip_under_pressure=skip_under_pressure,
+            ),
             timeout=COMMAND_TIMEOUT_SECONDS,
             retryable=False,
         )
@@ -364,6 +390,7 @@ class RentedThroughputCheck:
             **state.reading,
             "probed_this_cycle": probed,
             "failures_in_a_row": state.failures_in_a_row,
+            "probe_skips_in_a_row": state.probe_skips_in_a_row,
         }
         if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
             event = render_message(Msg.SLOW, ctx=ctx, check_id=self.check_id, what=what)
@@ -392,6 +419,7 @@ class RentedThroughputCheck:
             "disk_failures": state.disk_failures,
             "reading": state.reading,
             "measured": state.measured,
+            "probe_skips_in_a_row": state.probe_skips_in_a_row,
         }
         try:
             await ctx.services.redis.set(key, json.dumps(payload), ex=_REDIS_TTL_SECONDS)

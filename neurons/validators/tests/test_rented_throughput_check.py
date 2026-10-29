@@ -71,7 +71,7 @@ def rented(hotkey: str = "miner-hotkey", status: str | None = None) -> RentedExe
 
 
 @contextmanager
-def flags(*, enforce_pressure: bool = False):
+def flags(*, read_pressure: bool = True, enforce_pressure: bool = False):
     fake = SimpleNamespace(
         RENTED_THROUGHPUT_CHECK_ENABLED=True,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
@@ -79,7 +79,7 @@ def flags(*, enforce_pressure: bool = False):
         RENTED_THROUGHPUT_BUSY_MBPS=200.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
-        DISK_PRESSURE_CHECK_ENABLED=True,
+        DISK_PRESSURE_CHECK_ENABLED=read_pressure,
         DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED=enforce_pressure,
     )
     clock = Clock()
@@ -513,3 +513,55 @@ async def test_enforced_pressure_is_no_verdict_on_both_sides_and_keeps_the_strea
         clock.now += 31 * 60
         assert (await check.run(ctx)).passed is False
     assert all("lium_dp_skipped" in cmd for cmd in runner.commands)
+
+
+def test_command_reads_the_disk_pressure_only_with_the_reading_on():
+    with_reading = throughput_command(True, read_pressure=True)
+    without = throughput_command(True, read_pressure=False)
+    assert "sync -f" in with_reading and "lium_dp" in with_reading
+    assert "sync -f" not in without and "lium_dp" not in without and "/usr/bin/docker run" in without
+
+
+async def test_reading_off_sends_the_command_without_the_sync_and_judges_as_before():
+    with flags(read_pressure=False, enforce_pressure=True):
+        ctx, runner = make_ctx(SLOW_DISK)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert "sync -f" not in runner.commands[0] and "lium_dp_skipped" not in runner.commands[0]
+    assert (net, disk_side) == ("pass", "fail") and "disk_pressure" not in reading
+
+
+SKIPPED = snaps() + _pressure(stalled=True) + "lium_dp_skipped\n"
+PRESSURED_GOOD = snaps() + _pressure(stalled=True) + disk() + FAST
+
+
+async def test_the_fourth_reading_under_pressure_runs_the_probe_regardless():
+    # bounded like the port check: sustained pressure may not leave the sides unmeasured for good
+    with flags(enforce_pressure=True) as clock, patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(SKIPPED, SKIPPED, SKIPPED, PRESSURED_GOOD, SKIPPED)
+        check = RentedThroughputCheck()
+        outcomes = []
+        for _ in range(5):
+            outcomes.append((await check.run(ctx)).event.reason_code)
+            clock.now += 3 * 3600 + 1
+    skip_allowed = ["lium_dp_skipped" in cmd for cmd in runner.commands]
+    assert skip_allowed == [True, True, True, False, True]
+    assert outcomes == [Msg.UNMEASURED.reason] * 3 + [Msg.OK.reason, Msg.UNMEASURED.reason]
+
+
+async def test_a_skip_redis_refuses_to_record_runs_the_probe():
+    class ReadOnlyRedis(FakeRedis):
+        async def set(self, key, value, ex=None):
+            raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
+
+    redis = ReadOnlyRedis()
+    redis.store[f"rented_throughput:{EXECUTOR.uuid}"] = '{"at": 0}'
+    with flags(enforce_pressure=True), patch.dict(module._UNSAVED, clear=True):
+        runner = FakeRunner(PRESSURED_GOOD)
+        ctx = make_context(
+            state=build_state(rented_data=rented(), sysbox_runtime=True),
+            runner=runner,
+            services=build_services(redis=redis),
+        )
+        res = await RentedThroughputCheck().run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OK.reason
+    assert len(runner.commands) == 1 and "lium_dp_skipped" not in runner.commands[0]

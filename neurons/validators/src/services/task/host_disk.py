@@ -61,7 +61,7 @@ _PRESSURE_PROBE = (
     "src=$(cat $sf 2>/dev/null); rm -f $sf; rc=${src%% *}; te=${src#* }; "
     "[ -n \"$src\" ] || te=$(cut -d' ' -f1 /proc/uptime); "
     f'echo "{PRESSURE_MARKER}_sync start=$ts end=$te rc=$rc"; '
-    f'dp=0; if [ -z "$rc" ]; then dp=1; elif [ "$rc" = 0 ] && '
+    'dp=0; if [ -z "$rc" ]; then dp=1; elif [ "$rc" = 0 ] && '
     f'awk -v s=$ts -v e=$te "BEGIN{{exit !(e-s >= {DISK_PRESSURE_SYNCFS_SECONDS})}}"; then dp=1; fi; '
 )
 
