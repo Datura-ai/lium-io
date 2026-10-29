@@ -95,6 +95,7 @@ def flags(enabled=True):
         IDLE_DISK_WRITE_CHECK_ENABLED=enabled,
         RENTED_THROUGHPUT_DISK_MIN_MB_PER_S=50.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
+        IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S=5.0,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
         JOB_TIME_OUT=900,
     )
@@ -147,6 +148,35 @@ async def test_measures_a_filler_node_but_not_while_its_docker_root_disk_is_busy
         assert writes(runner) == 0 and len(runner.commands) == 1  # the 2 s read only
         ctx.services.backend.get_rented_executors_now.assert_not_called()
         assert float(redis.store[KEY]) < clock.now - 86400  # not stamped: the next cycle tries again
+
+
+async def test_a_filler_writing_under_the_rented_busy_line_still_skips_the_probe():
+    with flags() as clock:
+        ctx, runner, _ = make_ctx(clock, snap(20), rented_data=FILLER)
+        res = await IdleDiskWriteCheck().run(ctx)
+        assert writes(runner) == 0 and res.event.what_we_saw["reason"] == "disk busy (20 MB/s)"
+
+        ctx, runner, _ = make_ctx(clock, snap(20), write(400))  # no filler: 20 MB/s is the provider's, not busy
+        await IdleDiskWriteCheck().run(ctx)
+        assert writes(runner) == 1
+
+
+async def test_the_last_reading_goes_to_the_backend_every_cycle_until_the_next():
+    """DAH-5385: the backend keeps only the latest specs, so a day without a probe still carries the reading."""
+    with flags() as clock:
+        ctx, _, redis = make_ctx(clock, due=False)
+        assert not (await IdleDiskWriteCheck().run(ctx)).updates  # never measured: nothing sent
+
+        ctx, _, redis = make_ctx(clock, IDLE, write(13))
+        res = await IdleDiskWriteCheck().run(ctx)
+        assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
+
+        for rented_data in (None, POD):  # not due, then rented: the stored reading still rides along
+            ctx2, runner, _ = make_ctx(clock, rented_data=rented_data, due=False)
+            ctx2.services.redis.store.update(redis.store)
+            res = await IdleDiskWriteCheck().run(ctx2)
+            assert writes(runner) == 0
+            assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
 
 
 async def test_skips_a_node_rented_at_cycle_start_or_since():
