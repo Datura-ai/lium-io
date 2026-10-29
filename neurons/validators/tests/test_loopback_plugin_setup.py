@@ -47,8 +47,13 @@ if sys.argv[1] == "volume":
     if sys.argv[2] == "rm" and containers:
         print("Error: volume is in use", file=sys.stderr)
         sys.exit(1)
+    # named volumes the daemon still knows, as {name: driver}: `volume rm` drops one, `ls` lists it
+    volumes = state.setdefault("volumes", {})
+    if sys.argv[2] == "rm" and not state.get("volume_rm_exit"):
+        volumes.pop(sys.argv[-1], None)
+        state_path.write_text(json.dumps(state))
     if sys.argv[2] == "ls":
-        print("\n".join(state.get("volume_drivers", [])))
+        print("\n".join(state.get("volume_drivers", []) + list(volumes.values())))
     sys.exit(state.get("volume_" + sys.argv[2] + "_exit", 0))
 action = sys.argv[2]
 plugin_id = "a" * 64
@@ -372,6 +377,28 @@ def test_setup_replaces_an_earlier_v3_build_that_owns_no_volumes(tmp_path: Path)
     plugin_actions = [call[1] for call in _plugin_calls(tmp_path)]
     assert plugin_actions[plugin_actions.index("disable") :].count("install") == 1
     assert plugin_actions.index("disable") < plugin_actions.index("rm") < plugin_actions.index("install")
+    assert (tmp_path / "probe-ok").read_text() == LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest
+
+
+def test_setup_replaces_an_earlier_v3_build_whose_only_volume_is_an_abandoned_probe(tmp_path: Path) -> None:
+    # Arrange: a setup on the earlier build was killed before its cleanup, so its probe volume is the
+    # only volume left on that build; the cleanup that reclaims it runs only after the replacement
+    arguments = _setup_arguments(
+        tmp_path,
+        {
+            "installed": True, "enabled": True, "installed_manifest": "sha256:" + "0" * 64,
+            "marker_before": "old", "volumes": {"lium-loopback-probe-v3": "vloopback:v3"},
+        },
+    )
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert: the abandoned probe does not pin the host to the earlier build
+    assert result.returncode == 0, result.stderr
+    plugin_actions = [call[1] for call in _plugin_calls(tmp_path)]
+    assert plugin_actions.index("rm") < plugin_actions.index("install")
+    assert json.loads((tmp_path / "state.json").read_text())["volumes"] == {}
     assert (tmp_path / "probe-ok").read_text() == LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest
 
 

@@ -139,7 +139,11 @@ def read_saved_config(plugin_id):
 
 def remove_plugin_of_another_build(plugin):
     # Docker refuses to disable or remove a plugin its volumes still use; the listing only makes
-    # that refusal readable
+    # that refusal readable. A probe a killed setup left on that build is reclaimed first: its
+    # cleanup otherwise runs only after this replacement, and the host would never move on
+    leftovers = remove_probe_leftovers()
+    if leftovers:
+        raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
     listed = run_docker("volume", "ls", "--format", "{{.Driver}}")
     if listed.returncode:
         raise RuntimeError("cannot list the volumes of an earlier build")
