@@ -1206,6 +1206,14 @@ class InspectorMessages:
             "Read executor_stderr in the validation event and inspect libinspector on the executor."
         ),
     )
+    HOST_REBOOT_NEEDED = MessageTemplate(
+        event="Host needs a reboot",
+        reason="INSPECTOR_HOST_REBOOT_NEEDED",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation="Reboot the host.",
+    )
 
 
 class TenantEnforcementMessages:

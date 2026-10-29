@@ -6,6 +6,8 @@ import sys
 from typing import Any, TextIO
 
 LIBINSPECTOR_PATH = "/usr/lib/libinspector.so"
+# host stability on some kernels after an executor update
+os.environ.setdefault("TETRAGON_DISABLE_KPROBE_MULTI", "true")
 
 
 class InspectorExecutor:

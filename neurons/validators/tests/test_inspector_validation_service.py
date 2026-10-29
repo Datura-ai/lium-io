@@ -290,6 +290,27 @@ async def test_validate_rented_executor_returns_interactive_error():
 
 
 @pytest.mark.asyncio
+async def test_sensor_start_failure_asks_for_reboot():
+    service = InspectorValidationService()
+    ssh = FakeSSH()
+    ssh.process.stdout = FakeStdout([
+        json.dumps({"ok": True, "result": ""}) + "\n",
+        json.dumps({"ok": False, "error": "collector_start failed"}) + "\n",
+        json.dumps({"ok": True, "result": ""}) + "\n",
+    ])
+    ssh.process.stderr = FakeStderr([
+        "collector daemon error: tetragon socket did not appear\n",
+    ])
+    executor = SimpleNamespace(uuid="exec-1", python_path="/usr/bin/python3", root_dir="/root/app")
+
+    result = await service.validate_rented_executor(FakeShell(), ssh, executor, {"executor_uuid": "exec-1"})
+
+    assert result.error == "collector_start failed"
+    assert result.message.reason == Msg.HOST_REBOOT_NEEDED.reason
+    assert result.diagnostics["reason"] == "INSPECTOR_HOST_REBOOT_NEEDED"
+
+
+@pytest.mark.asyncio
 async def test_validate_rented_executor_returns_lib_mismatch_without_ssh_process():
     service = InspectorValidationService()
     ssh = FakeSSH()

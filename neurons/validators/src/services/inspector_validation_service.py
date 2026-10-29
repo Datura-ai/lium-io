@@ -539,6 +539,8 @@ class InspectorValidationService:
             message = Msg.FAILED_SSH_TRANSPORT if process is None else Msg.VALIDATION_ERROR
 
         executor_stderr = await self._capture_stderr(process)
+        if message is Msg.FAILED_INTERACTIVE and "tetragon socket did not appear" in (executor_stderr or ""):
+            message = Msg.HOST_REBOOT_NEEDED
         return self._failure_response(
             error=error,
             message=message,
