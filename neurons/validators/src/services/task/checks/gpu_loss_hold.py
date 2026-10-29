@@ -6,7 +6,9 @@ out again an hour later, while a renter's container on it keeps failing. The fat
 was listed again on its first clean scrape, and a rented one passed the rented check with score 1 in between.
 
 Every cycle this check judges the scrape with `judge_rented_gpus` (the rental's GPU count, the driver's count, the
-anchored UUID set, the NVML error code; an idle node counts as renting one GPU). A fault puts the node on a hold of
+anchored UUID set, the NVML error code; an idle node counts as renting one GPU). A full set of other cards
+(`full_set_changed`) is no fault, rented or idle: it is judged without the anchor, and GpuFingerprintCheck
+re-anchors it the same cycle. A fault puts the node on a hold of
 GPU_LOSS_HOLD_SECONDS, renewed by every faulty cycle; weak evidence (`confirm_first`) starts the hold only when the
 cycle before also showed a fault. Every cycle in the hold carries a GPU_LOST availability entry: the backend hides
 the node and refuses new rentals, and leaves `active`, billing and a rental already on the node alone. The first
@@ -38,7 +40,7 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .gpu_fingerprint import split_uuids, whole_set_replaced
+from .gpu_fingerprint import full_set_changed, split_uuids
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -54,10 +56,6 @@ logger = logging.getLogger(__name__)
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
-# An idle node back with a whole new card set (a VM host reboot) is re-anchored by GpuFingerprintCheck
-# but held like a lost card: 27 Oct, 8x H100 fcd3835d re-anchored 3 times in 5 h and was rented
-# between two reboots.
-FAULT_SET_REPLACED = "gpu_set_replaced"
 
 
 def _key(ctx: Context) -> str:
@@ -71,7 +69,7 @@ class DropMark:
     is_held: bool
     since: str
     last_seen: str
-    # the hold came from a whole replaced GPU set, not a lost card: its clean cycles say so
+    # a hold the retired set-replaced rule started: no hold any more (a full set change is no fault)
     replaced: bool = False
 
     @classmethod
@@ -107,8 +105,8 @@ def judge_scrape(ctx: Context, pods: list) -> GpuDrop | None:
     if nvml_count is None:
         nvml_count = (specs.get("gpu") or {}).get("count", 0) or 0
     anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
-    if whole_set_replaced(anchor, sorted(set(_listed_uuids(gpu_details))), rented=bool(pods)):
-        anchor = []  # replaced cards, not lost ones: GpuFingerprintCheck re-anchors them
+    if full_set_changed(anchor, sorted(set(_listed_uuids(gpu_details)))):
+        anchor = []  # other cards, not lost ones: GpuFingerprintCheck re-anchors them
     return judge_rented_gpus(
         rented_gpu_count=_rented_gpu_count(pods),
         anchor_uuids=anchor,
@@ -148,9 +146,6 @@ class GpuLossHoldCheck:
             )
             return CheckResult(passed=False, event=event)
         drop = judge_scrape(ctx, pods)
-        anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
-        listed = sorted(set(_listed_uuids(gpu_details)))
-        replaced = drop is None and whole_set_replaced(anchor, listed, rented=bool(pods))
         key = _key(ctx)
         mark: DropMark | None = None
         try:
@@ -186,34 +181,22 @@ class GpuLossHoldCheck:
             nvml_only = drop.faults == [FAULT_NVML_ERROR]
             return self._lost(ctx, mark, what, fatal=nvml_only and not pods)
 
-        if replaced:
-            mark = DropMark(is_held=True, since=now.isoformat(), last_seen=now.isoformat(), replaced=True)
-            await self._save(ctx, key, mark, settings.GPU_LOSS_HOLD_SECONDS)
-            # not fatal: GpuFingerprintCheck still runs and re-anchors the new cards this cycle
-            return self._lost(
-                ctx, mark, {"faults": [FAULT_SET_REPLACED]}, fatal=False, msg=Msg.SET_REPLACED
-            )
-
         if mark is None:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
-        if not mark.is_held:
-            # a weak sighting the next cycle did not confirm
+        if not mark.is_held or mark.replaced:
+            # a weak sighting the next cycle did not confirm, or a hold for a changed set (no fault)
             await self._forget(ctx, key)
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
-        return self._lost(
-            ctx, mark, {"faults": []}, fatal=not pods, msg=Msg.SET_REPLACED if mark.replaced else Msg.LOST
-        )
+        return self._lost(ctx, mark, {"faults": []}, fatal=not pods)
 
-    def _lost(
-        self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool, msg=Msg.LOST
-    ) -> CheckResult:
+    def _lost(self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool) -> CheckResult:
         last_seen = datetime.fromisoformat(mark.last_seen)
         event = render_message(
-            msg,
+            Msg.LOST,
             ctx=ctx,
             check_id=self.check_id,
             what={

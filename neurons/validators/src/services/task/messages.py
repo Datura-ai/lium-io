@@ -518,18 +518,7 @@ class GpuLossHoldMessages:
         remediation="A card fell out of NVML (see faults, missing_uuids, nvml_error_code). Run `nvidia-smi` and "
         "`dmesg | grep -i xid` on the host; 'Unknown Error' or Xid 79 ('fallen off the bus') means the card must "
         "be reseated, reset or replaced. The node is listed again once every card has read clean for the hold "
-        "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
-        "a node keeps the cards it was first verified with.",
-    )
-    SET_REPLACED = MessageTemplate(
-        event="The node came back with a different set of GPUs",
-        reason="GPU_LOST",
-        severity="error",
-        category=AVAILABILITY_CATEGORY,
-        impact="The new GPUs are verified and kept for this node, but it is hidden and takes no new rentals until "
-        "they read clean for the hold window (see hold_until); it scores 0 meanwhile",
-        remediation="Nothing to do, and do not remove or re-add the node: it is listed again on its own once all "
-        "its GPUs have been present for 2 hours. To avoid this, pass the same GPUs through on every host restart.",
+        "window.",
     )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
@@ -712,17 +701,16 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
-    # Warn mode (GPU_ANCHOR_HARD_ENABLED off): the legacy verdict. Its what_we_saw carries `anchor_hard_would_be`
-    # (GPU_MISSING or ANCHOR_BROKEN) so the hard rule can be read from a week of rows before it is switched on.
+    # A set that lost or gained cards (a full set of other cards is re-anchored, not this). Its what_we_saw carries
+    # `anchor_hard_would_be`: GPU_MISSING (only anchored cards missing) or ANCHOR_BROKEN (other cards among them).
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
         severity="warning",
         category="env",
         impact="Verification reset; score set to 0",
-        remediation="Ensure the same physical GPUs remain attached and stable. If you replaced the cards on "
-        "purpose, remove the node in the portal and add it again: a node keeps the cards it was first "
-        "verified with.",
+        remediation="Ensure every GPU of the node stays attached and visible. A node that comes back with the same "
+        "number of GPUs, all of them other cards, is verified again on its own.",
     )
     # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
@@ -735,19 +723,6 @@ class GpuFingerprintMessages:
         remediation=(
             "One or more GPUs this node listed are not visible. Check `nvidia-smi -L` and `dmesg` on the host. "
             "The node scores again when the full set is back."
-        ),
-    )
-    # Hard mode: the scrape shows a GPU that is not in the anchored set (swap, added card, or a set
-    # replaced by a different one). Permanent for this executor id; re-registering the node is the only way out.
-    ANCHOR_BROKEN = MessageTemplate(
-        event="GPU set differs from the listed set",
-        reason="GPU_UUID_CHANGED",
-        severity="error",
-        category="env",
-        impact="Score 0 on every cycle for this node id; verification does not restart",
-        remediation=(
-            "A listed node keeps one fixed set of GPUs. To list a different set, re-register the node. "
-            "Uptime starts over; penalties stay."
         ),
     )
     UUID_OK = MessageTemplate(

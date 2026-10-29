@@ -11,6 +11,7 @@ from neurons.validators.src.services.task.availability import (
     silence_availability_errors_on_our_own_outage,
 )
 from neurons.validators.src.services.task.checks import (
+    GpuFingerprintCheck,
     GpuLossHoldCheck,
     GpuModelValidCheck,
     MachineSpecScrapeCheck,
@@ -18,13 +19,19 @@ from neurons.validators.src.services.task.checks import (
     TenantEnforcementCheck,
     gpu_loss_hold,
     machine_spec_scrape,
+    rented_gpu_drop,
 )
 from neurons.validators.src.services.task.messages import GpuLossHoldMessages as Msg
 from neurons.validators.src.services.task.models import JobResult
 from neurons.validators.src.services.task.pipeline import CheckResult, Context, Pipeline, ValidationEvent
 from neurons.validators.src.services.task.runner import SSHCommandResult
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedGpuDropResponse,
+    RentedPod,
+)
 
 from tests.helpers import (
     FakeRedis,
@@ -397,30 +404,65 @@ async def test_a_card_missing_while_the_renter_resets_it_holds_the_cycle_without
     assert (await GpuLossHoldCheck().run(other)).event.reason_code != Msg.MISSING_GPUS_UNDER_RESET.reason
 
 
+OTHER_CARDS = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pods", [(), (4,)])
-async def test_a_node_whose_whole_gpu_set_was_replaced_is_held(context_factory, pods):
-    """Replaced cards are held like lost ones (a VM host reboot, 27 Oct fcd3835d); on an idle node the cycle is not
-    fatal here, so GpuFingerprintCheck still re-anchors them, and the node stays hidden for the hold window."""
+@pytest.mark.parametrize("pods", [pytest.param((), id="idle"), pytest.param((4,), id="rented")])
+@pytest.mark.parametrize("listed", [pytest.param(OTHER_CARDS, id="all"), pytest.param(UUIDS[:3] + OTHER_CARDS[:1], id="one")])
+async def test_a_full_set_of_other_cards_is_no_hold_and_verifies_the_same_cycle(context_factory, pods, listed):
+    """Regression: a node back with the same number of other GPUs (a VM host reboot) was hidden for the hold window,
+    or held under a rental, instead of being re-anchored and verified at once."""
     redis = FakeRedis()
-    replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
-    ctx = _ctx(context_factory, redis, listed=replaced, pods=pods)
+    ctx = _ctx(context_factory, redis, listed=listed, pods=pods)
 
     result = await GpuLossHoldCheck().run(ctx)
 
-    assert _hidden(result) and not result.passed
-    assert redis.ttl[gpu_loss_hold._key(ctx)] == gpu_loss_hold.settings.GPU_LOSS_HOLD_SECONDS
-    if not pods:
-        assert not _fatal(result)
-        assert result.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]
-        assert result.event.event == Msg.SET_REPLACED.event
-        # next cycle: the new cards are the anchor and read clean, the node is still hidden (fatal while idle)
-        reanchored = _ctx(context_factory, redis, listed=replaced, pods=(), anchor=replaced)
-        clean = await GpuLossHoldCheck().run(reanchored)
-        assert _hidden(clean) and _fatal(clean)
-        # its clean cycles say the node relists on its own, not that a card dropped out (Viren 115dd68b, 28 Oct)
-        assert clean.event.event == Msg.SET_REPLACED.event and "do not remove" in clean.event.remediation
-        # a second whole swap inside the hold is judged against the new anchor and starts the hold again
-        third = [f"GPU-c0c{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
-        again = await GpuLossHoldCheck().run(_ctx(context_factory, redis, listed=third, pods=(), anchor=replaced))
-        assert _hidden(again) and again.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]
+    assert result.passed and result.event.reason_code == Msg.OK.reason and not _hidden(result)
+    assert gpu_loss_hold._key(ctx) not in redis.store
+    fingerprint = await GpuFingerprintCheck().run(ctx)
+    assert fingerprint.passed and fingerprint.updates == {"gpu_reanchor": True}
+
+
+@pytest.mark.asyncio
+async def test_a_hold_left_by_the_retired_set_replaced_rule_is_dropped(context_factory):
+    redis = FakeRedis()
+    ctx = _ctx(context_factory, redis, pods=())
+    old = {"held": True, "since": "2026-10-29T00:00:00+00:00", "last_seen": "2026-10-29T00:00:00+00:00", "replaced": True}
+    redis.store[gpu_loss_hold._key(ctx)] = json.dumps(old)
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert result.passed and not _hidden(result) and gpu_loss_hold._key(ctx) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_fewer_cards_after_a_set_change_is_still_a_dropout_and_held(context_factory):
+    redis = FakeRedis()
+
+    result = await _cycle(context_factory, redis, listed=OTHER_CARDS[:3], count=3, pods=())
+
+    assert not result.passed and _hidden(result)
+    assert redis.ttl[gpu_loss_hold._key(_ctx(context_factory, redis, pods=()))] == gpu_loss_hold.settings.GPU_LOSS_HOLD_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_set_change_under_a_rental_posts_the_renters_incident_and_the_node_stays_listed(context_factory):
+    """The renter hears about the swap through the rented GPU-drop report for the pod; the node is not hidden."""
+    rented_gpu_drop._LOCAL_MARKS.clear()
+    redis = FakeRedis()
+    ctx = _ctx(context_factory, redis, listed=OTHER_CARDS, pods=(4,))
+    ctx.services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
+        recorded=True, delivery="notified"
+    )
+
+    with patch.object(rented_gpu_drop.settings, "DRY_RUN", False):
+        incident = await RentedGpuDropCheck().run(ctx)
+    hold = await GpuLossHoldCheck().run(ctx)
+
+    call = ctx.services.backend.report_rented_gpu_drop.await_args
+    assert call.args[0] == _pod(1, 4).pod_id and call.kwargs["state"] == "fault"
+    assert call.kwargs["missing_uuids"] == sorted(UUIDS)
+    assert incident.passed and not _hidden(incident)
+    assert hold.passed and not _hidden(hold)
+    rented_gpu_drop._LOCAL_MARKS.clear()

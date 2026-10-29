@@ -80,8 +80,8 @@ IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 # The anchor: the GPU UUID set of the executor's first successful verification, kept by every later write.
 GPU_ANCHOR_KEY = "uuids"
-# DAH-3457: field of a verified-job record, set once by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED and kept by
-# every later write; read back by the same check, which then fails the node without comparing the sets.
+# DAH-3457: field of a verified-job record, kept by every later write. No check sets or reads it any more (a changed
+# GPU set is re-anchored, not broken); old records still carry it.
 GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
 
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
@@ -812,7 +812,7 @@ class RedisService:
         reanchor_uuids: str = '',
     ):
         spec = prev_info.get('spec', '')
-        # a whole replaced set is anchored now, so a second swap inside the hold is judged against it
+        # a full set of other cards is anchored now, even on a cycle a later check failed
         uuids = reanchor_uuids or prev_info.get(GPU_ANCHOR_KEY, '')
 
         data = {
