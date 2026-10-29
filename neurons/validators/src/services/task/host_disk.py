@@ -46,8 +46,11 @@ DOCKER_ROOT_DEVICES = (
 # Docker-root devices, with the host's Dirty/Writeback and I/O pressure stall. `dp` is left set for the caller.
 _PRESSURE_PROBE = (
     'h=/proc/1/root; [ $h/ -ef / ] && h=; sr="$h$r"; [ -d "$sr" ] || sr=$r; '
-    "sf=/tmp/lium_syncfs.$$; rm -f $sf; ts=$(cut -d' ' -f1 /proc/uptime); "
-    '( sync -f "$sr" 2>/dev/null; echo $? > $sf ) </dev/null >/dev/null 2>&1 & '
+    "sf=/tmp/lium_syncfs.$$; rm -f $sf $sf.t; find /tmp -maxdepth 1 -name 'lium_syncfs.*' -mmin +60 -delete 2>/dev/null; "
+    "ts=$(cut -d' ' -f1 /proc/uptime); "
+    # the sync's own end time next to its rc, written whole: a half-written file would read as a timeout
+    '( sync -f "$sr" 2>/dev/null; rc=$?; echo "$rc $(cut -d\' \' -f1 /proc/uptime)" > $sf.t && mv $sf.t $sf ) '
+    "</dev/null >/dev/null 2>&1 & "
     f'dps() {{ echo "{PRESSURE_MARKER} t=$(cut -d\' \' -f1 /proc/uptime) '
     "dirty=$(awk '/^Dirty:/{d=$2} /^Writeback:/{w=$2} END{print d\":\"w}' $h/proc/meminfo 2>/dev/null) "
     "psi=$(awk '/^full/{sub(\"avg10=\",\"\",$2); print $2}' $h/proc/pressure/io 2>/dev/null) "
@@ -55,9 +58,10 @@ _PRESSURE_PROBE = (
     "$3, $6+$10, $13, $7+$11, $4+$8}' /proc/diskstats)\"; }; "
     f"dps; sleep {SNAPSHOT_SECONDS}; dps; i=0; "
     f"while [ $i -lt {SYNCFS_POLL_SECONDS * 4} ] && [ ! -e $sf ]; do sleep 0.25; i=$((i+1)); done; "
-    "te=$(cut -d' ' -f1 /proc/uptime); src=$(cat $sf 2>/dev/null); rm -f $sf; "
-    f'echo "{PRESSURE_MARKER}_sync start=$ts end=$te rc=$src"; '
-    f'dp=0; if [ -z "$src" ]; then dp=1; elif [ "$src" = 0 ] && '
+    "src=$(cat $sf 2>/dev/null); rm -f $sf; rc=${src%% *}; te=${src#* }; "
+    "[ -n \"$src\" ] || te=$(cut -d' ' -f1 /proc/uptime); "
+    f'echo "{PRESSURE_MARKER}_sync start=$ts end=$te rc=$rc"; '
+    f'dp=0; if [ -z "$rc" ]; then dp=1; elif [ "$rc" = 0 ] && '
     f'awk -v s=$ts -v e=$te "BEGIN{{exit !(e-s >= {DISK_PRESSURE_SYNCFS_SECONDS})}}"; then dp=1; fi; '
 )
 
@@ -86,7 +90,7 @@ class DiskPressureReading:
     pressure: bool = False
     # "syncfs" when pressure, else None
     reason: str | None = None
-    # None = read; else why the sync part could not be: no_output, docker_root_unresolved, syncfs_unavailable
+    # None = read; else why the sync part could not be: no_output, syncfs_unavailable, syncfs_failed, read_failed
     error: str | None = None
 
     def as_spec(self) -> dict[str, Any]:
@@ -112,10 +116,9 @@ def parse_disk_pressure(stdout: str) -> DiskPressureReading:
     fields: dict[str, Any] = {}
     if len(snaps) == 2:
         fields.update(_disk_fields(snaps[0], snaps[1], set(devices)))
+    # no resolved device only blanks the disk fields: `sync -f` on the Docker root needs none of them
     if sync is None:
         return DiskPressureReading(**fields, error="no_output")
-    if not devices:
-        return DiskPressureReading(**fields, error="docker_root_unresolved")
     try:
         seconds = float(sync["end"]) - float(sync["start"])
     except (KeyError, ValueError):
@@ -123,6 +126,8 @@ def parse_disk_pressure(stdout: str) -> DiskPressureReading:
     rc = sync.get("rc", "")
     if rc == str(_SYNC_UNAVAILABLE_RC):
         return DiskPressureReading(**fields, error="syncfs_unavailable")
+    if rc not in ("", "0"):
+        return DiskPressureReading(**fields, error="syncfs_failed")
     timed_out = rc == ""
     pressure = timed_out or (rc == "0" and seconds >= DISK_PRESSURE_SYNCFS_SECONDS)
     return DiskPressureReading(

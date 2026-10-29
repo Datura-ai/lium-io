@@ -661,7 +661,7 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
 # the event says what the gate would have done.
 STALLED = pressure_output(end=120.0, rc="")
 QUICK = pressure_output()
-MEMORY_PAIRS = [(40010, 40010), (40011, 40011), (40012, 40012)]
+MEMORY_PAIRS = [(40020, 40020), (40021, 40021), (40022, 40022)]
 
 
 def _filler_state():
@@ -721,13 +721,33 @@ async def test_enforced_pressure_republishes_the_last_verified_ports_without_a_c
     assert connectivity.called_with is None
     state = result.updates["state"]
     assert state.verified_port_count == 3 and state.verified_port_pairs == MEMORY_PAIRS
-    assert state.specs["verified_ports"] == [40010, 40011, 40012]
+    assert state.specs["verified_ports"] == [40020, 40021, 40022]
     assert state.sysbox_runtime is True and state.specs["sysbox_runtime"] is True  # the remembered sysbox
     assert state.specs["disk_pressure"]["pressure"] is True and state.specs["disk_pressure"]["syncfs_timed_out"] is True
     assert redis_service.deferrals[("miner-hotkey", "executor-123", False)] == 1
     assert result.updates["default_extra"]["disk_pressure_deferrals_in_a_row"] == 1
     # the memory is what it was: a republish never refreshes it
     assert redis_service.verified_ports[("miner-hotkey", "executor-123")]["pairs"] == MEMORY_PAIRS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_builder", [_rented_state, _filler_state], ids=["rented", "filler"])
+async def test_a_republished_memory_drops_the_ports_a_rental_or_filler_took_since(
+    context_factory, monkeypatch, state_builder
+):
+    # the memory predates the pod/filler holding 40010-40011; the rental probe puts ssh on a republished port
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, _ = _gate_ctx(context_factory, redis_service=redis_service, state=state_builder(), reading=STALLED)
+    _remember(redis_service, ctx, pairs=[(40010, 40010), (40011, 40011), (40012, 40012)])
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    state = result.updates["state"]
+    assert result.event.reason_code == Msg.VERIFY_DEFERRED.reason
+    assert state.verified_port_pairs == [(40012, 40012)] and state.specs["verified_ports"] == [40012]
+    assert result.updates["default_extra"]["verified_ports_now_busy"] == 2
+    assert redis_service.verified_ports[("miner-hotkey", "executor-123")]["pairs"][0] == (40010, 40010)
 
 
 @pytest.mark.asyncio

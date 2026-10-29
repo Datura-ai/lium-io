@@ -100,16 +100,23 @@ def test_the_busiest_docker_root_device_is_reported_whatever_its_name():
 @pytest.mark.parametrize(
     "transform, error",
     [
-        (lambda o: o.replace("lium_tp_device name=nvme0n1p2\n", "").replace("lium_tp_device name=nvme0n1\n", ""), "docker_root_unresolved"),
         (lambda o: o.replace("rc=", "rc=127"), "syncfs_unavailable"),
+        (lambda o: o.replace("rc=", "rc=1"), "syncfs_failed"),
         (lambda o: "\n".join(ln for ln in o.splitlines() if not ln.startswith("lium_dp_sync")), "no_output"),
         (lambda o: "", "no_output"),
     ],
-    ids=["no_devices", "no_sync_binary", "no_sync_line", "empty"],
+    ids=["no_sync_binary", "sync_failed", "no_sync_line", "empty"],
 )
 def test_a_reading_that_could_not_be_taken_is_never_pressure(transform, error):
     reading = parse_disk_pressure(transform(output(end=120.0, rc="")))
     assert reading.error == error and reading.pressure is False
+
+
+def test_an_unresolved_docker_root_device_still_times_the_sync():
+    # btrfs/zfs roots give a 0:NN device with no sysfs entry; the sync needs the path, not the device
+    out = output(end=120.0, rc="").replace("lium_tp_device name=nvme0n1p2\n", "").replace("lium_tp_device name=nvme0n1\n", "")
+    reading = parse_disk_pressure(out)
+    assert reading.pressure is True and reading.error is None and reading.device is None and reading.dirty_mb == 1024
 
 
 def test_a_counter_reset_between_snapshots_is_skipped():
@@ -124,6 +131,7 @@ def test_a_counter_reset_between_snapshots_is_skipped():
 def test_probe_shell_reports_the_sync_duration_and_sets_dp(tmp_path, sync_takes, expect_dp, monkeypatch):
     monkeypatch.setattr(module, "SYNCFS_POLL_SECONDS", 1)
     (tmp_path / "uptime").write_text("100.00 400.00\n")
+    (tmp_path / "uptime_later").write_text("100.30 400.00\n")
     (tmp_path / "meminfo").write_text("Dirty:            4096 kB\nWriteback:        512 kB\n")
     (tmp_path / "pressure").mkdir()
     (tmp_path / "pressure" / "io").write_text("some avg10=1.00 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.50 avg60=0.00 avg300=0.00 total=1\n")
@@ -135,6 +143,7 @@ def test_probe_shell_reports_the_sync_duration_and_sets_dp(tmp_path, sync_takes,
         'r=/var/lib/docker; dv="nvme0n1p2 nvme0n1"; '
         + probe.replace("h=/proc/1/root; [ $h/ -ef / ] && h=; ", f"h={tmp_path}; ")
         .replace('sync -f "$sr"', f"sleep {sync_takes}")
+        .replace("echo \"$rc $(cut -d' ' -f1 /proc/uptime)\"", f"echo \"$rc $(cut -d' ' -f1 {tmp_path}/uptime_later)\"")
         .replace("/proc/uptime", f"{tmp_path}/uptime")
         .replace("/proc/diskstats", f"{tmp_path}/diskstats")
         .replace("$h/proc/meminfo", f"{tmp_path}/meminfo")
@@ -145,4 +154,6 @@ def test_probe_shell_reports_the_sync_duration_and_sets_dp(tmp_path, sync_takes,
     reading = parse_disk_pressure("lium_tp_device name=nvme0n1\n" + out)
     assert out.strip().endswith(f"dp={expect_dp}"), out
     assert reading.syncfs_timed_out is (expect_dp == "1")
+    if expect_dp == "0":
+        assert reading.syncfs_seconds == 0.3  # the sync's own end, not the 2 s snapshot window
     assert reading.device == "nvme0n1" and reading.dirty_mb == 4 and reading.psi_io_full_avg10 == 0.5

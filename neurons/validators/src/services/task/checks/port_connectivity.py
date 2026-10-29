@@ -87,7 +87,7 @@ class PortConnectivityCheck:
 
         gate = await self._disk_pressure_gate(ctx, rented_executor, filler_ports)
         if gate.deferred:
-            return await self._deferred(ctx, gate, extra)
+            return await self._deferred(ctx, gate, extra, busy_ports=set(rented_ports) | set(filler_ports))
 
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
@@ -346,7 +346,7 @@ class PortConnectivityCheck:
                 _m("verified ports not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
             )
 
-    async def _deferred(self, ctx: Context, gate: _PressureGate, extra: dict) -> CheckResult:
+    async def _deferred(self, ctx: Context, gate: _PressureGate, extra: dict, *, busy_ports: set[int]) -> CheckResult:
         """No containers on a Docker root whose sync already stalls: the last completed check's ports are
         republished (PortCountCheck counts them as today) and sysbox is the scrape's or the remembered one; the
         sysbox and DinD-miss memories are left as they are."""
@@ -370,13 +370,15 @@ class PortConnectivityCheck:
             logger.warning(
                 _m("disk pressure deferral not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
             )
-        pairs = gate.memory.pairs
+        # a port a rental or filler took since the memory was written would collide with the rental probe's ssh
+        pairs = [(internal, external) for internal, external in gate.memory.pairs if external not in busy_ports]
         extra_info: dict[str, object] = {
             "sysbox_runtime": sysbox,
             "verified_port_count": len(pairs),
             "probed_port_count": len(pairs),
             "disk_pressure_deferred": True,
             "disk_pressure_deferrals_in_a_row": deferrals,
+            "verified_ports_now_busy": len(gate.memory.pairs) - len(pairs),
         }
         updated_state = replace(
             ctx.state,
