@@ -11,7 +11,8 @@ The limit counts only for overlay2 on xfs mounted with pquota whose ``--storage-
 With the setting on, a node without the limit that is not rented and whose host could build it (the scrape's
 ``storage_limit_capable``: a local filesystem other than docker's own mount with 100 GiB left after the system's
 reserve, the room `lium gpu-splitting setup` needs for its xfs image file) fails (score 0, STORAGE_LIMIT_REQUIRED) after
-two conclusive failed probes in a row, until the host passes the probe; a host with less free keeps the warning only;
+two conclusive failed probes in a row (or one, then over a day without a verdict), until the host passes the
+probe; a host with less free keeps the warning only;
 a rented node only gets the warning, so this check never touches a running rental.
 It runs right after the scrape, before the rented short-circuit, like GpuThermalThrottleCheck.
 """
@@ -123,7 +124,10 @@ class StorageLimitCheck:
             "enforced": settings.REQUIRE_STORAGE_LIMIT_SUPPORTED,
             "rented": rented,
         }
-        required = failures >= STORAGE_LIMIT_REQUIRED_AFTER_FAILURES
+        # one "unsupported", then inconclusive for over a day, counts as the second failure (grace bound)
+        required = failures >= STORAGE_LIMIT_REQUIRED_AFTER_FAILURES or (
+            verdict == "fail" and long_inconclusive
+        )
         if (
             settings.REQUIRE_STORAGE_LIMIT_SUPPORTED
             and not rented
