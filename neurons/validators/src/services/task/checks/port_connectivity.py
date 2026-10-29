@@ -11,7 +11,6 @@ from services.executor_connectivity.models import PortVerificationResult
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .port_count import split_port_requirement
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +44,9 @@ class PortConnectivityCheck:
         # DAH-2527: an idle filler holds ports without creating a pod, so an executor running only
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
+
+        # imported here: port_count also imports from this module, so a top-level import is circular
+        from .port_count import split_port_requirement
 
         split_need = split_port_requirement(ctx.state)
         connectivity_service = ctx.services.connectivity

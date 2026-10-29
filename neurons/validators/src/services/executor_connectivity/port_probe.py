@@ -45,31 +45,38 @@ class PortProbe:
         successful, failed = batch.successful, batch.failed
         tier = "batch"
 
-        if not successful:
+        def short(ok) -> bool:
+            # a split node (min_ports above the floor) keeps probing until it has its ports; the tier that
+            # verified most wins. Otherwise a later tier runs only when the earlier one verified nothing.
+            return not ok or (min_ports > MIN_PORT_COUNT and len(ok) < min_ports)
+
+        if short(successful):
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
             logger.debug(
-                _m("batch verification failed, trying semi-batch", extra=get_extra_info(log_ctx))
+                _m("batch verification short, trying semi-batch", extra=get_extra_info(log_ctx))
             )
-            successful, failed = await self.semi_batch_verifier.verify(
+            semi_ok, semi_failed = await self.semi_batch_verifier.verify(
                 ports,
                 ssh_client=ssh_client,
                 host=host,
                 max_ports=max(50, min_ports),
                 log_ctx=log_ctx,
             )
-            tier = "semi_batch"
+            if len(semi_ok) >= len(successful):
+                successful, failed, tier = semi_ok, semi_failed, "semi_batch"
 
-        if not successful:
+        if short(successful):
             logger.debug(
-                _m("semi-batch verification failed, trying fallback", extra=get_extra_info(log_ctx))
+                _m("semi-batch verification short, trying fallback", extra=get_extra_info(log_ctx))
             )
-            successful, failed = await self.fallback_verifier.verify(
+            fb_ok, fb_failed = await self.fallback_verifier.verify(
                 ports,
                 ssh_client=ssh_client,
                 host=host,
                 max_ports=max(10, min_ports),
                 log_ctx=log_ctx,
             )
-            tier = "fallback"
+            if len(fb_ok) >= len(successful):
+                successful, failed, tier = fb_ok, fb_failed, "fallback"
 
         return PortProbeResult(tuple(successful), tuple(failed), tier)
