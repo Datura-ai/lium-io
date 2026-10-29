@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -30,10 +31,24 @@ VERIFIED_PORTS_MEMORY_TTL_SECONDS = 24 * 3600
 DISK_PRESSURE_DEFERRALS_TTL_SECONDS = 24 * 3600
 # the two snapshots, the syncfs poll cap and a margin for the sysfs walk
 DISK_PRESSURE_READ_TIMEOUT_SECONDS = SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS + 15
-# (miner hotkey, executor uuid) whose latest completed check this process put on record in full - the ports
-# and the sysbox memory both; only such a memory is republished, so a check Redis refused, or a restart with an
-# older verdict still in Redis, means a real check first (the module outlives the per-cycle check instance)
-_SAVED_COMPLETED: set[tuple[str, str]] = set()
+# (miner hotkey, executor uuid) -> monotonic time its latest completed check went on record in full - the ports
+# and the sysbox memory both; only such a memory is republished, so a check Redis refused or cut short, or a
+# restart with an older verdict still in Redis, means a real check first (the module outlives the per-cycle
+# check instance). An entry as old as the port memory's TTL is gone with it.
+_COMPLETED_CHECK_SAVED_AT: dict[tuple[str, str], float] = {}
+
+
+def _completed_check_saved(key: tuple[str, str]) -> bool:
+    saved_at = _COMPLETED_CHECK_SAVED_AT.get(key)
+    return saved_at is not None and time.monotonic() - saved_at < VERIFIED_PORTS_MEMORY_TTL_SECONDS
+
+
+def _mark_completed_check_saved(key: tuple[str, str]) -> None:
+    # departed executors leave here on the next completion anywhere
+    now = time.monotonic()
+    for expired in [k for k, at in _COMPLETED_CHECK_SAVED_AT.items() if now - at >= VERIFIED_PORTS_MEMORY_TTL_SECONDS]:
+        del _COMPLETED_CHECK_SAVED_AT[expired]
+    _COMPLETED_CHECK_SAVED_AT[key] = now
 
 
 @dataclass(frozen=True)
@@ -65,6 +80,14 @@ class _PressureGate:
             "disk_pressure_would_defer": self.would_defer,
             "disk_pressure_deferrals_in_a_row": self.deferrals_in_a_row,
         }
+
+
+@dataclass(frozen=True)
+class _SysboxMemoryUpdate:
+    # every write this cycle owed the sysbox memory is in Redis (a read in the fallback included)
+    saved: bool
+    # ticket-0494: a rented node's probe measured nothing and the memory says sysbox
+    use_last_verified: bool = False
 
 
 class PortConnectivityCheck:
@@ -118,7 +141,11 @@ class PortConnectivityCheck:
                 "executor_ip": ctx.executor.address,
             },
         )
-        await self._record_completed_check(ctx, result, gate)
+        # this probe's verdict is on record only once every write below succeeded; a cancellation thrown into
+        # one of them leaves the memory in Redis older than the probe and the readiness gone
+        readiness_key = (ctx.miner_hotkey, ctx.executor.uuid)
+        _COMPLETED_CHECK_SAVED_AT.pop(readiness_key, None)
+        ports_saved = await self._record_completed_check(ctx, result, gate)
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
         declared_port_count = result.declared_port_count
@@ -164,15 +191,18 @@ class PortConnectivityCheck:
                 sysbox_runtime=ctx.state.sysbox_runtime,
             )
 
-        if await self._should_use_last_verified_sysbox(
+        sysbox_memory = await self._update_last_verified_sysbox(
             ctx, result, rented=rented_executor is not None, sysbox_now=updated_state.sysbox_runtime
-        ):
+        )
+        if sysbox_memory.use_last_verified:
             extra_info["sysbox_from_last_verified"] = True
             updated_state = replace(
                 updated_state,
                 specs={**updated_state.specs, "sysbox_runtime": True},
                 sysbox_runtime=True,
             )
+        if ports_saved and sysbox_memory.saved:
+            _mark_completed_check_saved(readiness_key)
 
         total = len(result.successful_ports) + len(result.failed_ports)
         pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
@@ -324,7 +354,7 @@ class PortConnectivityCheck:
             and memory is not None
             and deferrals < DISK_PRESSURE_MAX_DEFERRALS
         )
-        if would_defer and (ctx.miner_hotkey, ctx.executor.uuid) not in _SAVED_COMPLETED:
+        if would_defer and not _completed_check_saved((ctx.miner_hotkey, ctx.executor.uuid)):
             # the memory in Redis may be older than the last completed check
             logger.info(
                 _m(
@@ -384,10 +414,10 @@ class PortConnectivityCheck:
 
     async def _record_completed_check(
         self, ctx: Context, result: PortVerificationResult, gate: _PressureGate
-    ) -> None:
+    ) -> bool:
         # a completed check (any status, an empty result included) is what the next deferral republishes,
         # with the reading off too; the streak of deferrals ends here and nowhere earlier, so a timed-out
-        # check cannot reopen it
+        # check cannot reopen it. True once every write is in Redis.
         try:
             redis = ctx.services.redis
             await redis.record_verified_ports(
@@ -409,12 +439,12 @@ class PortConnectivityCheck:
                 )
             else:
                 await redis.clear_disk_pressure_deferrals(ctx.miner_hotkey, ctx.executor.uuid, shadow=True)
-            _SAVED_COMPLETED.add((ctx.miner_hotkey, ctx.executor.uuid))
+            return True
         except Exception as e:  # noqa: BLE001 - a safety net; never fail the port check over it
-            _SAVED_COMPLETED.discard((ctx.miner_hotkey, ctx.executor.uuid))
             logger.warning(
                 _m("verified ports not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
             )
+            return False
 
     async def _deferred(self, ctx: Context, gate: _PressureGate, extra: dict, *, busy_ports: set[int]) -> CheckResult:
         """No containers on a Docker root whose sync already stalls: the last completed check's ports are
@@ -507,9 +537,9 @@ class PortConnectivityCheck:
         return False
 
     @staticmethod
-    async def _should_use_last_verified_sysbox(
+    async def _update_last_verified_sysbox(
         ctx: Context, result: PortVerificationResult, *, rented: bool, sysbox_now: bool
-    ) -> bool:
+    ) -> _SysboxMemoryUpdate:
         """ticket-0494: keep a rented executor's verified sysbox when this cycle measured nothing.
 
         On a busy rented host the scrape's own sysbox test can time out (sysbox_runtime False), so
@@ -519,7 +549,7 @@ class PortConnectivityCheck:
         container with sysbox-runc is remembered here (pass refreshes, fail forgets); a rented
         executor whose probe never reached its container reads that memory. A probe that reached
         its container and found no sysbox stays a verdict. Fails open to the current behaviour on a
-        Redis error.
+        Redis error, which also leaves the memory unsaved (DAH-5244: a deferral would republish it).
         """
         redis = ctx.services.redis
         try:
@@ -534,20 +564,19 @@ class PortConnectivityCheck:
                     # DAH-5244: a deferred cycle republishes this memory, so a cycle an unrented node ends
                     # without sysbox forgets it - the next deferral may not pass SysboxRequired on it
                     await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-                return False
+                return _SysboxMemoryUpdate(saved=True)
             if sysbox_now or result.dind_ok:
-                return False
-            return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+                return _SysboxMemoryUpdate(saved=True)
+            use_last_verified = await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+            return _SysboxMemoryUpdate(saved=True, use_last_verified=use_last_verified)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
-            # the sysbox memory may now be older than this check: a deferral would republish it
-            _SAVED_COMPLETED.discard((ctx.miner_hotkey, ctx.executor.uuid))
             logger.warning(
                 _m(
                     "last verified sysbox unavailable",
                     extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
                 )
             )
-            return False
+            return _SysboxMemoryUpdate(saved=False)
 
 
 def _disk_pressure_spec(gate: _PressureGate) -> dict[str, Any]:

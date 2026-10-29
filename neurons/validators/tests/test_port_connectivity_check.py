@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutor,
@@ -14,7 +17,10 @@ from neurons.validators.src.services.redis_service import VerifiedPortsMemory
 from neurons.validators.src.services.task.checks import (
     port_connectivity as port_connectivity_module,
 )
-from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
+from neurons.validators.src.services.task.checks.port_connectivity import (
+    VERIFIED_PORTS_MEMORY_TTL_SECONDS,
+    PortConnectivityCheck,
+)
 from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
@@ -700,7 +706,7 @@ def _self_rented_state(*, filler_owner: str | None = None):
 @pytest.fixture(autouse=True)
 def fresh_saved_completed(monkeypatch):
     # the module-level set outlives the check instance; a test starts as a freshly started validator does
-    monkeypatch.setattr(port_connectivity_module, "_SAVED_COMPLETED", set())
+    monkeypatch.setattr(port_connectivity_module, "_COMPLETED_CHECK_SAVED_AT", {})
 
 
 def _gate_ctx(
@@ -726,7 +732,7 @@ def _remember(redis_service, ctx, pairs=MEMORY_PAIRS):
         "pairs": pairs,
         "ttl": 86400,
     }
-    port_connectivity_module._SAVED_COMPLETED.add((ctx.miner_hotkey, "executor-123"))
+    port_connectivity_module._COMPLETED_CHECK_SAVED_AT[(ctx.miner_hotkey, "executor-123")] = time.monotonic()
 
 
 @pytest.mark.asyncio
@@ -1070,7 +1076,7 @@ async def test_a_restarted_validator_runs_the_check_before_it_trusts_the_memory_
     redis_service.refuse_writes = True
     await _complete(context_factory, redis_service, success=False)
     redis_service.refuse_writes = False
-    monkeypatch.setattr(port_connectivity_module, "_SAVED_COMPLETED", set())  # the restart
+    monkeypatch.setattr(port_connectivity_module, "_COMPLETED_CHECK_SAVED_AT", {})  # the restart
 
     checked_after_restart = not await _pressured(context_factory, redis_service)
     deferred_once_saved = await _pressured(context_factory, redis_service)
@@ -1151,6 +1157,93 @@ async def test_a_completed_check_redis_refused_to_record_blocks_the_deferral_unt
         (8000 + i, 8000 + i) for i in range(100)
     ]
     assert deferred.event.reason_code == Msg.VERIFY_DEFERRED.reason and connectivity_after.called_with is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready_before", [True, False], ids=["ready_before", "not_ready_before"])
+@pytest.mark.parametrize(
+    "interrupted_method, interruption",
+    [
+        ("renting_in_progress", ConnectionError("redis down")),
+        ("record_verified_ports", asyncio.CancelledError()),
+        ("clear_sysbox_verified", asyncio.CancelledError()),
+    ],
+    ids=["pending_rental_read_fails", "cancelled_during_port_write", "cancelled_during_sysbox_delete"],
+)
+async def test_a_check_interrupted_before_all_of_it_is_saved_leaves_no_readiness_behind(
+    context_factory, monkeypatch, interrupted_method, interruption, ready_before
+):
+    # the scrape said sysbox, the probe said none: the Redis sysbox memory must go before a deferral may
+    # republish it. An error raised out of run() or a cancellation thrown into an await is not `except Exception`
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+
+    class InterruptingRedis(DummyRedis):
+        interrupt = False
+
+        async def _interrupted(self, *args, **kwargs):
+            if self.interrupt:
+                raise interruption
+            return await getattr(super(), interrupted_method)(*args, **kwargs)
+
+    setattr(InterruptingRedis, interrupted_method, InterruptingRedis._interrupted)
+    redis_service = InterruptingRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    ctx, _ = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=QUICK)
+    _remember(redis_service, ctx)
+    if not ready_before:
+        port_connectivity_module._COMPLETED_CHECK_SAVED_AT.clear()
+
+    def without_sysbox():
+        return DummyConnectivityService(success=True, sysbox_runtime=False, verified_port_count=100, dind_ok=True)
+
+    redis_service.interrupt = True
+    ctx, _ = _gate_ctx(
+        context_factory,
+        redis_service=redis_service,
+        state=_filler_state(sysbox_runtime=True),
+        reading=QUICK,
+        connectivity=without_sysbox(),
+    )
+    with pytest.raises(type(interruption)):
+        await PortConnectivityCheck().run(ctx)
+    redis_service.interrupt = False
+    ctx, connectivity = _gate_ctx(
+        context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED, connectivity=without_sysbox()
+    )
+
+    pressured = await PortConnectivityCheck().run(ctx)
+
+    assert pressured.event.reason_code == Msg.VERIFY_OK.reason and connectivity.called_with is not None
+    pressured_sysbox = await SysboxRequiredCheck().run(context_factory(state=pressured.updates["state"]))
+    assert pressured_sysbox.passed is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_outlives_the_port_memory_by_nothing_and_a_deferral_does_not_refresh_it(
+    context_factory, monkeypatch
+):
+    # a departed executor's key goes with the next completed check anywhere; an expired key is no readiness
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    saved_at = port_connectivity_module._COMPLETED_CHECK_SAVED_AT
+    expired = time.monotonic() - VERIFIED_PORTS_MEMORY_TTL_SECONDS - 1
+    ctx, _ = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+    _remember(redis_service, ctx)
+    saved_at[("departed-miner", "executor-gone")] = expired
+    ctx_expired, _ = _gate_ctx(
+        context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED, miner_hotkey="miner-late"
+    )
+    _remember(redis_service, ctx_expired)
+    saved_at[("miner-late", "executor-123")] = expired
+    recent_saved_at = saved_at[("miner-hotkey", "executor-123")]
+
+    expired_deferred = await _pressured(context_factory, redis_service, miner_hotkey="miner-late")
+    recent_deferred = await _pressured(context_factory, redis_service)
+
+    assert expired_deferred is False and recent_deferred is True
+    assert ("departed-miner", "executor-gone") not in saved_at  # pruned by the check miner-late completed
+    assert saved_at[("miner-late", "executor-123")] > expired  # its real check is a fresh completion
+    assert saved_at[("miner-hotkey", "executor-123")] == recent_saved_at  # a deferral refreshes nothing
 
 
 @pytest.mark.asyncio
