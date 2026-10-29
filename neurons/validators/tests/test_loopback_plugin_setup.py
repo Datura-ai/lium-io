@@ -37,6 +37,9 @@ if sys.argv[1] == "rm":
     if sys.argv[-1] not in containers:
         print("Error: No such container: " + sys.argv[-1], file=sys.stderr)
         sys.exit(1)
+    if state.get("rm_exit"):
+        print("Error: cannot remove container", file=sys.stderr)
+        sys.exit(1)
     containers.remove(sys.argv[-1])
     state_path.write_text(json.dumps(state))
     sys.exit(0)
@@ -111,10 +114,9 @@ def _setup_arguments(
     arguments[-2] = str(tmp_path / "setup.lock")
     if arguments[-1]:
         arguments[-1] = str(tmp_path / "probe-ok")
-        if overrides.get("probe_passed_before"):
-            (tmp_path / "probe-ok").write_text(digest)
-        if overrides.get("probe_passed_for_old_build"):
-            (tmp_path / "probe-ok").write_text("sha256:" + "0" * 64)
+        marker_content = {"current": digest, "old": "sha256:" + "0" * 64, "empty": ""}
+        if overrides.get("marker_before"):
+            (tmp_path / "probe-ok").write_text(marker_content[str(overrides["marker_before"])])
     return arguments
 
 
@@ -185,8 +187,8 @@ async def test_setup_verifies_download_before_enable_and_preserves_existing_plug
         ({}, True, 1, 0),
         ({"installed": True, "enabled": False}, True, 1, 0),
         ({"installed": True, "enabled": True}, True, 1, 0),
-        ({"installed": True, "enabled": True, "probe_passed_before": True}, True, 0, 0),
-        ({"installed": True, "enabled": True, "probe_passed_for_old_build": True}, True, 1, 0),
+        ({"installed": True, "enabled": True, "marker_before": "current"}, True, 0, 0),
+        ({"installed": True, "enabled": True, "marker_before": "old"}, True, 1, 0),
         ({"run_exit": 1}, False, 1, 1),
         ({"volume_create_exit": 1}, False, 0, 1),
         ({"run_exit": 1, "disable_exit": 1}, False, 1, 3),
@@ -226,7 +228,9 @@ async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it
     assert all("lium-loopback-probe-v3:/mnt" in call and "--network" in call for call in runs)
     creates = [call for call in calls if call[:2] == ["volume", "create"]]
     removes = [call for call in calls if call[:2] == ["volume", "rm"]]
-    assert len(creates) == len(removes) == (1 if mounts or "volume_create_exit" in overrides else 0)
+    assert len(creates) == (1 if mounts or "volume_create_exit" in overrides else 0)
+    # leftovers of an earlier probe go before the create, the probe's own after it
+    assert len(removes) == 2 * len(creates)
     assert all(
         call[3:5] == ["vloopback:v3", "-o"] and call[-1] == "lium-loopback-probe-v3"
         for call in creates
@@ -242,6 +246,76 @@ async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it
             assert "could not be disabled" in result.stderr
         else:
             assert json.loads((tmp_path / "state.json").read_text())["enabled"] is False
+
+
+@pytest.mark.parametrize("disable_exit", [0, 1], ids=["disable-ok", "disable-refused"])
+@pytest.mark.parametrize("run_exit", [0, 1], ids=["probe-ok", "probe-failed"])
+@pytest.mark.parametrize("marker_before", ["empty", "old", "current"])
+def test_setup_removes_a_marker_of_another_build_before_it_can_fail(
+    tmp_path: Path, marker_before: str, run_exit: int, disable_exit: int
+) -> None:
+    # Arrange: the backend's health check tests the marker's existence only. Were a marker of an
+    # earlier build left while this build's probe fails and the plugin cannot be disabled (volumes
+    # keep it busy), the validator would rent on v2 while the backend checks v3 (reread, 29.10)
+    overrides: dict[str, str | int | bool] = {
+        "installed": True, "enabled": True, "marker_before": marker_before,
+        "run_exit": run_exit, "disable_exit": disable_exit,
+    }
+    arguments = _setup_arguments(tmp_path, overrides)
+    digest = LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert
+    probed = marker_before != "current"
+    assert (result.returncode == 0) is (not probed or run_exit == 0), result.stderr
+    marker = tmp_path / "probe-ok"
+    if result.returncode == 0:
+        assert marker.read_text() == digest
+    else:
+        assert not marker.exists()
+        assert ("could not be disabled" in result.stderr) is bool(disable_exit)
+
+
+def test_setup_reclaims_a_probe_container_an_earlier_setup_abandoned(tmp_path: Path) -> None:
+    # Arrange: a setup killed before its cleanup left the probe container (`created`, never exits)
+    # holding the probe volume. The next setup must reclaim both before it probes, and never write
+    # the marker while they stay (reread, 29.10)
+    arguments = _setup_arguments(tmp_path, {"containers": ["lium-loopback-probe-v3"]})
+
+    # Act: two setups, as two rents would run them
+    results = [subprocess.run(arguments, capture_output=True, text=True, timeout=10) for _ in range(2)]
+
+    # Assert: the first reclaims and probes, the second finds the marker and skips
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert [result.returncode for result in results] == [0, 0], [result.stderr for result in results]
+    assert state["containers"] == []
+    assert (tmp_path / "probe-ok").read_text() == LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest
+    calls = state["calls"]
+    assert sum(call[0] == "run" for call in calls) == 1
+    first_rm = next(i for i, call in enumerate(calls) if call[:2] == ["rm", "-f"])
+    first_create = next(i for i, call in enumerate(calls) if call[:2] == ["volume", "create"])
+    assert first_rm < first_create
+    assert all(call[-1] == "lium-loopback-probe-v3" for call in calls if call[:2] == ["rm", "-f"])
+
+
+def test_setup_fails_without_a_marker_when_an_abandoned_probe_container_cannot_be_removed(
+    tmp_path: Path,
+) -> None:
+    # Arrange: the abandoned container refuses `docker rm -f`, so its volume stays in use
+    arguments = _setup_arguments(tmp_path, {"containers": ["lium-loopback-probe-v3"], "rm_exit": 1})
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert: a leftover is a setup error, not a warning, and no proof is written over it
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert result.returncode == 1
+    assert "an earlier probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3" in result.stderr
+    assert not (tmp_path / "probe-ok").exists()
+    assert not any(call[0] == "run" for call in state["calls"])
+    assert state["enabled"] is False
 
 
 def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(tmp_path: Path) -> None:
@@ -264,14 +338,15 @@ def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(t
     assert state["containers"] == []
     assert state["enabled"] is False
     assert not (tmp_path / "probe-ok").exists()
-    container_rms = [i for i, call in enumerate(state["calls"]) if call[:2] == ["rm", "-f"]]
-    volume_rms = [i for i, call in enumerate(state["calls"]) if call[:2] == ["volume", "rm"]]
-    runs = [call for call in state["calls"] if call[0] == "run"]
-    assert len(runs) == len(container_rms) == len(volume_rms) == 2
-    assert all(rm < volume_rm for rm, volume_rm in zip(container_rms, volume_rms))
-    container_names = [call[call.index("--name") + 1] for call in runs]
-    assert [call[-1] for call in state["calls"] if call[:2] == ["rm", "-f"]] == container_names
-    assert len(set(container_names)) == 2 and all(name.startswith("lium-loopback-probe-v3-") for name in container_names)
+    calls = state["calls"]
+    runs = [i for i, call in enumerate(calls) if call[0] == "run"]
+    assert len(runs) == 2
+    for run in runs:
+        assert calls[run][calls[run].index("--name") + 1] == "lium-loopback-probe-v3"
+        after = calls[run + 1 :]
+        container_rm = next(i for i, call in enumerate(after) if call[:2] == ["rm", "-f"])
+        volume_rm = next(i for i, call in enumerate(after) if call[:2] == ["volume", "rm"])
+        assert container_rm < volume_rm
 
 
 @pytest.mark.asyncio

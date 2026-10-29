@@ -77,37 +77,46 @@ def probe_marker_holds(expected_digest):
     except OSError:
         return False
 
+# one volume and one container per generation: the lock serialises setups, so a stable name lets
+# the next setup reclaim what a killed one left (a `created` container never exits, `--rm` or not)
+probe_volume = "lium-loopback-probe-" + generation
+probe_container = probe_volume
+
+def remove_probe_leftovers():
+    # the container first: a `docker run` cut off by its timeout leaves it running with the volume
+    # attached. Returns what stayed behind
+    leftovers = []
+    removed = run_docker("rm", "-f", probe_container)
+    if removed.returncode and "no such container" not in removed.stderr.lower():
+        leftovers.append("container " + probe_container)
+    if run_docker("volume", "rm", "-f", probe_volume).returncode:
+        leftovers.append("volume " + probe_volume)
+    return leftovers
+
 def mount_probe_volume():
     # install and enable mount nothing, and a host may refuse what the plugin asks of its loop
     # device (direct I/O, 4096-byte sectors): one probe volume is mounted before the plugin is
     # handed out, else it stays installed but disabled and the older plugin keeps renting.
     # 1g: the plugin's mkfs.xfs refuses anything under 300 MB; sparse, so a host with little
     # free disk is not refused by the reservation instead of by its loop device
-    name = "lium-loopback-probe-" + generation
-    # named, so a `docker run` cut off by its timeout (the daemon keeps the container running)
-    # is removed before its volume; else the volume stays in use and the plugin cannot be disabled
-    container = name + "-" + str(os.getpid())
-    started = False
+    leftovers = remove_probe_leftovers()
+    if leftovers:
+        raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
     try:
-        created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", name)
+        created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", probe_volume)
         if created.returncode:
             raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
-        started = True
-        mounted = run_docker("run", "--rm", "--name", container, "--network", "none", "-v", name + ":/mnt",
-                             probe_image, "sh", "-c", "echo probe > /mnt/probe && sync")
+        mounted = run_docker("run", "--rm", "--name", probe_container, "--network", "none",
+                             "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync")
         if mounted.returncode:
             raise RuntimeError("probe volume mount failed: " + mounted.stderr.strip()[-300:])
-    finally:
-        leftovers = []
-        if started:
-            removed = run_docker("rm", "-f", container)
-            # --rm already took a container whose sync finished: "no such container" is not a leftover
-            if removed.returncode and "no such container" not in removed.stderr.lower():
-                leftovers.append("container " + container)
-        if run_docker("volume", "rm", "-f", name).returncode:
-            leftovers.append("volume " + name)
-        if leftovers:
-            print("probe cleanup left " + ", ".join(leftovers), file=sys.stderr)
+    except BaseException:
+        remove_probe_leftovers()
+        raise
+    leftovers = remove_probe_leftovers()
+    if leftovers:
+        # a volume still in use means the mount did not end cleanly: not a proof
+        raise RuntimeError("probe cleanup left " + ", ".join(leftovers))
 
 def disable_plugin(plugin_id):
     # the backend's health check may hold a volume on the plugin for a moment: retry
@@ -134,6 +143,11 @@ try:
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        needs_probe = bool(probe_image) and not probe_marker_holds(digest)
+        if needs_probe and os.path.exists(marker_path):
+            # the backend's health check tests the marker's existence only: a marker of another
+            # build goes before anything below can fail, so both sides see the same fallback
+            os.remove(marker_path)
         plugin = inspect()
         if plugin is None:
             # The daemon may complete an install even if its client reports failure. Inspect
@@ -159,7 +173,7 @@ try:
             plugin = inspect()
         if not plugin or plugin["Id"] != plugin_id or plugin["Enabled"] is not True:
             raise RuntimeError("verified plugin remains disabled")
-        if probe_image and not probe_marker_holds(digest):
+        if needs_probe:
             # also for a plugin found enabled: an enabled plugin without the marker was never proven
             # to mount (a probe cut short by the validator's deadline, one enabled by hand); a marker
             # of another build means this one was never probed here
