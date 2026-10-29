@@ -524,8 +524,8 @@ class MinerLogLine(BaseModel):
             lead = (
                 f"No unrented incentive for {unpaid} of the free GPUs on this partially rented node: "
                 f"it has {port_limited.available_port_count} free port(s) for "
-                f"{port_limited.free_split_count} free GPU split(s), and each split needs its own port "
-                f"for a renter, so {port_limited.paid_split_count} split(s) keep earning. "
+                f"{port_limited.free_split_count} free GPU split(s), and each rental needs {MIN_PORT_COUNT} "
+                f"free ports, so {port_limited.paid_split_count} split(s) keep earning. "
             )
         else:
             lead = (

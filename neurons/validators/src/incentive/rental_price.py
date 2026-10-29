@@ -100,16 +100,16 @@ class PowerCapIncapable(BaseModel):
 
 
 class PortLimitedRemainder(BaseModel):
-    """The free remainder of a partially rented split node with fewer usable free ports than it
-    has minimum-size splits (DAH-3698, owner rule 26 Oct 2026: one usable, unique renter port per
-    minimum-size split). `available_port_count` is the distinct free verified ports PortCountCheck
-    wrote into the spec (the tenant's ports are already left out); `required_port_count` is one per
-    free split, and never below MIN_PORT_COUNT, the free ports the rent path needs for any rental."""
+    """The free remainder of a partially rented split node whose free ports fit fewer rentals at once
+    than it has minimum-size splits (DAH-3698): every rental takes MIN_PORT_COUNT free ports.
+    `available_port_count` is the distinct free verified ports PortCountCheck wrote into the spec
+    (the tenant's ports are already left out); `required_port_count` is MIN_PORT_COUNT per free
+    split, the free ports that let every free split be rented at once."""
 
     available_port_count: int
     required_port_count: int
     free_split_count: int
-    paid_split_count: int  # splits that have a port: their GPUs keep the idle pay
+    paid_split_count: int  # splits the free ports can rent at once: their GPUs keep the idle pay
     unpaid_gpu_count: int
 
 
@@ -536,14 +536,15 @@ class RentalPriceIncentive(DefaultIncentive):
             available = min(available, len(set(verified)))
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
-        # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
-        paid_split_count: int = min(free_split_count, available) if available >= MIN_PORT_COUNT else 0
+        # every rental takes MIN_PORT_COUNT free ports, so only this many fit at once: the same
+        # count the listing raises the split minimum by (lium-platform min_gpus_per_rental_for_ports)
+        paid_split_count: int = min(free_split_count, available // MIN_PORT_COUNT)
         # free GPUs below one whole split can't be listed or rented, so they get no idle pay either
-        if free_split_count > 0 and available >= MIN_PORT_COUNT and paid_split_count >= free_split_count:
+        if free_split_count > 0 and paid_split_count >= free_split_count:
             return None
         return PortLimitedRemainder(
             available_port_count=available,
-            required_port_count=max(free_split_count, MIN_PORT_COUNT),
+            required_port_count=max(free_split_count, 1) * MIN_PORT_COUNT,
             free_split_count=free_split_count,
             paid_split_count=paid_split_count,
             # GPUs left over below one split ride with the last paid split, so only whole splits go unpaid
