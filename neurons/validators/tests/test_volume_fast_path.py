@@ -12,7 +12,10 @@ import pytest
 from core.config import settings
 from payload_models.payloads import ContainerCreateRequest
 from services import docker_service as docker_service_module
-from services.loopback_plugin_setup import loopback_plugin_setup_command
+from services.loopback_plugin_setup import (
+    loopback_plugin_probe_marker_path,
+    loopback_plugin_setup_command,
+)
 from services.docker_service import (
     DockerService,
     NoUsableLoopbackPluginError,
@@ -606,7 +609,7 @@ def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marke
     command = (
         docker_service_module._loopback_plugin_state_command("vloopback:v3")
         .replace("/usr/bin/docker", str(docker))
-        .replace("/run/lock/lium-loopback-v3.probe-ok", str(marker_path))
+        .replace(loopback_plugin_probe_marker_path("vloopback:v3"), str(marker_path))
     )
 
     state = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=5)

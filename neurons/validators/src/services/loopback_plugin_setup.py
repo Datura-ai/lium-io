@@ -38,10 +38,13 @@ def loopback_plugin_probe_marker_path(alias: str) -> str | None:
     # the setup script writes it once a probe volume mounted on this plugin; an enabled plugin
     # without it is not handed out (the probe may have been cut short, or the plugin enabled by
     # hand). None for v2 and the legacy plugin, which run no probe. Lives beside the lock, so an
-    # executor restart costs one probe.
+    # executor restart costs one probe. Named after the pinned digest, so a newly pinned build is
+    # probed again on an already probed node.
     if alias != LOOPBACK_PLUGIN_V3_ALIAS:
         return None
-    return f"/run/lock/lium-loopback-{LOOPBACK_PLUGIN_BUILDS[alias].generation}.probe-ok"
+    build = LOOPBACK_PLUGIN_BUILDS[alias]
+    digest = build.digest.replace(":", "-").replace("/", "-")
+    return f"/run/lock/lium-loopback-{build.generation}-{digest}.probe-ok"
 
 
 # Executed by the executor's Python, not the validator's filesystem. Docker's plugin metadata
@@ -73,10 +76,11 @@ def mount_probe_volume():
     # install and enable mount nothing, and a host may refuse what the plugin asks of its loop
     # device (direct I/O, 4096-byte sectors): one probe volume is mounted before the plugin is
     # handed out, else it stays installed but disabled and the older plugin keeps renting.
-    # 1g: the plugin's mkfs.xfs refuses anything under 300 MB; fallocate makes it free
+    # 1g: the plugin's mkfs.xfs refuses anything under 300 MB; sparse, so a host with little
+    # free disk is not refused by the reservation instead of by its loop device
     name = "lium-loopback-probe-" + generation
     try:
-        created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", name)
+        created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", name)
         if created.returncode:
             raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
         mounted = run_docker("run", "--rm", "--network", "none", "-v", name + ":/mnt", probe_image,

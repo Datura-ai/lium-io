@@ -68,7 +68,9 @@ sys.exit(state.get(action + "_exit", 0))
 """
 
 
-def _setup_arguments(tmp_path: Path, overrides: dict, alias: str = "vloopback:v3") -> list[str]:
+def _setup_arguments(
+    tmp_path: Path, overrides: dict[str, str | int | bool], alias: str = "vloopback:v3"
+) -> list[str]:
     # the real setup command's arguments, with the fake docker and tmp_path as the host
     tag, digest, generation = LOOPBACK_PLUGIN_BUILDS[alias]
     state = {"manifest": digest, "generation": generation, "calls": [], **overrides}
@@ -209,7 +211,7 @@ async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it
         for call in creates
     )
     assert sum(call[:2] == ["plugin", "disable"] for call in calls) == disables
-    assert all("size=1g" in call for call in creates)
+    assert all("size=1g" in call and "sparse=true" in call for call in creates)
     assert (tmp_path / "probe-ok").exists() is success
     if not success:
         assert "probe volume" in result.stderr
@@ -261,7 +263,9 @@ async def test_setup_command_quotes_the_root_and_never_installs_a_digest(alias, 
     assert args[-3] == "/proc/1/root"
     assert args[-2] == f"/run/lock/lium-loopback-{generation}.lock"
     assert args[-1] == (
-        "" if generation == "v2" else f"/run/lock/lium-loopback-{generation}.probe-ok"
+        ""
+        if generation == "v2"
+        else f"/run/lock/lium-loopback-{generation}-{digest.replace(':', '-')}.probe-ok"
     )
     assert args[2] == _SETUP_SCRIPT
     assert args[4:8] == [alias, tag, digest, generation]
