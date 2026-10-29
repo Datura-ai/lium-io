@@ -18,8 +18,9 @@ A cycle with a filler skips the recheck; after FILLER_SKIP_LIMIT such skips the 
 node's Lium fillers and probes anyway, so a node that always runs a filler cannot skip it for good.
 
 GpuLossHoldCheck sets the marker too (source `gpu_loss_hold`) on the first clean read after a GPU dropout. For that
-marker only a pass lets the node list: a filler skip or a cycle with no verdict fails the node
-(WAITING_AFTER_GPU_LOSS) and keeps the marker, where a post-rental recheck lets the node proceed.
+marker only a pass lets the node list: a failure, a filler skip or a cycle with no verdict fails the node with a
+GPU_LOST availability entry (WAITING_AFTER_GPU_LOSS: the backend hides the node, which a failed cycle alone does not
+do while the row is still active) and keeps the marker, where a post-rental recheck lets the node proceed on a skip.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from services.redis_service import POST_RENTAL_GPU_RECHECK_PREFIX
 from core.config import settings
 from core.utils import _m, get_extra_info
 
+from ..availability import ReachSource, ReachTarget
 from ..messages import GpuFaultProbeMessages, render_message
 from ..messages import PostRentalGpuRecheckMessages as Msg
 from ..pipeline import CheckResult, Context
@@ -181,6 +183,7 @@ class PostRentalGpuRecheckCheck:
             return CheckResult(
                 passed=False,
                 event=render_message(Msg.FAILED, ctx=ctx, check_id=self.check_id, what=what),
+                extra_events=[self._unlisted(ctx, what, Msg.FAILED)] if marker.source == SOURCE_GPU_LOSS_HOLD else [],
             )
         if (
             probes.fault_probe.event.reason_code != GpuFaultProbeMessages.PROBE_OK.reason
@@ -203,13 +206,21 @@ class PostRentalGpuRecheckCheck:
         proceed; a node back from a GPU dropout stays unlisted until the test has passed on every card."""
         if marker.source != SOURCE_GPU_LOSS_HOLD:
             return CheckResult(passed=True, event=render_message(msg, ctx=ctx, check_id=self.check_id, what=what))
-        event = render_message(
+        return CheckResult(passed=False, event=self._unlisted(ctx, what, msg))
+
+    def _unlisted(self, ctx: Context, what: dict[str, Any], msg):
+        """The GPU_LOST availability entry that keeps a node back from a dropout off the market."""
+        return render_message(
             Msg.WAITING_AFTER_GPU_LOSS,
             ctx=ctx,
             check_id=self.check_id,
-            what={**what, "not_run": msg.reason},
+            what={
+                "reach_source": str(ReachSource.VALIDATOR),
+                "reach_target": str(ReachTarget.GPU),
+                "executor_uuid": ctx.executor.uuid,
+                "load_test": msg.reason,
+            },
         )
-        return CheckResult(passed=False, event=event)
 
     @staticmethod
     async def _recently_cleared(ctx: Context) -> bool:

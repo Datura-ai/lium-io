@@ -244,6 +244,7 @@ async def test_a_card_failing_the_load_test_keeps_the_node_out_until_a_clean_rea
     ok, events, _ = await pipeline.run(ctx)
 
     assert not ok and events[-1].reason_code == "POST_RENTAL_GPU_RECHECK_FAILED"
+    assert [e.reason_code for e in availability_errors(events)] == [AvailabilityErrorCode.GPU_LOST]
     assert RECHECK_KEY in redis.store  # still owed: the next clean read tests every card again
     # the card drops again: hidden again
     again = await _cycle(context_factory, redis, pods=(), **LOST_CARD)
@@ -273,6 +274,8 @@ async def test_a_node_back_from_a_dropout_is_not_listed_until_the_load_test_has_
 
     assert not ok
     assert events[-1].reason_code == RecheckMsg.WAITING_AFTER_GPU_LOSS.reason
+    # an availability entry: the backend hides the node even while its row is still active
+    assert [e.reason_code for e in availability_errors(events)] == [AvailabilityErrorCode.GPU_LOST]
     assert events[-1].event == "GPUs back; waiting for the load test on every card"
     assert json.loads(redis.store[RECHECK_KEY])["source"] == "gpu_loss_hold"  # still owed
 
@@ -296,6 +299,7 @@ async def test_a_post_rental_recheck_still_proceeds_on_a_skip(context_factory):
         result = await PostRentalGpuRecheckCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == RecheckMsg.FILLER_SKIPPED.reason
+    assert availability_errors([result.event]) == []
 
 
 def test_no_fixed_hold_duration_in_the_provider_facing_texts():
