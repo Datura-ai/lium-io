@@ -17,6 +17,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, NamedTuple
@@ -556,6 +557,10 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
+# DAH-5392: how long before this validator received a create the backend may have built its active_container_names:
+# the backend's send after the build is bounded by its forward to the validator's holder process (FORWARD_TIMEOUT 180 s,
+# plus a 10 s holder-move chase and 2+4 s local retry backoff), so 300 s covers the whole build->receipt leg
+_ACTIVE_LIST_BUILD_MARGIN_SECONDS = 300
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
@@ -4230,8 +4235,13 @@ class DockerService:
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
         refuse_before_removal: Callable[[list[str]], None] | None = None,
+        request_received_monotonic: float | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
+
+        DAH-5392: with ``request_received_monotonic`` (when the create arrived), an unlisted `pod_*`
+        other than ``pod_name`` that the host created after the backend could have built
+        ``active_container_names`` is kept with its volume: a newer create on the same node ran first.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
@@ -4297,6 +4307,16 @@ class DockerService:
                 if removed_id is not None and listed_ids.get(name) in (None, removed_id):
                     continue
                 stale_containers.append(name)
+            if request_received_monotonic is not None:
+                # DAH-5392: an unlisted pod_* this create did not name may be a newer create's pod on a split node
+                newer = await self._pods_created_after_list_built(
+                    ssh_client,
+                    [name for name in stale_containers if name != pod_name and name.startswith(POD_CONTAINER_PREFIX)],
+                    listed_ids,
+                    request_received_monotonic,
+                    default_extra,
+                )
+                stale_containers = [name for name in stale_containers if name not in newer]
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return []
@@ -4338,6 +4358,55 @@ class DockerService:
                 report.removed_cleanly_without_volume_rm = removed_cleanly and not volumes_to_remove
             return stale_containers
         return []
+
+    @staticmethod
+    async def _pods_created_after_list_built(
+        ssh_client: asyncssh.SSHClientConnection,
+        names: list[str],
+        listed_ids: dict[str, str],
+        request_received_monotonic: float,
+        default_extra: dict,
+    ) -> set[str]:
+        """The ``names`` the host created less than (time since the request arrived + build margin) ago.
+
+        Ages are read on the host clock (its `date` beside docker's Created, one command) and compared with
+        the time elapsed on this validator, so a skewed host clock cancels out. A container whose creation
+        time cannot be read is not returned, so it is removed as before."""
+        if not names:
+            return set()
+        targets = " ".join(shlex.quote(listed_ids.get(name, name)) for name in names)
+        try:
+            async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
+                result = await ssh_client.run(
+                    f"date +%s; /usr/bin/docker inspect --format '{{{{.Name}}}} {{{{.Created}}}}' {targets} 2>/dev/null",
+                    check=False,
+                    timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS,
+                )
+            window = time.monotonic() - request_received_monotonic + _ACTIVE_LIST_BUILD_MARGIN_SECONDS
+            lines = (result.stdout or "").splitlines()
+            host_now = int(lines[0].strip())
+            newer = set()
+            for line in lines[1:]:
+                name, _, created = line.strip().partition(" ")
+                name = name.removeprefix("/")
+                if name in names and host_now - datetime.fromisoformat(created).timestamp() < window:
+                    newer.add(name)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Unlisted pods' creation times unreadable; removing them as stale",
+                    extra=get_extra_info({**default_extra, "container_names": names, "error_type": exc.__class__.__name__}),
+                )
+            )
+            return set()
+        if newer:
+            logger.info(
+                _m(
+                    "Keeping unlisted pods created after this create's list was built",
+                    extra=get_extra_info({**default_extra, "container_names": sorted(newer)}),
+                )
+            )
+        return newer
 
     @staticmethod
     async def _remove_volumes(ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]) -> None:
@@ -8785,6 +8854,7 @@ class DockerService:
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
                     refuse_before_removal=lambda names: _refuse_filler_beside_unlisted_pod(payload, names),
+                    request_received_monotonic=payload._received_monotonic,
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, so the listings
