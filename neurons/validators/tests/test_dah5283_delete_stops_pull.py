@@ -76,3 +76,46 @@ async def test_wait_cancelled_returns_only_after_the_cancel():
         assert not waiter.done()
         inflight_creates.cancel("pod-5283")
         await asyncio.wait_for(waiter, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_delete_mid_custom_build_stops_the_build_before_its_export_and_tears_the_dind_down(svc, monkeypatch):
+    """A deleted pod's build loaded its image onto the host after the delete and filled the disk under the
+    renter's retry on the same node."""
+    from services.docker_service import _CreateCancelledByDelete
+    from test_custom_dockerfile_build import _base_payload, _make_dind_ssh
+
+    ssh_client = _make_dind_ssh()
+    build_started, build_cancelled, seen = asyncio.Event(), asyncio.Event(), []
+
+    async def esl(**kwargs):
+        seen.append(kwargs["command"])
+        if "docker build" in kwargs["command"]:
+            build_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                build_cancelled.set()
+                raise
+        return True, ""
+
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+
+    async def tracked_build():
+        with inflight_creates.track(payload.pod_id):
+            return await svc._custom_build_image(
+                ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+            )
+
+    build = asyncio.create_task(tracked_build())
+    await asyncio.wait_for(build_started.wait(), 10)
+    assert inflight_creates.cancel(payload.pod_id)
+    with pytest.raises(_CreateCancelledByDelete):
+        await asyncio.wait_for(build, 10)
+
+    assert build_cancelled.is_set()
+    assert not any("docker save" in c for c in seen)
+    assert any("rm -f" in c and "lium-dind-build-" in c for c in ssh_client.calls)

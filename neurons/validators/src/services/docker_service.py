@@ -7529,15 +7529,22 @@ class DockerService:
                 f"sh -c {shlex.quote(inner_build)}"
             )
             try:
-                ok, err = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=build_cmd,
-                    log_tag=log_tag,
-                    log_text=f"Building custom image {image_tag}",
-                    log_extra={**default_extra, "build_image_tag": image_tag},
-                    timeout=timeout_s,
-                    raise_exception=False,
+                ok, err = await self._unless_cancelled_by_delete(
+                    ssh_client,
+                    payload,
+                    default_extra,
+                    self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=build_cmd,
+                        log_tag=log_tag,
+                        log_text=f"Building custom image {image_tag}",
+                        log_extra={**default_extra, "build_image_tag": image_tag},
+                        timeout=timeout_s,
+                        raise_exception=False,
+                    ),
                 )
+            except _CreateCancelledByDelete:
+                raise
             except Exception as exc:
                 logger.error(
                     _m(
@@ -7571,14 +7578,19 @@ class DockerService:
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"docker save {shlex.quote(image_tag)} | /usr/bin/docker load"
             )
-            ok, err = await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=export_cmd,
-                log_tag=log_tag,
-                log_text=f"Exporting custom image {image_tag}",
-                log_extra={**default_extra, "build_image_tag": image_tag},
-                timeout=timeout_s,
-                raise_exception=False,
+            ok, err = await self._unless_cancelled_by_delete(
+                ssh_client,
+                payload,
+                default_extra,
+                self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=export_cmd,
+                    log_tag=log_tag,
+                    log_text=f"Exporting custom image {image_tag}",
+                    log_extra={**default_extra, "build_image_tag": image_tag},
+                    timeout=timeout_s,
+                    raise_exception=False,
+                ),
             )
             if not ok:
                 if stream_timed_out(err):
@@ -7779,37 +7791,41 @@ class DockerService:
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
 
-    async def _pull_unless_cancelled_by_delete(
+    async def _unless_cancelled_by_delete(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        docker_client,
         payload: ContainerCreateRequest,
         default_extra: dict,
-        pull: Awaitable[Any],
-    ) -> None:
-        """Run the pull, but stop it as soon as this pod's delete cancels the create.
+        step: Awaitable[Any],
+        on_cancel: Callable[[], Awaitable[Any]] | None = None,
+    ) -> Any:
+        """Run a long create step (image pull, custom build, its export), but stop it as soon as this
+        pod's delete cancels the create.
 
-        DAH-5283: the delete only flags the create, and the create looks at the flag after the pull. A
+        DAH-5283: the delete only flags the create, and the create looks at the flag after the step. A
         slow pull therefore kept streaming up to its 1 h deadline after the renter had deleted the pod,
-        and competed with the next create on the node. Closing the Docker client ends the SSH stream,
-        which makes dockerd drop the pull.
+        and a custom build went on to build and load its image onto the host, competing with the next
+        create on the node (a deleted pod's export filled the disk under the renter's retry). `on_cancel`
+        ends the remote side: closing the Docker client ends a pull's SSH stream; a custom build's
+        DinD container is removed by `_custom_build_image`'s teardown.
         """
-        pull_task = asyncio.ensure_future(pull)
+        step_task = asyncio.ensure_future(step)
         cancelled = asyncio.ensure_future(inflight_creates.wait_cancelled(payload.pod_id))
         try:
-            await asyncio.wait({pull_task, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({step_task, cancelled}, return_when=asyncio.FIRST_COMPLETED)
         except BaseException:
-            pull_task.cancel()
+            step_task.cancel()
             raise
         finally:
             cancelled.cancel()
-        if not pull_task.done():
-            pull_task.cancel()
-            with contextlib.suppress(Exception):
-                await docker_client.aclose()
-            await asyncio.wait({pull_task})
+        if not step_task.done():
+            step_task.cancel()
+            if on_cancel is not None:
+                with contextlib.suppress(Exception):
+                    await on_cancel()
+            await asyncio.wait({step_task})
             await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-        await pull_task
+        return await step_task
 
     def _explain_container_killed_during_bootstrap(
         self,
@@ -8616,9 +8632,8 @@ class DockerService:
                             log_tag,
                         )
                         try:
-                            await self._pull_unless_cancelled_by_delete(
+                            await self._unless_cancelled_by_delete(
                                 ssh_client,
-                                docker_client,
                                 payload,
                                 default_extra,
                                 run_logged_rental_docker_sdk_operation(
@@ -8627,6 +8642,7 @@ class DockerService:
                                     call=lambda: docker_client.pull(image=payload.docker_image),
                                     image=payload.docker_image,
                                 ),
+                                on_cancel=lambda: docker_client.aclose(),
                             )
                         except _CreateCancelledByDelete:
                             raise
