@@ -206,6 +206,7 @@ class TaskService:
                     gpu_attestation_passed=gpu_attestation_passed,
                     first_pass=first_pass,
                     encrypted_private_key=encrypted_private_key,
+                    task_started_at=task_started_at,
                 )
 
                 # Build and run validation pipeline

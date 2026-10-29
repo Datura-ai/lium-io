@@ -33,12 +33,14 @@ from .post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from .provider_side_load import ProviderSideLoadCheck
 from .registry_pull import RegistryPullCheck
 from .container_download_speed import ContainerDownloadSpeedCheck
+from .idle_disk_write import IdleDiskWriteCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
+from .provider_maintenance import ProviderMaintenanceCheck
 from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
@@ -93,10 +95,12 @@ __all__ = [
     "ProviderSideLoadCheck",
     "RegistryPullCheck",
     "ContainerDownloadSpeedCheck",
+    "IdleDiskWriteCheck",
     "RentalProbeCheck",
     "RentalVerificationCheck",
     "RentedGpuDropCheck",
     "TdxHostCheck",
+    "ProviderMaintenanceCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
     "StaleContainerCleanupCheck",

@@ -8,6 +8,7 @@ from typing import Tuple
 
 from core.config import settings, shared_client
 from services.executor_image_policy import ImageVerdict
+from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
 from services.task.pipeline import Context
 
 
@@ -47,9 +48,14 @@ def calculate_scores(
         warning_messages.append("Required executor image is outdated")
 
     # Machine price check
+    # DAH-5088: no cap for an unknown model priced like a reference (the backend's worker skips it too): the
+    # cheapest same-memory model is a payout floor, not a fair price; the soft limit still gates its idle pay
+    gpu_details = getattr(ctx.state, "gpu_details", None) or []
+    capacity_mb = gpu_details[0].get("capacity") if gpu_details else None
+    referenced = reference_gpu_model(gpu_model, capacity_mb) not in (None, normalize_gpu_model(gpu_model))
     base_price = shared_client.config.machine_prices.get(gpu_model, 0)
     max_price_rate = shared_client.config.machine_max_price_rate
-    if price_per_gpu and price_per_gpu > base_price * max_price_rate:
+    if price_per_gpu and not referenced and price_per_gpu > base_price * max_price_rate:
         actual_score = 0.0
         warning_messages.append(
             f"GPU price exceeds the limit. limit: {base_price * max_price_rate}, actual: {price_per_gpu}"
