@@ -64,8 +64,8 @@ data_dir = "/srv" + root + "/vloopback-" + generation
 state_dir = "/srv/run/docker-volume-loopback-" + generation
 plugins_dir = host_root + root + "/plugins"
 
-def run_docker(*args):
-    return subprocess.run([docker, *args], capture_output=True, text=True, check=False, timeout=120)
+def run_docker(*args, timeout=120):
+    return subprocess.run([docker, *args], capture_output=True, text=True, check=False, timeout=timeout)
 
 def call(*args):
     return run_docker("plugin", *args)
@@ -108,7 +108,7 @@ def mount_probe_volume():
         if created.returncode:
             raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
         mounted = run_docker("run", "--rm", "--name", probe_container, "--network", "none",
-                             "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync")
+                             "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync /mnt/probe")
         if mounted.returncode:
             raise RuntimeError("probe volume mount failed: " + mounted.stderr.strip()[-300:])
     except BaseException:
@@ -120,12 +120,35 @@ def mount_probe_volume():
         raise RuntimeError("probe cleanup left " + ", ".join(leftovers))
 
 def disable_plugin(plugin_id):
-    # the backend's health check may hold a volume on the plugin for a moment: retry
+    # the backend's health check may hold a volume on the plugin for a moment: retry. Short tries,
+    # so a hung daemon still ends them inside the validator's deadline with this reason on stderr
     for _ in range(3):
-        if call("disable", plugin_id).returncode == 0:
-            return
+        try:
+            if run_docker("plugin", "disable", plugin_id, timeout=10).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
         time.sleep(1)
     raise RuntimeError("the plugin could not be disabled")
+
+def read_saved_config(plugin_id):
+    if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
+        raise RuntimeError("invalid plugin ID")
+    with open(plugins_dir + "/" + plugin_id + "/config.json") as source:
+        return json.load(source)
+
+def remove_plugin_of_another_build(plugin):
+    # Docker refuses to disable or remove a plugin its volumes still use; the listing only makes
+    # that refusal readable
+    listed = run_docker("volume", "ls", "--format", "{{.Driver}}")
+    if listed.returncode:
+        raise RuntimeError("cannot list the volumes of an earlier build")
+    if alias in listed.stdout.split():
+        raise RuntimeError("an earlier build of the plugin still owns volumes")
+    if plugin["Enabled"]:
+        disable_plugin(plugin["Id"])
+    if call("rm", plugin["Id"]).returncode:
+        raise RuntimeError("the earlier build of the plugin could not be removed")
 
 def inspect():
     result = call("inspect", alias)
@@ -150,6 +173,11 @@ try:
             # build goes before anything below can fail, so both sides see the same fallback
             os.remove(marker_path)
         plugin = inspect()
+        if plugin is not None and probe_image and read_saved_config(plugin["Id"]).get("Manifest") != digest:
+            # an earlier pinned build under this alias (lium7 once lium8 is pinned) is replaced once
+            # no volume uses it, else every setup refuses its manifest and the host never moves on
+            remove_plugin_of_another_build(plugin)
+            plugin = None
         if plugin is None:
             # The daemon may complete an install even if its client reports failure. Inspect
             # the actual result under the lock before deciding whether setup succeeded.
@@ -159,10 +187,7 @@ try:
         if plugin is None:
             raise RuntimeError("installation did not produce a plugin")
         plugin_id = plugin["Id"]
-        if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
-            raise RuntimeError("invalid plugin ID")
-        with open(plugins_dir + "/" + plugin_id + "/config.json") as source:
-            saved = json.load(source)
+        saved = read_saved_config(plugin_id)
         if saved.get("Manifest") != digest or saved.get("plugin", {}).get("Id") != plugin_id:
             raise RuntimeError("downloaded manifest does not match the pinned digest")
         env = plugin.get("Settings", {}).get("Env", [])
