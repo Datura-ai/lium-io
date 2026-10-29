@@ -318,6 +318,11 @@ def failed_check_event(ok: bool, events: list[ValidationEvent]) -> ValidationEve
     last_event = events[-1]
     if last_event.check_id in CHECKS_THAT_KEEP_THE_LISTING:
         return None
+    return verification_failed_event(last_event.check_id, last_event.reason_code)
+
+
+def verification_failed_event(check_id: str, reason: str | None) -> ValidationEvent:
+    """VERIFICATION_FAILED: the node could not finish a verification this cycle (see failed_check_event)."""
     return build_availability_event(
         code=AvailabilityErrorCode.VERIFICATION_FAILED,
         reach_source=ReachSource.VALIDATOR,
@@ -326,5 +331,5 @@ def failed_check_event(ok: bool, events: list[ValidationEvent]) -> ValidationEve
         impact="Hidden and takes no new rentals until a check passes; a rental already on it is not touched",
         remediation="See the failed check's message for the cause. The node is listed again on the first check "
         "that passes.",
-        what_we_saw={"failed_check": last_event.check_id, "failed_reason": last_event.reason_code},
+        what_we_saw={"failed_check": check_id, "failed_reason": reason},
     )

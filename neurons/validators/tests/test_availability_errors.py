@@ -289,8 +289,8 @@ def test_every_failed_reachability_check_is_reported() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_failure_after_the_shell_opened_reports_the_node_as_reachable() -> None:
-    """DAH-2748: the connect proved the node is there, so a later crash must not keep it hidden."""
+async def test_a_shell_that_dies_after_the_connect_hides_the_node() -> None:
+    """DAH-2748: the connect proved the node is there. DAH-5395: but its shell dying under the run hides it."""
     import asyncssh
     from datura.requests.miner_requests import ExecutorSSHInfo
     from payload_models.payloads import MinerJobRequestPayload
@@ -333,7 +333,8 @@ async def test_a_failure_after_the_shell_opened_reports_the_node_as_reachable() 
             rented_data=MagicMock(), default_docker_image_digests={},
         )
 
-    assert result.availability_errors == []
+    assert [e["reason_code"] for e in result.availability_errors] == ["VERIFICATION_FAILED"]
+    assert result.availability_errors[0]["what_we_saw"]["failed_check"] == "pipeline.exception.Error"
 
 
 def _result_with(errors: list[dict] | None) -> "JobResult":
