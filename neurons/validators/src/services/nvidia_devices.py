@@ -229,7 +229,7 @@ async def build_gpu_docker_config_for_executor(
             per_gpu = await _query_all_gpu_nodes(ssh_client, host_probe=host_probe)
             is_partial_rental = False
         # The live count alone can be fooled by GPUs that are off the bus at this create. The backend's
-        # whole_host=False (protocol 1.17.0) also makes the rental partial, so neither side can grant the devices alone.
+        # whole_host=False (protocol 1.18.0) also makes the rental partial, so neither side can grant the devices alone.
         is_partial_rental = is_partial_rental or whole_host is False
 
         # On partial rentals (some-but-not-all GPUs on the host), withhold every host-wide node:
