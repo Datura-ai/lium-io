@@ -626,12 +626,6 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
-    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
-    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
-        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
-    )
-
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
     # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before

@@ -742,28 +742,72 @@ async def test_pod_mapping_reuse_no_duplicate_external_port(docker_service, test
     assert ssh_mapping[2] == 40040
 
 
+def _offered(ports):
+    return [PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in ports]
+
+
 @pytest.mark.asyncio
-async def test_min_port_count_validation(docker_service, test_executor_id, test_miner_hotkey, monkeypatch):
-    """Test that generate_portMappings returns empty when MIN_PORT_COUNT is not met."""
-    # Set MIN_PORT_COUNT to 3
-    monkeypatch.setattr("services.docker_service.MIN_PORT_COUNT", 3)
-
-    # Only 2 available ports (less than MIN_PORT_COUNT)
-    available_ports_raw = [
-        PayloadPortMapping(internal_port=p, external_port=p, docker_port=None)
-        for p in [9000, 9001]
-    ]
-
-    # Act
+async def test_min_port_count_validation(docker_service, test_executor_id, test_miner_hotkey):
+    """DAH-3698: no free port means no pod; a Jupyter pod needs a second one."""
     result, jupyter_map = await docker_service.generate_portMappings(
         test_miner_hotkey, test_executor_id, UUID(test_executor_id), [22, 8080, 8081],
-        available_ports_raw=available_ports_raw, pod_mapping_raw=[]
+        available_ports_raw=[], pod_mapping_raw=[]
     )
+    assert (result, jupyter_map) == ([], None)
 
-    # Assert - should return empty result
-    assert result == []
+    result, jupyter_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        enable_jupyter=True, available_ports_raw=_offered([9000]), pod_mapping_raw=[]
+    )
+    assert (result, jupyter_map) == ([], None)
+
+
+@pytest.mark.asyncio
+async def test_one_port_split_pod_gets_only_ssh(docker_service, test_executor_id, test_miner_hotkey):
+    """DAH-3698: a 1-GPU split offered one port is created with SSH on it, not refused for a 3-port floor."""
+    result, jupyter_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), initial_port_count=None,
+        available_ports_raw=_offered([40001]), pod_mapping_raw=[]
+    )
+    assert result == [(22, 40001, 40001)]
     assert jupyter_map is None
 
+
+@pytest.mark.asyncio
+async def test_two_port_jupyter_pod(docker_service, test_executor_id, test_miner_hotkey):
+    result, jupyter_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), enable_jupyter=True,
+        available_ports_raw=_offered([40001, 40002]), pod_mapping_raw=[]
+    )
+    assert [m[0] for m in result] == [22, 8888]
+    assert {m[2] for m in result} == {40001, 40002}
+    assert jupyter_map == (8888, next(m[2] for m in result if m[0] == 8888))
+
+
+@pytest.mark.asyncio
+async def test_full_node_pod_still_takes_every_preferred_port(docker_service, test_executor_id, test_miner_hotkey):
+    """An older platform offering a full node's ports: unchanged, SSH plus the 10 preferred ports."""
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(),
+        available_ports_raw=_offered(range(20000, 20040)), pod_mapping_raw=[]
+    )
+    assert [m[0] for m in result] == [22, *range(20000, 20010)]
+    assert len({m[2] for m in result}) == 11
+
+
+@pytest.mark.asyncio
+async def test_split_pods_never_share_an_external_port(docker_service, test_executor_id, test_miner_hotkey):
+    """Collisions: each 1-port split pod takes the one port it was offered; a port another pod holds is never offered,
+    and a port the offer lists twice maps once."""
+    taken = set()
+    for port in range(40001, 40009):  # 8x1 node, 8 ports, one per split
+        result, _ = await docker_service.generate_portMappings(
+            test_miner_hotkey, test_executor_id, uuid4(),
+            available_ports_raw=_offered([port, port]), pod_mapping_raw=[]
+        )
+        assert result == [(22, port, port)]
+        taken.add(port)
+    assert len(taken) == 8
 
 @pytest.mark.asyncio
 async def test_reserve_ports_with_backend_data(docker_service, test_executor_id, test_miner_hotkey):
