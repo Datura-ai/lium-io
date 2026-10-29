@@ -556,8 +556,8 @@ class Settings(BaseSettings):
     # yet (the follow-up zeroes the score on a slow disk).
     IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
     IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
-    # a node running a filler is busy from this rate: a filler writing slower than DISK_BUSY_MB_PER_S would
-    # otherwise share the disk with the probe and lower the reading
+    # a node running a filler is busy from this rate of sectors read plus written on the docker root disks: a filler
+    # moving less than DISK_BUSY_MB_PER_S would otherwise share the disk with the probe and lower the reading
     IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S: float = Field(
         env="IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S", default=5.0, gt=0
     )

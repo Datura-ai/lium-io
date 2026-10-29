@@ -51,9 +51,9 @@ class IdleDiskWriteCheck:
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S, a throwaway container writes RentedThroughputCheck's DISK_PROBE_BYTES with
     fsync into its writable layer. Logs IDLE_DISK_WRITE with the MB/s, the card, the provider and a shadow verdict
     (fail under RENTED_THROUGHPUT_DISK_MIN_MB_PER_S). Always passes: IDLE_DISK_WRITE_ENFORCE_ENABLED is read by nothing.
-    A node running a filler counts as busy from IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S: a filler writing under the
-    rented busy line would otherwise lower the reading. DAH-5385: every cycle the last reading goes to the backend as
-    specs[SPECS_KEY]; filler start keeps the big fillers off a slow disk.
+    A node running a filler counts as busy from IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S (sectors read plus written): a
+    filler moving its disk under the rented busy line would otherwise lower the reading. DAH-5385: every cycle the last
+    reading goes to the backend as specs[SPECS_KEY]; filler start keeps the big fillers off a slow disk.
     """
 
     check_id = "executor.validate.idle_disk_write"
