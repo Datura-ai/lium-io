@@ -1,11 +1,10 @@
 import enum
-import time
 from datetime import datetime
 from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator, model_serializer
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
 
 class CustomOptions(BaseModel):
@@ -337,9 +336,6 @@ class ContainerCreateRequest(ContainerBaseRequest):
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
-    # DAH-5392: time.monotonic() when this request was parsed (received); the stale sweep keeps an unlisted
-    # pod_* created after its active_container_names were built. Private: never sent or logged.
-    _received_monotonic: float = PrivateAttr(default_factory=time.monotonic)
     cluster_membership: ClusterMembership | None = None
     active_volume_names: list[str] | None = None
     # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator

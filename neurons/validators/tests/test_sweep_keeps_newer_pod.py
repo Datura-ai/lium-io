@@ -1,31 +1,25 @@
 """DAH-5392: a delayed create's stale sweep never removes a newer create's `pod_*` on a split node.
 
 Create A's active_container_names are built by the backend before it sends A; if A waits (the per-node
-create exclusion) and create B runs first, B's pod is not on A's list. The sweep keeps an unlisted
-`pod_*` the host created after A's list could have been built, and still removes an older leftover.
+create exclusion) and create B runs first, B's pod is not on A's list. The sweep removes an unlisted
+`pod_*` (and its volume) only when the backend confirms its rental closed; anything else keeps it.
 """
 
 from __future__ import annotations
 
-import time
-from datetime import UTC, datetime
+import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 import services.docker_service as ds_module
-from payload_models.payloads import ContainerCreateRequest
+from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
 from services.docker_service import DockerService, own_sweep_removals
 
-HOST_NOW = 4_000_000_000  # the host's clock, far from this validator's: only differences on it are compared
-
-
-def _result(stdout: str):
-    return Mock(exit_status=0, stdout=stdout, stderr="")
-
-
-def _created(seconds_ago: int) -> str:
-    return datetime.fromtimestamp(HOST_NOW - seconds_ago, UTC).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+NEWER = "11111111-1111-1111-1111-111111111111"
+LEFTOVER = "22222222-2222-2222-2222-222222222222"
+CLOSED = PodRentalActiveResponse(active=False)
+ACTIVE = PodRentalActiveResponse(active=True, status="PENDING")
 
 
 @pytest.fixture(autouse=True)
@@ -40,44 +34,89 @@ def retry_ssh_mock(monkeypatch):
     return mock
 
 
-async def _sweep(inspect_stdout: str) -> tuple[list[str], AsyncMock]:
-    svc = DockerService(ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None)), attestation_service=Mock())
+async def _sweep(answers: dict, retry_ssh_mock, backend: bool = True) -> tuple[list[str], str]:
+    async def rental_active(pod_id):
+        answer = answers[pod_id]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    backend_client = Mock(get_pod_rental_active=AsyncMock(side_effect=rental_active)) if backend else None
+    svc = DockerService(
+        ssh_service=Mock(),
+        redis_service=Mock(get=AsyncMock(return_value=None)),
+        attestation_service=Mock(),
+        backend_client=backend_client,
+    )
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=[_result("pod_target\npod_newer\npod_leftover\n"), _result(inspect_stdout)])
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout=f"pod_target\npod_{NEWER}\npod_{LEFTOVER}\n", stderr=""))
     removed = await svc.clean_existing_containers(
-        ssh_client=ssh_client,
-        default_extra={},
-        pod_name="pod_target",
-        active_container_names=[],
-        request_received_monotonic=time.monotonic(),
+        ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[]
     )
-    return removed, ssh_client
+    if backend_client is not None:
+        # the create's own container is never asked about: its handling is unchanged
+        assert sorted(call.args[0] for call in backend_client.get_pod_rental_active.await_args_list) == [NEWER, LEFTOVER]
+    return removed, " ".join(call.args[1] for call in retry_ssh_mock.await_args_list)
 
 
 @pytest.mark.asyncio
-async def test_unlisted_pod_created_after_the_request_arrived_is_kept_with_its_volume(retry_ssh_mock):
-    removed, ssh_client = await _sweep(
-        f"{HOST_NOW}\n/pod_newer {_created(10)}\n/pod_leftover {_created(3600)}\n"
-    )
+async def test_an_active_pod_is_kept_and_a_closed_leftover_removed_with_its_volume(retry_ssh_mock):
+    removed, sent = await _sweep({NEWER: ACTIVE, LEFTOVER: CLOSED}, retry_ssh_mock)
 
-    assert removed == ["pod_target", "pod_leftover"]
-    inspect_command = ssh_client.run.await_args_list[1].args[0]
-    # the create's own container is never asked about: its handling is unchanged
-    assert "pod_target" not in inspect_command
-    sent = " ".join(call.args[1] for call in retry_ssh_mock.await_args_list)
-    assert "pod_newer" not in sent and "volume_newer" not in sent
-    assert "volume_leftover" in sent
+    assert removed == ["pod_target", f"pod_{LEFTOVER}"]
+    assert f"pod_{NEWER}" not in sent and f"volume_{NEWER}" not in sent
+    assert f"volume_{LEFTOVER}" in sent
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [None, ACTIVE, RuntimeError("backend down"), TimeoutError()],
+    ids=["no-answer", "active", "error", "timeout"],
+)
+@pytest.mark.asyncio
+async def test_a_pod_whose_rental_is_not_confirmed_closed_is_kept_with_its_volume(retry_ssh_mock, answer):
+    removed, sent = await _sweep({NEWER: answer, LEFTOVER: answer}, retry_ssh_mock)
+
+    assert removed == ["pod_target"]
+    assert f"volume_{NEWER}" not in sent and f"volume_{LEFTOVER}" not in sent
 
 
 @pytest.mark.asyncio
-async def test_unreadable_creation_times_remove_unlisted_pods_as_before(retry_ssh_mock):
-    removed, _ = await _sweep("no date here\n")
+async def test_no_backend_client_keeps_every_unlisted_pod(retry_ssh_mock):
+    removed, sent = await _sweep({}, retry_ssh_mock, backend=False)
 
-    assert removed == ["pod_target", "pod_newer", "pod_leftover"]
+    assert removed == ["pod_target"]
+    assert "volume_1" not in sent and "volume_2" not in sent
 
 
-def test_received_time_is_recorded_when_the_request_is_parsed():
-    before = time.monotonic()
-    payload = ContainerCreateRequest(miner_hotkey="hk", executor_id="ex", pod_id="p", docker_image="i", gpu_uuids=[])
-    assert before <= payload._received_monotonic <= time.monotonic()
-    assert "_received_monotonic" not in payload.model_dump_json()
+@pytest.mark.asyncio
+async def test_a_name_that_is_no_backend_pod_is_removed_without_asking(retry_ssh_mock):
+    backend_client = Mock(get_pod_rental_active=AsyncMock())
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock(), backend_client=backend_client)
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout="pod_stale\npod_stale__prev\n", stderr=""))
+
+    removed = await svc.clean_existing_containers(ssh_client=ssh_client, default_extra={}, pod_name="pod_target")
+
+    assert removed == ["pod_stale", "pod_stale__prev"]
+    backend_client.get_pod_rental_active.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_hung_backend_answer_is_bounded_and_keeps_the_pod(retry_ssh_mock, monkeypatch):
+    monkeypatch.setattr(ds_module, "_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS", 0.01)
+    never = asyncio.get_running_loop().create_future()
+
+    async def hang(_pod_id):
+        return await never
+
+    svc = DockerService(
+        ssh_service=Mock(),
+        redis_service=Mock(),
+        attestation_service=Mock(),
+        backend_client=Mock(get_pod_rental_active=hang),
+    )
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout=f"pod_{NEWER}\n", stderr=""))
+
+    assert await svc.clean_existing_containers(ssh_client=ssh_client, default_extra={}, pod_name="pod_target") == []
