@@ -98,8 +98,10 @@ async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_re_anchored(cont
     handler = ResultHandler(redis_service=service, dry_run=False)
     await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=False)
 
-    ok, event, _ = await _cycle(service, handler, context_factory, uuids=swapped, hard=False)
+    ok, event, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=False)
     assert ok is False and event.reason_code == "GPU_UUID_CHANGED"  # the swap cycle is still a reset
+    # anchored on the swap cycle itself, so a second swap while the node is held is still seen
+    assert record["uuids"] == anchored_after
 
     ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=False)
     assert record["uuids"] == anchored_after
