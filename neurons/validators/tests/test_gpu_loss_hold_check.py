@@ -145,6 +145,7 @@ async def test_a_rented_node_whose_card_reads_clean_again_stays_hidden_but_keeps
     # hidden, and not fatal under a live rental: the rented check still runs and the renter is not touched
     assert not result.passed and not _fatal(result) and _hidden(result)
     assert result.event.what_we_saw["hold_until"]
+    assert result.event.event == Msg.LOST.event
 
 
 @pytest.mark.asyncio
@@ -424,6 +425,8 @@ async def test_a_node_whose_whole_gpu_set_was_replaced_is_held(context_factory, 
         reanchored = _ctx(context_factory, redis, listed=replaced, pods=(), anchor=replaced)
         clean = await GpuLossHoldCheck().run(reanchored)
         assert _hidden(clean) and _fatal(clean)
+        # its clean cycles say the node relists on its own, not that a card dropped out (Viren 115dd68b, 28 Oct)
+        assert clean.event.event == Msg.SET_REPLACED.event and "do not remove" in clean.event.remediation
         # a second whole swap inside the hold is judged against the new anchor and starts the hold again
         third = [f"GPU-c0c{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
         again = await GpuLossHoldCheck().run(_ctx(context_factory, redis, listed=third, pods=(), anchor=replaced))
@@ -449,7 +452,7 @@ async def test_a_partly_replaced_set_is_held(context_factory, spot, pods):
 @pytest.mark.asyncio
 async def test_a_set_replaced_with_another_model_is_not_reported_as_re_anchored(context_factory):
     """Regression: cards replaced with another GPU model are not re-anchored (GpuFingerprintCheck), so the hold must
-    not say SET_REPLACED ("nothing to re-register") before the fingerprint's UUID_CHANGED ("re-register"), nor renew
+    not say SET_REPLACED ("do not remove or re-add") before the fingerprint's UUID_CHANGED ("re-register"), nor renew
     a replacement hold on every later cycle."""
     redis = FakeRedis()
     replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]

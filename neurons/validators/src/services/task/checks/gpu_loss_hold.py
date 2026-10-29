@@ -66,11 +66,13 @@ def _key(ctx: Context) -> str:
 
 @dataclass(frozen=True)
 class DropMark:
-    """The hold as kept in Redis; stored as {"held", "since", "last_seen"}."""
+    """The hold as kept in Redis; stored as {"held", "since", "last_seen", "replaced"}."""
 
     is_held: bool
     since: str
     last_seen: str
+    # the hold came from a whole replaced GPU set, not a lost card: its clean cycles say so
+    replaced: bool = False
 
     @classmethod
     def load(cls, raw: object) -> DropMark | None:
@@ -78,10 +80,14 @@ class DropMark:
         if not isinstance(loaded, dict) or not loaded.get("last_seen"):
             return None
         last_seen = loaded["last_seen"]
-        return cls(bool(loaded.get("held")), loaded.get("since") or last_seen, last_seen)
+        return cls(
+            bool(loaded.get("held")), loaded.get("since") or last_seen, last_seen, bool(loaded.get("replaced"))
+        )
 
     def dump(self) -> str:
-        return json.dumps({"held": self.is_held, "since": self.since, "last_seen": self.last_seen})
+        return json.dumps(
+            {"held": self.is_held, "since": self.since, "last_seen": self.last_seen, "replaced": self.replaced}
+        )
 
 
 def rented_pods(ctx: Context) -> list:
@@ -182,7 +188,7 @@ class GpuLossHoldCheck:
             return self._lost(ctx, mark, what, fatal=nvml_only and not pods)
 
         if replaced:
-            mark = DropMark(is_held=True, since=now.isoformat(), last_seen=now.isoformat())
+            mark = DropMark(is_held=True, since=now.isoformat(), last_seen=now.isoformat(), replaced=True)
             await self._save(ctx, key, mark, settings.GPU_LOSS_HOLD_SECONDS)
             # not fatal: GpuFingerprintCheck still runs and re-anchors the new cards this cycle
             return self._lost(
@@ -199,7 +205,9 @@ class GpuLossHoldCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
-        return self._lost(ctx, mark, {"faults": []}, fatal=not pods)
+        return self._lost(
+            ctx, mark, {"faults": []}, fatal=not pods, msg=Msg.SET_REPLACED if mark.replaced else Msg.LOST
+        )
 
     def _lost(
         self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool, msg=Msg.LOST

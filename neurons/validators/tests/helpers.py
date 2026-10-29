@@ -162,6 +162,13 @@ class FakeRedis:
         self.store[key] = value
         self.ttl[key] = ex
 
+    async def pttl(self, key: str) -> int:
+        self._touch()
+        if key not in self.store:
+            return -2
+        ttl = self.ttl.get(key)
+        return -1 if ttl is None else ttl * 1000
+
     async def write_atomically(self, writes):
         """`RedisService.write_atomically`: all of `writes` or none. `fail_delete_of` names keys whose
         DELETE fails the whole batch (the shape of a connection lost mid-transaction); the set hooks

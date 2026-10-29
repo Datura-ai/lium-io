@@ -1,6 +1,7 @@
 import json
 import asyncio
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, NamedTuple
@@ -49,6 +50,29 @@ SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
 SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
+
+
+def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
+    # the UUID is the miner's word: keyed with the hotkey, a node copying it cannot set or clear the owner's stamp
+    return f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{miner_hotkey}:{executor_uuid}"
+
+
+async def get_or_adopt_legacy(redis, key: str, legacy_key: str):
+    """`key`'s value; on a miss, the pre-hotkey `legacy_key`'s, saved under `key` with the TTL it had left
+    (a deploy keeps open state, and a carried-over stamp expires when it would have)."""
+    raw = await redis.get(key)
+    if raw is not None:
+        return raw
+    raw = await redis.get(legacy_key)
+    if raw is None:
+        return None
+    pttl_ms = await redis.pttl(legacy_key)
+    if pttl_ms == -2:  # expired between the two reads
+        return None
+    await redis.set(key, raw, ex=None if pttl_ms < 0 else max(1, math.ceil(pttl_ms / 1000)))
+    return raw
+
+
 # sshd_bootstrap.sh's verify_sshd line: sshd is installed but not running or listening
 SSHD_VERIFY_FAILED_MARKER = "sshd verification failed"
 # where the sshd bootstrap script is copied in a filler container
@@ -412,6 +436,11 @@ class RedisService:
         """Get a value by key from Redis."""
         async with self.lock:
             return await self.redis.get(key)
+
+    async def pttl(self, key: str) -> int:
+        """Milliseconds `key` has left; -1 with no expiry, -2 when it does not exist."""
+        async with self.lock:
+            return await self.redis.pttl(key)
 
     async def mget(self, keys: list[str]) -> list:
         """Several GETs in one round trip and one lock hold; None for a missing key."""
