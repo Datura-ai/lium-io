@@ -58,7 +58,7 @@ class JobResult(BaseModel):
     # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
-    # DAH-3698: free GPUs of the remainder left out of the idle pool for want of MIN_PORT_COUNT free ports per split
+    # DAH-3698: free GPUs of the remainder left out of the idle pool for want of a free port per split
     port_unpaid_gpu_count: int = 0
     is_spot: bool = False
     # in the backend's provider_spot_executor_ids, the spot pay list: set to Spot by its provider, or
