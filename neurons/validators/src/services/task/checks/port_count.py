@@ -9,6 +9,14 @@ from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
+from .port_connectivity import external_pass_key
+
+
+async def _passed_outside_probe(ctx: Context) -> bool:
+    try:
+        return await ctx.services.redis.get(external_pass_key(ctx.miner_hotkey, ctx.executor.uuid)) is not None
+    except Exception:
+        return True  # a Redis outage keeps the filler count (the pre-DAH-4537 behaviour), not a fleet-wide delist
 
 
 def port_count_below_listing_floor(state: ContextState) -> int | None:
@@ -86,13 +94,18 @@ class PortCountCheck:
         probed = list((ctx.state.specs or {}).get("verified_ports") or [])
         # an outside-unreachable node's filler ports are firewalled too, so they cannot lift it over the floor
         held = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data and not ctx.state.externally_unreachable else []
-        filler_ports = sorted(set(held) - set(probed))
-        verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
-        port_count = ctx.state.verified_port_count + len(filler_ports)
 
         # Check if executor is rented (same pattern as rented_machine.py)
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
+
+        # fillers hold every port, so this cycle has no outside evidence: they count only if the last
+        # cycle with a free port passed the outside probe
+        if held and not is_rented and ctx.state.probed_port_count == 0 and not await _passed_outside_probe(ctx):
+            held = []
+        filler_ports = sorted(set(held) - set(probed))
+        verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
+        port_count = ctx.state.verified_port_count + len(filler_ports)
 
         updated_state = replace(
             ctx.state,

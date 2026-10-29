@@ -35,7 +35,8 @@ from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.service import ExecutorConnectivityService
 
-from tests.helpers import build_context_config, build_services, build_state
+from neurons.validators.src.services.task.checks.port_connectivity import external_pass_key
+from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_rented_machine_check import DummyBackendClient, DummySSHClient
 
 DECLARED_RANGE = "40000-65535"
@@ -208,6 +209,8 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     count_result, ctx = await apply(ctx, PortCountCheck())
 
     assert connectivity_result.passed is True
+    # DAH-4537: a cycle that passed with free ports leaves the record a fully filled cycle reads
+    ctx.services.redis.set.assert_any_await(external_pass_key("miner-hotkey", "executor-123"), "1", ex=7 * 24 * 3600)
     # one sample of the lowest 300 ports out of 25,536 declared; a partial batch is final
     assert len(batch.calls[0]) == BATCH_PORT_VERIFICATION_SIZE
     assert batch.calls[0][0] == PortPair(40000, 40000)
@@ -601,3 +604,34 @@ async def test_an_externally_unreachable_idle_node_cannot_pass_the_floor_on_fill
     assert result.passed is False
     assert result.updates["port_count"] == 0
     assert result.updates["state"].specs["verified_ports"] == []
+
+
+def _fully_filled(services, rented=False):
+    rented_data = RentedExecutorsResponse(
+        executors=rented_with_one_pod().executors if rented else {},
+        filler_ports_by_executor={"executor-123": [2001, 2002, 2003]},
+    )
+    state = build_state(verified_port_count=0, probed_port_count=0, specs={"verified_ports": []}, rented_data=rented_data)
+    return state, services
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record, passes", [(False, False), (True, True)])
+async def test_a_fully_filled_idle_node_counts_its_filler_only_after_an_outside_pass(context_factory, record, passes):
+    """DAH-4537 review 5701429544: with fillers on every port nothing is probed, so the filler counts
+    only if the last cycle with a free port passed the outside probe; a firewalled node never does."""
+    redis = FakeRedis()
+    if record:
+        redis.store[external_pass_key("miner-hotkey", "executor-123")] = "1"
+    state, services = _fully_filled(build_services(redis=redis))
+    result = await PortCountCheck().run(context_factory(state=state, services=services))
+
+    assert result.passed is passes
+    assert result.updates["port_count"] == (3 if passes else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_keeps_the_fully_filled_count(context_factory):
+    state, services = _fully_filled(build_services(redis=FakeRedis(failing=True)))
+    result = await PortCountCheck().run(context_factory(state=state, services=services))
+    assert result.passed is True

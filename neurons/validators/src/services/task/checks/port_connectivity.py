@@ -13,6 +13,14 @@ from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
+# DAH-4537: the last cycle with a free port passed the outside probe. PortCountCheck reads it when
+# fillers hold every port, so nothing is left to probe (review 5701429544).
+EXTERNAL_PASS_SECONDS = 7 * 24 * 3600
+
+
+def external_pass_key(miner_hotkey: str, executor_uuid: str) -> str:
+    return f"port_external_pass:{miner_hotkey}:{executor_uuid}"
+
 
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
@@ -93,6 +101,16 @@ class PortConnectivityCheck:
             dind_probe_error=result.dind_error,
             externally_unreachable=result.status == "externally_unreachable",
         )
+
+        if result.status in ("ok", "externally_unreachable"):
+            key = external_pass_key(ctx.miner_hotkey, ctx.executor.uuid)
+            try:
+                if result.status == "ok":
+                    await ctx.services.redis.set(key, "1", ex=EXTERNAL_PASS_SECONDS)
+                else:
+                    await ctx.services.redis.delete(key)
+            except Exception as e:  # the record only matters on a fully filled cycle; never fail this check on it
+                logger.warning(_m(f"external pass record not written: {e}", extra=get_extra_info(extra)))
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
             extra_info["sysbox_downgrade_tolerated"] = True
