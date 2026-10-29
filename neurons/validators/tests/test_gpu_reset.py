@@ -6,11 +6,16 @@ inside the pod, and a stopped container is always started again.
 """
 
 import json
+import os
+import re
+import shlex
+import subprocess
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from payload_models.payloads import GpuResetErrorCode
 from services.gpu_reset import (
+    build_fabric_reset_command,
     build_reset_command,
     parse_host_gpus,
     parse_nvlink_peers,
@@ -76,6 +81,7 @@ class FakeHost:
         self.fm_start_ok = fm_start_ok
         self.active_during_reset: dict[str, bool] | None = None
         self.reset_raises = False
+        self.fm_log: list[tuple[str, str]] = []
 
     async def run(self, cmd: str, *, timeout: int = 60, retryable: bool = True, **_):
         self.commands.append(cmd)
@@ -99,8 +105,24 @@ class FakeHost:
             pids = [int(p) for p in cmd.split(";")[0].split()[3:]]
             out = "\n".join(f"{pid} {self.cgroups[pid]} " for pid in pids if pid in self.cgroups)
             return make_command_result(True, out)
+        if cmd.startswith("nsenter -t 1 -m -- systemd-run "):
+            # the host unit: stop, reset, start again, whatever happens to the SSH session
+            script = shlex.split(cmd)[-1]
+            units = re.search(r"for u in (.*?); do systemctl stop", script).group(1).split()
+            for unit in units:
+                self.active[unit] = False
+                self.fm_log.append(("stop", unit))
+            self.commands.append(re.search(r"\{ (nvidia-smi -r [^;]*);", script).group(1))
+            self.active_during_reset = dict(self.active)
+            for unit in reversed(units):
+                self.active[unit] = unit != "nvidia-fabricmanager" or self.fm_start_ok
+                self.fm_log.append(("start", unit))
+            if self.reset_raises:
+                raise RuntimeError("ssh dropped")
+            return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
         if cmd.startswith("nsenter -t 1 -m -- systemctl "):
             verb, unit = cmd.split()[-2:]
+            self.fm_log.append((verb, unit))
             if verb == "is-active":
                 up = self.active[unit]
                 return make_command_result(up, "active" if up else "inactive", exit_code=0 if up else 3)
@@ -233,7 +255,7 @@ CHECK_BOTH = [("is-active", FM), ("is-active", NVLSM)]
 
 
 def _fm_commands(host: FakeHost) -> list[tuple[str, str]]:
-    return [tuple(cmd.split()[-2:]) for cmd in host.commands if cmd.startswith("nsenter -t 1 -m -- systemctl")]
+    return host.fm_log
 
 
 @pytest.mark.asyncio
@@ -251,6 +273,7 @@ async def test_a_fabric_manager_node_the_pod_owns_whole_stops_fm_around_the_rese
     assert report.ok and {g.uuid for g in report.gpus} == set(U)
     assert host.active_during_reset == {FM: False, NVLSM: False} and host.active[FM]
     assert _fm_commands(host) == [*CHECK_BOTH, ("stop", FM), ("start", FM), ("is-active", FM)]
+    assert sum("systemd-run" in cmd for cmd in host.commands) == 1
     start.assert_awaited_once()
 
 
@@ -266,8 +289,8 @@ async def test_nvlsm_is_stopped_after_fm_and_started_before_it():
         ("stop", FM),
         ("stop", NVLSM),
         ("start", NVLSM),
-        ("is-active", NVLSM),
         ("start", FM),
+        ("is-active", NVLSM),
         ("is-active", FM),
     ]
 
@@ -289,6 +312,34 @@ async def test_fabric_manager_is_started_again_when_the_reset_fails():
     report, start = await _reset(host, backend=U)
     assert not report.ok and host.active == {FM: True, NVLSM: True}
     start.assert_awaited_once()
+
+
+def _run_fabric_script(tmp_path, *, stop_fails=False, reset_exit=0):
+    """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl and nvidia-smi."""
+    log = tmp_path / "log"
+    for name, body in (
+        ("systemctl", f'echo "$1 $2" >> {log}; [ "$1" = stop ] && [ -n "$STOP_FAILS" ] && exit 1; exit 0'),
+        ("nvidia-smi", f'echo "reset $*" >> {log}; exit {reset_exit}'),
+    ):
+        (tmp_path / name).write_text(f"#!/bin/sh\n{body}\n")
+        (tmp_path / name).chmod(0o755)
+    cmd = build_fabric_reset_command([FM, NVLSM], f"nvidia-smi -r -i {U[0]}")
+    assert cmd.startswith("nsenter -t 1 -m -- systemd-run ")
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": "1" if stop_fails else ""}
+    done = subprocess.run(["/bin/sh", "-c", shlex.split(cmd)[-1]], env=env, capture_output=True, text=True)
+    return done, log.read_text().splitlines()
+
+
+def test_the_host_unit_starts_the_fabric_again_after_a_failed_reset(tmp_path):
+    done, log = _run_fabric_script(tmp_path, reset_exit=3)
+    assert done.returncode == 3
+    assert log == [f"stop {FM}", f"stop {NVLSM}", f"reset -r -i {U[0]}", f"start {NVLSM}", f"start {FM}"]
+
+
+def test_the_host_unit_skips_the_reset_when_a_stop_fails_and_still_starts_the_fabric(tmp_path):
+    done, log = _run_fabric_script(tmp_path, stop_fails=True)
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT and f"could not stop {FM}" in done.stderr
+    assert log == [f"stop {FM}", f"start {NVLSM}", f"start {FM}"]
 
 
 @pytest.mark.asyncio
