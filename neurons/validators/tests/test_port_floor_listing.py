@@ -68,15 +68,17 @@ class HostNetworkBatch:
 
 
 class PublishedPorts:
-    """A -p tier: Docker's DNAT path, the one a renter's pod uses, answers on every port it publishes."""
+    """A -p tier: Docker's DNAT path, the one a renter's pod uses, answers on every port it publishes
+    (only the first `reachable` when set)."""
 
-    def __init__(self):
+    def __init__(self, reachable: int | None = None):
+        self.reachable = reachable
         self.calls: list[list[PortPair]] = []
 
     async def verify(self, ports, *, ssh_client, host, max_ports, log_ctx=None):
         tested = list(ports[:max_ports])
         self.calls.append(tested)
-        return tested, []
+        return tested[: self.reachable], tested[self.reachable :] if self.reachable is not None else []
 
 
 class DindOk:
@@ -621,7 +623,7 @@ async def test_an_8_gpu_split_node_needs_its_ports_once_every_listed_pod_is_stal
     pods = {"stale": ("pod-stale",), "live": ("pod-stale", "pod-live"), "unresolved": ("pod-stale", "pod-unknown")}
     ctx = run_context(
         context_factory,
-        connectivity(HostNetworkBatch(reachable=ports), PublishedPorts(), PublishedPorts()),
+        connectivity(HostNetworkBatch(reachable=ports), PublishedPorts(ports), PublishedPorts(ports)),
         rented_data=rented_with_pods(*pods[rental]),
         ssh=PerPodSSHClient(running={"container_pod-live"}),
         backend=NoRecordForSecondPod(active={"pod-live"}),
@@ -640,3 +642,29 @@ async def test_an_8_gpu_split_node_needs_its_ports_once_every_listed_pod_is_stal
     if expected:
         assert tenant_result.event.reason_code == expected
         assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-stale"
+
+
+@pytest.mark.asyncio
+async def test_a_split_node_with_every_port_open_passes_when_its_only_listed_pod_is_stale(context_factory):
+    """Rented at the snapshot, the probe still goes on to the tier that reaches every port, so the stale-pod
+    branch judges the node's real count and does not hide a node that has all its ports open."""
+    from dataclasses import replace
+
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=3), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-stale"),
+        ssh=PerPodSSHClient(running=set()),
+        backend=PerPodBackendClient(active=set()),
+    )
+    ctx = ctx.model_copy(
+        update={"state": replace(ctx.state, gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=1)}
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert count_result.passed is True
+    assert ctx.state.specs["available_port_count"] >= 24
+    assert tenant_result.passed is True
