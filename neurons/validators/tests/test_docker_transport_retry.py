@@ -143,6 +143,24 @@ async def test_create_volume_retry_refuses_a_same_name_volume_on_another_driver(
     assert api.calls == ["create_volume", "inspect_volume"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_driver, adopted", [("vloopback:v2", False), ("vloopback", True)])
+async def test_adopt_takes_a_same_name_volume_only_from_the_requested_plugin_tag(requested_driver, adopted):
+    # `vloopback` is `vloopback:latest`, the old plugin; `vloopback:v2` is another plugin
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_volume_errors = [EOFError()]
+    api.existing_volumes["volume_p1"] = {"Name": "volume_p1", "Driver": "vloopback:latest"}
+    created = _client(api).create_volume(volume_name="volume_p1", driver=requested_driver, driver_opts={"size": "10g"})
+
+    if adopted:
+        await created
+    else:
+        with pytest.raises(RentalDockerOperationError, match="already exists on driver 'vloopback:latest'"):
+            await created
+
+    assert api.calls == ["create_volume", "inspect_volume"]
+
+
 # ---------------------------------------------------------------------------
 # run container: create is never run twice without the name check
 # ---------------------------------------------------------------------------
@@ -161,6 +179,49 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
         await _client(api).run_container(_run_spec())
 
     assert api.calls == ["create_container", "inspect_container"]
+
+
+# ---------------------------------------------------------------------------
+# pull: the stream cut mid-pull (27 Oct alert ece89) → one re-open and one more pull
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pull_cut_mid_stream_is_retried_once_after_reopen():
+    import http.client
+
+    adapter = _FakeAdapter()
+    client = _client(_FakeApiClient(adapter=adapter))
+    errors = [http.client.IncompleteRead(b"")]
+    pulls = []
+
+    def pull_sync(image):
+        pulls.append(image)
+        if errors:
+            raise errors.pop(0)
+
+    client._pull_sync = pull_sync
+    await client.pull(image="daturaai/pytorch:x")
+
+    assert pulls == ["daturaai/pytorch:x", "daturaai/pytorch:x"]
+    assert adapter.reopen_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pull_refused_by_the_registry_is_not_retried():
+    adapter = _FakeAdapter()
+    client = _client(_FakeApiClient(adapter=adapter))
+    pulls = []
+
+    def pull_sync(image):
+        pulls.append(image)
+        raise RuntimeError("manifest unknown")
+
+    client._pull_sync = pull_sync
+    with pytest.raises(RentalDockerOperationError, match="Docker SDK pull failed: manifest unknown"):
+        await client.pull(image="nope/nope:1")
+
+    assert len(pulls) == 1 and adapter.reopen_calls == 0
 
 
 # ---------------------------------------------------------------------------

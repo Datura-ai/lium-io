@@ -15,6 +15,7 @@ import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.redis_service import get_or_adopt_legacy
 
 from ..messages import RegistryPullMessages as Msg
 from ..messages import render_message
@@ -549,7 +550,11 @@ class RegistryPullCheck:
 
     async def _load(self, ctx: Context) -> _ProbeState | None:
         try:
-            raw = await ctx.services.redis.get(f"{_REDIS_PREFIX}:{ctx.executor.uuid}")
+            raw = await get_or_adopt_legacy(
+                ctx.services.redis,
+                _state_key(ctx),
+                f"{_REDIS_PREFIX}:{ctx.executor.uuid}",
+            )
         except Exception as exc:
             logger.warning(
                 _m(
@@ -564,7 +569,7 @@ class RegistryPullCheck:
     async def _save(self, ctx: Context, state: _ProbeState) -> None:
         try:
             await ctx.services.redis.set(
-                f"{_REDIS_PREFIX}:{ctx.executor.uuid}", state.as_json(), ex=_REDIS_TTL_SECONDS
+                _state_key(ctx), state.as_json(), ex=_REDIS_TTL_SECONDS
             )
         except Exception:
             logger.warning(
@@ -583,6 +588,11 @@ class RegistryPullCheck:
             what["last"] = last
         event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
+
+
+def _state_key(ctx: Context) -> str:
+    # with the hotkey: a node copying another miner's UUID cannot overwrite the owner's last pull
+    return f"{_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
 
 
 def _is_rented(ctx: Context) -> bool:

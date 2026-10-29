@@ -11,7 +11,7 @@ HOW A NODE PICKS A POOL:
                                                           mining score is zeroed, e.g. Sysbox
                                                           not confirmed; reason below)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
-       AND (not flagship-8x OR NCU/split/attested-CVM offered) AND power cap appliable
+       AND (not full-8x OR NCU/split/attested-CVM offered) AND power cap appliable
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
@@ -47,7 +47,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      score gate: CPU truth, an outdated image, a rented node's halt) is not a
      failed check and gets no Group C reason
    Every reason that applies is recorded, in the order above: a node blocked by Discord
-   still learns that its 8x flagship gate blocks it too. The first entry is the one the
+   still learns that its 8x gate blocks it too. The first entry is the one the
    old first-match evaluation reported.
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
@@ -81,7 +81,7 @@ from services.executor_image_policy import outdated_image_remediation
 if TYPE_CHECKING:
     from incentive.rental_price import (
         InsufficientDisk,
-        MissingFlagshipCapability,
+        MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
     )
@@ -100,6 +100,7 @@ class ZeroIncentiveReason(StrEnum):
     SPOT_TIER = "spot_tier"
     PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
     NEW_RENTALS_PAUSED = "new_rentals_paused"
+    PROVIDER_MAINTENANCE = "provider_maintenance"
     MINER_DEFAULT_JOB = "miner_default_job"
     HOTKEY_EXCLUDED_FROM_SCORING = "hotkey_excluded_from_scoring"
     # Group B: idle but not qualified for the unrented pool
@@ -109,7 +110,7 @@ class ZeroIncentiveReason(StrEnum):
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
-    FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
+    FULL_8X_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"  # wire code, append-only: consumers key on it (DAH-5197 keeps the value)
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
@@ -286,6 +287,18 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
+    def no_payout_because_provider_maintenance(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PROVIDER_MAINTENANCE,
+            message=(
+                "No subnet incentive: this executor is in a maintenance window and earns nothing "
+                "until the window ends or you click I have finished."
+            ),
+            internal_message="Executor excluded from both pools - provider maintenance window",
+        )
+
+    @staticmethod
     def no_payout_because_running_own_default_job(result: JobResult) -> MinerLogLine:
         return MinerLogLine._no_payout(
             result,
@@ -436,12 +449,12 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_flagship_without_ncu_or_split(
-        result: JobResult, missing: MissingFlagshipCapability
+    def no_payout_because_full_8x_without_ncu_or_split(
+        result: JobResult, missing: MissingFull8xCapability
     ) -> MinerLogLine:
         return MinerLogLine._no_payout(
             result,
-            reason=ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+            reason=ZeroIncentiveReason.FULL_8X_WITHOUT_NCU_OR_SPLIT,
             message=(
                 f"No unrented incentive: an idle {result.gpu_count}x {result.gpu_model} must offer "
                 "NCU profiling, GPU splitting or confidential computing. Either open the host "
@@ -695,7 +708,9 @@ class MinerLogLine(BaseModel):
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
                 "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
-                f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate); "
+                f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate) "
+                "* spot_pool_multiplier (below 1 when the GPU model's spot nodes together would be paid "
+                "more than its fillers earn per hour, filler_revenue_usd_per_hour); "
                 "paid on top of the rental share (paid_fraction < 1: the pool had room for only "
                 "that part of spot pay and floor top-ups)"
             ),
@@ -710,6 +725,8 @@ class MinerLogLine(BaseModel):
                 "sysbox_multiplier": result.sysbox_multiplier,
                 "driver_multiplier": result.driver_multiplier,
                 "secure_rate": secure_rate,
+                "filler_revenue_usd_per_hour": result.filler_revenue_usd_per_hour,
+                "spot_pool_multiplier": result.spot_pool_multiplier,
                 "effective_rate": result.effective_rate,
                 "rental_share": result.rental_share,
                 "burn_share": result.burn_share,
