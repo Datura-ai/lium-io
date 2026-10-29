@@ -82,6 +82,7 @@ def build_rented_data(
             container_name=c.get("name", "container"),
             rented_ports=[],
             created_at=c.get("created_at"),
+            status=c.get("status"),
         )
         for c in containers
     ]
@@ -1595,3 +1596,18 @@ async def test_a_container_the_cleanup_reaped_this_cycle_is_not_gpu_usage_outsid
     assert result.passed is passed
     expected = Msg.ALREADY_RENTED.reason if passed else Msg.GPU_OUTSIDE_TENANT.reason
     assert result.event.reason_code == expected
+
+
+@pytest.mark.asyncio
+async def test_unnamed_pod_whose_create_is_still_running_after_the_grace_is_not_penalised(context_factory):
+    # a custom-Dockerfile build keeps the pod PENDING with no container for longer than the grace
+    created_at = datetime.now(UTC) - timedelta(minutes=POD_CONTAINER_NAME_GRACE_MINUTES + 20)
+    pods = {"containers": [{"name": "", "pod_id": "53a68595", "created_at": created_at, "status": "PENDING"}]}
+    ssh = DummySSHClient(pod_running=False)
+    ctx = _unnamed_pod_ctx(context_factory, ssh, [], DummyBackendClient(active=True), pods)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert "clear_verified_job_reason" not in result.updates
