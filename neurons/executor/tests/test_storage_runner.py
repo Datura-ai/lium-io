@@ -227,6 +227,34 @@ def test_backup_repository_probe_retries_transient_access_denied(
     assert '"event":"heartbeat"' in event_output.getvalue()
 
 
+def test_backup_repository_probe_retries_closed_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    clock = _RetryClock()
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error='Stat: Head "https://bucket/restic/config": Connection closed by foreign host',
+            ),
+            _repository_command_result(0, standard_output="[]"),
+        ]
+    )
+
+    monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    runner._ensure_repository_for_backup()
+
+    assert [command[2] for command in repository_command_sequence.commands] == [
+        "snapshots",
+        "snapshots",
+    ]
+
+
 def test_backup_repository_initialization_retries_transient_access_denied(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

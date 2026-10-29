@@ -930,7 +930,8 @@ class ResticStorageRunner:
 def _is_retryable_repository_failure(failure_detail: str) -> bool:
     # Restic treats AccessDenied as permanent and does not retry it, but AWS can
     # return it temporarily while a newly attached IAM policy is propagating.
-    retryable_failure_markers = ("accessdenied",)
+    # 28-29 Oct: 7 auto backups failed the probe on "Connection closed by foreign host" in hourly bursts.
+    retryable_failure_markers = ("accessdenied", "connectionclosedbyforeignhost")
     # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
     normalized_detail = "".join(failure_detail.casefold().split())
     return any(marker in normalized_detail for marker in retryable_failure_markers)
