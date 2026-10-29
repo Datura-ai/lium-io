@@ -2441,6 +2441,9 @@ def _build_gocryptfs_setup_and_mount_script(
     # time, so a missing gocryptfs.conf means the ciphertext is gone. Re-initialising it there would
     # hand the customer an empty volume, report the start as a success and spare the miner the
     # penalty for data they destroyed. Only pod creation initialises.
+    # -kernel_cache: without it every open() of a file drops its page cache, and on kernel 6.8 two such opens racing
+    # a backup read of the same file spun forever in invalidate_inode_pages2 and hung the host (DAH-5363). Only this
+    # mount writes the ciphertext, so the kept cache cannot go stale.
     plaintext = shlex.quote(plaintext_path)
     passfile = shlex.quote(passfile_path)
     mount_check = (
@@ -2473,7 +2476,7 @@ if [ ! -f {_LIUM_CIPHER_MOUNT}/gocryptfs.conf ]; then
 {_shell_branch_when_gocryptfs_config_missing(allow_init)}
 fi
 if ! {mount_check}; then
-  gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
+  gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -kernel_cache -o allow_other -nonempty
 fi
 """
 

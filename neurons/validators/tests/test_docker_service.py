@@ -7623,6 +7623,15 @@ def test_gocryptfs_script_still_initialises_at_create_time():
     assert "gocryptfs -init /lium-cipher -scryptn 10 " in script
 
 
+def test_gocryptfs_mount_keeps_the_page_cache_on_open():
+    # without -kernel_cache each open() invalidates the file's page cache; on 6.8 that livelocked a host mid-backup
+    script = docker_service_module._build_gocryptfs_setup_and_mount_script(
+        "/workspace", pad_hex="00", wrapped_hex="00", pad_var="_a", wrapped_var="_b", passfile_path="/tmp/pf"
+    )
+
+    assert "-kernel_cache" in script
+
+
 @pytest.mark.asyncio
 async def test_recover_pod_declines_when_the_container_inspect_fails(docker_service, monkeypatch):
     # an inspect that does not answer cannot rule out an encrypted volume, so recovery stands down
