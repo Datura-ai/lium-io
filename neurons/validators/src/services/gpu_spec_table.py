@@ -244,7 +244,7 @@ def reference_gpu_model(name: str | None, vram_mb: int | None) -> str | None:
         return canonical
     if not canonical.startswith("NVIDIA "):
         return None
-    return pick_reference(vram_mb)
+    return pick_reference(vram_mb, canonical)
 
 
 def matmul_probe_vram_mb(model: str | None, reported_vram_mb: int | None = None) -> int | None:
