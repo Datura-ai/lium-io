@@ -1002,11 +1002,12 @@ def custom_build_log_tail(output: str | None) -> str | None:
 def custom_build_export_timeout(
     size_bytes: int | None, floor_s: int, elapsed_s: float, min_bytes_per_s: int, budget_s: int
 ) -> int:
-    """Seconds the image export may take: the image's size at `min_bytes_per_s`, never below
-    `floor_s` (the build timeout, what the export always had) and never past what is left of
-    `budget_s` after `elapsed_s` (the backend fails a pod still PENDING after 1 h)."""
+    """Seconds the image export may take: the image's size at `min_bytes_per_s`, at least
+    `floor_s` (the build timeout), but never past what is left of `budget_s` after `elapsed_s`
+    (the backend fails a pod still PENDING after 1 h): the budget wins over the floor."""
     scaled = math.ceil(size_bytes / min_bytes_per_s) if size_bytes else 0
-    return max(floor_s, min(scaled, int(budget_s - elapsed_s)))
+    # at least 1: the streamer reads a 0 timeout as no timeout
+    return max(1, min(max(floor_s, scaled), int(budget_s - elapsed_s)))
 
 
 def stream_timed_out(err: str | None) -> bool:

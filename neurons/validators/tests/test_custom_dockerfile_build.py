@@ -667,9 +667,12 @@ def test_A20_export_timeout_scales_with_image_size_within_the_pending_budget():
     assert custom_build_export_timeout(2 * gib, 1200, 950, 10 * 1024**2, 3300) == 1200
     # a 20 GiB image at 10 MiB/s needs 2048 s, more than the build timeout
     assert custom_build_export_timeout(20 * gib, 1200, 950, 10 * 1024**2, 3300) == 2048
-    # never past what is left of the budget, never below the build timeout
+    # never past what is left of the budget, even when that is below the build timeout
     assert custom_build_export_timeout(40 * gib, 1200, 950, 10 * 1024**2, 3300) == 2350
-    assert custom_build_export_timeout(40 * gib, 1200, 3000, 10 * 1024**2, 3300) == 1200
+    assert custom_build_export_timeout(40 * gib, 1200, 3000, 10 * 1024**2, 3300) == 300
+    assert custom_build_export_timeout(None, 1200, 3000, 10 * 1024**2, 3300) == 300
+    # budget spent: 1 s, never 0 (the streamer reads 0 as no timeout)
+    assert custom_build_export_timeout(None, 1200, 3400, 10 * 1024**2, 3300) == 1
 
 
 @pytest.mark.asyncio
