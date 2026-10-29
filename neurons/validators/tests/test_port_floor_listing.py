@@ -210,7 +210,7 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
 
     assert connectivity_result.passed is True
     # DAH-4537: a cycle that passed with free ports leaves the record a fully filled cycle reads
-    ctx.services.redis.set.assert_any_await(external_pass_key("miner-hotkey", "executor-123"), "1", ex=7 * 24 * 3600)
+    ctx.services.redis.set.assert_any_await(external_pass_key("miner-hotkey", "executor-123"), "1")
     # one sample of the lowest 300 ports out of 25,536 declared; a partial batch is final
     assert len(batch.calls[0]) == BATCH_PORT_VERIFICATION_SIZE
     assert batch.calls[0][0] == PortPair(40000, 40000)
@@ -635,3 +635,25 @@ async def test_a_redis_outage_keeps_the_fully_filled_count(context_factory):
     state, services = _fully_filled(build_services(redis=FakeRedis(failing=True)))
     result = await PortCountCheck().run(context_factory(state=state, services=services))
     assert result.passed is True
+
+
+class OutsideBlockedBatch:
+    """The validator reaches the sampled ports, the outside prober none of them."""
+
+    async def verify(self, ports, *, ssh_client, host, log_ctx=None):
+        return BatchResult(list(ports), [], external_blocked=True)
+
+
+@pytest.mark.asyncio
+async def test_an_outside_failure_removes_the_pass_record(context_factory):
+    ctx = run_context(
+        context_factory,
+        connectivity(OutsideBlockedBatch(), PublishedPorts(), PublishedPorts()),
+        backend=RentalsBackendClient(None),
+    )
+
+    result, ctx = await apply(ctx, PortConnectivityCheck())
+
+    assert ctx.state.externally_unreachable is True
+    ctx.services.redis.delete.assert_awaited_once_with(external_pass_key("miner-hotkey", "executor-123"))
+    ctx.services.redis.set.assert_not_awaited()

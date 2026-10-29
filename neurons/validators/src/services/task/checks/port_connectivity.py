@@ -14,8 +14,8 @@ from ..pipeline import CheckResult, Context
 logger = logging.getLogger(__name__)
 
 # DAH-4537: the last cycle with a free port passed the outside probe. PortCountCheck reads it when
-# fillers hold every port, so nothing is left to probe (review 5701429544).
-EXTERNAL_PASS_SECONDS = 7 * 24 * 3600
+# fillers hold every port, so nothing is left to probe (review 5701429544). No TTL: a fully filled node
+# cannot refresh it, so only an observed outside failure removes it (review 5701706549).
 
 
 def external_pass_key(miner_hotkey: str, executor_uuid: str) -> str:
@@ -106,7 +106,7 @@ class PortConnectivityCheck:
             key = external_pass_key(ctx.miner_hotkey, ctx.executor.uuid)
             try:
                 if result.status == "ok":
-                    await ctx.services.redis.set(key, "1", ex=EXTERNAL_PASS_SECONDS)
+                    await ctx.services.redis.set(key, "1")
                 else:
                     await ctx.services.redis.delete(key)
             except Exception as e:  # the record only matters on a fully filled cycle; never fail this check on it
