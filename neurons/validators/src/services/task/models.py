@@ -63,6 +63,7 @@ class JobResult(BaseModel):
     # force-spot by a penalty demotion; not a banned hotkey, pin or no-incentive rental. Gates spot-node pay.
     is_on_spot_pay_list: bool = False
     is_new_rentals_paused: bool = False
+    is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False
     # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS: no incentive from any pool, set
     # by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
@@ -74,6 +75,9 @@ class JobResult(BaseModel):
     has_lium_filler: bool = False  # the backend lists at least one active Lium filler container on the node
     # the node's GPU configuration's average filler USD per GPU-hour; None = no usable sample
     filler_revenue_per_gpu_hour: float | None = None
+    # DAH-5128: what Lium's fillers earn per hour in total on the node's GPU model; the most all its
+    # idle spot nodes are paid together. None = no usable sample
+    filler_revenue_usd_per_hour: float | None = None
 
     # tdx attestation relevant fields
     attestation_digest: str | None = None
@@ -111,6 +115,9 @@ class JobResult(BaseModel):
     # Such a copy under the keeper's own executor UUID: one backend row, so it is not published
     # and the row hears only the copy that kept the score.
     duplicate_shares_kept_row: bool = Field(default=False, exclude=True)
+    # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
+    # from; scored like the cycle it came from, never published
+    carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
@@ -138,6 +145,9 @@ class JobResult(BaseModel):
     eligible_for_rental_share: bool = False
     # spot-node pay: set on a spot node that qualifies; its effective_rate is then the paid rate
     spot_pay_candidate: bool = False
+    # the share of its own spot rate a spot node is paid: below 1 when its GPU model's spot nodes would
+    # together be paid more than the model's fillers earn per hour (filler_revenue_usd_per_hour)
+    spot_pool_multiplier: float | None = None
     # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
     # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
     # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),

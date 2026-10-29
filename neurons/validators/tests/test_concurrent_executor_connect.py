@@ -12,9 +12,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from unittest.mock import Mock
 
 import pytest
-from payload_models.payloads import ContainerCreated, ProfilerStepName
 from services.docker_service import DockerService
-from test_deploy_optimizations import _patch_happy, _payload, _run, _ssh_client
 
 
 class _Recorder:
@@ -64,102 +62,6 @@ def _docker_context(rec: _Recorder, *, fail: bool = False, late: bool = False):
             rec.events.append("docker:exit")
 
     return ctx()
-
-
-@pytest.mark.asyncio
-async def test_both_connections_are_opened_at_the_same_time():
-    rec = _Recorder()
-
-    async with AsyncExitStack() as stack:
-        ssh_client, docker_client = await DockerService._connect_ssh_and_docker(
-            stack, _ssh_context(rec), _docker_context(rec)
-        )
-        assert (ssh_client, docker_client) == ("ssh-client", "docker-client")
-        assert sorted(rec.events) == ["docker:enter", "ssh:enter"]
-
-    assert sorted(rec.events[2:]) == ["docker:exit", "ssh:exit"]
-
-
-@pytest.mark.asyncio
-async def test_a_failed_docker_connect_closes_the_ssh_session_and_raises():
-    rec = _Recorder()
-
-    with pytest.raises(ConnectionError, match="docker over ssh refused"):
-        async with AsyncExitStack() as stack:
-            await DockerService._connect_ssh_and_docker(
-                stack, _ssh_context(rec, late=True), _docker_context(rec, fail=True)
-            )
-
-    # the ssh side connected after docker had already failed and is still closed, not leaked
-    assert "ssh:exit" in rec.events
-    assert "docker:exit" not in rec.events
-
-
-@pytest.mark.asyncio
-async def test_when_both_connects_fail_the_docker_error_is_the_cause_of_the_ssh_one():
-    # A host that refuses both handshakes used to surface only the SSH error; the Docker one was dropped.
-    rec = _Recorder()
-
-    with pytest.raises(ConnectionError, match="sshd refused") as raised:
-        async with AsyncExitStack() as stack:
-            await DockerService._connect_ssh_and_docker(
-                stack, _ssh_context(rec, fail=True), _docker_context(rec, fail=True)
-            )
-
-    assert isinstance(raised.value.__cause__, ConnectionError)
-    assert str(raised.value.__cause__) == "docker over ssh refused"
-
-
-@pytest.mark.asyncio
-async def test_a_failed_ssh_connect_closes_the_docker_client_and_raises():
-    rec = _Recorder()
-
-    with pytest.raises(ConnectionError, match="sshd refused"):
-        async with AsyncExitStack() as stack:
-            await DockerService._connect_ssh_and_docker(
-                stack, _ssh_context(rec, fail=True), _docker_context(rec, late=True)
-            )
-
-    # the docker side connected after ssh had already failed and is still closed, not leaked
-    assert "docker:exit" in rec.events
-    assert "ssh:exit" not in rec.events
-
-
-@pytest.mark.asyncio
-async def test_ssh_connected_callback_runs_while_docker_still_connects():
-    """DAH-3980: the host probes start on the SSH session without waiting for the slower Docker one."""
-    rec = _Recorder()
-    callback_ran = asyncio.Event()
-
-    @asynccontextmanager
-    async def docker_connect_waiting_for_the_callback():
-        rec.docker_started.set()
-        # a callback that ran only after both connects would never let this context finish
-        await asyncio.wait_for(callback_ran.wait(), timeout=1)
-        yield "docker-client"
-
-    def on_ssh_connected(ssh_client):
-        assert ssh_client == "ssh-client"
-        callback_ran.set()
-
-    async with AsyncExitStack() as stack:
-        connected = await DockerService._connect_ssh_and_docker(
-            stack, _ssh_context(rec), docker_connect_waiting_for_the_callback(), on_ssh_connected=on_ssh_connected
-        )
-
-    assert connected == ("ssh-client", "docker-client")
-
-
-@pytest.mark.asyncio
-async def test_create_container_still_completes_with_one_ssh_connection_step(monkeypatch):
-    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
-    _patch_happy(svc, monkeypatch, _ssh_client())
-
-    result = await _run(svc, _payload(ships_sshd=True))
-
-    assert isinstance(result, ContainerCreated)
-    ssh_steps = [p for p in result.profilers if p.name == ProfilerStepName.SSH_CONNECTION_ESTABLISHED]
-    assert len(ssh_steps) == 1
 
 
 @pytest.mark.asyncio

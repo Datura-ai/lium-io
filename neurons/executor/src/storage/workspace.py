@@ -274,6 +274,10 @@ class WorkspaceResolver:
         cgroup_path = self._proc_root / str(identity.pid) / "cgroup"
         try:
             cgroup = cgroup_path.read_text()
+        except FileNotFoundError as error:
+            raise WorkspaceResolutionError(
+                "executor is not running in the host PID namespace (pid: host)"
+            ) from error
         except OSError as error:
             raise WorkspaceResolutionError("cannot read rental process cgroup") from error
         if identity.container_id not in cgroup and identity.container_id[:12] not in cgroup:

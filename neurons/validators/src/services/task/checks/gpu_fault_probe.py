@@ -59,7 +59,7 @@ class GpuFaultProbeCheck:
     round-trips pinned memory through the copy engines, verifies every result on the device, and reads
     uncorrected ECC / remapped rows / recovery action from NVML before and after.
 
-    Shadow-first like every score-zeroing gate: GPU_FAULT_PROBE_CHECK_ENABLED runs it and emits the verdict,
+    Shadow-first like every score-zeroing gate: it always runs and emits the verdict;
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED lets a fault fail the (fatal) check. A probe that could not run
     (no libcuda, cuInit, JIT) passes with GPU_FAULT_PROBE_UNKNOWN: inability to measure is not a fault.
     """
@@ -73,11 +73,6 @@ class GpuFaultProbeCheck:
         self.enforce = enforce
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not (self.enforce or settings.GPU_FAULT_PROBE_CHECK_ENABLED):
-            return CheckResult(
-                passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
-            )
-
         if ctx.config.first_pass and not (
             self.enforce or settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED
         ):

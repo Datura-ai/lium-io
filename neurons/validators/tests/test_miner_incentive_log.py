@@ -9,7 +9,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
-    MissingFlagshipCapability,
+    MissingFull8xCapability,
     PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
@@ -27,6 +27,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_tier",
         "provider_discord_not_connected",
         "new_rentals_paused",
+        "provider_maintenance",
         "miner_default_job",
         "hotkey_excluded_from_scoring",
         "gpu_model_not_eligible_for_unrented_incentive",
@@ -151,9 +152,9 @@ def _job(**overrides) -> JobResult:
             "rented node",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            lambda job: MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job,
-                MissingFlagshipCapability(
+                MissingFull8xCapability(
                     ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
                 ),
             ),

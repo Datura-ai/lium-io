@@ -64,9 +64,8 @@ def _idle_ctx(context_factory, runner, validation, *, marker=MARKER, gpu_count=2
 
 @pytest.fixture
 def probe_flags_off():
-    # the global probe flags are off: the recheck enforces regardless
+    # global enforcement is off: the recheck enforces regardless
     with (
-        patch.object(module.settings, "GPU_FAULT_PROBE_CHECK_ENABLED", False),
         patch.object(module.settings, "GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", False),
     ):
         yield

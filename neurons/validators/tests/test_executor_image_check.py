@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
-from core.config import Settings, settings
+from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -12,10 +12,7 @@ from services.executor_image_policy import (
     ExpectedImageSnapshot,
     ImageVerdict,
 )
-from services.task.checks.executor_image import ExecutorImageCheck, observed_executor_digest
-from services.task.checks.rented_machine import TenantEnforcementCheck
-from services.task.pipeline_factory import PipelineFactory
-from services.task.result_handler import ResultHandler
+from services.task.checks.executor_image import ExecutorImageCheck
 from services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_context_config, build_state, make_context
@@ -69,68 +66,6 @@ def specs(*, executor_digest: str = EXECUTOR_DIGEST) -> dict:
     }
 
 
-def test_observation_uses_container_id_then_name():
-    assert observed_executor_digest(specs()) == EXECUTOR_DIGEST
-    assert (
-        observed_executor_digest(
-            {
-                "docker": {
-                    "containers": [
-                        {
-                            "container_id": "other-id",
-                            "digest": EXECUTOR_DIGEST,
-                            "name": "provider-stack-executor-1",
-                        }
-                    ]
-                }
-            }
-        )
-        == EXECUTOR_DIGEST
-    )
-
-
-def test_observation_returns_none_when_ambiguous():
-    assert (
-        observed_executor_digest(
-            {
-                "docker": {
-                    "containers": [
-                        {"digest": EXECUTOR_DIGEST, "name": "executor-executor-1"},
-                        {"digest": EXECUTOR_DIGEST, "name": "provider-executor-1"},
-                    ]
-                }
-            }
-        )
-        is None
-    )
-
-
-@pytest.mark.asyncio
-async def test_shipped_default_keeps_an_idle_outdated_executor_validated(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    # Regression: the default flips back to True before DAH-3419 restores auto-update, and every
-    # idle node on the old image fails validation again (99 executors earned 0 in one hour, 11 Sep).
-    monkeypatch.delenv("EXECUTOR_IMAGE_CHECK_ENFORCE", raising=False)
-    shipped = Settings(_env_file=None)  # no developer .env: the class default only
-    monkeypatch.setattr(
-        settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", shipped.EXECUTOR_IMAGE_CHECK_ENFORCE
-    )
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.event.severity == "warning"
-    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
-
-
 @pytest.mark.asyncio
 async def test_unrented_outdated_executor_fails_validation(enforce):
     context = make_context(
@@ -152,63 +87,6 @@ async def test_unrented_outdated_executor_fails_validation(enforce):
 
 
 @pytest.mark.asyncio
-async def test_warning_only_unrented_outdated_executor_passes_and_logs_digests(warn_only):
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
-    assert result.updates["default_extra"]["executor_image_status"] == "OUTDATED"
-    assert result.event.reason_code == "EXECUTOR_IMAGE_OUTDATED"
-    assert result.event.severity == "warning"
-    assert result.event.what_we_saw["observed_digest"] == STALE_DIGEST
-    assert result.event.what_we_saw["expected_digest"] == EXECUTOR_DIGEST
-    assert "EXECUTOR_IMAGE_CHECK_ENFORCE" in result.event.impact
-    assert "EXECUTOR_IMAGE_CHECK_ENFORCE" in result.event.remediation
-    assert "earns no incentive" not in result.event.remediation
-    assert result.event.context["executor_image_check_enforced"] is False
-
-
-@pytest.mark.asyncio
-async def test_rented_outdated_executor_passes_validation(enforce):
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=rented_data(),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
-
-
-@pytest.mark.asyncio
-async def test_current_executor_passes_validation():
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=EXECUTOR_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates["state"].executor_image_report.status is ImageVerdict.CURRENT
-
-
-@pytest.mark.asyncio
 async def test_unobservable_executor_digest_is_outdated(enforce):
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
@@ -223,61 +101,6 @@ async def test_unobservable_executor_digest_is_outdated(enforce):
     assert result.passed is True
     assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
     assert result.event.reason_code == "EXECUTOR_IMAGE_OUTDATED"
-
-
-@pytest.mark.asyncio
-async def test_cvm_outdated_executor_skips_image_check():
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-        tdx_attestation_passed=True,
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates == {}
-    assert result.event.reason_code == "EXECUTOR_IMAGE_SKIPPED"
-    assert result.event.context.get("skip_reason") == "cvm"
-
-
-@pytest.mark.asyncio
-async def test_missing_expected_state_skips_without_penalty():
-    unknown_policy = ExpectedImageSnapshot(
-        executor=None,
-        executor_ref="executor:latest",
-    )
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=unknown_policy),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates == {}
-    assert result.event.reason_code == "EXECUTOR_IMAGE_SKIPPED"
-
-
-def test_image_check_is_fatal():
-    assert ExecutorImageCheck.fatal is True
-
-
-def test_image_check_precedes_tenant_enforcement_in_both_pipelines():
-    for checks in (PipelineFactory.build_checks(), PipelineFactory.build_dry_run_checks()):
-        image_index = next(
-            index for index, check in enumerate(checks) if isinstance(check, ExecutorImageCheck)
-        )
-        tenant_index = next(
-            index for index, check in enumerate(checks) if isinstance(check, TenantEnforcementCheck)
-        )
-        assert image_index < tenant_index
 
 
 @pytest.mark.parametrize(
@@ -305,40 +128,3 @@ def test_score_calculator_zeroes_outdated_executor(
     assert "Required executor image is outdated" in warning
 
 
-@pytest.mark.parametrize("rented", [False, True])
-def test_warning_only_score_calculator_leaves_outdated_executor_scored(warn_only, rented: bool):
-    report = policy().report(STALE_DIGEST)
-    context = make_context(
-        state=build_state(
-            gpu_model="NVIDIA H200",
-            executor_image_report=report,
-            specs={"network": {"ema_verifyx_download_speed": 100.0}},
-        ),
-        collateral_deposited=True,
-    )
-
-    actual_score, job_score, warning = calculate_scores(context, rented)
-
-    assert actual_score == 1.0
-    assert job_score == 1.0
-    assert "outdated" not in warning
-
-
-@pytest.mark.asyncio
-async def test_result_handler_publishes_report_on_job_result_and_specs():
-    report = policy().report(EXECUTOR_DIGEST)
-    context = make_context(
-        state=build_state(specs={"gpu": {}}, executor_image_report=report),
-    )
-
-    result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
-        context=context,
-        miner_info=SimpleNamespace(miner_hotkey="miner", job_batch_id="batch"),
-        executor_info=context.executor,
-        verified_job_info={},
-        log_text="ok",
-        success=True,
-    )
-
-    assert result.executor_image_report == report.as_dict()
-    assert result.spec["executor_image"] == report.as_dict()

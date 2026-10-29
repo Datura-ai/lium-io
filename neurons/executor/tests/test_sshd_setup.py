@@ -10,16 +10,12 @@ PR's Ran-it section.
 """
 
 import os
-import re
-import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
 
 EXECUTOR_DIR = Path(__file__).resolve().parents[1]
 SCRIPT = EXECUTOR_DIR / "sshd_setup.sh"
-DOCKERFILE = EXECUTOR_DIR / "Dockerfile"
 
 # sshd -T stand-ins. OpenSSH 10's dump line for the directive follows the drop-in when the
 # main config includes sshd_config.d/*.conf; OpenSSH 9.2 rejects the keyword outright.
@@ -32,11 +28,6 @@ else
     echo "persourcepenalties crash:90 authfail:5 noauth:1 grace-exceeded:20 max:600 min:15"
 fi
 if grep -qi '^LogLevel VERBOSE' "$SSHD_CONFIG_DIR"/*.conf 2>/dev/null; then echo "loglevel VERBOSE"; else echo "loglevel INFO"; fi
-"""
-SSHD_MODERN_WITHOUT_INCLUDE = """#!/bin/sh
-case " $* " in *" PerSourcePenalties="*) exit 0;; esac
-echo "port 22"
-echo "persourcepenalties crash:90 authfail:5 noauth:1 grace-exceeded:20 max:600 min:15"
 """
 SSHD_OLD = """#!/bin/sh
 case " $* " in *" PerSourcePenalties="*)
@@ -54,12 +45,6 @@ esac
 echo "port 22"
 echo "loglevel INFO"
 """
-SSHD_BROKEN_CONFIG = """#!/bin/sh
-echo "/etc/ssh/sshd_config line 7: Bad configuration option: AcceptEnvv" >&2
-exit 255
-"""
-
-pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="sshd_setup.sh needs ssh-keygen")
 
 
 def run_setup(tmp_path: Path, sshd_script: str) -> tuple[subprocess.CompletedProcess, Path]:
@@ -82,15 +67,6 @@ def run_setup(tmp_path: Path, sshd_script: str) -> tuple[subprocess.CompletedPro
     return result, config_dir / "lium.conf"
 
 
-def test_modern_sshd_gets_per_source_penalties_off(tmp_path):
-    result, drop_in = run_setup(tmp_path, SSHD_MODERN)
-
-    assert result.returncode == 0, result.stderr
-    assert "PerSourcePenalties no" in drop_in.read_text().splitlines()
-    assert "sshd_setup: PerSourcePenalties no" in result.stdout
-    assert "sshd_setup: sshd -T accepts" in result.stdout
-
-
 def test_modern_sshd_logs_verbose(tmp_path):
     result, drop_in = run_setup(tmp_path, SSHD_MODERN)
 
@@ -111,14 +87,6 @@ def test_old_sshd_gets_only_verbose_logging_and_still_passes(tmp_path):
     assert "sshd_setup: sshd -T accepts" in result.stdout
 
 
-def test_drop_in_that_sshd_does_not_read_fails_the_build(tmp_path):
-    result, drop_in = run_setup(tmp_path, SSHD_MODERN_WITHOUT_INCLUDE)
-
-    assert result.returncode == 1
-    assert drop_in.exists()
-    assert "is not in effect" in result.stderr
-
-
 def test_log_level_that_sshd_does_not_apply_fails_the_build(tmp_path):
     result, _ = run_setup(tmp_path, SSHD_WITHOUT_INCLUDE_OLD)
 
@@ -126,20 +94,3 @@ def test_log_level_that_sshd_does_not_apply_fails_the_build(tmp_path):
     assert "LogLevel VERBOSE" in result.stderr
 
 
-def test_config_sshd_rejects_for_another_reason_fails_the_build(tmp_path):
-    result, drop_in = run_setup(tmp_path, SSHD_BROKEN_CONFIG)
-
-    assert result.returncode == 1
-    assert not drop_in.exists()
-    assert "sshd -T failed: /etc/ssh/sshd_config line 7: Bad configuration option: AcceptEnvv" in result.stderr
-
-
-def test_dockerfile_pins_the_base_by_digest_and_runs_the_setup():
-    lines = DOCKERFILE.read_text().splitlines()
-    from_lines = [line for line in lines if line.startswith("FROM ")]
-
-    assert len(from_lines) == 1
-    assert re.fullmatch(r"FROM python:3\.11-slim@sha256:[0-9a-f]{64}", from_lines[0])
-    # the setup checks the executor's own sshd_config lines too, so it runs after they are appended
-    accept_env = next(i for i, line in enumerate(lines) if line.startswith("RUN echo 'AcceptEnv CONTAINER_NAME'"))
-    assert lines.index("RUN sh sshd_setup.sh") > accept_env

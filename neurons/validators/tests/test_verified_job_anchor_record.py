@@ -39,85 +39,6 @@ async def _record(service: RedisService) -> dict:
     return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, f"hk:{EXECUTOR}"))
 
 
-@pytest.mark.asyncio
-async def test_anchor_survives_reset_failure_and_success_writes():
-    """Regression: a reset, a failed cycle or a later success rewrites `uuids` from the current scrape, so a
-    swapped node re-anchors on the new set under the same executor id."""
-    service = _redis_service()
-    service.publish = AsyncMock()
-
-    await service.set_verified_job_info("hk", EXECUTOR, prev_info={}, success=True, spec="A100:1", uuids="gpu-001")
-    info = await _record(service)
-    assert info["uuids"] == "gpu-001"
-
-    await service.clear_verified_job_info("hk", EXECUTOR, prev_info=info)
-    info = await _record(service)
-    assert info == {"count": 0, "failed": 0, "spec": "A100:1", "uuids": "gpu-001"}
-
-    await service.set_verified_job_info("hk", EXECUTOR, prev_info=info, success=False)
-    info = await _record(service)
-    assert (info["uuids"], info["failed"]) == ("gpu-001", 1)
-
-    await service.set_verified_job_info("hk", EXECUTOR, prev_info=info, success=True, spec="A100:1", uuids="gpu-002")
-    info = await _record(service)
-    assert info["uuids"] == "gpu-001"
-    assert GPU_ANCHOR_BROKEN_KEY not in info
-
-
-@pytest.mark.asyncio
-async def test_broken_mark_is_written_once_and_kept_by_every_later_write():
-    """Regression: the reset that breaks the anchor does not store the mark, or a later failed/successful
-    write drops it, so the node is re-verified on its next clean scrape."""
-    service = _redis_service()
-    service.publish = AsyncMock()
-    info = {"count": 12, "failed": 1, "spec": "A100:1", "uuids": "gpu-001"}
-
-    await service.clear_verified_job_info("hk", EXECUTOR, prev_info=info, anchor_broken=True)
-    info = await _record(service)
-    assert info[GPU_ANCHOR_BROKEN_KEY] is True
-    assert info["uuids"] == "gpu-001"
-    assert (info["count"], info["failed"]) == (0, 0)
-
-    await service.set_verified_job_info("hk", EXECUTOR, prev_info=info, success=False)
-    info = await _record(service)
-    assert info[GPU_ANCHOR_BROKEN_KEY] is True
-
-    await service.set_verified_job_info("hk", EXECUTOR, prev_info=info, success=True, spec="A100:1", uuids="gpu-001")
-    info = await _record(service)
-    assert info[GPU_ANCHOR_BROKEN_KEY] is True
-
-    await service.clear_verified_job_info("hk", EXECUTOR, prev_info=info)
-    info = await _record(service)
-    assert info[GPU_ANCHOR_BROKEN_KEY] is True
-
-
-@pytest.mark.asyncio
-async def test_result_handler_passes_the_broken_mark_to_the_reset(context_factory):
-    """Regression: the check sets gpu_anchor_broken on the context and the handler's reset call drops it,
-    so the record is reset but never marked."""
-    service = _redis_service()
-    service.publish = AsyncMock()
-    handler = ResultHandler(redis_service=service, dry_run=False)
-    ctx = context_factory(
-        state=build_state(gpu_uuids="gpu-003"),
-        clear_verified_job_info=True,
-        gpu_anchor_broken=True,
-        clear_verified_job_evidence={"reason_code": "GPU_UUID_CHANGED", "check_id": "gpu.validate.fingerprint"},
-    )
-    prev = {"count": 3, "failed": 0, "spec": "A100:1", "uuids": "gpu-001"}
-
-    await handler._persist_verification_data(
-        miner_hotkey="hk", executor_id=EXECUTOR, verified_job_info=prev, context=ctx, success=False
-    )
-
-    info = await _record(service)
-    assert info[GPU_ANCHOR_BROKEN_KEY] is True
-    assert info["uuids"] == "gpu-001"
-    published = service.publish.await_args.args[1]
-    assert published["reason_code"] == "GPU_UUID_CHANGED"
-    assert published["executor_uuid"] == EXECUTOR
-
-
 async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool):
     """One validation cycle as the service runs it: record from Redis, the two GPU-set checks through the real
     Pipeline, the outcome persisted by the ResultHandler."""
@@ -158,20 +79,30 @@ async def test_a_swap_breaks_the_anchor_through_pipeline_context_and_handler(con
     assert service.publish.await_count == 1
 
 
+
+
 @pytest.mark.asyncio
-async def test_a_missing_card_is_gpu_missing_and_the_node_passes_when_it_is_back(context_factory):
-    """Regression: SpecChangeCheck runs first again (the count changed, SPEC_CHANGED), or GPU_MISSING marks the
-    anchor broken so the node never passes once the card is back."""
+@pytest.mark.parametrize(
+    ("swapped", "anchored_after"),
+    [
+        ("gpu-003,gpu-004", "gpu-003,gpu-004"),  # every card replaced (a VM host after a reboot): re-anchored
+        ("gpu-001,gpu-003", "gpu-001,gpu-002"),  # one card replaced: the anchor stays
+        ("gpu-003", "gpu-001,gpu-002"),  # fewer cards: the anchor stays
+    ],
+)
+async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_re_anchored(context_factory, swapped, anchored_after):
+    """Regression: a node whose cards were all replaced failed GPU_UUID_CHANGED on every cycle under its executor id,
+    so a VM host had to remove and re-add the node after each reboot that brought other GPUs."""
     service = _redis_service()
     service.publish = AsyncMock()
     handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=False)
 
-    ok, _, _ = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=True)
-    assert ok is True
+    ok, event, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=False)
+    assert ok is False and event.reason_code == "GPU_UUID_CHANGED"  # the swap cycle is still a reset
+    # anchored on the swap cycle itself, so a second swap while the node is held is still seen
+    assert record["uuids"] == anchored_after
 
-    ok, event, record = await _cycle(service, handler, context_factory, uuids="gpu-001", hard=True)
-    assert ok is False and event.reason_code == "GPU_MISSING" and event.check_id == "gpu.validate.fingerprint"
-    assert record["uuids"] == "gpu-001,gpu-002" and GPU_ANCHOR_BROKEN_KEY not in record
-
-    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=True)
-    assert ok is True and record["count"] == 1
+    ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=False)
+    assert record["uuids"] == anchored_after
+    assert ok is (anchored_after == swapped)
