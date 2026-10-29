@@ -528,9 +528,8 @@ class GpuLossHoldMessages:
         category=AVAILABILITY_CATEGORY,
         impact="The new GPUs are verified and kept for this node, but it is hidden and takes no new rentals until "
         "they read clean for the hold window (see hold_until); it scores 0 meanwhile",
-        remediation="Every GPU UUID changed, as when a VM host gets other cards on a restart. Keep the same GPUs "
-        "passed through to this node across restarts (`nvidia-smi -L` before and after must match) and find why "
-        "the host restarted. Nothing to re-register: the node is listed again on its own after the hold window.",
+        remediation="Nothing to do, and do not remove or re-add the node: it is listed again on its own once all "
+        "its GPUs have been present for 2 hours. To avoid this, pass the same GPUs through on every host restart.",
     )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
@@ -1624,6 +1623,17 @@ class RentedThroughputMessages:
     SKIPPED = MessageTemplate(
         event="Rented pod throughput check skipped",
         reason="RENTED_THROUGHPUT_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class IdleDiskWriteMessages:
+    # DAH-5320: shadow only; the reading itself is the IDLE_DISK_WRITE log line
+    LOGGED = MessageTemplate(
+        event="Idle node disk write speed logged (not enforced)",
+        reason="IDLE_DISK_WRITE_LOGGED",
         severity="info",
         category="runtime",
         impact="Proceed",
