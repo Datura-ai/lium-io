@@ -66,6 +66,8 @@ class AvailabilityErrorCode(StrEnum):
     # ... held from new rentals after one failed probe, or after over 24 h without a verdict
     STORAGE_LIMIT_MISSING = "STORAGE_LIMIT_MISSING"
     STORAGE_LIMIT_INCONCLUSIVE_LONG = "STORAGE_LIMIT_INCONCLUSIVE_LONG"
+    # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
+    GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
 
 
 # Faults of the node itself (its cards, its Docker storage): never a sign of our own outage, never silenced with one.
@@ -77,6 +79,7 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.STORAGE_LIMIT_INCONCLUSIVE,
         AvailabilityErrorCode.STORAGE_LIMIT_MISSING,
         AvailabilityErrorCode.STORAGE_LIMIT_INCONCLUSIVE_LONG,
+        AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
     }
 )
 
