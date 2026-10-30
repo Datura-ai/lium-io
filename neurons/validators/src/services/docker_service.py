@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 import asyncssh
 import bittensor
 import redis.exceptions
+from clients.backend_client import BackendClient
 from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
@@ -556,6 +557,8 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
+# DAH-5392: bounds the backend's rental-active answer for an unlisted pod in a create's sweep; no answer keeps the pod
+_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
@@ -2545,8 +2548,10 @@ class DockerService:
         redis_service: Annotated[RedisService, Depends(RedisService)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
         rental_docker_client_factory: RentalDockerSdkClientFactory | None = None,
+        backend_client: BackendClient | None = None,
     ):
         self.ssh_service = ssh_service
+        self.backend_client = backend_client
         self.redis_service = redis_service
         self.attestation_service = attestation_service
         self.rental_docker_client_factory = (
@@ -4233,6 +4238,10 @@ class DockerService:
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
+        DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
+        backend confirms its rental closed: a create that waited may sweep after a newer create on the
+        same node, whose pod its older ``active_container_names`` do not name.
+
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
         ``refuse_before_removal`` gets the listing's names before anything is removed and may raise to
@@ -4297,6 +4306,12 @@ class DockerService:
                 if removed_id is not None and listed_ids.get(name) in (None, removed_id):
                     continue
                 stale_containers.append(name)
+            # DAH-5392: an unlisted pod_* may be a newer create's pod on a split node (this create's list was
+            # built before it); it goes only when the backend confirms its rental closed
+            unlisted_pods = [name for name in stale_containers if name != pod_name and name.startswith(POD_CONTAINER_PREFIX)]
+            if unlisted_pods:
+                closed = await self._pods_with_closed_rental(unlisted_pods, default_extra)
+                stale_containers = [name for name in stale_containers if name not in unlisted_pods or name in closed]
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return []
@@ -4338,6 +4353,38 @@ class DockerService:
                 report.removed_cleanly_without_volume_rm = removed_cleanly and not volumes_to_remove
             return stale_containers
         return []
+
+    async def _pods_with_closed_rental(self, names: list[str], default_extra: dict) -> set[str]:
+        """The ``names`` whose rental the backend confirms closed, plus names that are not `pod_<uuid>` (the
+        backend names every pod it creates after the pod's uuid, so such a name is no newer create's pod).
+        No backend client, no answer, an error or a timeout keeps the pod: a removal cannot be undone."""
+
+        async def closed(name: str) -> bool:
+            pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
+            try:
+                UUID(pod_id)
+            except ValueError:
+                return True
+            if self.backend_client is None:
+                return False
+            try:
+                async with asyncio.timeout(_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS):
+                    answer = await self.backend_client.get_pod_rental_active(pod_id)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Unlisted pod kept: its rental could not be read",
+                        extra=get_extra_info({**default_extra, "container_name": name, "error_type": exc.__class__.__name__}),
+                    )
+                )
+                return False
+            return answer is not None and not answer.active
+
+        answers = await asyncio.gather(*(closed(name) for name in names))
+        kept = [name for name, is_closed in zip(names, answers) if not is_closed]
+        if kept:
+            logger.info(_m("Keeping unlisted pods whose rental is not confirmed closed", extra=get_extra_info({**default_extra, "container_names": kept})))
+        return {name for name, is_closed in zip(names, answers) if is_closed}
 
     @staticmethod
     async def _remove_volumes(ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]) -> None:
