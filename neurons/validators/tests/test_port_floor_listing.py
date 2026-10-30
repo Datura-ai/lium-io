@@ -114,9 +114,13 @@ class PerPodSSHClient(DummySSHClient):
 class PerPodBackendClient(DummyBackendClient):
     """get_pod_rental_active answers per pod: active only for the ids in `active`."""
 
-    def __init__(self, active: set[str]):
+    def __init__(self, active: set[str], rented_now: RentedExecutorsResponse | None = None):
         super().__init__(active=False)
         self.active_pods = active
+        self.rented_now = rented_now
+
+    async def get_rented_executors_now(self):
+        return self.rented_now
 
     async def get_pod_rental_active(self, pod_id: str):
         record = await super().get_pod_rental_active(pod_id)
@@ -684,7 +688,7 @@ class Firewalled:
         return BatchResult(ok, bad) if max_ports is None else (ok, bad)
 
 
-def stale_split_ctx(context_factory, probe, last_port, filler_ports=()):
+def stale_split_ctx(context_factory, probe, last_port, filler_ports=(), rented_now=None):
     """8 GPUs, one per split (24 ports), declaring 40000-<last_port>; its only rental, on 40000-40002, closed."""
     from dataclasses import replace
 
@@ -710,7 +714,7 @@ def stale_split_ctx(context_factory, probe, last_port, filler_ports=()):
         connectivity(probe, probe, probe),
         rented_data=rented,
         ssh=PerPodSSHClient(running=set()),
-        backend=PerPodBackendClient(active=set()),
+        backend=PerPodBackendClient(active=set(), rented_now=rented_now),
         port_range=f"40000-{last_port}",
     )
     return ctx.model_copy(
@@ -739,6 +743,12 @@ async def test_a_split_node_declaring_exactly_its_split_target_counts_the_stale_
     assert tenant_result.passed is passed
     if not passed:
         assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+    # the re-probe's ports and counts are published, so the backend allocates from what the verdict saw
+    published = tenant_result.updates["state"]
+    declared = last_port - 40000 + 1
+    assert sorted(published.specs["verified_ports"]) == list(range(40000, last_port + 1))
+    assert published.specs["available_port_count"] == tenant_result.updates["port_count"] == declared
+    assert len(published.verified_port_pairs) == published.verified_port_count == declared
 
 
 @pytest.mark.asyncio
@@ -771,3 +781,39 @@ async def test_a_stale_split_nodes_reprobe_keeps_crediting_its_idle_fillers_port
     assert ctx.state.specs["available_port_count"] == 21  # 17 probed + 4 filler
     assert not {40020, 40021, 40022, 40023} & {p.external for call in probe.calls[probes_before:] for p in call}
     assert tenant_result.passed is True
+    assert tenant_result.updates["state"].specs["available_port_count"] == 24
+    assert sorted(tenant_result.updates["state"].specs["verified_ports"]) == list(range(40000, 40024))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("since_snapshot, passed", [("nothing", False), ("rental", True), ("filler", True)])
+async def test_a_stale_split_node_rereads_rentals_before_failing_its_reprobe(context_factory, since_snapshot, passed):
+    """Reviewer's case: the snapshot's only pod closed and, before this check, something took 40003-40005, which
+    the re-probe finds busy (21 of 24). A new rental is a rented node, exempt; a new filler's ports count."""
+    taken = [40003, 40004, 40005]
+    new_rental = RentedExecutor(
+        miner_hotkey="miner-hotkey",
+        executor_ip_address="127.0.0.1",
+        executor_ip_port="8001",
+        pods=[RentedPod(pod_id="pod-new", container_name="container_pod-new", rented_ports=taken)],
+    )
+    rented_now = {
+        "nothing": RentedExecutorsResponse(executors={}),
+        "rental": RentedExecutorsResponse(executors={EXECUTOR_UUID: new_rental}),
+        "filler": RentedExecutorsResponse(executors={}, filler_ports_by_executor={EXECUTOR_UUID: taken}),
+    }[since_snapshot]
+    ctx = stale_split_ctx(context_factory, Firewalled(blocked=set(taken)), 40023, rented_now=rented_now)
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is passed
+    published = tenant_result.updates["state"].specs
+    if since_snapshot == "nothing":
+        assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+        assert published["available_port_count"] == 21
+    elif since_snapshot == "filler":
+        assert published["available_port_count"] == 24 and set(taken) <= set(published["verified_ports"])
+    else:
+        assert published["available_port_count"] == ctx.state.specs["available_port_count"]  # the renter's ports

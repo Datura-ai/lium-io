@@ -47,8 +47,11 @@ class PortConnectivityCheck:
 
         # imported here: port_count also imports from this module, so a top-level import is circular
         from .port_count import split_port_requirement
+        from .rented_machine import _rental_of_validated_miner
 
         split_need = split_port_requirement(ctx.state)
+        # probe to the split target unless PortCountCheck will find this node rented (same rental identity)
+        validated_rental = _rental_of_validated_miner(ctx, rented_executor)
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
@@ -67,7 +70,8 @@ class PortConnectivityCheck:
             },
             # a rented node is exempt from the split requirement (PortCountCheck), so only the floor applies;
             # one whose every listed pod is stale is re-probed to its split target by TenantEnforcementCheck
-            min_ports=split_need[1] if split_need and not rented_executor else MIN_PORT_COUNT,
+            min_ports=split_need[1] if split_need and not (validated_rental and validated_rental.pods)
+            else MIN_PORT_COUNT,
         )
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)

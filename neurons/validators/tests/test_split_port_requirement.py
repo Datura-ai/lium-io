@@ -174,3 +174,53 @@ async def test_the_outage_guard_keeps_a_split_node_that_declares_too_few_ports()
         [e["reason_code"] for e in result.availability_errors] == ["INSUFFICIENT_PORTS"]
         for result in results
     )
+
+
+def _rented_by(miner_hotkey: str, address: str) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey=miner_hotkey,
+                executor_ip_address=address,
+                executor_ip_port="22",  # the helper executor's port
+                pods=[RentedPod(pod_id="pod-1", container_name="container_pod-1", rented_ports=[65000])],
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "miner_hotkey, address, rented",
+    [
+        ("miner-hotkey", "127.0.0.1", True),  # same miner
+        ("other-hotkey", "127.0.0.1", True),  # another miner, same endpoint: the renter's pod is on this box
+        ("other-hotkey", "10.0.0.9", False),  # another miner, another endpoint: not this node's rental
+    ],
+)
+async def test_the_split_requirement_sees_the_rental_the_tenant_check_judges(miner_hotkey, address, rented):
+    from dataclasses import replace
+
+    from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
+    from neurons.validators.src.services.task.checks.rented_machine import _rental_of_validated_miner
+
+    ctx = _ctx(MIN_PORT_COUNT)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=_rented_by(miner_hotkey, address))})
+    rental = ctx.state.rented_data.executors["executor-123"]
+    assert (_rental_of_validated_miner(ctx, rental) is not None) is rented
+
+    result = await PortCountCheck().run(ctx)
+    assert result.passed is rented
+    if not rented:
+        assert result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+
+    from unittest.mock import AsyncMock
+
+    probe = AsyncMock()
+    probe.verify_ports.side_effect = RuntimeError("stop after the probe call")
+    ctx = ctx.model_copy(update={"services": replace(ctx.services, connectivity=probe)})
+    with pytest.raises(RuntimeError):
+        await PortConnectivityCheck().run(ctx)
+    assert probe.verify_ports.call_args.kwargs["min_ports"] == (
+        MIN_PORT_COUNT if rented else 8 * MIN_PORT_COUNT
+    )

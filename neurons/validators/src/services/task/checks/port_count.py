@@ -161,8 +161,12 @@ class PortCountCheck:
         verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
         port_count = ctx.state.verified_port_count + len(filler_ports)
 
-        # Check if executor is rented (same pattern as rented_machine.py)
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        # the rental TenantEnforcementCheck judges: another miner's on another endpoint is not this node's
+        from .rented_machine import _rental_of_validated_miner  # rented_machine imports this module
+
+        rented_executor = _rental_of_validated_miner(
+            ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        )
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         updated_state = replace(
