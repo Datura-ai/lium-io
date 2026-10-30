@@ -484,12 +484,13 @@ class RedisService:
     async def record_disk_pressure_deferral(
         self, miner_hotkey: str, executor_id: str, *, shadow: bool, ttl_seconds: int
     ) -> int:
-        """One more port check deferred (or, shadow, one that would have been); the new count."""
-        count = await self.disk_pressure_deferrals(miner_hotkey, executor_id, shadow=shadow) + 1
-        await self.set(
-            self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow), str(count), ex=ttl_seconds
-        )
-        return count
+        """One more port check deferred (or, shadow, one that would have been); the new count. INCR, so two
+        cycles never take the same slot of the bounded streak."""
+        key = self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow)
+        async with self.lock:
+            count = await self.redis.incr(key)
+            await self.redis.expire(key, ttl_seconds)
+        return int(count)
 
     async def clear_disk_pressure_deferrals(self, miner_hotkey: str, executor_id: str, *, shadow: bool) -> None:
         """A port check completed: the streak of deferrals ends."""

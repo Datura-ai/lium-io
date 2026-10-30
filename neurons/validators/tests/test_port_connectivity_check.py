@@ -1477,3 +1477,32 @@ async def test_a_persisting_port_miss_restarts_the_window_instead_of_earning_fre
     await service.redis.expire(key, 5)  # the window nearly over
     assert await service.record_port_verify_miss("hk", "ex", 3600) is False
     assert await service.redis.ttl(key) > 3000
+
+
+@pytest.mark.asyncio
+async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
+    # DAH-5244 review: a read-then-set counter let two cycles take the same slot of the bounded streak
+    import asyncio
+
+    from fakeredis.aioredis import FakeRedis
+
+    from services.redis_service import RedisService
+
+    class AnswersOnALaterTurn(FakeRedis):
+        async def get(self, key):
+            await asyncio.sleep(0)  # a socket's answer arrives on a later loop turn; fakeredis answers at once
+            return await super().get(key)
+
+    service = RedisService.__new__(RedisService)
+    service.redis = AnswersOnALaterTurn()
+    service.lock = asyncio.Lock()
+
+    counts = await asyncio.gather(
+        *(service.record_disk_pressure_deferral("hk", "ex", shadow=False, ttl_seconds=3600) for _ in range(2))
+    )
+
+    assert sorted(counts) == [1, 2]
+    assert await service.disk_pressure_deferrals("hk", "ex", shadow=False) == 2
+    assert await service.redis.ttl("disk_pressure_deferrals:hk:ex") > 3000
+    await service.clear_disk_pressure_deferrals("hk", "ex", shadow=False)
+    assert await service.disk_pressure_deferrals("hk", "ex", shadow=False) == 0
