@@ -110,7 +110,7 @@ async def test_port_probe_fallback_tests_every_port_a_split_node_needs(mocker):
 
 @pytest.mark.asyncio
 async def test_port_probe_runs_next_tier_while_a_split_node_is_short(mocker):
-    # a node that needs 24 ports (24 one-GPU splits): 3 host-network successes must not stop the published-port tiers
+    # a split node needs 24: 3 host-network successes must not stop the published-port tiers
     ports = [PortPair(9000 + i, 9000 + i) for i in range(30)]
     batch = mocker.Mock()
     batch.verify = mocker.AsyncMock(return_value=BatchResult(ports[:3], ports[3:]))
