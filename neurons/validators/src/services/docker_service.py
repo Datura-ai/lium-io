@@ -6366,6 +6366,8 @@ class DockerService:
         local_volume_path: str = '/root',
         encrypted_local_volume: bool = False,
     ):
+        # refused before any command runs on the host, not halfway through the copy
+        root_sed = _jupyter_root_sed(local_volume_path if local_volume or encrypted_local_volume else "/root")
         if local_volume and not encrypted_local_volume:
             temp_container_name = f"temp_jupyter_copy_{uuid4()}"
             try:
@@ -6373,7 +6375,7 @@ class DockerService:
                     f"/usr/bin/docker run -d --rm -v {local_volume}:/mnt "
                     f"--name {temp_container_name} --entrypoint sh "
                     f"daturaai/compute-subnet-executor:latest "
-                    f"-c {shlex.quote(f'sed {_jupyter_root_sed(local_volume_path)} /root/app/run_jupyter.sh > /mnt/run_jupyter.sh')}"
+                    f"-c {shlex.quote(f'sed {root_sed} /root/app/run_jupyter.sh > /mnt/run_jupyter.sh')}"
                 )
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -6448,7 +6450,7 @@ class DockerService:
             command = (
                 f"test -s /root/app/run_jupyter.sh || "
                 f"{{ echo 'run_jupyter.sh is missing on the executor host' >&2; exit 1; }}; "
-                f"sed {_jupyter_root_sed(target_path)} /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
+                f"sed {root_sed} /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'cat > {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
