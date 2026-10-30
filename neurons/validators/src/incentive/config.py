@@ -124,7 +124,7 @@ RENTAL_PRICES_PER_HOUR.update({
 # ratio of the A100 80GB PCIe and SXM4, RTX A6000, L40S and RTX 4090, rounded to the cent. Not an A100 80GB rate.
 RENTAL_PRICES_PER_HOUR.update({
     "NVIDIA A100-PCIE-40GB": 0.37,  # vast 0.553 x 0.668
-    "NVIDIA A100-SXM4-40GB": 0.47,  # vast 0.715 x 0.668
+    "NVIDIA A100-SXM4-40GB": 0.48,  # vast 0.715 x 0.668 = 0.477
 })
 
 
