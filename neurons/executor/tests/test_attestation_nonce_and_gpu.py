@@ -12,7 +12,9 @@ Covers:
   host-mode never emits; a missing NVIDIA stack degrades to a logged None.
 """
 
+import socket as socketlib
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -157,10 +159,23 @@ def test_dated_nonce_freshness(client, miner_keypair, validator_keypair, age, st
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-def tdx_service(monkeypatch):
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
-    return TDXQuoteService()
+@pytest.mark.parametrize("path_kind, serves_quotes", [("socket", True), ("directory", False), ("missing", False)])
+def test_tdx_quote_served_only_on_the_dstack_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path_kind: str, serves_quotes: bool
+) -> None:
+    # Arrange — bare metal: Docker creates a missing bind-mount source as a directory.
+    # Relative path: macOS tmp dirs exceed the AF_UNIX path limit.
+    monkeypatch.chdir(tmp_path)
+    path = Path("dstack.sock")
+    if path_kind == "socket":
+        with socketlib.socket(socketlib.AF_UNIX) as dstack_socket:
+            dstack_socket.bind(str(path))
+    elif path_kind == "directory":
+        path.mkdir()
+    monkeypatch.setattr(settings, "DSTACK_SOCKET_PATH", str(path))
+
+    # Act / Assert
+    assert TDXQuoteService().enabled is serves_quotes
 
 
 # ---------------------------------------------------------------------------

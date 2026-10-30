@@ -11,7 +11,7 @@ HOW A NODE PICKS A POOL:
                                                           mining score is zeroed, e.g. Sysbox
                                                           not confirmed; reason below)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
-       AND (not flagship-8x OR NCU/split/attested-CVM offered) AND power cap appliable
+       AND (not full-8x OR NCU/split/attested-CVM offered) AND power cap appliable
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
@@ -47,7 +47,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      score gate: CPU truth, an outdated image, a rented node's halt) is not a
      failed check and gets no Group C reason
    Every reason that applies is recorded, in the order above: a node blocked by Discord
-   still learns that its 8x flagship gate blocks it too. The first entry is the one the
+   still learns that its 8x gate blocks it too. The first entry is the one the
    old first-match evaluation reported.
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
@@ -77,11 +77,12 @@ from pydantic import BaseModel, Field
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from services.executor_image_policy import outdated_image_remediation
+from services.const import MIN_PORT_COUNT
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
         InsufficientDisk,
-        MissingFlagshipCapability,
+        MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
     )
@@ -100,6 +101,7 @@ class ZeroIncentiveReason(StrEnum):
     SPOT_TIER = "spot_tier"
     PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
     NEW_RENTALS_PAUSED = "new_rentals_paused"
+    PROVIDER_MAINTENANCE = "provider_maintenance"
     MINER_DEFAULT_JOB = "miner_default_job"
     HOTKEY_EXCLUDED_FROM_SCORING = "hotkey_excluded_from_scoring"
     # Group B: idle but not qualified for the unrented pool
@@ -109,7 +111,7 @@ class ZeroIncentiveReason(StrEnum):
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
-    FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
+    FULL_8X_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"  # wire code, append-only: consumers key on it (DAH-5197 keeps the value)
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
@@ -286,6 +288,18 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
+    def no_payout_because_provider_maintenance(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PROVIDER_MAINTENANCE,
+            message=(
+                "No subnet incentive: this executor is in a maintenance window and earns nothing "
+                "until the window ends or you click I have finished."
+            ),
+            internal_message="Executor excluded from both pools - provider maintenance window",
+        )
+
+    @staticmethod
     def no_payout_because_running_own_default_job(result: JobResult) -> MinerLogLine:
         return MinerLogLine._no_payout(
             result,
@@ -436,12 +450,12 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_flagship_without_ncu_or_split(
-        result: JobResult, missing: MissingFlagshipCapability
+    def no_payout_because_full_8x_without_ncu_or_split(
+        result: JobResult, missing: MissingFull8xCapability
     ) -> MinerLogLine:
         return MinerLogLine._no_payout(
             result,
-            reason=ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+            reason=ZeroIncentiveReason.FULL_8X_WITHOUT_NCU_OR_SPLIT,
             message=(
                 f"No unrented incentive: an idle {result.gpu_count}x {result.gpu_model} must offer "
                 "NCU profiling, GPU splitting or confidential computing. Either open the host "
@@ -486,20 +500,52 @@ class MinerLogLine(BaseModel):
     def no_payout_because_port_limited_remainder(
         result: JobResult, port_limited: PortLimitedRemainder
     ) -> MinerLogLine:
-        # `result` is the free portion: gpu_count is the number of free GPUs the message names.
+        # `result` is the free portion; the message names the GPUs the missing ports leave unpaid.
+        unpaid: int = port_limited.unpaid_gpu_count
+        if port_limited.free_split_count == 0:
+            # fewer free GPUs than the minimum rental: no port change makes them rentable
+            return MinerLogLine._no_payout(
+                result,
+                reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+                message=(
+                    f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: "
+                    "they are fewer than its minimum rental, so nobody can rent them. The rented GPUs "
+                    "keep earning. Idle pay resumes when the rental ends."
+                ),
+                extra_fields={
+                    "gpu_count": unpaid,
+                    "available_port_count": port_limited.available_port_count,
+                    "required_port_count": port_limited.required_port_count,
+                    "free_split_count": 0,
+                    "paid_split_count": 0,
+                },
+            )
+        if port_limited.paid_split_count:
+            lead = (
+                f"No unrented incentive for {unpaid} of the free GPUs on this partially rented node: "
+                f"it has {port_limited.available_port_count} free port(s) for "
+                f"{port_limited.free_split_count} free GPU split(s), and each split needs its own port "
+                f"for a renter, so {port_limited.paid_split_count} split(s) keep earning. "
+            )
+        else:
+            lead = (
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: "
+                f"it has {port_limited.available_port_count} free port(s) and needs at least "
+                f"{MIN_PORT_COUNT} to list and rent them, so nobody can rent these GPUs right now. "
+            )
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
             message=(
-                f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
-                f"rented node: it has {port_limited.available_port_count} free port(s) and the "
-                f"marketplace needs at least {port_limited.required_port_count} to list and rent them, so nobody "
-                "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
-                "when the rental ends or the node gets more open ports."
+                lead + "The rented GPUs keep earning. Full idle pay resumes when the rental ends or the "
+                f"node has {port_limited.required_port_count} open free ports."
             ),
             extra_fields={
+                "gpu_count": unpaid,
                 "available_port_count": port_limited.available_port_count,
                 "required_port_count": port_limited.required_port_count,
+                "free_split_count": port_limited.free_split_count,
+                "paid_split_count": port_limited.paid_split_count,
             },
         )
 

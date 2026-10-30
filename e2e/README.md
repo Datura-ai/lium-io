@@ -8,7 +8,8 @@ missing is the chain: the subtensor client is never constructed, the miner never
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
-**`e2e-gate`**, routed by `.github/actions/changed-packages`); a PR that touches none of those skips it, and
+**`e2e-gate`**, routed by `.github/actions/changed-packages`; a push to `main` runs it when the push changed one of
+those); a PR that touches none of those, or only a neuron's own `tests/`, skips it, and
 `tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
 stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
 container on the provider's host.
@@ -66,8 +67,9 @@ cache exports, 1.63 GB, and the `--load` of five tarballs are inside the step); 
 Dockerfile input changed, built in 61 s (36 layers `CACHED`; the 61 s is the five cache-manifest imports, the blob
 downloads and the five `--load`s) and the whole `e2e-gate` job took 4 min 20 s against 6 min 57 s cold. The gha backend
 needs the Actions cache URL and token in the environment and a builder that can export cache: `test.yml` adds
-`docker/setup-buildx-action` and `crazy-max/ghaction-github-runtime` before `gate.sh` for that. The `pod` image is not in
-the cache: `seed` builds it on the executor host's dockerd (dind), which has no builder of its own. Cache reads follow the
+`docker/setup-buildx-action` and `crazy-max/ghaction-github-runtime` before `gate.sh` for that. `make build` also builds the
+`pod` image on the host (cache scope `e2e-pod`) and `seed` loads it onto the executor host's dockerd (dind; on the GPU
+path the executor uses the host's daemon, which already has it), so `make up` needs a `make build` first. Cache reads follow the
 Actions cache rules: a `pull_request` run reads the entries of its merge ref (`refs/pull/N/merge`) and of main, and
 writes to its merge ref; a push to main writes main's, which every later PR reads.
 
@@ -109,7 +111,7 @@ sysbox, and on a GPU-less runner the scrape halts the pipeline before the check,
 AVAILABLE verdict can be observed).
 
 **`tests/rental`** — `MinerService.handle_container`: `ContainerCreateRequest` for the executor → a container from
-`pod/Dockerfile` (ubuntu + openssh-server; `seed` builds it onto the executor's dockerd) with the renter's key,
+`pod/Dockerfile` (ubuntu + openssh-server; `seed` loads it onto the executor's dockerd) with the renter's key,
 `ContainerCreated` with the port map; the renter's key opens the pod on the executor's address (what `lium exec`
 does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite expects `nvidia-smi -L` to list GPUs — not yet observed);
 `ContainerDeleteRequest` → `ContainerDeleted` and the port is closed. A create for an executor the miner does not own
