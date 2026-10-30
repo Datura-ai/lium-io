@@ -47,6 +47,7 @@ DISK_HELPERS = {
     "disk_root_dir",
     "containerd_root",
     "containerd_processes",
+    "in_host_root",
     "docker_containerd",
     "same_socket",
     "containerd_dump",
@@ -646,6 +647,25 @@ def test_the_root_is_read_from_the_containerd_docker_uses(scrape: dict, monkeypa
 
     assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
     assert asked == [f"/proc/1/root{expected_root}"]
+
+
+def test_a_rentals_nested_containerd_is_not_a_candidate() -> None:
+    # a rental running its own containerd: it reads its container's config, so its address matches the host's too
+    namespace = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", DISK_HELPERS, {"http": http, "os": os})
+    processes = {10: (_EXTERNAL, 100), 20: (["/usr/bin/containerd"], 200), 30: (_MANAGED, None), 40: (["dockerd"], 100)}
+    roots = {"/proc/1/root": 100, **{f"/proc/{pid}/root": ino for pid, (_, ino) in processes.items() if ino}}
+
+    def stat(path):
+        if path not in roots:
+            raise FileNotFoundError(path)  # the process is gone
+        return SimpleNamespace(st_dev=1, st_ino=roots[path])
+
+    namespace["os"] = SimpleNamespace(stat=stat)
+    namespace["psutil"] = SimpleNamespace(
+        process_iter=lambda attrs: [SimpleNamespace(pid=pid, info={"cmdline": argv}) for pid, (argv, _) in processes.items()]
+    )
+
+    assert namespace["containerd_processes"]() == [_EXTERNAL]
 
 
 def test_two_containerd_daemons_without_dockers_address_are_unknown(scrape: dict, monkeypatch) -> None:

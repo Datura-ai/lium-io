@@ -442,6 +442,9 @@ docker_containerd() {
     for f in "${SYSBOX_SETUP_HOST_ROOT:-}"/proc/[0-9]*/cmdline; do
         mapfile -d '' -t argv < "$f" 2>/dev/null || continue
         [ "${argv[0]##*/}" = containerd ] || continue
+        # a rental's nested containerd (another root) reads its container's config: its address matches the host's too
+        f=${f%/cmdline}/root
+        [ -e "${SYSBOX_SETUP_HOST_ROOT:-}/proc/1/root" ] && [ -e "$f" ] && ! [ "$f" -ef "${SYSBOX_SETUP_HOST_ROOT:-}/proc/1/root" ] && continue
         bin=${argv[0]} cfg=/etc/containerd/config.toml root="" addr=""
         for ((i = 1; i < ${#argv[@]}; i++)); do
             case "${argv[i]}" in

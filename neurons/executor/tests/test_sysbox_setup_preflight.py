@@ -426,6 +426,19 @@ def test_two_containerd_daemons_without_dockers_address_are_not_measured(tmp_pat
     assert "SKIP" in out and "neither on Docker's address" in out
 
 
+def test_a_rentals_nested_containerd_is_not_a_candidate(tmp_path):
+    # a rental's own containerd reads its container's config, so it would match Docker's address as well
+    root, files = _containerd_fixture(tmp_path, _EXTERNAL, _EXTERNAL)
+    (root / "rental").mkdir()
+    for pid, pid_root in {1: root, 100: root, 101: root / "rental"}.items():
+        (root / "proc" / str(pid)).mkdir(parents=True, exist_ok=True)
+        (root / "proc" / str(pid) / "root").symlink_to(pid_root)
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_ADDRESS": "/run/containerd/containerd.sock", "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/data/containerd is below" in out
+
+
 def test_no_visible_daemon_on_dockers_own_address_reads_its_generated_config(tmp_path):
     # Docker's address names its own containerd: the generated config, not /etc/containerd/config.toml
     root, files = _containerd_fixture(tmp_path)

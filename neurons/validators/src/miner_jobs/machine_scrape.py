@@ -831,12 +831,23 @@ def disk_root_dir(info):
 
 
 def containerd_processes():
-    # argv of every containerd daemon on the host (the executor shares the host's pid namespace)
+    # argv of every containerd daemon on the host (the executor shares the host's pid namespace). Only those in
+    # the host's own root: a rental's nested containerd reads its container's config, so it would also match the
+    # host config's address and leave two candidates.
     return [
         process.info["cmdline"]
         for process in psutil.process_iter(["cmdline"])
         if (process.info["cmdline"] or [""])[0].rsplit("/", 1)[-1] == "containerd"
+        and in_host_root(process.pid)
     ]
+
+
+def in_host_root(pid):
+    try:
+        root, host_root = os.stat(f"/proc/{pid}/root"), os.stat("/proc/1/root")
+    except OSError:
+        return False  # gone, or not readable: not a daemon we can resolve
+    return (root.st_dev, root.st_ino) == (host_root.st_dev, host_root.st_ino)
 
 
 def docker_containerd(info):
