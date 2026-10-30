@@ -93,6 +93,9 @@ class RentedExecutor(BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-5244 (protocol 1.18.0): a pod on the node has an open rental contracted as a self-rent. A backend
+    # before 1.18.0 omits it, so every rental reads as a third party's - today's behaviour.
+    self_rent: bool = False
 
     def get_rented_ports(self) -> list[int]:
         """Aggregate rented ports from all pods."""

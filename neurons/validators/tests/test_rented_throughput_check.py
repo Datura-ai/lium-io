@@ -3,6 +3,7 @@ download check never looks at a rented node."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -71,7 +72,7 @@ def rented(hotkey: str = "miner-hotkey", status: str | None = None) -> RentedExe
 
 
 @contextmanager
-def flags():
+def flags(*, read_pressure: bool = True, enforce_pressure: bool = False):
     fake = SimpleNamespace(
         RENTED_THROUGHPUT_CHECK_ENABLED=True,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
@@ -79,6 +80,8 @@ def flags():
         RENTED_THROUGHPUT_BUSY_MBPS=200.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
+        DISK_PRESSURE_CHECK_ENABLED=read_pressure,
+        DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED=enforce_pressure,
     )
     clock = Clock()
 
@@ -459,3 +462,173 @@ async def test_a_throughput_failed_node_earns_from_neither_pool(
     assert idle == (
         pytest.approx(0.1) if earns and rented_gpus == 1 else 0.0
     )  # rental-share (idle) pool
+
+
+# DAH-5244: the command times `sync -f` on the Docker root before the probe container. Enforced, a stalling sync
+# leaves the container out (its start would wait on the same pages): nothing measured, the streak stands. In shadow
+# the probe runs and the reading says what the verdict would have been.
+def _pressure(stalled: bool) -> str:
+    end = 120.0 if stalled else 100.3
+    rc = "" if stalled else "0"
+    return (
+        "lium_dp t=100.0 dirty=524288:1024 psi=1.00 io=nvme0n1:1000:100:200:10,\n"
+        "lium_dp t=102.0 dirty=1048576:2048 psi=3.50 io=nvme0n1:21000:200:700:60,\n"
+        f"lium_dp_sync start=100.0 end={end} rc={rc}\n"
+    )
+
+
+def test_command_leaves_the_probe_container_out_under_pressure_only_when_enforced():
+    shadow = throughput_command(True)
+    enforced = throughput_command(True, skip_under_pressure=True)
+    assert 'sync -f "$sr"' in shadow and "lium_dp_skipped" not in shadow
+    assert enforced.index("lium_dp_sync") < enforced.index('if [ "$dp" = 1 ]') < enforced.index("/usr/bin/docker run")
+    assert shadow.index("lium_tp_device") < shadow.index("sync -f") < shadow.index("/usr/bin/docker run")
+
+
+async def test_shadow_runs_the_probe_and_records_what_the_gate_would_say():
+    with flags():
+        ctx, runner = make_ctx(snaps() + _pressure(stalled=True) + disk(secs=30.0) + FAST)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert "lium_dp_skipped" not in runner.commands[0]
+    assert (net, disk_side) == ("pass", "fail")
+    assert reading["disk_pressure"]["pressure"] is True and reading["disk_pressure"]["syncfs_timed_out"] is True
+    assert reading["disk_verdict_shadow"] == "none"
+    with flags():
+        ctx, _ = make_ctx(snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST)
+        reading, _, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert reading["disk_pressure"]["pressure"] is False and reading["disk_verdict_shadow"] == "fail"
+
+
+async def test_enforced_pressure_is_no_verdict_on_both_sides_and_keeps_the_streak():
+    skipped = snaps() + _pressure(stalled=True) + "lium_dp_skipped\n"
+    with flags(enforce_pressure=True) as clock:
+        ctx, runner = make_ctx(SLOW_DISK, skipped, SLOW_DISK)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        under_pressure = await check.run(ctx)
+        assert under_pressure.passed and under_pressure.event.reason_code == Msg.SLOW_ONCE.reason
+        what = under_pressure.event.what_we_saw
+        assert what["probe_skipped"] == "disk pressure" and what["disk_verdict"] == what["network_verdict"] == "none"
+        assert what["disk_pressure"]["reason"] == "syncfs" and what["endpoints"] == []
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+    assert all("lium_dp_skipped" in cmd for cmd in runner.commands)
+
+
+def test_command_reads_the_disk_pressure_only_with_the_reading_on():
+    with_reading = throughput_command(True, read_pressure=True)
+    without = throughput_command(True, read_pressure=False)
+    assert "sync -f" in with_reading and "lium_dp" in with_reading
+    assert "sync -f" not in without and "lium_dp" not in without and "/usr/bin/docker run" in without
+
+
+async def test_reading_off_sends_the_command_without_the_sync_and_judges_as_before():
+    with flags(read_pressure=False, enforce_pressure=True):
+        ctx, runner = make_ctx(SLOW_DISK)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert "sync -f" not in runner.commands[0] and "lium_dp_skipped" not in runner.commands[0]
+    assert (net, disk_side) == ("pass", "fail") and "disk_pressure" not in reading
+
+
+SKIPPED = snaps() + _pressure(stalled=True) + "lium_dp_skipped\n"
+PRESSURED_GOOD = snaps() + _pressure(stalled=True) + disk() + FAST
+
+
+async def test_the_fourth_reading_under_pressure_runs_the_probe_regardless():
+    # bounded like the port check: sustained pressure may not leave the probe container unstarted for good; the
+    # forced probe measures the network and logs the disk, whose side stays unjudged under the pressure it read
+    with flags(enforce_pressure=True) as clock, patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(SKIPPED, SKIPPED, SKIPPED, PRESSURED_GOOD, SKIPPED)
+        check = RentedThroughputCheck()
+        results = []
+        for _ in range(5):
+            results.append(await check.run(ctx))
+            clock.now += 3 * 3600 + 1
+    skip_allowed = ["lium_dp_skipped" in cmd for cmd in runner.commands]
+    assert skip_allowed == [True, True, True, False, True]
+    assert [r.event.reason_code for r in results] == [Msg.UNMEASURED.reason] * 5
+    forced = results[3].event.what_we_saw
+    assert "probe_skipped" not in forced and forced["network_verdict"] == "pass"
+    assert forced["disk_verdict"] == "none" and forced["disk"]["mb_per_s"] is not None
+
+
+async def test_an_enforced_probe_that_ran_under_pressure_judges_no_disk_side():
+    # the skip budget spent or its reservation refused: the probe runs and its dd waits on the tenant's pages, so
+    # the disk is busy, not slow - what disk_verdict_shadow promises in shadow, enforcement delivers
+    with flags(enforce_pressure=True):
+        ctx, _ = make_ctx(snaps() + _pressure(stalled=True) + disk(secs=30.0) + FAST)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert (net, disk_side) == ("pass", "none")
+    assert reading["disk"]["mb_per_s"] is not None and reading["disk_verdict_shadow"] == "none"
+    with flags(enforce_pressure=True):
+        ctx, _ = make_ctx(snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST)
+        _, _, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert disk_side == "fail"
+
+
+async def test_a_skip_redis_refuses_to_record_runs_the_probe():
+    class ReadOnlyRedis(FakeRedis):
+        async def set(self, key, value, ex=None):
+            raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
+
+    redis = ReadOnlyRedis()
+    redis.store[f"rented_throughput:{EXECUTOR.uuid}"] = '{"at": 0}'
+    with flags(enforce_pressure=True), patch.dict(module._UNSAVED, clear=True):
+        runner = FakeRunner(PRESSURED_GOOD)
+        ctx = make_context(
+            state=build_state(rented_data=rented(), sysbox_runtime=True),
+            runner=runner,
+            services=build_services(redis=redis),
+        )
+        res = await RentedThroughputCheck().run(ctx)
+    # the probe ran: the network is measured, the disk side is unjudged under the pressure it read
+    assert res.passed and res.event.reason_code == Msg.UNMEASURED.reason
+    what = res.event.what_we_saw
+    assert "probe_skipped" not in what and (what["network_verdict"], what["disk_verdict"]) == ("pass", "none")
+    assert len(runner.commands) == 1 and "lium_dp_skipped" not in runner.commands[0]
+
+
+# a slow disk whose output the host ended with the marker, pressure read or not
+FORGED = snaps() + _pressure(stalled=True) + disk(secs=30.0) + FAST + "lium_dp_skipped\n"
+
+
+@pytest.mark.parametrize(
+    "read_pressure, enforce, recorded, output, disk_verdict, skipped",
+    [
+        (True, False, None, FORGED, "fail", False),  # enforcement off: no skip offered
+        (False, True, None, FORGED, "fail", False),  # reading off: no skip offered
+        # the reservation Redis refused to record, the budget spent: the probe ran; the disk side is unjudged for
+        # the pressure the validator's own sync read, not for the marker
+        (True, True, "refused", FORGED, "none", False),
+        (True, True, {"at": 0, "probe_skips_in_a_row": 3}, FORGED, "none", False),
+        (True, True, None, snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST + "lium_dp_skipped\n", "fail", False),
+        (True, True, None, SKIPPED, "none", True),  # the skip the validator offered, under the pressure it read
+    ],
+    ids=["enforcement_off", "reading_off", "reservation_refused", "budget_spent", "no_pressure_read", "offered"],
+)
+async def test_a_skip_marker_the_validator_did_not_offer_grants_nothing(
+    read_pressure, enforce, recorded, output, disk_verdict, skipped
+):
+    # the host's output cannot grant a skip: the marker counts only in the reading whose command carried it and
+    # whose sync stalled; anywhere else it is noise and the rest of the output is judged
+    class ReadOnlyRedis(FakeRedis):
+        async def set(self, key, value, ex=None):
+            raise ConnectionError("OOM command not allowed when used memory > 'maxmemory'")
+
+    redis = ReadOnlyRedis() if recorded == "refused" else FakeRedis()
+    redis.store[f"rented_throughput:{EXECUTOR.uuid}"] = json.dumps(recorded if isinstance(recorded, dict) else {"at": 0})
+    with flags(read_pressure=read_pressure, enforce_pressure=enforce), patch.dict(module._UNSAVED, clear=True):
+        runner = FakeRunner(output)
+        ctx = make_context(
+            state=build_state(rented_data=rented(), sysbox_runtime=True),
+            runner=runner,
+            services=build_services(redis=redis),
+        )
+        res = await RentedThroughputCheck().run(ctx)
+
+    what = res.event.what_we_saw
+    assert what["disk_verdict"] == disk_verdict
+    assert (what.get("probe_skipped") == "disk pressure") is skipped
+    assert what.get("unsolicited_skip_marker", False) is (not skipped)
+    assert res.event.reason_code == (Msg.UNMEASURED.reason if disk_verdict == "none" else Msg.SLOW_ONCE.reason)

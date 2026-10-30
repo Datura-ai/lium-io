@@ -367,6 +367,7 @@ class RentedMachine(pydantic.BaseModel):
     executor_ip_port: str
     containers: list[RentedContainer]
     owner_flag: bool = False
+    self_rent: bool = False  # DAH-5244, as http.RentedExecutor.self_rent
     rented_ports: list[int] = []  # as above
 
 

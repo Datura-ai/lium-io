@@ -553,6 +553,17 @@ class Settings(BaseSettings):
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5244: before its port-check container (and the rented-throughput probe) the validator times `sync -f` on
+    # the host's Docker root - the wait every `docker run` pays while a tenant's dirty pages sit on that filesystem
+    # - and reads the Docker-root disk and host Dirty around it (services/task/host_disk.py). CHECK_ENABLED takes
+    # the reading, logs it and sends it to the backend (specs.disk_pressure). ENFORCEMENT additionally lets a node
+    # rented by someone else, or running our filler, keep its last verified ports and sysbox instead of a port
+    # check into the stall (DISK_PRESSURE_MAX_DEFERRALS cycles in a row at most; the rental probe rents nothing on
+    # such a cycle), and leaves out the rented-throughput probe container under pressure (a probe that runs under
+    # it judges no disk side). Shadow by default: a week of readings decides the flip.
+    DISK_PRESSURE_CHECK_ENABLED: bool = Field(env="DISK_PRESSURE_CHECK_ENABLED", default=True)
+    DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED: bool = Field(env="DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", default=False)
+
     # DAH-5320: IdleDiskWriteCheck, last in the pipeline, writes the same 256 MiB with fsync on idle and filler nodes
     # once a day per node (skipped while the docker root disk already moves DISK_BUSY_MB_PER_S) and logs
     # IDLE_DISK_WRITE with a shadow verdict against DISK_MIN_MB_PER_S. Logged only; ENFORCE_ENABLED is read by nothing
