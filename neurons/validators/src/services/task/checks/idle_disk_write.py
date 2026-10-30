@@ -58,11 +58,11 @@ class IdleDiskWriteCheck:
     (fail under RENTED_THROUGHPUT_DISK_MIN_MB_PER_S). Always passes: IDLE_DISK_WRITE_ENFORCE_ENABLED is read by nothing.
     A node running a filler counts as busy from IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S (sectors read plus written): a
     filler moving its disk under the rented busy line would otherwise lower the reading. The filler comes from the
-    cycle-start list, or else from the backend's fresh list, so a filler started mid-cycle counts too. DAH-5385: every cycle that
-    reaches this check sends the last reading to the backend as specs[SPECS_KEY]; filler start keeps the big fillers
-    off a slow disk. A node the backend still rents is never measured: TenantEnforcementCheck halts most such cycles
-    earlier, and its passing returns (a rental of another hotkey or address, a stale pod) reach _skip_reason's re-read
-    of the rented list, so the backend holds the last reading it had.
+    cycle-start list, or else from the backend's fresh list, so a filler started mid-cycle counts too. DAH-5385:
+    every cycle that reaches this check sends the last reading to the backend as specs[SPECS_KEY]; filler start
+    keeps the big fillers off a slow disk. A node the backend still rents is never measured: TenantEnforcementCheck
+    halts most such cycles earlier, and its passing returns (a rental of another hotkey or address, a stale pod)
+    reach _skip_reason's re-read of the rented list, so the backend holds the last reading it had.
     """
 
     check_id = "executor.validate.idle_disk_write"
