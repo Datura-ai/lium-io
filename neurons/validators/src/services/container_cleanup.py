@@ -83,7 +83,7 @@ async def evict_cache_volumes_oldest_first(
     volume_names: list[str],
     run_removal: Callable[[str], Awaitable[object]],
     has_room: Callable[[], Awaitable[bool]],
-    first_prefix: str | None = None,
+    evict_first_prefix: str | None = None,
 ) -> None:
     """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
 
@@ -112,7 +112,7 @@ async def evict_cache_volumes_oldest_first(
     ordered: list[str] = sorted(
         volume_names,
         key=lambda name: (
-            not (first_prefix and name.startswith(first_prefix)),
+            not (evict_first_prefix and name.startswith(evict_first_prefix)),
             created_at.get(name, "~"),
             name,
         ),

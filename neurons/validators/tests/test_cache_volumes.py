@@ -398,6 +398,21 @@ async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(dock
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(2389, []), (1000, [_KIMI])])
+async def test_a_recreate_on_its_existing_volume_needs_only_its_storage_and_is_never_clamped(
+    docker_service, free_gb, removed
+):
+    # the pod's 2620 GB volume is already preallocated, outside df free: only the 1310 GB storage (+20) is new
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
+    rental = _rental(2620, 1310)
+    rental.local_volume = "volume_pod"
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed
+    assert rental.volume_limit_gb == 2620
+
+
+@pytest.mark.asyncio
 async def test_a_rental_takes_the_engy_cache_before_an_older_dolphin_cache(docker_service, monkeypatch):
     # the listing offered the Engy cache as free disk, never the Dolphin one, so the Engy family goes first
     class InspectingSshClient(FakeSshClient):

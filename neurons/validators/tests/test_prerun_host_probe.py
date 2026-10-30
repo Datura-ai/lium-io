@@ -36,7 +36,7 @@ from unittest.mock import AsyncMock, Mock
 
 import asyncssh
 import pytest
-from payload_models.payloads import WorkloadKind
+from payload_models.payloads import ContainerWarningCode, WorkloadKind
 from services.docker_service import (
     DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD,
     DockerService,
@@ -972,3 +972,34 @@ async def test_a_customer_create_waits_for_the_engy_cache_removal_before_it_size
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert events == ["cache volume removed", "volume sized", "volume created", "docker run"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("clamped_gb", "created"), [(2500, True), (1059, False)])
+async def test_a_rental_volume_clamped_below_the_order_warns_the_backend_or_fails_the_create(
+    svc_fixture, monkeypatch, clamped_gb, created
+):
+    """DAH-5260: a removal that failed leaves less disk than the listing; the reclaim clamps the volume. Within 5% of the
+    2620 GB order the pod is created and the backend is told; 1059 GB is a short-change, so the create fails and the
+    backend's rent retry moves the pod to another node."""
+    svc = svc_fixture
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+
+    async def clamp(*, payload, **_kwargs):
+        payload.volume_limit_gb = clamped_gb
+        return True
+
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(side_effect=clamp))
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(return_value=ds_module.VolumeSizingResult(clamped_gb, 1310, "legacy"))
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=2620, storage_limit_gb=1310))
+
+    if created:
+        assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+        assert ContainerWarningCode.VolumeSmallerThanRequested in result.warnings
+    else:
+        assert type(result).__name__ == "FailedContainerRequest"
+        assert result.failure_step == ds_module.RENTAL_DISK_SHORT_STEP
+        svc._run_rental_docker_create_with_port_retry.assert_not_awaited()

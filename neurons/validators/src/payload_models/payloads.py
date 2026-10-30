@@ -539,6 +539,7 @@ class BaseValidatorResponse(BaseRequest, DeliveryStamps):
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    VolumeSmallerThanRequested = "VolumeSmallerThanRequested"
 
 
 class VolumeEncryptionStatus(str, enum.Enum):
