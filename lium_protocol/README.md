@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 17 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.19.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.20.0`) is semver over the wire.
 
 ## Using it
 
@@ -59,9 +59,10 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `1.13.0` — `command_id` (optional, default empty) on every `ServerRequest`; a validator that knows it answers a repeat from the first run instead of running it again.
 - `1.14.0` — `command_id` (optional, default empty) on `SshPubKeyAdded` and `FailedContainerRequest`: a validator that knows it echoes the `AddSshPublicKeyRequest`'s `command_id`, so the backend can tell which send an answer confirms.
 - `1.15.0` — `RestoreContainerRequest.recovery` (optional, default false): a re-dispatch of a restore that may already be running (after a reconnect or a redelivered create); the validator does not report its dispatch failure. An older validator ignores it.
-- `1.19.0` — `ContainerWarningCode.HungGpuReset`, `HungGpuNotResetMig`, `HungGpuNotResetNvlinkShared`, `HungGpuNotResetInUse`, `HungGpuNotResetUnsupported` (on `ContainerCreated.warnings`): a reboot or edit found a pod GPU hung and reset it before starting the new container, or could not reset it and says why.
 - `1.17.0` — `RentedExecutorsResponse.maintenance_executor_ids` (optional, default empty): the nodes inside a running provider maintenance window; the validator pays them no incentive from either pool, rented or not. `RentedExecutorsResponse.maintenance_windows_by_executor` (optional, default empty): executor_id → `MaintenanceWindow` (UTC `starting_at`, `expiring_at`, half-open); the validator fails a node with `PROVIDER_MAINTENANCE` when its cycle started inside the window.
 - `1.16.0` — `ResetPodGpuRequest` (backend → validator; `local_volume_path` optional, needed for a pod with an encrypted volume) and its answer `PodGpuResetResult` with `GpuResetErrorCode` and `GpuResetOutcome` (a renter resets their pod's GPUs; the validator stops the container, runs `nvidia-smi -r -i` on the pod's GPUs only and starts it again).
+- `1.18.0` — `ContainerCreateRequest.whole_host` (optional): False when the backend rents the pod part of its host. The validator then hands it no host-wide devices even if every GPU the host shows is in the request. An older validator ignores it.
+- `1.20.0` — `ContainerWarningCode.HungGpuReset`, `HungGpuNotResetMig`, `HungGpuNotResetNvlinkShared`, `HungGpuNotResetInUse`, `HungGpuNotResetUnsupported` (on `ContainerCreated.warnings`): a reboot or edit found a pod GPU hung and reset it before starting the new container, or could not reset it and says why.
 - `1.0.0` — first release.
 
 ## Tests

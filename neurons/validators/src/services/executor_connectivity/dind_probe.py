@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 # connect, key exchange AND authentication against it, none of which carry over to the next
 # attempt, so a host slow enough to need 6s would fail every single try. An attempt is shortened
 # only when less than 12s of the deadline is left, which is time it could not have used anyway.
+# DAH-5419: `docker run` over SSH has no timeout of its own; a stuck daemon held it until the task was dropped.
+# Long enough for a first pull of the DinD image. It is enforced on the node (`timeout -s KILL`): cancelling only
+# our SSH wait leaves the remote CLI running, and it could create the container after the removal in `finally`.
+DIND_RUN_TIMEOUT_SECONDS = 180
+# our own wait on top of it, for an SSH channel that hangs after the remote command is gone
+DIND_RUN_SSH_GRACE_SECONDS = 30
 DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
@@ -179,7 +185,9 @@ class DindVerifier:
             cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
             logger.debug("run: %s...", cmd[:100])
 
-            result = await ssh_client.run(cmd)
+            cmd = f"timeout -s KILL {DIND_RUN_TIMEOUT_SECONDS} {cmd}"
+            async with asyncio.timeout(DIND_RUN_TIMEOUT_SECONDS + DIND_RUN_SSH_GRACE_SECONDS):
+                result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                 # carried whether or not the probe asked for sysbox-runc: the executor's own sysbox
