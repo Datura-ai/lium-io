@@ -178,22 +178,43 @@ async def test_the_last_reading_goes_to_the_backend_every_cycle_until_the_next()
         assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
 
 
-async def test_a_node_left_unmeasured_for_days_keeps_its_reading():
+async def test_a_stored_reading_is_not_refreshed_on_read_so_it_expires_after_its_probe():
     with flags() as clock:
         ctx, _, redis = make_ctx(clock, due=False)
-        key = f"{module.SPECS_KEY}:miner-hotkey:{EXECUTOR.uuid}"
-        redis.store[key] = "13.0"
-        expiries = []
+        key = f"{module._READING_PREFIX}:miner-hotkey:{EXECUTOR.uuid}"
+        redis.store[key] = f"13.0:{clock.now - 3600}"
+        redis.set = AsyncMock()
+        res = await IdleDiskWriteCheck().run(ctx)
+    specs = res.updates["state"].specs
+    assert specs[module.SPECS_KEY] == 13.0 and specs[module.SPECS_MEASURED_AT_KEY] == clock.now - 3600
+    assert all(c.args[0] != key for c in redis.set.await_args_list)
+
+
+async def test_the_reading_is_sent_even_when_redis_fails_to_keep_it():
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(clock, IDLE, write(13))
         real_set = redis.set
 
         async def set_(k, v, ex=None):
-            expiries.append((k, ex))
+            if k.startswith(module._READING_PREFIX):
+                raise ConnectionError
             await real_set(k, v, ex)
 
         redis.set = set_
         res = await IdleDiskWriteCheck().run(ctx)
-    assert res.updates["state"].specs[module.SPECS_KEY] == 13.0
-    assert (key, module._READING_TTL_SECONDS) in expiries
+    assert writes(runner) == 1
+    assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
+    assert res.updates["state"].specs[module.SPECS_MEASURED_AT_KEY] == clock.now
+    assert res.event.what_we_saw["mb_per_s_sent"] == pytest.approx(13, rel=0.01)
+
+
+async def test_a_filler_started_since_cycle_start_keeps_its_download_from_being_measured():
+    """lio#1953 review: the snapshot has no filler, the fresh list has one; 20 MB/s is its download."""
+    with flags() as clock:
+        ctx, runner, _ = make_ctx(clock, snap(20), write(400), fresh=FILLER)
+        res = await IdleDiskWriteCheck().run(ctx)
+    assert writes(runner) == 0 and res.event.what_we_saw["reason"] == "disk busy (20 MB/s)"
+    assert res.event.what_we_saw["disk_busy_mb_per_s"] == pytest.approx(20, rel=0.01)
 
 
 async def test_skips_a_node_rented_since_cycle_start():

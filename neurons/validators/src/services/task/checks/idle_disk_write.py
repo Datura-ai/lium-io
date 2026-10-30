@@ -36,9 +36,12 @@ _RESERVE_SECONDS = (
     SNAPSHOT_TIMEOUT_SECONDS + _RENTED_REREAD_TIMEOUT_SECONDS + WRITE_TIMEOUT_SECONDS + _AFTER_CHECK_SLACK_SECONDS
 )
 _REDIS_PREFIX = "idle_disk_write"
-# DAH-5385: the last reading, sent in the specs every cycle (the backend keeps only the latest specs) for filler start;
-# also the Redis key prefix it is kept under
+# DAH-5385: the last reading and when it was taken (epoch seconds), sent in the specs every cycle (the backend keeps
+# only the latest specs) for filler start
 SPECS_KEY = "idle_disk_write_mb_per_s"
+SPECS_MEASURED_AT_KEY = "idle_disk_write_measured_at"
+_READING_PREFIX = "idle_disk_write_reading"
+# from the write only: a node that cannot be measured again stops sending its figure after this
 _READING_TTL_SECONDS = 3 * INTERVAL_SECONDS
 
 
@@ -63,17 +66,18 @@ class IdleDiskWriteCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         if not settings.IDLE_DISK_WRITE_CHECK_ENABLED:
-            return self._result(ctx, "IDLE_DISK_WRITE_CHECK_ENABLED is off")
+            return self._result(ctx, {"reason": "IDLE_DISK_WRITE_CHECK_ENABLED is off"}, None)
+        what: dict = {}
         try:
-            reason = await self._measure(ctx)
+            what["reason"] = await self._measure(ctx, what)
         except Exception:  # noqa: BLE001 — shadow only: nothing it hits may change the result
             logger.warning(_m("Idle disk write: probe failed", extra=get_extra_info(ctx.default_extra)))
-            reason = "probe failed"
-        return self._result(ctx, reason, await _last_reading(ctx))
+            what["reason"] = "probe failed"
+        return self._result(ctx, what, what.pop("reading", None) or await _last_reading(ctx))
 
-    async def _measure(self, ctx: Context) -> str:
+    async def _measure(self, ctx: Context, what: dict) -> str:
         key = f"{_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
-        skip = await self._skip_reason(ctx, key)
+        skip = await self._skip_reason(ctx, key, what)
         if skip is not None:
             return skip
         await ctx.services.redis.set(key, str(time.time()), ex=2 * INTERVAL_SECONDS)
@@ -85,7 +89,8 @@ class IdleDiskWriteCheck:
         disk = parse_disk(result.stdout or "")
         verdict = None
         if disk.mb_per_s is not None:
-            await ctx.services.redis.set(_reading_key(ctx), str(disk.mb_per_s), ex=_READING_TTL_SECONDS)
+            # sent this cycle even if Redis then fails to keep it
+            what["reading"] = (disk.mb_per_s, time.time())
             verdict = "fail" if disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S else "pass"
         gpu_details = ctx.state.gpu_details or ctx.state.specs.get("gpu", {}).get("details", [])
         logger.info(
@@ -101,16 +106,23 @@ class IdleDiskWriteCheck:
                         "disk_min_mb_per_s": settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S,
                         "gpu_model": ctx.state.gpu_model or (gpu_details[0].get("name") if gpu_details else None),
                         "miner_hotkey": ctx.miner_hotkey,
-                        "filler": _has_filler(ctx),
+                        "filler": _has_filler(ctx.state.rented_data, ctx),
                         "shadow_verdict": verdict,
                         "enforced": False,
                     }
                 ),
             )
         )
+        if disk.mb_per_s is not None:
+            try:
+                await ctx.services.redis.set(
+                    _reading_key(ctx), f"{disk.mb_per_s}:{what['reading'][1]}", ex=_READING_TTL_SECONDS
+                )
+            except Exception:  # noqa: BLE001 — the next cycles send nothing until the next probe; this one still does
+                logger.warning(_m("Idle disk write: reading not stored", extra=get_extra_info(ctx.default_extra)))
         return f"measured: {verdict or 'no verdict'}"
 
-    async def _skip_reason(self, ctx: Context, key: str) -> str | None:
+    async def _skip_reason(self, ctx: Context, key: str, what: dict) -> str | None:
         """Why not now: not due, too little task time, or the node not idle. None = write now."""
         redis = ctx.services.redis
         raw = await redis.get(key)
@@ -127,20 +139,23 @@ class IdleDiskWriteCheck:
         # first, so a busy node (never stamped, so due every cycle) costs one 2 s read and no backend list
         snapshot = await ctx.runner.run(_SNAPSHOT, timeout=SNAPSHOT_TIMEOUT_SECONDS, retryable=False)
         _, disk_busy = parse_busy(snapshot.stdout or "")
+        what["disk_busy_mb_per_s"] = disk_busy
         if disk_busy is None:
             # the docker root's disks are not resolvable (btrfs/zfs, no host view): no later cycle reads them either
             await redis.set(key, str(now), ex=2 * INTERVAL_SECONDS)
             return "docker root disk not resolvable"
-        busy_line_mb_per_s = (
-            settings.IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S
-            if _has_filler(ctx)
-            else settings.RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S
-        )
-        if disk_busy >= busy_line_mb_per_s:
-            return f"disk busy ({disk_busy:.0f} MB/s)"
+        busy = f"disk busy ({disk_busy:.0f} MB/s)"
+        if disk_busy >= settings.RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S:
+            return busy
+        filler_busy = disk_busy >= settings.IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S
+        if filler_busy and _has_filler(ctx.state.rented_data, ctx):
+            return busy
         fresh = await ctx.services.backend.get_rented_executors_now()
         if fresh is None:
             return "rented state unknown"
+        # a filler started since the cycle-start snapshot (capability.py's race): its download is not the disk's speed
+        if filler_busy and _has_filler(fresh, ctx):
+            return busy
         rented_now = fresh.executors.get(ctx.executor.uuid)
         if rented_now is not None and rented_now.pods:
             return "rented"
@@ -148,28 +163,28 @@ class IdleDiskWriteCheck:
             return "rent in progress"
         return None
 
-    def _result(self, ctx: Context, reason: str, mb_per_s: float | None = None) -> CheckResult:
-        what = {"reason": reason}
+    def _result(self, ctx: Context, what: dict, reading: tuple[float, float] | None) -> CheckResult:
+        if reading is not None:
+            what["mb_per_s_sent"], what["measured_at"] = reading
         event = render_message(Msg.LOGGED, ctx=ctx, check_id=self.check_id, what=what)
-        if mb_per_s is None:
+        if reading is None:
             return CheckResult(passed=True, event=event)
-        state = replace(ctx.state, specs={**ctx.state.specs, SPECS_KEY: mb_per_s})
-        return CheckResult(passed=True, event=event, updates={"state": state})
+        specs = {**ctx.state.specs, SPECS_KEY: reading[0], SPECS_MEASURED_AT_KEY: reading[1]}
+        return CheckResult(passed=True, event=event, updates={"state": replace(ctx.state, specs=specs)})
 
 
 def _reading_key(ctx: Context) -> str:
-    return f"{SPECS_KEY}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+    return f"{_READING_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
 
 
-async def _last_reading(ctx: Context) -> float | None:
+async def _last_reading(ctx: Context) -> tuple[float, float] | None:
+    """The stored (MB/s, measured_at); not refreshed here, so it expires _READING_TTL_SECONDS after its probe."""
     try:
-        key = _reading_key(ctx)
-        raw = await ctx.services.redis.get(key)
+        raw = await ctx.services.redis.get(_reading_key(ctx))
         if raw is None:
             return None
-        # a filler node that stays busy goes unmeasured for days: the reading lives until it is replaced
-        await ctx.services.redis.set(key, raw, ex=_READING_TTL_SECONDS)
-        return float(raw)
+        mb_per_s, measured_at = str(raw if isinstance(raw, str) else raw.decode()).split(":")
+        return float(mb_per_s), float(measured_at)
     except Exception:  # noqa: BLE001 — no reading is sent as none: the backend then allows every filler
         return None
 
@@ -179,6 +194,5 @@ def _node_fraction_of_day(ctx: Context) -> float:
     return phase_offset_seconds(ctx.executor.uuid) / (settings.RENTED_THROUGHPUT_INTERVAL_HOURS * 3600)
 
 
-def _has_filler(ctx: Context) -> bool:
-    rented_data = ctx.state.rented_data
+def _has_filler(rented_data, ctx: Context) -> bool:
     return bool(rented_data and rented_data.get_filler_containers(ctx.executor.uuid))
