@@ -474,7 +474,7 @@ resolve_disk_dir() {
     # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
     # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
     # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd or its root cannot be told.
-    local ctrd_root
+    local ctrd_root plugin root_path
     DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
     [ -d "$DISK_DIR" ] || DISK_DIR=/
@@ -494,7 +494,19 @@ resolve_disk_dir() {
     # a root that is not there is unknown, not the data-root
     [ -d "$ctrd_root" ] || return 1
     DISK_DIR=$ctrd_root
-    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $ctrd_root, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (\"root\" in /etc/containerd/config.toml) to the big disk."
+    # the snapshotter's root_path, when set, is where the snapshots really are; else its directory in the root,
+    # which may be a mount of another disk
+    plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
+    [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
+    root_path=$({ "$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null || cat "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null; } |
+        sed -n "/^ *\[plugins\.[\"']${plugin//./\\.}[\"']\]/,/^ *\[/s/^ *root_path *= *[\"']\([^\"']\+\)[\"'].*/\1/p" | head -1)
+    if [ -n "$root_path" ]; then
+        [ -d "$root_path" ] || return 1
+        DISK_DIR=$root_path
+    elif [ -d "$ctrd_root/$plugin" ]; then
+        DISK_DIR=$ctrd_root/$plugin
+    fi
+    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (\"root\" in /etc/containerd/config.toml, or the snapshotter's \"root_path\") to the big disk."
 }
 
 check_total_disk_for_vram() {

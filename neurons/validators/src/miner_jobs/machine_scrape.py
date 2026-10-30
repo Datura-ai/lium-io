@@ -827,7 +827,7 @@ def disk_root_dir(info):
     docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return docker_root_dir
-    return containerd_root(*docker_containerd(info))
+    return containerd_root(*docker_containerd(info), snapshotter=info.get("Driver") or "overlayfs")
 
 
 def containerd_processes():
@@ -913,16 +913,20 @@ def containerd_dump(binary, config_path):
         return {}
 
 
-def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, root=None):
-    # containerd's effective root on the host. A leftover /var/lib/containerd proves nothing: a root
-    # moved in an imported config file leaves it behind, so the default is used only when no config
+def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, root=None, snapshotter="overlayfs"):
+    # where containerd's snapshotter keeps container filesystems on the host: its root_path, else its directory in
+    # containerd's effective root (a mount there counts), else that root. A leftover /var/lib/containerd proves
+    # nothing: a root moved in an imported config file leaves it behind, so the default is used only when no config
     # sets one, and a root that cannot be read raises (CONTAINERD_ROOT_UNKNOWN) instead of measuring it.
-    dumped = None if root else containerd_dump(binary, config_path).get("root")
+    plugin = f"io.containerd.snapshotter.v1.{snapshotter}"
+    dump = containerd_dump(binary, config_path)
+    dumped = dump.get("root")
+    root_path = ((dump.get("plugins") or {}).get(plugin) or {}).get("root_path")
     # walked even after a dump: a missing literal import can still dump exit 0 with the default root
-    roots = []
+    roots, root_paths = [], []
     pending, seen = [config_path], set()
     try:
-        while pending and not root:
+        while pending:
             path = pending.pop(0)
             if path in seen:
                 continue
@@ -935,7 +939,10 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
                 if path != CONTAINERD_CONFIG_PATH:
                     raise
                 config = {}  # no config at all: containerd runs on its default root
-            roots += [config["root"]] if isinstance(config.get("root"), str) else []
+            # containerd keeps an earlier nonempty value over an empty one
+            roots += [config["root"]] if isinstance(config.get("root"), str) and config["root"] else []
+            path_value = ((config.get("plugins") or {}).get(plugin) or {}).get("root_path")
+            root_paths += [path_value] if isinstance(path_value, str) and path_value else []
             for pattern in config.get("imports") or []:
                 # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
                 pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
@@ -947,10 +954,42 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
     # unreadable, or not TOML containerd would load
     except (OSError, ValueError, TypeError) as exc:
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
-    root = root or dumped or (roots[-1] if roots else "/var/lib/containerd")
+    root = host_realpath(root or dumped or (roots[-1] if roots else "/var/lib/containerd"))
     if not os.path.isdir(f"/proc/1/root{root}"):
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
-    return root
+    root_path = root_path or (root_paths[-1] if root_paths else None)
+    if root_path:
+        root_path = host_realpath(root_path)
+        if not os.path.isdir(f"/proc/1/root{root_path}"):
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: snapshotter root_path {root_path!r} is not on the host")
+        return root_path
+    snapshots = host_realpath(f"{root}/{plugin}")
+    return snapshots if os.path.isdir(f"/proc/1/root{snapshots}") else root
+
+
+def host_realpath(path):
+    # path with its symlinks resolved on the host: an absolute link read through /proc/1/root would land in this
+    # container (/var/lib/containerd -> /data/containerd), so each one is followed from the host's root instead
+    parts, resolved, links = path.split("/"), "", 0
+    while parts:
+        part = parts.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            resolved = os.path.dirname(resolved).rstrip("/")
+            continue
+        try:
+            target = os.readlink(f"/proc/1/root{resolved}/{part}")
+        except OSError:  # not a link, or not there: isdir answers for it
+            resolved = f"{resolved}/{part}"
+            continue
+        links += 1
+        if links > 40:
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: symlink loop at {path!r}")
+        parts = target.split("/") + parts
+        if target.startswith("/"):
+            resolved = ""
+    return resolved or "/"
 
 
 def cache_volume_bytes(df, prefixes):

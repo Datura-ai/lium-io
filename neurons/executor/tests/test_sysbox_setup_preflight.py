@@ -466,6 +466,42 @@ def test_an_unreadable_managed_root_is_skipped_not_read_as_the_leftover(tmp_path
     assert "/var/lib/containerd is below" not in out
 
 
+_OVERLAYFS = "io.containerd.snapshotter.v1.overlayfs"
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("snapshots", ["data/snapshots", "var/lib/containerd/snaps"])  # another disk, or inside the root
+def test_disk_is_measured_at_the_snapshotters_root_path(tmp_path, quote, snapshots):
+    # containerd's root on the 436 GiB disk, [plugins."...overlayfs"].root_path on the 14 TiB one: the snapshots
+    root = tmp_path / "root"
+    (root / snapshots).mkdir(parents=True)
+    config = (f'version = 2\nroot = "{root}/var/lib/containerd"\n[plugins]\n  [plugins.{quote}{_OVERLAYFS}{quote}]\n'
+              f'    root_path = {quote}{root}/{snapshots}{quote}\n')
+    files = {"var/lib/containerd/.keep": "", "etc/containerd/config.toml": config}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/{snapshots} is below" in out
+
+
+def test_the_snapshotters_directory_in_the_root_is_measured(tmp_path):
+    # no root_path: the snapshotter's own directory, which may be a mount of another disk beneath the root
+    root = tmp_path / "root"
+    files = {f"var/lib/containerd/{_OVERLAYFS}/.keep": "",
+             "etc/containerd/config.toml": f'version = 2\nroot = "{root}/var/lib/containerd"\n'}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/var/lib/containerd/{_OVERLAYFS} is below" in out
+
+
+def test_a_root_path_that_is_not_on_the_host_is_skipped(tmp_path):
+    root = tmp_path / "root"
+    config = f'root = "{root}/var/lib/containerd"\n[plugins."{_OVERLAYFS}"]\n  root_path = "/gone/snapshots"\n'
+    files = {"var/lib/containerd/.keep": "", "etc/containerd/config.toml": config}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 0, out
+    assert "SKIP" in out and "is below" not in out
+
+
 # ── free disk for the node's images and VerifyX's storage test ───────────────
 
 
