@@ -3,6 +3,7 @@ download check never looks at a rented node."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
@@ -982,7 +983,10 @@ async def test_repeated_late_cycles_fail_the_reading_until_one_completes():
         failed = await check.run(late)
         # no command ran, so not the measured-slow claim
         assert failed.passed is False and failed.event.reason_code == Msg.NOT_RUN.reason
-        assert failed.updates == {"rented_throughput_passed": False, "rented_throughput_not_run": True}
+        assert failed.updates == {
+            "rented_throughput_passed": False,
+            "rented_throughput_not_run": True,
+        }
         assert runner.commands == []
         # a completed reading resets the counter
         assert (await check.run(ctx)).passed
@@ -1001,4 +1005,30 @@ async def test_late_skips_count_while_redis_refuses_writes():
             assert (await check.run(late)).passed
         failed = await check.run(late)
         assert failed.passed is False and failed.event.reason_code == Msg.NOT_RUN.reason
+        assert runner.commands == []
+
+
+async def test_a_slow_redis_save_on_a_late_skip_never_drops_the_cycle():
+    # a SET slower than the cycle time left must not run into the task deadline: bounded, the count kept in memory
+    class SlowRedis(FakeRedis):
+        async def set(self, key, value, ex=None):
+            await asyncio.sleep(30)
+
+    with flags(), patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(GOOD)
+        redis = SlowRedis()
+        redis.store[f"rented_throughput:{EXECUTOR.uuid}"] = '{"at": 0}'
+        ctx = ctx.model_copy(update={"services": build_services(redis=redis)})
+        check = RentedThroughputCheck()
+        # 0.3 s of save budget, then 0 (the save is skipped): both return in time and count the skip
+        for skips, left in ((1, module.SAVE_RESERVE_SECONDS + 0.3), (2, 1)):
+            late = ctx.model_copy(
+                update={
+                    "started_at_monotonic": ctx.started_at_monotonic
+                    - (module.task_seconds_left(ctx) - left)
+                }
+            )
+            result = await asyncio.wait_for(check.run(late), 5)
+            assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+            assert module._UNSAVED[EXECUTOR.uuid].late_skips == skips
         assert runner.commands == []

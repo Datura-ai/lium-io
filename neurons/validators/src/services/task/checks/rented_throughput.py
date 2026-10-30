@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -38,6 +39,8 @@ MIN_TASK_SECONDS_LEFT = COMMAND_TIMEOUT_SECONDS + 30
 # due readings skipped for lack of cycle time, in a row, that count as a failed reading (the provider controls how long
 # the earlier checks take, so endless late cycles must not keep the score)
 LATE_SKIPS_BEFORE_VERDICT = 3
+# cycle time kept after a late skip's Redis save, to finish the cycle
+SAVE_RESERVE_SECONDS = 5
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
 BUSY_WINDOW_SECONDS = 2
@@ -441,11 +444,12 @@ class RentedThroughputCheck:
             if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
             state.late_skips += 1
-            # a skip Redis refuses (READONLY failover) is kept in memory, else the count never reaches the verdict
-            if await self._save(ctx, key, state):
+            # in memory first: a refused (READONLY failover) or slow save must not lose the count, and a save is
+            # bounded by the cycle time left so it cannot itself run into the task deadline and drop the cycle
+            _UNSAVED[ctx.executor.uuid] = state
+            budget = task_seconds_left(ctx) - SAVE_RESERVE_SECONDS
+            if budget > 0 and await self._save(ctx, key, state, timeout=budget):
                 _UNSAVED.pop(ctx.executor.uuid, None)
-            else:
-                _UNSAVED[ctx.executor.uuid] = state
             if state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
             return self._skipped(ctx, "too little cycle time left")
@@ -589,10 +593,14 @@ class RentedThroughputCheck:
             template = Msg.SLOW if slow else Msg.NOT_RUN
             event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
             # NOT_RUN measured nothing, so scoring and the portal must not call it slow
-            updates = {"rented_throughput_passed": False} if slow else {
-                "rented_throughput_passed": False,
-                "rented_throughput_not_run": True,
-            }
+            updates = (
+                {"rented_throughput_passed": False}
+                if slow
+                else {
+                    "rented_throughput_passed": False,
+                    "rented_throughput_not_run": True,
+                }
+            )
             return CheckResult(passed=False, event=event, updates=updates)
         if not probed:
             return self._skipped(
@@ -608,7 +616,9 @@ class RentedThroughputCheck:
             passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         )
 
-    async def _save(self, ctx: Context, key: str, state: _State) -> bool:
+    async def _save(
+        self, ctx: Context, key: str, state: _State, *, timeout: float | None = None
+    ) -> bool:
         payload = {
             "at": state.at,
             "failures_in_a_row": state.failures_in_a_row,
@@ -619,7 +629,9 @@ class RentedThroughputCheck:
             "late_skips": state.late_skips,
         }
         try:
-            await ctx.services.redis.set(key, json.dumps(payload), ex=_REDIS_TTL_SECONDS)
+            await asyncio.wait_for(
+                ctx.services.redis.set(key, json.dumps(payload), ex=_REDIS_TTL_SECONDS), timeout
+            )
             return True
         except Exception:
             logger.warning(
