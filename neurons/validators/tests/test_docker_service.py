@@ -4082,8 +4082,19 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     [
         ("Docker SDK login for r.example failed: 503 Server Error: Service Unavailable", "Docker login to the image registry failed"),
         ("Docker SDK login for r.example failed: UnixHTTPConnectionPool: Read timed out. (read timeout=60)", "Docker login to the image registry failed"),
-        ('Get "https://r.example/v2/": dial tcp: i/o timeout', "Docker login timed out: the node could not reach the image registry"),
+        ('Get "https://r.example/v2/": dial tcp: i/o timeout', "Docker login timed out while contacting the image registry"),
         ("401 Client Error: unauthorized: incorrect username or password", "Docker login refused by the image registry: check the template's registry credentials"),
+        ('Get "https://r.example/v2/": net/http: TLS handshake timeout', "Docker login timed out while contacting the image registry"),
+        ('Get "https://r.example/v2/": net/http: timeout awaiting response headers', "Docker login timed out while contacting the image registry"),
+        (
+            'Docker SDK login for unauthorized.example failed: 503 Server Error for http+docker://ssh/v1.52/auth: '
+            'Service Unavailable ("Get "https://unauthorized.example/v2/": service unavailable")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example failed: 401 Client Error: unauthorized: authentication required",
+            "Docker login refused by the image registry: check the template's registry credentials",
+        ),
     ],
 )
 def test_docker_login_failed_names_only_the_reason_the_error_shows(login_error, expected):
@@ -4124,7 +4135,7 @@ async def test_create_container_login_timeout_has_its_own_renter_headline(docker
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_login"
-    assert result.msg == "Docker login timed out: the node could not reach the image registry"
+    assert result.msg == "Docker login timed out while contacting the image registry"
     assert "127.0.0.1" not in result.msg and "scw.cloud" not in result.msg
     assert "context deadline exceeded" in result.detail
 
