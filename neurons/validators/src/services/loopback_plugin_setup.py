@@ -65,10 +65,13 @@ PROBE_SECONDS = 60
 CLEANUP_SECONDS = 10
 DISABLE_TRY_SECONDS = 10
 DISABLE_TRIES = 3
+# the shell and Python start before the clock above, so the validator's `timeout` may fire this much
+# sooner; it also covers the 1 s timeout floors
+START_SECONDS = 5
 # the probe ends this long before the validator's deadline, however long the lock, install and enable
-# took: the removals before and after it, every disable try with its pause, and 5 s for the shell and
-# Python starting before the clock above and the probe's 1 s timeout floors
-PROBE_RESERVE_SECONDS = 4 * CLEANUP_SECONDS + DISABLE_TRIES * (DISABLE_TRY_SECONDS + 1) + 5
+# took: the removals before and after it, every disable try with its pause, and START_SECONDS
+PROBE_RESERVE_SECONDS = 4 * CLEANUP_SECONDS + DISABLE_TRIES * (DISABLE_TRY_SECONDS + 1) + START_SECONDS
+TOO_LITTLE_TIME_TO_PROBE = "too little of the validator's deadline left to probe"
 # the validator's state check prints the same: the ID changes with every install, DATA_DIR with `plugin set`
 INSTALLATION_FORMAT = "{{.Id}} {{json .Settings.Env}}"
 
@@ -83,8 +86,20 @@ data_dir = "/srv" + root + "/vloopback-" + generation
 state_dir = "/srv/run/docker-volume-loopback-" + generation
 plugins_dir = host_root + root + "/plugins"
 
-def run_docker(*args, timeout=120):
-    return subprocess.run([docker, *args], capture_output=True, text=True, check=False, timeout=timeout)
+def seconds_before_probe_reserve():
+    return validator_deadline - PROBE_RESERVE_SECONDS - time.monotonic()
+
+def run_docker(*args, timeout=None):
+    if timeout is None and probe_image:
+        # a probed setup's calls before the probe end where its reserve begins: however long the lock
+        # and they took, a failed probe still has the time to clean up and disable the plugin
+        try:
+            return subprocess.run([docker, *args], capture_output=True, text=True, check=False,
+                                  timeout=max(1, seconds_before_probe_reserve()))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE) from None
+    return subprocess.run([docker, *args], capture_output=True, text=True, check=False,
+                          timeout=120 if timeout is None else timeout)
 
 def call(*args):
     return run_docker("plugin", *args)
@@ -125,7 +140,7 @@ def mount_probe_volume():
     # free disk is not refused by the reservation instead of by its loop device
     deadline = min(time.monotonic() + PROBE_SECONDS, validator_deadline - PROBE_RESERVE_SECONDS)
     if deadline <= time.monotonic():
-        raise RuntimeError("too little of the validator's deadline left to probe")
+        raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE)
     leftovers = remove_probe_leftovers()
     if leftovers:
         raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
@@ -148,11 +163,15 @@ def mount_probe_volume():
         raise RuntimeError("probe cleanup left " + ", ".join(leftovers))
 
 def disable_plugin(plugin_id):
-    # the backend's health check may hold a volume on the plugin for a moment: retry. Short tries,
-    # so a hung daemon still ends them inside the validator's deadline with this reason on stderr
+    # the backend's health check may hold a volume on the plugin for a moment: retry. Short tries that
+    # stop before the validator's deadline, so a hung daemon still leaves this reason on stderr even
+    # when the lock wait ate the probe's reserve
     for _ in range(DISABLE_TRIES):
+        try_seconds = min(DISABLE_TRY_SECONDS, validator_deadline - START_SECONDS - time.monotonic())
+        if try_seconds < 1:
+            break
         try:
-            if run_docker("plugin", "disable", plugin_id, timeout=DISABLE_TRY_SECONDS).returncode == 0:
+            if run_docker("plugin", "disable", plugin_id, timeout=try_seconds).returncode == 0:
                 return
         except subprocess.TimeoutExpired:
             pass
@@ -206,10 +225,10 @@ try:
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        # the backend's health check tests the marker's existence only: a marker of another build goes
-        # before anything below can fail, and one of another installation (the plugin absent, removed
-        # and installed again, or set to another data directory) once inspect shows it, so both sides
-        # see the same fallback
+        # the backend's health check compares the marker with the plugin's ID and settings but not with
+        # the pinned digest, which it does not know: a marker of another build goes before anything
+        # below can fail, so both sides see the same fallback, and one of another installation (the
+        # plugin absent, removed and installed again, or set to another data directory) once inspect shows it
         if probe_image and read_probe_marker().split(" ")[0] != digest:
             remove_probe_marker()
         plugin = inspect()
@@ -237,6 +256,9 @@ try:
             if [entry for entry in env if entry.startswith(name + "=")] != [name + "=" + value]:
                 raise RuntimeError("data/state directories do not match this Docker data root")
         if not plugin["Enabled"]:
+            if probe_image and seconds_before_probe_reserve() <= 0:
+                # enabled now, the plugin would have no time left to be probed or disabled again
+                raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE)
             call("enable", plugin_id)
             plugin = inspect()
         if not plugin or plugin["Id"] != plugin_id or plugin["Enabled"] is not True:

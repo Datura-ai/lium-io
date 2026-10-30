@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import json
 import shlex
 import signal
@@ -514,20 +515,53 @@ def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_in
     assert not (tmp_path / "probe-ok").exists()
 
 
-def test_setup_with_no_time_left_to_probe_disables_the_plugin_without_mounting(tmp_path: Path) -> None:
-    # Arrange: the install outlasts what the deadline leaves before the 15 s reserve
-    arguments = _setup_arguments(tmp_path, {"install_delay": 6}, deadline_seconds=20)
+def test_setup_with_no_time_left_to_probe_never_enables_the_plugin(tmp_path: Path) -> None:
+    # Arrange: the install outlasts what the deadline leaves before the 15 s reserve and the daemon would
+    # hang on every disable (review, 30.10: an enable the probe had no time for left a disable to the deadline)
+    deadline_seconds = 20
+    arguments = _setup_arguments(
+        tmp_path, {"install_delay": 6, "disable_hang": True}, deadline_seconds=deadline_seconds
+    )
     arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
+    started = time.monotonic()
 
     # Act
     result = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
 
-    # Assert
+    # Assert: the install is cut where the reserve begins and nothing is enabled, so nothing needs disabling
     state = json.loads((tmp_path / "state.json").read_text())
+    assert time.monotonic() - started < deadline_seconds - 10
     assert result.returncode == 1
     assert "too little of the validator's deadline left to probe" in result.stderr
+    assert [call[1] for call in _plugin_calls(tmp_path) if call[1] in ("enable", "disable")] == []
     assert not any(call[0] == "run" for call in state["calls"])
-    assert state["enabled"] is False
+    assert state.get("enabled", False) is False
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_setup_whose_lock_wait_ate_the_reserve_stops_hung_disables_before_the_deadline(tmp_path: Path) -> None:
+    # Arrange: an enabled v3 that was never probed, another setup holding the lock for 12 of the 20 s and a
+    # daemon that hangs on every disable: the reserve is gone, the three disable tries no longer fit
+    deadline_seconds = 20
+    arguments = _setup_arguments(
+        tmp_path, {"installed": True, "enabled": True, "disable_hang": True}, deadline_seconds=deadline_seconds
+    )
+    arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
+    with open(tmp_path / "setup.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = time.monotonic()
+        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(12)
+
+    # Act
+    _, stderr = process.communicate(timeout=60)
+
+    # Assert: the disable tries stop before the validator's `timeout` would, and both reasons reach stderr
+    assert time.monotonic() - started < deadline_seconds
+    assert process.returncode == 1
+    assert "too little of the validator's deadline left to probe" in stderr
+    assert "could not be disabled" in stderr
+    assert 0 < sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) < 3
     assert not (tmp_path / "probe-ok").exists()
 
 
