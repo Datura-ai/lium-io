@@ -5,6 +5,7 @@ from neurons.validators.src.services.nvidia_devices import (
     MissingRentedGpuError,
     _query_gpu_nodes_for_uuids,
     _query_shared_nodes,
+    build_gpu_docker_config_for_executor,
     build_gpu_flags,
 )
 
@@ -79,6 +80,18 @@ async def test_query_shared_nodes_skips_host_wide_nodes_on_a_partial_rental():
     assert "/dev/nvidia-caps-imex-channels" not in cmd
     # RDMA cards belong to the host too — see DAH-2571
     assert "/dev/infiniband" not in cmd
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("whole_host", "gets_host_wide_nodes"), [(None, True), (True, True), (False, False)])
+async def test_the_backend_marking_a_rental_partial_withholds_host_wide_nodes(whole_host, gets_host_wide_nodes):
+    # every GPU the host shows is requested, but GPUs off the bus at this create are not shown (protocol 1.18.0)
+    ssh = fake_ssh(FakeRun("GPU-aaa, 0\nGPU-bbb, 1\n"), FakeRun(""))
+
+    await build_gpu_docker_config_for_executor(ssh, ["GPU-aaa", "GPU-bbb"], whole_host=whole_host)
+
+    shared_nodes_cmd = ssh.run.call_args_list[-1].args[0]
+    assert ("/dev/infiniband" in shared_nodes_cmd) is gets_host_wide_nodes
 
 
 # ---------------------------- build_gpu_flags ----------------------------
