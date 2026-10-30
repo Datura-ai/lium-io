@@ -228,10 +228,12 @@ class CustomBuildOrphanSweepCheck:
 
         active_pod_ids = self._active_pod_ids(ctx)
         # A pod still being created is not in rented_data yet; its in-flight build
-        # (DinD, scratch dir, image) is listed in the shared pending-pods set.
+        # (DinD, scratch dir, image) is listed in the shared pending-pods set. Every
+        # entry counts, not only the last 30 min: setup + build + export can run
+        # past that, and a create cut off by a restart has its entry cleared then.
         try:
             pending = await ctx.services.redis.get_pending_pods(
-                ctx.miner_hotkey, executor_uuid
+                ctx.miner_hotkey, executor_uuid, max_age_seconds=None
             )
         except Exception as exc:  # noqa: BLE001 — cannot tell what is in flight: sweep nothing
             event = render_message(

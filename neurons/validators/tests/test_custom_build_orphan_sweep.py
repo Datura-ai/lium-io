@@ -4,6 +4,8 @@ build's DinD one second into the build)."""
 
 from __future__ import annotations
 
+import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,6 +13,7 @@ import pytest
 from neurons.validators.src.services.task.checks.custom_build_orphan_sweep import (
     CustomBuildOrphanSweepCheck,
 )
+from services.redis_service import PENDING_PODS_PREFIX, RedisService
 
 from tests.helpers import build_services
 
@@ -44,7 +47,9 @@ async def test_a_pending_pods_build_dind_is_not_removed(context_factory):
 
     assert result.passed is True
     assert _removed(ssh) == [ORPHAN]
-    redis.get_pending_pods.assert_awaited_once_with(ctx.miner_hotkey, ctx.executor.uuid)
+    redis.get_pending_pods.assert_awaited_once_with(
+        ctx.miner_hotkey, ctx.executor.uuid, max_age_seconds=None
+    )
 
 
 @pytest.mark.asyncio
@@ -58,3 +63,15 @@ async def test_unreadable_pending_pods_removes_nothing(context_factory):
 
     assert result.passed is True
     assert ssh.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_build_pending_past_30_minutes_is_still_listed_for_the_sweep():
+    # setup + build (1200 s) + export can run past the 30 min other readers allow
+    entry = {"time": int(time.time()) - 40 * 60, "pod_id": "pod-long-build"}
+    service = RedisService.__new__(RedisService)
+    service.hget = AsyncMock(return_value=json.dumps([entry]))
+
+    assert await service.get_pending_pods("miner", "exec") == []
+    assert await service.get_pending_pods("miner", "exec", max_age_seconds=None) == [entry]
+    service.hget.assert_awaited_with(PENDING_PODS_PREFIX, "miner:exec")

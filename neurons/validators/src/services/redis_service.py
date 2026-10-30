@@ -723,7 +723,10 @@ class RedisService:
                 await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
         return creates
 
-    async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
+    async def get_pending_pods(
+        self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60
+    ) -> list[dict]:
+        """Pending-pod entries younger than `max_age_seconds` (None: every entry)."""
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
             return []
@@ -739,7 +742,10 @@ class RedisService:
         pending_pods = []
         
         for item in data:
-            if now - item.get('time', 0) >= 30 * 60:  # 30 mins
+            if (
+                max_age_seconds is not None
+                and now - item.get('time', 0) >= max_age_seconds
+            ):
                 continue
             pending_pods.append(item)
         
