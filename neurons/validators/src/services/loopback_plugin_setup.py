@@ -58,8 +58,20 @@ import sys
 import time
 
 docker, alias, tag, digest, generation, probe_image, root, host_root, lock_path, marker_path = sys.argv[1:]
-# the validator ends this script with `timeout -k 5`: its SIGTERM must still run the cleanup below
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+# a failed probe still disables the plugin inside the validator's 150 s deadline: worst case
+# 2 leftover removals + the probe + 2 cleanup removals + the disable tries is 133 s
+PROBE_SECONDS = 60
+CLEANUP_SECONDS = 10
+DISABLE_TRY_SECONDS = 10
+DISABLE_TRIES = 3
+
+def end_on_validator_deadline(*_):
+    # the validator ends this script with `timeout -k 5`: the reason goes out before the cleanup
+    # below runs, so its SIGKILL cannot leave stderr empty
+    print("setup cut short by the validator's deadline", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+signal.signal(signal.SIGTERM, end_on_validator_deadline)
 data_dir = "/srv" + root + "/vloopback-" + generation
 state_dir = "/srv/run/docker-volume-loopback-" + generation
 plugins_dir = host_root + root + "/plugins"
@@ -87,10 +99,10 @@ def remove_probe_leftovers():
     # the container first: a `docker run` cut off by its timeout leaves it running with the volume
     # attached. Returns what stayed behind
     leftovers = []
-    removed = run_docker("rm", "-f", probe_container)
+    removed = run_docker("rm", "-f", probe_container, timeout=CLEANUP_SECONDS)
     if removed.returncode and "no such container" not in removed.stderr.lower():
         leftovers.append("container " + probe_container)
-    if run_docker("volume", "rm", "-f", probe_volume).returncode:
+    if run_docker("volume", "rm", "-f", probe_volume, timeout=CLEANUP_SECONDS).returncode:
         leftovers.append("volume " + probe_volume)
     return leftovers
 
@@ -103,12 +115,15 @@ def mount_probe_volume():
     leftovers = remove_probe_leftovers()
     if leftovers:
         raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
+    deadline = time.monotonic() + PROBE_SECONDS
     try:
-        created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", probe_volume)
+        created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", probe_volume,
+                             timeout=deadline - time.monotonic())
         if created.returncode:
             raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
         mounted = run_docker("run", "--rm", "--name", probe_container, "--network", "none",
-                             "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync /mnt/probe")
+                             "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync /mnt/probe",
+                             timeout=max(1, deadline - time.monotonic()))
         if mounted.returncode:
             raise RuntimeError("probe volume mount failed: " + mounted.stderr.strip()[-300:])
     except BaseException:
@@ -122,9 +137,9 @@ def mount_probe_volume():
 def disable_plugin(plugin_id):
     # the backend's health check may hold a volume on the plugin for a moment: retry. Short tries,
     # so a hung daemon still ends them inside the validator's deadline with this reason on stderr
-    for _ in range(3):
+    for _ in range(DISABLE_TRIES):
         try:
-            if run_docker("plugin", "disable", plugin_id, timeout=10).returncode == 0:
+            if run_docker("plugin", "disable", plugin_id, timeout=DISABLE_TRY_SECONDS).returncode == 0:
                 return
         except subprocess.TimeoutExpired:
             pass

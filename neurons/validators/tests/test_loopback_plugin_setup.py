@@ -1,12 +1,16 @@
 import asyncio
 import json
+import re
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
+from services.docker_service import _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
 from services.loopback_plugin_setup import (
     _SETUP_SCRIPT,
     LOOPBACK_PLUGIN_BUILDS,
@@ -336,7 +340,7 @@ def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(t
     # first, the volume stays in use and the plugin cannot be disabled, and every retry adds a
     # container (review, 29.10)
     arguments = _setup_arguments(tmp_path, {"run_hang": True})
-    arguments[2] = _SETUP_SCRIPT.replace("timeout=120", "timeout=1")
+    arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", "PROBE_SECONDS = 1")
 
     # Act: two attempts, as two rents would retry the setup
     results = [subprocess.run(arguments, capture_output=True, text=True, timeout=20) for _ in range(2)]
@@ -440,7 +444,7 @@ def test_v2_setup_never_replaces_a_plugin_of_another_build(tmp_path: Path) -> No
 def test_setup_reports_a_disable_that_times_out_after_a_failed_probe(tmp_path: Path) -> None:
     # Arrange: the probe mount fails, then the daemon hangs on every disable
     arguments = _setup_arguments(tmp_path, {"run_exit": 1, "disable_hang": True})
-    arguments[2] = _SETUP_SCRIPT.replace("timeout=10", "timeout=1")
+    arguments[2] = _SETUP_SCRIPT.replace("DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1")
 
     # Act
     result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
@@ -452,6 +456,59 @@ def test_setup_reports_a_disable_that_times_out_after_a_failed_probe(tmp_path: P
     assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 3
     assert not (tmp_path / "probe-ok").exists()
 
+
+
+def _script_constant(name: str) -> int:
+    return int(re.search(rf"^{name} = (\d+)$", _SETUP_SCRIPT, re.M).group(1))
+
+
+def test_a_failed_probe_and_its_disable_tries_fit_the_validators_deadline() -> None:
+    # Arrange: every step of a failed probe takes its full timeout (review, 29.10: 120 s probe + cleanup
+    # + 33 s of disable tries ran past 150 s, and the SIGKILL left stderr empty)
+    cleanup = _script_constant("CLEANUP_SECONDS")
+    disable_tries = _script_constant("DISABLE_TRIES") * (_script_constant("DISABLE_TRY_SECONDS") + 1)
+
+    # Act
+    worst_case = 2 * cleanup + _script_constant("PROBE_SECONDS") + 2 * cleanup + disable_tries
+
+    # Assert
+    assert worst_case < _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
+
+
+def test_setup_reports_a_probe_that_ran_out_of_its_budget_and_a_disable_that_hung(tmp_path: Path) -> None:
+    # Arrange: the probe never returns, then the daemon hangs on every disable
+    arguments = _setup_arguments(tmp_path, {"run_hang": True, "disable_hang": True})
+    arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", "PROBE_SECONDS = 1").replace(
+        "DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1"
+    )
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+
+    # Assert
+    assert result.returncode == 1
+    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "could not be disabled" in result.stderr
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: Path) -> None:
+    # Arrange: the probe is still running when the validator's `timeout` sends SIGTERM
+    arguments = _setup_arguments(tmp_path, {"run_hang": True})
+    process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 10
+    while not any(call[0] == "run" for call in json.loads((tmp_path / "state.json").read_text())["calls"]):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+
+    # Act
+    process.send_signal(signal.SIGTERM)
+    _, stderr = process.communicate(timeout=20)
+
+    # Assert
+    assert process.returncode == 1
+    assert "setup cut short by the validator's deadline" in stderr
+    assert not (tmp_path / "probe-ok").exists()
 
 @pytest.mark.asyncio
 async def test_concurrent_setup_waits_for_the_first_install(tmp_path: Path) -> None:
