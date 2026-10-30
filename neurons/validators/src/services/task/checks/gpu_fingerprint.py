@@ -16,12 +16,29 @@ DECISION_GPU_MISSING = "GPU_MISSING"
 DECISION_ANCHOR_BROKEN = "ANCHOR_BROKEN"
 
 
-def whole_set_replaced(anchor: list[str], current: list[str], rented: bool) -> bool:
-    """An idle node lists as many cards as it was anchored with and none of the anchored ones: the cards were replaced
-    (a VM host can get other physical GPUs on a reboot). It is re-anchored, as removing and re-adding the node would
-    do, and GpuLossHoldCheck hides it for the GPU loss hold window first; a rented node, a missing card and a partly
-    changed set are not re-anchored."""
-    return not rented and bool(anchor) and len(current) == len(anchor) and not set(anchor) & set(current)
+def cards_replaced(anchor: list[str], current: list[str], rented: bool, spot: bool = False) -> bool:
+    """An idle node lists as many cards as it was anchored with, but other ones: the cards were replaced. It is
+    re-anchored, as removing and re-adding the node would do, keeping its node id, and GpuLossHoldCheck hides it for
+    the GPU loss hold window first. Any node qualifies when none of the anchored cards is left (a VM host can get
+    other physical GPUs on a reboot); a Spot node also when only some were replaced. A rented node, a missing or
+    added card, and a partly changed set off Spot keep the anchor."""
+    if rented or not anchor or len(current) != len(anchor) or set(current) == set(anchor):
+        return False
+    return spot or not set(anchor) & set(current)
+
+
+def replacement_reanchors(ctx: Context, anchor: list[str], current: list[str], rented: bool) -> bool:
+    """cards_replaced on the same GPU model: another model keeps the old `spec`, so SpecChangeCheck would fail
+    it every cycle. GpuFingerprintCheck and GpuLossHoldCheck take this one decision."""
+    spec, new_spec = (ctx.verified or {}).get("spec"), ctx.state.gpu_model_count
+    same_model = not (spec and new_spec and spec != new_spec)
+    return same_model and cards_replaced(anchor, current, rented=rented, spot=is_spot(ctx))
+
+
+def is_spot(ctx: Context) -> bool:
+    """The backend lists the node on the Spot tier; no backend data reads as not Spot."""
+    rented_data = ctx.state.rented_data
+    return bool(rented_data and ctx.executor.uuid in (rented_data.spot_executor_ids or []))
 
 
 def split_uuids(csv: str) -> list[str]:
@@ -39,7 +56,7 @@ class GpuFingerprintCheck:
 
     The anchor is the `uuids` value of the executor's verified-job record: written on the first successful
     verification and kept by every later write, including the reset (`clear_verified_job_info` copies it),
-    so a node is never re-anchored under the same executor id.
+    so a node is re-anchored under the same executor id only when its cards were replaced (cards_replaced).
 
     Legacy (GPU_ANCHOR_HARD_ENABLED off): any difference is GPU_UUID_CHANGED, fatal, verification reset.
     The event's what_we_saw also carries the hard rule's decision so it can be read from the stored rows.
@@ -110,10 +127,10 @@ class GpuFingerprintCheck:
             if not hard:
                 from .gpu_loss_hold import rented_pods  # gpu_loss_hold imports this module
 
-                # still a reset (score 0 this cycle); a whole replaced set becomes the anchor now
-                reanchor = whole_set_replaced(anchor, current, rented=bool(rented_pods(ctx)))
+                # still a reset (score 0 this cycle); replaced cards become the anchor now
+                reanchor = replacement_reanchors(ctx, anchor, current, rented=bool(rented_pods(ctx)))
                 event = render_message(
-                    Msg.UUID_CHANGED,
+                    Msg.UUID_REPLACED if reanchor else Msg.UUID_CHANGED,
                     ctx=ctx,
                     check_id=self.check_id,
                     what={**what, "anchor_hard_would_be": decision, **({"reanchored": True} if reanchor else {})},

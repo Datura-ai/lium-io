@@ -11,11 +11,13 @@ from neurons.validators.src.services.task.availability import (
     silence_availability_errors_on_our_own_outage,
 )
 from neurons.validators.src.services.task.checks import (
+    GpuFingerprintCheck,
     GpuLossHoldCheck,
     GpuModelValidCheck,
     MachineSpecScrapeCheck,
     RentedGpuDropCheck,
     TenantEnforcementCheck,
+    gpu_fingerprint,
     gpu_loss_hold,
     machine_spec_scrape,
 )
@@ -63,7 +65,9 @@ def _ctx(
     scrape_error=None,
     pods=(4,),
     owner="miner-hotkey",
+    spot=False,
     anchor=UUIDS,
+    model_count=None,
 ):
     executor = default_executor()
     specs: dict = {"gpu": {"count": count, "details": _details(listed)}}
@@ -82,7 +86,10 @@ def _ctx(
         gpu_count=count,
         gpu_details=_details(listed),
         gpu_uuids=",".join(listed),
-        rented_data=RentedExecutorsResponse(executors=rented),
+        gpu_model_count=model_count,
+        rented_data=RentedExecutorsResponse(
+            executors=rented, spot_executor_ids=[executor.uuid] if spot else []
+        ),
     )
     return context_factory(
         services=build_services(redis=redis),
@@ -424,3 +431,38 @@ async def test_a_node_whose_whole_gpu_set_was_replaced_is_held(context_factory, 
         third = [f"GPU-c0c{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
         again = await GpuLossHoldCheck().run(_ctx(context_factory, redis, listed=third, pods=(), anchor=replaced))
         assert _hidden(again) and again.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("spot", "pods"), [(True, ()), (False, ()), (True, (4,))])
+async def test_a_partly_replaced_set_is_held(context_factory, spot, pods):
+    """One card replaced on an idle Spot node is re-anchored (GpuFingerprintCheck) and held like a whole-set swap,
+    not fatal here; off Spot or under a rental the anchored card is missing, a lost card."""
+    partly = UUIDS[:3] + ["GPU-b0b0-0000-0000-0000-000000000000"]
+
+    result = await _cycle(context_factory, FakeRedis(), listed=partly, pods=pods, spot=spot)
+
+    assert _hidden(result) and not result.passed
+    replaced = spot and not pods
+    assert (result.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]) is replaced
+    if replaced:
+        assert not _fatal(result)
+
+
+@pytest.mark.asyncio
+async def test_a_set_replaced_with_another_model_is_not_reported_as_re_anchored(context_factory):
+    """Regression: cards replaced with another GPU model are not re-anchored (GpuFingerprintCheck), so the hold must
+    not say SET_REPLACED ("do not remove or re-add") before the fingerprint's UUID_CHANGED ("re-register"), nor renew
+    a replacement hold on every later cycle."""
+    redis = FakeRedis()
+    replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+    for _ in range(2):
+        ctx = _ctx(context_factory, redis, listed=replaced, pods=(), model_count="NVIDIA H100 80GB HBM3:4")
+        with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", False):
+            ok, events, ctx = await Pipeline([GpuLossHoldCheck(), GpuFingerprintCheck()], _ListSink()).run(ctx)
+
+        hold, fingerprint = events
+        assert hold.event != Msg.SET_REPLACED.event
+        assert gpu_loss_hold.FAULT_SET_REPLACED not in hold.what_we_saw["faults"]
+        assert fingerprint.reason_code == "GPU_UUID_CHANGED" and "reanchored" not in fingerprint.what_we_saw
+        assert ok is False and ctx.gpu_reanchor is False

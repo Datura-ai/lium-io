@@ -38,7 +38,7 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .gpu_fingerprint import split_uuids, whole_set_replaced
+from .gpu_fingerprint import replacement_reanchors, split_uuids
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
-# An idle node back with a whole new card set (a VM host reboot) is re-anchored by GpuFingerprintCheck
+# An idle node back with replaced cards (a VM host reboot; on Spot also a partial swap) is re-anchored by GpuFingerprintCheck
 # but held like a lost card: 27 Oct, 8x H100 fcd3835d re-anchored 3 times in 5 h and was rented
 # between two reboots.
 FAULT_SET_REPLACED = "gpu_set_replaced"
@@ -107,7 +107,8 @@ def judge_scrape(ctx: Context, pods: list) -> GpuDrop | None:
     if nvml_count is None:
         nvml_count = (specs.get("gpu") or {}).get("count", 0) or 0
     anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
-    if whole_set_replaced(anchor, sorted(set(_listed_uuids(gpu_details))), rented=bool(pods)):
+    listed = sorted(set(_listed_uuids(gpu_details)))
+    if replacement_reanchors(ctx, anchor, listed, rented=bool(pods)):
         anchor = []  # replaced cards, not lost ones: GpuFingerprintCheck re-anchors them
     return judge_rented_gpus(
         rented_gpu_count=_rented_gpu_count(pods),
@@ -150,7 +151,7 @@ class GpuLossHoldCheck:
         drop = judge_scrape(ctx, pods)
         anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
         listed = sorted(set(_listed_uuids(gpu_details)))
-        replaced = drop is None and whole_set_replaced(anchor, listed, rented=bool(pods))
+        replaced = drop is None and replacement_reanchors(ctx, anchor, listed, rented=bool(pods))
         key = _key(ctx)
         mark: DropMark | None = None
         try:
