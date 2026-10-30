@@ -187,8 +187,13 @@ class DockerCommand:
 
     @staticmethod
     def ps_running(container_name: str) -> str:
-        """Build docker ps command to check if container is running."""
-        return f"/usr/bin/docker ps -q -f name={container_name}"
+        """Build docker ps command to check if container is running.
+
+        Docker's name filter is an unanchored regex: `name=pod_1` also lists `pod_12`. A container
+        name is [a-zA-Z0-9_.-], so `.` is its only regex metacharacter.
+        """
+        pattern = container_name.replace(".", r"\.")
+        return f"/usr/bin/docker ps -q -f {shlex.quote(f'name=^/?{pattern}$')}"
 
     @staticmethod
     def exec_command(container_name: str, command: str) -> str:

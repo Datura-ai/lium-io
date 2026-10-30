@@ -10768,6 +10768,21 @@ class DockerService:
             )
             return False
 
+        # a start that did not stick (pod da05c116, 30 Oct: exit 126, restart loop) is not a
+        # recovery: log it truthfully with the container's exit code and logs
+        diagnostics = await collect_container_death_diagnostics(ssh_client, container_name)
+        if diagnostics.status is not None and diagnostics.status != "running":
+            logger.error(
+                _m(
+                    "POD_STALE_MOUNT_RECOVERY_NOT_RUNNING",
+                    extra=get_extra_info({**log_extra, **diagnostics.to_log_fields()}),
+                )
+            )
+            # A restarting container still returns True: the caller's `docker ps` re-read counts it as
+            # running, exactly as before this log existed. Whether a crash loop under the renter's own
+            # image is penalised is the penalty owners' call, not this recovery's (lium-io #1534).
+            return diagnostics.status == "restarting"
+
         logger.info(
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
         )

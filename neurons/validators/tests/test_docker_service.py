@@ -7501,6 +7501,49 @@ async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
 
 
 @pytest.mark.parametrize(
+    "status, expected_recovered",
+    [
+        # restarting keeps True so the caller's `docker ps` re-read decides the verdict as before
+        pytest.param("restarting", True, id="crash_loop_keeps_todays_verdict"),
+        pytest.param("exited", False, id="start_did_not_stick"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_logs_a_start_that_did_not_stick_with_its_exit_code(
+    docker_service, monkeypatch, caplog, status, expected_recovered
+):
+    # pod da05c116 (30 Oct): the repaired container came back restarting with exit 126, yet the
+    # recovery logged POD_STALE_MOUNT_RECOVERED and no exit code anywhere
+    state = {"Status": status, "ExitCode": 126, "OOMKilled": False, "Error": ""}
+    ssh_client = _recovery_ssh_client()
+    plain_run = ssh_client.run.side_effect
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _make_ssh_command_result(stdout=json.dumps(state))
+        if "docker logs" in command:
+            return _make_ssh_command_result(stdout="exec /entrypoint.sh: permission denied\n")
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "start_existing_container", AsyncMock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    events = [str(record.msg) for record in caplog.records]
+    assert "POD_STALE_MOUNT_RECOVERED" not in events
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_NOT_RUNNING"]
+    assert record.msg.extra["container_status"] == status
+    assert record.msg.extra["container_exit_code"] == 126
+    assert "permission denied" in record.msg.extra["container_logs_tail"]
+
+
+@pytest.mark.parametrize(
     "local_volume_path",
     [
         pytest.param(None, id="path_absent"),
