@@ -74,6 +74,7 @@ async def test_dind_probe_fails_when_its_container_start_hangs(mocker):
     ssh_service = mocker.Mock()
     ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
     mocker.patch.object(dind_probe, "DIND_RUN_TIMEOUT_SECONDS", 0.1)
+    mocker.patch.object(dind_probe, "DIND_RUN_SSH_GRACE_SECONDS", 0)
 
     result = await asyncio.wait_for(  # without the bound the start would hold the probe for the full 5 s
         dind_probe.DindVerifier(ssh_service).verify(
@@ -88,6 +89,36 @@ async def test_dind_probe_fails_when_its_container_start_hangs(mocker):
 
     assert result.success is False
     assert any("docker run" not in c for c in commands)  # the probe container is still removed
+
+
+@pytest.mark.asyncio
+async def test_dind_start_is_killed_on_the_node_before_the_container_is_removed(mocker):
+    # DAH-5419 review: a late remote start must not create the container after the removal, so the node's
+    # own `timeout` ends the CLI and the removal runs only once that command has returned
+    from services.executor_connectivity import dind_probe
+
+    commands = []
+
+    async def run(cmd):
+        commands.append(cmd)
+        if "docker run" in cmd:
+            return mocker.Mock(exit_status=137, stdout="", stderr="")  # killed by timeout -s KILL
+        return mocker.Mock(exit_status=0, stdout="", stderr="")
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
+
+    result = await dind_probe.DindVerifier(ssh_service).verify(
+        PortPair(9000, 9000),
+        ssh_client=mocker.Mock(run=run),
+        host="1.2.3.4",
+        container_name_prefix="container_x",
+        sysbox=False,
+    )
+
+    assert result.success is False
+    assert commands[0].startswith(f"timeout -s KILL {dind_probe.DIND_RUN_TIMEOUT_SECONDS} /usr/bin/docker run ")
+    assert "docker rm -fv container_x_9000" in commands[-1]
 
 
 def _batch_verifier(mocker, test_many, external=None):
