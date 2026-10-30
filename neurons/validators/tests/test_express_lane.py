@@ -47,6 +47,7 @@ CYCLE_BATCH_ID = "2026-09-22 19:01:12"
 class _AxonInfo:
     ip: str = "192.0.2.10"
     port: int = 8091
+    is_serving: bool = True
 
 
 @dataclass
@@ -185,6 +186,8 @@ class _Harness:
             miner_service.miners_awaiting_wave_list = {}
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
+        # A self-hosted miner that does not answer its executor list (the portal-snapshot cases).
+        self.miner_service.list_executor_ids = AsyncMock(return_value=None)
         self.release = asyncio.Event()
         self.release.set()
 
@@ -207,13 +210,18 @@ class _Harness:
             backend_client=Mock(
                 get_all_rented_executors=AsyncMock(return_value=RentedExecutorsResponse(executors={}))
             ),
-            subtensor_client=Mock(get_miners=AsyncMock(return_value=miners)),
+            subtensor_client=Mock(
+                get_miners=AsyncMock(return_value=miners),
+                hotkeys_routed_via_central_miner=frozenset(),
+            ),
             cycle_inputs=lambda: self.inputs,
             portal_api=self.portal_api,
         )
 
     async def tick_and_settle(self) -> int:
         launched = await self.lane.tick()
+        if self.lane._listing is not None:
+            await self.lane._listing
         if self.lane._tasks:
             await asyncio.gather(*self.lane._tasks)
         return launched
@@ -263,6 +271,90 @@ async def test_a_never_validated_executor_is_verified_alone_and_published_spec_o
     assert extra["executor_uuid"] == new_node and extra["outcome"] == "passed" and extra["attempt"] == 1
     assert 40 <= extra["registration_to_publish_s"] < 60
     assert extra["first_seen_to_publish_s"] >= 0 and extra["verification_s"] >= 0
+
+
+# --- Self-hosted miners: their new nodes are not in the portal snapshot --------------------
+
+
+@pytest.mark.asyncio
+async def test_a_self_hosted_miners_new_executor_is_found_by_asking_the_miner(monkeypatch, wallet):
+    """A self-hosted miner's node reaches the portal snapshot only after its first publish, so the
+    lane asks the miner for its list. What the first answer lists is the cycle's (like a node
+    registered before fleet_known_since); a node that appears later is verified ahead of the wave."""
+    old, new = str(uuid4()), str(uuid4())
+    harness = _Harness(monkeypatch, {}, [_Neuron("miner-self")])
+    harness.miner_service.list_executor_ids = AsyncMock(return_value=[old])
+
+    assert await harness.tick_and_settle() == 0
+    harness.miner_service.list_executor_ids.return_value = [old, new]
+    harness.lane._next_self_hosted_listing = 0.0
+    assert await harness.tick_and_settle() == 0  # the listing lands after this tick's selection
+    assert await harness.tick_and_settle() == 1
+
+    request = harness.miner_service.request_job_to_miner.await_args.kwargs
+    assert request["executor_id"] == new and request["payload"].miner_hotkey == "miner-self"
+    assert await harness.redis_service.get_validated_executors() == {new}
+
+
+@pytest.mark.asyncio
+async def test_the_self_hosted_listing_cannot_hammer_miners(monkeypatch, wallet):
+    """Only serving miners off the central miner are asked, once per listing interval, and one that
+    did not answer is skipped for the backoff."""
+    miners = [
+        _Neuron("miner-self"),
+        _Neuron("miner-central"),
+        _Neuron("miner-off", axon_info=_AxonInfo(ip="0.0.0.0", is_serving=False)),
+        _Neuron("miner-down"),
+    ]
+    harness = _Harness(monkeypatch, {}, miners)
+    harness.lane.subtensor_client.hotkeys_routed_via_central_miner = frozenset({"miner-central"})
+    harness.miner_service.list_executor_ids = AsyncMock(
+        side_effect=lambda miner: None if miner.hotkey == "miner-down" else []
+    )
+
+    def asked():
+        hotkeys = sorted(
+            c.args[0].hotkey for c in harness.miner_service.list_executor_ids.await_args_list
+        )
+        harness.miner_service.list_executor_ids.reset_mock()
+        return hotkeys
+
+    await harness.tick_and_settle()
+    assert asked() == ["miner-down", "miner-self"]
+    await harness.tick_and_settle()
+    assert asked() == []  # not due yet
+    harness.lane._next_self_hosted_listing = 0.0
+    await harness.tick_and_settle()
+    assert asked() == ["miner-self"]  # miner-down is backed off
+
+
+@pytest.mark.asyncio
+async def test_a_miners_executor_list_is_its_executors_route(wallet):
+    """POST /executors on the miner (a DB read; installs no key), signed over our own hotkey as
+    verify_simple_validator_signature checks. No answer is None, never an exception."""
+    executor_id = str(uuid4())
+    service = MinerService.__new__(MinerService)
+    service._make_rest_request = AsyncMock(
+        return_value=(
+            200,
+            {
+                "validator_hotkey": VALIDATOR_HOTKEY,
+                "executors": [{"uuid": executor_id, "address": "198.51.100.7", "port": 8001}],
+            },
+        )
+    )
+
+    assert await service.list_executor_ids(_Neuron("miner-self")) == [executor_id]
+    call = service._make_rest_request.await_args.kwargs
+    assert (call["method"], call["url"]) == ("POST", "http://192.0.2.10:8091/executors")
+    assert call["json_data"] == {"signature": "0x010203", "validator_hotkey": VALIDATOR_HOTKEY}
+    assert call["timeout"] <= 10
+    wallet.sign.assert_called_with(VALIDATOR_HOTKEY)
+
+    service._make_rest_request = AsyncMock(return_value=(404, {"detail": "Not Found"}))
+    assert await service.list_executor_ids(_Neuron("miner-self")) is None
+    service._make_rest_request = AsyncMock(side_effect=asyncio.TimeoutError)
+    assert await service.list_executor_ids(_Neuron("miner-self")) is None
 
 
 # --- job_batch_id: the prod_executors row's time ---------------------------------------------

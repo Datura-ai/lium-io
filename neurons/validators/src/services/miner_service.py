@@ -22,6 +22,8 @@ from datura.requests.miner_requests import (
     SSHKeyRemoved,
 )
 from datura.requests.validator_requests import (
+    ExecutorListResponse,
+    SimpleValidatorRequest,
     SSHPubKeyRemoveRequest,
     SSHPubKeySubmitRequest,
     GetPodLogsRequest,
@@ -274,6 +276,7 @@ JOB_LENGTH = 30
 
 # HTTP timeout constants for REST API calls
 REST_SSH_SUBMIT_TIMEOUT = 30  # Timeout for SSH key submission requests
+REST_EXECUTOR_LIST_TIMEOUT = 5  # the miner's POST /executors is a DB read
 REST_CONTAINER_OP_TIMEOUT = 30  # Timeout for container operations
 REST_POD_LOGS_TIMEOUT = 30  # Timeout for pod logs requests
 REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
@@ -1738,6 +1741,42 @@ class MinerService:
             "X-Timestamp": str(payload.timestamp),
             "X-Signature": signature,
         }
+
+    async def list_executor_ids(self, miner: bittensor.NeuronInfo) -> list[str] | None:
+        """The executor uuids a miner lists for this validator, or None when it does not answer.
+
+        The miner's POST /executors (verify_simple_validator_signature: we sign our own hotkey) is
+        a read of its executor table that installs nothing on the nodes, unlike the cycle's
+        ssh-pubkey-submit. The express lane asks self-hosted miners, whose new nodes the portal
+        snapshot does not list.
+        """
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        extra = {"miner_hotkey": miner.hotkey}
+        try:
+            request = SimpleValidatorRequest(
+                signature=f"0x{my_key.sign(my_key.ss58_address).hex()}",
+                validator_hotkey=my_key.ss58_address,
+            )
+            status, data = await self._make_rest_request(
+                method="POST",
+                url=f"http://{miner.axon_info.ip}:{miner.axon_info.port}/executors",
+                json_data=request.model_dump(),
+                headers={"Content-Type": "application/json"},
+                timeout=REST_EXECUTOR_LIST_TIMEOUT,
+                log_extra=extra,
+                operation_name="executor list",
+            )
+            if status != 200 or data is None:
+                raise ValueError(f"status {status}")
+            return [executor.uuid for executor in ExecutorListResponse.model_validate(data).executors]
+        except Exception as exc:
+            logger.info(
+                _m(
+                    "[express] Miner did not list its executors",
+                    extra=get_extra_info({**extra, "error": str(exc) or type(exc).__name__}),
+                )
+            )
+            return None
 
     async def _make_rest_request(
         self,
