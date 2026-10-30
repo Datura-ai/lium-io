@@ -4044,7 +4044,7 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
-        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
     )
     docker_client.pull_error = Exception("blocked")
     payload = _private_registry_create_payload()
@@ -4069,9 +4069,111 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_login"
     assert (
-        "earlier login failure: Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker login failed: Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
         in result.detail
     )
+    assert "pull without login then failed: blocked" in result.detail
+    # the wire msg the backend shows the renter: the reason only, no registry or executor text
+    assert result.msg == "Docker login refused by the image registry: check the template's registry credentials"
+
+
+@pytest.mark.parametrize(
+    ("login_error", "expected"),
+    [
+        ("Docker SDK login for r.example failed: 503 Server Error: Service Unavailable", "Docker login to the image registry failed"),
+        ("Docker SDK login for r.example failed: UnixHTTPConnectionPool: Read timed out. (read timeout=60)", "Docker login to the image registry failed"),
+        ('Get "https://r.example/v2/": dial tcp: i/o timeout', "Docker login timed out while contacting the image registry"),
+        ("401 Client Error: unauthorized: incorrect username or password", "Docker login refused by the image registry: check the template's registry credentials"),
+        ('Get "https://r.example/v2/": net/http: TLS handshake timeout', "Docker login timed out while contacting the image registry"),
+        ('Get "https://r.example/v2/": net/http: timeout awaiting response headers', "Docker login timed out while contacting the image registry"),
+        (
+            'Docker SDK login for unauthorized.example failed: 503 Server Error for http+docker://ssh/v1.52/auth: '
+            'Service Unavailable ("Get "https://unauthorized.example/v2/": service unavailable")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example failed: 500 Server Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://unauthorized.example/v2/": dial tcp: lookup unauthorized.example: no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example:5000 failed: 500 Server Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://unauthorized.example:5000/v2/": dial tcp: lookup unauthorized.example on 127.0.0.53:53: '
+            'no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example:5000 failed: 500 Server Error: (\"Get \"https://unauthorized.example:5000/v2/\": "
+            'x509: certificate is valid for other.example, not unauthorized.example")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for auth:5000 failed: 401 Client Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://auth:5000/v2/": unauthorized: incorrect username or password")',
+            "Docker login refused by the image registry: check the template's registry credentials",
+        ),
+        (
+            'Docker SDK login for unauthorized:5000 failed: 500 Server Error: ("Get "https://unauthorized:5000/v2/": '
+            'dial tcp: lookup unauthorized: no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            'Docker SDK login for timeout:5000 failed: 500 Server Error: ("Get "https://timeout:5000/v2/": '
+            'net/http: TLS handshake timeout")',
+            "Docker login timed out while contacting the image registry",
+        ),
+        (
+            'Docker SDK login for registry.example failed: 500 Server Error: ("Get "https://registry.example/v2/": '
+            'x509: certificate is valid for unauthorized.example, not registry.example")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example failed: 401 Client Error: unauthorized: authentication required",
+            "Docker login refused by the image registry: check the template's registry credentials",
+        ),
+    ],
+)
+def test_docker_login_failed_names_only_the_reason_the_error_shows(login_error, expected):
+    """A registry 5xx is not a credential problem, and a validator->daemon read timeout is not the registry's."""
+    from services.docker_service import DockerLoginFailed
+
+    assert DockerLoginFailed("text", login_error).renter_sentence == expected
+
+
+@pytest.mark.asyncio
+async def test_create_container_login_timeout_has_its_own_renter_headline(docker_service, monkeypatch):
+    """A login that timed out reaching the registry must not read as bad credentials (30 Oct prod: Scaleway)."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        'Docker SDK login for rg.fr-par.scw.cloud failed: 500 Server Error ("Get "https://rg.fr-par.scw.cloud/v2/":'
+        ' context deadline exceeded")'
+    )
+    docker_client.pull_error = Exception("pull access denied, may require 'docker login'")
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_login"
+    assert result.msg == "Docker login timed out while contacting the image registry"
+    assert "127.0.0.1" not in result.msg and "scw.cloud" not in result.msg
+    assert "context deadline exceeded" in result.detail
 
 
 @pytest.mark.asyncio
@@ -4082,7 +4184,7 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
     _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
-        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
     )
     payload = _private_registry_create_payload()
     executor_info = ExecutorSSHInfo(

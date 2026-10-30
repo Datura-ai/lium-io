@@ -1263,6 +1263,41 @@ async def _raise_unless_running_before_created(
         )
 
 
+# Every marker is several words, which no hostname, port or URL can be, so the registry's name in the error
+# (SDK label, DNS lookup, x509 certificate names) never matches; the text is matched as it is. The bare word
+# "unauthorized" is no marker: a single-label host of that name reads "lookup unauthorized: no such host".
+# The daemon's own errors reaching the registry (Go net/http), never a validator->daemon read timeout
+_LOGIN_REGISTRY_TIMEOUT_MARKERS = (
+    "context deadline exceeded",
+    "i/o timeout",
+    "tls handshake timeout",
+    "timeout awaiting response headers",
+)
+# Only an explicit refusal by the registry is a credential problem; a 5xx or anything else is not
+_LOGIN_REFUSED_MARKERS = (
+    "401 client error",
+    "incorrect username or password",
+    "authentication required",
+)
+
+
+class DockerLoginFailed(RentalDockerOperationError):
+    """The login failed and the anonymous pull after it failed too. ``renter_sentence`` is the wire `msg`:
+    the backend's renter-facing error, so it names the reason only and no registry or host text."""
+
+    def __init__(self, text: str, login_error: str):
+        lowered = login_error.lower()
+        if any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
+            self.renter_sentence = (
+                "Docker login refused by the image registry: check the template's registry credentials"
+            )
+        elif any(marker in lowered for marker in _LOGIN_REGISTRY_TIMEOUT_MARKERS):
+            self.renter_sentence = "Docker login timed out while contacting the image registry"
+        else:
+            self.renter_sentence = "Docker login to the image registry failed"
+        super().__init__(text)
+
+
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
     ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is `oom`, `killed`,
@@ -8775,10 +8810,13 @@ class DockerService:
                             if login_error is None:
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
-                            # pull failure is most likely the login's fault — attribute it
+                            # pull failure is most likely the login's fault — attribute it,
+                            # and lead with the login error: the anonymous pull's "may require
+                            # 'docker login'" hides a login that timed out reaching the registry
                             current_step = "docker_login"
-                            raise RentalDockerOperationError(
-                                f"{exc} (earlier login failure: {login_error})"
+                            raise DockerLoginFailed(
+                                f"Docker login failed: {login_error} (pull without login then failed: {exc})",
+                                login_error,
                             ) from exc
 
                         # Add profiler for docker pull
@@ -10077,7 +10115,7 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=(
                     last_exc.renter_sentence
-                    if isinstance(last_exc, ContainerKilledDuringBootstrap)
+                    if isinstance(last_exc, (ContainerKilledDuringBootstrap, DockerLoginFailed))
                     else str(log_text)
                 ),
                 detail=failure_detail,
