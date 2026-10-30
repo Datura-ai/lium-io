@@ -432,10 +432,10 @@ async def test_the_synced_marker_is_read_before_the_list(monkeypatch) -> None:
     [
         # nvidia-smi timed out: nothing was read, nothing recorded; the retry records the 80 % tier
         (AsyncMock(side_effect=asyncio.TimeoutError()), (280, 280), None, [0.8, 0.8]),
-        # F-35: GPU-0 read in the tier, GPU-1 missing and pending at stock; the retry reads GPU-1 in the tier
-        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), [0.8, 1.0], [0.8, 0.8]),
-        # GPU-0 read at stock, GPU-1 missing; the host cuts GPU-0 to 80 % before the retry: GPU-0 keeps 1.0
-        (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (280, 350), [1.0, 1.0], [1.0, 1.0]),
+        # partial output: GPU-0 read in the tier, GPU-1 missing and held at stock; the retry keeps both
+        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), [0.8, 1.0], [0.8, 1.0]),
+        # GPU-0 read at stock, GPU-1 missing; the host cuts GPU-0 to 80 % before the retry: it keeps 1.0
+        (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (280, 280), [1.0, 1.0], [1.0, 1.0]),
     ],
 )
 @pytest.mark.asyncio

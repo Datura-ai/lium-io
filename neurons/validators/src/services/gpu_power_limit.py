@@ -741,13 +741,6 @@ async def raise_low_power_limits_to_default(
     return raised
 
 
-def _record_pending(raw: str | bytes | None) -> bool:
-    try:
-        return bool(json.loads(raw).get("pending"))
-    except (ValueError, TypeError, AttributeError):
-        return False
-
-
 def rental_record_pod_id(raw: str | bytes | None) -> str | None:
     """The pod a rental-start record names, or None for a missing or corrupt record."""
     if not raw:
@@ -777,21 +770,19 @@ async def _record_rental_start_ratios(
     writes = RedisWrites()
     unreadable: list[str] = []
     for gpu_uuid, key, old in zip(uuids, keys, existing):
-        if rental_record_pod_id(old) == pod_id and not _record_pending(old):
+        if rental_record_pod_id(old) == pod_id:
             continue  # a reboot or edit of the same rental keeps the limit it started on
         state = state_by_uuid.get(gpu_uuid)
-        record: dict[str, object] = {"pod_id": pod_id}
         if state is None or state.default_watts is None or state.default_watts <= 0:
-            # never read: held at 90 % until the retry's first reading replaces it (a GPU read keeps its own)
+            # held at 90 %; the GPUs read now keep this start too, so a retry cannot re-read them lower
             unreadable.append(gpu_uuid)
-            ratio, record["pending"] = 1.0, True
+            ratio = 1.0
         else:
             ratio = state.current_watts / state.default_watts
         if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
             # raised to its default just above, or a running rental from before the records: it stays at 90 %
             ratio = 1.0
-        record["ratio"] = round(ratio, 4)
-        writes.set(key, json.dumps(record), ex=RENTAL_START_RATIO_TTL_SECONDS)
+        writes.set(key, json.dumps({"pod_id": pod_id, "ratio": round(ratio, 4)}), ex=RENTAL_START_RATIO_TTL_SECONDS)
     try:
         # one MULTI/EXEC: a pod's GPUs are recorded together or not at all, so a retry never mixes starts
         await redis.write_atomically(writes)
