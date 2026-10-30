@@ -2566,7 +2566,7 @@ class GpuAttestationIdentityMessages:
         severity="warning",
         category="policy",
         impact="Score set to 0 while the finding stands",
-        remediation="Update every GPU's VBIOS to at least the version NVIDIA lists for multi-GPU CC mode "
+        remediation="Update every GPU's VBIOS to at least NVIDIA's minimum for CC in R595 "
         "(B200 97.00.E4.00.xx, B300 97.10.64.00.xx).",
     )
     OK = MessageTemplate(

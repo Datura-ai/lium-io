@@ -200,8 +200,8 @@ def host_slots(hw_by_uuid: dict[str, dict]) -> list[str]:
 
 
 def vbios_below(seen, minimum: str) -> bool | None:
-    """Whether `seen` is below `minimum`, comparing the dotted hex fields in order; "XX" in `minimum` matches any
-    value. None when `seen` does not parse as the same number of hex fields."""
+    """Whether `seen` is below `minimum`, comparing the dotted hex fields in order; an "XX" field in `minimum` matches
+    any value and the comparison goes on. None when `seen` does not parse as the same number of hex fields."""
     try:
         fields = [int(f, 16) for f in seen.strip().split(".")]
     except (AttributeError, ValueError):
@@ -211,7 +211,7 @@ def vbios_below(seen, minimum: str) -> bool | None:
         return None
     for got, need in zip(fields, floor):
         if need.upper() == "XX":
-            return False
+            continue
         if got != int(need, 16):
             return got < int(need, 16)
     return False
@@ -219,7 +219,7 @@ def vbios_below(seen, minimum: str) -> bool | None:
 
 def cc_vbios_findings(hw_by_uuid: dict[str, dict], rows: list[dict], minimums: dict[str, str]) -> dict[str, dict]:
     """Per GPU of a multi-GPU node in Confidential Computing mode: a B200/B300 (any model in `minimums`) whose VBIOS
-    is below NVIDIA's multi-GPU CC minimum ("below") or does not parse ("unparseable"). NVML hands out a card's
+    is below NVIDIA's minimum VBIOS for CC in R595 ("below") or does not parse ("unparseable"). NVML hands out a card's
     CC certificate only with CC on, so one card with cert_rc 0 marks the node as CC."""
     if len(hw_by_uuid) < 2 or not any(row.get("cert_rc") == 0 for row in rows):
         return {}
@@ -259,9 +259,8 @@ class GpuAttestationIdentityCheck:
     (bus id + model) are the same, is a finding. VBIOS changes are recorded only (legit updates). A root
     provider can fake all of these consistently: this catches inconsistent fakes, it is not proof.
 
-    On a multi-GPU node in CC mode, a B200/B300 whose VBIOS is below NVIDIA's multi-GPU CC minimum
-    (CC_VBIOS_MINIMUMS) is logged: NCCL across its GPUs fails in CC. It fails the node only under
-    CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED (off by default).
+    On a multi-GPU node in CC mode, a B200/B300 whose VBIOS is below NVIDIA's minimum VBIOS for CC in R595
+    (CC_VBIOS_MINIMUMS) is logged, and fails the node under CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED (on by default).
     """
 
     check_id = "gpu.validate.attestation_identity"

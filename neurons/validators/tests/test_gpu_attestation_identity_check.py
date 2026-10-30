@@ -411,6 +411,7 @@ async def test_vbios_update_and_ecc_toggle_are_recorded_not_flagged(context_fact
         ("garbage", "97.00.E4.00.XX", None),
         ("97.00.E4", "97.00.E4.00.XX", None),
         (None, "97.00.E4.00.XX", None),
+        ("97.00.E4.00.00", "97.XX.E5.00.00", True),  # an XX field before the last one is skipped, not the end
     ],
 )
 def test_vbios_below(seen, minimum, expected):
@@ -464,11 +465,11 @@ def _cc_b200_ctx(context_factory, ca, vbios, rented=False):
 
 
 @pytest.mark.asyncio
-async def test_cc_vbios_below_minimum_is_shadow_by_default(context_factory, caplog):
+async def test_cc_vbios_below_minimum_is_only_logged_with_its_flag_off(context_factory, caplog):
     ca = FakeCa()
     ctx = _cc_b200_ctx(context_factory, ca, "97.00.C5.00.2D")
     with caplog.at_level("WARNING", logger=MODULE):
-        result = await _run(ctx, ca, enforce=True)
+        result = await _run(ctx, ca, enforce=True, enforce_cc_vbios=False)
     assert result.passed is True
     assert result.event.reason_code == Msg.OK.reason
     assert set(result.event.what_we_saw["cc_vbios"]) == {"GPU-a", "GPU-b"}
