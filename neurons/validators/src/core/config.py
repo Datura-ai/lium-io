@@ -564,8 +564,9 @@ class Settings(BaseSettings):
     # - and reads the Docker-root disk and host Dirty around it (services/task/host_disk.py). CHECK_ENABLED takes
     # the reading, logs it and sends it to the backend (specs.disk_pressure). ENFORCEMENT additionally lets a node
     # rented by someone else, or running our filler, keep its last verified ports and sysbox instead of a port
-    # check into the stall (DISK_PRESSURE_MAX_DEFERRALS cycles in a row at most), and leaves out the
-    # rented-throughput probe container under pressure. Shadow by default: a week of readings decides the flip.
+    # check into the stall (DISK_PRESSURE_MAX_DEFERRALS cycles in a row at most; the rental probe rents nothing on
+    # such a cycle), and leaves out the rented-throughput probe container under pressure (a probe that runs under
+    # it judges no disk side). Shadow by default: a week of readings decides the flip.
     DISK_PRESSURE_CHECK_ENABLED: bool = Field(env="DISK_PRESSURE_CHECK_ENABLED", default=True)
     DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED: bool = Field(env="DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", default=False)
 
