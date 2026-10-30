@@ -91,7 +91,10 @@ class CustomBuildOrphanSweepCheck:
 
     @staticmethod
     def _active_pod_ids(ctx: Context) -> set[str]:
-        """Pod ids the validator currently believes are rented on *this* executor."""
+        """Pod ids the validator currently believes are rented on *this* executor.
+
+        Pods still being created are added from the pending-pods set in ``run``.
+        """
         if ctx.state.rented_data is None:
             return set()
         executor = ctx.state.rented_data.executors.get(ctx.executor.uuid)
@@ -224,6 +227,21 @@ class CustomBuildOrphanSweepCheck:
             return CheckResult(passed=True, event=event)
 
         active_pod_ids = self._active_pod_ids(ctx)
+        # A pod still being created is not in rented_data yet; its in-flight build
+        # (DinD, scratch dir, image) is listed in the shared pending-pods set.
+        try:
+            pending = await ctx.services.redis.get_pending_pods(
+                ctx.miner_hotkey, executor_uuid
+            )
+        except Exception as exc:  # noqa: BLE001 — cannot tell what is in flight: sweep nothing
+            event = render_message(
+                Msg.SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"reason": "pending pods unreadable", "error": str(exc)},
+            )
+            return CheckResult(passed=True, event=event)
+        active_pod_ids |= {item["pod_id"] for item in pending if item.get("pod_id")}
         try:
             orphan_images, orphan_scratch, orphan_dind = await asyncio.gather(
                 self._list_orphan_images(ctx.ssh, active_pod_ids),
