@@ -389,6 +389,9 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
     # drops it on deserialization of the backend's request.
     cache_volumes: list[CacheVolume] | None = None
+    # protocol 1.18.0: False when the backend rents the pod part of its host, so it gets no host-wide devices
+    # (RDMA, nvidia-caps) even when every GPU the host shows is requested. None from an older backend.
+    whole_host: bool | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -441,7 +444,7 @@ class ResetPodGpuRequest(ContainerBaseRequest):
 
 class LockPodGpuClocksRequest(ContainerBaseRequest):
     """DAH-4663: lock (or with reset, release) a running pod's GPU clocks; answered by PodGpuClocksResult
-    (lium_protocol 1.18.0)."""
+    (lium_protocol 1.19.0)."""
 
     message_type: ContainerRequestType = ContainerRequestType.LockPodGpuClocksRequest
     container_name: str

@@ -149,7 +149,6 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
 
     async def inspector_start_that_hangs(**kwargs) -> None:
         await asyncio.Event().wait()
@@ -179,7 +178,6 @@ async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     inspector_may_start = asyncio.Event()
 
     async def inspector_start_held(**kwargs) -> None:
@@ -214,7 +212,6 @@ async def test_a_second_edit_cancelled_by_a_delete_while_it_waits_never_parks(sv
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     inspector_may_start = asyncio.Event()
 
     async def inspector_start_held(**kwargs) -> None:

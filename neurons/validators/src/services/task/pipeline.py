@@ -107,7 +107,6 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
@@ -211,7 +210,7 @@ class CheckResult(BaseModel):
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
-    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
@@ -282,6 +281,9 @@ class Context(BaseModel):
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
+    # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    hardware_identity_passed: bool = True
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True

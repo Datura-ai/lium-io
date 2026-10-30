@@ -1036,6 +1036,18 @@
           "default": null,
           "title": "Volume Limit Gb"
         },
+        "whole_host": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Whole Host"
+        },
         "workload_kind": {
           "$ref": "#/$defs/WorkloadKind",
           "default": "CUSTOMER_RENTAL"
@@ -3896,7 +3908,7 @@
       "type": "object"
     },
     "LockPodGpuClocksRequest": {
-      "description": "1.18.0: the renter asked to lock the graphics clocks of their running pod's GPUs to\n`[min_mhz, max_mhz]` (None = the GPU's own bound; clamped to its supported clocks), or with `reset`\nto give them back to the driver. `gpu_uuids` and `gpu_indices` as in `ResetPodGpuRequest`. Answered\nby `validator_to_backend.PodGpuClocksResult` with the same `request_id`.",
+      "description": "1.19.0: the renter asked to lock the graphics clocks of their running pod's GPUs to\n`[min_mhz, max_mhz]` (None = the GPU's own bound; clamped to its supported clocks), or with `reset`\nto give them back to the driver. `gpu_uuids` and `gpu_indices` as in `ResetPodGpuRequest`. Answered\nby `validator_to_backend.PodGpuClocksResult` with the same `request_id`.",
       "properties": {
         "command_id": {
           "default": "",
@@ -4366,7 +4378,7 @@
       "type": "object"
     },
     "PodGpuClocksResult": {
-      "description": "1.18.0: the answer to `backend_to_validator.LockPodGpuClocksRequest`, same `request_id`.\n`gpus` is one outcome per GPU touched, with the clamped range applied; empty when a precheck refused\nbefore anything changed, when `detail` says why. `error_code` reuses `GpuResetErrorCode`.",
+      "description": "1.19.0: the answer to `backend_to_validator.LockPodGpuClocksRequest`, same `request_id`.\n`gpus` is one outcome per GPU touched, with the clamped range applied; empty when a precheck refused\nbefore anything changed, when `detail` says why. `error_code` reuses `GpuResetErrorCode`.",
       "properties": {
         "detail": {
           "anyOf": [
@@ -6489,7 +6501,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.18.0",
+  "protocol_version": "1.19.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
