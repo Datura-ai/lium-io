@@ -92,7 +92,8 @@ def split_ports_event(
         remediation=(
             f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
             "(one per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
-            "then `docker compose up -d` in neurons/executor."
+            "then run `docker compose restart executor-runner` in neurons/executor. Edit .env with nano: "
+            "vim and sed -i replace the file, and the running executor keeps the old copy."
         ),
         extra=extra,
     )
