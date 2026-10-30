@@ -4097,6 +4097,17 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
             "Docker login to the image registry failed",
         ),
         (
+            "Docker SDK login for unauthorized.example:5000 failed: 500 Server Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://unauthorized.example:5000/v2/": dial tcp: lookup unauthorized.example on 127.0.0.53:53: '
+            'no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example:5000 failed: 500 Server Error: (\"Get \"https://unauthorized.example:5000/v2/\": "
+            'x509: certificate is valid for other.example, not unauthorized.example")',
+            "Docker login to the image registry failed",
+        ),
+        (
             "Docker SDK login for unauthorized.example failed: 401 Client Error: unauthorized: authentication required",
             "Docker login refused by the image registry: check the template's registry credentials",
         ),

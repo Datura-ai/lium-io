@@ -1278,8 +1278,9 @@ class DockerLoginFailed(RentalDockerOperationError):
             response = login_error
         registry = head.partition(" for ")[2].strip().lower() if sep else ""
         lowered = re.sub(r"\S+://\S+", " ", response).lower()
-        if registry:  # a DNS error names the bare host ("lookup <registry>: no such host")
-            lowered = lowered.replace(registry, " ")
+        # DNS and x509 errors name the bare host, without the registry's port ("lookup <host>: no such host")
+        for name in {registry, registry.rsplit(":", 1)[0]} - {""}:
+            lowered = lowered.replace(name, " ")
         if any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
             self.renter_sentence = (
                 "Docker login refused by the image registry: check the template's registry credentials"
