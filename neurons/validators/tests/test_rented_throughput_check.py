@@ -949,3 +949,21 @@ async def test_a_throughput_failed_node_earns_from_neither_pool(
     assert idle == (
         pytest.approx(0.1) if earns and rented_gpus == 1 else 0.0
     )  # rental-share (idle) pool
+
+
+async def test_a_late_cycle_skips_the_reading_instead_of_losing_the_node():
+    # 316223c6 (30 Oct 17:49Z): the reading started with ~150 s left and the task deadline dropped the whole cycle
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_DISK, SLOW_DISK, GOOD)
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        check = RentedThroughputCheck()
+        skipped = await check.run(late)
+        assert skipped.passed and skipped.event.reason_code == Msg.SKIPPED.reason
+        assert skipped.event.what_we_saw["reason"] == "too little cycle time left"
+        assert runner.commands == []
+        # still due: the next cycle measures; a standing SLOW verdict survives a late cycle
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW_ONCE.reason
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+        clock.now += 31 * 60
+        assert (await check.run(late)).passed is False and len(runner.commands) == 2

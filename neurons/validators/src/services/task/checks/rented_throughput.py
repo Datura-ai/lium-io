@@ -24,6 +24,7 @@ from .container_download_speed import (
     parse_download_speed,
 )
 from .rented_gpu_drop import POD_STATUS_RUNNING
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,9 @@ DISK_PROBE_BYTES = 256 * 1024 * 1024
 DISK_TIMEOUT_SECONDS = 60
 # the 2 s busy window, the disk probe (direct, then buffered), both fetches and a second container start
 COMMAND_TIMEOUT_SECONDS = 270
+# a reading needs its full command timeout plus the checks after it; started later, the task deadline cuts it off
+# and the node's whole cycle is dropped without a result (316223c6, 30 Oct 17:49Z)
+MIN_TASK_SECONDS_LEFT = COMMAND_TIMEOUT_SECONDS + 30
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
 BUSY_WINDOW_SECONDS = 2
@@ -423,6 +427,11 @@ class RentedThroughputCheck:
                 _UNSAVED[ctx.executor.uuid] = state
         if now < state.next_due_at():
             return self._verdict(ctx, state, probed=False)
+        if task_seconds_left(ctx) < MIN_TASK_SECONDS_LEFT:
+            # no reading this cycle: a standing SLOW stays, otherwise skip; still due, so the next cycle measures
+            if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
+                return self._verdict(ctx, state, probed=False)
+            return self._skipped(ctx, "too little cycle time left")
 
         reading, net, disk = await self._measure_and_judge(ctx)
         reading["inconclusive"] = "inconclusive" in (net, disk)
