@@ -76,6 +76,7 @@ from .checks import (
     ScoreCheck,
     SpecChangeCheck,
     SshdAuthLogCheck,
+    HostOomKillCheck,
     StorageLimitCheck,
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
@@ -302,6 +303,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # ticket-0903: observation only, before any fatal check so a failing node's verdict names the kill too
+                HostOomKillCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -492,6 +495,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # ticket-0903: observation only, before any fatal check so a failing node's verdict names the kill too
+                HostOomKillCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
