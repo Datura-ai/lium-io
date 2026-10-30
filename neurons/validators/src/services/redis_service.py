@@ -648,9 +648,14 @@ class RedisService:
         pending_pods.append(item)
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
-    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str, kind: str | None = None):
+        """Every pending mark of the pod, or only its marks of `kind` when given."""
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
-        pending_pods = [item for item in pending_pods if item.get('pod_id', '') != pod_id]
+        pending_pods = [
+            item
+            for item in pending_pods
+            if item.get('pod_id', '') != pod_id or (kind is not None and item.get('kind') != kind)
+        ]
         if pending_pods:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
         else:
