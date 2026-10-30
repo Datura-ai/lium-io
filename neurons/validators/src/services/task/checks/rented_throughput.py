@@ -35,6 +35,9 @@ COMMAND_TIMEOUT_SECONDS = 270
 # a reading needs its full command timeout plus the checks after it; started later, the task deadline cuts it off
 # and the node's whole cycle is dropped without a result (316223c6, 30 Oct 17:49Z)
 MIN_TASK_SECONDS_LEFT = COMMAND_TIMEOUT_SECONDS + 30
+# due readings skipped for lack of cycle time, in a row, that count as a failed reading (the provider controls how long
+# the earlier checks take, so endless late cycles must not keep the score)
+LATE_SKIPS_BEFORE_VERDICT = 3
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
 BUSY_WINDOW_SECONDS = 2
@@ -347,6 +350,7 @@ class _State:
     disk_failures: int = 0
     reading: dict[str, Any] = field(default_factory=dict)
     measured: bool = False
+    late_skips: int = 0
 
     def next_due_at(self) -> float:
         if self.failures_in_a_row > 0 or self.reading.get("inconclusive"):
@@ -364,6 +368,7 @@ class _State:
                 disk_failures=int(data.get("disk_failures", 0)),
                 reading=dict(data.get("reading") or {}),
                 measured=bool(data.get("measured")),
+                late_skips=int(data.get("late_skips", 0)),
             )
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
@@ -391,7 +396,8 @@ class RentedThroughputCheck:
     failing side inconclusive too. Inconclusive = no strike and no pass however many in a row (owner decision: IO that
     cannot be attributed never fails a node), re-probed after RETRY_SECONDS.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
-    (RENTED_THROUGHPUT_SLOW) until that side passes a reading. Non-fatal: the rental keeps running.
+    (RENTED_THROUGHPUT_SLOW) until that side passes a reading; so do LATE_SKIPS_BEFORE_VERDICT due readings in a row
+    skipped for too little cycle time, until a reading completes. Non-fatal: the rental keeps running.
     """
 
     check_id = "host.validate.rented_throughput"
@@ -430,6 +436,11 @@ class RentedThroughputCheck:
         if task_seconds_left(ctx) < MIN_TASK_SECONDS_LEFT:
             # no reading this cycle: a standing SLOW stays, otherwise skip; still due, so the next cycle measures
             if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
+                return self._verdict(ctx, state, probed=False)
+            state.late_skips += 1
+            # shortcut: a skip Redis refuses to record is not counted; fine while Redis outages are short
+            await self._save(ctx, key, state)
+            if state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
             return self._skipped(ctx, "too little cycle time left")
 
@@ -565,8 +576,12 @@ class RentedThroughputCheck:
             **state.reading,
             "probed_this_cycle": probed,
             "failures_in_a_row": state.failures_in_a_row,
+            "late_skips_in_a_row": state.late_skips,
         }
-        if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
+        if (
+            state.failures_in_a_row >= READINGS_BEFORE_VERDICT
+            or state.late_skips >= LATE_SKIPS_BEFORE_VERDICT
+        ):
             event = render_message(Msg.SLOW, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(
                 passed=False, event=event, updates={"rented_throughput_passed": False}
@@ -593,6 +608,7 @@ class RentedThroughputCheck:
             "disk_failures": state.disk_failures,
             "reading": state.reading,
             "measured": state.measured,
+            "late_skips": state.late_skips,
         }
         try:
             await ctx.services.redis.set(key, json.dumps(payload), ex=_REDIS_TTL_SECONDS)

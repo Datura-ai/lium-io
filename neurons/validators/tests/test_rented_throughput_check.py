@@ -967,3 +967,22 @@ async def test_a_late_cycle_skips_the_reading_instead_of_losing_the_node():
         assert (await check.run(ctx)).passed is False
         clock.now += 31 * 60
         assert (await check.run(late)).passed is False and len(runner.commands) == 2
+
+
+async def test_repeated_late_cycles_fail_the_reading_until_one_completes():
+    # the provider controls how long the earlier checks take; endless late cycles must not keep the score
+    with flags():
+        ctx, runner = make_ctx(GOOD)
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        check = RentedThroughputCheck()
+        for skips in range(1, module.LATE_SKIPS_BEFORE_VERDICT):
+            result = await check.run(late)
+            assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+            assert stored(ctx)["late_skips"] == skips
+        failed = await check.run(late)
+        assert failed.passed is False and failed.event.reason_code == Msg.SLOW.reason
+        assert failed.updates == {"rented_throughput_passed": False}
+        assert runner.commands == []
+        # a completed reading resets the counter
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["late_skips"] == 0 and len(runner.commands) == 1
