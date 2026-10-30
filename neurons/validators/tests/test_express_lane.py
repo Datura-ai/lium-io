@@ -11,6 +11,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock, patch
@@ -326,6 +327,24 @@ async def test_the_self_hosted_listing_cannot_hammer_miners(monkeypatch, wallet)
     harness.lane._next_self_hosted_listing = 0.0
     await harness.tick_and_settle()
     assert asked() == ["miner-self"]  # miner-down is backed off
+
+
+@pytest.mark.asyncio
+async def test_a_miner_that_missed_one_listing_is_asked_again_a_minute_later(monkeypatch, wallet):
+    """One timeout is not a down miner: it is skipped for SELF_HOSTED_LIST_SECONDS, and the skip
+    doubles only while it keeps failing, up to the failure backoff. An answer resets it."""
+    harness = _Harness(monkeypatch, {}, [_Neuron("miner-flaky")])
+    answers = [None, None, None, None, None, None, [], None]
+    harness.miner_service.list_executor_ids = AsyncMock(side_effect=answers)
+
+    skips = []
+    for _ in answers:
+        harness.lane._next_self_hosted_listing = 0.0
+        harness.lane._self_hosted_backoff.pop("miner-flaky", None)
+        await harness.tick_and_settle()
+        until = harness.lane._self_hosted_backoff.get("miner-flaky")
+        skips.append(None if until is None else round(until - time.monotonic(), -1))
+    assert skips == [60, 120, 240, 480, 600, 600, None, 60]
 
 
 @pytest.mark.asyncio

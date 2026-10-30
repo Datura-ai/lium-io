@@ -59,8 +59,9 @@ MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
 FIRST_PASS_FAILED = "first pass failed"
 FIRST_PASS_FAILED_RETRY_SECONDS = 60
 FIRST_PASS_MAX_RUNS = 3
-# Self-hosted miners' executor lists: how often, how many miners at once, and how long a miner
-# that did not answer is skipped. Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
+# Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
+# that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
+# Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
 SELF_HOSTED_LIST_SECONDS = 60
 SELF_HOSTED_LIST_CONCURRENCY = 8
 SELF_HOSTED_LIST_FAILURE_BACKOFF_SECONDS = 600
@@ -144,6 +145,7 @@ class ExpressLane:
         # what the miner's first answer listed: known before this lane looked, the cycle's.
         self._self_hosted: dict[str, dict[str, datetime | None]] = {}
         self._self_hosted_backoff: dict[str, float] = {}  # miner hotkey -> monotonic
+        self._self_hosted_misses: Counter[str] = Counter()  # miner hotkey -> misses in a row
         self._next_self_hosted_listing = 0.0  # monotonic
         self._listing: asyncio.Task | None = None
 
@@ -224,10 +226,15 @@ class ExpressLane:
                 async with limit:
                     executor_ids = await self.miner_service.list_executor_ids(miner)
                 if executor_ids is None:
-                    self._self_hosted_backoff[miner.hotkey] = (
-                        time.monotonic() + SELF_HOSTED_LIST_FAILURE_BACKOFF_SECONDS
+                    self._self_hosted_misses[miner.hotkey] += 1
+                    # From the listing's start, so a one-interval skip ends at the next listing.
+                    self._self_hosted_backoff[miner.hotkey] = now + min(
+                        SELF_HOSTED_LIST_SECONDS
+                        * 2 ** (self._self_hosted_misses[miner.hotkey] - 1),
+                        SELF_HOSTED_LIST_FAILURE_BACKOFF_SECONDS,
                     )
                     return
+                self._self_hosted_misses.pop(miner.hotkey, None)
                 known = self._self_hosted.get(miner.hotkey)
                 seen_at = datetime.now(UTC) if known is not None else None
                 self._self_hosted[miner.hotkey] = {
