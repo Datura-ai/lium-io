@@ -73,10 +73,7 @@ def dmi_overlay_findings(mountinfo: str, file_fs: str) -> list[str]:
 
 
 def gpu_sources_disagree(reported: list[str], kernel: list[str] | None) -> bool:
-    """NVML (the scrape) names a card the kernel's procfs list does not; unknown when the kernel list is unreadable.
-
-    A kernel card the node does not report is not a disagreement: a split host or a card kept out of the listing.
-    """
+    """NVML (the scrape) names a card the kernel's procfs list does not; unknown when the kernel list is unreadable."""
     return kernel is not None and not set(reported) <= set(kernel)
 
 

@@ -816,7 +816,6 @@ class BannedProviderMessages:
 
 
 class HardwareIdentityMessages:
-    # DAH-4547: fails the node.
     SPOOFED = MessageTemplate(
         event="Host hardware identity does not match the hardware",
         reason="HARDWARE_IDENTITY_SPOOFED",

@@ -48,7 +48,6 @@ def test_gpu_sources_disagree():
 
 
 def test_kernel_gpu_the_node_does_not_report_is_not_a_disagreement():
-    # a split host, or a card the provider keeps out of the listing: prod showed 9 kernel GPUs, 8 reported
     assert gpu_sources_disagree(["GPU-a"], ["GPU-a", "GPU-b"]) is False
 
 
@@ -85,7 +84,7 @@ async def test_clean_host_passes_and_logs_fingerprint(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_overlay_fails(context_factory):
+async def test_dmi_overlay_fails(context_factory):
     stdout = _stdout(rows=f"{DMI_ID_PATH}/product_uuid tmpfs\n")
     result = await _run(_ctx(context_factory, stdout=stdout))
     assert result.passed is False
