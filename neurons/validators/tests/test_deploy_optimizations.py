@@ -40,7 +40,7 @@ from services.rental_docker_sdk import ContainerExecResult, ContainerStateSnapsh
 def svc():
     return DockerService(
         ssh_service=Mock(),
-        redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock()),
+        redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None)),
         attestation_service=Mock(),
     )
 

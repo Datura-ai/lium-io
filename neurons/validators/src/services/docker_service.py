@@ -7945,8 +7945,9 @@ class DockerService:
         if executor_info is not None:
             try:
                 rented = await redis_service.get_rented_machine(executor_info)
-            except Exception:
-                return True  # unknown: 90 % only ever holds the provider to more
+            except Exception as exc:
+                # a guess either way records the wrong start for good; the create fails and is retried
+                raise GpuPowerRestoreStateError("rented-machine cache could not be read") from exc
             if any(c.get("pod_id") == pod_id for c in (rented or {}).get("containers", [])):
                 return True
         return await DockerService._pod_container_on_host(ssh_client, pod_id, host_probe)

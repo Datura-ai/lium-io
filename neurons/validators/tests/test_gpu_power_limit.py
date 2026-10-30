@@ -341,7 +341,6 @@ async def test_create_without_a_probe_asks_docker_whether_the_pod_is_on_host(mon
         ({"containers": [{"name": "pod_pod-1", "pod_id": "pod-1"}]}, True),
         ({"containers": [{"name": "pod_pod-2", "pod_id": "pod-2"}]}, False),
         (None, False),
-        (RuntimeError("redis down"), True),
     ],
 )
 async def test_the_backends_rented_list_marks_a_reboot_the_host_hides(monkeypatch, rented, expected) -> None:
@@ -361,3 +360,21 @@ async def test_the_backends_rented_list_marks_a_reboot_the_host_hides(monkeypatc
         record_rental_start=True, executor_info=object(),
     )
     assert raise_mock.await_args.kwargs["pod_on_host"] is expected
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_rented_list_fails_the_create_instead_of_guessing(monkeypatch) -> None:
+    # a guess would record a new 80 % rental at 1.0 (or a reboot at its cut limit) for good
+    import services.docker_service as ds
+
+    monkeypatch.setattr(ds, "restore_tracked_gpu_power_limits", AsyncMock())
+    raise_mock = AsyncMock(return_value=0)
+    monkeypatch.setattr(ds, "raise_low_power_limits_to_default", raise_mock)
+    redis_service = SimpleNamespace(get_rented_machine=AsyncMock(side_effect=RuntimeError("redis down")))
+    payload = SimpleNamespace(gpu_uuids=["GPU-0"], executor_id="ex-1", pod_id="pod-1")
+    with pytest.raises(ds.GpuPowerRestoreStateError):
+        await ds.DockerService._restore_gpu_power_for_uncapped_pod(
+            SimpleNamespace(redis_service=redis_service), AsyncMock(), payload, SimpleNamespace(container_names=()), {},
+            record_rental_start=True, executor_info=object(),
+        )
+    raise_mock.assert_not_awaited()
