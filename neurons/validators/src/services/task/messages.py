@@ -2686,6 +2686,35 @@ class SshdBootstrapMessages:
     )
 
 
+class HostOomKillMessages:
+    NONE = MessageTemplate(
+        event="No host out-of-memory kill in the last day",
+        reason="HOST_OOM_KILL_NONE",
+        severity="info",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+    KILLED = MessageTemplate(
+        event="The host ran out of memory and the kernel killed a process",
+        reason="HOST_OOM_KILL",
+        severity="info",
+        category="runtime",
+        impact="Proceed; observation only",
+        remediation=(
+            "The kernel kills the biggest memory holder when the whole host runs out of memory. If it was a "
+            "process outside Lium's containers, stop it or give the host more RAM; if it was a rental pod, the "
+            "pod used more than the host could spare."
+        ),
+    )
+    UNREAD = MessageTemplate(
+        event="Host out-of-memory kills not read",
+        reason="HOST_OOM_KILL_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+
+
 class SshdAuthLogMessages:
     LOGINS = MessageTemplate(
         event="Executor sshd logins since the last cycle",

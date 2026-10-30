@@ -49,6 +49,7 @@ from .spec_change import SpecChangeCheck
 from .storage_limit import StorageLimitCheck
 from .sshd_bootstrap import SshdBootstrapCheck
 from .sshd_auth_log import SshdAuthLogCheck
+from .host_oom_kill import HostOomKillCheck
 from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
 from .pid_host_required import PidHostRequiredCheck
@@ -88,6 +89,7 @@ __all__ = [
     "RentedPodResourcesCheck",
     "RentedThroughputCheck",
     "SshdAuthLogCheck",
+    "HostOomKillCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
     "NvlinkFaultCheck",
