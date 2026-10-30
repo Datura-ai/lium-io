@@ -336,14 +336,15 @@ async def test_create_without_a_probe_asks_docker_whether_the_pod_is_on_host(mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("rented", "expected"),
+    ("rented", "synced", "expected"),
     [
-        ({"containers": [{"name": "pod_pod-1", "pod_id": "pod-1"}]}, True),
-        ({"containers": [{"name": "pod_pod-2", "pod_id": "pod-2"}]}, False),
-        (None, False),
+        ({"containers": [{"name": "pod_pod-1", "pod_id": "pod-1"}]}, False, True),
+        ({"containers": [{"name": "pod_pod-2", "pod_id": "pod-2"}]}, True, False),
+        (None, True, False),
+        (None, False, "raises"),  # no backend list yet: absence proves nothing
     ],
 )
-async def test_the_backends_rented_list_marks_a_reboot_the_host_hides(monkeypatch, rented, expected) -> None:
+async def test_the_backends_rented_list_marks_a_reboot_the_host_hides(monkeypatch, rented, synced, expected) -> None:
     # F-12 (lio#1924): the host removed both pod_pod-1 and pod_pod-1__prev; the backend's list still names the pod.
     import services.docker_service as ds
 
@@ -351,15 +352,39 @@ async def test_the_backends_rented_list_marks_a_reboot_the_host_hides(monkeypatc
     monkeypatch.setattr(ds, "restore_tracked_gpu_power_limits", AsyncMock())
     monkeypatch.setattr(ds, "raise_low_power_limits_to_default", raise_mock)
     redis_service = SimpleNamespace(
-        get_rented_machine=AsyncMock(side_effect=rented) if isinstance(rented, Exception) else AsyncMock(return_value=rented)
+        get_rented_machine=AsyncMock(return_value=rented), rented_machines_synced=AsyncMock(return_value=synced)
     )
     payload = SimpleNamespace(gpu_uuids=["GPU-0"], executor_id="ex-1", pod_id="pod-1")
-    probe = SimpleNamespace(container_names=())
-    await ds.DockerService._restore_gpu_power_for_uncapped_pod(
-        SimpleNamespace(redis_service=redis_service), AsyncMock(), payload, probe, {},
+    restore = ds.DockerService._restore_gpu_power_for_uncapped_pod(
+        SimpleNamespace(redis_service=redis_service), AsyncMock(), payload, SimpleNamespace(container_names=()), {},
         record_rental_start=True, executor_info=object(),
     )
-    assert raise_mock.await_args.kwargs["pod_on_host"] is expected
+    if expected == "raises":
+        with pytest.raises(ds.GpuPowerRestoreStateError):
+            await restore
+        raise_mock.assert_not_awaited()
+    else:
+        await restore
+        assert raise_mock.await_args.kwargs["pod_on_host"] is expected
+
+
+@pytest.mark.asyncio
+async def test_the_rented_list_is_rebuilt_in_one_transaction() -> None:
+    # F-12: a reader between the old DELETE and the re-adds took a listed legacy rental for a new one
+    from protocol.vc_protocol.compute_requests import RentedMachine
+    from services.redis_service import RENTED_MACHINE_PREFIX, RENTED_MACHINES_SYNCED_KEY, RedisService
+
+    service = SimpleNamespace(write_atomically=AsyncMock())
+    machine = RentedMachine(
+        miner_hotkey="hk", executor_id="ex-1", executor_ip_address="1.2.3.4", executor_ip_port="8001",
+        containers=[{"name": "pod_pod-1", "pod_id": "pod-1"}],
+    )
+    await RedisService.replace_rented_machines(service, [machine])
+    (writes,) = service.write_atomically.await_args.args
+    assert [(op.command, op.args[0]) for op in writes.ops] == [
+        ("delete", RENTED_MACHINE_PREFIX), ("hset", RENTED_MACHINE_PREFIX), ("set", RENTED_MACHINES_SYNCED_KEY),
+    ]
+    assert writes.ops[1].args[1] == "1.2.3.4:8001"
 
 
 @pytest.mark.asyncio

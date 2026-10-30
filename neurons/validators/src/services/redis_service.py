@@ -26,6 +26,8 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 # DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
+# set with every rebuild of the hash above: before the first one a missing machine proves nothing
+RENTED_MACHINES_SYNCED_KEY = "rented_machines_synced"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4658: the pod of a renter GPU reset that ended a moment ago, per node, for a short TTL
@@ -568,9 +570,6 @@ class RedisService:
             async for key in self.redis.scan_iter(match=pattern):
                 await self.redis.delete(key.decode())
 
-    async def add_rented_machine(self, machine: RentedMachine):
-        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json())
-    
     async def add_rented_pod(self, executor: ExecutorSSHInfo, pod_id: str, container_name: str):
         rented_machine = await self.get_rented_machine(executor)
         if not rented_machine:
@@ -592,6 +591,18 @@ class RedisService:
                 await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
             else:
                 await self.hset(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}", json.dumps(rented_machine))
+
+    async def replace_rented_machines(self, machines: list[RentedMachine]) -> None:
+        """Swap in the backend's whole list at once, so a reader never sees the hash half rebuilt."""
+        writes = RedisWrites().delete(RENTED_MACHINE_PREFIX)
+        for machine in machines:
+            writes.hset(
+                RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json()
+            )
+        await self.write_atomically(writes.set(RENTED_MACHINES_SYNCED_KEY, "1"))
+
+    async def rented_machines_synced(self) -> bool:
+        return bool(await self.get(RENTED_MACHINES_SYNCED_KEY))
 
     async def get_rented_machine(self, executor: ExecutorSSHInfo) -> dict | None:
         data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")

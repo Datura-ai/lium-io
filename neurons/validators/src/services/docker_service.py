@@ -4877,7 +4877,7 @@ class DockerService:
         """Record the new container in the rented-machine cache; never fail the create over it.
 
         DAH-2475: this hash is a CACHE, not the source of truth — the backend rebuilds it wholesale
-        every ~10 min (RentedMachineRequest -> delete(RENTED_MACHINE_PREFIX) + re-add) and already
+        every ~10 min (RentedMachineRequest -> replace_rented_machines, one MULTI/EXEC) and already
         learns about this container from the ContainerCreated callback. Before this, a Redis blip at
         this last step raised and tripped cleanup_failed_container_creation, destroying a container
         that was already built and running: on 2026-07-22 a "Timeout connecting to server" here tore
@@ -7950,6 +7950,13 @@ class DockerService:
                 raise GpuPowerRestoreStateError("rented-machine cache could not be read") from exc
             if any(c.get("pod_id") == pod_id for c in (rented or {}).get("containers", [])):
                 return True
+            try:
+                synced = await redis_service.rented_machines_synced()
+            except Exception as exc:
+                raise GpuPowerRestoreStateError("rented-machine cache could not be read") from exc
+            if not synced:
+                # no backend list yet (fresh Redis): absence proves nothing; the create is retried
+                raise GpuPowerRestoreStateError("rented-machine cache not synced from the backend yet")
         return await DockerService._pod_container_on_host(ssh_client, pod_id, host_probe)
 
     @staticmethod
