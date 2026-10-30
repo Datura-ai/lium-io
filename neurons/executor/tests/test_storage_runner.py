@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
@@ -36,9 +37,13 @@ from storage.restic import (
     BACKUP_SOURCE_SCRIPT,
     JsonEventWriter,
     ResticOperationError,
+    ResticResult,
     ResticStorageRunner,
     RestoreStats,
     StorageOperationCancelled,
+    kernel_kill_lines,
+    kernel_kill_note,
+    restic_restore_helper_memory,
 )
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
@@ -222,6 +227,59 @@ def test_backup_repository_probe_retries_transient_access_denied(
         "init",
     ]
     assert clock.now == 2.0
+    assert '"event":"heartbeat"' in event_output.getvalue()
+
+
+def test_backup_repository_probe_retries_closed_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    clock = _RetryClock()
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error='Stat: Head "https://bucket/restic/config": Connection closed by foreign host',
+            ),
+            _repository_command_result(0, standard_output="[]"),
+        ]
+    )
+
+    def slow_restic(*args: object, **kwargs: object) -> object:
+        clock.now += 900.0  # restic's own retries outlast the readiness window
+        return repository_command_sequence(*args, **kwargs)
+
+    monkeypatch.setattr("storage.restic.subprocess.run", slow_restic)
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    runner._ensure_repository_for_backup()
+
+    assert [command[2] for command in repository_command_sequence.commands] == [
+        "snapshots",
+        "snapshots",
+    ]
+
+
+def test_slow_repository_probe_keeps_heartbeating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    event_output = io.StringIO()
+    event_writer = JsonEventWriter(
+        str(OPERATION_ID), 0, heartbeat_interval_seconds=0.0, output=event_output
+    )
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path), event_writer=event_writer)
+
+    def slow_probe(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        time.sleep(1.5)
+        return _repository_command_result(0, standard_output="[]")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", slow_probe)
+    runner._ensure_repository_for_backup()
+
     assert '"event":"heartbeat"' in event_output.getvalue()
 
 
@@ -740,34 +798,108 @@ def test_exit_code_three_with_snapshot_is_completed_partial(
     assert '"result_quality":"PARTIAL"' in output.getvalue()
 
 
+HELPER_ID = "4f2a" + "0" * 60
+OOM_KILL_DMESG = f"""[1000.1] restic invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=1000
+[1000.2] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=docker-{HELPER_ID}.scope,mems_allowed=0,\
+oom_memcg=/system.slice/docker-{HELPER_ID}.scope,task_memcg=/system.slice/docker-{HELPER_ID}.scope,task=restic,pid=4242,uid=0
+[1000.3] Memory cgroup out of memory: Killed process 4242 (restic) total-vm:9000000kB, anon-rss:4100000kB, file-rss:0kB
+[1000.4] oom_reaper: reaped process 4242 (restic), now anon-rss:0kB
+"""
+
+
 class _KilledPopen(_FakePopen):
     def wait(self) -> int:
         return 137
 
 
+@pytest.mark.parametrize("action", ["backup", "restore"])
 @pytest.mark.parametrize(
-    ("oom_killed", "message"),
-    [("true", "^backup ran out of memory$"), ("false", r"^backup helper was killed \(often out of memory\)$")],
+    ("oom_killed", "kernel_log", "message"),
+    [
+        (True, "", " ran out of memory"),
+        (False, "", " helper was killed (Docker recorded no out-of-memory kill)"),
+        (False, OOM_KILL_DMESG, " ran out of memory"),  # the kernel's OOM kill that Docker's flag missed
+        (None, OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect failed
+        ("", OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect printed nothing
+    ],
 )
-def test_killed_helper_reports_oom_only_when_docker_says_so(
-    monkeypatch: pytest.MonkeyPatch, oom_killed: str, message: str
+def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+    oom_killed: bool | str | None,
+    kernel_log: str,
+    message: str,
+    action: str,
 ) -> None:
-    operation = StorageOperationSpec.from_mapping(_operation_payload())
-    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
-    runner = ResticStorageRunner(operation, workspace)
     calls: list[list[str]] = []
+    state = {"Status": "exited", "OOMKilled": oom_killed, "ExitCode": 137}
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
-        stdout = f"{oom_killed}\n" if "inspect" in command else "[]"
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if "inspect" in command:
+            if oom_killed is None:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
+            inspection = json.dumps({"Id": HELPER_ID, "State": state})
+            return SimpleNamespace(returncode=0, stdout=inspection if oom_killed != "" else "", stderr="")
+        if command[0] == "dmesg":
+            return SimpleNamespace(returncode=0, stdout=kernel_log, stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps([{"id": SNAPSHOT_ID}]), stderr="")
 
+    monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)  # restore's empty-target check
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
     monkeypatch.setattr("storage.restic.subprocess.Popen", _KilledPopen)
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action=action))
+    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
+    session = _RenewalSession()  # no cancellation requested
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction(action),
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.BACKUP),
+        session=session,
+    )
+    events = JsonEventWriter(str(OPERATION_ID), 0, output=io.StringIO(), reporter=reporter)
+    runner = ResticStorageRunner(operation, workspace, event_writer=events)
 
-    with pytest.raises(ResticOperationError, match=message):
+    with pytest.raises(ResticOperationError) as raised:
         runner.run()
-    assert calls[-1][1:3] == ["rm", "--force"]
+    # what storage_runner.main does with the raised failure
+    events.diagnostic(str(raised.value))
+    events.result(ResticResult("FAILED", None, None, 1))
+
+    assert str(raised.value) == f"{action}{message}"
+    assert session.puts[-1]["json"]["error_message"] == f"{action}{message}"
+    assert [c for c in calls if c[0] != "dmesg"][-1][1:3] == ["rm", "--force"]
+    # detached runs delete stderr, so the state line must reach the reported operation logs
+    log = "\n".join(session.puts[-1]["json"]["logs"] or [])
+    assert ("docker state" in log) is (oom_killed is not True)
+    if oom_killed is False:
+        assert '"ExitCode": 137' in log
+        kernel_line = "kernel: " + " | ".join(OOM_KILL_DMESG.splitlines()[1:3])
+        assert (kernel_line in log) is bool(kernel_log)
+    elif oom_killed is True:
+        assert not any(c[0] == "dmesg" for c in calls)
+    else:
+        assert "kernel: no helper container ID to match" in log
+
+
+
+
+def test_kernel_kill_lines_match_the_helper_container_only() -> None:
+    assert kernel_kill_lines(OOM_KILL_DMESG, HELPER_ID) == OOM_KILL_DMESG.splitlines()[1:3]
+    assert kernel_kill_lines(OOM_KILL_DMESG.replace(HELPER_ID, "9" * 64), HELPER_ID) == []
+    assert kernel_kill_lines("", HELPER_ID) == []
+
+
+def test_kernel_kill_note_names_a_missing_kill_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_dmesg(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("dmesg")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", no_dmesg)
+    assert kernel_kill_note(HELPER_ID) == "kernel: dmesg unreadable (FileNotFoundError)"
+    monkeypatch.setattr(
+        "storage.restic.subprocess.run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="[1.0] unrelated\n", stderr=""),
+    )
+    assert kernel_kill_note(HELPER_ID) == "kernel: no kernel kill line for the helper"
 
 
 class _TerminatedRunnerPopen(_FakePopen):
@@ -876,7 +1008,8 @@ def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
     assert not any(argument.startswith("s3.connections=") for argument in command)
 
 
-def test_encrypted_restore_preserves_user_xattrs() -> None:
+def test_encrypted_restore_preserves_user_xattrs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("storage.restic.restic_restore_helper_memory", lambda: "16384m")
     operation = StorageOperationSpec.from_mapping(
         _operation_payload(action="restore", mode="encrypted_running")
     )
@@ -896,6 +1029,7 @@ def test_encrypted_restore_preserves_user_xattrs() -> None:
     assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
     assert command[command.index("-t") + 1] == "4321"
     assert "/proc/4321/root/root/restored" in command
+    assert command[command.index("--memory") + 1] == "16384m"  # backups and legacy tar restores keep 4g
     assert "restore" in command
     assert "--json" in command
     excluded_xattrs = [
@@ -974,6 +1108,46 @@ def test_no_rendered_helper_spec_carries_a_volume_passphrase(
     assert not any("passphrase" in item.lower() for item in rendered), rendered
     assert not any("gocryptfs" in item for item in rendered), rendered
     assert "leaked-from-the-executor-environment" not in " ".join(rendered)
+
+
+@pytest.mark.parametrize(
+    ("mem_total_kib", "expected"),
+    [
+        (14 * 1024 * 1024, "4096m"),  # quarter is 3.5 GiB: floor 4g
+        (32 * 1024 * 1024, "8192m"),
+        (128 * 1024 * 1024, "16384m"),  # quarter is 32 GiB: capped at 16g
+    ],
+)
+def test_restic_restore_helper_memory_is_a_quarter_of_host_ram_between_4g_and_16g(
+    tmp_path: Path, mem_total_kib: int, expected: str
+) -> None:
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(f"MemTotal:       {mem_total_kib} kB\nMemFree:        1024 kB\n")
+
+    assert restic_restore_helper_memory(str(meminfo)) == expected
+
+
+def test_restic_restore_helper_memory_falls_back_to_4g_when_meminfo_is_unreadable(tmp_path: Path) -> None:
+    assert restic_restore_helper_memory(str(tmp_path / "missing")) == "4g"
+    garbled = tmp_path / "meminfo"
+    garbled.write_text("MemFree: 1 kB\n")
+    assert restic_restore_helper_memory(str(garbled)) == "4g"
+
+
+def test_legacy_tar_restore_keeps_the_4g_helper_cap() -> None:
+    payload = _operation_payload(action="restore")
+    payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace/restored"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), workspace)
+
+    command, _ = runner._legacy_restore_execution_command("legacy/object.tgz")
+
+    assert command[command.index("--memory") + 1] == "4g"
 
 
 def test_local_cancellation_marker_is_observed() -> None:
@@ -1130,7 +1304,7 @@ def test_restore_reporter_surfaces_scan_then_restore_stages() -> None:
     second_payload = session.requests[1]["json"]
     assert isinstance(first_payload, dict)
     assert isinstance(second_payload, dict)
-    assert first_payload["stage"] == "PREPARING"
+    assert first_payload["stage"] == "SCANNING"
     assert first_payload["total_files"] == 123
     assert second_payload["stage"] == "RESTORING"
 
@@ -1628,8 +1802,10 @@ class _RenewalSession:
     def __init__(self, status_code: int = 200) -> None:
         self.status_code = status_code
         self.posts: list[dict[str, object]] = []
+        self.puts: list[dict[str, object]] = []
 
     def put(self, url: str, **kwargs: object) -> SimpleNamespace:
+        self.puts.append(kwargs)
         return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {})
 
     def post(self, url: str, **kwargs: object) -> SimpleNamespace:
@@ -1748,3 +1924,57 @@ def test_backup_renews_at_most_three_times(monkeypatch: pytest.MonkeyPatch, tmp_
     with pytest.raises(ResticOperationError, match="credentials expired"):
         runner.run()
     assert (len(environments), len(session.posts)) == (4, 3)
+
+
+TIMEOUT_EXIT = (
+    '{"message_type":"exit_error","code":1,"message":"Fatal: unable to save snapshot: client.PutObject: '
+    'Put \\"https://bucket.s3.amazonaws.com/restic/v1/pods/p/data/54/54ce\\": request timeout"}\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("first_runs", "runs", "completed"),
+    [
+        pytest.param([TIMEOUT_EXIT], 2, True, id="one timeout reruns and completes"),
+        pytest.param([TIMEOUT_EXIT, TIMEOUT_EXIT], 2, False, id="a second timeout fails"),
+        pytest.param(
+            [TIMEOUT_EXIT, '{"message_type":"exit_error","code":1,"message":"Fatal: repository is already locked"}\n'],
+            2,
+            False,
+            id="a different second failure is the one reported",
+        ),
+        pytest.param(
+            ['{"message_type":"exit_error","code":1,"message":"Fatal: repository is already locked"}\n'],
+            1,
+            False,
+            id="no rerun for a non-network failure",
+        ),
+    ],
+)
+def test_backup_reruns_once_after_an_s3_upload_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first_runs: list[str], runs: int, completed: bool
+) -> None:
+    runner, _ = _renewing_runner(monkeypatch, tmp_path, _RenewalSession(), expired_runs=0)
+    calls: list[list[str]] = []
+
+    class _Popen(_FakePopen):
+        def __init__(self, command: list[str], *args: object, **kwargs: object) -> None:
+            super().__init__(command, *args, **kwargs)
+            calls.append(command)
+            self._failed = len(calls) <= len(first_runs)
+            if self._failed:
+                self.stdout = iter([first_runs[len(calls) - 1]])
+
+        def wait(self) -> int:
+            return 1 if self._failed else 0
+
+    monkeypatch.setattr("storage.restic.subprocess.Popen", _Popen)
+
+    if completed:
+        assert (runner.run().status, len(calls)) == ("COMPLETED", runs)
+    else:
+        with pytest.raises(ResticOperationError, match="restic backup failed with exit 1"):
+            runner.run()
+        assert len(calls) == runs
+        # the reported cause is the last run's own fatal error, not the first run's timeout
+        assert first_runs[-1].split('"message":"')[1][:30] in runner._events._reporter._restic_failure_detail

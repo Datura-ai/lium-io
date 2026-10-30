@@ -84,6 +84,7 @@ from clients.subtensor_client import SubtensorClient
 from services.docker_service import create_steps_after_reply, inflight_creates
 from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
+from services.task.inspector_verdict import canonical_sha256
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
     BackendCommand,
@@ -107,13 +108,19 @@ logger = logging.getLogger(__name__)
 # mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
+# the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
+MAX_FRAME_BYTES = 4 * 1024 * 1024
+# room left for the delivery stamps send_model adds to an event report
+EVENT_REPORT_MAX_BYTES = MAX_FRAME_BYTES - 64 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
 # pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
 # so the backend loses the validator for seconds, not the whole startup.
 CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
-CONNECTOR_LEAD_LOCK_TTL_SECONDS = 15
+# The old pod is SIGKILLed holding the lock, so the backend loses the validator for what is left of the TTL plus the
+# reconnect (12-14 s at 15 s, 29 Oct); 6 s keeps that under the backend's 10 s rent wait (lium-platform DAH-5174).
+CONNECTOR_LEAD_LOCK_TTL_SECONDS = 6
 CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
 
 
@@ -136,6 +143,54 @@ class OutgoingMessages(list[DeliveryStamps]):
             responses.append(message.model_dump_json())
         super().append(message)
         self.appended.set()
+
+
+def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
+    """Keeps the leading findings of an oversized report that fit one frame; counts the rest.
+
+    Not split into several requests: the backend stores each request as one row, one per cycle.
+    """
+    findings = (event.report or {}).get("findings")
+    if not isinstance(findings, list):
+        return event
+    if len(event.model_dump_json().encode()) <= EVENT_REPORT_MAX_BYTES:
+        return event
+    empty = {**event.report, "findings": [], "findings_omitted": len(findings)}
+    room = EVENT_REPORT_MAX_BYTES - len(
+        event.model_copy(update={"report": empty}).model_dump_json().encode()
+    )
+    kept = 0
+    for finding in findings:
+        # json.dumps escapes non-ASCII and adds spaces, so it never undercounts the compact frame
+        room -= len(json.dumps(finding).encode()) + 1
+        if room < 0:
+            break
+        kept += 1
+    report = {**event.report, "findings": findings[:kept], "findings_omitted": len(findings) - kept}
+    logger.warning(
+        _m(
+            "Trimmed an event report to fit one frame",
+            extra=get_extra_info({
+                "executor_id": event.executor_id,
+                "miner_hotkey": event.miner_hotkey,
+                "findings_kept": kept,
+                "findings_omitted": len(findings) - kept,
+            }),
+        )
+    )
+    update = {"report": report}
+    verdict = event.context.get("verdict")
+    if isinstance(verdict, dict) and "report_sha256" in verdict:
+        # the verdict hashed the full report; it must match the report actually stored
+        verdict = {**verdict, "report_sha256": canonical_sha256(report)}
+        update["context"] = {**event.context, "verdict": verdict}
+    return event.model_copy(update=update)
+
+
+class FrameTooBig(Exception):
+    def __init__(self, size: int):
+        super().__init__(f"frame of {size} bytes exceeds {MAX_FRAME_BYTES}")
+        self.size = size
 
 
 class AuthenticationError(Exception):
@@ -463,7 +518,7 @@ class ComputeClient:
                         )
 
                         async with self.lock:
-                            self.message_queue.append(inspector_event)
+                            self.message_queue.append(fit_event_report(inspector_event))
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         # DAH-4658: the renter is resetting the node's GPUs, or did a moment ago; what a reset can
                         # cause is the renter's doing, never the provider's fault (an unreadable mark sends it)
@@ -557,7 +612,11 @@ class ComputeClient:
         # stamped inside the retry so a message resent after a reconnect reports its own delay
         msg.forwarded_at = time.time()
         msg.queue_depth = len(self.message_queue)
-        await self.ws.send(msg.model_dump_json())
+        payload = msg.model_dump_json()
+        size = len(payload.encode())
+        if size > MAX_FRAME_BYTES:
+            raise FrameTooBig(size)
+        await self.ws.send(payload)
 
     async def handle_send_messages(self):
         while True:
@@ -576,6 +635,22 @@ class ComputeClient:
                             # kept until now so a second restart before the send reports it again
                             await self._untrack_backend_create_for_restart_report(log_to_send.pod_id)
                     except Exception as exc:
+                        if isinstance(exc, FrameTooBig):
+                            # checked before the send: requeued, it went first on every reconnect and closed each new
+                            # socket with 1009. A 1009 close itself is not judged: it fails every later send too.
+                            logger.error(
+                                _m(
+                                    "Dropped a message the backend refuses as too big",
+                                    extra=get_extra_info({
+                                        **self.logging_extra,
+                                        "message_type": type(log_to_send).__name__,
+                                        "executor_id": getattr(log_to_send, "executor_id", None),
+                                        "miner_hotkey": getattr(log_to_send, "miner_hotkey", None),
+                                        "size": exc.size,
+                                    }),
+                                )
+                            )
+                            continue
                         async with self.lock:
                             self.message_queue.insert(0, log_to_send)
                         logger.error(

@@ -162,3 +162,11 @@ def test_kernel_gpu_view_flag_zeroes_a_rented_score(passed):
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == (1.0 if passed else 0.0)
     assert ("Kernel GPU list was overlaid" in warning) is not passed
+
+
+def test_hardware_identity_flag_zeroes_a_rented_score():
+    """HardwareIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"hardware_identity_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "Host hardware identity" in warning
