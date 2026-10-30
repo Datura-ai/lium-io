@@ -42,7 +42,8 @@ _REDIS_PREFIX = "idle_disk_write"
 SPECS_KEY = "idle_disk_write_mb_per_s"
 SPECS_MEASURED_AT_KEY = "idle_disk_write_measured_at"
 _READING_PREFIX = "idle_disk_write_reading"
-# from the write only: a node that cannot be measured again stops sending its figure after this
+# from the write only: a node that cannot be measured again stops sending its figure after this (the backend still
+# keeps the last figure it got)
 _READING_TTL_SECONDS = 3 * INTERVAL_SECONDS
 
 
@@ -56,7 +57,8 @@ class IdleDiskWriteCheck:
     fsync into its writable layer. Logs IDLE_DISK_WRITE with the MB/s, the card, the provider and a shadow verdict
     (fail under RENTED_THROUGHPUT_DISK_MIN_MB_PER_S). Always passes: IDLE_DISK_WRITE_ENFORCE_ENABLED is read by nothing.
     A node running a filler counts as busy from IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S (sectors read plus written): a
-    filler moving its disk under the rented busy line would otherwise lower the reading. DAH-5385: every cycle that
+    filler moving its disk under the rented busy line would otherwise lower the reading. The filler comes from the
+    cycle-start list, or else from the backend's fresh list, so a filler started mid-cycle counts too. DAH-5385: every cycle that
     reaches this check sends the last reading to the backend as specs[SPECS_KEY]; filler start keeps the big fillers
     off a slow disk. A node the backend still rents is never measured: TenantEnforcementCheck halts most such cycles
     earlier, and its passing returns (a rental of another hotkey or address, a stale pod) reach _skip_reason's re-read
@@ -89,8 +91,10 @@ class IdleDiskWriteCheck:
             retryable=False,
         )
         disk = parse_disk(result.stdout or "")
+        # a write that timed out with nothing written parses as 0.0 MB/s: no measurement, not a slow disk
+        measured = disk.mb_per_s is not None and disk.bytes > 0
         verdict = None
-        if disk.mb_per_s is not None:
+        if measured:
             # sent this cycle even if Redis then fails to keep it
             what["reading"] = (disk.mb_per_s, time.time())
             verdict = "fail" if disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S else "pass"
@@ -115,7 +119,7 @@ class IdleDiskWriteCheck:
                 ),
             )
         )
-        if disk.mb_per_s is not None:
+        if measured:
             try:
                 await ctx.services.redis.set(
                     _reading_key(ctx), f"{disk.mb_per_s}:{what['reading'][1]}", ex=_READING_TTL_SECONDS

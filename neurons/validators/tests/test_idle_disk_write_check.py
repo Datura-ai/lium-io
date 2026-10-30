@@ -217,6 +217,15 @@ async def test_a_filler_started_since_cycle_start_keeps_its_download_from_being_
     assert res.event.what_we_saw["disk_busy_mb_per_s"] == pytest.approx(20, rel=0.01)
 
 
+async def test_a_write_that_timed_out_with_nothing_written_sends_no_reading():
+    """lio#1953 review: bytes=0 parses as 0.0 MB/s, which the backend would hold as a slow disk for a day."""
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(clock, IDLE, "lium_disk bytes=0 start=0.00 end=150.00 rc=124\n")
+        res = await IdleDiskWriteCheck().run(ctx)
+    assert writes(runner) == 1 and not res.updates
+    assert not any(k.startswith(module._READING_PREFIX) for k in redis.store)
+
+
 async def test_skips_a_node_rented_since_cycle_start():
     with flags() as clock:
         ctx, runner, _ = make_ctx(clock, IDLE, fresh=POD)
