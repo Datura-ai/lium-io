@@ -163,7 +163,7 @@ def _plugin_calls(tmp_path: Path) -> list[list[str]]:
 async def test_setup_verifies_download_before_enable_and_preserves_existing_plugins(
     tmp_path: Path,
     alias: str,
-    overrides: dict,
+    overrides: dict[str, str | int | bool],
     success: bool,
     installs: int,
     enables: int,
@@ -222,7 +222,7 @@ async def test_setup_verifies_download_before_enable_and_preserves_existing_plug
 )
 async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it_when_the_host_refuses(
     tmp_path: Path,
-    overrides: dict,
+    overrides: dict[str, str | int | bool],
     success: bool,
     mounts: int,
     disables: int,
