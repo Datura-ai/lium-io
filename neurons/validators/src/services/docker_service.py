@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 import asyncssh
 import bittensor
 import redis.exceptions
+from clients.backend_client import BackendClient
 from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
@@ -89,7 +90,7 @@ from services.const import (
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
-    MIN_PORT_COUNT,
+    MIN_POD_PORT_COUNT,
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
@@ -556,6 +557,8 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
+# DAH-5392: bounds the backend's rental-active answer for an unlisted pod in a create's sweep; no answer keeps the pod
+_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
@@ -2134,6 +2137,16 @@ def _is_stale_vloopback_mountpoint_error(error_text: str) -> bool:
     return all(phrase in error_text for phrase in _VLOOPBACK_MOUNT_ERROR_PHRASES)
 
 
+# ticket-0729: after a dockerd/containerd restart the old shim still holds the task, and every
+# start of the (exited) container fails with this until the shim is gone.
+_ORPHANED_TASK_ERROR_RE = re.compile(r"AlreadyExists: task ([0-9a-f]{64}): already exists")
+
+
+def _orphaned_task_id(error_text: str) -> str | None:
+    match = _ORPHANED_TASK_ERROR_RE.search(error_text)
+    return match.group(1) if match else None
+
+
 def _is_safe_docker_volume_name(volume_name: str) -> bool:
     return bool(_DOCKER_VOLUME_NAME_RE.fullmatch(volume_name))
 
@@ -2441,6 +2454,9 @@ def _build_gocryptfs_setup_and_mount_script(
     # time, so a missing gocryptfs.conf means the ciphertext is gone. Re-initialising it there would
     # hand the customer an empty volume, report the start as a success and spare the miner the
     # penalty for data they destroyed. Only pod creation initialises.
+    # -kernel_cache: without it every open() of a file drops its page cache, and on kernel 6.8 two such opens racing
+    # a backup read of the same file spun forever in invalidate_inode_pages2 and hung the host (DAH-5363). Only this
+    # mount writes the ciphertext, so the kept cache cannot go stale.
     plaintext = shlex.quote(plaintext_path)
     passfile = shlex.quote(passfile_path)
     mount_check = (
@@ -2473,7 +2489,7 @@ if [ ! -f {_LIUM_CIPHER_MOUNT}/gocryptfs.conf ]; then
 {_shell_branch_when_gocryptfs_config_missing(allow_init)}
 fi
 if ! {mount_check}; then
-  gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
+  gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -kernel_cache -o allow_other -nonempty
 fi
 """
 
@@ -2532,8 +2548,10 @@ class DockerService:
         redis_service: Annotated[RedisService, Depends(RedisService)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
         rental_docker_client_factory: RentalDockerSdkClientFactory | None = None,
+        backend_client: BackendClient | None = None,
     ):
         self.ssh_service = ssh_service
+        self.backend_client = backend_client
         self.redis_service = redis_service
         self.attestation_service = attestation_service
         self.rental_docker_client_factory = (
@@ -2541,6 +2559,7 @@ class DockerService:
             or RentalDockerSdkClientFactory(pull_timeout_seconds=_DOCKER_PULL_TIMEOUT_SECONDS)
         )
         self.lock = asyncio.Lock()
+        self._pods_in_recovery: set[str] = set()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
         self.log_stream_finish_requested = asyncio.Event()
@@ -3572,9 +3591,11 @@ class DockerService:
                     available_ports = {}
                     pod_mapping = {}
 
-                if not pod_mapping and len(available_ports) < MIN_PORT_COUNT:
+                # SSH, plus Jupyter when enabled; the renter's other ports take what the backend offered
+                required_port_count = MIN_POD_PORT_COUNT + (1 if enable_jupyter else 0)
+                if not pod_mapping and len(available_ports) < required_port_count:
                     logger.warning(
-                        f"Insufficient ports available ({len(available_ports)}/{MIN_PORT_COUNT}) "
+                        f"Insufficient ports available ({len(available_ports)}/{required_port_count}) "
                         f"for executor {executor_id}"
                     )
                     return [], None
@@ -4217,6 +4238,10 @@ class DockerService:
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
+        DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
+        backend confirms its rental closed: a create that waited may sweep after a newer create on the
+        same node, whose pod its older ``active_container_names`` do not name.
+
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
         ``refuse_before_removal`` gets the listing's names before anything is removed and may raise to
@@ -4281,6 +4306,12 @@ class DockerService:
                 if removed_id is not None and listed_ids.get(name) in (None, removed_id):
                     continue
                 stale_containers.append(name)
+            # DAH-5392: an unlisted pod_* may be a newer create's pod on a split node (this create's list was
+            # built before it); it goes only when the backend confirms its rental closed
+            unlisted_pods = [name for name in stale_containers if name != pod_name and name.startswith(POD_CONTAINER_PREFIX)]
+            if unlisted_pods:
+                closed = await self._pods_with_closed_rental(unlisted_pods, default_extra)
+                stale_containers = [name for name in stale_containers if name not in unlisted_pods or name in closed]
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return []
@@ -4322,6 +4353,38 @@ class DockerService:
                 report.removed_cleanly_without_volume_rm = removed_cleanly and not volumes_to_remove
             return stale_containers
         return []
+
+    async def _pods_with_closed_rental(self, names: list[str], default_extra: dict) -> set[str]:
+        """The ``names`` whose rental the backend confirms closed, plus names that are not `pod_<uuid>` (the
+        backend names every pod it creates after the pod's uuid, so such a name is no newer create's pod).
+        No backend client, no answer, an error or a timeout keeps the pod: a removal cannot be undone."""
+
+        async def closed(name: str) -> bool:
+            pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
+            try:
+                UUID(pod_id)
+            except ValueError:
+                return True
+            if self.backend_client is None:
+                return False
+            try:
+                async with asyncio.timeout(_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS):
+                    answer = await self.backend_client.get_pod_rental_active(pod_id)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Unlisted pod kept: its rental could not be read",
+                        extra=get_extra_info({**default_extra, "container_name": name, "error_type": exc.__class__.__name__}),
+                    )
+                )
+                return False
+            return answer is not None and not answer.active
+
+        answers = await asyncio.gather(*(closed(name) for name in names))
+        kept = [name for name, is_closed in zip(names, answers) if not is_closed]
+        if kept:
+            logger.info(_m("Keeping unlisted pods whose rental is not confirmed closed", extra=get_extra_info({**default_extra, "container_names": kept})))
+        return {name for name, is_closed in zip(names, answers) if is_closed}
 
     @staticmethod
     async def _remove_volumes(ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]) -> None:
@@ -10436,9 +10499,46 @@ class DockerService:
         # hits the plugin's "file exists" and the container stays down until the rental ends. Only
         # that exact failure is recovered: a pod stopped on purpose exits with an empty State.Error
         # and never matches, so a customer's stop is never overridden.
-        if not container_error or not _is_stale_vloopback_mountpoint_error(container_error):
+        # ticket-0729: the same pod can first be stuck behind an orphaned shim of its own old task;
+        # that shim is cleared below, then the stale-mountpoint repair runs as usual.
+        orphaned_task_id = _orphaned_task_id(container_error or "")
+        if not container_error or not (
+            orphaned_task_id or _is_stale_vloopback_mountpoint_error(container_error)
+        ):
             return False
+        # one recovery per pod at a time: a second check cycle acting on the same stale verdict
+        # could otherwise stop or kill what the first one has just started
+        if container_name in self._pods_in_recovery:
+            return False
+        self._pods_in_recovery.add(container_name)
+        try:
+            return await self._recover_pod(
+                ssh_client=ssh_client,
+                executor_info=executor_info,
+                miner_hotkey=miner_hotkey,
+                private_key=private_key,
+                container_name=container_name,
+                pod_id=pod_id,
+                orphaned_task_id=orphaned_task_id,
+                local_volume_path=local_volume_path,
+                default_extra=default_extra,
+            )
+        finally:
+            self._pods_in_recovery.discard(container_name)
 
+    async def _recover_pod(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        orphaned_task_id: str | None,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool:
         log_extra = {**default_extra, "container_name": container_name}
         try:
             encryption_state = await self._local_volume_encryption_state(
@@ -10458,6 +10558,10 @@ class DockerService:
                     )
                 )
                 return False
+            if orphaned_task_id and not await self._kill_orphaned_task_shim(
+                ssh_client, container_name, orphaned_task_id, log_extra
+            ):
+                return False
             repaired_volume = await self._repair_stale_mountpoint_of_container_volume(
                 ssh_client,
                 container_name,
@@ -10474,7 +10578,8 @@ class DockerService:
                 )
             )
             return False
-        if not repaired_volume:
+        # an orphaned-shim pod may have no stale mountpoint at all; its start is the test
+        if not repaired_volume and not orphaned_task_id:
             logger.warning(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED",
@@ -10532,6 +10637,49 @@ class DockerService:
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
         )
         return True
+
+    async def _kill_orphaned_task_shim(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        orphaned_task_id: str,
+        log_extra: dict[str, Any],
+    ) -> bool:
+        # only the pod's own task, and only while dockerd reports the container not running: the
+        # error must name this container's id, so no other container's shim is ever touched
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect {shlex.quote(container_name)} "
+            "--format '{{.Id}} {{.State.Status}}'",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        container_id, _, status = (inspect_result.stdout or "").strip().partition(" ")
+        if (
+            getattr(inspect_result, "exit_status", 0) != 0
+            or container_id != orphaned_task_id
+            or status not in ("exited", "created")
+        ):
+            logger.warning(
+                _m(
+                    "POD_ORPHANED_SHIM_RECOVERY_SKIPPED",
+                    extra=get_extra_info({**log_extra, "container_id": container_id, "status": status}),
+                )
+            )
+            return False
+        # the command re-reads the state and pins the shim generation on the host itself, so a pod
+        # started again since the inspect above (by its provider or another cycle) is left alone
+        killed = await ssh_client.run(
+            DockerCommand.kill_orphaned_task_shim(container_id),
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        result = (killed.stdout or "").strip()
+        cleared = result.startswith(("killed ", "no shim"))
+        logger.info(
+            _m(
+                "POD_ORPHANED_SHIM_KILLED" if cleared else "POD_ORPHANED_SHIM_RECOVERY_SKIPPED",
+                extra=get_extra_info({**log_extra, "result": result}),
+            )
+        )
+        return cleared
 
     async def _local_volume_encryption_state(
         self,

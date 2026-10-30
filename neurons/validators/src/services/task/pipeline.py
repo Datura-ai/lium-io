@@ -210,7 +210,7 @@ class CheckResult(BaseModel):
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
-    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
@@ -284,6 +284,9 @@ class Context(BaseModel):
     # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
     # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
     cc_vbios_passed: bool = True
+    # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    hardware_identity_passed: bool = True
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True

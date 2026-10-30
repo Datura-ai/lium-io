@@ -124,6 +124,12 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing")
 
+    # Host hardware identity gate (DAH-4547): non-fatal on a live rental, so only this line zeroes it.
+    if not ctx.hardware_identity_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Host hardware identity does not match the hardware")
+
     # Host-write gate (DAH-4548): same mechanics; it reads only the sensor's verdict that the host
     # wrote into a rented pod under enforcement, and shadow leaves the flag True.
     if not ctx.inspector_host_write_passed:
