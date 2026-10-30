@@ -6500,13 +6500,15 @@ class DockerService:
         timeout: int,
         log_extra: dict,
         current_plugin_unusable_reason: str,
+        docker_root_dir: str | None,
     ) -> str:
-        """An older plugin for one new volume when the current one cannot be used, only if it is
-        already enabled: the previous version first (its volumes behave as today), then the legacy
-        one, so a node the current install does not reach keeps renting. With the flag off only the
+        """An older plugin for one new volume when the current one cannot be used: the previous
+        version first (its volumes behave as today), set up as the flag off would when it is not
+        enabled yet and the data root is known, then the legacy one only if it is already enabled,
+        so a node the current install does not reach keeps renting. With the flag off only the
         legacy plugin, the one RentalVerificationCheck then names to the backend's health check.
         Returns the driver to create on, else raises NoUsableLoopbackPluginError; never installs or
-        enables either. The only place a plugin command may name the old plugins; it goes away with them."""
+        enables the legacy plugin. The only place a plugin command may name the old plugins; it goes away with them."""
         current_alias = current_loopback_plugin_alias()
         old_plugin_aliases = (
             (LOOPBACK_PLUGIN_ALIAS, LEGACY_LOOPBACK_PLUGIN_ALIAS)
@@ -6524,6 +6526,15 @@ class DockerService:
                 old_plugin_states[old_plugin_alias] = "unknown"
             if old_plugin_states[old_plugin_alias] == "true":
                 break
+            if old_plugin_alias == LOOPBACK_PLUGIN_ALIAS and docker_root_dir is not None:
+                # a node that joined with v3 on never had v2: without this a host that refuses the
+                # direct-I/O loop lost every size-limited rent (review, 30.10)
+                previous_plugin_unusable_reason = await self._set_up_loopback_plugin(
+                    ssh_client, docker_root_dir, LOOPBACK_PLUGIN_ALIAS
+                )
+                if previous_plugin_unusable_reason is None:
+                    break
+                old_plugin_states[old_plugin_alias] += f" ({previous_plugin_unusable_reason})"
         else:
             raise NoUsableLoopbackPluginError(current_plugin_unusable_reason, current_alias, old_plugin_states)
         logger.warning(
@@ -6547,6 +6558,35 @@ class DockerService:
             return "unknown"
         return (state_result.stdout or "").strip()
 
+    @staticmethod
+    async def _set_up_loopback_plugin(
+        ssh_client: asyncssh.SSHClientConnection, docker_root_dir: str, alias: str
+    ) -> str | None:
+        # the pinned build under this alias, installed, verified and enabled on the host (v3: and
+        # probed); returns why it cannot be used, None once it can
+        generation = LOOPBACK_PLUGIN_BUILDS[alias].generation
+        try:
+            setup_timeout = (
+                _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
+                if loopback_plugin_probe_marker_path(alias)
+                else _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
+            )
+            result = await _run_with_host_timeout(
+                ssh_client,
+                loopback_plugin_setup_command(docker_root_dir, alias),
+                setup_timeout,
+            )
+            if result.exit_status == 0:
+                return None
+            return f"{generation} setup exit {result.exit_status}: {(result.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
+        except (SshSessionMayStillBeTakenError, asyncssh.Error):
+            raise
+        except TimeoutError:
+            return f"{generation} setup timed out"
+        except Exception as exc:
+            # SSH errors can contain provider banners or credentials. Log only the type.
+            return f"{generation} setup error: {type(exc).__name__}"
+
     async def _pick_loopback_driver_for_new_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -6556,10 +6596,9 @@ class DockerService:
     ) -> str:
         if not settings.LOOPBACK_PLUGIN_V2_ENABLED:
             return await self._fall_back_to_old_loopback_plugin(
-                ssh_client, timeout, log_extra, "v2 disabled by LOOPBACK_PLUGIN_V2_ENABLED"
+                ssh_client, timeout, log_extra, "v2 disabled by LOOPBACK_PLUGIN_V2_ENABLED", None
             )
         current_alias = current_loopback_plugin_alias()
-        generation = LOOPBACK_PLUGIN_BUILDS[current_alias].generation
         if host_probe is not None and host_probe.loopback_plugin_enabled:
             return current_alias
         root = host_probe.docker_root_dir if host_probe else await self.get_docker_root_dir(ssh_client)
@@ -6567,30 +6606,13 @@ class DockerService:
             # An existing enabled plugin remains usable even when DockerRootDir could not be read.
             if await self._get_current_loopback_plugin_state(ssh_client, timeout) == "true":
                 return current_alias
-            reason = "Docker data root unknown"
-        else:
-            try:
-                setup_timeout = (
-                    _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
-                    if loopback_plugin_probe_marker_path(current_alias)
-                    else _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
-                )
-                result = await _run_with_host_timeout(
-                    ssh_client,
-                    loopback_plugin_setup_command(root, current_alias),
-                    setup_timeout,
-                )
-                if result.exit_status == 0:
-                    return current_alias
-                reason = f"{generation} setup exit {result.exit_status}: {(result.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
-            except (SshSessionMayStillBeTakenError, asyncssh.Error):
-                raise
-            except TimeoutError:
-                reason = f"{generation} setup timed out"
-            except Exception as exc:
-                # SSH errors can contain provider banners or credentials. Log only the type.
-                reason = f"{generation} setup error: {type(exc).__name__}"
-        return await self._fall_back_to_old_loopback_plugin(ssh_client, timeout, log_extra, reason)
+            return await self._fall_back_to_old_loopback_plugin(
+                ssh_client, timeout, log_extra, "Docker data root unknown", None
+            )
+        reason = await self._set_up_loopback_plugin(ssh_client, root, current_alias)
+        if reason is None:
+            return current_alias
+        return await self._fall_back_to_old_loopback_plugin(ssh_client, timeout, log_extra, reason, root)
 
     async def create_local_volume(
         self,
