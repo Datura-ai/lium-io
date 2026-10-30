@@ -803,6 +803,7 @@ async def _reprobe_split_shortfall(
     """Re-probe a split node whose every listed pod is stale, ports those pods held included; on any
     error the shortfall stands, since an unprobed port is never credited."""
     rented_data = ctx.state.rented_data
+    filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
     try:
         result = await ctx.services.connectivity.verify_ports(
             ctx.ssh,
@@ -810,7 +811,7 @@ async def _reprobe_split_shortfall(
             ctx.executor,
             ctx.state.sysbox_runtime,
             rented_ports=[],
-            filler_ports=rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else [],
+            filler_ports=filler_ports,
             log_ctx={
                 "pipeline_id": ctx.pipeline_id,
                 "job_batch_id": ctx.config.job_batch_id,
@@ -823,7 +824,9 @@ async def _reprobe_split_shortfall(
     except Exception:
         logger.warning(_m("SPLIT_PORT_REPROBE_FAILED", extra=get_extra_info(ctx.default_extra)), exc_info=True)
         return split_short
-    return split_port_shortfall(ctx.state, len(result.successful_ports))
+    # the probe skips our idle filler's ports; they count as in PortCountCheck, which a rental frees
+    answered = {pair.external for pair in result.successful_ports}
+    return split_port_shortfall(ctx.state, len(answered | set(filler_ports)))
 
 
 async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:

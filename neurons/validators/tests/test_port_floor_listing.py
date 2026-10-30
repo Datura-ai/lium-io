@@ -685,11 +685,12 @@ class Firewalled:
         return BatchResult(ok, bad) if max_ports is None else (ok, bad)
 
 
-def stale_split_ctx(context_factory, probe, last_port):
+def stale_split_ctx(context_factory, probe, last_port, filler_ports=()):
     """8 GPUs, one per split (24 ports), declaring 40000-<last_port>; its only rental, on 40000-40002, closed."""
     from dataclasses import replace
 
     rented = RentedExecutorsResponse(
+        filler_ports_by_executor={EXECUTOR_UUID: list(filler_ports)},
         executors={
             EXECUTOR_UUID: RentedExecutor(
                 miner_hotkey="miner-hotkey",
@@ -754,3 +755,20 @@ async def test_a_stale_split_nodes_freed_ports_that_no_longer_answer_are_not_cre
     assert ctx.state.specs["available_port_count"] == 21
     assert tenant_result.passed is False
     assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_stale_split_nodes_reprobe_keeps_crediting_its_idle_fillers_ports(context_factory):
+    """Reviewer's case: 40000-40023 declared, the closed rental held 40000-40002 and our idle filler holds
+    40020-40023. The re-probe skips the filler's four like the first probe; they still count, so 20 + 4 = 24."""
+    probe = Firewalled(blocked=set())
+    ctx = stale_split_ctx(context_factory, probe, 40023, filler_ports=[40020, 40021, 40022, 40023])
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    probes_before = len(probe.calls)
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert ctx.state.specs["available_port_count"] == 21  # 17 probed + 4 filler
+    assert not {40020, 40021, 40022, 40023} & {p.external for call in probe.calls[probes_before:] for p in call}
+    assert tenant_result.passed is True
