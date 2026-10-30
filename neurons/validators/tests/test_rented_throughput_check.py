@@ -982,7 +982,7 @@ async def test_repeated_late_cycles_fail_the_reading_until_one_completes():
         failed = await check.run(late)
         # no command ran, so not the measured-slow claim
         assert failed.passed is False and failed.event.reason_code == Msg.NOT_RUN.reason
-        assert failed.updates == {"rented_throughput_passed": False}
+        assert failed.updates == {"rented_throughput_passed": False, "rented_throughput_not_run": True}
         assert runner.commands == []
         # a completed reading resets the counter
         assert (await check.run(ctx)).passed

@@ -588,9 +588,12 @@ class RentedThroughputCheck:
         if slow or state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
             template = Msg.SLOW if slow else Msg.NOT_RUN
             event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(
-                passed=False, event=event, updates={"rented_throughput_passed": False}
-            )
+            # NOT_RUN measured nothing, so scoring and the portal must not call it slow
+            updates = {"rented_throughput_passed": False} if slow else {
+                "rented_throughput_passed": False,
+                "rented_throughput_not_run": True,
+            }
+            return CheckResult(passed=False, event=event, updates=updates)
         if not probed:
             return self._skipped(
                 ctx, "not due", last={**what, "read_at": state.at, "next_at": state.next_due_at()}
