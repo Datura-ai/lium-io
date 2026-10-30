@@ -271,12 +271,8 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
-    # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
-    # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
-    # node scores 0 on every later cycle under this executor id and is never re-anchored.
-    gpu_anchor_broken: bool = False
-    # Set by GpuFingerprintCheck (legacy rule) when an idle node's whole GPU set was replaced: the reset drops the
-    # anchor, so the next passing cycle anchors the new cards (whole_set_replaced).
+    # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
+    # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
