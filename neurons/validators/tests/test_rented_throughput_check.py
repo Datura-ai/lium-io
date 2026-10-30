@@ -980,9 +980,25 @@ async def test_repeated_late_cycles_fail_the_reading_until_one_completes():
             assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
             assert stored(ctx)["late_skips"] == skips
         failed = await check.run(late)
-        assert failed.passed is False and failed.event.reason_code == Msg.SLOW.reason
+        # no command ran, so not the measured-slow claim
+        assert failed.passed is False and failed.event.reason_code == Msg.NOT_RUN.reason
         assert failed.updates == {"rented_throughput_passed": False}
         assert runner.commands == []
         # a completed reading resets the counter
         assert (await check.run(ctx)).passed
         assert stored(ctx)["late_skips"] == 0 and len(runner.commands) == 1
+
+
+async def test_late_skips_count_while_redis_refuses_writes():
+    # READONLY during a failover: GET works, SET fails; the skip count must still reach the verdict
+    with flags(), patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(GOOD)
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        check = RentedThroughputCheck()
+        assert (await check.run(late)).passed  # first skip, saved
+        ctx.services.redis.set = AsyncMock(side_effect=Exception("READONLY"))
+        for _ in range(1, module.LATE_SKIPS_BEFORE_VERDICT - 1):
+            assert (await check.run(late)).passed
+        failed = await check.run(late)
+        assert failed.passed is False and failed.event.reason_code == Msg.NOT_RUN.reason
+        assert runner.commands == []

@@ -397,7 +397,7 @@ class RentedThroughputCheck:
     cannot be attributed never fails a node), re-probed after RETRY_SECONDS.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading; so do LATE_SKIPS_BEFORE_VERDICT due readings in a row
-    skipped for too little cycle time, until a reading completes. Non-fatal: the rental keeps running.
+    skipped for too little cycle time (RENTED_THROUGHPUT_NOT_RUN), until a reading completes. Non-fatal: the rental keeps running.
     """
 
     check_id = "host.validate.rented_throughput"
@@ -423,7 +423,10 @@ class RentedThroughputCheck:
             return self._skipped(ctx, "last reading unreadable in Redis")
         state = _State.from_raw(raw) if raw is not None else None
         unsaved = _UNSAVED.get(ctx.executor.uuid)
-        if unsaved is not None and (state is None or unsaved.at > state.at):
+        # a late skip keeps .at, so a newer unsaved skip count wins on a tie
+        if unsaved is not None and (
+            state is None or (unsaved.at, unsaved.late_skips) > (state.at, state.late_skips)
+        ):
             state = unsaved
         now = time.time()
         if state is None:
@@ -438,8 +441,11 @@ class RentedThroughputCheck:
             if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
             state.late_skips += 1
-            # shortcut: a skip Redis refuses to record is not counted; fine while Redis outages are short
-            await self._save(ctx, key, state)
+            # a skip Redis refuses (READONLY failover) is kept in memory, else the count never reaches the verdict
+            if await self._save(ctx, key, state):
+                _UNSAVED.pop(ctx.executor.uuid, None)
+            else:
+                _UNSAVED[ctx.executor.uuid] = state
             if state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
             return self._skipped(ctx, "too little cycle time left")
@@ -578,11 +584,10 @@ class RentedThroughputCheck:
             "failures_in_a_row": state.failures_in_a_row,
             "late_skips_in_a_row": state.late_skips,
         }
-        if (
-            state.failures_in_a_row >= READINGS_BEFORE_VERDICT
-            or state.late_skips >= LATE_SKIPS_BEFORE_VERDICT
-        ):
-            event = render_message(Msg.SLOW, ctx=ctx, check_id=self.check_id, what=what)
+        slow = state.failures_in_a_row >= READINGS_BEFORE_VERDICT
+        if slow or state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
+            template = Msg.SLOW if slow else Msg.NOT_RUN
+            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(
                 passed=False, event=event, updates={"rented_throughput_passed": False}
             )

@@ -1631,6 +1631,20 @@ class RentedThroughputMessages:
             "for a failing or full drive"
         ),
     )
+    # DAH-5453: the reading was due but the earlier checks left too little cycle time, several cycles in a row
+    NOT_RUN = MessageTemplate(
+        event="The rented throughput reading could not run in several validation cycles in a row",
+        reason="RENTED_THROUGHPUT_NOT_RUN",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=(
+            "the earlier checks on this rented node used up most of each validation cycle, so the network and "
+            "disk throughput reading never ran. Check that the node answers SSH and docker commands promptly "
+            "(load, a slow or full disk under the docker root, a slow uplink). The score returns once a reading "
+            "completes"
+        ),
+    )
     SLOW_ONCE = MessageTemplate(
         event="A rented pod's network or disk throughput was slow once; the next reading decides",
         reason="RENTED_THROUGHPUT_SLOW_ONCE",
