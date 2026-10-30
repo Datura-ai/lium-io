@@ -329,6 +329,21 @@ async def test_every_uuid_new_in_the_same_slots_is_a_swap(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_whole_set_replaced_with_new_serials_is_re_pinned(context_factory):
+    # a VM moved to other physical cards: every UUID new, same slots, every card a new real serial
+    ca = FakeCa()
+    old = [_hw("GPU-a", serial="1650000000001", pci="00000000:17:00.0"), _hw("GPU-b", serial="1650000000002", pci="00000000:65:00.0")]
+    ctx = _ctx(context_factory, ca, lambda n: old, gpus=("GPU-a", "GPU-b"))
+    assert (await _run(ctx, ca, enforce=True)).passed is True
+    new = [_hw("GPU-y", serial="1650000000003", pci="00000000:17:00.0"), _hw("GPU-z", serial="1650000000004", pci="00000000:65:00.0")]
+    redis = ctx.services.redis
+    ctx = _ctx(context_factory, ca, lambda n: new, gpus=("GPU-y", "GPU-z"), redis=redis)
+    assert (await _run(ctx, ca, enforce=True)).passed is True
+    host = json.loads(await redis.get(f"gpu_identity:host:{ctx.executor.address}:{ctx.executor.port}"))
+    assert host["uuids"] == ["GPU-y", "GPU-z"]
+
+
+@pytest.mark.asyncio
 async def test_replacing_one_failed_card_in_place_is_not_a_swap(context_factory):
     result = await _twice(
         context_factory,
