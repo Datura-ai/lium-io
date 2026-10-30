@@ -1008,12 +1008,13 @@ async def test_late_skips_count_while_redis_refuses_writes():
         assert runner.commands == []
 
 
+class SlowRedis(FakeRedis):
+    async def set(self, key, value, ex=None):
+        await asyncio.sleep(30)
+
+
 async def test_a_slow_redis_save_on_a_late_skip_never_drops_the_cycle():
     # a SET slower than the cycle time left must not run into the task deadline: bounded, the count kept in memory
-    class SlowRedis(FakeRedis):
-        async def set(self, key, value, ex=None):
-            await asyncio.sleep(30)
-
     with flags(), patch.dict(module._UNSAVED, clear=True):
         ctx, runner = make_ctx(GOOD)
         redis = SlowRedis()
@@ -1032,3 +1033,14 @@ async def test_a_slow_redis_save_on_a_late_skip_never_drops_the_cycle():
             assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
             assert module._UNSAVED[EXECUTOR.uuid].late_skips == skips
         assert runner.commands == []
+
+
+async def test_a_slow_redis_save_after_a_reading_never_drops_the_cycle():
+    # the initial-state save and the reading's save are bounded too: each gets 0.3 s, the reading kept in memory
+    with flags(), patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(GOOD)
+        ctx = ctx.model_copy(update={"services": build_services(redis=SlowRedis())})
+        with patch.object(module, "SAVE_RESERVE_SECONDS", module.task_seconds_left(ctx) - 0.3):
+            result = await asyncio.wait_for(RentedThroughputCheck().run(ctx), 5)
+        assert result.passed and len(runner.commands) == 1
+        assert module._UNSAVED[EXECUTOR.uuid].reading

@@ -39,7 +39,7 @@ MIN_TASK_SECONDS_LEFT = COMMAND_TIMEOUT_SECONDS + 30
 # due readings skipped for lack of cycle time, in a row, that count as a failed reading (the provider controls how long
 # the earlier checks take, so endless late cycles must not keep the score)
 LATE_SKIPS_BEFORE_VERDICT = 3
-# cycle time kept after a late skip's Redis save, to finish the cycle
+# cycle time kept after a Redis save, to finish the cycle
 SAVE_RESERVE_SECONDS = 5
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
@@ -434,9 +434,8 @@ class RentedThroughputCheck:
         now = time.time()
         if state is None:
             state = _State(at=now - phase_offset_seconds(ctx.executor.uuid))
-            if not await self._save(ctx, key, state):
-                # else each cycle recreates it and the first reading never comes due
-                _UNSAVED[ctx.executor.uuid] = state
+            # kept even unsaved, else each cycle recreates it and the first reading never comes due
+            await self._bounded_save(ctx, key, state)
         if now < state.next_due_at():
             return self._verdict(ctx, state, probed=False)
         if task_seconds_left(ctx) < MIN_TASK_SECONDS_LEFT:
@@ -444,12 +443,7 @@ class RentedThroughputCheck:
             if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
             state.late_skips += 1
-            # in memory first: a refused (READONLY failover) or slow save must not lose the count, and a save is
-            # bounded by the cycle time left so it cannot itself run into the task deadline and drop the cycle
-            _UNSAVED[ctx.executor.uuid] = state
-            budget = task_seconds_left(ctx) - SAVE_RESERVE_SECONDS
-            if budget > 0 and await self._save(ctx, key, state, timeout=budget):
-                _UNSAVED.pop(ctx.executor.uuid, None)
+            await self._bounded_save(ctx, key, state)
             if state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
             return self._skipped(ctx, "too little cycle time left")
@@ -482,14 +476,7 @@ class RentedThroughputCheck:
                 ),
             )
         )
-        if await self._save(ctx, key, state):
-            _UNSAVED.pop(ctx.executor.uuid, None)
-        else:
-            # bounded like Redis itself: a node not measured for _REDIS_TTL_SECONDS is gone; a due node keeps its
-            # unsaved streak until its own next reading replaces it
-            for uuid in [u for u, s in _UNSAVED.items() if now - s.at > _REDIS_TTL_SECONDS]:
-                del _UNSAVED[uuid]
-            _UNSAVED[ctx.executor.uuid] = state
+        await self._bounded_save(ctx, key, state)
         return self._verdict(ctx, state, probed=True)
 
     async def _measure_and_judge(self, ctx: Context) -> tuple[dict[str, Any], str, str]:
@@ -616,9 +603,20 @@ class RentedThroughputCheck:
             passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         )
 
-    async def _save(
-        self, ctx: Context, key: str, state: _State, *, timeout: float | None = None
-    ) -> bool:
+    async def _bounded_save(self, ctx: Context, key: str, state: _State) -> None:
+        """In memory first: a refused (READONLY failover) or slow save must not lose the state. The Redis save is
+        bounded by the cycle time left so it cannot itself run into the task deadline and drop the cycle."""
+        # bounded like Redis itself: a node not measured for _REDIS_TTL_SECONDS is gone; a due node keeps its
+        # unsaved streak until its own next reading replaces it
+        now = time.time()
+        for uuid in [u for u, s in _UNSAVED.items() if now - s.at > _REDIS_TTL_SECONDS]:
+            del _UNSAVED[uuid]
+        _UNSAVED[ctx.executor.uuid] = state
+        budget = task_seconds_left(ctx) - SAVE_RESERVE_SECONDS
+        if budget > 0 and await self._save(ctx, key, state, timeout=budget):
+            _UNSAVED.pop(ctx.executor.uuid, None)
+
+    async def _save(self, ctx: Context, key: str, state: _State, *, timeout: float) -> bool:
         payload = {
             "at": state.at,
             "failures_in_a_row": state.failures_in_a_row,
