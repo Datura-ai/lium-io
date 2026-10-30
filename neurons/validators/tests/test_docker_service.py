@@ -4074,7 +4074,23 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     )
     assert "pull without login then failed: blocked" in result.detail
     # the wire msg the backend shows the renter: the reason only, no registry or executor text
-    assert result.msg == "Docker login to the image registry failed: check the template's registry credentials"
+    assert result.msg == "Docker login refused by the image registry: check the template's registry credentials"
+
+
+@pytest.mark.parametrize(
+    ("login_error", "expected"),
+    [
+        ("Docker SDK login for r.example failed: 503 Server Error: Service Unavailable", "Docker login to the image registry failed"),
+        ("Docker SDK login for r.example failed: UnixHTTPConnectionPool: Read timed out. (read timeout=60)", "Docker login to the image registry failed"),
+        ('Get "https://r.example/v2/": dial tcp: i/o timeout', "Docker login timed out: the node could not reach the image registry"),
+        ("401 Client Error: unauthorized: incorrect username or password", "Docker login refused by the image registry: check the template's registry credentials"),
+    ],
+)
+def test_docker_login_failed_names_only_the_reason_the_error_shows(login_error, expected):
+    """A registry 5xx is not a credential problem, and a validator->daemon read timeout is not the registry's."""
+    from services.docker_service import DockerLoginFailed
+
+    assert DockerLoginFailed("text", login_error).renter_sentence == expected
 
 
 @pytest.mark.asyncio

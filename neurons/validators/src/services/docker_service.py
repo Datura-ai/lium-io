@@ -1255,7 +1255,10 @@ async def _raise_unless_running_before_created(
         )
 
 
-_LOGIN_TIMEOUT_MARKERS = ("context deadline exceeded", "timed out", "timeout")
+# The daemon's own errors reaching the registry (Go net/http), never a validator->daemon read timeout
+_LOGIN_REGISTRY_TIMEOUT_MARKERS = ("context deadline exceeded", "i/o timeout", "tls handshake timeout")
+# Only an explicit refusal by the registry is a credential problem; a 5xx or anything else is not
+_LOGIN_REFUSED_MARKERS = ("unauthorized", "incorrect username or password", "authentication required", "401 client error")
 
 
 class DockerLoginFailed(RentalDockerOperationError):
@@ -1264,11 +1267,14 @@ class DockerLoginFailed(RentalDockerOperationError):
 
     def __init__(self, text: str, login_error: str):
         lowered = login_error.lower()
-        self.renter_sentence = (
-            "Docker login timed out: the node could not reach the image registry"
-            if any(marker in lowered for marker in _LOGIN_TIMEOUT_MARKERS)
-            else "Docker login to the image registry failed: check the template's registry credentials"
-        )
+        if any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
+            self.renter_sentence = (
+                "Docker login refused by the image registry: check the template's registry credentials"
+            )
+        elif any(marker in lowered for marker in _LOGIN_REGISTRY_TIMEOUT_MARKERS):
+            self.renter_sentence = "Docker login timed out: the node could not reach the image registry"
+        else:
+            self.renter_sentence = "Docker login to the image registry failed"
         super().__init__(text)
 
 
