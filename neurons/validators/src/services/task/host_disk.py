@@ -10,7 +10,7 @@ the Docker root does, because it is that very wait. The diskstats and meminfo fi
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 # a healthy Docker root syncs in well under a second; beyond this the port-check containers (60 s) are at risk
 DISK_PRESSURE_SYNCFS_SECONDS = 5.0
@@ -139,6 +139,16 @@ def parse_disk_pressure(stdout: str) -> DiskPressureReading:
     )
 
 
+class _DeviceWindow(NamedTuple):
+    """One Docker-root device's /proc/diskstats counters moved between the two snapshots."""
+
+    name: str
+    sectors: int
+    io_ticks_ms: int
+    ms_spent: int
+    ios_completed: int
+
+
 def _disk_fields(first: dict[str, str], second: dict[str, str], devices: set[str]) -> dict[str, Any]:
     # the busiest (io_ticks) of the Docker-root devices over the window; another disk's traffic says nothing
     fields: dict[str, Any] = {}
@@ -155,21 +165,24 @@ def _disk_fields(first: dict[str, str], second: dict[str, str], devices: set[str
     except (KeyError, ValueError):
         pass
     before = _io_counters(first.get("io", ""))
-    busiest: tuple[int, str, list[int]] | None = None
+    busiest: _DeviceWindow | None = None
     for name, after in _io_counters(second.get("io", "")).items():
         if name not in before or name not in devices:
             continue
-        delta = [a - b for a, b in zip(after, before[name])]
-        if min(delta) < 0:  # a counter reset or a device that came back
+        window = _DeviceWindow(name, *(a - b for a, b in zip(after, before[name])))
+        if min(window[1:]) < 0:  # a counter reset or a device that came back
             continue
-        if busiest is None or delta[1] > busiest[0]:
-            busiest = (delta[1], name, delta)
+        if busiest is None or window.io_ticks_ms > busiest.io_ticks_ms:
+            busiest = window
     if busiest is not None:
-        _, name, (sectors, ticks, ms, ios) = busiest
-        fields["device"] = name
-        fields["mb_per_s"] = round(sectors * 512 / dt / 1e6, 1)
-        fields["util_percent"] = round(min(ticks / (dt * 1000) * 100, 100.0), 1)
-        fields["await_ms"] = round(ms / ios, 1) if ios >= AWAIT_MIN_COMPLETED_IOS else None
+        fields["device"] = busiest.name
+        fields["mb_per_s"] = round(busiest.sectors * 512 / dt / 1e6, 1)
+        fields["util_percent"] = round(min(busiest.io_ticks_ms / (dt * 1000) * 100, 100.0), 1)
+        fields["await_ms"] = (
+            round(busiest.ms_spent / busiest.ios_completed, 1)
+            if busiest.ios_completed >= AWAIT_MIN_COMPLETED_IOS
+            else None
+        )
     return fields
 
 
