@@ -23,6 +23,8 @@ from .task_time import task_seconds_left
 logger = logging.getLogger(__name__)
 
 INTERVAL_SECONDS = 24 * 3600
+# a write the task's end cut off logs nothing: try again this soon, not a day later
+CUT_WRITE_RETRY_SECONDS = 3600
 # the 2 s busy window before the write
 SNAPSHOT_TIMEOUT_SECONDS = 30
 # container start, the O_DIRECT write and the buffered retry
@@ -69,12 +71,15 @@ class IdleDiskWriteCheck:
         skip = await self._skip_reason(ctx, key)
         if skip is not None:
             return skip
-        await ctx.services.redis.set(key, str(time.time()), ex=2 * INTERVAL_SECONDS)
+        started_at = time.time()
+        retry_stamp = started_at - INTERVAL_SECONDS + CUT_WRITE_RETRY_SECONDS
+        await ctx.services.redis.set(key, str(retry_stamp), ex=2 * INTERVAL_SECONDS)
         result = await ctx.runner.run(
             download_speed_command(bool(ctx.state.sysbox_runtime), _DISK_SCRIPT),
             timeout=WRITE_TIMEOUT_SECONDS,
             retryable=False,
         )
+        await ctx.services.redis.set(key, str(started_at), ex=2 * INTERVAL_SECONDS)
         disk = parse_disk(result.stdout or "")
         verdict = None
         if disk.mb_per_s is not None:

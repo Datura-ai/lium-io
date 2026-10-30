@@ -415,12 +415,14 @@ class GpuThermalThrottleMessages:
         event="GPU clock collapsed by thermal throttling",
         reason="GPU_THERMAL_COLLAPSE",
         severity="error",
-        category="env",
-        impact="Job skipped; score set to 0 until a busy GPU holds at least half its max clock",
+        # an availability error: the backend hides the node and refuses new rentals at once
+        category=AVAILABILITY_CATEGORY,
+        impact="Node hidden, job skipped and score set to 0 until the hold ends (see remediation)",
         remediation="A busy GPU runs below half its max clock with a thermal or hardware slowdown set (see "
-        "gpus[]: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the cooling (fans, "
-        "airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`); the node passes again "
-        "on the next validation once the clock recovers.",
+        "gpus[], held_gpu_uuids: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the "
+        "cooling (fans, airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`). The hold "
+        "ends when the card runs busy at half its max clock or more with no thermal slowdown (for example under "
+        "the Lium filler or the host's own load), or after 7 days, or when the card is replaced.",
     )
     OK = MessageTemplate(
         event="GPU clocks not thermally throttled",
