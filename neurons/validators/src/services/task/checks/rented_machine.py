@@ -132,10 +132,16 @@ def _rental_of_validated_miner(
     return rented_executor if same_endpoint else None
 
 
+# The backend's create is still running for a pod in these statuses (a first rental or a reboot), and it
+# records the container name only when that create answers: a custom-Dockerfile build can take longer
+# than the grace below.
+_CREATE_IN_FLIGHT_POD_STATUSES = frozenset({"PENDING", "REBOOT_PENDING"})
+
+
 def _within_container_name_grace(pod: RentedPod) -> bool:
-    """An unnamed pod is waited for only this long after it was created; a pod with no
-    created_at (backend predates the field) is waited for as before."""
-    if pod.created_at is None:
+    """An unnamed pod is waited for while the backend's create is still running, else only this long
+    after it was created; a pod with no created_at (backend predates the field) is waited for as before."""
+    if pod.status in _CREATE_IN_FLIGHT_POD_STATUSES or pod.created_at is None:
         return True
     created_at = pod.created_at
     if created_at.tzinfo is None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -9,11 +10,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-
 from services.task.checks import idle_disk_write as module
 from services.task.checks import task_time
 from services.task.checks.idle_disk_write import IdleDiskWriteCheck
 from services.task.runner import SSHCommandResult
+
 from tests.helpers import build_services, build_state, default_executor, make_context
 
 EXECUTOR = default_executor()
@@ -208,3 +209,24 @@ async def test_an_unresolvable_docker_root_disk_is_its_own_reason_and_stamps_the
         res = await IdleDiskWriteCheck().run(ctx)
     assert writes(runner) == 0 and float(redis.store[KEY]) == clock.now
     assert res.event.what_we_saw["reason"] == "docker root disk not resolvable"
+
+
+
+class CutRunner(FakeRunner):
+    """The task ends (cancelled at its timeout) while the write runs."""
+
+    async def run(self, cmd, **kwargs):
+        if "lium_disk" in cmd:
+            raise asyncio.CancelledError
+        return await super().run(cmd, **kwargs)
+
+
+async def test_a_write_cut_by_the_task_end_is_retried_within_the_hour_not_the_day():
+    with flags() as clock:
+        ctx, _, _ = make_ctx(clock)
+        with pytest.raises(asyncio.CancelledError):
+            await IdleDiskWriteCheck().run(ctx.model_copy(update={"runner": CutRunner(IDLE)}))
+        clock.now += 3600
+        runner = FakeRunner(IDLE, write(400))
+        await IdleDiskWriteCheck().run(ctx.model_copy(update={"runner": runner}))
+    assert writes(runner) == 1

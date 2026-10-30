@@ -37,6 +37,7 @@ from .checks import (
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
+    DiskSpaceCheck,
     DuplicateExecutorCheck,
     ExecutorImageCheck,
     FinalizeCheck,
@@ -411,6 +412,8 @@ class PipelineFactory:
                 # passing answer and run over SSH otherwise. Off by default, never fatal.
                 LocalVerifyCheck(),
                 VerifyXCheck(),
+                # DAH-4961: the listing's disk floor, judged on the figure VerifyX just published (idle nodes only)
+                DiskSpaceCheck(),
                 CapabilityCheck(),
                 # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
                 # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
@@ -531,6 +534,7 @@ class PipelineFactory:
                 GpuUsageCheck(),
                 LocalVerifyCheck(),
                 VerifyXCheck(),
+                DiskSpaceCheck(),
                 ParallelStage(
                     [
                         [
