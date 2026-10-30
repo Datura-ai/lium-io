@@ -10753,14 +10753,20 @@ class DockerService:
                 )
             raise
         except Exception as exc:
-            container_stopped = await self._stop_half_recovered_container(
-                ssh_client, container_name
-            )
+            # read exit code and log tail before the stop: an entrypoint that dies at once makes the
+            # remount's `docker exec` fail, and that error alone does not say why the workload died
+            try:
+                diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name)
+            finally:
+                container_stopped = await self._stop_half_recovered_container(
+                    ssh_client, container_name
+                )
             logger.error(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_START_FAILED",
                     extra=get_extra_info({
                         **log_extra,
+                        **diagnostics.to_log_fields(),
                         "error": str(exc),
                         "container_stopped": container_stopped,
                     }),
@@ -10770,7 +10776,7 @@ class DockerService:
 
         # a start that did not stick (pod da05c116, 30 Oct: exit 126, restart loop) is not a
         # recovery: log it truthfully with the container's exit code and logs
-        diagnostics = await collect_container_death_diagnostics(ssh_client, container_name)
+        diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name)
         if diagnostics.status is not None and diagnostics.status != "running":
             logger.error(
                 _m(
@@ -10887,6 +10893,20 @@ class DockerService:
             )
         ]
         return repaired[0] if repaired else None
+
+    async def _bounded_death_diagnostics(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+    ) -> ContainerDeathDiagnostics:
+        # a hung `docker logs` on the miner's host must not hold back the recovery's verdict or stop
+        try:
+            return await asyncio.wait_for(
+                collect_container_death_diagnostics(ssh_client, container_name),
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+        except TimeoutError:
+            return ContainerDeathDiagnostics(capture_error="diagnostics timed out")
 
     async def _stop_half_recovered_container(
         self,
