@@ -428,24 +428,28 @@ async def test_the_synced_marker_is_read_before_the_list(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("query", "recovered_ratio"),
+    ("first_query", "retry_watts", "after_first", "kept"),
     [
-        (AsyncMock(side_effect=asyncio.TimeoutError()), 0.8),  # nvidia-smi timed out
-        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), 0.8),  # partial output: GPU-1 missing
+        # nvidia-smi timed out: nothing was read, nothing recorded; the retry records the 80 % tier
+        (AsyncMock(side_effect=asyncio.TimeoutError()), (280, 280), None, [0.8, 0.8]),
+        # partial output: GPU-0 read in the tier, GPU-1 missing and held at stock; the retry keeps both
+        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), [0.8, 1.0], [0.8, 1.0]),
+        # GPU-0 read at stock, GPU-1 missing; the host cuts GPU-0 to 80 % before the retry: it keeps 1.0
+        (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (280, 280), [1.0, 1.0], [1.0, 1.0]),
     ],
 )
 @pytest.mark.asyncio
-async def test_an_unreadable_rental_start_fails_the_create_and_a_retry_records_the_tier(
-    monkeypatch, query, recovered_ratio
+async def test_an_unreadable_rental_start_fails_the_create_and_a_retry_cannot_lower_it(
+    monkeypatch, first_query, retry_watts, after_first, kept
 ) -> None:
-    # 280/350 W is the 80 % tier: a create that went on without its record would be held at 90 % for good
     monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
-    monkeypatch.setattr(gpl, "_query_power_state", query)
+    monkeypatch.setattr(gpl, "_query_power_state", first_query)
     redis = SharedFakeRedis()
     with pytest.raises(RuntimeError):
         await gpl.raise_low_power_limits_to_default(AsyncMock(), "ex-1", ["GPU-0", "GPU-1"], redis=redis, pod_id="pod-1")
-    assert not any(key.startswith("gpu_power_rental_start_ratio:") for key in redis.store)
-    await _rental_start(monkeypatch, redis, _power(280, 280))  # recovered: the retried create
-    assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == [recovered_ratio] * 2
-    await _rental_start(monkeypatch, redis, _power(280, 280))  # a reboot keeps the tier start
-    assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == [recovered_ratio] * 2
+    recorded = any(k.startswith("gpu_power_rental_start_ratio:") for k in redis.store)
+    assert ([_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] if recorded else None) == after_first
+    await _rental_start(monkeypatch, redis, _power(*retry_watts))  # the retried create
+    assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == kept
+    await _rental_start(monkeypatch, redis, _power(*retry_watts))  # a reboot keeps the start
+    assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == kept

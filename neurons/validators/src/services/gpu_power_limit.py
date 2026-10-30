@@ -768,14 +768,17 @@ async def _record_rental_start_ratios(
         # without the old records a reboot could replace its rental's start with today's limit
         raise GpuPowerRestoreStateError("GPU power rental-start records could not be read") from exc
     writes = RedisWrites()
+    unreadable: list[str] = []
     for gpu_uuid, key, old in zip(uuids, keys, existing):
         if rental_record_pod_id(old) == pod_id:
             continue  # a reboot or edit of the same rental keeps the limit it started on
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None or state.default_watts <= 0:
-            # every GPU of the pod gets its start, or the create fails and is retried
-            raise RuntimeError(f"GPU power state of {gpu_uuid} unreadable; rental start not recorded")
-        ratio = state.current_watts / state.default_watts
+            # held at 90 %; the GPUs read now keep this start too, so a retry cannot re-read them lower
+            unreadable.append(gpu_uuid)
+            ratio = 1.0
+        else:
+            ratio = state.current_watts / state.default_watts
         if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
             # raised to its default just above, or a running rental from before the records: it stays at 90 %
             ratio = 1.0
@@ -785,6 +788,8 @@ async def _record_rental_start_ratios(
         await redis.write_atomically(writes)
     except Exception as exc:
         raise GpuPowerRestoreStateError(f"GPU power rental-start ratios not recorded: {exc}") from exc
+    if unreadable:
+        raise RuntimeError(f"GPU power state of {', '.join(unreadable)} unreadable; recorded at stock, create retried")
 
 
 async def _raise_below_floor(
