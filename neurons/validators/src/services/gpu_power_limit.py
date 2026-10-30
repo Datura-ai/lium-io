@@ -134,6 +134,8 @@ class GpuPowerRestoreReadResult(BaseModel):
 
     records: list[GpuPowerRestoreRecord]
     read_failed: bool
+    # GPUs asked for that have no record (never capped, or already restored and cleared)
+    missing: list[str] = []
 
 
 @dataclass(frozen=True)
@@ -528,9 +530,11 @@ async def read_gpu_power_restore_records(
 ) -> GpuPowerRestoreReadResult:
     """Read the frozen restore records for these GPUs. Pure read: a corrupt record is logged and
     skipped (it can't grant a check pass and can't be restored; cleanup is manual); a failed Redis
-    read is logged and reported via ``read_failed``. ``require_complete`` instead raises on unreadable,
-    missing, or corrupt records when a customer cannot safely proceed with an unknown cap."""
+    read is logged and reported via ``read_failed``; a GPU without a record is listed in ``missing``.
+    ``require_complete`` instead raises on unreadable or corrupt records when a customer cannot
+    safely proceed with an unknown cap."""
     records: list[GpuPowerRestoreRecord] = []
+    missing: list[str] = []
     read_failed = False
     for gpu_uuid in gpu_uuids:
         key = _restore_key(gpu_uuid)
@@ -543,8 +547,7 @@ async def read_gpu_power_restore_records(
             read_failed = True
             continue
         if not raw:
-            if require_complete:
-                raise GpuPowerRestoreStateError("GPU power restore record is missing")
+            missing.append(gpu_uuid)
             continue
         try:
             record = GpuPowerRestoreRecord.model_validate_json(raw)
@@ -555,7 +558,7 @@ async def read_gpu_power_restore_records(
             if require_complete:
                 raise GpuPowerRestoreStateError("GPU power restore record is corrupt") from exc
             _log(logging.ERROR, f"gpu power restore: ignoring corrupt record {raw!r} for {gpu_uuid}", {"gpu_uuid": gpu_uuid}, log_extra)
-    return GpuPowerRestoreReadResult(records=records, read_failed=read_failed)
+    return GpuPowerRestoreReadResult(records=records, read_failed=read_failed, missing=missing)
 
 
 async def _delete_pod_index(
@@ -630,19 +633,34 @@ async def restore_tracked_gpu_power_limits(
     """Restore the frozen pre-cap limit of every tracked GPU among ``gpu_uuids``.
 
     Best-effort by default; returns the number of records restored and cleared.
-    ``require_complete`` raises on unreadable records or any restore not confirmed and cleared.
+    ``require_complete`` raises on unreadable records or any restore not confirmed and cleared, and
+    on a GPU without a record that the host does not show at 90 % of its default limit or more.
     """
     read_result = await read_gpu_power_restore_records(
         redis, gpu_uuids, log_extra, require_complete=require_complete
     )
-    if not read_result.records:
+    # A GPU of the index whose record is gone was restored already, e.g. by the customer create's own
+    # restore before its `docker run`; strict callers confirm that on the GPU itself.
+    check_missing = require_complete and bool(read_result.missing)
+    if not read_result.records and not check_missing:
         return 0
     try:
-        # before-values for the change log only
+        # before-values for the change log (and the strict check of record-less GPUs)
         state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
     except Exception as exc:
+        if check_missing:
+            raise GpuPowerRestoreStateError("GPU power state could not be read to confirm a restore") from exc
         _log(logging.WARNING, f"gpu power restore: state query failed: {exc}; restoring without before-values", {}, log_extra)
         state_by_uuid = {}
+    if check_missing:
+        for gpu_uuid in read_result.missing:
+            state = state_by_uuid.get(gpu_uuid)
+            if state is None or state.default_watts is None or (
+                state.current_watts < RENTED_MIN_POWER_LIMIT_RATIO * state.default_watts
+            ):
+                raise GpuPowerRestoreStateError(f"GPU power restore record is missing and {gpu_uuid} is below its floor")
+    if not read_result.records:
+        return 0
     restored = await _restore_records(
         ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency,
         require_complete=require_complete,

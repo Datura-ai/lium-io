@@ -467,9 +467,49 @@ def _stuck_filler_host(probe_stdout: str, *, listing_after: str = f"filler_stuck
 @pytest.fixture
 def _short_removal_bound(monkeypatch):
     monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(ds_module, "_FILLER_ONLY_RM_TIMEOUT_SECONDS", 0.1)
     ds_module.fillers_exiting_after_kill.clear()
     yield
     ds_module.fillers_exiting_after_kill.clear()
+
+
+@pytest.fixture
+def _short_filler_only_bound(monkeypatch):
+    monkeypatch.setattr(ds_module, "_FILLER_ONLY_RM_TIMEOUT_SECONDS", 0.05)
+    ds_module.fillers_exiting_after_kill.clear()
+    yield
+    ds_module.fillers_exiting_after_kill.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_filler_only_rm_is_settled_without_waiting_for_the_customer_bound(
+    docker_service, retry_ssh_mock, _short_filler_only_bound
+):
+    """DAH-5019: the customer waits for the killed filler to be exiting, not for its GPU teardown (12-60 s)."""
+    ssh_client = _stuck_filler_host(f"HOSTPID\nPROC\t{_STUCK_ID}\t4242\tD\t4194564\tnv_teardown\n")
+
+    await asyncio.wait_for(
+        docker_service.remove_fillers_at_ssh_connect(
+            ssh_client, {"executor_uuid": "exec-1"}, "pod_target", ["volume_stuck"]
+        ),
+        timeout=2,
+    )
+
+    assert _STUCK_ID in ds_module.fillers_exiting_after_kill
+
+
+@pytest.mark.asyncio
+async def test_a_filler_rm_with_its_volume_keeps_the_customer_bound(
+    docker_service, retry_ssh_mock, _short_filler_only_bound
+):
+    ssh_client = _stuck_filler_host(f"HOSTPID\nPROC\t{_STUCK_ID}\t4242\tD\t4194564\tnv_teardown\n")
+    deadline = asyncio.get_running_loop().time() + 60
+    removal = docker_service._remove_stale_containers_tolerantly(
+        ssh_client, {}, ["filler_stuck"], [_STUCK_ID], ["volume_stuck"], deadline
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(removal, timeout=0.5)
 
 
 def test_a_process_is_exiting_once_killed_or_a_zombie():

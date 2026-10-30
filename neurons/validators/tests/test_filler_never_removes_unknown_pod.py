@@ -72,7 +72,10 @@ def _create_over_a_host(svc, monkeypatch, container_names, unmounted_vloopback=(
 async def _run(svc, payload):
     executor_info = Mock(uuid=payload.executor_id, address="127.0.0.1", port=8080, ssh_username="root", ssh_port=2200)
     executor_info.ssh_host_key = "ssh-ed25519 AAAATESTKEY"
-    return await svc.create_container(payload, executor_info, Mock(ss58_address="validator-hotkey"), "private-key")
+    # production registers every create before create_container (handle_container); the cleanup
+    # removes the failed container by name only while this create is the pod's only one
+    with ds_module.inflight_creates.track(payload.pod_id):
+        return await svc.create_container(payload, executor_info, Mock(ss58_address="validator-hotkey"), "private-key")
 
 
 def _removed_names(ssh_client) -> list[str]:
