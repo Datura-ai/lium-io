@@ -173,7 +173,7 @@ STUBS = {
     "containerd": textwrap.dedent(
         """\
         #!/bin/bash
-        [ "$1 $3 $4" = "--config config dump" ] || exit 1
+        [ "$1 $3 $4" = "--config config dump" ] && [ -z "${STUB_CONTAINERD_DUMP_FAILS:-}" ] || exit 1
         [ ! -f "$SYSBOX_SETUP_HOST_ROOT$2" ] || exec cat "$SYSBOX_SETUP_HOST_ROOT$2"
         [ -z "${STUB_CONTAINERD_ROOT:-}" ] || printf "version = 3\\nroot = %s\\n" "$STUB_CONTAINERD_ROOT"
         """
@@ -491,6 +491,23 @@ def test_the_snapshotters_directory_in_the_root_is_measured(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
     assert rc == 1, out
     assert f"FIX  Free disk 50.0 GB on {root}/var/lib/containerd/{_OVERLAYFS} is below" in out
+
+
+@pytest.mark.parametrize("imports, measured", [("", "data/snapshots"), ('imports = ["/etc/containerd/conf.d/*.toml"]\n', None)])
+def test_without_a_dump_the_config_file_is_read_unless_it_imports_others(tmp_path, imports, measured):
+    # an imported file may set root or root_path; without containerd's own merge that is unknown, not the main file
+    root = tmp_path / "root"
+    (root / "data" / "snapshots").mkdir(parents=True)
+    config = f'{imports}root = "{root}/var/lib/containerd"\n[plugins."{_OVERLAYFS}"]\n  root_path = "{root}/data/snapshots"\n'
+    files = {"var/lib/containerd/.keep": "", "etc/containerd/config.toml": config}
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_DUMP_FAILS": "1", "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    if measured:
+        assert rc == 1, out
+        assert f"FIX  Free disk 50.0 GB on {root}/{measured} is below" in out
+    else:
+        assert rc == 0, out
+        assert "SKIP" in out and "is below" not in out
 
 
 def test_a_root_path_that_is_not_on_the_host_is_skipped(tmp_path):

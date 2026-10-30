@@ -474,17 +474,22 @@ resolve_disk_dir() {
     # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
     # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
     # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd or its root cannot be told.
-    local ctrd_root plugin root_path
+    local ctrd_root plugin root_path config
     DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
     [ -d "$DISK_DIR" ] || DISK_DIR=/
     SNAPSHOTTER_FIX=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
     docker_containerd || return 1
+    # the merged config (imports resolved); no dump: its config file itself, unless that imports others, whose
+    # root or root_path would be missed: unknown then, as the validator's scrape follows them
+    config=$("$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null) || {
+        config=$(cat "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null)
+        ! sed -n '/^ *\[/q; /^ *imports *=/p' <<<"$config" | grep -q . || return 1
+    }
     ctrd_root=$CTRD_ROOT
-    # containerd 1.x dumps root = "...", 2.x root = '...'; no dump: the top level of its config file itself
-    [ -n "$ctrd_root" ] || ctrd_root=$("$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null | sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
-    [ -n "$ctrd_root" ] || ctrd_root=$(sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null | head -1)
+    # containerd 1.x dumps root = "...", 2.x root = '...'
+    [ -n "$ctrd_root" ] || ctrd_root=$(sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" <<<"$config" | head -1)
     if [ -z "$ctrd_root" ]; then
         # containerd's default root only for the system config: an unreadable generated (Docker-managed) or custom
         # config does not mean a leftover /var/lib/containerd holds the containers
@@ -498,8 +503,7 @@ resolve_disk_dir() {
     # which may be a mount of another disk
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
-    root_path=$({ "$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null || cat "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null; } |
-        sed -n "/^ *\[plugins\.[\"']${plugin//./\\.}[\"']\]/,/^ *\[/s/^ *root_path *= *[\"']\([^\"']\+\)[\"'].*/\1/p" | head -1)
+    root_path=$(sed -n "/^ *\[plugins\.[\"']${plugin//./\\.}[\"']\]/,/^ *\[/s/^ *root_path *= *[\"']\([^\"']\+\)[\"'].*/\1/p" <<<"$config" | head -1)
     if [ -n "$root_path" ]; then
         [ -d "$root_path" ] || return 1
         DISK_DIR=$root_path
