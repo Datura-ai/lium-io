@@ -2566,8 +2566,8 @@ class GpuAttestationIdentityMessages:
         severity="warning",
         category="policy",
         impact="Score set to 0 while the finding stands",
-        remediation="Update every GPU's VBIOS to at least NVIDIA's minimum for CC in R595 "
-        "(B200 97.00.E4.00.xx, B300 97.10.64.00.xx).",
+        remediation="Pause new rentals and wait for running ones to end, since the update restarts the host. Then "
+        "update every GPU's VBIOS to at least NVIDIA's minimum for CC in R595 (B200 97.00.E4.00.xx, B300 97.10.64.00.xx).",
     )
     OK = MessageTemplate(
         event="GPU identity verified against NVIDIA's root",
