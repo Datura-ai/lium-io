@@ -37,8 +37,8 @@ from tests.test_host_disk import output as pressure_output
 class DummyRedis:
     def __init__(self, *, renting_in_progress: bool = False, dind_miss_on_record: bool = False):
         self.renting_in_progress_value = renting_in_progress
-        self.verified_ports = {}
-        self.deferrals = {}
+        self.verified_ports: dict[tuple[str, str], dict] = {}
+        self.deferrals: dict[tuple[str, str, bool], int] = {}
         # DAH-3597: whether a DinD probe miss is already on record for the executor.
         self.dind_miss_on_record = dind_miss_on_record
         self.recorded_misses: list[tuple[str, str, int]] = []
@@ -56,9 +56,6 @@ class DummyRedis:
         return (miner_hotkey, executor_id) in self.sysbox_verified
 
     # DAH-5244: the last completed check's ports and the deferral counters (real and shadow)
-    verified_ports: dict[tuple[str, str], dict] = {}
-    deferrals: dict[tuple[str, str, bool], int] = {}
-
     async def record_verified_ports(self, miner_hotkey, executor_id, identity, pairs, ttl_seconds):
         self.verified_ports[(miner_hotkey, executor_id)] = {"identity": identity, "pairs": pairs, "ttl": ttl_seconds}
 
@@ -1013,7 +1010,8 @@ async def test_the_fourth_pressured_cycle_runs_the_check_and_ends_the_streak(con
     deferred = []
     for _ in range(5):
         ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
-        _remember(redis_service, ctx) if not redis_service.verified_ports else None
+        if not redis_service.verified_ports:
+            _remember(redis_service, ctx)
         result = await PortConnectivityCheck().run(ctx)
         deferred.append(connectivity.called_with is None)
         assert result.passed

@@ -9,8 +9,8 @@ the Docker root does, because it is that very wait. The diskstats and meminfo fi
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, NamedTuple
+from dataclasses import asdict, dataclass, replace
+from typing import NamedTuple
 
 # a healthy Docker root syncs in well under a second; beyond this the port-check containers (60 s) are at risk
 DISK_PRESSURE_SYNCFS_SECONDS = 5.0
@@ -93,45 +93,62 @@ class DiskPressureReading:
     # None = read; else why the sync part could not be: no_output, syncfs_unavailable, syncfs_failed, read_failed
     error: str | None = None
 
-    def as_spec(self) -> dict[str, Any]:
+    def as_spec(self) -> dict[str, str | float | int | bool | None]:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class _DiskSnapshot:
+    uptime_seconds_text: str
+    dirty_and_writeback_kb: str
+    psi_io_full_avg10: str
+    device_counters: str
+
+    @classmethod
+    def from_tokens(cls, tokens: dict[str, str]) -> _DiskSnapshot:
+        return cls(
+            uptime_seconds_text=tokens.get("t", ""),
+            dirty_and_writeback_kb=tokens.get("dirty", ""),
+            psi_io_full_avg10=tokens.get("psi", ""),
+            device_counters=tokens.get("io", ""),
+        )
+
+
 def _tokens(line: str, marker: str) -> dict[str, str]:
-    return dict(t.partition("=")[::2] for t in line[len(marker) :].split())
+    return dict(token.partition("=")[::2] for token in line[len(marker) :].split())
 
 
 def parse_disk_pressure(stdout: str) -> DiskPressureReading:
     """The reading from the probe's output; the disk fields are filled even when the sync part failed."""
     devices: list[str] = []
-    snaps: list[dict[str, str]] = []
+    snapshots: list[_DiskSnapshot] = []
     sync: dict[str, str] | None = None
     for line in (stdout or "").splitlines():
         if line.startswith(f"{DEVICE_MARKER} name="):
             devices.append(line.partition("=")[2].strip())
         elif line.startswith(f"{PRESSURE_MARKER} "):
-            snaps.append(_tokens(line, PRESSURE_MARKER))
+            snapshots.append(_DiskSnapshot.from_tokens(_tokens(line, PRESSURE_MARKER)))
         elif line.startswith(f"{PRESSURE_MARKER}_sync "):
             sync = _tokens(line, f"{PRESSURE_MARKER}_sync")
-    fields: dict[str, Any] = {}
-    if len(snaps) == 2:
-        fields.update(_disk_fields(snaps[0], snaps[1], set(devices)))
+    reading = DiskPressureReading()
+    if len(snapshots) == 2:
+        reading = _read_disk_telemetry(snapshots[0], snapshots[1], set(devices))
     # no resolved device only blanks the disk fields: `sync -f` on the Docker root needs none of them
     if sync is None:
-        return DiskPressureReading(**fields, error="no_output")
+        return replace(reading, error="no_output")
     try:
         seconds = float(sync["end"]) - float(sync["start"])
     except (KeyError, ValueError):
-        return DiskPressureReading(**fields, error="no_output")
+        return replace(reading, error="no_output")
     rc = sync.get("rc", "")
     if rc == str(_SYNC_UNAVAILABLE_RC):
-        return DiskPressureReading(**fields, error="syncfs_unavailable")
+        return replace(reading, error="syncfs_unavailable")
     if rc not in ("", "0"):
-        return DiskPressureReading(**fields, error="syncfs_failed")
+        return replace(reading, error="syncfs_failed")
     timed_out = rc == ""
     pressure = timed_out or (rc == "0" and seconds >= DISK_PRESSURE_SYNCFS_SECONDS)
-    return DiskPressureReading(
-        **fields,
+    return replace(
+        reading,
         syncfs_seconds=round(seconds, 2),
         syncfs_timed_out=timed_out,
         pressure=pressure,
@@ -143,55 +160,68 @@ class _DeviceWindow(NamedTuple):
     """One Docker-root device's /proc/diskstats counters moved between the two snapshots."""
 
     name: str
-    sectors: int
+    sectors_transferred: int
     io_ticks_ms: int
-    ms_spent: int
+    total_io_duration_ms: int
     ios_completed: int
 
 
-def _disk_fields(first: dict[str, str], second: dict[str, str], devices: set[str]) -> dict[str, Any]:
+class _DeviceCounters(NamedTuple):
+    sectors_transferred: int
+    io_ticks_ms: int
+    total_io_duration_ms: int
+    ios_completed: int
+
+
+def _read_disk_telemetry(first: _DiskSnapshot, second: _DiskSnapshot, devices: set[str]) -> DiskPressureReading:
     # the busiest (io_ticks) of the Docker-root devices over the window; another disk's traffic says nothing
-    fields: dict[str, Any] = {}
+    reading = DiskPressureReading()
     try:
-        dt = max(float(second["t"]) - float(first["t"]), 0.01)
-    except (KeyError, ValueError):
-        return fields
-    dirty, _, writeback = second.get("dirty", "").partition(":")
-    if dirty.isdigit() and writeback.isdigit():
-        fields["dirty_mb"] = int(dirty) // 1024
-        fields["writeback_mb"] = int(writeback) // 1024
+        elapsed_seconds = max(float(second.uptime_seconds_text) - float(first.uptime_seconds_text), 0.01)
+    except ValueError:
+        return reading
+    dirty_kb, _, writeback_kb = second.dirty_and_writeback_kb.partition(":")
+    if dirty_kb.isdigit() and writeback_kb.isdigit():
+        reading = replace(reading, dirty_mb=int(dirty_kb) // 1024, writeback_mb=int(writeback_kb) // 1024)
     try:
-        fields["psi_io_full_avg10"] = float(second["psi"])
-    except (KeyError, ValueError):
+        reading = replace(reading, psi_io_full_avg10=float(second.psi_io_full_avg10))
+    except ValueError:
         pass
-    before = _io_counters(first.get("io", ""))
-    busiest: _DeviceWindow | None = None
-    for name, after in _io_counters(second.get("io", "")).items():
+    busiest_device_window = _busiest_device_window(first.device_counters, second.device_counters, devices)
+    if busiest_device_window is not None:
+        reading = replace(
+            reading,
+            device=busiest_device_window.name,
+            mb_per_s=round(busiest_device_window.sectors_transferred * 512 / elapsed_seconds / 1e6, 1),
+            util_percent=round(min(busiest_device_window.io_ticks_ms / (elapsed_seconds * 1000) * 100, 100.0), 1),
+            await_ms=(
+                round(busiest_device_window.total_io_duration_ms / busiest_device_window.ios_completed, 1)
+                if busiest_device_window.ios_completed >= AWAIT_MIN_COMPLETED_IOS
+                else None
+            ),
+        )
+    return reading
+
+
+def _busiest_device_window(first: str, second: str, devices: set[str]) -> _DeviceWindow | None:
+    before = _io_counters(first)
+    busiest_device_window: _DeviceWindow | None = None
+    for name, after in _io_counters(second).items():
         if name not in before or name not in devices:
             continue
         window = _DeviceWindow(name, *(a - b for a, b in zip(after, before[name])))
         if min(window[1:]) < 0:  # a counter reset or a device that came back
             continue
-        if busiest is None or window.io_ticks_ms > busiest.io_ticks_ms:
-            busiest = window
-    if busiest is not None:
-        fields["device"] = busiest.name
-        fields["mb_per_s"] = round(busiest.sectors * 512 / dt / 1e6, 1)
-        fields["util_percent"] = round(min(busiest.io_ticks_ms / (dt * 1000) * 100, 100.0), 1)
-        fields["await_ms"] = (
-            round(busiest.ms_spent / busiest.ios_completed, 1)
-            if busiest.ios_completed >= AWAIT_MIN_COMPLETED_IOS
-            else None
-        )
-    return fields
+        if busiest_device_window is None or window.io_ticks_ms > busiest_device_window.io_ticks_ms:
+            busiest_device_window = window
+    return busiest_device_window
 
 
-def _io_counters(raw: str) -> dict[str, list[int]]:
-    """device -> [sectors moved, io_ticks ms, ms spent, I/Os completed]."""
-    counters: dict[str, list[int]] = {}
+def _io_counters(raw: str) -> dict[str, _DeviceCounters]:
+    counters: dict[str, _DeviceCounters] = {}
     for entry in raw.split(","):
         name, _, numbers = entry.partition(":")
-        parts = numbers.split(":")
-        if name and len(parts) == 4 and all(p.lstrip("-").isdigit() for p in parts):
-            counters[name] = [int(p) for p in parts]
+        counter_values = numbers.split(":")
+        if name and len(counter_values) == 4 and all(part.lstrip("-").isdigit() for part in counter_values):
+            counters[name] = _DeviceCounters(*(int(part) for part in counter_values))
     return counters

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TypedDict
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from services.const import DEFAULT_JOB_OWNER_LIUM, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
@@ -42,17 +42,30 @@ DISK_PRESSURE_READ_TIMEOUT_SECONDS = SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS + 15
 _COMPLETED_CHECK_SAVED_AT: dict[tuple[str, str], float] = {}
 
 
-def _completed_check_saved(key: tuple[str, str]) -> bool:
+def _has_fresh_completed_check(key: tuple[str, str]) -> bool:
     saved_at = _COMPLETED_CHECK_SAVED_AT.get(key)
     return saved_at is not None and time.monotonic() - saved_at < VERIFIED_PORTS_MEMORY_TTL_SECONDS
 
 
-def _mark_completed_check_saved(key: tuple[str, str]) -> None:
+def _record_completed_check_save_time(key: tuple[str, str]) -> None:
     # departed executors leave here on the next completion anywhere
     now = time.monotonic()
     for expired in [k for k, at in _COMPLETED_CHECK_SAVED_AT.items() if now - at >= VERIFIED_PORTS_MEMORY_TTL_SECONDS]:
         del _COMPLETED_CHECK_SAVED_AT[expired]
     _COMPLETED_CHECK_SAVED_AT[key] = now
+
+
+class _DiskPressureSpec(TypedDict, total=False):
+    disk_pressure: dict[str, str | float | int | bool | None]
+
+
+class _PressureGateFields(_DiskPressureSpec, total=False):
+    disk_pressure_eligible: bool
+    disk_pressure_self_rent: bool
+    default_job_owner: str | None
+    has_verified_ports_memory: bool
+    disk_pressure_would_defer: bool
+    disk_pressure_deferrals_in_a_row: int
 
 
 @dataclass(frozen=True)
@@ -72,7 +85,7 @@ class _PressureGate:
     would_defer: bool = False
     deferred: bool = False
 
-    def fields(self) -> dict[str, Any]:
+    def event_fields(self) -> _PressureGateFields:
         if self.reading is None:
             return {}
         return {
@@ -89,7 +102,7 @@ class _PressureGate:
 @dataclass(frozen=True)
 class _SysboxMemoryUpdate:
     # every write this cycle owed the sysbox memory is in Redis (a read in the fallback included)
-    saved: bool
+    is_saved: bool
     # ticket-0494: a rented node's probe measured nothing and the memory says sysbox
     use_last_verified: bool = False
 
@@ -159,7 +172,7 @@ class PortConnectivityCheck:
         # one of them leaves the memory in Redis older than the probe and the readiness gone
         readiness_key = (ctx.miner_hotkey, ctx.executor.uuid)
         _COMPLETED_CHECK_SAVED_AT.pop(readiness_key, None)
-        ports_saved = await self._record_completed_check(ctx, result, gate)
+        ports_saved = await self._save_completed_ports_and_deferral_counter(ctx, result, gate)
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
         declared_port_count = result.declared_port_count
@@ -176,7 +189,7 @@ class PortConnectivityCheck:
         # event-only: kept out of default_extra so later checks' log lines stay small
         event_extra: dict[str, object] = {
             "port_ranges": [r.as_dict() for r in result.port_ranges],
-            **gate.fields(),
+            **gate.event_fields(),
         }
         updated_state = replace(
             ctx.state,
@@ -216,8 +229,8 @@ class PortConnectivityCheck:
                 specs={**updated_state.specs, "sysbox_runtime": True},
                 sysbox_runtime=True,
             )
-        if ports_saved and sysbox_memory.saved:
-            _mark_completed_check_saved(readiness_key)
+        if ports_saved and sysbox_memory.is_saved:
+            _record_completed_check_save_time(readiness_key)
 
         # status "ok" means at least one port answered; a partial loss is a miss too, or one transient probe
         # failure would cut a split remainder's idle pay at once
@@ -353,31 +366,23 @@ class PortConnectivityCheck:
             rented_executor is not None or (bool(filler_ports) and default_job_owner == DEFAULT_JOB_OWNER_LIUM)
         )
         enforce = settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED
-        memory = None
-        sysbox_verified = False
-        deferrals = 0
-        if deferral_eligible:
-            try:
-                redis = ctx.services.redis
-                memory = await redis.last_verified_ports(
-                    ctx.miner_hotkey, ctx.executor.uuid, self._port_setup_fingerprint(ctx)
-                )
-                sysbox_verified = await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-                deferrals = await redis.disk_pressure_deferrals(
-                    ctx.miner_hotkey, ctx.executor.uuid, shadow=not enforce
-                )
-            except Exception as e:  # noqa: BLE001 - a safety net; never fail the port check over it
-                logger.warning(
-                    _m("verified ports memory unavailable", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
-                )
-                memory = None
+        gate = await self._load_pressure_gate_memory(
+            ctx,
+            _PressureGate(
+                reading=reading,
+                deferral_eligible=deferral_eligible,
+                self_rent=self_rent,
+                default_job_owner=default_job_owner,
+            ),
+            shadow=not enforce,
+        )
         would_defer = (
             reading.pressure
             and deferral_eligible
-            and memory is not None
-            and deferrals < DISK_PRESSURE_MAX_DEFERRALS
+            and gate.memory is not None
+            and gate.deferrals_in_a_row < DISK_PRESSURE_MAX_DEFERRALS
         )
-        if would_defer and not _completed_check_saved((ctx.miner_hotkey, ctx.executor.uuid)):
+        if would_defer and not _has_fresh_completed_check((ctx.miner_hotkey, ctx.executor.uuid)):
             # the memory in Redis may be older than the last completed check
             logger.info(
                 _m(
@@ -386,67 +391,84 @@ class PortConnectivityCheck:
                 )
             )
             would_defer = False
-        deferred = enforce and would_defer
-        if deferred:
-            # the bound lives in this counter: a deferral Redis did not record (reachable, refusing writes)
-            # would never count, so the check runs instead
-            try:
-                deferrals = await ctx.services.redis.record_disk_pressure_deferral(
-                    ctx.miner_hotkey,
-                    ctx.executor.uuid,
-                    shadow=False,
-                    ttl_seconds=DISK_PRESSURE_DEFERRALS_TTL_SECONDS,
-                )
-            except Exception as e:  # noqa: BLE001 - not on record, so not deferred
-                logger.warning(
-                    _m("disk pressure deferral not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
-                )
-                deferred = False
-            else:
-                if deferrals > DISK_PRESSURE_MAX_DEFERRALS:
-                    # the slot INCR handed out is past the bound: another cycle took the last one between the read
-                    # above and this write, so this cycle runs the check
-                    logger.info(
-                        _m(
-                            "deferral_blocked: streak bound reached",
-                            extra=get_extra_info({**ctx.default_extra, "deferrals": deferrals}),
-                        )
-                    )
-                    deferred = False
-        gate = _PressureGate(
-            reading=reading,
-            deferral_eligible=deferral_eligible,
-            self_rent=self_rent,
-            default_job_owner=default_job_owner,
-            memory=memory,
-            sysbox_verified=sysbox_verified,
-            deferrals_in_a_row=deferrals,
-            would_defer=would_defer,
-            deferred=deferred,
-        )
+        gate = replace(gate, would_defer=would_defer)
+        if enforce and would_defer:
+            gate = await self._reserve_pressure_deferral(ctx, gate)
         # its own line per reading: the port event repeats and LoggerSink drops a repeat to DEBUG
         logger.info(
             _m(
                 "DISK_PRESSURE_READING",
-                extra=get_extra_info({**ctx.default_extra, **gate.fields(), "disk_pressure_deferred": deferred}),
+                extra=get_extra_info(
+                    {**ctx.default_extra, **gate.event_fields(), "disk_pressure_deferred": gate.deferred}
+                ),
             )
         )
         return gate
 
+    async def _load_pressure_gate_memory(self, ctx: Context, gate: _PressureGate, *, shadow: bool) -> _PressureGate:
+        memory = None
+        sysbox_verified = False
+        deferrals = 0
+        if gate.deferral_eligible:
+            try:
+                redis = ctx.services.redis
+                memory = await redis.last_verified_ports(
+                    ctx.miner_hotkey, ctx.executor.uuid, self._port_setup_fingerprint(ctx)
+                )
+                sysbox_verified = await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+                deferrals = await redis.disk_pressure_deferrals(ctx.miner_hotkey, ctx.executor.uuid, shadow=shadow)
+            except Exception as e:  # noqa: BLE001 - a safety net; never fail the port check over it
+                logger.warning(
+                    _m(
+                        "verified ports memory unavailable",
+                        extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
+                    )
+                )
+                memory = None
+        return replace(gate, memory=memory, sysbox_verified=sysbox_verified, deferrals_in_a_row=deferrals)
+
+    async def _reserve_pressure_deferral(self, ctx: Context, gate: _PressureGate) -> _PressureGate:
+        deferred = True
+        deferrals = gate.deferrals_in_a_row
+        # the bound lives in this counter: a deferral Redis did not record (reachable, refusing writes)
+        # would never count, so the check runs instead
+        try:
+            deferrals = await ctx.services.redis.record_disk_pressure_deferral(
+                ctx.miner_hotkey,
+                ctx.executor.uuid,
+                shadow=False,
+                ttl_seconds=DISK_PRESSURE_DEFERRALS_TTL_SECONDS,
+            )
+        except Exception as e:  # noqa: BLE001 - not on record, so not deferred
+            logger.warning(
+                _m("disk pressure deferral not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+            )
+            deferred = False
+        else:
+            if deferrals > DISK_PRESSURE_MAX_DEFERRALS:
+                # the slot INCR handed out is past the bound: another cycle took the last one between the read
+                # in _load_pressure_gate_memory and this write, so this cycle runs the check
+                logger.info(
+                    _m(
+                        "deferral_blocked: streak bound reached",
+                        extra=get_extra_info({**ctx.default_extra, "deferrals": deferrals}),
+                    )
+                )
+                deferred = False
+        return replace(gate, deferred=deferred, deferrals_in_a_row=deferrals)
+
     @staticmethod
     async def _read_disk_pressure(ctx: Context) -> DiskPressureReading:
         try:
-            run = await ctx.runner.run(
+            command_result = await ctx.runner.run(
                 disk_pressure_command(), timeout=DISK_PRESSURE_READ_TIMEOUT_SECONDS, retryable=False
             )
-            return parse_disk_pressure(run.stdout or "")
+            return parse_disk_pressure(command_result.stdout or "")
         except Exception as e:  # noqa: BLE001 - a reading that fails is "not read", never pressure
-            logger.warning(
-                _m("disk pressure not read", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
-            )
+            logger.warning(_m("disk pressure not read", extra=get_extra_info({**ctx.default_extra, "error": str(e)})))
             return DiskPressureReading(error="read_failed")
 
-    async def _record_completed_check(
+    async def _save_completed_ports_and_deferral_counter(
         self, ctx: Context, result: PortVerificationResult, gate: _PressureGate
     ) -> bool:
         # a completed check (any status, an empty result included) is what the next deferral republishes,
@@ -480,7 +502,9 @@ class PortConnectivityCheck:
             )
             return False
 
-    async def _deferred(self, ctx: Context, gate: _PressureGate, extra: dict, *, busy_ports: set[int]) -> CheckResult:
+    async def _deferred(
+        self, ctx: Context, gate: _PressureGate, extra: dict[str, object], *, busy_ports: set[int]
+    ) -> CheckResult:
         """No containers on a Docker root whose sync already stalls: the last completed check's ports are
         republished (PortCountCheck counts them as today) and sysbox is what the validator's own probe verified
         (the host's scrape never counts); the sysbox and DinD-miss memories are left as they are."""
@@ -524,7 +548,7 @@ class PortConnectivityCheck:
                     f"deferral {deferrals} of {DISK_PRESSURE_MAX_DEFERRALS}"
                 ),
                 "verified_ports_measured_at": gate.memory.measured_at,
-                **gate.fields(),
+                **gate.event_fields(),
             },
             extra=extra_info,
         )
@@ -564,9 +588,7 @@ class PortConnectivityCheck:
         # known value and let the next verification cycle re-measure. Mirrors
         # the rented-executor sysbox fallback in ExecutorConnectivityService.
         sysbox_downgraded = ctx.state.sysbox_runtime and not result.sysbox_runtime
-        if sysbox_downgraded and await ctx.services.redis.renting_in_progress(
-            ctx.miner_hotkey, ctx.executor.uuid
-        ):
+        if sysbox_downgraded and await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
             return True
         if not settings.DIND_PROBE_FIRST_MISS_GRACE:
             return False
@@ -617,11 +639,11 @@ class PortConnectivityCheck:
                     # DAH-5244: a deferred cycle republishes this memory, so a cycle an unrented node ends
                     # without sysbox forgets it - the next deferral may not pass SysboxRequired on it
                     await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-                return _SysboxMemoryUpdate(saved=True)
+                return _SysboxMemoryUpdate(is_saved=True)
             if sysbox_now or result.dind_ok:
-                return _SysboxMemoryUpdate(saved=True)
+                return _SysboxMemoryUpdate(is_saved=True)
             use_last_verified = await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            return _SysboxMemoryUpdate(saved=True, use_last_verified=use_last_verified)
+            return _SysboxMemoryUpdate(is_saved=True, use_last_verified=use_last_verified)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
             logger.warning(
                 _m(
@@ -629,9 +651,9 @@ class PortConnectivityCheck:
                     extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
                 )
             )
-            return _SysboxMemoryUpdate(saved=False)
+            return _SysboxMemoryUpdate(is_saved=False)
 
 
-def _disk_pressure_spec(gate: _PressureGate) -> dict[str, Any]:
+def _disk_pressure_spec(gate: _PressureGate) -> _DiskPressureSpec:
     # the backend keeps one cycle's reading (lium-platform MachineSpecs.disk_pressure); none read, no key
     return {"disk_pressure": gate.reading.as_spec()} if gate.reading is not None else {}
