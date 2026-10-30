@@ -357,3 +357,54 @@ async def test_rental_evicts_the_oldest_cache_first_and_keeps_the_rest_once_it_f
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(500), {}) is True
     assert _removed_volumes(ssh_client) == ["engy_cache_hf_old"]
+
+
+@pytest.mark.asyncio
+async def test_a_rental_that_still_does_not_fit_after_the_eviction_is_clamped_to_the_freed_disk(docker_service):
+    # a `volume rm` that failed (it hides errors behind `|| true`) frees nothing: 2389 GB stays free, so the legacy
+    # 2620 GB volume would be preallocated on disk that was never freed and the create would fail
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert rental.volume_limit_gb == 2389 - 1310 - 20
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(docker_service, monkeypatch):
+    class HangingRemoval(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                await asyncio.sleep(3600)
+            return await super().run(command, *args, **kwargs)
+
+    monkeypatch.setattr("services.docker_service.CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS", 0.01)
+    rental = _rental(500)
+
+    await asyncio.wait_for(
+        docker_service.reclaim_dphn_cache_for_rental(HangingRemoval([_KIMI, "volume_pod"], free_gb=300), rental, {}), 5
+    )
+    assert rental.volume_limit_gb == 300 - 20
+
+
+@pytest.mark.asyncio
+async def test_a_rental_takes_the_engy_cache_before_an_older_dolphin_cache(docker_service, monkeypatch):
+    # the listing offered the Engy cache as free disk, never the Dolphin one, so the Engy family goes first
+    class InspectingSshClient(FakeSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume inspect" in command:
+                self.commands.append(command)
+                body = f"{_KIMI} 2026-10-22T10:00:00Z\ndphn_cache_hf_x 2026-10-01T10:00:00Z"
+                return SimpleNamespace(exit_status=0, stdout=body, stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = InspectingSshClient([_KIMI, "dphn_cache_hf_x", "volume_pod"])
+    monkeypatch.setattr(docker_service, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
+    monkeypatch.setattr(
+        docker_service,
+        "_get_fs_available_bytes",
+        AsyncMock(side_effect=[50 * 1024**3, 60 * 1024**3] + [900 * 1024**3] * 3),
+    )
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(500), {}) is True
+    assert _removed_volumes(ssh_client) == [_KIMI]

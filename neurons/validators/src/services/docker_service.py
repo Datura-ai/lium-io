@@ -4935,14 +4935,15 @@ class DockerService:
             if not cache_volumes:
                 return False
 
-            needed_gb: float = (
+            # unsized (no --storage-opt): nothing caps the renter, so every listed Engy cache goes
+            rental_needs_free_gb: float = (
                 payload.volume_limit_gb + (payload.storage_limit_gb or 0) + RENTAL_DISK_HEADROOM_GB
                 if payload.volume_limit_gb
                 else math.inf
             )
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
             free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-            if free_gb >= needed_gb:
+            if free_gb >= rental_needs_free_gb:
                 return False
 
             logger.info(
@@ -4952,7 +4953,8 @@ class DockerService:
                         **default_extra,
                         "volumes": cache_volumes,
                         "free_gb": round(free_gb, 1),
-                        "needed_gb": needed_gb,
+                        # json.dumps writes inf as bare Infinity (invalid JSON)
+                        "rental_needs_free_gb": rental_needs_free_gb if payload.volume_limit_gb else None,
                     }),
                 )
             )
@@ -4964,10 +4966,29 @@ class DockerService:
 
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb >= needed_gb
+                return free_now_gb >= rental_needs_free_gb
 
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
-            await evict_cache_volumes_oldest_first(ssh_client, cache_volumes, remove, rental_fits)
+            try:
+                await evict_cache_volumes_oldest_first(
+                    ssh_client, cache_volumes, remove, rental_fits, first_prefix=ENGY_CACHE_VOLUME_PREFIX
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "DPHN cache reclaim for rental failed; continuing with the rent",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    ),
+                    exc_info=True,
+                )
+            # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed
+            if payload.volume_limit_gb and not await rental_fits():
+                free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+                payload.volume_limit_gb = max(
+                    int(free_now_gb - (payload.storage_limit_gb or 0) - RENTAL_DISK_HEADROOM_GB), 1
+                )
             return True
         except asyncio.CancelledError:
             raise

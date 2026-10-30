@@ -83,6 +83,7 @@ async def evict_cache_volumes_oldest_first(
     volume_names: list[str],
     run_removal: Callable[[str], Awaitable[object]],
     has_room: Callable[[], Awaitable[bool]],
+    first_prefix: str | None = None,
 ) -> None:
     """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
 
@@ -107,7 +108,15 @@ async def evict_cache_volumes_oldest_first(
     await run_removal(REMOVE_IDLE_FILLER_IMAGES)
     if await has_room():
         return
-    ordered: list[str] = sorted(volume_names, key=lambda name: (created_at.get(name, "~"), name))
+    # DAH-5260: a rental passes the Engy prefix, the cache its listing offered as free disk
+    ordered: list[str] = sorted(
+        volume_names,
+        key=lambda name: (
+            not (first_prefix and name.startswith(first_prefix)),
+            created_at.get(name, "~"),
+            name,
+        ),
+    )
     for index, name in enumerate(ordered):
         await run_removal(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(name)}")
         if index + 1 < len(ordered) and await has_room():
