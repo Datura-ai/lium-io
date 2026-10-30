@@ -711,13 +711,17 @@ def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
     marker_path = loopback_plugin_probe_marker_path(loopback_plugin_alias)
     if marker_path is None:
         return plugin_state_command
-    # "true" only once the setup script's probe volume mounted on this pinned build (the marker
-    # holds its digest); an enabled plugin still being probed, whose probe was cut short, or probed
-    # as an earlier build reads "unverified" and goes through setup
+    # "true" only once the setup script's probe volume mounted on this installation of this pinned
+    # build (the marker holds its digest and the plugin's ID); an enabled plugin still being probed,
+    # whose probe was cut short, probed as an earlier build or installed again by hand reads
+    # "unverified" and goes through setup
     digest = LOOPBACK_PLUGIN_BUILDS[loopback_plugin_alias].digest
+    plugin_id_command = (
+        f"/usr/bin/docker plugin inspect --format '{{{{.Id}}}}' {shlex.quote(loopback_plugin_alias)} 2>/dev/null"
+    )
     return (
         f'state="$( {plugin_state_command})"; '
-        f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != {shlex.quote(digest)} ]; '
+        f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != "{digest} $({plugin_id_command})" ]; '
         'then echo unverified; else echo "$state"; fi'
     )
 
@@ -6589,7 +6593,7 @@ class DockerService:
             )
             setup_execution = await _run_with_host_timeout(
                 ssh_client,
-                loopback_plugin_setup_command(docker_root_dir, alias),
+                loopback_plugin_setup_command(docker_root_dir, alias, setup_timeout_seconds),
                 setup_timeout_seconds,
             )
             if setup_execution.exit_status == 0:

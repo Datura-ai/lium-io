@@ -412,7 +412,7 @@ async def test_v3_switch_off_creates_on_v2_exactly_as_before(docker_service, mon
     assert [volume["driver"] for volume in created] == ["vloopback:v2"]
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
     assert commands[-1] == _bounded(
-        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2"), 60
+        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2", 60), 60
     )
     assert "1.0.0-lium1" in commands[-1]
     assert not any("vloopback:v3" in command or "lium3" in command for command in commands)
@@ -483,7 +483,7 @@ async def test_create_local_volume_sets_up_v2_when_v3_cannot_be_used_on_a_node_w
     # Assert: v2 is set up as the flag off would, under the plain install budget, before the legacy plugin is read
     assert [volume["driver"] for volume in created] == ["vloopback:v2"]
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert commands[-1] == _bounded(loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2"), 60)
+    assert commands[-1] == _bounded(loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2", 60), 60)
     legacy_state_command = docker_service_module._loopback_plugin_state_command("vloopback")
     assert not any(legacy_state_command in command for command in commands)
     (logged,), _ = warning.call_args
@@ -521,7 +521,7 @@ async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_
     assert [volume["driver"] for volume in created] == ["vloopback:v3"]
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
     assert commands[-1] == _bounded(
-        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v3"), 150
+        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v3", 150), 150
     )
     assert all("vloopback:v3" in command for command in commands if "plugin" in command)
 
@@ -630,9 +630,10 @@ async def test_create_container_probe_failure_takes_the_per_command_path(svc, mo
         ("true", "current", "true"),
         ("true", None, "unverified"),
         ("true", "old", "unverified"),
+        ("true", "another-install", "unverified"),
         ("false", None, "false"),
     ],
-    ids=["probed", "enabled-unprobed", "enabled-probed-as-old-build", "disabled"],
+    ids=["probed", "enabled-unprobed", "enabled-probed-as-old-build", "enabled-probed-as-another-install", "disabled"],
 )
 def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marker(
     tmp_path, enabled, marker, expected
@@ -640,13 +641,17 @@ def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marke
     # an enabled v3 is handed out by the fast path only once the setup script's probe volume mounted
     # on it: a probe cut short by the validator's deadline leaves the plugin enabled without the
     # marker, and the next create must probe again instead of renting on it (reread, 27.10). The
-    # marker holds the digest of the build it was written for: another build's marker does not count
+    # marker holds the digest and the plugin ID it was written for: the marker of another build, or of
+    # a plugin since removed and installed again, does not count (review, 30.10)
     docker = tmp_path / "docker"
-    docker.write_text(f"#!/bin/sh\necho {enabled}\n")
+    docker.write_text(f'#!/bin/sh\ncase "$*" in *.Id*) echo {"a" * 64} ;; *) echo {enabled} ;; esac\n')
     docker.chmod(0o700)
     marker_path = tmp_path / "probe-ok"
+    digest = LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest
     if marker == "current":
-        marker_path.write_text(LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest)
+        marker_path.write_text(f"{digest} {'a' * 64}")
+    elif marker == "another-install":
+        marker_path.write_text(f"{digest} {'b' * 64}")
     elif marker == "old":
         marker_path.write_text("sha256:" + "0" * 64)
     command = (
@@ -681,3 +686,5 @@ async def test_plugin_setup_runs_under_the_probed_budget_only_for_the_generation
     ]
     assert len(setup_commands) == 1
     assert setup_commands[0].startswith(f"timeout -k 5 {budget} ")
+    # the script measures its probe against the same deadline
+    assert shlex.split(shlex.split(setup_commands[0])[-1])[9] == budget
