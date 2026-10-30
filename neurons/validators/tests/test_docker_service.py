@@ -34,6 +34,7 @@ from services.docker_service import (
     _is_docker_read_timeout_error,
     _is_docker_volume_in_use_error,
     _parse_volume_size_to_bytes,
+    _pod_volume_path,
     _should_encrypt_local_volume,
 )
 from services.rental_docker_sdk import (
@@ -8430,3 +8431,23 @@ def test_no_usable_loopback_plugin_error_preserves_the_disabled_classification()
     message = str(NoUsableLoopbackPluginError("verified v2 plugin remains disabled", "false"))
 
     assert "plugin vloopback" in message and "disabled" in message
+
+
+@pytest.mark.parametrize(
+    ("volumes", "existing_volume", "expected"),
+    [
+        # DAH-5426: a new volume goes where the template says, bare or host:container
+        (["/workspace"], False, "/workspace"),
+        (["/data/rental:/workspace"], False, "/workspace"),
+        (None, False, "/root"),
+        # a reboot/edit keeps the volume where it is: a bare template path was dropped before DAH-5426,
+        # so the /workspace-template pods made then sit at /root and must stay there
+        (["/workspace"], True, "/root"),
+        # the backend names an existing volume's own path as "<volume>:<path>"
+        (["volume_pod:/workspace"], True, "/workspace"),
+        (["volume_pod:/root"], True, "/root"),
+        (None, True, "/root"),
+    ],
+)
+def test_pod_volume_path(volumes, existing_volume, expected):
+    assert _pod_volume_path(volumes, existing_volume=existing_volume) == expected

@@ -1,10 +1,14 @@
 import enum
+import re
 from datetime import datetime
 from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
+
+# absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` is the encrypted volume's ciphertext mount
+_BARE_VOLUME_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
 
 
 class CustomOptions(BaseModel):
@@ -55,10 +59,18 @@ class CustomOptions(BaseModel):
             # Remove any extra flags or commands
             clean_volume = volume.strip().split()[0]
             
-            # Validate format: must be host_path:container_path
+            # DAH-5426: the backend sends a template's volume as a bare container path ("/workspace"): the
+            # container side of the pod's own named volume. Only a plain absolute path is taken, and one
+            # that came with flags is refused whole rather than stripped.
             if ':' not in clean_volume:
+                if (
+                    _BARE_VOLUME_PATH_RE.fullmatch(volume.strip())
+                    and clean_volume.split('/')[1] != 'lium-cipher'
+                    and not CustomOptions._is_dangerous_path(clean_volume)
+                ):
+                    sanitized.append(clean_volume)
                 continue
-                
+
             host_path, container_path = clean_volume.split(':', 1)
             
             # Basic validation - reject dangerous paths

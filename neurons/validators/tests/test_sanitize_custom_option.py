@@ -72,3 +72,31 @@ class TestCustomOptionsSanitization:
         assert result.environment == {"SAFE_VAR": "safe_value"}  # Only safe env var
         assert result.entrypoint == "bash"  # Only first part allowed (flags stripped)
         assert result.shm_size == "1g"  # Valid part extracted from malicious input
+
+
+def test_sanitize_volumes_keeps_a_bare_template_path():
+    # DAH-5426: the backend sends a template volume as the bare container path
+    result = CustomOptions.sanitize(CustomOptions(volumes=["/workspace", "/safe/path:/data"]))
+
+    assert result.volumes == ["/workspace", "/safe/path:/data"]
+
+
+def test_sanitize_volumes_refuses_unsafe_bare_paths():
+    unsafe = [
+        "workspace",
+        "./workspace",
+        "/workspace/../etc",
+        "/workspace/.",
+        "/",
+        "/workspace --privileged",
+        "/workspace;rm",
+        "/work$(id)",
+        "/work`id`",
+        "/etc",
+        "/proc/self",
+        "/lium-cipher",
+        "/lium-cipher/data",
+        "-v",
+    ]
+
+    assert CustomOptions.sanitize(CustomOptions(volumes=unsafe)).volumes is None
