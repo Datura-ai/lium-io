@@ -2424,6 +2424,17 @@ def _xor_wrap_passphrase(passphrase: str) -> tuple[str, str]:
     return pad.hex(), wrapped.hex()
 
 
+def _pod_volume_path(volumes: list[str] | None, *, existing_volume: bool) -> str:
+    """The path the pod's own volume is mounted at (an encrypted volume's plaintext path)."""
+    # DAH-5426: a bare template path ("/workspace") places a NEW volume. An existing one (reboot, edit,
+    # template switch) never moves: before DAH-5426 a bare path was dropped, so pods made from such a
+    # template sit at /root, and the backend names an existing volume's own path as "<volume>:<path>".
+    for volume in volumes or []:
+        if ':' in volume or not existing_volume:
+            return volume.split(':')[-1]
+    return '/root'
+
+
 def _can_remount_encrypted_volume(local_volume_path: str | None) -> bool:
     # whether recovery has everything it needs to put a gocryptfs volume back the way the customer
     # had it. Checked before the container is started, because the remount only happens after
@@ -2554,6 +2565,15 @@ def _build_volume_setup_exec_script(
             "{ mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys; } || exit 93"
         )
     return "\n".join(lines)
+
+
+def _jupyter_root_sed(root: str) -> str:
+    # DAH-5426: Jupyter serves the pod volume, wherever it is mounted; the executor's run_jupyter.sh hardcodes
+    # /root and older executors refuse an unknown option, so the validator rewrites the line as it copies it.
+    # The path lands in a sed program run on the executor host: anything but a plain path could end the expression.
+    if not _PLAINTEXT_PATH_RE.fullmatch(root):
+        raise ValueError(f"refusing Jupyter root {root!r}: not a plain absolute path")
+    return shlex.quote(f"s#--ServerApp.root_dir=/root #--ServerApp.root_dir={root} #")
 
 
 class DockerService:
@@ -6504,13 +6524,16 @@ class DockerService:
         local_volume_path: str = '/root',
         encrypted_local_volume: bool = False,
     ):
+        # refused before any command runs on the host, not halfway through the copy
+        root_sed = _jupyter_root_sed(local_volume_path if local_volume or encrypted_local_volume else "/root")
         if local_volume and not encrypted_local_volume:
             temp_container_name = f"temp_jupyter_copy_{uuid4()}"
             try:
                 command = (
                     f"/usr/bin/docker run -d --rm -v {local_volume}:/mnt "
                     f"--name {temp_container_name} --entrypoint sh "
-                    f"daturaai/compute-subnet-executor:latest -c 'cp /root/app/run_jupyter.sh /mnt/'"
+                    f"daturaai/compute-subnet-executor:latest "
+                    f"-c {shlex.quote(f'sed {root_sed} /root/app/run_jupyter.sh > /mnt/run_jupyter.sh')}"
                 )
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -6585,7 +6608,7 @@ class DockerService:
             command = (
                 f"test -s /root/app/run_jupyter.sh || "
                 f"{{ echo 'run_jupyter.sh is missing on the executor host' >&2; exit 1; }}; "
-                f"cat /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
+                f"sed {root_sed} /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'cat > {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
@@ -8785,8 +8808,7 @@ class DockerService:
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
                         prev_timestamp = now_ms()
 
-                # Get the container path from the first volume
-                local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
+                local_volume_path = _pod_volume_path(custom_options.volumes, existing_volume=bool(local_volume))
                 # DAH-2265: default-image / cached-template rentals set `ships_sshd`.
                 # Those images run their own start.sh, which starts sshd unconditionally
                 # and launches Jupyter itself. Rather than have the validator bootstrap

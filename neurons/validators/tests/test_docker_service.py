@@ -34,6 +34,7 @@ from services.docker_service import (
     _is_docker_read_timeout_error,
     _is_docker_volume_in_use_error,
     _parse_volume_size_to_bytes,
+    _pod_volume_path,
     _should_encrypt_local_volume,
 )
 from services.rental_docker_sdk import (
@@ -7026,7 +7027,7 @@ async def test_run_jupyter_with_encrypted_volume_installs_into_plaintext_mount(
     install = [call for call in calls if "cat > /root/run_jupyter.sh" in call.kwargs["command"]]
     assert install, commands
     install_command = install[0].kwargs["command"]
-    assert "cat /root/app/run_jupyter.sh |" in install_command
+    assert "/root/app/run_jupyter.sh | /usr/bin/docker exec" in install_command
     assert "docker exec -i -u 0 pod_test" in install_command
     # nothing is fed from the executor process: the host shell owns the pipe
     assert install[0].kwargs.get("stdin_data") is None
@@ -8484,3 +8485,31 @@ def test_no_usable_loopback_plugin_error_preserves_the_disabled_classification()
     message = str(NoUsableLoopbackPluginError("verified v2 plugin remains disabled", "false"))
 
     assert "plugin vloopback" in message and "disabled" in message
+
+
+@pytest.mark.parametrize(
+    ("volumes", "existing_volume", "expected"),
+    [
+        # DAH-5426: a new volume goes where the template says, bare or host:container
+        (["/workspace"], False, "/workspace"),
+        (["/data/rental:/workspace"], False, "/workspace"),
+        (None, False, "/root"),
+        # a reboot/edit keeps the volume where it is: a bare template path was dropped before DAH-5426,
+        # so the /workspace-template pods made then sit at /root and must stay there
+        (["/workspace"], True, "/root"),
+        # the backend names an existing volume's own path as "<volume>:<path>"
+        (["volume_pod:/workspace"], True, "/workspace"),
+        (["volume_pod:/root"], True, "/root"),
+        (None, True, "/root"),
+    ],
+)
+def test_pod_volume_path(volumes, existing_volume, expected):
+    assert _pod_volume_path(volumes, existing_volume=existing_volume) == expected
+
+
+@pytest.mark.parametrize("template_volume", ["/workspace", "/workspace/", " /workspace/ "])
+@pytest.mark.parametrize(("existing_volume", "expected"), [(False, "/workspace"), (True, "/root")])
+def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_volume, existing_volume, expected):
+    volumes = CustomOptions.sanitize(CustomOptions(volumes=[template_volume])).volumes
+
+    assert _pod_volume_path(volumes, existing_volume=existing_volume) == expected
