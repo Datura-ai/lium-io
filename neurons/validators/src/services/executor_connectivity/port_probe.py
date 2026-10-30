@@ -36,8 +36,10 @@ class PortProbe:
             log_ctx=log_ctx,
         )
         if batch.external_blocked:
-            # the other tiers probe from the validator too, so they would pass the same host
-            return PortProbeResult((), tuple(ports), "external_blocked")
+            # the other tiers probe from the validator too, so they would pass the same host. The validator's
+            # ports are kept: PortConnectivityCheck decides whether this reading fails the node.
+            return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
+        external = "passed" if batch.external_passed else None
         successful, failed = batch.successful, batch.failed
         tier = "batch"
 
@@ -68,4 +70,4 @@ class PortProbe:
             )
             tier = "fallback"
 
-        return PortProbeResult(tuple(successful), tuple(failed), tier)
+        return PortProbeResult(tuple(successful), tuple(failed), tier, external)

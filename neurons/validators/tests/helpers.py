@@ -237,6 +237,11 @@ class FakeRedis:
         self._touch()
         self.ttl.pop(key, None)
 
+    async def has_external_probe_pass(self, miner_hotkey: str, executor_id: str) -> bool:
+        from neurons.validators.src.services.redis_service import EXTERNAL_PROBE_PASS_PREFIX
+
+        return await self.get(f"{EXTERNAL_PROBE_PASS_PREFIX}:{miner_hotkey}:{executor_id}") is not None
+
 
 def default_executor() -> ExecutorSSHInfo:
     return ExecutorSSHInfo(

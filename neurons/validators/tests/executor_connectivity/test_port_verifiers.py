@@ -74,7 +74,10 @@ async def test_batch_does_not_reprobe_when_most_ports_pass(mocker):
 
 
 @pytest.mark.asyncio
-async def test_batch_late_bind_with_outside_prober_refused_is_not_externally_blocked(mocker):
+async def test_batch_late_bind_with_enforced_outside_prober_is_not_externally_blocked(mocker):
+    from core.config import settings
+
+    mocker.patch.object(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
     calls = []
 

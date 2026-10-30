@@ -35,7 +35,7 @@ from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.service import ExecutorConnectivityService
 
-from neurons.validators.src.services.task.checks.port_connectivity import external_pass_key
+from neurons.validators.src.services.redis_service import EXTERNAL_PROBE_PASS_PREFIX
 from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_rented_machine_check import DummyBackendClient, DummySSHClient
 
@@ -209,8 +209,8 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     count_result, ctx = await apply(ctx, PortCountCheck())
 
     assert connectivity_result.passed is True
-    # DAH-4537: a cycle that passed with free ports leaves the record a fully filled cycle reads
-    ctx.services.redis.set.assert_any_await(external_pass_key("miner-hotkey", "executor-123"), "1")
+    # DAH-4537: no outside prober ran, so the cycle is no outside pass
+    ctx.services.redis.record_external_probe_pass.assert_not_awaited()
     # one sample of the lowest 300 ports out of 25,536 declared; a partial batch is final
     assert len(batch.calls[0]) == BATCH_PORT_VERIFICATION_SIZE
     assert batch.calls[0][0] == PortPair(40000, 40000)
@@ -606,34 +606,46 @@ async def test_an_externally_unreachable_idle_node_cannot_pass_the_floor_on_fill
     assert result.updates["state"].specs["verified_ports"] == []
 
 
-def _fully_filled(services, rented=False):
-    rented_data = RentedExecutorsResponse(
-        executors=rented_with_one_pod().executors if rented else {},
-        filler_ports_by_executor={"executor-123": [2001, 2002, 2003]},
-    )
-    state = build_state(verified_port_count=0, probed_port_count=0, specs={"verified_ports": []}, rented_data=rented_data)
-    return state, services
+def _fully_filled():
+    rented_data = RentedExecutorsResponse(executors={}, filler_ports_by_executor={"executor-123": [2001, 2002, 2003]})
+    return build_state(verified_port_count=0, probed_port_count=0, specs={"verified_ports": []}, rented_data=rented_data)
+
+
+@pytest.fixture
+def enforced(monkeypatch):
+    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
+    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_URL", "https://prober.example/")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("record, passes", [(False, False), (True, True)])
-async def test_a_fully_filled_idle_node_counts_its_filler_only_after_an_outside_pass(context_factory, record, passes):
-    """DAH-4537 review 5701429544: with fillers on every port nothing is probed, so the filler counts
-    only if the last cycle with a free port passed the outside probe; a firewalled node never does."""
+async def test_a_fully_filled_idle_node_counts_its_filler_only_after_an_outside_pass(
+    context_factory, enforced, record, passes
+):
+    """With fillers on every port nothing is probed, so the filler counts only if the node's last
+    outside reading passed; a firewalled node never has one."""
     redis = FakeRedis()
     if record:
-        redis.store[external_pass_key("miner-hotkey", "executor-123")] = "1"
-    state, services = _fully_filled(build_services(redis=redis))
-    result = await PortCountCheck().run(context_factory(state=state, services=services))
+        redis.store[f"{EXTERNAL_PROBE_PASS_PREFIX}:miner-hotkey:executor-123"] = "1"
+    services = build_services(redis=redis)
+    result = await PortCountCheck().run(context_factory(state=_fully_filled(), services=services))
 
     assert result.passed is passes
     assert result.updates["port_count"] == (3 if passes else 0)
 
 
 @pytest.mark.asyncio
-async def test_a_redis_outage_keeps_the_fully_filled_count(context_factory):
-    state, services = _fully_filled(build_services(redis=FakeRedis(failing=True)))
-    result = await PortCountCheck().run(context_factory(state=state, services=services))
+async def test_the_fully_filled_rule_waits_for_the_enforce_flag(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", False)
+    services = build_services(redis=FakeRedis())
+    result = await PortCountCheck().run(context_factory(state=_fully_filled(), services=services))
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_keeps_the_fully_filled_count(context_factory, enforced):
+    services = build_services(redis=FakeRedis(failing=True))
+    result = await PortCountCheck().run(context_factory(state=_fully_filled(), services=services))
     assert result.passed is True
 
 
@@ -644,16 +656,68 @@ class OutsideBlockedBatch:
         return BatchResult(list(ports), [], external_blocked=True)
 
 
-@pytest.mark.asyncio
-async def test_an_outside_failure_removes_the_pass_record(context_factory):
+class OutsidePassedBatch:
+    async def verify(self, ports, *, ssh_client, host, log_ctx=None):
+        return BatchResult(list(ports), [], external_passed=True)
+
+
+def _outside_context(context_factory, batch, *, first_miss=True):
     ctx = run_context(
-        context_factory,
-        connectivity(OutsideBlockedBatch(), PublishedPorts(), PublishedPorts()),
-        backend=RentalsBackendClient(None),
+        context_factory, connectivity(batch, PublishedPorts(), PublishedPorts()), backend=RentalsBackendClient(None)
     )
+    ctx.services.redis.record_external_probe_miss.return_value = first_miss
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_a_first_outside_failure_is_not_a_verdict(context_factory, enforced):
+    result, ctx = await apply(_outside_context(context_factory, OutsideBlockedBatch()), PortConnectivityCheck())
+
+    assert result.passed is True
+    assert ctx.state.externally_unreachable is False
+    assert ctx.state.verified_port_count > 0
+    ctx.services.redis.clear_external_probe_pass.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_second_outside_failure_in_a_row_fails_the_node_and_removes_the_pass(context_factory, enforced):
+    ctx = _outside_context(context_factory, OutsideBlockedBatch(), first_miss=False)
 
     result, ctx = await apply(ctx, PortConnectivityCheck())
 
+    assert result.passed is False
     assert ctx.state.externally_unreachable is True
-    ctx.services.redis.delete.assert_awaited_once_with(external_pass_key("miner-hotkey", "executor-123"))
-    ctx.services.redis.set.assert_not_awaited()
+    assert ctx.state.verified_port_count == 0
+    ctx.services.redis.clear_external_probe_pass.assert_awaited_once_with("miner-hotkey", "executor-123")
+
+
+@pytest.mark.asyncio
+async def test_a_second_outside_failure_is_only_logged_until_enforced(context_factory, monkeypatch, caplog):
+    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", False)
+    ctx = _outside_context(context_factory, OutsideBlockedBatch(), first_miss=False)
+
+    with caplog.at_level("WARNING"):
+        result, ctx = await apply(ctx, PortConnectivityCheck())
+
+    assert result.passed is True
+    assert ctx.state.externally_unreachable is False
+    assert "failed twice in a row (log-only)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_outside_pass_is_recorded(context_factory, enforced):
+    _, ctx = await apply(_outside_context(context_factory, OutsidePassedBatch()), PortConnectivityCheck())
+
+    ctx.services.redis.record_external_probe_pass.assert_awaited_once_with("miner-hotkey", "executor-123")
+    ctx.services.redis.record_external_probe_miss.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_never_fails_a_node_on_the_outside_probe(context_factory, enforced):
+    ctx = _outside_context(context_factory, OutsideBlockedBatch())
+    ctx.services.redis.record_external_probe_miss.side_effect = RuntimeError("redis down")
+
+    result, ctx = await apply(ctx, PortConnectivityCheck())
+
+    assert result.passed is True
+    assert ctx.state.externally_unreachable is False

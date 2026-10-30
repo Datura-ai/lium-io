@@ -160,7 +160,7 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-        return BatchResult((reached or []) + successful, failed, external_blocked)
+        return BatchResult((reached or []) + successful, failed, external_blocked, bool(reached))
 
 
 class FallbackVerifier:

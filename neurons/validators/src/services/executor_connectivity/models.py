@@ -16,6 +16,8 @@ class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
     tier: str = "batch"
+    # DAH-4537: the outside prober's reading: "passed", "blocked", or None when it did not run
+    external: str | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,8 @@ class BatchResult:
     failed: list[PortPair]
     # DAH-4537: the validator reached the sampled ports but the outside prober reached none of them
     external_blocked: bool = False
+    # the outside prober reached at least one sampled port
+    external_passed: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,8 @@ class PortVerificationResult:
     # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending.
     port_ranges: tuple[PortRangeResult, ...] = ()
     probe_tier: str | None = None
+    # DAH-4537: PortProbeResult.external; PortConnectivityCheck turns a confirmed "blocked" into externally_unreachable
+    external_probe: str | None = None
     # len(get_all_ports(...)) for the executor's declared range or mappings; None when they could not be parsed
     declared_port_count: int | None = None
     # ticket-0494: the DinD probe's own sysbox reading, before any fallback. True/False only when the
