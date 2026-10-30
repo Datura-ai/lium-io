@@ -119,6 +119,13 @@ RENTAL_PRICES_PER_HOUR.update({
     "NVIDIA GeForce GTX 1060": 0.09,
     "NVIDIA Tesla M40": 0.08,
 })
+# A100 40GB (DAH-5088, Fish 30 Oct 2026: "give idle rates once you figure out what they are worth"): no Lium rentals
+# yet, so the anchor is the 30 Oct vast.ai median (listed and rented offers) times 0.668, the median Lium/vast price
+# ratio of the A100 80GB PCIe and SXM4, RTX A6000, L40S and RTX 4090, rounded to the cent. Not an A100 80GB rate.
+RENTAL_PRICES_PER_HOUR.update({
+    "NVIDIA A100-PCIE-40GB": 0.37,  # vast 0.553 x 0.668
+    "NVIDIA A100-SXM4-40GB": 0.48,  # vast 0.715 x 0.668 = 0.477
+})
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -158,6 +165,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "RTX 3090": {1: 10, 8: 64},
     "H800": {1: 10, 8: 64},
     "A800": {1: 10, 8: 64},
+    "A100 40GB": {1: 10, 8: 64},  # own family: no demand data yet, the default caps
     "CMP 170HX": {1: 10, 8: 64},
     "RTX 5090": {1: 10, 8: 64},
     "RTX 5090 D": {1: 10, 8: 64},
@@ -305,6 +313,8 @@ BASE_GPU_MAP = {
     "NVIDIA RTX 2000 Ada Generation": "RTX 2000 Ada Generation",
     "NVIDIA A100 80GB PCIe": "A100",
     "NVIDIA A100-SXM4-80GB": "A100",
+    "NVIDIA A100-PCIE-40GB": "A100 40GB",
+    "NVIDIA A100-SXM4-40GB": "A100 40GB",
     "NVIDIA A800 80GB PCIe": "A800",
     "NVIDIA CMP 170HX": "CMP 170HX",
     "NVIDIA A10 Tensor Core GPU": "A10",

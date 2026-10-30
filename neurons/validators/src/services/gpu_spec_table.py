@@ -117,6 +117,8 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Ampere data-center
     "NVIDIA A100 80GB PCIe": [81920],  # 80 GB; observed: 81920
     "NVIDIA A100-SXM4-80GB": [81920],  # 80 GB; observed: 81920
+    "NVIDIA A100-PCIE-40GB": [40960],  # 40 GB
+    "NVIDIA A100-SXM4-40GB": [40960],  # 40 GB; observed: 40960
     "NVIDIA A800 80GB PCIe": [81920],  # 80 GB
     "NVIDIA A10 Tensor Core GPU": [24576],  # 24 GB
     # Only 8 GB is a factory SKU; 40/64 GB come from the community driver unlock.
