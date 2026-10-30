@@ -46,6 +46,13 @@ STORAGE_HELPERS = {
     "vloopback_mount_test",
     "check_vloopback_volume_ability",
     "vloopback_check_payload",
+    "docker_root_loop_without_dio",
+    "MountLine",
+    "covering_mount",
+    "block_device_holding",
+    "kernel_name_of_device_node",
+    "whole_disk_of",
+    "read_sysfs_text",
 }
 
 TICKET_0331_RUNC_ERROR = (
@@ -178,6 +185,13 @@ def _scrape(host: FakeDockerHost, tmp_path: Path) -> dict[str, Any]:
             "os": os,
             "re": re,
             "sys": sys,
+            # the host mount table and sysfs, empty unless a test writes them
+            "HOST_MOUNTS_PATH": str(tmp_path / "mounts"),
+            "HOST_ROOT_PREFIX": str(tmp_path / "root"),
+            "SYS_CLASS_BLOCK_PATH": str(tmp_path / "sys"),
+            "SYS_DEV_BLOCK_PATH": str(tmp_path / "sys-dev"),
+            "ST_MODE_TYPE_MASK": 0o170000,
+            "ST_MODE_BLOCK_DEVICE": 0o060000,
         },
     )
 
@@ -238,6 +252,42 @@ def test_a_host_without_sysbox_is_tested_under_the_default_runtime_and_passes(
     assert payload["vc_verdict"] == "pass"
     assert payload["vc_runtime"] == "default"
     assert not [arg for arg in host.call("run") if arg.startswith("--runtime")]
+
+
+@pytest.mark.parametrize("dio, reason_code", [("0", "DOCKER_ROOT_LOOP_NO_DIO"), ("1", "")])
+def test_a_docker_root_on_a_loop_device_without_direct_io_is_reported(
+    tmp_path: Path, dio: str, reason_code: str
+) -> None:
+    # Arrange: docker's data root is a filesystem on /dev/loop3
+    (tmp_path / "mounts").write_text("/dev/loop3 /var/lib/docker xfs rw,relatime 0 0\n")
+    (tmp_path / "sys" / "loop3" / "loop").mkdir(parents=True)
+    (tmp_path / "sys" / "loop3" / "loop" / "dio").write_text(f"{dio}\n")
+
+    # Act
+    payload = _check(FakeDockerHost(), tmp_path)
+
+    # Assert
+    assert payload["vc_verdict"] == "pass"
+    assert payload["vc_reason_code"] == reason_code
+    assert ("loop3" in payload["vc_detail"]) == bool(reason_code)
+
+
+def test_a_non_utf8_mount_entry_keeps_the_mount_test_pass(tmp_path: Path) -> None:
+    # Arrange: an unrelated mount point with a raw latin-1 byte, docker's data root on /dev/loop3 without dio
+    (tmp_path / "mounts").write_bytes(
+        b"/dev/sdb1 /mnt/caf\xe9 ext4 rw 0 0\n/dev/loop3 /var/lib/docker xfs rw,relatime 0 0\n"
+    )
+    (tmp_path / "sys" / "loop3" / "loop").mkdir(parents=True)
+    (tmp_path / "sys" / "loop3" / "loop" / "dio").write_text("0\n")
+    host = FakeDockerHost()
+
+    # Act
+    payload = _check(host, tmp_path)
+
+    # Assert
+    assert payload["vc_verdict"] == "pass"
+    assert payload["vc_reason_code"] == "DOCKER_ROOT_LOOP_NO_DIO"
+    assert host.volumes == set() and host.containers == set()
 
 
 @pytest.mark.parametrize(
