@@ -634,7 +634,7 @@ async def restore_tracked_gpu_power_limits(
 
     Best-effort by default; returns the number of records restored and cleared.
     ``require_complete`` raises on unreadable records or any restore not confirmed and cleared, and
-    on a GPU without a record that the host does not show at 90 % of its default limit or more.
+    on a GPU without a record that the host does not show at 80 % of its default limit or more.
     """
     read_result = await read_gpu_power_restore_records(
         redis, gpu_uuids, log_extra, require_complete=require_complete
@@ -656,7 +656,8 @@ async def restore_tracked_gpu_power_limits(
         for gpu_uuid in read_result.missing:
             state = state_by_uuid.get(gpu_uuid)
             if state is None or state.default_watts is None or (
-                state.current_watts < RENTED_MIN_POWER_LIMIT_RATIO * state.default_watts
+                # a host may set 80 %; the rental-start record, not this check, then holds the rental there
+                state.current_watts < MIN_POWER_LIMIT_RATIO * state.default_watts
             ):
                 raise GpuPowerRestoreStateError(f"GPU power restore record is missing and {gpu_uuid} is below its floor")
     if not read_result.records:

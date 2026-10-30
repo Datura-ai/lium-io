@@ -7888,6 +7888,7 @@ class DockerService:
         default_extra: dict,
         concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
         record_rental_start: bool = False,
+        executor_info: ExecutorSSHInfo | None = None,
     ) -> None:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
@@ -7924,10 +7925,31 @@ class DockerService:
             # the create's last power read is the limit the rental starts on (DAH-5302)
             redis=self.redis_service if record_rental_start else None,
             pod_id=payload.pod_id if record_rental_start else None,
-            pod_on_host=await DockerService._pod_container_on_host(ssh_client, payload.pod_id, host_probe)
+            pod_on_host=await DockerService._pod_existed_before_create(
+                ssh_client, self.redis_service, executor_info, payload.pod_id, host_probe
+            )
             if record_rental_start
             else False,
         )
+
+    @staticmethod
+    async def _pod_existed_before_create(
+        ssh_client: asyncssh.SSHClientConnection,
+        redis_service: RedisService,
+        executor_info: ExecutorSSHInfo | None,
+        pod_id: str,
+        host_probe: PrerunHostProbe | None,
+    ) -> bool:
+        """A reboot or edit of a running rental, so a rental from before the records keeps 90 %. The
+        backend's rented-machine cache answers first: the host can hide its containers, not that (F-12)."""
+        if executor_info is not None:
+            try:
+                rented = await redis_service.get_rented_machine(executor_info)
+            except Exception:
+                return True  # unknown: 90 % only ever holds the provider to more
+            if any(c.get("pod_id") == pod_id for c in (rented or {}).get("containers", [])):
+                return True
+        return await DockerService._pod_container_on_host(ssh_client, pod_id, host_probe)
 
     @staticmethod
     async def _pod_container_on_host(
@@ -9158,6 +9180,7 @@ class DockerService:
                                 host_probe,
                                 default_extra,
                                 record_rental_start=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
+                                executor_info=executor_info,
                             )
                         except GpuPowerRestoreStateError:
                             current_step = "gpu_power_restore_state"  # our Redis, not the host's fault

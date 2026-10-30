@@ -124,12 +124,12 @@ async def test_strict_pod_restore_accepts_a_record_already_restored():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("current_watts", "accepted"), [(800, False), (899, False), (900, True)])
-async def test_strict_pod_restore_without_record_holds_the_rented_floor(current_watts, accepted):
+@pytest.mark.parametrize(("current_watts", "accepted"), [(700, False), (799, False), (800, True), (900, True)])
+async def test_strict_pod_restore_without_record_holds_the_floor(current_watts, accepted):
     # Arrange: GPU-a's record is gone; only its live limit can show it was restored.
     redis = FakeRedis({_pod_index_key(POD_ID): '["GPU-a"]'})
     ssh = fake_ssh(FakeRun(stdout=f"GPU-a, {current_watts}, 1000, 100, 1000\n"))
-    # Act / Assert: below the rented-start floor fails the create.
+    # Act / Assert: below the 80 % floor fails the create; a host's own 80-90 % setting does not.
     if accepted:
         assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True) == 0
     else:
@@ -332,3 +332,32 @@ async def test_create_without_a_probe_asks_docker_whether_the_pod_is_on_host(mon
     assert raise_mock.await_args.kwargs["pod_on_host"] is expected
     assert "docker container inspect pod_pod-1" in ssh.run.await_args.args[0]
     assert "docker container inspect pod_pod-1__prev" in ssh.run.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rented", "expected"),
+    [
+        ({"containers": [{"name": "pod_pod-1", "pod_id": "pod-1"}]}, True),
+        ({"containers": [{"name": "pod_pod-2", "pod_id": "pod-2"}]}, False),
+        (None, False),
+        (RuntimeError("redis down"), True),
+    ],
+)
+async def test_the_backends_rented_list_marks_a_reboot_the_host_hides(monkeypatch, rented, expected) -> None:
+    # F-12 (lio#1924): the host removed both pod_pod-1 and pod_pod-1__prev; the backend's list still names the pod.
+    import services.docker_service as ds
+
+    raise_mock = AsyncMock(return_value=0)
+    monkeypatch.setattr(ds, "restore_tracked_gpu_power_limits", AsyncMock())
+    monkeypatch.setattr(ds, "raise_low_power_limits_to_default", raise_mock)
+    redis_service = SimpleNamespace(
+        get_rented_machine=AsyncMock(side_effect=rented) if isinstance(rented, Exception) else AsyncMock(return_value=rented)
+    )
+    payload = SimpleNamespace(gpu_uuids=["GPU-0"], executor_id="ex-1", pod_id="pod-1")
+    probe = SimpleNamespace(container_names=())
+    await ds.DockerService._restore_gpu_power_for_uncapped_pod(
+        SimpleNamespace(redis_service=redis_service), AsyncMock(), payload, probe, {},
+        record_rental_start=True, executor_info=object(),
+    )
+    assert raise_mock.await_args.kwargs["pod_on_host"] is expected
