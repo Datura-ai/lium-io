@@ -4108,6 +4108,21 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
             "Docker login to the image registry failed",
         ),
         (
+            "Docker SDK login for auth:5000 failed: 401 Client Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://auth:5000/v2/": unauthorized: incorrect username or password")',
+            "Docker login refused by the image registry: check the template's registry credentials",
+        ),
+        (
+            'Docker SDK login for timeout:5000 failed: 500 Server Error: ("Get "https://timeout:5000/v2/": '
+            'net/http: TLS handshake timeout")',
+            "Docker login timed out while contacting the image registry",
+        ),
+        (
+            'Docker SDK login for registry.example failed: 500 Server Error: ("Get "https://registry.example/v2/": '
+            'x509: certificate is valid for unauthorized.example, not registry.example")',
+            "Docker login to the image registry failed",
+        ),
+        (
             "Docker SDK login for unauthorized.example failed: 401 Client Error: unauthorized: authentication required",
             "Docker login refused by the image registry: check the template's registry credentials",
         ),

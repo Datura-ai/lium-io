@@ -1255,6 +1255,8 @@ async def _raise_unless_running_before_created(
         )
 
 
+# Every marker holds a space or a ": ", which no hostname, port or URL can, so the registry's name in the error
+# (SDK label, DNS lookup, x509 certificate names) never matches; the text is matched as it is.
 # The daemon's own errors reaching the registry (Go net/http), never a validator->daemon read timeout
 _LOGIN_REGISTRY_TIMEOUT_MARKERS = (
     "context deadline exceeded",
@@ -1263,7 +1265,12 @@ _LOGIN_REGISTRY_TIMEOUT_MARKERS = (
     "timeout awaiting response headers",
 )
 # Only an explicit refusal by the registry is a credential problem; a 5xx or anything else is not
-_LOGIN_REFUSED_MARKERS = ("unauthorized", "incorrect username or password", "authentication required", "401 client error")
+_LOGIN_REFUSED_MARKERS = (
+    "401 client error",
+    "unauthorized: ",
+    "incorrect username or password",
+    "authentication required",
+)
 
 
 class DockerLoginFailed(RentalDockerOperationError):
@@ -1271,17 +1278,9 @@ class DockerLoginFailed(RentalDockerOperationError):
     the backend's renter-facing error, so it names the reason only and no registry or host text."""
 
     def __init__(self, text: str, login_error: str):
-        # read the response only: rental_docker_sdk prefixes "Docker SDK login for <registry> failed: ", and URLs
-        # carry the registry host too, so a registry named "unauthorized.example" proves nothing
-        head, sep, response = login_error.partition(" failed: ")
-        if not sep:
-            response = login_error
-        registry = head.partition(" for ")[2].strip().lower() if sep else ""
-        lowered = re.sub(r"\S+://\S+", " ", response).lower()
-        # DNS and x509 errors name the bare host, without the registry's port ("lookup <host>: no such host")
-        for name in {registry, registry.rsplit(":", 1)[0]} - {""}:
-            lowered = lowered.replace(name, " ")
-        if any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
+        lowered = login_error.lower()
+        # a refusal the SDK reports as the bare word ends the text: "... failed: unauthorized"
+        if lowered.endswith(": unauthorized") or any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
             self.renter_sentence = (
                 "Docker login refused by the image registry: check the template's registry credentials"
             )
