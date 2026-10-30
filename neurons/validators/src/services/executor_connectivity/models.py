@@ -60,6 +60,8 @@ class DindProbeResult:
     # container's own logs before removal. DAH-3634: also when `docker run` itself was refused by
     # the NVIDIA container hook (docker's stderr). None when the probe passed or the cause is unknown.
     error: DindLogCause | None = None
+    # the in-container Sysbox test timed out: sysbox_runtime is False, but nothing was measured
+    sysbox_timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,7 +105,8 @@ class PortVerificationResult:
     declared_port_count: int | None = None
     # ticket-0494: the DinD probe's own sysbox reading, before any fallback. True/False only when the
     # probe reached its container with sysbox-runc requested; None when it never reached the container
-    # or did not test sysbox. PortConnectivityCheck remembers a True and forgets on a False.
+    # or did not test sysbox, or its in-container test timed out. PortConnectivityCheck remembers a True and
+    # forgets on a False.
     sysbox_measured: bool | None = None
 
 
