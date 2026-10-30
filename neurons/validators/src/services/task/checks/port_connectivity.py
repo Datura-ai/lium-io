@@ -27,6 +27,10 @@ from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
+# machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
+# out: a busy host, not a verdict on Sysbox
+SYSBOX_TEST_TIMED_OUT = "Test command timed out."
+
 VERIFIED_PORTS_MEMORY_TTL_SECONDS = 24 * 3600
 DISK_PRESSURE_DEFERRALS_TTL_SECONDS = 24 * 3600
 # the two snapshots, the syncfs poll cap and a margin for the sysfs walk
@@ -124,12 +128,18 @@ class PortConnectivityCheck:
         if gate.deferred:
             return await self._deferred(ctx, gate, extra, busy_ports=set(rented_ports) | set(filler_ports))
 
+        # 26 Oct: an unrented node's scrape sysbox test timed out under load, so the probe ran without sysbox-runc,
+        # failed, and the node scored 0 with Sysbox working. The timeout is provider-reported, so it is neither a
+        # pass nor a miss: the validator's own probe measures Sysbox with sysbox-runc instead.
+        scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+        probe_sysbox = ctx.state.sysbox_runtime or (rented_executor is None and scrape_error == SYSBOX_TEST_TIMED_OUT)
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
             ctx.miner_hotkey,
             ctx.executor,
-            ctx.state.sysbox_runtime,
+            probe_sysbox,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
             filler_ports=filler_ports,
@@ -141,6 +151,10 @@ class PortConnectivityCheck:
                 "executor_ip": ctx.executor.address,
             },
         )
+        if probe_sysbox and not ctx.state.sysbox_runtime:
+            # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
+            # own in-container measurement may say Sysbox works
+            result = replace(result, sysbox_runtime=result.sysbox_measured is True)
         # this probe's verdict is on record only once every write below succeeded; a cancellation thrown into
         # one of them leaves the memory in Redis older than the probe and the readiness gone
         readiness_key = (ctx.miner_hotkey, ctx.executor.uuid)

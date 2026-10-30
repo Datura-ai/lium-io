@@ -237,6 +237,58 @@ Causes the installer names:
 
 Validator releases after this change also run the test in the machine scrape, on nodes whose Docker accepts `--storage-opt` (a node without it is rented without a disk limit and is not tested); a validator on an earlier release does not run it. The scrape checks the plugin, `Mountpoint`, and a volume mounted into a container under the runtime this node's rentals get (Sysbox when the scrape's Sysbox GPU test passes, Docker's default runtime otherwise). They only read the plugin, never install or change it, and remove their test container and volume (`lium_storage_check_*`) when the test ends.
 
+### Docker data-root on a loop image
+
+A data-root on a loop-mounted image file (`/dev/loopN` in `df /var/lib/docker`) must have direct I/O on. Buffered, every write in a rented pod is cached twice; one pod writing heavily can stall Docker for minutes and the node is delisted. The installer reports it as a `FIX`. Better: put the data-root on a real disk ([Docker Storage Setup](https://docs.lium.io/providers/nodes/docker-storage)).
+
+**Switch it on now** (no rental running; on a busy device the command waits until the writes stop):
+
+```shell
+sudo losetup --direct-io=on /dev/loopN
+losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
+```
+
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. When direct I/O cannot be set (`losetup` fails with `Invalid argument`, e.g. an image whose sector size is smaller than its disk's), Docker still starts so the node stays up, the journal shows a warning and the installer's `--check` reports `FIX`; move the data-root to a real disk then. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), or a real disk replaces the image at the same mount point, the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
+
+1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
+
+   ```
+   /data/img.raw /data/dockerimg xfs loop,pquota,nofail,x-systemd.requires=/data 0 0
+   ```
+
+2. The script, the unit, and Docker requiring it:
+
+   ```shell
+   sudo tee /usr/local/sbin/loop-dio-docker >/dev/null <<'EOF'
+   #!/bin/sh
+   MNT=/data/dockerimg
+   root=$(tr -d '\n\r' 2>/dev/null </etc/docker/daemon.json | sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+   root=${root:-/var/lib/docker}   # no "data-root" key: Docker's default
+   case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
+   src=$(findmnt -n -o SOURCE --mountpoint "$MNT") || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
+   case "$src" in /dev/loop*) losetup --direct-io=on "$src" || echo "<4>direct I/O failed on $src, Docker starts buffered: move the data-root to a real disk" ;; esac   # a real disk needs nothing
+   EOF
+   sudo chmod 755 /usr/local/sbin/loop-dio-docker
+   sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
+   [Unit]
+   Description=Direct I/O on the Docker data-root loop device
+   Wants=data-dockerimg.mount
+   After=data-dockerimg.mount
+   Before=docker.service containerd.service
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/usr/local/sbin/loop-dio-docker
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   sudo mkdir -p /etc/systemd/system/docker.service.d
+   printf '[Unit]\nRequires=loop-dio-docker.service\nAfter=loop-dio-docker.service\n' | sudo tee /etc/systemd/system/docker.service.d/loop-dio.conf >/dev/null
+   sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
+   ```
+
+   `data-dockerimg.mount` is the mount unit systemd makes from the fstab line; for another mount point, `systemd-escape -p --suffix=mount <dir>` prints its name.
+
 ## The executor image
 
 `Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: it turns sshd's `PerSourcePenalties` off through `/etc/ssh/sshd_config.d/lium.conf` when the base's OpenSSH knows the directive (9.8 and later), and fails the build when `sshd -T` rejects the rendered configuration. The same drop-in sets `LogLevel VERBOSE`, so every login records the key fingerprint that opened it. The container runs no syslog: `run.sh` starts `sshd_log_receiver.py` as `/dev/log`, which keeps the `Accepted` lines with sshd's time and pid in `/var/log/sshd-auth.log` (renamed to `.1` past 50 MB). Each cycle the validator logs the lines it has not read yet as `Executor sshd logins` and moves its cursor in `/var/log/sshd-auth.cursor` only after that.
