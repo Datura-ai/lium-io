@@ -357,7 +357,8 @@ class MinerService:
         # wave's list of the node's miner, or the wave could verify and publish the node again
         # under the same id once the lane let go of it.
         self.miners_awaiting_wave_list: dict[str, str] = {}
-        # per miner hotkey, the rented executor uuids it left out of its previous answer (RENTED_NOT_LISTED_ONE_CYCLE_GRACE).
+        # per miner hotkey, the rented executor uuids it left out of its previous answer (one-cycle grace: a
+        # single miss is mostly a key upload that missed the miner's 10 s window, so the row starts at the second).
         # shortcut: in memory, so a restart costs one extra cycle before a real outage is reported.
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
         # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
@@ -865,14 +866,12 @@ class MinerService:
         miner_returned_executors: list[ExecutorSSHInfo],
         executor_id: str | None,
     ) -> Iterator[tuple[str, RentedExecutor]]:
-        """The missing rented executors that get a row: with RENTED_NOT_LISTED_ONE_CYCLE_GRACE only those the
-        miner also left out of its previous answer."""
+        """The missing rented executors that get a row: only those the miner also left out of its previous
+        answer (one-cycle grace)."""
         for executor_uuid, rented_executor in self._missing_rented(
             payload, rented_data, miner_returned_executors, executor_id
         ):
-            if settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE and executor_uuid not in self.rented_missed_last_cycle.get(
-                payload.miner_hotkey, ()
-            ):
+            if executor_uuid not in self.rented_missed_last_cycle.get(payload.miner_hotkey, ()):
                 continue
             yield executor_uuid, rented_executor
 
@@ -926,7 +925,7 @@ class MinerService:
                 payload, rented_data, miner_returned_executors, executor_id
             )
         ]
-        if settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE and rented_data and executor_id is None:
+        if rented_data and executor_id is None:
             # this miner's misses replace its previous ones: a node it returned, or whose rental ended, drops out
             self.rented_missed_last_cycle[payload.miner_hotkey] = {
                 executor_uuid
@@ -2239,8 +2238,8 @@ class MinerService:
                 _m("Sent SSH key to miner via REST API.", extra=get_extra_info(default_extra)),
             )
 
-            # A restarting miner refuses connections for about a minute. Nothing has reached it
-            # yet, so a create waits that out instead of failing the renter's pod.
+            # A restarting miner refuses connections for about a minute. A create waits that out instead of
+            # failing the renter's pod; a resubmitted key is harmless, the removal drops every copy.
             deadline = time.monotonic() + MINER_RESTART_WAIT_S
             while True:
                 # The miner accepts a signed timestamp for 10 s only, so each attempt signs anew.
@@ -2261,8 +2260,9 @@ class MinerService:
                     if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
                         break
                 except aiohttp.ClientConnectorError:
-                    is_create = isinstance(payload, ContainerCreateRequest)
-                    if not is_create or time.monotonic() >= deadline:
+                    # refused: it never reached the miner, so its rental hook did not run and a resubmit must
+                    # run it. A timeout may have run it, and the hook is not idempotent: that create fails.
+                    if not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
                         raise
                 await asyncio.sleep(MINER_RESTART_RETRY_S)
 
@@ -2482,7 +2482,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             return self._handle_container_error(
                 payload=payload,
@@ -2595,7 +2595,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             logger.error(log_text)
 
@@ -2735,7 +2735,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             logger.error(log_text, exc_info=True)
 

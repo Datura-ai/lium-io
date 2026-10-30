@@ -78,9 +78,12 @@ async def test_context_first_pass_follows_the_caller(monkeypatch, first_pass, ex
         rented_data=None,
         default_docker_image_digests={},
         first_pass=first_pass,
+        task_started_at=123.0,
     )
 
     assert ctx.config.first_pass is expected
+    # DAH-5320: the task budget counts from the task start, not from the context build
+    assert ctx.started_at_monotonic == 123.0
 
 
 def test_context_config_default_is_not_a_first_pass():
