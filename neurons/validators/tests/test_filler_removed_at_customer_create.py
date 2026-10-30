@@ -603,6 +603,35 @@ async def test_a_filler_that_is_not_exiting_fails_at_its_own_step(
 
 
 @pytest.mark.asyncio
+async def test_a_not_exiting_filler_that_dockerd_then_removes_does_not_fail_the_create(
+    docker_service, retry_ssh_mock, _short_filler_only_bound, monkeypatch
+):
+    """28 Oct (8x B300): the filler's processes were in D state on a FUSE lookup, SIGKILL pending; dockerd
+    removed it ~30 s after the rm, while the cleanup deadline still had time left."""
+    monkeypatch.setattr(ds_module, "_STUCK_FILLER_RELIST_SECONDS", 0.01)
+    ssh_client = _stuck_filler_host(f"HOSTPID\nPROC\t{_STUCK_ID}\t4242\tD\t4194560\trequest_wait_answer\n")
+    stuck_host = ssh_client.run.side_effect
+    listings = iter([f"filler_stuck {_STUCK_ID}\n", f"filler_stuck {_STUCK_ID}\n", ""])
+
+    async def run(cmd, *args, **kwargs):
+        if cmd == ds_module.DOCKER_PS_ALL_NAMES_IDS_CMD:
+            return _listing(next(listings))
+        return await stuck_host(cmd, *args, **kwargs)
+
+    ssh_client.run.side_effect = run
+
+    removed = await asyncio.wait_for(
+        docker_service.remove_fillers_at_ssh_connect(
+            ssh_client, {"executor_uuid": "exec-1"}, "pod_target", ["volume_stuck"]
+        ),
+        timeout=2,
+    )
+
+    assert removed.listed_id_by_filler_name == {"filler_stuck": _STUCK_ID}
+    assert _STUCK_ID not in ds_module.fillers_exiting_after_kill
+
+
+@pytest.mark.asyncio
 async def test_a_stuck_filler_fails_the_create_at_filler_removal_stuck_not_container_cleanup(svc, monkeypatch):
     _customer_create_host(svc, monkeypatch, listing_at_running_check="PS\t0\n", listing_after_rm="")
     monkeypatch.setattr(

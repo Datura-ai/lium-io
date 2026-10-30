@@ -1209,7 +1209,26 @@ def check_vloopback_volume_ability(runtime):
         remove_error = remove_storage_check(name)
     if verdict[0] == "pass" and remove_error:
         return "fail", "VLOOPBACK_VOLUME_REMOVE_FAILED", remove_error
+    if verdict[0] == "pass":
+        loop_device = docker_root_loop_without_dio(docker_root_dir)
+        if loop_device:
+            return "pass", "DOCKER_ROOT_LOOP_NO_DIO", f"data-root {docker_root_dir} is on {loop_device} with dio=0"
     return verdict
+
+
+def docker_root_loop_without_dio(docker_root_dir):
+    # the loop device under docker's data root when it runs buffered (no direct I/O), else "":
+    # heavy container writes then stall Docker itself
+    try:
+        with open(HOST_MOUNTS_PATH, errors="surrogateescape") as mounts_file:
+            mounts_text = mounts_file.read()
+    except OSError:
+        return ""
+    device = block_device_holding(mounts_text, docker_root_dir)
+    disk = whole_disk_of(device) if device else ""
+    if disk.startswith("loop") and read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/loop/dio") == "0":
+        return disk
+    return ""
 
 
 def vloopback_check_payload(storage_opt_supported, sysbox_supported):
