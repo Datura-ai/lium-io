@@ -25,6 +25,7 @@ from ..host_disk import (
 from ..messages import RentedThroughputMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from ..runner import SSHCommandResult
 from .container_download_speed import (
     _FETCH_SCRIPT,
     _TIMEOUT_EXITS,
@@ -388,7 +389,7 @@ class RentedThroughputCheck:
         return reading, net, disk_side
 
     @staticmethod
-    def _unprobed_reading(result: Any, pressure: DiskPressureReading | None) -> dict[str, Any]:
+    def _unprobed_reading(result: SSHCommandResult, pressure: DiskPressureReading | None) -> dict[str, Any]:
         reading: dict[str, Any] = {
             "endpoints": [],
             "disk": asdict(DiskReading(error="not_probed")),
