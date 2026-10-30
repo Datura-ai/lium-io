@@ -253,7 +253,7 @@ class PortConnectivityCheck:
         redis, hotkey, uuid = ctx.services.redis, ctx.miner_hotkey, ctx.executor.uuid
         try:
             if result.external_probe == "passed":
-                await redis.record_external_probe_pass(hotkey, uuid)
+                await redis.clear_external_probe_miss(hotkey, uuid)
                 return False
             if result.external_probe != "blocked":
                 return False
@@ -261,7 +261,6 @@ class PortConnectivityCheck:
             if await redis.record_external_probe_miss(hotkey, uuid, PORT_VERIFY_FIRST_MISS_TTL_SECONDS):
                 logger.info(_m("outside port probe failed once; not a verdict", extra=get_extra_info(ctx.default_extra)))
                 return False
-            await redis.clear_external_probe_pass(hotkey, uuid)
         except Exception as e:  # noqa: BLE001 — never fail a node over the probe's own records
             logger.warning(
                 _m("outside probe record unavailable", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))

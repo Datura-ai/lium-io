@@ -104,9 +104,6 @@ DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 PORT_VERIFY_MISS_PREFIX = "port_verify_miss"
 # DAH-4537: one key per executor while an outside port probe failure is on record (a second one in a row fails it)
 EXTERNAL_PROBE_MISS_PREFIX = "external_probe_miss"
-# DAH-4537: one key per executor whose last outside reading passed. No TTL: a node whose fillers hold every port
-# cannot refresh it, so only a confirmed outside failure removes it.
-EXTERNAL_PROBE_PASS_PREFIX = "port_external_pass"
 # ticket-0494: one key per executor while its last DinD probe that reached the container found sysbox.
 SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 # One key per executor: when this validator first found it without its recommended default image
@@ -428,17 +425,9 @@ class RedisService:
             await self.redis.expire(key, ttl_seconds)
             return False
 
-    async def record_external_probe_pass(self, miner_hotkey: str, executor_id: str) -> None:
-        """The outside prober reached the node: forget any failure on record and remember the pass."""
-        async with self.lock:
-            await self.redis.delete(f"{EXTERNAL_PROBE_MISS_PREFIX}:{miner_hotkey}:{executor_id}")
-            await self.redis.set(f"{EXTERNAL_PROBE_PASS_PREFIX}:{miner_hotkey}:{executor_id}", "1")
-
-    async def clear_external_probe_pass(self, miner_hotkey: str, executor_id: str) -> None:
-        await self.delete(f"{EXTERNAL_PROBE_PASS_PREFIX}:{miner_hotkey}:{executor_id}")
-
-    async def has_external_probe_pass(self, miner_hotkey: str, executor_id: str) -> bool:
-        return await self.get(f"{EXTERNAL_PROBE_PASS_PREFIX}:{miner_hotkey}:{executor_id}") is not None
+    async def clear_external_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
+        """The outside prober reached the node: forget the failure on record."""
+        await self.delete(f"{EXTERNAL_PROBE_MISS_PREFIX}:{miner_hotkey}:{executor_id}")
 
     @staticmethod
     def _sysbox_verified_key(miner_hotkey: str, executor_id: str) -> str:

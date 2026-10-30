@@ -35,7 +35,6 @@ from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.service import ExecutorConnectivityService
 
-from neurons.validators.src.services.redis_service import EXTERNAL_PROBE_PASS_PREFIX
 from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_rented_machine_check import DummyBackendClient, DummySSHClient
 
@@ -209,8 +208,9 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     count_result, ctx = await apply(ctx, PortCountCheck())
 
     assert connectivity_result.passed is True
-    # DAH-4537: no outside prober ran, so the cycle is no outside pass
-    ctx.services.redis.record_external_probe_pass.assert_not_awaited()
+    # DAH-4537: no outside prober ran, so the cycle is no outside reading
+    ctx.services.redis.clear_external_probe_miss.assert_not_awaited()
+    ctx.services.redis.record_external_probe_miss.assert_not_awaited()
     # one sample of the lowest 300 ports out of 25,536 declared; a partial batch is final
     assert len(batch.calls[0]) == BATCH_PORT_VERIFICATION_SIZE
     assert batch.calls[0][0] == PortPair(40000, 40000)
@@ -606,11 +606,6 @@ async def test_an_externally_unreachable_idle_node_cannot_pass_the_floor_on_fill
     assert result.updates["state"].specs["verified_ports"] == []
 
 
-def _fully_filled():
-    rented_data = RentedExecutorsResponse(executors={}, filler_ports_by_executor={"executor-123": [2001, 2002, 2003]})
-    return build_state(verified_port_count=0, probed_port_count=0, specs={"verified_ports": []}, rented_data=rented_data)
-
-
 @pytest.fixture
 def enforced(monkeypatch):
     monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
@@ -618,47 +613,33 @@ def enforced(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("record, passes", [(False, False), (True, True)])
-async def test_a_fully_filled_idle_node_counts_its_filler_only_after_an_outside_pass(
-    context_factory, enforced, record, passes
-):
-    """With fillers on every port nothing is probed, so the filler counts only if the node's last
-    outside reading passed; a firewalled node never has one."""
-    redis = FakeRedis()
-    if record:
-        redis.store[f"{EXTERNAL_PROBE_PASS_PREFIX}:miner-hotkey:executor-123"] = "1"
-    services = build_services(redis=redis)
-    result = await PortCountCheck().run(context_factory(state=_fully_filled(), services=services))
+async def test_a_fully_filled_idle_node_keeps_its_filler_count_when_enforced(context_factory, enforced):
+    """Fillers on every port leave nothing to probe: no outside reading is no evidence, so the filler counts."""
+    rented_data = RentedExecutorsResponse(executors={}, filler_ports_by_executor={"executor-123": [2001, 2002, 2003]})
+    state = build_state(verified_port_count=0, probed_port_count=0, specs={"verified_ports": []}, rented_data=rented_data)
+    result = await PortCountCheck().run(context_factory(state=state, services=build_services(redis=FakeRedis())))
 
-    assert result.passed is passes
-    assert result.updates["port_count"] == (3 if passes else 0)
-
-
-@pytest.mark.asyncio
-async def test_the_fully_filled_rule_waits_for_the_enforce_flag(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", False)
-    services = build_services(redis=FakeRedis())
-    result = await PortCountCheck().run(context_factory(state=_fully_filled(), services=services))
     assert result.passed is True
-
-
-@pytest.mark.asyncio
-async def test_a_redis_outage_keeps_the_fully_filled_count(context_factory, enforced):
-    services = build_services(redis=FakeRedis(failing=True))
-    result = await PortCountCheck().run(context_factory(state=_fully_filled(), services=services))
-    assert result.passed is True
+    assert result.updates["port_count"] == 3
 
 
 class OutsideBlockedBatch:
     """The validator reaches the sampled ports, the outside prober none of them."""
 
     async def verify(self, ports, *, ssh_client, host, log_ctx=None):
-        return BatchResult(list(ports), [], external_blocked=True)
+        return BatchResult(list(ports), [], external="blocked")
 
 
 class OutsidePassedBatch:
     async def verify(self, ports, *, ssh_client, host, log_ctx=None):
-        return BatchResult(list(ports), [], external_passed=True)
+        return BatchResult(list(ports), [], external="passed")
+
+
+class NoOutsideReadingBatch:
+    """The prober errored or was skipped: the validator's ports pass, with no outside reading."""
+
+    async def verify(self, ports, *, ssh_client, host, log_ctx=None):
+        return BatchResult(list(ports), [])
 
 
 def _outside_context(context_factory, batch, *, first_miss=True):
@@ -676,11 +657,10 @@ async def test_a_first_outside_failure_is_not_a_verdict(context_factory, enforce
     assert result.passed is True
     assert ctx.state.externally_unreachable is False
     assert ctx.state.verified_port_count > 0
-    ctx.services.redis.clear_external_probe_pass.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_a_second_outside_failure_in_a_row_fails_the_node_and_removes_the_pass(context_factory, enforced):
+async def test_a_second_outside_failure_in_a_row_fails_the_node(context_factory, enforced):
     ctx = _outside_context(context_factory, OutsideBlockedBatch(), first_miss=False)
 
     result, ctx = await apply(ctx, PortConnectivityCheck())
@@ -688,7 +668,6 @@ async def test_a_second_outside_failure_in_a_row_fails_the_node_and_removes_the_
     assert result.passed is False
     assert ctx.state.externally_unreachable is True
     assert ctx.state.verified_port_count == 0
-    ctx.services.redis.clear_external_probe_pass.assert_awaited_once_with("miner-hotkey", "executor-123")
 
 
 @pytest.mark.asyncio
@@ -705,11 +684,40 @@ async def test_a_second_outside_failure_is_only_logged_until_enforced(context_fa
 
 
 @pytest.mark.asyncio
-async def test_an_outside_pass_is_recorded(context_factory, enforced):
+async def test_an_outside_pass_clears_the_failure_on_record(context_factory, enforced):
     _, ctx = await apply(_outside_context(context_factory, OutsidePassedBatch()), PortConnectivityCheck())
 
-    ctx.services.redis.record_external_probe_pass.assert_awaited_once_with("miner-hotkey", "executor-123")
+    ctx.services.redis.clear_external_probe_miss.assert_awaited_once_with("miner-hotkey", "executor-123")
     ctx.services.redis.record_external_probe_miss.assert_not_awaited()
+
+
+class _MissRecord:
+    """A stateful stand-in for the Redis failure record shared across cycles."""
+
+    def __init__(self):
+        self.on = False
+
+    async def record(self, hotkey, uuid, ttl):
+        first, self.on = not self.on, True
+        return first
+
+    async def clear(self, hotkey, uuid):
+        self.on = False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middle, fails", [(NoOutsideReadingBatch, True), (OutsidePassedBatch, False)])
+async def test_failure_then_middle_cycle_then_failure(context_factory, enforced, middle, fails):
+    """A cycle with no outside reading (prober error or skip) leaves the first failure on record; a pass clears it."""
+    record, verdicts = _MissRecord(), []
+    for batch in (OutsideBlockedBatch(), middle(), OutsideBlockedBatch()):
+        ctx = _outside_context(context_factory, batch)
+        ctx.services.redis.record_external_probe_miss.side_effect = record.record
+        ctx.services.redis.clear_external_probe_miss.side_effect = record.clear
+        _, ctx = await apply(ctx, PortConnectivityCheck())
+        verdicts.append(ctx.state.externally_unreachable)
+
+    assert verdicts == [False, False, fails]
 
 
 @pytest.mark.asyncio

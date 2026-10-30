@@ -43,7 +43,7 @@ async def test_batch_reports_ports_that_answer_only_the_validator_whatever_the_f
 
     result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert (result.external_blocked, result.external_passed) == (True, False)
+    assert result.external == "blocked"
     assert result.successful == PORTS
 
 
@@ -53,7 +53,7 @@ async def test_batch_counts_ports_the_outside_prober_reached_without_fetching_th
 
     result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert (result.external_blocked, result.external_passed) == (False, True)
+    assert result.external == "passed"
     assert sorted(result.successful, key=lambda p: p.internal) == PORTS
     assert len(port_tester.test_many.call_args.args[2]) == len(PORTS) - 3
 
@@ -74,14 +74,14 @@ async def test_a_failed_prober_never_flags_the_node(mocker):
 
     result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert (result.external_blocked, result.external_passed) == (False, False)
+    assert result.external is None
     assert result.successful == PORTS
 
 
 @pytest.mark.asyncio
 async def test_port_probe_does_not_fall_back_to_validator_only_tiers_when_blocked(mocker):
     batch = mocker.Mock()
-    batch.verify = mocker.AsyncMock(return_value=BatchResult(PORTS, [], external_blocked=True))
+    batch.verify = mocker.AsyncMock(return_value=BatchResult(PORTS, [], external="blocked"))
     semi, fallback = mocker.Mock(), mocker.Mock()
 
     result = await PortProbe(batch, semi, fallback).probe(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")

@@ -160,7 +160,8 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-        return BatchResult((reached or []) + successful, failed, external_blocked, bool(reached))
+        external = "blocked" if external_blocked else "passed" if reached else None
+        return BatchResult((reached or []) + successful, failed, external)
 
 
 class FallbackVerifier:

@@ -4,24 +4,11 @@ import json
 from dataclasses import replace
 from typing import Any
 
-from core.config import settings
 from services.const import MIN_PORT_COUNT
 from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
-
-
-async def _passed_outside_probe(ctx: Context) -> bool:
-    try:
-        return await ctx.services.redis.has_external_probe_pass(ctx.miner_hotkey, ctx.executor.uuid)
-    except Exception:
-        return True  # a Redis outage keeps the filler count (the pre-DAH-4537 behaviour), not a fleet-wide delist
-
-
-def _fillers_hold_every_port(ctx: Context, held: list[int], is_rented: bool) -> bool:
-    """An idle node whose fillers hold every port: this cycle probed nothing, so it has no outside reading."""
-    return bool(held) and not is_rented and ctx.state.probed_port_count == 0
 
 
 def port_count_below_listing_floor(state: ContextState) -> int | None:
@@ -105,14 +92,6 @@ class PortCountCheck:
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
-        # with no outside reading this cycle, the fillers count only if the node's last outside reading passed
-        if (
-            settings.EXTERNAL_PORT_PROBE_ENFORCE
-            and settings.EXTERNAL_PORT_PROBE_URL  # no prober, no outside reading to ask for
-            and _fillers_hold_every_port(ctx, held, is_rented)
-            and not await _passed_outside_probe(ctx)
-        ):
-            held = []
         filler_ports = sorted(set(held) - set(probed))
         verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
         port_count = ctx.state.verified_port_count + len(filler_ports)
