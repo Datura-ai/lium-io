@@ -121,7 +121,11 @@ class PortConnectivityCheck:
             )
 
         if await self._should_use_last_verified_sysbox(
-            ctx, result, rented=rented_executor is not None, sysbox_now=updated_state.sysbox_runtime
+            ctx,
+            result,
+            rented=rented_executor is not None,
+            sysbox_now=updated_state.sysbox_runtime,
+            sysbox_probed=probe_sysbox,
         ):
             extra_info["sysbox_from_last_verified"] = True
             updated_state = replace(
@@ -293,7 +297,7 @@ class PortConnectivityCheck:
 
     @staticmethod
     async def _should_use_last_verified_sysbox(
-        ctx: Context, result: PortVerificationResult, *, rented: bool, sysbox_now: bool
+        ctx: Context, result: PortVerificationResult, *, rented: bool, sysbox_now: bool, sysbox_probed: bool
     ) -> bool:
         """ticket-0494: keep a rented executor's verified sysbox when this cycle measured nothing.
 
@@ -321,7 +325,8 @@ class PortConnectivityCheck:
                 if result.sysbox_measured is None and scrape_error and scrape_error != SYSBOX_TEST_TIMED_OUT:
                     await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
                 return False
-            if sysbox_now or result.dind_ok:
+            # a probe that reached its container with sysbox-runc but whose Sysbox test timed out measured nothing too
+            if sysbox_now or (result.dind_ok and not (sysbox_probed and result.sysbox_measured is None)):
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it

@@ -114,3 +114,16 @@ async def test_a_readable_map_is_not_logged_as_unreadable(caplog, uid_map):
         await DindVerifier(Mock())._sysbox_works(_InnerSSH(uid_map), {})
 
     assert _unreadable_logs(caplog) == []
+
+
+class _HelloWorldHangs(_InnerSSH):
+    async def run(self, command):
+        if command == "docker run --rm hello-world":
+            raise TimeoutError
+        return await super().run(command)
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_sysbox_test_measured_nothing():
+    """30 Oct, pod c0877f60: a busy host is not a host without Sysbox."""
+    assert await DindVerifier(Mock())._sysbox_works(_HelloWorldHangs(SYSBOX_MAP), {}) is None
