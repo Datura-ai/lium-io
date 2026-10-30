@@ -121,7 +121,7 @@ RENTAL_PRICES_PER_HOUR.update({
 })
 # A100 40GB (DAH-5088, Fish 30 Oct 2026: "give idle rates once you figure out what they are worth"): no Lium rentals
 # yet, so the anchor is the 30 Oct vast.ai median (listed and rented offers) times 0.668, the median Lium/vast price
-# ratio of the A100 80GB PCIe and SXM4, RTX A6000, L40S and RTX 4090, floored to the cent. Not an A100 80GB rate.
+# ratio of the A100 80GB PCIe and SXM4, RTX A6000, L40S and RTX 4090, rounded to the cent. Not an A100 80GB rate.
 RENTAL_PRICES_PER_HOUR.update({
     "NVIDIA A100-PCIE-40GB": 0.37,  # vast 0.553 x 0.668
     "NVIDIA A100-SXM4-40GB": 0.47,  # vast 0.715 x 0.668
