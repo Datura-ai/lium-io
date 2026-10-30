@@ -806,9 +806,16 @@ async def test_a_stale_split_node_rereads_rentals_before_failing_its_reprobe(con
 
     _, ctx = await apply(ctx, PortConnectivityCheck())
     _, ctx = await apply(ctx, PortCountCheck())
-    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+    if since_snapshot == "rental":
+        ctx.ssh.running.add("container_pod-new")
+        ctx.services.backend.active_pods.add("pod-new")
+    tenant_result, final = await apply(ctx, TenantEnforcementCheck())
 
     assert tenant_result.passed is passed
+    if since_snapshot == "rental":
+        # the replacement is judged as the rented node it is: rented, halted, its pod the one on record
+        assert tenant_result.halt and final.rented is True
+        assert final.state.rented_data.executors[EXECUTOR_UUID].pods[0].pod_id == "pod-new"
     published = tenant_result.updates["state"].specs
     if since_snapshot == "nothing":
         assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason

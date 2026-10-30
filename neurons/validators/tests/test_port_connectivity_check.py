@@ -125,6 +125,7 @@ class DummyConnectivityService:
             "executor_uuid": executor_info.uuid,
             "sysbox_runtime": sysbox_runtime,
             "rented_ports": rented_ports,
+            "rented_pod_names": rented_pod_names,
             "filler_ports": filler_ports,
             "min_ports": min_ports,
         }
@@ -786,3 +787,26 @@ async def test_a_persisting_port_miss_restarts_the_window_instead_of_earning_fre
     await service.redis.expire(key, 5)  # the window nearly over
     assert await service.record_port_verify_miss("hk", "ex", 3600) is False
     assert await service.redis.ttl(key) > 3000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rental_ip, skipped", [("10.0.0.9", False), ("127.0.0.1", True)])
+async def test_another_miners_rental_under_this_uuid_skips_ports_only_on_this_endpoint(
+    context_factory, rental_ip, skipped
+):
+    """DAH-3698: a provider advertising a competitor's executor UUID gets no ports skipped for that rental; on the
+    same IP and port the renter's pod is on this box, so its ports stay skipped."""
+    foreign = RentedExecutor(
+        miner_hotkey="other-miner",
+        executor_ip_address=rental_ip,
+        executor_ip_port="22",
+        pods=[RentedPod(pod_id="pod-x", container_name="container_pod-x", rented_ports=[40010, 40011])],
+    )
+    state = build_state(rented_data=RentedExecutorsResponse(executors={"executor-123": foreign}))
+    ctx = _verified_ctx(context_factory, redis_service=DummyRedis(), state=state, dind_ok=True, sysbox_measured=True)
+
+    await PortConnectivityCheck().run(ctx)
+
+    called = ctx.services.connectivity.called_with
+    assert called["rented_ports"] == ([40010, 40011] if skipped else [])
+    assert called["rented_pod_names"] == (["container_pod-x"] if skipped else [])
