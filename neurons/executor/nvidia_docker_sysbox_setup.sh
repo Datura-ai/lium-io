@@ -426,7 +426,7 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
-CTRD_UNKNOWN="two containerd daemons run and neither is on Docker's address, so where containers live is unknown."
+CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (two containerd daemons and neither on Docker's address, or its root cannot be read)."
 
 docker_containerd() {
     # CTRD_BIN, CTRD_CONFIG, CTRD_ROOT (--root, else empty): the containerd Docker uses. Without --containerd Docker
@@ -437,6 +437,8 @@ docker_containerd() {
     local -a argv
     address=$(docker info --format '{{with .Containerd}}{{.Address}}{{end}}' 2>/dev/null)
     CTRD_BIN=containerd CTRD_CONFIG=/etc/containerd/config.toml CTRD_ROOT=""
+    # no daemon seen: Docker's own containerd (<exec-root>/containerd/containerd.sock) runs on the config beside it
+    case "$address" in */docker/containerd/*) CTRD_CONFIG=${address%/*}/containerd.toml ;; esac
     for f in "${SYSBOX_SETUP_HOST_ROOT:-}"/proc/[0-9]*/cmdline; do
         mapfile -d '' -t argv < "$f" 2>/dev/null || continue
         [ "${argv[0]##*/}" = containerd ] || continue
@@ -468,7 +470,7 @@ resolve_disk_dir() {
     # DISK_DIR: where container root filesystems live. That is Docker's data-root, except under Docker's
     # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
     # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
-    # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd cannot be told.
+    # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd or its root cannot be told.
     local ctrd_root
     DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
@@ -480,8 +482,14 @@ resolve_disk_dir() {
     # containerd 1.x dumps root = "...", 2.x root = '...'; no dump: the top level of its config file itself
     [ -n "$ctrd_root" ] || ctrd_root=$("$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null | sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
     [ -n "$ctrd_root" ] || ctrd_root=$(sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null | head -1)
-    [ -n "$ctrd_root" ] && [ -d "$ctrd_root" ] || ctrd_root="${SYSBOX_SETUP_HOST_ROOT:-}/var/lib/containerd"
-    [ -d "$ctrd_root" ] || return 0
+    if [ -z "$ctrd_root" ]; then
+        # containerd's default root only for the system config: an unreadable generated (Docker-managed) or custom
+        # config does not mean a leftover /var/lib/containerd holds the containers
+        [ "$CTRD_CONFIG" = /etc/containerd/config.toml ] || return 1
+        ctrd_root="${SYSBOX_SETUP_HOST_ROOT:-}/var/lib/containerd"
+    fi
+    # a root that is not there is unknown, not the data-root
+    [ -d "$ctrd_root" ] || return 1
     DISK_DIR=$ctrd_root
     SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $ctrd_root, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (\"root\" in /etc/containerd/config.toml) to the big disk."
 }

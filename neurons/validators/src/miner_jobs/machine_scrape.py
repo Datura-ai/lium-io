@@ -875,7 +875,14 @@ def docker_containerd(info):
             raise RuntimeError(
                 f"{CONTAINERD_ROOT_UNKNOWN}: cannot tell which containerd Docker uses"
             )
-    return daemons[0][:3] if daemons else ("containerd", CONTAINERD_CONFIG_PATH, None)
+    if daemons:
+        return daemons[0][:3]
+    # no daemon seen: a Docker-managed address (<exec-root>/containerd/containerd.sock) still names Docker's own
+    # containerd, whose generated config sits beside the socket; the system config would point at a leftover root
+    address = (info.get("Containerd") or {}).get("Address") or ""
+    if "/docker/containerd/" in address:
+        return "containerd", f"{os.path.dirname(address)}/containerd.toml", None
+    return "containerd", CONTAINERD_CONFIG_PATH, None
 
 
 def same_socket(address, other):
@@ -910,7 +917,8 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
                 continue
             seen.add(path)
             try:
-                with open(f"/proc/1/root{path}") as config_file:
+                # /var/run is a symlink to /run: absolute, so through /proc/1/root it would land in this container
+                with open(f"/proc/1/root{re.sub(r'^/var/run/', '/run/', path)}") as config_file:
                     config = tomllib.loads(config_file.read())
             except FileNotFoundError:
                 if path != CONTAINERD_CONFIG_PATH:

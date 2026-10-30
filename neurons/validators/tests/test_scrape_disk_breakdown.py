@@ -605,6 +605,9 @@ def test_a_bracket_glob_import_is_followed_when_the_dump_cannot_run(scrape: dict
 _MANAGED_CONFIG = "/var/run/docker/containerd/containerd.toml"
 _MANAGED = ["containerd", "--config", _MANAGED_CONFIG, "--log-level", "info"]
 _MANAGED_TOML = 'version = 2\nroot = "/data/docker/containerd/daemon"\n[grpc]\n  address = "/var/run/docker/containerd/containerd.sock"\n'
+# where the generated config really is: /var/run is an absolute symlink to /run, which /proc/1/root would resolve
+# inside the executor container
+_MANAGED_HOST_FILE = "/run/docker/containerd/containerd.toml"
 _EXTERNAL = ["/usr/bin/containerd"]
 _EXTERNAL_TOML = 'version = 2\nroot = "/data/containerd"\n[grpc]\n  address = "/run/containerd/containerd.sock"\n'
 
@@ -624,6 +627,11 @@ _EXTERNAL_TOML = 'version = 2\nroot = "/data/containerd"\n[grpc]\n  address = "/
          {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_CONFIG: _MANAGED_TOML}, "/data/containerd"),
         # a --root flag beats any config
         ([["containerd", "--root=/data/flag-root", "-c", _MANAGED_CONFIG]], None, {_MANAGED_CONFIG: _MANAGED_TOML}, "/data/flag-root"),
+        # no daemon visible, but Docker's address is its own containerd: its generated config, not the system one
+        ([], "/var/run/docker/containerd/containerd.sock", None, "/data/docker/containerd/daemon"),
+        ([], "/var/run/docker/containerd/containerd.sock", {_MANAGED_CONFIG: _MANAGED_TOML}, "/data/docker/containerd/daemon"),
+        # no daemon visible and an external address: the system config
+        ([], "/run/containerd/containerd.sock", None, "/data/containerd"),
     ],
 )
 def test_the_root_is_read_from_the_containerd_docker_uses(scrape: dict, monkeypatch, processes, address, dump, expected_root) -> None:
@@ -631,7 +639,7 @@ def test_the_root_is_read_from_the_containerd_docker_uses(scrape: dict, monkeypa
     _stub_docker_api(scrape, {"/info": info})
     scrape["containerd_processes"] = lambda: processes
     # a leftover /var/lib/containerd on the root disk, as on a host that once ran the system containerd
-    files = {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_CONFIG: _MANAGED_TOML}
+    files = {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_HOST_FILE: _MANAGED_TOML}
     _stub_containerd_config(scrape, monkeypatch, files, dump)
     dirs = {"/proc/1/root/data/docker/containerd/daemon", "/proc/1/root/data/containerd", "/proc/1/root/data/flag-root", "/proc/1/root/var/lib/containerd"}
     asked = _stub_filesystem(scrape, monkeypatch, host_dirs=dirs, usage_by_path={f"/proc/1/root{expected_root}": _DOCKER_PARTITION})

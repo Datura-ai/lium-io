@@ -423,7 +423,34 @@ def test_two_containerd_daemons_without_dockers_address_are_not_measured(tmp_pat
     _, files = _containerd_fixture(tmp_path, _EXTERNAL, _MANAGED)
     rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=SNAPSHOTTER, files=files)
     assert rc == 0, out
-    assert "SKIP" in out and "neither is on Docker's address" in out
+    assert "SKIP" in out and "neither on Docker's address" in out
+
+
+def test_no_visible_daemon_on_dockers_own_address_reads_its_generated_config(tmp_path):
+    # Docker's address names its own containerd: the generated config, not /etc/containerd/config.toml
+    root, files = _containerd_fixture(tmp_path)
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_ADDRESS": "/var/run/docker/containerd/containerd.sock",
+           "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/data/docker/containerd/daemon is below" in out
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        None,  # the managed daemon's generated config cannot be read (and so not dumped)
+        'version = 2\nroot = "/gone/containerd/daemon"\n',  # a root that is not on the host
+    ],
+)
+def test_an_unreadable_managed_root_is_skipped_not_read_as_the_leftover(tmp_path, config_text):
+    # a leftover /var/lib/containerd on the root disk must not stand in for Docker's containerd
+    _, files = _containerd_fixture(tmp_path, _MANAGED)
+    files[MANAGED_CONFIG.lstrip("/")] = config_text
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 0, out
+    assert "SKIP" in out and "root cannot be read" in out
+    assert "/var/lib/containerd is below" not in out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────
