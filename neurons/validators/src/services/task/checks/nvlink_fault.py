@@ -5,12 +5,9 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from core.config import settings
-
 from ..messages import NvlinkFaultMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .capability import get_filler_only_container
 
 # Stdlib-only, shipped over stdin like the pinned-memory probe: nothing to upload or update.
 PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "nvlink_multicast_probe.py"
@@ -30,7 +27,9 @@ class NvlinkFaultCheck:
     bind. Only boards the scrape reports as NVLink between every GPU pair are probed; a GPU without
     multicast support, a driver without the API, or any error other than the NVLink-fault codes passes
     with NVLINK_UNKNOWN. Runs after the rented halt, so a rented node is never probed or failed here.
-    A fault fails the node only with NVLINK_FAULT_ENFORCEMENT_ENABLED; off, it is logged and the node passes.
+    It runs beside an active filler: on 8x H100 and 8x B300 (28 Oct) the probe passed beside an NVLS
+    all-reduce filler, which kept exact results with one slower second per probe. A filler holding
+    nearly all GPU memory can leave no room for the probe's context: NVLINK_UNKNOWN, the node passes.
     """
 
     check_id = "gpu.validate.nvlink_fault"
@@ -42,19 +41,6 @@ class NvlinkFaultCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             )
-        # the probe opens a context on every GPU beside the filler's own NCCL, like the fault probe it skips
-        filler_container = get_filler_only_container(ctx)
-        if filler_container:
-            return CheckResult(
-                passed=True,
-                event=render_message(
-                    Msg.FILLER_SKIPPED,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={"filler_container": filler_container},
-                ),
-            )
-
         run = await ctx.runner.run(
             f"{shlex.quote(ctx.executor.python_path)} -I -",
             timeout=PROBE_TIMEOUT_SECONDS,
@@ -79,16 +65,10 @@ class NvlinkFaultCheck:
         }
         status = report.get("status")
         if status == "fault":
-            enforce = settings.NVLINK_FAULT_ENFORCEMENT_ENABLED
-            event = render_message(
-                Msg.PROBE_FAILED,
-                ctx=ctx,
-                check_id=self.check_id,
-                severity=None if enforce else "warning",
-                impact=None if enforce else "Shadow observation only: score was NOT changed",
-                what=what,
+            return CheckResult(
+                passed=False,
+                event=render_message(Msg.PROBE_FAILED, ctx=ctx, check_id=self.check_id, what=what),
             )
-            return CheckResult(passed=not enforce, event=event)
         template = Msg.PROBE_OK if status == "ok" else Msg.UNKNOWN
         return CheckResult(
             passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)

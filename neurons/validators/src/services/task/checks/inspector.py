@@ -35,14 +35,6 @@ class InspectorRentedCheck:
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not ctx.config.inspector_enabled:
-            event = render_message(
-                Msg.DISABLED,
-                ctx=ctx,
-                check_id=self.check_id,
-            )
-            return CheckResult(passed=True, event=event)
-
         rented_executor = (
             ctx.state.rented_data.executors.get(ctx.executor.uuid)
             if ctx.state.rented_data

@@ -111,6 +111,7 @@ Note: Please use either **RENTING_PORT_RANGE** or **RENTING_PORT_MAPPINGS** and 
 Optional, commented out in the template (`src/core/config.py` has the defaults):
 
 - **COMPUTE_REST_API_URL**: the Lium backend the executor pre-pulls its GPU's cache template image from (default `https://lium.io/api`; empty disables the pre-pull)
+- **PRE_PULL_TEMPLATES_ENABLED**: on an idle node, also pull the most-rented official template images so rentals start faster; this uses disk (keeps `PRE_PULL_MIN_FREE_GB` free) and bandwidth (default `true`; set `false` to opt this node out)
 - **CACHE_TEMPLATE_REFRESH_SECONDS**: how often the template digest is re-checked (default `900`)
 - **CONTAINER_SIGNATURE_MAX_AGE_SECONDS**: maximum clock skew accepted on signed pod-metrics and pod-log requests (default `300`; keep the host on NTP rather than widening this)
 - **EXECUTOR_LOCAL_VERIFY_ENABLED**: answer the validator's one-call `POST /verify` (the verification suite from one signed intent, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused, and so is an intent that does not name this host's `MINER_HOTKEY_SS58_ADDRESS`) instead of 404 (default `false`; the validator falls back to its SSH checks either way)
@@ -235,6 +236,58 @@ Causes the installer names:
 - **`docker plugin install` fails**: the host cannot pull `ashald/docker-volume-loopback` from Docker Hub. Check the host's proxy or DNS, then run the installer again.
 
 Validator releases after this change also run the test in the machine scrape, on nodes whose Docker accepts `--storage-opt` (a node without it is rented without a disk limit and is not tested); a validator on an earlier release does not run it. The scrape checks the plugin, `Mountpoint`, and a volume mounted into a container under the runtime this node's rentals get (Sysbox when the scrape's Sysbox GPU test passes, Docker's default runtime otherwise). They only read the plugin, never install or change it, and remove their test container and volume (`lium_storage_check_*`) when the test ends.
+
+### Docker data-root on a loop image
+
+A data-root on a loop-mounted image file (`/dev/loopN` in `df /var/lib/docker`) must have direct I/O on. Buffered, every write in a rented pod is cached twice; one pod writing heavily can stall Docker for minutes and the node is delisted. The installer reports it as a `FIX`. Better: put the data-root on a real disk ([Docker Storage Setup](https://docs.lium.io/providers/nodes/docker-storage)).
+
+**Switch it on now** (no rental running; on a busy device the command waits until the writes stop):
+
+```shell
+sudo losetup --direct-io=on /dev/loopN
+losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
+```
+
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. When direct I/O cannot be set (`losetup` fails with `Invalid argument`, e.g. an image whose sector size is smaller than its disk's), Docker still starts so the node stays up, the journal shows a warning and the installer's `--check` reports `FIX`; move the data-root to a real disk then. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), or a real disk replaces the image at the same mount point, the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
+
+1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
+
+   ```
+   /data/img.raw /data/dockerimg xfs loop,pquota,nofail,x-systemd.requires=/data 0 0
+   ```
+
+2. The script, the unit, and Docker requiring it:
+
+   ```shell
+   sudo tee /usr/local/sbin/loop-dio-docker >/dev/null <<'EOF'
+   #!/bin/sh
+   MNT=/data/dockerimg
+   root=$(tr -d '\n\r' 2>/dev/null </etc/docker/daemon.json | sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+   root=${root:-/var/lib/docker}   # no "data-root" key: Docker's default
+   case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
+   src=$(findmnt -n -o SOURCE --mountpoint "$MNT") || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
+   case "$src" in /dev/loop*) losetup --direct-io=on "$src" || echo "<4>direct I/O failed on $src, Docker starts buffered: move the data-root to a real disk" ;; esac   # a real disk needs nothing
+   EOF
+   sudo chmod 755 /usr/local/sbin/loop-dio-docker
+   sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
+   [Unit]
+   Description=Direct I/O on the Docker data-root loop device
+   Wants=data-dockerimg.mount
+   After=data-dockerimg.mount
+   Before=docker.service containerd.service
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/usr/local/sbin/loop-dio-docker
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   sudo mkdir -p /etc/systemd/system/docker.service.d
+   printf '[Unit]\nRequires=loop-dio-docker.service\nAfter=loop-dio-docker.service\n' | sudo tee /etc/systemd/system/docker.service.d/loop-dio.conf >/dev/null
+   sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
+   ```
+
+   `data-dockerimg.mount` is the mount unit systemd makes from the fstab line; for another mount point, `systemd-escape -p --suffix=mount <dir>` prints its name.
 
 ## The executor image
 

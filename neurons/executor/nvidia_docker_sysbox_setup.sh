@@ -469,6 +469,26 @@ check_total_disk_for_vram() {
         ${SNAPSHOTTER_FIX:+"$SNAPSHOTTER_FIX"}
 }
 
+check_data_root_loop_dio() {
+    # DAH-5150: a data-root on a buffered loop image caches every pod write twice; a renter writing ~480 GB/h
+    # stalled host writeback, `docker run` hung ~8 minutes and the node was delisted. Direct I/O on that loop
+    # fixed it in the lab (worst `docker run` 20 s). A data-root on a real disk is not checked.
+    local data_root src loop dio
+    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
+    [ -d "$data_root" ] || data_root=/
+    src=$(df -P "$data_root" 2>/dev/null | awk 'NR == 2 {print $1}')
+    case "$src" in /dev/loop[0-9]*) loop=${src#/dev/} ;; *) return 0 ;; esac
+    dio=$(cat "$(host_path "/sys/block/$loop/loop/dio")" 2>/dev/null)
+    if [ "$dio" = 1 ]; then
+        pf_pass "Docker's data-root $data_root is on $src with direct I/O."
+        return 0
+    fi
+    pf_fix "Docker's data-root $data_root is on the loop device $src without direct I/O — a rented pod's heavy writes can stall Docker for minutes and the node gets delisted." \
+        "With no rental running: sudo losetup --direct-io=on $src" \
+        "Keep it across reboots: https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#docker-data-root-on-a-loop-image, or move the data-root to a real disk."
+}
+
 check_free_disk_for_node() {
     # VerifyX allocates MIN_FREE_STORAGE_GB on the node's filesystem; before the first `lium mine` the node's images
     # still have to come out of the same free space
@@ -822,6 +842,7 @@ preflight_advisory() {
     check_iptables_modules || true
     check_total_disk_for_vram || true
     check_free_disk_for_node || true
+    check_data_root_loop_dio || true
     check_ports || true
 }
 

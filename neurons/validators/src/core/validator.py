@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
+from core.loop_sampler import start_loop_sampler
 from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
@@ -121,6 +122,7 @@ def settle_cycle_results(
                 and not (
                     job_result.is_new_rentals_paused and not job_result.is_rented
                 )
+                and not job_result.is_in_maintenance
             ):
                 total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
     return total_gpu_model_count_map
@@ -497,7 +499,7 @@ class Validator:
                 # request jobs
                 jobs = [
                     asyncio.create_task(
-                        self.miner_service.request_job_to_miner(
+                        self.request_wave_job(
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
@@ -1376,6 +1378,12 @@ class Validator:
             )
         )
 
+    async def request_wave_job(self, **kwargs) -> dict | None:
+        """One miner's wave request; its new executors that passed are listed now, not at the cycle's end."""
+        job = await self.miner_service.request_job_to_miner(**kwargs)
+        await self.miner_service.publish_new_executors_at_pass(job)
+        return job
+
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
         if not settings.RENTED_POD_SSH_PROBE_ENABLED:
@@ -1576,6 +1584,8 @@ class Validator:
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
+                # which code saturates the loop the lane shares with the wave (core/loop_sampler.py)
+                self.loop_sampler_stop = start_loop_sampler()
 
             while not self.should_exit:
                 await self.sync()
@@ -1608,6 +1618,8 @@ class Validator:
         )
 
         self.should_exit = True
+        if getattr(self, "loop_sampler_stop", None) is not None:
+            self.loop_sampler_stop.set()
 
         # Cleanup subtensor client
         if hasattr(self, 'subtensor_client'):

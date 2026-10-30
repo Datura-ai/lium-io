@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import shlex
 from dataclasses import dataclass
 
@@ -101,6 +102,37 @@ class DockerCommand:
             "if [ -n \"$shim\" ] && grep -qa containerd-shim /proc/$shim/cmdline 2>/dev/null; "
             "then kill -9 $shim 2>/dev/null; else shim=; fi; "
             "sleep 3; echo \"killed pid=$pid shim=${shim:-none}\"; fi; true"
+        )
+
+    @staticmethod
+    def kill_orphaned_task_shim(container_id: str) -> str:
+        """SIGKILL the containerd shim still holding the task of a container dockerd reports exited.
+
+        After a dockerd/containerd restart the old shim can outlive dockerd's view of the container,
+        and every `docker start` then fails with "AlreadyExists: task <id>". Matches only the shim
+        started with `-id <container_id>` (the exact 64-hex id). Its pid and start time are captured
+        first, then the container state is re-read: only while it is still exited/created, and only
+        that same shim generation, is it killed with its children. A replacement shim started by
+        anyone in between has another pid/start time and is never touched. Exit 0 always.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ValueError(f"not a full container id: {container_id!r}")
+        # argv0 must be the shim binary, so this shell (whose own cmdline holds the id) never matches
+        return (
+            "shim=; for d in /proc/[0-9]*; do "
+            "c=$(tr '\\0' ' ' 2>/dev/null < $d/cmdline); "
+            "case \"${c%% *}\" in *containerd-shim*) case \"$c\" in "
+            f"*' -id {container_id} '*) shim=${{d#/proc/}};; esac;; esac; done; "
+            "[ -n \"$shim\" ] || { echo 'no shim'; exit 0; }; "
+            # field 22 of /proc/<pid>/stat = start time: (pid, start time) names one process
+            "gen=$(cut -d' ' -f22 /proc/$shim/stat 2>/dev/null); "
+            f"st=$(/usr/bin/docker inspect --format '{{{{.State.Status}}}}' {container_id} 2>&1); "
+            "case \"$st\" in exited|created) ;; *) echo \"skipped state=$st\"; exit 0;; esac; "
+            "[ -n \"$gen\" ] && [ \"$(cut -d' ' -f22 /proc/$shim/stat 2>/dev/null)\" = \"$gen\" ] "
+            "|| { echo 'skipped shim replaced'; exit 0; }; "
+            "kids=$(awk -v p=$shim '/^PPid:/ && $2 == p {print FILENAME}' /proc/[0-9]*/status "
+            "2>/dev/null | cut -d/ -f3); kill -9 $kids $shim 2>/dev/null; "
+            "echo \"killed shim=$shim init=$kids\"; sleep 3; true"
         )
 
     @staticmethod

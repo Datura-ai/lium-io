@@ -164,7 +164,7 @@ STUBS = {
         case "${!#}" in   # STUB_DATA_DF_TOTAL_KB: a data-root on its own big disk, the rest on the root disk
             */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 $STUB_DATA_DF_TOTAL_KB 1% /data"; exit 0; } ;;
         esac
-        echo "/dev/nvme0n1p1 ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
+        echo "${STUB_DF_SOURCE:-/dev/nvme0n1p1} ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
         """
     ),
     # `containerd config dump` prints the root in 1.x quotes "..." or 2.x quotes '...'
@@ -388,6 +388,30 @@ def test_free_disk_just_below_100_gib_is_not_rounded_up(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env)
     assert rc == 1, out
     assert "FIX  Free disk 100.0 GB on " in out
+
+
+# ── data-root on a loop image (DAH-5150) ─────────────────────────────────────
+
+
+def test_data_root_on_a_buffered_loop_gets_the_direct_io_fix(tmp_path):
+    env = {"STUB_DF_SOURCE": "/dev/loop7"}
+    rc, out, _ = run_check(tmp_path, "check_data_root_loop_dio", env=env, files={"sys/block/loop7/loop/dio": "0\n"})
+    assert rc == 1
+    assert "is on the loop device /dev/loop7 without direct I/O" in out
+    assert "With no rental running: sudo losetup --direct-io=on /dev/loop7" in out
+
+
+def test_data_root_on_a_direct_io_loop_passes(tmp_path):
+    env = {"STUB_DF_SOURCE": "/dev/loop7"}
+    rc, out, _ = run_check(tmp_path, "check_data_root_loop_dio", env=env, files={"sys/block/loop7/loop/dio": "1\n"})
+    assert rc == 0
+    assert "on /dev/loop7 with direct I/O." in out
+
+
+def test_data_root_on_a_real_disk_is_not_reported(tmp_path):
+    rc, out, fixes = run_check(tmp_path, "check_data_root_loop_dio")
+    assert (rc, fixes) == (0, 0)
+    assert "loop" not in out
 
 
 # ── ports ────────────────────────────────────────────────────────────────────
