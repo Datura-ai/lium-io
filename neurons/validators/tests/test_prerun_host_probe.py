@@ -924,3 +924,49 @@ def svc_fixture():
     )
 
 
+
+
+@pytest.mark.asyncio
+async def test_a_customer_create_waits_for_the_engy_cache_removal_before_it_sizes_and_runs_the_pod(
+    svc_fixture, monkeypatch
+):
+    """DAH-5260: the scrape lists the 1561 GB kimi-k3 cache as free and the backend sizes the rental on it, so the
+    pod fits only once the volume is gone. A slow `docker volume rm` must answer before the pod volume is sized and
+    created and before `docker run`; a removal left running beside them would fail the create for want of disk."""
+    svc = svc_fixture
+    kimi = "engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"
+    ssh_client = _deploy_ssh_client()
+    _wire(svc, monkeypatch, ssh_client, probe_result=_probe(volumes=(ProbedVolume(name=kimi, driver="local"),)))
+    monkeypatch.delattr(svc, "reclaim_dphn_cache_for_rental")
+    gb = 1024**3
+    free = {"bytes": 2389 * gb}
+    events: list[str] = []
+    host = ssh_client.run.side_effect
+
+    async def run(cmd, *args, **kwargs):
+        if f"volume rm {kimi}" in cmd:
+            await asyncio.sleep(0.2)  # the unlink of ~1.5 TB
+            free["bytes"] += 1561 * gb
+            events.append("cache volume removed")
+        return host(cmd, *args, **kwargs)
+
+    def recorded(event: str, answer: object = None):
+        async def record(*_args, **_kwargs):
+            events.append(event)
+            return answer
+
+        return record
+
+    ssh_client.run.side_effect = run
+    monkeypatch.setattr(svc, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
+    monkeypatch.setattr(svc, "_get_fs_available_bytes", AsyncMock(side_effect=lambda *_a: free["bytes"]))
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(side_effect=recorded("volume sized", ds_module.VolumeSizingResult(2620, 1310, "legacy"))),
+    )
+    monkeypatch.setattr(svc, "create_local_volume", AsyncMock(side_effect=recorded("volume created")))
+    svc._run_rental_docker_create_with_port_retry.side_effect = recorded("docker run")
+
+    result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=2620, storage_limit_gb=1310))
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert events == ["cache volume removed", "volume sized", "volume created", "docker run"]
