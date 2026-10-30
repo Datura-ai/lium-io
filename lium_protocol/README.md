@@ -62,6 +62,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `1.17.0` — `RentedExecutorsResponse.maintenance_executor_ids` (optional, default empty): the nodes inside a running provider maintenance window; the validator pays them no incentive from either pool, rented or not. `RentedExecutorsResponse.maintenance_windows_by_executor` (optional, default empty): executor_id → `MaintenanceWindow` (UTC `starting_at`, `expiring_at`, half-open); the validator fails a node with `PROVIDER_MAINTENANCE` when its cycle started inside the window.
 - `1.16.0` — `ResetPodGpuRequest` (backend → validator; `local_volume_path` optional, needed for a pod with an encrypted volume) and its answer `PodGpuResetResult` with `GpuResetErrorCode` and `GpuResetOutcome` (a renter resets their pod's GPUs; the validator stops the container, runs `nvidia-smi -r -i` on the pod's GPUs only and starts it again).
 - `2.0.0` — `RentedExecutorsResponse.renter_hardware_fault_executor_ids` removed: the validator no longer reads it and the backend never sent it. Both sides ignore unknown keys, so a 1.x peer that still sends or expects it keeps working.
+- `1.18.0` — `ContainerCreateRequest.whole_host` (optional): False when the backend rents the pod part of its host. The validator then hands it no host-wide devices even if every GPU the host shows is in the request. An older validator ignores it.
 - `1.0.0` — first release.
 
 ## Tests
