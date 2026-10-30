@@ -39,8 +39,8 @@ def loopback_plugin_probe_marker_path(alias: str) -> str | None:
     # without it is not handed out (the probe may have been cut short, or the plugin enabled by
     # hand). None for v2 and the legacy plugin, which run no probe. Lives beside the lock, so an
     # executor restart costs one probe. The path is read by the backend's health check too, so it
-    # stays fixed; the file holds the pinned digest and the plugin's ID, so a newly pinned build or
-    # a reinstalled plugin is probed again.
+    # stays fixed; the file holds the pinned digest and the plugin's ID and settings, so a newly
+    # pinned build, a reinstalled plugin or one moved to another data directory is probed again.
     if alias != LOOPBACK_PLUGIN_V3_ALIAS:
         return None
     return f"/run/lock/lium-loopback-{LOOPBACK_PLUGIN_BUILDS[alias].generation}.probe-ok"
@@ -69,6 +69,8 @@ DISABLE_TRIES = 3
 # took: the removals before and after it, every disable try with its pause, and 5 s for the shell and
 # Python starting before the clock above and the probe's 1 s timeout floors
 PROBE_RESERVE_SECONDS = 4 * CLEANUP_SECONDS + DISABLE_TRIES * (DISABLE_TRY_SECONDS + 1) + 5
+# the validator's state check prints the same: the ID changes with every install, DATA_DIR with `plugin set`
+INSTALLATION_FORMAT = "{{.Id}} {{json .Settings.Env}}"
 
 def end_on_validator_deadline(*_):
     # the validator ends this script with `timeout -k 5`: the reason goes out before the cleanup
@@ -180,6 +182,13 @@ def remove_plugin_of_another_build(plugin):
     if call("rm", plugin["Id"]).returncode:
         raise RuntimeError("the earlier build of the plugin could not be removed")
 
+def probe_proof():
+    # what a passed probe proved: this build, this installation of it, mounting in this data directory
+    result = call("inspect", "--format", INSTALLATION_FORMAT, alias)
+    if result.returncode:
+        raise RuntimeError("plugin inspect failed")
+    return digest + " " + result.stdout.strip()
+
 def inspect():
     result = call("inspect", alias)
     if result.returncode:
@@ -198,13 +207,14 @@ try:
     with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         # the backend's health check tests the marker's existence only: a marker of another build goes
-        # before anything below can fail, and one of another installation (the plugin absent, or
-        # removed and installed again) once inspect shows it, so both sides see the same fallback
+        # before anything below can fail, and one of another installation (the plugin absent, removed
+        # and installed again, or set to another data directory) once inspect shows it, so both sides
+        # see the same fallback
         if probe_image and read_probe_marker().split(" ")[0] != digest:
             remove_probe_marker()
         plugin = inspect()
-        if probe_image and (plugin is None or read_probe_marker() != digest + " " + plugin["Id"]):
-            remove_probe_marker()
+        if probe_image and os.path.exists(marker_path) and (plugin is None or read_probe_marker() != probe_proof()):
+            os.remove(marker_path)
         if plugin is not None and probe_image and read_saved_config(plugin["Id"]).get("Manifest") != digest:
             # an earlier pinned build under this alias (lium7 once lium8 is pinned) is replaced once
             # no volume uses it, else every setup refuses its manifest and the host never moves on
@@ -231,10 +241,8 @@ try:
             plugin = inspect()
         if not plugin or plugin["Id"] != plugin_id or plugin["Enabled"] is not True:
             raise RuntimeError("verified plugin remains disabled")
-        # the plugin's ID changes with every install and its data directory is fixed at install, so
-        # the proof covers this installation and the directory the probe volume was written to
-        probe_proof = digest + " " + plugin_id
-        if probe_image and read_probe_marker() != probe_proof:
+        verified_probe_proof = probe_proof() if probe_image else None
+        if verified_probe_proof is not None and read_probe_marker() != verified_probe_proof:
             # also for a plugin found enabled: an enabled plugin without the marker was never proven
             # to mount (a probe cut short by the validator's deadline, one enabled by hand)
             try:
@@ -247,7 +255,7 @@ try:
                     reason += "; " + str(disable_error)
                 raise RuntimeError(reason) from None
             with open(marker_path, "w") as marker:
-                marker.write(probe_proof)
+                marker.write(verified_probe_proof)
         print("verified plugin ready")
 except Exception as error:
     # Do not echo a remote banner, registry credentials, or arbitrary filesystem contents.

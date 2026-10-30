@@ -631,9 +631,17 @@ async def test_create_container_probe_failure_takes_the_per_command_path(svc, mo
         ("true", None, "unverified"),
         ("true", "old", "unverified"),
         ("true", "another-install", "unverified"),
+        ("true", "another-data-dir", "unverified"),
         ("false", None, "false"),
     ],
-    ids=["probed", "enabled-unprobed", "enabled-probed-as-old-build", "enabled-probed-as-another-install", "disabled"],
+    ids=[
+        "probed",
+        "enabled-unprobed",
+        "enabled-probed-as-old-build",
+        "enabled-probed-as-another-install",
+        "enabled-probed-in-another-data-dir",
+        "disabled",
+    ],
 )
 def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marker(
     tmp_path, enabled, marker, expected
@@ -641,17 +649,21 @@ def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marke
     # an enabled v3 is handed out by the fast path only once the setup script's probe volume mounted
     # on it: a probe cut short by the validator's deadline leaves the plugin enabled without the
     # marker, and the next create must probe again instead of renting on it (reread, 27.10). The
-    # marker holds the digest and the plugin ID it was written for: the marker of another build, or of
-    # a plugin since removed and installed again, does not count (review, 30.10)
+    # marker holds the digest, plugin ID and Env it was written for: the marker of another build, of a
+    # plugin since removed and installed again, or set to another data directory, does not count
+    # (review, 30.10)
+    installation = "a" * 64 + ' ["DATA_DIR=/srv/var/lib/docker/vloopback-v3"]'
     docker = tmp_path / "docker"
-    docker.write_text(f'#!/bin/sh\ncase "$*" in *.Id*) echo {"a" * 64} ;; *) echo {enabled} ;; esac\n')
+    docker.write_text(f"#!/bin/sh\ncase \"$*\" in *.Id*) echo '{installation}' ;; *) echo {enabled} ;; esac\n")
     docker.chmod(0o700)
     marker_path = tmp_path / "probe-ok"
     digest = LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest
     if marker == "current":
-        marker_path.write_text(f"{digest} {'a' * 64}")
+        marker_path.write_text(f"{digest} {installation}")
     elif marker == "another-install":
-        marker_path.write_text(f"{digest} {'b' * 64}")
+        marker_path.write_text(f"{digest} {installation.replace('a', 'b')}")
+    elif marker == "another-data-dir":
+        marker_path.write_text(f"{digest} {installation.replace('vloopback-v3', 'moved')}")
     elif marker == "old":
         marker_path.write_text("sha256:" + "0" * 64)
     command = (

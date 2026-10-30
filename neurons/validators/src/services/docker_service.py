@@ -712,16 +712,18 @@ def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
     if marker_path is None:
         return plugin_state_command
     # "true" only once the setup script's probe volume mounted on this installation of this pinned
-    # build (the marker holds its digest and the plugin's ID); an enabled plugin still being probed,
-    # whose probe was cut short, probed as an earlier build or installed again by hand reads
-    # "unverified" and goes through setup
+    # build (the marker holds its digest and the plugin's ID and settings, printed as the script
+    # prints them); an enabled plugin still being probed, whose probe was cut short, probed as an
+    # earlier build, installed again or set to another data directory reads "unverified" and goes
+    # through setup
     digest = LOOPBACK_PLUGIN_BUILDS[loopback_plugin_alias].digest
-    plugin_id_command = (
-        f"/usr/bin/docker plugin inspect --format '{{{{.Id}}}}' {shlex.quote(loopback_plugin_alias)} 2>/dev/null"
+    installation_command = (
+        "/usr/bin/docker plugin inspect --format '{{.Id}} {{json .Settings.Env}}' "
+        f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null"
     )
     return (
         f'state="$( {plugin_state_command})"; '
-        f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != "{digest} $({plugin_id_command})" ]; '
+        f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != "{digest} $({installation_command})" ]; '
         'then echo unverified; else echo "$state"; fi'
     )
 

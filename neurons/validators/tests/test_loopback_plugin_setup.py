@@ -16,8 +16,14 @@ from services.loopback_plugin_setup import (
     loopback_plugin_setup_command,
 )
 
-# what the setup writes once its probe volume mounted: the pinned digest and the fake plugin's ID
-_PROBE_PROOF = LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest + " " + "a" * 64
+
+def _probe_proof(tmp_path: Path, plugin_id: str = "a" * 64, data_dir_suffix: str = "") -> str:
+    # what the setup writes once its probe volume mounted: the pinned digest, the fake plugin's ID and Env
+    env = [
+        "DATA_DIR=/srv" + str(tmp_path) + "/vloopback-v3" + data_dir_suffix,
+        "STATE_DIR=/srv/run/docker-volume-loopback-v3",
+    ]
+    return LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest + " " + plugin_id + " " + json.dumps(env, separators=(",", ":"))
 
 _FAKE_DOCKER = r"""
 import json
@@ -98,6 +104,10 @@ if action == "inspect":
     if not state.get("installed"):
         print("Error response from daemon: No such plugin: " + sys.argv[3], file=sys.stderr)
         sys.exit(1)
+    if sys.argv[3] == "--format":
+        # what `{{.Id}} {{json .Settings.Env}}` prints: Go's json, no spaces
+        print(plugin()["Id"] + " " + json.dumps(plugin()["Settings"]["Env"], separators=(",", ":")))
+        sys.exit(0)
     print(json.dumps([plugin()]))
 sys.exit(state.get(action + "_exit", 0))
 """
@@ -134,8 +144,9 @@ def _setup_arguments(
     if arguments[-1]:
         arguments[-1] = str(tmp_path / "probe-ok")
         marker_content = {
-            "current": f"{digest} {'a' * 64}".encode(),
-            "another-install": f"{digest} {'b' * 64}".encode(),
+            "current": _probe_proof(tmp_path).encode(),
+            "another-install": _probe_proof(tmp_path, plugin_id="b" * 64).encode(),
+            "another-data-dir": _probe_proof(tmp_path, data_dir_suffix="-moved").encode(),
             "old": b"sha256:" + b"0" * 64,
             "empty": b"",
             "binary": b"\xff",
@@ -214,6 +225,7 @@ async def test_setup_verifies_download_before_enable_and_preserves_existing_plug
         ({"installed": True, "enabled": True, "marker_before": "current"}, True, 0, 0),
         ({"installed": True, "enabled": True, "marker_before": "old"}, True, 1, 0),
         ({"installed": True, "enabled": True, "marker_before": "another-install"}, True, 1, 0),
+        ({"installed": True, "enabled": True, "marker_before": "another-data-dir"}, True, 1, 0),
         ({"marker_before": "current"}, True, 1, 0),
         ({"run_exit": 1}, False, 1, 1),
         ({"volume_create_exit": 1}, False, 0, 1),
@@ -226,6 +238,7 @@ async def test_setup_verifies_download_before_enable_and_preserves_existing_plug
         "enabled-probed",
         "enabled-probed-as-old-build",
         "enabled-probed-as-another-install",
+        "enabled-probed-in-another-data-dir",
         "absent-with-a-current-marker",
         "mount-refused",
         "create-refused",
@@ -243,9 +256,10 @@ async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it
     # install and enable never reach: the plugin must not stay enabled there, or every create and
     # the backend's health check would pick it (review, 27.10). A plugin found enabled is probed
     # too unless the marker of a passed probe is there (a probe the validator's deadline cut short
-    # left the plugin enabled; reread, 27.10). The marker holds the pinned digest and the plugin's
-    # ID: one left by an earlier build or by an installation since removed proves nothing about this
-    # one, which is probed and the marker rewritten once it mounts (review, 30.10)
+    # left the plugin enabled; reread, 27.10). The marker holds the pinned digest and the plugin's ID
+    # and Env: one left by an earlier build, by an installation since removed or for another data
+    # directory proves nothing about this one, which is probed and the marker rewritten once it
+    # mounts (review, 30.10)
     arguments = _setup_arguments(tmp_path, overrides)
 
     result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
@@ -268,7 +282,7 @@ async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it
     assert all("size=1g" in call and "sparse=true" in call for call in creates)
     assert (tmp_path / "probe-ok").exists() is success
     if success:
-        assert (tmp_path / "probe-ok").read_text() == _PROBE_PROOF
+        assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
     if not success:
         assert "probe volume" in result.stderr
         if overrides.get("disable_exit"):
@@ -300,7 +314,7 @@ def test_setup_removes_a_marker_of_another_build_before_it_can_fail(
     assert (result.returncode == 0) is (not probed or run_exit == 0), result.stderr
     marker = tmp_path / "probe-ok"
     if result.returncode == 0:
-        assert marker.read_text() == _PROBE_PROOF
+        assert marker.read_text() == _probe_proof(tmp_path)
     else:
         assert not marker.exists()
         assert ("could not be disabled" in result.stderr) is bool(disable_exit)
@@ -319,7 +333,7 @@ def test_setup_reclaims_a_probe_container_an_earlier_setup_abandoned(tmp_path: P
     state = json.loads((tmp_path / "state.json").read_text())
     assert [result.returncode for result in results] == [0, 0], [result.stderr for result in results]
     assert state["containers"] == []
-    assert (tmp_path / "probe-ok").read_text() == _PROBE_PROOF
+    assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
     calls = state["calls"]
     assert sum(call[0] == "run" for call in calls) == 1
     first_rm = next(i for i, call in enumerate(calls) if call[:2] == ["rm", "-f"])
@@ -393,7 +407,7 @@ def test_setup_replaces_an_earlier_v3_build_that_owns_no_volumes(tmp_path: Path)
     plugin_actions = [call[1] for call in _plugin_calls(tmp_path)]
     assert plugin_actions[plugin_actions.index("disable") :].count("install") == 1
     assert plugin_actions.index("disable") < plugin_actions.index("rm") < plugin_actions.index("install")
-    assert (tmp_path / "probe-ok").read_text() == _PROBE_PROOF
+    assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
 
 
 def test_setup_replaces_an_earlier_v3_build_whose_only_volume_is_an_abandoned_probe(tmp_path: Path) -> None:
@@ -415,7 +429,7 @@ def test_setup_replaces_an_earlier_v3_build_whose_only_volume_is_an_abandoned_pr
     plugin_actions = [call[1] for call in _plugin_calls(tmp_path)]
     assert plugin_actions.index("rm") < plugin_actions.index("install")
     assert json.loads((tmp_path / "state.json").read_text())["volumes"] == {}
-    assert (tmp_path / "probe-ok").read_text() == _PROBE_PROOF
+    assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
 
 
 def test_setup_keeps_an_earlier_v3_build_that_still_owns_volumes(tmp_path: Path) -> None:
