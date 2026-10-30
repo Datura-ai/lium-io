@@ -217,6 +217,9 @@ class Settings(BaseSettings):
     # is zeroed (every pool, spot pay and referral), and the share they would have taken is
     # left to burn. Empty (the default) changes nothing. Burner hotkeys are never affected.
     SCORING_EXCLUDED_HOTKEYS: str = Field(env="SCORING_EXCLUDED_HOTKEYS", default="")
+    # Comma-separated miner hotkeys whose unrented (idle) executors earn no incentive, same format
+    # and effect as SCORING_EXCLUDED_HOTKEYS but only while not rented; rented GPUs score as usual.
+    IDLE_INCENTIVE_EXCLUDED_HOTKEYS: str = Field(env="IDLE_INCENTIVE_EXCLUDED_HOTKEYS", default="")
 
     # DAH-2251 — referral incentive paid via emission, to referrer hotkeys weighted by
     # the backend's epoch-stable EMA feed. There is no funding wallet, so unlike the
@@ -366,12 +369,6 @@ class Settings(BaseSettings):
     # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
     # matched on the reported list until this is flipped from a week of clean fleet data.
     KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
-    # DAH-4547 - HardwareIdentityCheck: DMI files not served by sysfs (a cloak script's overlay), the
-    # kernel and NVML GPU lists disagreeing, or DMI identity changing under an unchanged GPU set.
-    # Shadow by default: the finding is logged as a warning event and the node passes.
-    HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED: bool = Field(
-        env="HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED", default=False
-    )
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count); a kernel list that is
@@ -543,6 +540,8 @@ class Settings(BaseSettings):
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
+    # DiskSpaceCheck: free-space floor for an idle node, matching the renter listing of the same environment
+    MIN_FREE_DISK_GB: int = Field(env="MIN_FREE_DISK_GB", default=50, ge=0)
     # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
     # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
     # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
@@ -782,6 +781,9 @@ class Settings(BaseSettings):
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
+
+    def get_idle_incentive_excluded_hotkeys(self) -> set[str]:
+        return {s.strip() for s in self.IDLE_INCENTIVE_EXCLUDED_HOTKEYS.split(",") if s.strip()}
 
     # DAH-2958 — express lane for never-validated executors. A new node is published only by
     # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and

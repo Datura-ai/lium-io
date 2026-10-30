@@ -5,6 +5,7 @@ from .capability import CapabilityCheck
 from .collateral_status import CollateralStatusCheck
 from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
+from .disk_space import DiskSpaceCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
@@ -64,6 +65,7 @@ __all__ = [
     "CollateralStatusCheck",
     "CpuTruthCheck",
     "DiskHealthCheck",
+    "DiskSpaceCheck",
     "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",

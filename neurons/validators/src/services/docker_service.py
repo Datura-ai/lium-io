@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 import asyncssh
 import bittensor
 import redis.exceptions
+from clients.backend_client import BackendClient
 from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
@@ -558,9 +559,13 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
+# DAH-5392: bounds the backend's rental-active answer for an unlisted pod in a create's sweep; no answer keeps the pod
+_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
+# a filler the probe found not exiting may still be removed by dockerd before the cleanup deadline: re-list this often
+_STUCK_FILLER_RELIST_SECONDS = 3
 # DAH-5019: a filler's rm takes 1-2 s, but on some hosts its killed processes take 12-60 s to exit (GPU teardown)
 # and dockerd waits for that; the customer needs only that they are exiting, so the settle step reads it this soon
 _FILLER_ONLY_RM_TIMEOUT_SECONDS = 5
@@ -2547,8 +2552,10 @@ class DockerService:
         redis_service: Annotated[RedisService, Depends(RedisService)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
         rental_docker_client_factory: RentalDockerSdkClientFactory | None = None,
+        backend_client: BackendClient | None = None,
     ):
         self.ssh_service = ssh_service
+        self.backend_client = backend_client
         self.redis_service = redis_service
         self.attestation_service = attestation_service
         self.rental_docker_client_factory = (
@@ -4235,6 +4242,10 @@ class DockerService:
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
+        DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
+        backend confirms its rental closed: a create that waited may sweep after a newer create on the
+        same node, whose pod its older ``active_container_names`` do not name.
+
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
         ``refuse_before_removal`` gets the listing's names before anything is removed and may raise to
@@ -4299,6 +4310,12 @@ class DockerService:
                 if removed_id is not None and listed_ids.get(name) in (None, removed_id):
                     continue
                 stale_containers.append(name)
+            # DAH-5392: an unlisted pod_* may be a newer create's pod on a split node (this create's list was
+            # built before it); it goes only when the backend confirms its rental closed
+            unlisted_pods = [name for name in stale_containers if name != pod_name and name.startswith(POD_CONTAINER_PREFIX)]
+            if unlisted_pods:
+                closed = await self._pods_with_closed_rental(unlisted_pods, default_extra)
+                stale_containers = [name for name in stale_containers if name not in unlisted_pods or name in closed]
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return []
@@ -4340,6 +4357,38 @@ class DockerService:
                 report.removed_cleanly_without_volume_rm = removed_cleanly and not volumes_to_remove
             return stale_containers
         return []
+
+    async def _pods_with_closed_rental(self, names: list[str], default_extra: dict) -> set[str]:
+        """The ``names`` whose rental the backend confirms closed, plus names that are not `pod_<uuid>` (the
+        backend names every pod it creates after the pod's uuid, so such a name is no newer create's pod).
+        No backend client, no answer, an error or a timeout keeps the pod: a removal cannot be undone."""
+
+        async def closed(name: str) -> bool:
+            pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
+            try:
+                UUID(pod_id)
+            except ValueError:
+                return True
+            if self.backend_client is None:
+                return False
+            try:
+                async with asyncio.timeout(_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS):
+                    answer = await self.backend_client.get_pod_rental_active(pod_id)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Unlisted pod kept: its rental could not be read",
+                        extra=get_extra_info({**default_extra, "container_name": name, "error_type": exc.__class__.__name__}),
+                    )
+                )
+                return False
+            return answer is not None and not answer.active
+
+        answers = await asyncio.gather(*(closed(name) for name in names))
+        kept = [name for name, is_closed in zip(names, answers) if not is_closed]
+        if kept:
+            logger.info(_m("Keeping unlisted pods whose rental is not confirmed closed", extra=get_extra_info({**default_extra, "container_names": kept})))
+        return {name for name, is_closed in zip(names, answers) if is_closed}
 
     @staticmethod
     async def _remove_volumes(ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]) -> None:
@@ -4569,7 +4618,7 @@ class DockerService:
         if timeout_error is not None:
             if fillers_only:
                 return await self._settle_stuck_filler_removal(
-                    ssh_client, default_extra, stale_containers, targets, timeout_error
+                    ssh_client, default_extra, stale_containers, targets, timeout_error, cleanup_deadline
                 )
             raise Exception(
                 f"[clean_existing_containers] docker rm -fv did not finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
@@ -4610,7 +4659,7 @@ class DockerService:
             # DAH-5012 (22 Oct 22:32Z, 8x aad247c2): the rm of our filler can also exit 1 and then its retry hang
             if stale_containers and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in stale_containers):
                 return await self._settle_stuck_filler_removal(
-                    ssh_client, default_extra, stale_containers, targets, exc
+                    ssh_client, default_extra, stale_containers, targets, exc, cleanup_deadline
                 )
             raise Exception(
                 "[clean_existing_containers] the steps after a failed docker rm -fv did not finish in "
@@ -4625,6 +4674,7 @@ class DockerService:
         fillers: list[str],
         targets: list[str],
         timeout_error: TimeoutError,
+        cleanup_deadline: float,
     ) -> CustomerContainerRemoval:
         """DAH-5012: a customer create's `docker rm -fv` of our fillers did not finish in time. In prod (22 Oct,
         ENGY_TEE fillers on 8x B300) dockerd kept removing them: one went 62 s after the rm was sent, the
@@ -4633,7 +4683,11 @@ class DockerService:
         So the filler processes are killed directly and read once (bounded): when dockerd is visible and every
         process left is exiting (PF_EXITING, or a zombie) the filler can run nothing more, dockerd finishes
         the removal, and the create goes on. Otherwise the create fails at its own step,
-        FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours."""
+        FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours.
+
+        Before failing, the listing is read again until ``cleanup_deadline``: a filler gone from it was removed
+        by dockerd (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still pending, and
+        dockerd removed it about 30 s after the rm, 4 s after the create had already failed)."""
         error = (
             f"[clean_existing_containers] docker rm -fv of filler {fillers} did not finish in time"
         )
@@ -4679,9 +4733,35 @@ class DockerService:
             )
         )
         if not exiting:
-            raise _FillerRemovalStuck(f"{error}; a filler process is not exiting after SIGKILL") from timeout_error
+            listing = await self._listing_once_gone(ssh_client, targets, cleanup_deadline)
+            if listing is None:
+                raise _FillerRemovalStuck(f"{error}; a filler process is not exiting after SIGKILL") from timeout_error
+            logger.info(
+                _m(
+                    "Stuck filler removed by dockerd before the customer create's cleanup deadline",
+                    extra=get_extra_info({**default_extra, "container_names": fillers}),
+                )
+            )
+            return CustomerContainerRemoval(False, listing)
         fillers_exiting_after_kill.update(targets)
         return CustomerContainerRemoval(False, await self._list_all_containers(ssh_client))
+
+    async def _listing_once_gone(
+        self, ssh_client: asyncssh.SSHClientConnection, targets: list[str], deadline: float
+    ) -> ContainerListing | None:
+        """The host listing once none of ``targets`` is on it, read every few seconds until ``deadline``; None if
+        they are still listed (or the host cannot be listed) by then."""
+        loop = asyncio.get_running_loop()
+        while (remaining := deadline - loop.time()) > 0:
+            await asyncio.sleep(min(_STUCK_FILLER_RELIST_SECONDS, remaining))
+            try:
+                async with asyncio.timeout_at(deadline):
+                    listing = await self._list_all_containers(ssh_client)
+            except TimeoutError:
+                return None
+            if listing is not None and not set(targets) & (set(listing[0]) | set(listing[1].values())):
+                return listing
+        return None
 
     @staticmethod
     async def _rm_containers(
