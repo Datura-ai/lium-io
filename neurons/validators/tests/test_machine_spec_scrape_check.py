@@ -698,6 +698,14 @@ async def test_a_failed_vloopback_test_changes_no_stored_spec(context_factory):
     assert result.updates["state"].supports_gpu_splitting is True
 
 
+@pytest.mark.asyncio
+async def test_a_provider_reported_port_grace_marker_is_dropped(context_factory):
+    # DAH-3698: the marker is PortConnectivityCheck's; a provider-sent one would bypass the split-remainder port gate
+    result = await _scrape_ok_event_for(context_factory, {"port_verify_first_miss": True})
+
+    assert "port_verify_first_miss" not in result.updates["state"].specs
+
+
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
 # failure no host fault can produce, and none of these qualifies).

@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
-from services.const import DEFAULT_JOB_OWNER_LIUM
+from services.const import DEFAULT_JOB_OWNER_LIUM, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
 from services.redis_service import VerifiedPortsMemory
 
@@ -167,7 +167,8 @@ class PortConnectivityCheck:
         updated_state = replace(
             ctx.state,
             specs={
-                **ctx.state.specs,
+                # DAH-3698: the grace marker is the validator's alone; one the provider's specs carry never survives
+                **{key: value for key, value in ctx.state.specs.items() if key != "port_verify_first_miss"},
                 "sysbox_runtime": result.sysbox_runtime,
                 "verified_ports": [p.external for p in result.successful_ports],
                 **_disk_pressure_spec(gate),
@@ -203,6 +204,14 @@ class PortConnectivityCheck:
             )
         if ports_saved and sysbox_memory.saved:
             _mark_completed_check_saved(readiness_key)
+
+        # status "ok" means at least one port answered; a partial loss is a miss too, or one transient probe
+        # failure would cut a split remainder's idle pay at once
+        if await self._is_first_port_verify_miss(ctx, ok=result.status == "ok" and not result.failed_ports):
+            extra_info["port_verify_first_miss"] = True
+            updated_state = replace(
+                updated_state, specs={**updated_state.specs, "port_verify_first_miss": True}
+            )
 
         total = len(result.successful_ports) + len(result.failed_ports)
         pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
@@ -498,6 +507,24 @@ class PortConnectivityCheck:
             event=event,
             updates={"default_extra": {**extra, **extra_info}, "state": updated_state},
         )
+
+    @staticmethod
+    async def _is_first_port_verify_miss(ctx: Context, *, ok: bool) -> bool:
+        """DAH-3698: the first failed verification inside the window is not a verdict on the
+        node's ports; the split-remainder port gate skips that cycle. A repeat inside the window
+        counts, even with passes in between: a pass never clears the record, or alternating a
+        pass and a failure would earn grace every time. Fails closed (no grace) on a Redis error."""
+        try:
+            if ok:
+                return False
+            return await ctx.services.redis.record_port_verify_miss(
+                ctx.miner_hotkey, ctx.executor.uuid, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
+            )
+        except Exception as e:  # noqa: BLE001 — never fail the port check over the grace
+            logger.warning(
+                _m("port verify miss record unavailable", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+            )
+            return False
 
     @staticmethod
     async def _should_keep_last_known_sysbox(
