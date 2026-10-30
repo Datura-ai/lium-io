@@ -58,9 +58,10 @@ import sys
 import time
 
 docker, alias, tag, digest, generation, probe_image, root, host_root, lock_path, marker_path = sys.argv[1:]
-# once the plugin is enabled, a failed probe still disables it inside the validator's 150 s deadline:
-# 2 leftover removals + the probe + 2 cleanup removals + the disable tries is 133 s. Install and enable
-# before it keep run_docker's 120 s cap; when they run into the deadline, the handler below says so
+# on a plugin that was already enabled when the script started, a failed probe still disables it inside
+# the validator's 150 s deadline: 2 leftover removals + the probe + 2 cleanup removals + the disable tries
+# is 133 s. After a fresh install and enable (run_docker's 120 s cap each) less of the deadline is left and
+# the disable tries can be cut; the SIGTERM handler below then says so on stderr
 PROBE_SECONDS = 60
 CLEANUP_SECONDS = 10
 DISABLE_TRY_SECONDS = 10
