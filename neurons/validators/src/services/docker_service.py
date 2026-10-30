@@ -1273,8 +1273,13 @@ class DockerLoginFailed(RentalDockerOperationError):
     def __init__(self, text: str, login_error: str):
         # read the response only: rental_docker_sdk prefixes "Docker SDK login for <registry> failed: ", and URLs
         # carry the registry host too, so a registry named "unauthorized.example" proves nothing
-        response = login_error.split(" failed: ", 1)[-1]
+        head, sep, response = login_error.partition(" failed: ")
+        if not sep:
+            response = login_error
+        registry = head.partition(" for ")[2].strip().lower() if sep else ""
         lowered = re.sub(r"\S+://\S+", " ", response).lower()
+        if registry:  # a DNS error names the bare host ("lookup <registry>: no such host")
+            lowered = lowered.replace(registry, " ")
         if any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
             self.renter_sentence = (
                 "Docker login refused by the image registry: check the template's registry credentials"

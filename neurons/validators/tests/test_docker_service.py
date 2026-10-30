@@ -4092,6 +4092,11 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
             "Docker login to the image registry failed",
         ),
         (
+            "Docker SDK login for unauthorized.example failed: 500 Server Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://unauthorized.example/v2/": dial tcp: lookup unauthorized.example: no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
             "Docker SDK login for unauthorized.example failed: 401 Client Error: unauthorized: authentication required",
             "Docker login refused by the image registry: check the template's registry credentials",
         ),
