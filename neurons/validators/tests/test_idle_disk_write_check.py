@@ -171,12 +171,11 @@ async def test_the_last_reading_goes_to_the_backend_every_cycle_until_the_next()
         res = await IdleDiskWriteCheck().run(ctx)
         assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
 
-        for rented_data in (None, POD):  # not due, then rented: the stored reading still rides along
-            ctx2, runner, _ = make_ctx(clock, rented_data=rented_data, due=False)
-            ctx2.services.redis.store.update(redis.store)
-            res = await IdleDiskWriteCheck().run(ctx2)
-            assert writes(runner) == 0
-            assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
+        ctx2, runner, _ = make_ctx(clock, due=False)  # not due: the stored reading still rides along
+        ctx2.services.redis.store.update(redis.store)
+        res = await IdleDiskWriteCheck().run(ctx2)
+        assert writes(runner) == 0
+        assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
 
 
 async def test_a_node_left_unmeasured_for_days_keeps_its_reading():
@@ -197,12 +196,8 @@ async def test_a_node_left_unmeasured_for_days_keeps_its_reading():
     assert (key, module._READING_TTL_SECONDS) in expiries
 
 
-async def test_skips_a_node_rented_at_cycle_start_or_since():
+async def test_skips_a_node_rented_since_cycle_start():
     with flags() as clock:
-        ctx, runner, _ = make_ctx(clock, rented_data=POD)
-        await IdleDiskWriteCheck().run(ctx)
-        assert not runner.commands
-
         ctx, runner, _ = make_ctx(clock, IDLE, fresh=POD)
         await IdleDiskWriteCheck().run(ctx)
         assert writes(runner) == 0

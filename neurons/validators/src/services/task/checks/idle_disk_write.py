@@ -52,8 +52,10 @@ class IdleDiskWriteCheck:
     fsync into its writable layer. Logs IDLE_DISK_WRITE with the MB/s, the card, the provider and a shadow verdict
     (fail under RENTED_THROUGHPUT_DISK_MIN_MB_PER_S). Always passes: IDLE_DISK_WRITE_ENFORCE_ENABLED is read by nothing.
     A node running a filler counts as busy from IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S (sectors read plus written): a
-    filler moving its disk under the rented busy line would otherwise lower the reading. DAH-5385: every cycle the last
-    reading goes to the backend as specs[SPECS_KEY]; filler start keeps the big fillers off a slow disk.
+    filler moving its disk under the rented busy line would otherwise lower the reading. DAH-5385: every cycle that
+    reaches this check sends the last reading to the backend as specs[SPECS_KEY]; filler start keeps the big fillers
+    off a slow disk. A rented node never gets here (TenantEnforcementCheck halts its cycle earlier), so its cycles send
+    no reading and the backend holds the last one it had.
     """
 
     check_id = "executor.validate.idle_disk_write"
@@ -62,16 +64,11 @@ class IdleDiskWriteCheck:
     async def run(self, ctx: Context) -> CheckResult:
         if not settings.IDLE_DISK_WRITE_CHECK_ENABLED:
             return self._result(ctx, "IDLE_DISK_WRITE_CHECK_ENABLED is off")
-        rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        if rented_executor is not None and rented_executor.pods:
-            reason = "rented"
-        else:
-            try:
-                reason = await self._measure(ctx)
-            except Exception:  # noqa: BLE001 — shadow only: nothing it hits may change the result
-                logger.warning(_m("Idle disk write: probe failed", extra=get_extra_info(ctx.default_extra)))
-                reason = "probe failed"
+        try:
+            reason = await self._measure(ctx)
+        except Exception:  # noqa: BLE001 — shadow only: nothing it hits may change the result
+            logger.warning(_m("Idle disk write: probe failed", extra=get_extra_info(ctx.default_extra)))
+            reason = "probe failed"
         return self._result(ctx, reason, await _last_reading(ctx))
 
     async def _measure(self, ctx: Context) -> str:
@@ -134,12 +131,12 @@ class IdleDiskWriteCheck:
             # the docker root's disks are not resolvable (btrfs/zfs, no host view): no later cycle reads them either
             await redis.set(key, str(now), ex=2 * INTERVAL_SECONDS)
             return "docker root disk not resolvable"
-        busy_from = (
+        busy_line_mb_per_s = (
             settings.IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S
             if _has_filler(ctx)
             else settings.RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S
         )
-        if disk_busy >= busy_from:
+        if disk_busy >= busy_line_mb_per_s:
             return f"disk busy ({disk_busy:.0f} MB/s)"
         fresh = await ctx.services.backend.get_rented_executors_now()
         if fresh is None:
