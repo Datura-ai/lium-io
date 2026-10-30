@@ -9270,6 +9270,7 @@ class DockerService:
                     executor_id=payload.executor_id,
                     default_extra=default_extra,
                     host_probe=host_probe,
+                    whole_host=payload.whole_host,
                 )
 
                 if payload.cluster_membership is not None:
