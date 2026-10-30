@@ -646,8 +646,8 @@ async def test_an_8_gpu_split_node_needs_its_ports_once_every_listed_pod_is_stal
 
 @pytest.mark.asyncio
 async def test_a_split_node_with_every_port_open_passes_when_its_only_listed_pod_is_stale(context_factory):
-    """Rented at the snapshot, the probe still goes on to the tier that reaches every port, so the stale-pod
-    branch judges the node's real count and does not hide a node that has all its ports open."""
+    """Rented at the snapshot, the cycle's probe stops at the floor; the stale-pod branch re-probes to the split
+    target, so a node that has all its ports open is not hidden."""
     from dataclasses import replace
 
     ctx = run_context(
@@ -666,7 +666,6 @@ async def test_a_split_node_with_every_port_open_passes_when_its_only_listed_pod
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
     assert count_result.passed is True
-    assert ctx.state.specs["available_port_count"] >= 24
     assert tenant_result.passed is True
 
 

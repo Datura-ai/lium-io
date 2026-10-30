@@ -144,3 +144,24 @@ async def test_port_probe_keeps_the_best_tier_for_a_short_split_node(mocker):
 
     assert list(result.successful) == ports[:5]
     assert result.tier == "batch"
+
+
+@pytest.mark.asyncio
+async def test_port_probe_stops_once_every_selected_port_answered(mocker):
+    # fewer ports selected than a split node needs (a rental holds the rest): all 21 answered, so no later tier runs
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(21)]
+    batch = mocker.Mock()
+    batch.verify = mocker.AsyncMock(return_value=BatchResult(ports, []))
+    semi = mocker.Mock()
+    semi.verify = mocker.AsyncMock()
+    fallback = mocker.Mock()
+    fallback.verify = mocker.AsyncMock()
+
+    result = await PortProbe(batch, semi, fallback).probe(
+        ports, ssh_client=mocker.Mock(), host="127.0.0.1", min_ports=24
+    )
+
+    assert list(result.successful) == ports
+    assert result.tier == "batch"
+    semi.verify.assert_not_called()
+    fallback.verify.assert_not_called()

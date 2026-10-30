@@ -46,9 +46,10 @@ class PortProbe:
         tier = "batch"
 
         def short(ok) -> bool:
-            # a split node (min_ports above the floor) keeps probing until it has its ports; the tier that
-            # verified most wins. Otherwise a later tier runs only when the earlier one verified nothing.
-            return not ok or (min_ports > MIN_PORT_COUNT and len(ok) < min_ports)
+            # a split node (min_ports above the floor) keeps probing until it has its ports or every selected port
+            # answered; the tier that verified most wins. Otherwise a later tier runs only when the earlier one
+            # verified nothing.
+            return not ok or (min_ports > MIN_PORT_COUNT and len(ok) < min(min_ports, len(ports)))
 
         if short(successful):
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.

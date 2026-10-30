@@ -65,8 +65,9 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
-            # also when rented at the snapshot: a node whose every listed pod turns out stale is judged on this count
-            min_ports=split_need[1] if split_need else MIN_PORT_COUNT,
+            # a rented node is exempt from the split requirement (PortCountCheck), so only the floor applies;
+            # one whose every listed pod is stale is re-probed to its split target by TenantEnforcementCheck
+            min_ports=split_need[1] if split_need and not rented_executor else MIN_PORT_COUNT,
         )
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
