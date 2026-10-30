@@ -224,8 +224,9 @@ class RentedThroughputCheck:
     DAH-5244: the command also times `sync -f` on the Docker root (host_disk). Under
     DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED a stalling sync leaves the probe container out - its start would wait
     on the same pages - and both sides are no verdict, DISK_PRESSURE_MAX_DEFERRALS readings in a row at most before
-    the probe runs regardless; in shadow the probe runs and the reading says what the verdict would have been
-    (`disk_verdict_shadow`).
+    the probe runs regardless; a probe that does run under pressure measures and logs the disk but judges no disk
+    side (busy, not slow, as the busy window excuses it); in shadow the probe runs and the reading says what the
+    verdict would have been (`disk_verdict_shadow`).
     """
 
     check_id = "host.validate.rented_throughput"
@@ -346,6 +347,12 @@ class RentedThroughputCheck:
         disk_is_busy = (
             disk_busy is None or disk_busy >= settings.RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S
         )
+        # DAH-5244, enforced: a Docker root whose sync stalls is busy, not slow - the dd waited on the tenant's
+        # pages - so a probe that ran under pressure (the skip budget spent or its reservation refused) still
+        # judges no disk side; what `disk_verdict_shadow` promises below is what enforcement delivers
+        disk_under_pressure = (
+            settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED and pressure is not None and pressure.pressure
+        )
 
         judged = await ContainerDownloadSpeedCheck()._judge(endpoints)
         # a bridge fallback (rentals network not inspectable) did not measure the renter's path
@@ -354,7 +361,7 @@ class RentedThroughputCheck:
             net = "none"
         else:
             net = "fail" if judged.is_failing else "pass"
-        if disk_is_busy or disk.mb_per_s is None:
+        if disk_is_busy or disk_under_pressure or disk.mb_per_s is None:
             disk_side = "none"
         else:
             disk_side = (

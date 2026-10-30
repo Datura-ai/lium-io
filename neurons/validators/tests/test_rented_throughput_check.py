@@ -536,17 +536,35 @@ PRESSURED_GOOD = snaps() + _pressure(stalled=True) + disk() + FAST
 
 
 async def test_the_fourth_reading_under_pressure_runs_the_probe_regardless():
-    # bounded like the port check: sustained pressure may not leave the sides unmeasured for good
+    # bounded like the port check: sustained pressure may not leave the probe container unstarted for good; the
+    # forced probe measures the network and logs the disk, whose side stays unjudged under the pressure it read
     with flags(enforce_pressure=True) as clock, patch.dict(module._UNSAVED, clear=True):
         ctx, runner = make_ctx(SKIPPED, SKIPPED, SKIPPED, PRESSURED_GOOD, SKIPPED)
         check = RentedThroughputCheck()
-        outcomes = []
+        results = []
         for _ in range(5):
-            outcomes.append((await check.run(ctx)).event.reason_code)
+            results.append(await check.run(ctx))
             clock.now += 3 * 3600 + 1
     skip_allowed = ["lium_dp_skipped" in cmd for cmd in runner.commands]
     assert skip_allowed == [True, True, True, False, True]
-    assert outcomes == [Msg.UNMEASURED.reason] * 3 + [Msg.OK.reason, Msg.UNMEASURED.reason]
+    assert [r.event.reason_code for r in results] == [Msg.UNMEASURED.reason] * 5
+    forced = results[3].event.what_we_saw
+    assert "probe_skipped" not in forced and forced["network_verdict"] == "pass"
+    assert forced["disk_verdict"] == "none" and forced["disk"]["mb_per_s"] is not None
+
+
+async def test_an_enforced_probe_that_ran_under_pressure_judges_no_disk_side():
+    # the skip budget spent or its reservation refused: the probe runs and its dd waits on the tenant's pages, so
+    # the disk is busy, not slow - what disk_verdict_shadow promises in shadow, enforcement delivers
+    with flags(enforce_pressure=True):
+        ctx, _ = make_ctx(snaps() + _pressure(stalled=True) + disk(secs=30.0) + FAST)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert (net, disk_side) == ("pass", "none")
+    assert reading["disk"]["mb_per_s"] is not None and reading["disk_verdict_shadow"] == "none"
+    with flags(enforce_pressure=True):
+        ctx, _ = make_ctx(snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST)
+        _, _, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert disk_side == "fail"
 
 
 async def test_a_skip_redis_refuses_to_record_runs_the_probe():
@@ -564,7 +582,10 @@ async def test_a_skip_redis_refuses_to_record_runs_the_probe():
             services=build_services(redis=redis),
         )
         res = await RentedThroughputCheck().run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OK.reason
+    # the probe ran: the network is measured, the disk side is unjudged under the pressure it read
+    assert res.passed and res.event.reason_code == Msg.UNMEASURED.reason
+    what = res.event.what_we_saw
+    assert "probe_skipped" not in what and (what["network_verdict"], what["disk_verdict"]) == ("pass", "none")
     assert len(runner.commands) == 1 and "lium_dp_skipped" not in runner.commands[0]
 
 
@@ -573,19 +594,21 @@ FORGED = snaps() + _pressure(stalled=True) + disk(secs=30.0) + FAST + "lium_dp_s
 
 
 @pytest.mark.parametrize(
-    "read_pressure, enforce, recorded, output, disk_verdict",
+    "read_pressure, enforce, recorded, output, disk_verdict, skipped",
     [
-        (True, False, None, FORGED, "fail"),  # enforcement off: no skip offered
-        (False, True, None, FORGED, "fail"),  # reading off: no skip offered
-        (True, True, "refused", FORGED, "fail"),  # the reservation Redis refused to record
-        (True, True, {"at": 0, "probe_skips_in_a_row": 3}, FORGED, "fail"),  # the budget is spent
-        (True, True, None, snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST + "lium_dp_skipped\n", "fail"),
-        (True, True, None, SKIPPED, "none"),  # the skip the validator offered, under the pressure it read
+        (True, False, None, FORGED, "fail", False),  # enforcement off: no skip offered
+        (False, True, None, FORGED, "fail", False),  # reading off: no skip offered
+        # the reservation Redis refused to record, the budget spent: the probe ran; the disk side is unjudged for
+        # the pressure the validator's own sync read, not for the marker
+        (True, True, "refused", FORGED, "none", False),
+        (True, True, {"at": 0, "probe_skips_in_a_row": 3}, FORGED, "none", False),
+        (True, True, None, snaps() + _pressure(stalled=False) + disk(secs=30.0) + FAST + "lium_dp_skipped\n", "fail", False),
+        (True, True, None, SKIPPED, "none", True),  # the skip the validator offered, under the pressure it read
     ],
     ids=["enforcement_off", "reading_off", "reservation_refused", "budget_spent", "no_pressure_read", "offered"],
 )
 async def test_a_skip_marker_the_validator_did_not_offer_grants_nothing(
-    read_pressure, enforce, recorded, output, disk_verdict
+    read_pressure, enforce, recorded, output, disk_verdict, skipped
 ):
     # the host's output cannot grant a skip: the marker counts only in the reading whose command carried it and
     # whose sync stalled; anywhere else it is noise and the rest of the output is judged
@@ -606,6 +629,6 @@ async def test_a_skip_marker_the_validator_did_not_offer_grants_nothing(
 
     what = res.event.what_we_saw
     assert what["disk_verdict"] == disk_verdict
-    assert (what.get("probe_skipped") == "disk pressure") is (disk_verdict == "none")
-    assert what.get("unsolicited_skip_marker", False) is (disk_verdict == "fail")
+    assert (what.get("probe_skipped") == "disk pressure") is skipped
+    assert what.get("unsolicited_skip_marker", False) is (not skipped)
     assert res.event.reason_code == (Msg.UNMEASURED.reason if disk_verdict == "none" else Msg.SLOW_ONCE.reason)
