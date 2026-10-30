@@ -31,8 +31,9 @@ from helpers import build_state
 
 
 @pytest.mark.asyncio
-async def test_the_reset_carries_the_address_this_cycle_checked(context_factory):
-    # DAH-2865: the backend drops a reset that arrives after the node moved to another address under the same id
+async def test_the_reset_carries_the_address_and_cycle_this_check_ran_in(context_factory):
+    # DAH-2865: the backend drops a reset that arrives after the node moved to another address under the same id,
+    # timed by its cycle however late it arrives
     redis = AsyncMock()
     ctx = context_factory(state=build_state()).model_copy(
         update={"clear_verified_job_info": True, "clear_verified_job_evidence": {"reason_code": "SPEC_CHANGED"}}
@@ -46,4 +47,5 @@ async def test_the_reset_carries_the_address_this_cycle_checked(context_factory)
         "reason_code": "SPEC_CHANGED",
         "executor_ip": ctx.executor.address,
         "executor_port": ctx.executor.port,
+        "job_batch_id": ctx.config.job_batch_id,
     }

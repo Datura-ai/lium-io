@@ -197,24 +197,24 @@ class ExecutorService:
             )
 
     def update(self, payload: UpdateExecutorRequest) -> Union[ExecutorUpdated, ExecutorUpdateFailed]:
+        sent = payload.executor
         try:
-            executor = Executor(
-                uuid=payload.executor.uuid,
-                validator=payload.executor.validator,
-                address=payload.executor.address,
-                port=payload.executor.port,
-                price_per_gpu=payload.executor.price_per_gpu,
-            )
-            self.executor_dao.update_by_uuid(executor.uuid, executor)
+            # only the fields the portal sent: an address edit (DAH-2865) carries no price or validator, and must keep
+            # the ones this miner has, which may be newer than the portal's
+            executor = self.executor_dao.find_by_uuid(sent.uuid)
+            for name in ("validator", "address", "port", "price_per_gpu"):
+                if name in sent.model_fields_set:
+                    setattr(executor, name, getattr(sent, name))
+            self.executor_dao.session.commit()
 
-            logger.info("Updated for executor (id=%s)", str(executor.uuid))
+            logger.info("Updated for executor (id=%s)", str(sent.uuid))
             return ExecutorUpdated(
-                executor_id=executor.uuid,
+                executor_id=sent.uuid,
             )
         except Exception as e:
             self.executor_dao.session.rollback()
             return ExecutorUpdateFailed(
-                executor_id=executor.uuid,
+                executor_id=sent.uuid,
                 error=str(e),
             )
 

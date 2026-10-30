@@ -189,6 +189,7 @@ async def test_a_dead_gpu_runtime_on_a_rented_node_marks_the_executor_inactive(
         "scrape_error": "no_gpu_details",
         "executor_ip": ctx.executor.address,
         "executor_port": ctx.executor.port,
+        "job_batch_id": ctx.config.job_batch_id,
     }
     if gpu_scrape_error is not None:
         evidence["gpu_scrape_error"] = gpu_scrape_error
