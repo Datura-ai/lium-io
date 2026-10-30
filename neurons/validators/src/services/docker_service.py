@@ -8603,10 +8603,12 @@ class DockerService:
                             if login_error is None:
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
-                            # pull failure is most likely the login's fault — attribute it
+                            # pull failure is most likely the login's fault — attribute it,
+                            # and lead with the login error: the anonymous pull's "may require
+                            # 'docker login'" hides a login that timed out reaching the registry
                             current_step = "docker_login"
                             raise RentalDockerOperationError(
-                                f"{exc} (earlier login failure: {login_error})"
+                                f"Docker login failed: {login_error} (pull without login then failed: {exc})"
                             ) from exc
 
                         # Add profiler for docker pull

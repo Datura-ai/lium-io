@@ -4069,9 +4069,10 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_login"
     assert (
-        "earlier login failure: Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker login failed: Docker SDK login for registry.digitalocean.com failed: unauthorized"
         in result.detail
     )
+    assert "pull without login then failed: blocked" in result.detail
 
 
 @pytest.mark.asyncio
