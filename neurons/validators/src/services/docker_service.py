@@ -566,6 +566,9 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
 # DAH-5392: bounds the backend's rental-active answer for an unlisted pod in a create's sweep; no answer keeps the pod
 _POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
+# a provider could leave thousands of stopped pod_<uuid> containers: one sweep asks about at most this many,
+# and keeps the rest unchecked (a later create's sweep asks again)
+MAX_UNLISTED_POD_LOOKUPS = 20
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
@@ -4473,9 +4476,12 @@ class DockerService:
     async def _pods_with_closed_rental(self, names: list[str], default_extra: dict) -> set[str]:
         """The ``names`` whose rental the backend confirms closed, plus names that are not `pod_<uuid>` (the
         backend names every pod it creates after the pod's uuid, so such a name is no newer create's pod).
-        No backend client, no answer, an error or a timeout keeps the pod: a removal cannot be undone."""
+        No backend client, no answer, an error or a timeout keeps the pod: a removal cannot be undone.
+        At most MAX_UNLISTED_POD_LOOKUPS pods are asked about per sweep; the rest are kept unchecked."""
+        lookups = skipped = 0
 
         async def closed(name: str) -> bool:
+            nonlocal lookups, skipped
             pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
             try:
                 UUID(pod_id)
@@ -4483,6 +4489,10 @@ class DockerService:
                 return True
             if self.backend_client is None:
                 return False
+            if lookups >= MAX_UNLISTED_POD_LOOKUPS:
+                skipped += 1
+                return False
+            lookups += 1
             try:
                 async with asyncio.timeout(_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS):
                     answer = await self.backend_client.get_pod_rental_active(pod_id)
@@ -4497,6 +4507,8 @@ class DockerService:
             return answer is not None and not answer.active
 
         answers = await asyncio.gather(*(closed(name) for name in names))
+        if skipped:
+            logger.warning(_m("Unlisted pod lookups capped for this sweep; the rest are kept unchecked", extra=get_extra_info({**default_extra, "lookup_cap": MAX_UNLISTED_POD_LOOKUPS, "unchecked_count": skipped})))
         kept = [name for name, is_closed in zip(names, answers) if not is_closed]
         if kept:
             logger.info(_m("Keeping unlisted pods whose rental is not confirmed closed", extra=get_extra_info({**default_extra, "container_names": kept})))
