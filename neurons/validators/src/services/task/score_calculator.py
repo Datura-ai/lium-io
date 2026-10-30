@@ -109,7 +109,11 @@ def calculate_scores(
     if not ctx.rented_throughput_passed:
         actual_score = 0.0
         job_score = 0.0
-        warning_messages.append("A rented pod gets far too little network or disk throughput")
+        warning_messages.append(
+            "Rented throughput reading could not run in several cycles in a row"
+            if ctx.rented_throughput_not_run
+            else "A rented pod gets far too little network or disk throughput"
+        )
 
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the
     # score there; shadow leaves the flag True.

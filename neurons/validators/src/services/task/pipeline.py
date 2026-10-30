@@ -274,6 +274,8 @@ class Context(BaseModel):
     # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
     # score gate lives in calculate_scores.
     rented_throughput_passed: bool = True
+    # True when that failure is RENTED_THROUGHPUT_NOT_RUN (no reading ran), not a slow reading.
+    rented_throughput_not_run: bool = False
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True

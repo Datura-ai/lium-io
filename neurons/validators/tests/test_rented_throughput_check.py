@@ -3,6 +3,7 @@ download check never looks at a rented node."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
@@ -949,3 +950,97 @@ async def test_a_throughput_failed_node_earns_from_neither_pool(
     assert idle == (
         pytest.approx(0.1) if earns and rented_gpus == 1 else 0.0
     )  # rental-share (idle) pool
+
+
+async def test_a_late_cycle_skips_the_reading_instead_of_losing_the_node():
+    # 316223c6 (30 Oct 17:49Z): the reading started with ~150 s left and the task deadline dropped the whole cycle
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_DISK, SLOW_DISK, GOOD)
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        check = RentedThroughputCheck()
+        skipped = await check.run(late)
+        assert skipped.passed and skipped.event.reason_code == Msg.SKIPPED.reason
+        assert skipped.event.what_we_saw["reason"] == "too little cycle time left"
+        assert runner.commands == []
+        # still due: the next cycle measures; a standing SLOW verdict survives a late cycle
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW_ONCE.reason
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+        clock.now += 31 * 60
+        assert (await check.run(late)).passed is False and len(runner.commands) == 2
+
+
+async def test_repeated_late_cycles_fail_the_reading_until_one_completes():
+    # the provider controls how long the earlier checks take; endless late cycles must not keep the score
+    with flags():
+        ctx, runner = make_ctx(GOOD)
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        check = RentedThroughputCheck()
+        for skips in range(1, module.LATE_SKIPS_BEFORE_VERDICT):
+            result = await check.run(late)
+            assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+            assert stored(ctx)["late_skips"] == skips
+        failed = await check.run(late)
+        # no command ran, so not the measured-slow claim
+        assert failed.passed is False and failed.event.reason_code == Msg.NOT_RUN.reason
+        assert failed.updates == {
+            "rented_throughput_passed": False,
+            "rented_throughput_not_run": True,
+        }
+        assert runner.commands == []
+        # a completed reading resets the counter
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["late_skips"] == 0 and len(runner.commands) == 1
+
+
+async def test_late_skips_count_while_redis_refuses_writes():
+    # READONLY during a failover: GET works, SET fails; the skip count must still reach the verdict
+    with flags(), patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(GOOD)
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        check = RentedThroughputCheck()
+        assert (await check.run(late)).passed  # first skip, saved
+        ctx.services.redis.set = AsyncMock(side_effect=Exception("READONLY"))
+        for _ in range(1, module.LATE_SKIPS_BEFORE_VERDICT - 1):
+            assert (await check.run(late)).passed
+        failed = await check.run(late)
+        assert failed.passed is False and failed.event.reason_code == Msg.NOT_RUN.reason
+        assert runner.commands == []
+
+
+class SlowRedis(FakeRedis):
+    async def set(self, key, value, ex=None):
+        await asyncio.sleep(30)
+
+
+async def test_a_slow_redis_save_on_a_late_skip_never_drops_the_cycle():
+    # a SET slower than the cycle time left must not run into the task deadline: bounded, the count kept in memory
+    with flags(), patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(GOOD)
+        redis = SlowRedis()
+        redis.store[f"rented_throughput:{EXECUTOR.uuid}"] = '{"at": 0}'
+        ctx = ctx.model_copy(update={"services": build_services(redis=redis)})
+        check = RentedThroughputCheck()
+        # 0.3 s of save budget, then 0 (the save is skipped): both return in time and count the skip
+        for skips, left in ((1, module.SAVE_RESERVE_SECONDS + 0.3), (2, 1)):
+            late = ctx.model_copy(
+                update={
+                    "started_at_monotonic": ctx.started_at_monotonic
+                    - (module.task_seconds_left(ctx) - left)
+                }
+            )
+            result = await asyncio.wait_for(check.run(late), 5)
+            assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+            assert module._UNSAVED[EXECUTOR.uuid].late_skips == skips
+        assert runner.commands == []
+
+
+async def test_a_slow_redis_save_after_a_reading_never_drops_the_cycle():
+    # the initial-state save and the reading's save are bounded too: each gets 0.3 s, the reading kept in memory
+    with flags(), patch.dict(module._UNSAVED, clear=True):
+        ctx, runner = make_ctx(GOOD)
+        ctx = ctx.model_copy(update={"services": build_services(redis=SlowRedis())})
+        with patch.object(module, "SAVE_RESERVE_SECONDS", module.task_seconds_left(ctx) - 0.3):
+            result = await asyncio.wait_for(RentedThroughputCheck().run(ctx), 5)
+        assert result.passed and len(runner.commands) == 1
+        assert module._UNSAVED[EXECUTOR.uuid].reading
