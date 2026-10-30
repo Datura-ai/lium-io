@@ -309,6 +309,7 @@ def _reports_missing_container(message: str) -> bool:
 async def collect_container_death_diagnostics(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,
+    diagnostics: ContainerDeathDiagnostics | None = None,
 ) -> ContainerDeathDiagnostics:
     """Read why a container died over an already-open SSH session.
 
@@ -316,9 +317,10 @@ async def collect_container_death_diagnostics(
     (cancellation excepted). At both call sites this runs right before the
     container is force-removed, and the executor host belongs to the miner —
     losing the rest of the evidence to an exception is worse than a partial
-    record.
+    record. A caller that bounds this with a timeout passes its own `diagnostics`
+    so the fields read before the timeout survive it.
     """
-    diagnostics = ContainerDeathDiagnostics()
+    diagnostics = diagnostics if diagnostics is not None else ContainerDeathDiagnostics()
     capture_errors: list[str] = []
     quoted_name = shlex.quote(container_name)
 

@@ -10899,14 +10899,17 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
     ) -> ContainerDeathDiagnostics:
-        # a hung `docker logs` on the miner's host must not hold back the recovery's verdict or stop
+        # a hung `docker logs` on the miner's host must not hold back the recovery's verdict or stop;
+        # the state read before the hang is kept, so a dead container is not taken for a recovery
+        diagnostics = ContainerDeathDiagnostics()
         try:
             return await asyncio.wait_for(
-                collect_container_death_diagnostics(ssh_client, container_name),
+                collect_container_death_diagnostics(ssh_client, container_name, diagnostics),
                 timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
             )
         except TimeoutError:
-            return ContainerDeathDiagnostics(capture_error="diagnostics timed out")
+            diagnostics.capture_error = "diagnostics timed out"
+            return diagnostics
 
     async def _stop_half_recovered_container(
         self,
