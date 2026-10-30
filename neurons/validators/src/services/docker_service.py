@@ -7924,10 +7924,28 @@ class DockerService:
             # the create's last power read is the limit the rental starts on (DAH-5302)
             redis=self.redis_service if record_rental_start else None,
             pod_id=payload.pod_id if record_rental_start else None,
-            # a reboot or edit re-creates a pod whose container is still listed (`ps -a`)
-            pod_on_host=host_probe is not None
-            and f"{POD_CONTAINER_PREFIX}{payload.pod_id}" in (host_probe.container_names or ()),
+            pod_on_host=await DockerService._pod_container_on_host(ssh_client, payload.pod_id, host_probe)
+            if record_rental_start
+            else False,
         )
+
+    @staticmethod
+    async def _pod_container_on_host(
+        ssh_client: asyncssh.SSHClientConnection, pod_id: str, host_probe: PrerunHostProbe | None
+    ) -> bool:
+        """A reboot or edit re-creates a pod whose container is still listed (`ps -a`). Without a probe,
+        one `docker inspect` asks, so a rebooted legacy rental is not taken for a new one (F-12)."""
+        name = f"{POD_CONTAINER_PREFIX}{pod_id}"
+        names = (name, name + EDIT_PARKED_SUFFIX)  # an edit parks the old container before the probe
+        if host_probe is not None:
+            return any(n in (host_probe.container_names or ()) for n in names)
+        try:
+            result = await ssh_client.run(
+                " || ".join(f"/usr/bin/docker container inspect {shlex.quote(n)} >/dev/null 2>&1" for n in names)
+            )
+        except Exception:
+            return False
+        return result.exit_status == 0
 
     async def _run_create_steps_after_reply(
         self,

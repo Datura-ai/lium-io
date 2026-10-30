@@ -132,6 +132,9 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # no parsed probe here: one inspect asks whether the pod (or its parked copy) is on the host
+        f"/usr/bin/docker container inspect {name} >/dev/null 2>&1"
+        f" || /usr/bin/docker container inspect {parked} >/dev/null 2>&1",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         host_key,

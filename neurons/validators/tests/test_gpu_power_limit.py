@@ -295,7 +295,10 @@ async def test_raise_without_redis_never_records_or_raises(monkeypatch) -> None:
     assert await gpl.raise_low_power_limits_to_default(AsyncMock(), "ex-1", None) == 0
 
 
-@pytest.mark.parametrize(("container_names", "expected"), [(("pod_pod-1",), True), (("pod_pod-2",), False), (None, False)])
+@pytest.mark.parametrize(
+    ("container_names", "expected"),
+    [(("pod_pod-1",), True), (("pod_pod-1__prev",), True), (("pod_pod-2",), False), (None, False)],
+)
 @pytest.mark.asyncio
 async def test_create_passes_pod_on_host_from_the_prerun_listing(monkeypatch, container_names, expected) -> None:
     import services.docker_service as ds
@@ -309,3 +312,23 @@ async def test_create_passes_pod_on_host_from_the_prerun_listing(monkeypatch, co
         SimpleNamespace(redis_service=object()), AsyncMock(), payload, probe, {}, record_rental_start=True
     )
     assert raise_mock.await_args.kwargs["pod_on_host"] is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("inspect_exit", "expected"), [(0, True), (1, False)])
+async def test_create_without_a_probe_asks_docker_whether_the_pod_is_on_host(monkeypatch, inspect_exit, expected) -> None:
+    # F-12 (lio#1924): a failed pre-run probe must not take a rebooted legacy rental for a new one.
+    import services.docker_service as ds
+
+    raise_mock = AsyncMock(return_value=0)
+    monkeypatch.setattr(ds, "restore_tracked_gpu_power_limits", AsyncMock())
+    monkeypatch.setattr(ds, "raise_low_power_limits_to_default", raise_mock)
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=inspect_exit, stdout="", stderr="")
+    payload = SimpleNamespace(gpu_uuids=["GPU-0"], executor_id="ex-1", pod_id="pod-1")
+    await ds.DockerService._restore_gpu_power_for_uncapped_pod(
+        SimpleNamespace(redis_service=object()), ssh, payload, None, {}, record_rental_start=True
+    )
+    assert raise_mock.await_args.kwargs["pod_on_host"] is expected
+    assert "docker container inspect pod_pod-1" in ssh.run.await_args.args[0]
+    assert "docker container inspect pod_pod-1__prev" in ssh.run.await_args.args[0]
