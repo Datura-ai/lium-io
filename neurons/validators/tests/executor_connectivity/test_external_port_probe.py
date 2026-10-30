@@ -1,10 +1,10 @@
 import importlib.util
 import json
+import socket
 from pathlib import Path
 
 import pytest
 from aiohttp import web
-from core.config import settings
 from services.executor_connectivity.external_probe import ExternalPortProbe
 from services.executor_connectivity.models import (
     BatchResult,
@@ -16,6 +16,9 @@ from services.executor_connectivity.models import (
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_verifiers import BatchVerifier
+from services.node_host import NodeHostError
+
+from core.config import settings
 
 PORTS = [PortPair(9000 + i, 9000 + i) for i in range(5)]
 
@@ -145,6 +148,49 @@ async def test_external_probe_counts_only_answers_carrying_the_token():
         await runner.cleanup()
 
     assert reached == [PORTS[0]]
+
+
+def _infos(*addresses):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, 0)) for a in addresses]
+
+
+@pytest.mark.asyncio
+async def test_external_probe_sends_a_dns_named_node_only_at_its_single_public_address(mocker):
+    sent = []
+
+    async def prober(request):
+        targets = (await request.json())["targets"]
+        sent.extend(t["host"] for t in targets)
+        return web.json_response({"results": [{**t, "body": "tok:9000"} for t in targets]})
+
+    async def resolve(host, port):
+        if host == "refused.example":
+            raise NodeHostError("refused.example resolves to a non-public address: 10.0.0.1")
+        return _infos("5.6.7.8", "5.6.7.8") if host == "one.example" else _infos("5.6.7.8", "5.6.7.9")
+
+    resolver = mocker.patch(
+        "services.executor_connectivity.external_probe.resolve_node_host", side_effect=resolve
+    )
+    app = web.Application()
+    app.router.add_post("/", prober)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        probe = ExternalPortProbe(f"http://127.0.0.1:{port}/", "secret")
+        reached = await probe.reached("one.example", PORTS[:1], "tok")
+        two_addresses = await probe.reached("two.example", PORTS[:1], "tok")
+        refused = await probe.reached("refused.example", PORTS[:1], "tok")
+    finally:
+        await runner.cleanup()
+
+    assert sent == ["5.6.7.8"]
+    assert reached == [PORTS[0]]
+    assert two_addresses is None
+    assert refused is None
+    assert resolver.call_count == 3
 
 
 @pytest.mark.asyncio

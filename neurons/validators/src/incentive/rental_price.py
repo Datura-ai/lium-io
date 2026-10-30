@@ -45,12 +45,12 @@ logger = get_logger(__name__)
 # incentive but stays active.
 MIN_DISK_TO_VRAM_RATE = 1.5
 
-# DAH-2546 — flagship capability gate. An unrented 8x machine of these base models must
+# DAH-2546 — full 8x capability gate. An unrented 8x machine of these base models must
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
 # quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
 # the incentive but stays active.
-FLAGSHIP_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
-FLAGSHIP_CAPABILITY_GPU_COUNT = 8
+FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
+FULL_8X_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
 NCU_PROFILING_UNRESTRICTED = "unrestricted"
 
@@ -80,8 +80,8 @@ class InsufficientDisk(BaseModel):
     rate: float  # required disk-to-VRAM margin the machine failed to clear
 
 
-class MissingFlagshipCapability(BaseModel):
-    """What the scrape reported about NCU profiling on a flagship machine that offers no open
+class MissingFull8xCapability(BaseModel):
+    """What the scrape reported about NCU profiling on a full 8x machine that offers no open
     profiling counters, real GPU splitting or attested CVM. Sole owner of these scrape keys."""
 
     ncu_profiling_access: str | None  # None = the scrape carries no observation at all
@@ -100,13 +100,17 @@ class PowerCapIncapable(BaseModel):
 
 
 class PortLimitedRemainder(BaseModel):
-    """The free remainder of a partially rented split node whose node has fewer free ports than
-    the marketplace floor (DAH-3698). `available_port_count` is the number PortCountCheck wrote
-    into the spec — verified ports minus the tenant's and the fillers' — the same figure the
-    platform lists against and the rent path refuses below."""
+    """The free remainder of a partially rented split node with fewer usable free ports than it
+    has minimum-size splits (DAH-3698, owner rule 26 Oct 2026: one usable, unique renter port per
+    minimum-size split). `available_port_count` is the distinct free verified ports PortCountCheck
+    wrote into the spec (the tenant's ports are already left out); `required_port_count` is one per
+    free split, and never below MIN_PORT_COUNT, the free ports the rent path needs for any rental."""
 
     available_port_count: int
     required_port_count: int
+    free_split_count: int
+    paid_split_count: int  # splits that have a port: their GPUs keep the idle pay
+    unpaid_gpu_count: int
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -385,13 +389,13 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _missing_flagship_capability(
+    def _missing_full_8x_capability(
         self, result: JobResult, base_model: str
-    ) -> MissingFlagshipCapability | None:
-        # None also when the machine is out of the gate's scope: not an 8x flagship, or unscraped
-        if result.gpu_count != FLAGSHIP_CAPABILITY_GPU_COUNT:
+    ) -> MissingFull8xCapability | None:
+        # None also when the machine is out of the gate's scope: not a full 8x machine, or unscraped
+        if result.gpu_count != FULL_8X_CAPABILITY_GPU_COUNT:
             return None
-        if base_model not in FLAGSHIP_CAPABILITY_BASE_MODELS:
+        if base_model not in FULL_8X_CAPABILITY_BASE_MODELS:
             return None
         if result.spec is None:
             # no scrape at all: a synthetic or estimated job result, nothing to measure
@@ -417,18 +421,18 @@ class RentalPriceIncentive(DefaultIncentive):
             or attested_cvm
         ):
             return None
-        return MissingFlagshipCapability(
+        return MissingFull8xCapability(
             ncu_profiling_access=ncu_profiling_access,
             ncu_profiling_scrape_error=result.spec.get("ncu_profiling_scrape_error"),
         )
 
-    def _log_flagship_capability_limit(
-        self, result: JobResult, missing: MissingFlagshipCapability
+    def _log_full_8x_capability_limit(
+        self, result: JobResult, missing: MissingFull8xCapability
     ) -> None:
-        # structured log for every rental-eligible 8x flagship executor lacking all capabilities
+        # structured log for every rental-eligible 8x executor lacking all capabilities
         logger.info(
             _m(
-                "Unrented flagship executor has no NCU profiling, GPU splitting "
+                "Unrented full 8x executor has no NCU profiling, GPU splitting "
                 "or confidential computing",
                 extra={
                     "executor_id": str(result.executor_info.uuid),
@@ -443,7 +447,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     # ordinary host; attestation_digest is None on every line emitted here
                     "tdx_quote_present": bool(result.executor_info.tdx_quote),
                     "enforced": True,
-                    "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+                    "reason": ZeroIncentiveReason.FULL_8X_WITHOUT_NCU_OR_SPLIT,
                     "pool": "rental_excluded",
                 },
             )
@@ -516,36 +520,58 @@ class RentalPriceIncentive(DefaultIncentive):
     def _port_limited_remainder(result: JobResult) -> PortLimitedRemainder | None:
         # None whenever the spec does not carry a readable count: a synthetic result or an
         # older validator must never cost a miner the incentive.
-        if not result.is_split_remainder or result.spec is None:
+        if not result.is_split_remainder or result.spec is None or not result.gpu_splitting_min_count:
+            return None
+        # a single failed port verification is not a verdict (PortConnectivityCheck's first miss)
+        if result.spec.get("port_verify_first_miss") is True:
             return None
         # a Lium filler does not exempt it: not rentable on Lium means no idle pay
         available: Any = result.spec.get("available_port_count")
         # bool is excluded explicitly - it passes isinstance(int) and would read True as 1
         if not isinstance(available, int) or isinstance(available, bool):
             return None
-        if available >= MIN_PORT_COUNT:
+        verified: Any = result.spec.get("verified_ports")
+        if isinstance(verified, list):
+            # a port two mappings both publish can still serve only one renter
+            available = min(available, len(set(verified)))
+        free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
+        free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
+        # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
+        paid_split_count: int = min(free_split_count, available) if available >= MIN_PORT_COUNT else 0
+        # free GPUs below one whole split can't be listed or rented, so they get no idle pay either
+        if free_split_count > 0 and available >= MIN_PORT_COUNT and paid_split_count >= free_split_count:
             return None
-        return PortLimitedRemainder(available_port_count=available, required_port_count=MIN_PORT_COUNT)
+        return PortLimitedRemainder(
+            available_port_count=available,
+            required_port_count=max(free_split_count, MIN_PORT_COUNT),
+            free_split_count=free_split_count,
+            paid_split_count=paid_split_count,
+            # GPUs left over below one split ride with the last paid split, so only whole splits go unpaid
+            unpaid_gpu_count=free_gpu_count
+            if paid_split_count == 0
+            else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+        )
 
     def _log_port_limited_remainder(
         self, result: JobResult, port_limited: PortLimitedRemainder
     ) -> None:
         # structured log for every split remainder under the marketplace port floor; the reason
         # code is what Loki and the provider dashboard (DAH-3699) key off
-        enforced: bool = settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
         logger.info(
             _m(
-                "Free remainder of a partially rented split node is below the marketplace port floor"
-                + ("" if enforced else " (shadow only - flag off)"),
+                "Free remainder of a partially rented split node is below the marketplace port floor",
                 extra={
                     "executor_id": str(result.executor_info.uuid),
                     "gpu_model": result.gpu_model,
                     "gpu_count": result.gpu_count,
                     "available_port_count": port_limited.available_port_count,
                     "required_port_count": port_limited.required_port_count,
-                    "enforced": enforced,
+                    "free_split_count": port_limited.free_split_count,
+                    "paid_split_count": port_limited.paid_split_count,
+                    "unpaid_gpu_count": port_limited.unpaid_gpu_count,
+                    "enforced": True,
                     "reason": ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
-                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                    "pool": "rental_partial" if port_limited.paid_split_count else "rental_excluded",
                 },
             )
         )
@@ -570,6 +596,8 @@ class RentalPriceIncentive(DefaultIncentive):
             exclusions.append(MinerLogLine.no_payout_because_discord_not_connected(job_result))
         if job_result.is_new_rentals_paused and not job_result.is_rented:
             exclusions.append(MinerLogLine.no_payout_because_paused_for_new_rentals(job_result))
+        if job_result.is_in_maintenance:
+            exclusions.append(MinerLogLine.no_payout_because_provider_maintenance(job_result))
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
             exclusions.append(MinerLogLine.no_payout_because_running_own_default_job(job_result))
         if job_result.is_hotkey_excluded_from_scoring:
@@ -677,7 +705,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     unrented=free.incentive_formula_inputs,
                 )
             )
-            merged.gpu_count += free.gpu_count
+            merged.gpu_count += free.gpu_count + free.port_unpaid_gpu_count
             merged.set_incentive_split(merged.incentive or 0.0, free.incentive or 0.0)
             merged.incentive_logs.extend(free.incentive_logs)
             # DAH-2340 reasons ride a separate list — the unrented portion's zero reasons would
@@ -1160,6 +1188,19 @@ class RentalPriceIncentive(DefaultIncentive):
         for base_model, result in self._spot_pay_candidates:
             rate_sum_by_model[base_model] = rate_sum_by_model.get(base_model, 0.0) + result.gpu_count * result.effective_rate
             pool_by_model[base_model] = result.filler_revenue_usd_per_hour or 0.0
+        for base_model, rate_sum in rate_sum_by_model.items():
+            logger.info(
+                _m(
+                    "Spot pay shares the GPU model's filler earnings",
+                    extra={
+                        "base_model": base_model,
+                        "filler_revenue_usd_per_hour": pool_by_model[base_model],
+                        "spot_rate_sum_usd_per_hour": rate_sum,
+                        "spot_pool_multiplier": min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0,
+                        "spot_gpu_count": sum(r.gpu_count for m, r in self._spot_pay_candidates if m == base_model),
+                    },
+                )
+            )
         total: float = 0.0
         for base_model, result in self._spot_pay_candidates:
             rate_sum: float = rate_sum_by_model[base_model]
@@ -1280,22 +1321,26 @@ class RentalPriceIncentive(DefaultIncentive):
         # on that cycle. An enforced gate also runs on a node something else already blocks, to
         # record its reason too.
 
-        # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
-        # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
-        port_floor_enforced: bool = settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
+        # DAH-3698: a split remainder earns idle pay only for the minimum-size splits that have a
+        # free port; the rest is capacity nobody can rent. First in the chain so it never reaches
+        # the shadow numbers.
         port_limited_remainder: PortLimitedRemainder | None = (
             self._port_limited_remainder(job_result)
-            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, port_floor_enforced)
+            if idle_pool_candidate
             else None
         )
         if port_limited_remainder is not None:
             if eligible_for_rental_share:
                 self._log_port_limited_remainder(job_result, port_limited_remainder)
-            if port_floor_enforced:
+            if port_limited_remainder.paid_split_count == 0:
                 eligible_for_rental_share = False
-                job_result.record_incentive_log(
-                    MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited_remainder)
-                )
+            else:
+                # the pools below count only the paid GPUs; the merge adds the rest back
+                job_result.gpu_count -= port_limited_remainder.unpaid_gpu_count
+                job_result.port_unpaid_gpu_count += port_limited_remainder.unpaid_gpu_count
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited_remainder)
+            )
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays active).
@@ -1328,17 +1373,17 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.record_incentive_log(reason)
 
-        # DAH-2546 flagship capability gate
+        # DAH-2546 full 8x capability gate
         missing_capability = (
-            self._missing_flagship_capability(job_result, base_model)
+            self._missing_full_8x_capability(job_result, base_model)
             if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, enforced=True)
             else None
         )
         if missing_capability is not None:
             if eligible_for_rental_share:
-                self._log_flagship_capability_limit(job_result, missing_capability)
+                self._log_full_8x_capability_limit(job_result, missing_capability)
             eligible_for_rental_share = False
-            reason: MinerLogLine = MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            reason: MinerLogLine = MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job_result, missing_capability
             )
             job_result.record_incentive_log(reason)
