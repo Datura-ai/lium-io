@@ -475,7 +475,8 @@ class PortConnectivityCheck:
         updated_state = replace(
             ctx.state,
             specs={
-                **ctx.state.specs,
+                # a deferral is no miss: the grace marker never survives it, the provider's one included
+                **{key: value for key, value in ctx.state.specs.items() if key != "port_verify_first_miss"},
                 "sysbox_runtime": sysbox,
                 "verified_ports": [external for _, external in pairs],
                 **_disk_pressure_spec(gate),

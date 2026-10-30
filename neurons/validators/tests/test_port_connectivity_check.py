@@ -765,6 +765,19 @@ async def test_enforced_pressure_republishes_the_last_verified_ports_without_a_c
     assert state.sysbox_runtime is True and state.specs["sysbox_runtime"] is True  # the remembered sysbox
     assert state.specs["disk_pressure"]["pressure"] is True and state.specs["disk_pressure"]["syncfs_timed_out"] is True
 
+
+@pytest.mark.asyncio
+async def test_a_deferred_cycle_drops_a_grace_marker_from_the_providers_specs(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    state = dataclasses.replace(_rented_state(), specs={"port_verify_first_miss": True})
+    ctx, _ = _gate_ctx(context_factory, redis_service=redis_service, state=state, reading=STALLED)
+    _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.VERIFY_DEFERRED.reason
+    assert "port_verify_first_miss" not in result.updates["state"].specs
     assert redis_service.deferrals[("miner-hotkey", "executor-123", False)] == 1
     assert result.updates["default_extra"]["disk_pressure_deferrals_in_a_row"] == 1
     # the memory is what it was: a republish never refreshes it
