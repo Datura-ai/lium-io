@@ -515,6 +515,26 @@ async def test_A6_build_timeout_carries_the_step_that_was_running(svc, monkeypat
     assert tail.endswith("docker build exceeded 1200 s")
 
 
+@pytest.mark.asyncio
+async def test_A6b_a_lost_node_connection_mid_build_says_so(svc, monkeypatch):
+    """The SSH connection dropping during the build is not the renter's Dockerfile failing."""
+    import asyncssh
+
+    async def _esl(**kwargs):
+        if "docker build" in kwargs.get("command", ""):
+            raise asyncssh.ConnectionLost("Connection lost")
+        return (True, "")
+
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=_make_dind_ssh(), payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert (ok, step, tail) == (False, "build_ssh_lost", "the connection to the node was lost during the build; please retry")
+
+
 # ------------------------------------------------------------------
 # A.13 — egress firewall failure → build_egress_setup, NO build attempted
 # ------------------------------------------------------------------
