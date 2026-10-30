@@ -426,19 +426,60 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
+CTRD_UNKNOWN="two containerd daemons run and neither is on Docker's address, so where containers live is unknown."
+
+docker_containerd() {
+    # CTRD_BIN, CTRD_CONFIG, CTRD_ROOT (--root, else empty): the containerd Docker uses. Without --containerd Docker
+    # runs its own on a generated --config whose root is <DockerRootDir>/containerd/daemon, so the host's
+    # /etc/containerd/config.toml and a leftover /var/lib/containerd say nothing about it. With two daemons, the one
+    # on Docker's address; fails when that cannot be told.
+    local f i bin cfg root addr address n=0 matches=0
+    local -a argv
+    address=$(docker info --format '{{with .Containerd}}{{.Address}}{{end}}' 2>/dev/null)
+    CTRD_BIN=containerd CTRD_CONFIG=/etc/containerd/config.toml CTRD_ROOT=""
+    for f in "${SYSBOX_SETUP_HOST_ROOT:-}"/proc/[0-9]*/cmdline; do
+        mapfile -d '' -t argv < "$f" 2>/dev/null || continue
+        [ "${argv[0]##*/}" = containerd ] || continue
+        bin=${argv[0]} cfg=/etc/containerd/config.toml root="" addr=""
+        for ((i = 1; i < ${#argv[@]}; i++)); do
+            case "${argv[i]}" in
+                --config=*) cfg=${argv[i]#*=} ;;
+                --config | -c) i=$((i + 1)); cfg=${argv[i]:-} ;;
+                --root=*) root=${argv[i]#*=} ;;
+                --root) i=$((i + 1)); root=${argv[i]:-} ;;
+                --address=*) addr=${argv[i]#*=} ;;
+                --address | -a) i=$((i + 1)); addr=${argv[i]:-} ;;
+            esac
+        done
+        [ -n "$addr" ] || addr=$("$bin" --config "$cfg" config dump 2>/dev/null | sed -n "/^\[grpc\]/,/^\[/s/^ *address *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
+        n=$((n + 1))
+        # /var/run is /run
+        if [ -n "$address" ] && [ "${addr#/var}" = "${address#/var}" ]; then
+            matches=$((matches + 1))
+        elif [ "$n" -gt 1 ] || [ "$matches" -gt 0 ]; then
+            continue
+        fi
+        CTRD_BIN=$bin CTRD_CONFIG=$cfg CTRD_ROOT=$root
+    done
+    [ "$n" -le 1 ] || [ "$matches" -eq 1 ]
+}
+
 resolve_disk_dir() {
     # DISK_DIR: where container root filesystems live. That is Docker's data-root, except under Docker's
     # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
     # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
-    # SNAPSHOTTER_FIX: the extra fix line for that case, else empty.
+    # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd cannot be told.
     local ctrd_root
     DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
     [ -d "$DISK_DIR" ] || DISK_DIR=/
     SNAPSHOTTER_FIX=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
-    # containerd 1.x dumps root = "...", 2.x root = '...'
-    ctrd_root=$(containerd config dump 2>/dev/null | sed -n "s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
+    docker_containerd || return 1
+    ctrd_root=$CTRD_ROOT
+    # containerd 1.x dumps root = "...", 2.x root = '...'; no dump: the top level of its config file itself
+    [ -n "$ctrd_root" ] || ctrd_root=$("$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null | sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
+    [ -n "$ctrd_root" ] || ctrd_root=$(sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null | head -1)
     [ -n "$ctrd_root" ] && [ -d "$ctrd_root" ] || ctrd_root="${SYSBOX_SETUP_HOST_ROOT:-}/var/lib/containerd"
     [ -d "$ctrd_root" ] || return 0
     DISK_DIR=$ctrd_root
@@ -452,7 +493,7 @@ check_total_disk_for_vram() {
     command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
     vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
-    resolve_disk_dir
+    resolve_disk_dir || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — $CTRD_UNKNOWN"; return 0; }
     data_root=$DISK_DIR
     total_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $2}')
     [ "${total_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — cannot read the filesystem size of $data_root."; return 0; }
@@ -493,7 +534,7 @@ check_free_disk_for_node() {
     # VerifyX allocates MIN_FREE_STORAGE_GB on the node's filesystem; before the first `lium mine` the node's images
     # still have to come out of the same free space
     local data_root free_kb free_gb needed_gb
-    resolve_disk_dir
+    resolve_disk_dir || { pf_skip "Free disk for the node — $CTRD_UNKNOWN"; return 0; }
     data_root=$DISK_DIR
     free_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $4}')
     [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $data_root."; return 0; }

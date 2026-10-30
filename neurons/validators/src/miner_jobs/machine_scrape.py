@@ -15,6 +15,7 @@ import hashlib
 from base64 import b64encode
 from cryptography.fernet import Fernet
 import tempfile
+import tomllib
 
 
 nvmlLib = None
@@ -826,36 +827,97 @@ def disk_root_dir(info):
     docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return docker_root_dir
-    return containerd_root()
+    return containerd_root(*docker_containerd(info))
 
 
-def containerd_root():
+def containerd_processes():
+    # argv of every containerd daemon on the host (the executor shares the host's pid namespace)
+    return [
+        process.info["cmdline"]
+        for process in psutil.process_iter(["cmdline"])
+        if (process.info["cmdline"] or [""])[0].rsplit("/", 1)[-1] == "containerd"
+    ]
+
+
+def docker_containerd(info):
+    # (binary, --config, --root) of the containerd Docker uses. Without --containerd Docker runs its own on a
+    # generated --config whose root is <DockerRootDir>/containerd/daemon: /etc/containerd/config.toml and a
+    # leftover /var/lib/containerd say nothing about it. Two daemons: the one on Docker's /info address.
+    daemons = []
+    for argv in containerd_processes():
+        flags, args = {}, iter(argv[1:])
+        for arg in args:
+            name, equals, value = arg.partition("=")
+            name = {"-c": "--config", "-a": "--address"}.get(name, name)
+            if name in ("--config", "--root", "--address"):
+                flags[name] = value if equals else next(args, "")
+        daemons.append(
+            (
+                argv[0],
+                flags.get("--config") or CONTAINERD_CONFIG_PATH,
+                flags.get("--root"),
+                flags.get("--address"),
+            )
+        )
+    if len(daemons) > 1:
+        address = (info.get("Containerd") or {}).get("Address")
+        daemons = [
+            daemon
+            for daemon in daemons
+            if address
+            and same_socket(
+                address,
+                daemon[3]
+                or (containerd_dump(daemon[0], daemon[1]).get("grpc") or {}).get("address"),
+            )
+        ]
+        if len(daemons) != 1:
+            raise RuntimeError(
+                f"{CONTAINERD_ROOT_UNKNOWN}: cannot tell which containerd Docker uses"
+            )
+    return daemons[0][:3] if daemons else ("containerd", CONTAINERD_CONFIG_PATH, None)
+
+
+def same_socket(address, other):
+    # /var/run is /run
+    return bool(other) and address.removeprefix("/var") == other.removeprefix("/var")
+
+
+def containerd_dump(binary, config_path):
+    # the daemon's merged config, imports resolved, as the installer's preflight reads it; {} when it cannot run
+    if not all(re.fullmatch(r"[\w./+-]+", part) for part in (binary, config_path)):
+        return {}  # never handed to a shell
+    try:
+        return tomllib.loads(
+            run_cmd(f"timeout 20 chroot /proc/1/root {binary} --config {config_path} config dump")
+        )
+    except Exception:
+        return {}
+
+
+def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, root=None):
     # containerd's effective root on the host. A leftover /var/lib/containerd proves nothing: a root
     # moved in an imported config file leaves it behind, so the default is used only when no config
     # sets one, and a root that cannot be read raises (CONTAINERD_ROOT_UNKNOWN) instead of measuring it.
-    try:
-        # the host's own merged config, imports resolved: what the installer's preflight reads
-        dumped = toml_top_level(run_cmd("timeout 20 chroot /proc/1/root containerd config dump"), "root")
-    except Exception:
-        dumped = []
+    dumped = None if root else containerd_dump(binary, config_path).get("root")
     # walked even after a dump: a missing literal import can still dump exit 0 with the default root
     roots = []
-    pending, seen = [CONTAINERD_CONFIG_PATH], set()
+    pending, seen = [config_path], set()
     try:
-        while pending:
+        while pending and not root:
             path = pending.pop(0)
             if path in seen:
                 continue
             seen.add(path)
             try:
                 with open(f"/proc/1/root{path}") as config_file:
-                    text = config_file.read()
+                    config = tomllib.loads(config_file.read())
             except FileNotFoundError:
                 if path != CONTAINERD_CONFIG_PATH:
                     raise
-                text = ""  # no config at all: containerd runs on its default root
-            roots += toml_top_level(text, "root")
-            for pattern in toml_top_level(text, "imports"):
+                config = {}  # no config at all: containerd runs on its default root
+            roots += [config["root"]] if isinstance(config.get("root"), str) else []
+            for pattern in config.get("imports") or []:
                 # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
                 pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
                 if "*" not in pattern:
@@ -863,21 +925,13 @@ def containerd_root():
                     continue
                 # a later file overrides an earlier one, in the order containerd merges them
                 pending += sorted(match[len("/proc/1/root"):] for match in glob.glob(f"/proc/1/root{pattern}"))
-    except OSError as exc:
+    # unreadable, or not TOML containerd would load
+    except (OSError, ValueError, TypeError) as exc:
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
-    roots = dumped or roots
-    root = roots[-1] if roots else "/var/lib/containerd"
+    root = root or dumped or (roots[-1] if roots else "/var/lib/containerd")
     if not os.path.isdir(f"/proc/1/root{root}"):
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
     return root
-
-
-def toml_top_level(text, key):
-    # string values of a top-level key (before the first [table]); one string or an array of them
-    text = re.sub(r"""("[^"]*"|'[^']*')|#[^\n]*""", r"\1", text)  # drop comments outside strings
-    top = re.split(r"(?m)^\s*\[", text, maxsplit=1)[0]
-    match = re.search(rf"""(?ms)^\s*{key}\s*=\s*(\[.*?\]|"[^"]*"|'[^']*')""", top)
-    return re.findall(r"""["']([^"']*)["']""", match.group(1)) if match else []
 
 
 def cache_volume_bytes(df, prefixes):

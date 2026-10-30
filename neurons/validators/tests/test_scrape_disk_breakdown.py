@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import tomllib
 from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +46,10 @@ DISK_HELPERS = {
     "release_filler_cache",
     "disk_root_dir",
     "containerd_root",
-    "toml_top_level",
+    "containerd_processes",
+    "docker_containerd",
+    "same_socket",
+    "containerd_dump",
     "CONTAINERD_CONFIG_PATH",
     "CONTAINERD_ROOT_UNKNOWN",
     "on_one_filesystem",
@@ -59,12 +63,14 @@ def _no_host_containerd(cmd):
 @pytest.fixture
 def scrape() -> dict:
     """The disk helpers, executed in a namespace of their own."""
-    return build_scrape_namespace(
+    namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HELPERS,
         {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket,
-         "run_cmd": _no_host_containerd},
+         "tomllib": tomllib, "run_cmd": _no_host_containerd},
     )
+    namespace["containerd_processes"] = lambda: []  # never this test host's own daemons
+    return namespace
 
 
 def _stub_docker_api(scrape: dict, responses: dict) -> None:
@@ -468,13 +474,19 @@ def test_disk_usage_follows_a_moved_containerd_root(scrape: dict, monkeypatch) -
     assert asked == ["/proc/1/root/data/containerd"]
 
 
-def _stub_containerd_config(scrape: dict, monkeypatch, files: dict, dump: str | None = None) -> None:
-    """The host's containerd config files by host path; `dump` is `containerd config dump`, None when it cannot run."""
+CONTAINERD_DEFAULT = "/etc/containerd/config.toml"
+
+
+def _stub_containerd_config(scrape: dict, monkeypatch, files: dict, dump: str | dict | None = None) -> None:
+    """The host's containerd config files by host path; `dump` is `containerd config dump`, None when it cannot run,
+    or a dict of dumps by --config path."""
 
     def run_cmd(cmd):
-        if dump is None:
+        dumps = dump if isinstance(dump, dict) else {CONTAINERD_DEFAULT: dump}
+        found = [text for config, text in dumps.items() if f"--config {config} config dump" in cmd and text is not None]
+        if not found:
             raise RuntimeError("chroot: cannot run containerd")
-        return dump
+        return found[0]
 
     def open_host(path):
         path = os.path.normpath(path.removeprefix("/proc/1/root"))  # "./x" is x, as on a real filesystem
@@ -578,6 +590,65 @@ def test_containerd_root_reads_imports_as_containerd_does(scrape: dict, monkeypa
     _stub_filesystem(scrape, monkeypatch, host_dirs={"/proc/1/root/data/containerd", "/proc/1/root/var/lib/containerd"}, usage_by_path={})
 
     assert scrape["containerd_root"]() == expected_root
+
+
+def test_a_bracket_glob_import_is_followed_when_the_dump_cannot_run(scrape: dict, monkeypatch) -> None:
+    # the "]" of the character class must not end the imports array
+    files = {CONTAINERD_DEFAULT: 'version = 2\nimports = ["/etc/containerd/conf.d/[0-9]*.toml"]\n',
+             "/etc/containerd/conf.d/10-root.toml": 'root = "/data/containerd"\n'}
+    _stub_containerd_config(scrape, monkeypatch, files)
+    _stub_filesystem(scrape, monkeypatch, host_dirs={"/proc/1/root/data/containerd", "/proc/1/root/var/lib/containerd"}, usage_by_path={})
+
+    assert scrape["containerd_root"]() == "/data/containerd"
+
+
+_MANAGED_CONFIG = "/var/run/docker/containerd/containerd.toml"
+_MANAGED = ["containerd", "--config", _MANAGED_CONFIG, "--log-level", "info"]
+_MANAGED_TOML = 'version = 2\nroot = "/data/docker/containerd/daemon"\n[grpc]\n  address = "/var/run/docker/containerd/containerd.sock"\n'
+_EXTERNAL = ["/usr/bin/containerd"]
+_EXTERNAL_TOML = 'version = 2\nroot = "/data/containerd"\n[grpc]\n  address = "/run/containerd/containerd.sock"\n'
+
+
+@pytest.mark.parametrize(
+    "processes, address, dump, expected_root",
+    [
+        # Docker runs its own containerd: its generated --config, not /etc/containerd/config.toml
+        ([_MANAGED], None, {_MANAGED_CONFIG: _MANAGED_TOML}, "/data/docker/containerd/daemon"),
+        ([_MANAGED], None, None, "/data/docker/containerd/daemon"),  # no dump: the generated file itself
+        # an external (systemd) containerd: the host config
+        ([_EXTERNAL], "/run/containerd/containerd.sock", {CONTAINERD_DEFAULT: _EXTERNAL_TOML}, "/data/containerd"),
+        # both run (a system containerd for something else): the one on Docker's address
+        ([_EXTERNAL, _MANAGED], "/var/run/docker/containerd/containerd.sock",
+         {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_CONFIG: _MANAGED_TOML}, "/data/docker/containerd/daemon"),
+        ([_EXTERNAL, _MANAGED], "/var/run/containerd/containerd.sock",
+         {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_CONFIG: _MANAGED_TOML}, "/data/containerd"),
+        # a --root flag beats any config
+        ([["containerd", "--root=/data/flag-root", "-c", _MANAGED_CONFIG]], None, {_MANAGED_CONFIG: _MANAGED_TOML}, "/data/flag-root"),
+    ],
+)
+def test_the_root_is_read_from_the_containerd_docker_uses(scrape: dict, monkeypatch, processes, address, dump, expected_root) -> None:
+    info = {**_SNAPSHOTTER_INFO, "Containerd": {"Address": address} if address else None}
+    _stub_docker_api(scrape, {"/info": info})
+    scrape["containerd_processes"] = lambda: processes
+    # a leftover /var/lib/containerd on the root disk, as on a host that once ran the system containerd
+    files = {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_CONFIG: _MANAGED_TOML}
+    _stub_containerd_config(scrape, monkeypatch, files, dump)
+    dirs = {"/proc/1/root/data/docker/containerd/daemon", "/proc/1/root/data/containerd", "/proc/1/root/data/flag-root", "/proc/1/root/var/lib/containerd"}
+    asked = _stub_filesystem(scrape, monkeypatch, host_dirs=dirs, usage_by_path={f"/proc/1/root{expected_root}": _DOCKER_PARTITION})
+
+    assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
+    assert asked == [f"/proc/1/root{expected_root}"]
+
+
+def test_two_containerd_daemons_without_dockers_address_are_unknown(scrape: dict, monkeypatch) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["containerd_processes"] = lambda: [_EXTERNAL, _MANAGED]
+    _stub_containerd_config(scrape, monkeypatch, {}, {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_CONFIG: _MANAGED_TOML})
+    asked = _stub_filesystem(scrape, monkeypatch, host_dirs={"/proc/1/root/data/containerd"}, usage_by_path={})
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["get_host_disk_usage"]()
+    assert asked == []
 
 
 def test_filler_run_volumes_on_another_filesystem_are_not_reported_as_free(scrape: dict, monkeypatch) -> None:
