@@ -1255,6 +1255,23 @@ async def _raise_unless_running_before_created(
         )
 
 
+_LOGIN_TIMEOUT_MARKERS = ("context deadline exceeded", "timed out", "timeout")
+
+
+class DockerLoginFailed(RentalDockerOperationError):
+    """The login failed and the anonymous pull after it failed too. ``renter_sentence`` is the wire `msg`:
+    the backend's renter-facing error, so it names the reason only and no registry or host text."""
+
+    def __init__(self, text: str, login_error: str):
+        lowered = login_error.lower()
+        self.renter_sentence = (
+            "Docker login timed out: the node could not reach the image registry"
+            if any(marker in lowered for marker in _LOGIN_TIMEOUT_MARKERS)
+            else "Docker login to the image registry failed: check the template's registry credentials"
+        )
+        super().__init__(text)
+
+
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
     ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is `oom`, `killed`,
@@ -8607,8 +8624,9 @@ class DockerService:
                             # and lead with the login error: the anonymous pull's "may require
                             # 'docker login'" hides a login that timed out reaching the registry
                             current_step = "docker_login"
-                            raise RentalDockerOperationError(
-                                f"Docker login failed: {login_error} (pull without login then failed: {exc})"
+                            raise DockerLoginFailed(
+                                f"Docker login failed: {login_error} (pull without login then failed: {exc})",
+                                login_error,
                             ) from exc
 
                         # Add profiler for docker pull
@@ -9897,7 +9915,7 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=(
                     last_exc.renter_sentence
-                    if isinstance(last_exc, ContainerKilledDuringBootstrap)
+                    if isinstance(last_exc, (ContainerKilledDuringBootstrap, DockerLoginFailed))
                     else str(log_text)
                 ),
                 detail=failure_detail,

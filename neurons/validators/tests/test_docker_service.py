@@ -4073,6 +4073,44 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
         in result.detail
     )
     assert "pull without login then failed: blocked" in result.detail
+    # the wire msg the backend shows the renter: the reason only, no registry or executor text
+    assert result.msg == "Docker login to the image registry failed: check the template's registry credentials"
+
+
+@pytest.mark.asyncio
+async def test_create_container_login_timeout_has_its_own_renter_headline(docker_service, monkeypatch):
+    """A login that timed out reaching the registry must not read as bad credentials (30 Oct prod: Scaleway)."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        'Docker SDK login for rg.fr-par.scw.cloud failed: 500 Server Error ("Get "https://rg.fr-par.scw.cloud/v2/":'
+        ' context deadline exceeded")'
+    )
+    docker_client.pull_error = Exception("pull access denied, may require 'docker login'")
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_login"
+    assert result.msg == "Docker login timed out: the node could not reach the image registry"
+    assert "127.0.0.1" not in result.msg and "scw.cloud" not in result.msg
+    assert "context deadline exceeded" in result.detail
 
 
 @pytest.mark.asyncio
