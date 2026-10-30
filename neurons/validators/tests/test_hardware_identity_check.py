@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from neurons.validators.src.services.nvidia_devices import KernelGpuView
+from neurons.validators.src.services.task.checks import hardware_identity
 from neurons.validators.src.services.task.checks.hardware_identity import (
     DMI_ID_PATH,
     HW_ID_FS_SEPARATOR,
@@ -51,12 +53,14 @@ def test_kernel_gpu_the_node_does_not_report_is_not_a_disagreement():
     assert gpu_sources_disagree(["GPU-a"], ["GPU-a", "GPU-b"]) is False
 
 
-def _ctx(context_factory, *, stdout, kernel=("GPU-a",), redis=None, rented_data=None, executor=None):
+def _ctx(
+    context_factory, *, stdout, kernel=("GPU-a",), reported="GPU-a", redis=None, rented_data=None, executor=None
+):
     async def run(cmd, *args, **kwargs):
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
 
     state = build_state(
-        gpu_uuids="GPU-a",
+        gpu_uuids=reported,
         kernel_gpu_uuids=list(kernel) if kernel is not None else None,
         kernel_gpu_uuids_read_attempted=True,
         rented_data=rented_data,
@@ -95,6 +99,32 @@ async def test_dmi_overlay_fails(context_factory):
 @pytest.mark.asyncio
 async def test_nvml_gpu_missing_from_kernel_fails(context_factory):
     result = await _run(_ctx(context_factory, stdout=_stdout(), kernel=("GPU-b",)))
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["gpu_sources_disagree"]
+
+
+def _container_with_one_of_two_cards(context_factory, monkeypatch, *, host_uuids):
+    async def read_host_view(ssh, *, host_view=False):
+        assert host_view is True
+        return KernelGpuView(uuids=host_uuids, foreign_mounts=[])
+
+    monkeypatch.setattr(hardware_identity, "read_kernel_gpu_view", read_host_view)
+    return _ctx(context_factory, stdout=_stdout(), kernel=("GPU-a",), reported="GPU-a,GPU-b")
+
+
+@pytest.mark.asyncio
+async def test_container_given_some_of_the_host_cards_passes_on_the_host_list(context_factory, monkeypatch):
+    ctx = _container_with_one_of_two_cards(context_factory, monkeypatch, host_uuids=["GPU-a", "GPU-b"])
+    result = await _run(ctx)
+    assert result.passed is True
+    assert result.event.what_we_saw["host_kernel_gpu_uuids"] == ["GPU-a", "GPU-b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_uuids", [["GPU-a"], None])
+async def test_nvml_gpu_missing_from_the_host_list_too_fails(context_factory, monkeypatch, host_uuids):
+    ctx = _container_with_one_of_two_cards(context_factory, monkeypatch, host_uuids=host_uuids)
+    result = await _run(ctx)
     assert result.passed is False
     assert result.event.what_we_saw["findings"] == ["gpu_sources_disagree"]
 

@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 
+from services.nvidia_devices import read_kernel_gpu_view
+
 from ..messages import HardwareIdentityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental, kernel_gpu_view, reported_gpu_uuids
@@ -138,10 +140,16 @@ class HardwareIdentityCheck:
         except Exception:
             logger.warning("hardware identity record unavailable", exc_info=True, extra=ctx.default_extra)
 
+        host_kernel = None
+        if gpu_sources_disagree(reported, kernel) and ctx.ssh is not None:
+            # a container handed some of the host's cards lists only those; the host's own list is the full one
+            host_uuids, _ = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+            host_kernel = sorted(set(host_uuids)) if host_uuids else None
+
         findings = []
         if overlays:
             findings.append("dmi_overlaid")
-        if gpu_sources_disagree(reported, kernel):
+        if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
         if dmi_identity_drifted(previous, gpus, dmi_identity):
             findings.append("dmi_changed_under_same_gpus")
@@ -153,6 +161,7 @@ class HardwareIdentityCheck:
             if previous and previous.get("dmi")
             else None,
             "kernel_gpu_uuids": kernel,
+            "host_kernel_gpu_uuids": host_kernel,
             "reported_gpu_uuids": reported,
             "dmi_overlays": overlays,
             "findings": findings,
