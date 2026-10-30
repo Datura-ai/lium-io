@@ -106,3 +106,34 @@ def test_jupyter_root_sed_rewrites_the_executor_script():
 
     assert "--ServerApp.root_dir=/workspace \\" in out
     assert "--ServerApp.root_dir=/root" not in out
+
+
+@pytest.mark.parametrize(
+    "root",
+    ["/workspace;printf${IFS}SED_EXECUTED;true#e;#", "/work#space", "/root/../etc", "workspace", "/a b"],
+)
+def test_jupyter_root_sed_refuses_a_path_that_is_not_plain(root):
+    with pytest.raises(ValueError):
+        _jupyter_root_sed(root)
+
+
+@pytest.mark.asyncio
+async def test_run_jupyter_runs_nothing_for_a_hostile_volume_path():
+    service = _InstallJupyterService(_VolumeEncryptionState.ENCRYPTED)
+    service.execute_and_stream_logs = AsyncMock(return_value=(True, ""))
+
+    with pytest.raises(ValueError):
+        await DockerService.run_jupyter(
+            service,
+            ssh_client=object(),
+            container_name="pod_pod",
+            jupyter_token="t",
+            jupyter_port=8888,
+            log_tag="t",
+            log_extra={},
+            local_volume="volume_pod",
+            local_volume_path="/workspace;printf${IFS}SED_EXECUTED;true#e;#",
+            encrypted_local_volume=True,
+        )
+
+    assert all("sed " not in c.kwargs["command"] for c in service.execute_and_stream_logs.await_args_list)

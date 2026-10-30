@@ -2551,7 +2551,10 @@ def _build_volume_setup_exec_script(
 
 def _jupyter_root_sed(root: str) -> str:
     # DAH-5426: Jupyter serves the pod volume, wherever it is mounted; the executor's run_jupyter.sh hardcodes
-    # /root and older executors refuse an unknown option, so the validator rewrites the line as it copies it
+    # /root and older executors refuse an unknown option, so the validator rewrites the line as it copies it.
+    # The path lands in a sed program run on the executor host: anything but a plain path could end the expression.
+    if not _PLAINTEXT_PATH_RE.fullmatch(root):
+        raise ValueError(f"refusing Jupyter root {root!r}: not a plain absolute path")
     return shlex.quote(f"s#--ServerApp.root_dir=/root #--ServerApp.root_dir={root} #")
 
 
