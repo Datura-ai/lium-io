@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from services.executor_connectivity.models import ContainerStartResult, PortPair
-from services.executor_connectivity.port_verifiers import SemiBatchVerifier
+from services.executor_connectivity.port_verifiers import FallbackVerifier, SemiBatchVerifier
 
 
 CONTAINER_STARTED = ContainerStartResult(ok=True, container_id="c", status="Up")
@@ -30,6 +30,32 @@ async def test_semi_batch_fails_a_chunk_that_does_not_answer_in_time(mocker):
 
     assert failed == ports[:10]
     assert successful == ports[10:]
+
+
+@pytest.mark.asyncio
+async def test_fallback_stops_when_a_container_start_hangs(mocker):
+    # DAH-5419: a stuck docker daemon held the start until the task was dropped with no result
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+
+    async def ok_then_hang(*_args):
+        if runner.run.await_count > 1:
+            await asyncio.sleep(5)
+        return CONTAINER_STARTED
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(side_effect=ok_then_hang)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_one = mocker.AsyncMock(return_value=True)
+    mocker.patch.object(FallbackVerifier, "START_TIMEOUT_SEC", 0.1)
+
+    successful, failed = await FallbackVerifier(port_tester, runner).verify(
+        ports, ssh_client=mocker.Mock(), host="1.2.3.4"
+    )
+
+    assert successful == ports[:1]
+    assert failed == ports[1:]
+    assert runner.run.await_count == 2
 
 
 def _batch_verifier(mocker, test_many, external=None):
