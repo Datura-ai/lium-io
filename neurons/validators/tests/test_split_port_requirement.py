@@ -1,5 +1,6 @@
-"""DAH-3698 — a node offered as GPU splits lists only with MIN_PORT_COUNT free verified ports for each of
-its gpu_count // gpu_splitting_min_count splits; below that PortCountCheck fails INSUFFICIENT_PORTS."""
+"""DAH-3698 — a node offered as GPU splits lists only with one free verified port for each of its
+gpu_count // gpu_splitting_min_count splits (never below MIN_PORT_COUNT); below that PortCountCheck fails
+INSUFFICIENT_PORTS. An 8-GPU node in 1-GPU splits needs 8 ports, in 2-GPU splits 4."""
 
 from __future__ import annotations
 
@@ -51,29 +52,39 @@ def _ctx(
     )
 
 
+@pytest.mark.parametrize(
+    "gpu_count, min_count, need",
+    [(8, 1, (8, 8)), (8, 2, (4, 4)), (8, 4, (2, 3)), (2, 1, (2, 3)), (8, None, None)],
+)
+def test_one_port_per_split_never_below_the_floor(gpu_count, min_count, need):
+    from neurons.validators.src.services.task.checks.port_count import split_port_requirement
+
+    assert split_port_requirement(_ctx(0, gpu_count=gpu_count, min_count=min_count).state) == need
+
+
 @pytest.mark.asyncio
 async def test_exactly_enough_ports_for_every_split_passes():
-    result = await PortCountCheck().run(_ctx(8 * MIN_PORT_COUNT))
+    result = await PortCountCheck().run(_ctx(8))
     assert result.passed is True
     assert result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
 
 
 @pytest.mark.asyncio
 async def test_one_port_short_fails_with_the_split_count_and_the_ports_to_open():
-    result = await PortCountCheck().run(_ctx(8 * MIN_PORT_COUNT - 1))
+    result = await PortCountCheck().run(_ctx(7))
     assert result.passed is False
     assert result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
     what = result.event.what_we_saw
-    assert (what["available_port_count"], what["required"], what["max_splits"]) == (23, 24, 8)
-    assert "Open at least 24 renting ports for this node's 8 GPU splits" in result.event.remediation
-    assert result.updates["state"].specs["available_port_count"] == 23
+    assert (what["available_port_count"], what["required"], what["max_splits"]) == (7, 8, 8)
+    assert "Open at least 8 renting ports for this node's 8 GPU splits (one per split)" in result.event.remediation
+    assert result.updates["state"].specs["available_port_count"] == 7
 
 
 @pytest.mark.asyncio
 async def test_two_gpu_splits_need_ports_for_four_splits():
-    assert (await PortCountCheck().run(_ctx(4 * MIN_PORT_COUNT, min_count=2))).passed is True
-    short = await PortCountCheck().run(_ctx(4 * MIN_PORT_COUNT - 1, min_count=2))
-    assert short.passed is False and short.event.what_we_saw["max_splits"] == 4
+    assert (await PortCountCheck().run(_ctx(4, min_count=2))).passed is True
+    short = await PortCountCheck().run(_ctx(3, min_count=2))
+    assert short.passed is False and short.event.what_we_saw["required"] == short.event.what_we_saw["max_splits"] == 4
 
 
 @pytest.mark.asyncio
@@ -106,7 +117,7 @@ def _rented_now(*, pods: bool = False, filler_ports: list[int] | None = None) ->
 
 @pytest.mark.asyncio
 async def test_a_rent_that_started_after_the_snapshot_keeps_the_rented_exemption():
-    ctx = _ctx(8 * MIN_PORT_COUNT - 3)
+    ctx = _ctx(5)
     ctx.services.backend.get_rented_executors_now.return_value = _rented_now(pods=True)
     result = await PortCountCheck().run(ctx)
     assert result.passed is True
@@ -115,36 +126,36 @@ async def test_a_rent_that_started_after_the_snapshot_keeps_the_rented_exemption
 
 @pytest.mark.asyncio
 async def test_a_filler_that_started_after_the_snapshot_counts_its_ports():
-    ctx = _ctx(8 * MIN_PORT_COUNT - 3)
+    ctx = _ctx(5)
     ctx.services.backend.get_rented_executors_now.return_value = _rented_now(filler_ports=[61000, 61001, 61002])
     result = await PortCountCheck().run(ctx)
     assert result.passed is True
-    assert result.updates["port_count"] == 8 * MIN_PORT_COUNT
+    assert result.updates["port_count"] == 8
 
 
 @pytest.mark.asyncio
 async def test_no_fresh_rental_data_keeps_the_failure():
-    ctx = _ctx(8 * MIN_PORT_COUNT - 3)  # the helper's backend answers None
+    ctx = _ctx(5)  # the helper's backend answers None
     assert (await PortCountCheck().run(ctx)).passed is False
 
 
 @pytest.mark.asyncio
-async def test_a_listed_split_node_is_hidden_at_23_ports_and_listed_again_at_24():
+async def test_a_listed_split_node_is_hidden_at_7_ports_and_listed_again_at_8():
     from neurons.validators.src.services.task.availability import availability_errors
 
     def errors(result):
         return [e.reason_code for e in availability_errors([result.event])]
 
     # the backend skips a zero-score report, so only an availability entry takes the listing down
-    assert errors(await PortCountCheck().run(_ctx(24))) == []
-    short = await PortCountCheck().run(_ctx(23))
+    assert errors(await PortCountCheck().run(_ctx(8))) == []
+    short = await PortCountCheck().run(_ctx(7))
     assert errors(short) == [PortCountMessages.INSUFFICIENT_PORTS.reason]
     assert short.event.what_we_saw["reach_target"] == "executor_ports"
-    assert errors(await PortCountCheck().run(_ctx(24))) == []
+    assert errors(await PortCountCheck().run(_ctx(8))) == []
 
 
 async def _guarded(declared: int) -> list:
-    """Six listed nodes verified at 23 ports, declaring `declared`, through the outage guard."""
+    """Six listed nodes verified at 7 ports, declaring `declared`, through the outage guard."""
     from neurons.validators.src.services.task.availability import (
         availability_errors,
         silence_availability_errors_on_our_own_outage,
@@ -153,7 +164,7 @@ async def _guarded(declared: int) -> list:
 
     results = []
     for _ in range(6):
-        event = (await PortCountCheck().run(_ctx(23, declared=declared))).event
+        event = (await PortCountCheck().run(_ctx(7, declared=declared))).event
         entries = [e.model_dump(mode="json") for e in availability_errors([event])]
         results.append(JobResult.model_construct(availability_errors=entries))
     silence_availability_errors_on_our_own_outage(results)
@@ -163,13 +174,13 @@ async def _guarded(declared: int) -> list:
 @pytest.mark.asyncio
 async def test_the_outage_guard_counts_and_silences_a_split_probe_shortfall():
     # enough ports declared, too few verified: a fleet-wide probe failure on our side must not hide every split node
-    assert all(result.availability_errors is None for result in await _guarded(declared=24))
+    assert all(result.availability_errors is None for result in await _guarded(declared=8))
 
 
 @pytest.mark.asyncio
 async def test_the_outage_guard_keeps_a_split_node_that_declares_too_few_ports():
     # too few ports declared is the node's configuration, not our probe: the listing comes down
-    results = await _guarded(declared=23)
+    results = await _guarded(declared=7)
     assert all(
         [e["reason_code"] for e in result.availability_errors] == ["INSUFFICIENT_PORTS"]
         for result in results
@@ -222,5 +233,5 @@ async def test_the_split_requirement_sees_the_rental_the_tenant_check_judges(min
     with pytest.raises(RuntimeError):
         await PortConnectivityCheck().run(ctx)
     assert probe.verify_ports.call_args.kwargs["min_ports"] == (
-        MIN_PORT_COUNT if rented else 8 * MIN_PORT_COUNT
+        MIN_PORT_COUNT if rented else 8
     )

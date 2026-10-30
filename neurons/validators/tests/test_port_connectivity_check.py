@@ -287,7 +287,7 @@ async def test_port_connectivity_asks_the_probe_for_every_port_an_idle_split_nod
 
     await PortConnectivityCheck().run(ctx)
 
-    assert connectivity_service.called_with["min_ports"] == 24
+    assert connectivity_service.called_with["min_ports"] == 8
 
 
 @pytest.mark.asyncio

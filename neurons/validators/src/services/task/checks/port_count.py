@@ -33,21 +33,22 @@ def port_count_below_listing_floor(state: ContextState) -> int | None:
 def split_port_requirement(state: ContextState) -> tuple[int, int] | None:
     """(max splits, ports needed) for a node offered as GPU splits, else None.
 
-    DAH-3698 (owner, 29 Oct 2026): a split node lists only with MIN_PORT_COUNT free verified ports
-    for each of its gpu_count // gpu_splitting_min_count splits, so every split can be rented at once.
+    DAH-3698 (owner, 29 Oct 2026, "minimum ports as maximum splits"): a split node lists only with one
+    free verified port for each of its gpu_count // gpu_splitting_min_count splits (a rental takes one
+    port since lium-platform#2122), and never below the plain MIN_PORT_COUNT floor.
     """
     min_count = state.gpu_splitting_min_count
     if not state.supports_gpu_splitting or not min_count or min_count <= 0:
         return None
     max_splits = (state.gpu_count or 0) // min_count
-    return max_splits, max(max_splits * MIN_PORT_COUNT, MIN_PORT_COUNT)
+    return max_splits, max(max_splits, MIN_PORT_COUNT)
 
 
 def split_port_shortfall(
     state: ContextState, verified_override: int | None = None
 ) -> tuple[int, tuple[int, int]] | None:
-    """(port count, split_port_requirement) when a split node has the plain floor but not MIN_PORT_COUNT
-    ports per split, else None (below the floor, the floor reports it). The count is the published
+    """(port count, split_port_requirement) when a split node has the plain floor but not one port
+    per split, else None (below the floor, the floor reports it). The count is the published
     `available_port_count`, or `verified_override` when the caller re-probed the node itself."""
     need = split_port_requirement(state)
     available: Any = state.specs.get("available_port_count")
@@ -90,7 +91,7 @@ def split_ports_event(
         },
         remediation=(
             f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
-            f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
+            "(one per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
             "then `docker compose up -d` in neurons/executor."
         ),
         extra=extra,
