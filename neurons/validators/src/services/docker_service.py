@@ -1255,8 +1255,9 @@ async def _raise_unless_running_before_created(
         )
 
 
-# Every marker holds a space or a ": ", which no hostname, port or URL can, so the registry's name in the error
-# (SDK label, DNS lookup, x509 certificate names) never matches; the text is matched as it is.
+# Every marker is several words, which no hostname, port or URL can be, so the registry's name in the error
+# (SDK label, DNS lookup, x509 certificate names) never matches; the text is matched as it is. The bare word
+# "unauthorized" is no marker: a single-label host of that name reads "lookup unauthorized: no such host".
 # The daemon's own errors reaching the registry (Go net/http), never a validator->daemon read timeout
 _LOGIN_REGISTRY_TIMEOUT_MARKERS = (
     "context deadline exceeded",
@@ -1267,7 +1268,6 @@ _LOGIN_REGISTRY_TIMEOUT_MARKERS = (
 # Only an explicit refusal by the registry is a credential problem; a 5xx or anything else is not
 _LOGIN_REFUSED_MARKERS = (
     "401 client error",
-    "unauthorized: ",
     "incorrect username or password",
     "authentication required",
 )
@@ -1279,8 +1279,7 @@ class DockerLoginFailed(RentalDockerOperationError):
 
     def __init__(self, text: str, login_error: str):
         lowered = login_error.lower()
-        # a refusal the SDK reports as the bare word ends the text: "... failed: unauthorized"
-        if lowered.endswith(": unauthorized") or any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
+        if any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
             self.renter_sentence = (
                 "Docker login refused by the image registry: check the template's registry credentials"
             )

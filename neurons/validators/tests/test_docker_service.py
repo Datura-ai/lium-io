@@ -4044,7 +4044,7 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
-        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
     )
     docker_client.pull_error = Exception("blocked")
     payload = _private_registry_create_payload()
@@ -4069,7 +4069,7 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_login"
     assert (
-        "Docker login failed: Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker login failed: Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
         in result.detail
     )
     assert "pull without login then failed: blocked" in result.detail
@@ -4111,6 +4111,11 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
             "Docker SDK login for auth:5000 failed: 401 Client Error for http+docker://ssh/v1.52/auth: "
             '("Get "https://auth:5000/v2/": unauthorized: incorrect username or password")',
             "Docker login refused by the image registry: check the template's registry credentials",
+        ),
+        (
+            'Docker SDK login for unauthorized:5000 failed: 500 Server Error: ("Get "https://unauthorized:5000/v2/": '
+            'dial tcp: lookup unauthorized: no such host")',
+            "Docker login to the image registry failed",
         ),
         (
             'Docker SDK login for timeout:5000 failed: 500 Server Error: ("Get "https://timeout:5000/v2/": '
@@ -4179,7 +4184,7 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
     _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
-        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
     )
     payload = _private_registry_create_payload()
     executor_info = ExecutorSSHInfo(
