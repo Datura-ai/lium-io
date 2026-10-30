@@ -45,6 +45,15 @@ RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# pod id -> set by the rented-pod recovery when it stops a pod or before it renames one back, cleared
+# once the pod is started again (no expiry: it is the only evidence the stop was ours): a stopped
+# pod_<id> it marked is its own to start next cycle, even when the rename's reply and its cleanup
+# were lost with the SSH transport
+STOPPED_BY_RECOVERY_PREFIX = "stopped_by_recovery:"
+# its values: RENAMING only makes the pod restartable (the rename may not have applied, so the pod is
+# still judged down); STOPPED also means the recovery itself stopped the pod
+STOPPED_BY_RECOVERY_RENAMING = "renaming"
+STOPPED_BY_RECOVERY_STOPPED = "stopped"
 # set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
@@ -173,6 +182,19 @@ class InflightBackendCreate(BaseModel):
     executor_id: str
     workload_kind: WorkloadKind
     started_at_unix_seconds: int
+    # which execution wrote it; each execution has its own record
+    create_id: str = ""
+
+
+def _inflight_create_field(pod_id: str, create_id: str) -> str:
+    # one field per execution, so overlapping creates of a pod each keep their own record
+    return f"{pod_id}|{create_id}" if create_id else pod_id
+
+
+def _pod_of_inflight_create_field(field: str | bytes) -> str:
+    if isinstance(field, bytes):
+        field = field.decode()
+    return field.split("|", 1)[0]
 
 
 class RedisWrite(NamedTuple):
@@ -696,32 +718,45 @@ class RedisService:
                 await self.redis.delete(key)
 
     async def add_inflight_backend_create(
-        self, pod_id: str, miner_hotkey: str, executor_id: str, workload_kind: WorkloadKind
+        self,
+        pod_id: str,
+        miner_hotkey: str,
+        executor_id: str,
+        workload_kind: WorkloadKind,
+        create_id: str = "",
     ) -> None:
         create = InflightBackendCreate(
             miner_hotkey=miner_hotkey,
             executor_id=executor_id,
             workload_kind=workload_kind,
             started_at_unix_seconds=int(time.time()),
+            create_id=create_id,
         )
-        await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
+        await self.hset(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id), create.model_dump_json())
 
-    async def remove_inflight_backend_create(self, pod_id: str) -> None:
-        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+    async def remove_inflight_backend_create(self, pod_id: str, create_id: str = "") -> None:
+        """Remove one execution's record; the pod's other executions keep theirs."""
+        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id))
 
-    async def inflight_backend_creates(self) -> dict[str, InflightBackendCreate]:
-        """pod id -> the create the backend sent for it"""
+    async def backend_create_inflight(self, pod_id: str) -> bool:
+        """Whether the connector is running any create, reboot or edit of the pod (another process)."""
+        fields = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
+        return any(_pod_of_inflight_create_field(field) == pod_id for field in fields)
+
+    async def inflight_backend_creates(self) -> dict[str, list[InflightBackendCreate]]:
+        """pod id -> every create the backend sent for it that is still recorded"""
         raw = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
-        creates: dict[str, InflightBackendCreate] = {}
-        for raw_pod_id, entry in raw.items():
-            pod_id = raw_pod_id.decode() if isinstance(raw_pod_id, bytes) else raw_pod_id
+        creates: dict[str, list[InflightBackendCreate]] = {}
+        for raw_field, entry in raw.items():
+            field = raw_field.decode() if isinstance(raw_field, bytes) else raw_field
+            pod_id = _pod_of_inflight_create_field(field)
             try:
-                creates[pod_id] = InflightBackendCreate.model_validate_json(entry)
+                creates.setdefault(pod_id, []).append(InflightBackendCreate.model_validate_json(entry))
             except ValidationError:
                 # one bad entry must not block the sweep of the others on every start
                 logger.error(_m("Dropping an unreadable inflight backend create", extra={"pod_id": pod_id}))
-                await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
-        return creates
+                await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, field)
+        return {pod_id: pod_creates for pod_id, pod_creates in creates.items() if pod_creates}
 
     async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")

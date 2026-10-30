@@ -69,8 +69,7 @@ def client(monkeypatch):
     client.lock = asyncio.Lock()
     client.logging_extra = {}
     client.miner_service = MagicMock(redis_service=service)
-    client._track_backend_create_for_restart_report = AsyncMock()
-    client._untrack_backend_create_for_restart_report = AsyncMock()
+    client._write_backend_create_record = AsyncMock(return_value=True)
     client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="127.0.0.1", port=8000))
     client.miner_service.handle_container = AsyncMock(
         return_value=ContainerCreated(

@@ -120,3 +120,30 @@ async def test_a_hung_backend_answer_is_bounded_and_keeps_the_pod(retry_ssh_mock
     ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout=f"pod_{NEWER}\n", stderr=""))
 
     assert await svc.clean_existing_containers(ssh_client=ssh_client, default_extra={}, pod_name="pod_target") == []
+
+
+@pytest.mark.asyncio
+async def test_lookups_are_capped_per_sweep_and_unchecked_pods_kept(retry_ssh_mock):
+    """A provider can leave thousands of stopped pod_<uuid> containers: one sweep asks about at most the cap."""
+    cap = ds_module.MAX_UNLISTED_POD_LOOKUPS
+    ids = [f"{i:08d}-0000-0000-0000-000000000000" for i in range(cap + 5)]
+    backend_client = Mock(get_pod_rental_active=AsyncMock(return_value=CLOSED))
+    svc = DockerService(
+        ssh_service=Mock(),
+        redis_service=Mock(get=AsyncMock(return_value=None)),
+        attestation_service=Mock(),
+        backend_client=backend_client,
+    )
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout="".join(f"pod_{i}\n" for i in ids), stderr=""))
+
+    removed = await svc.clean_existing_containers(
+        ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[]
+    )
+
+    asked = {call.args[0] for call in backend_client.get_pod_rental_active.await_args_list}
+    assert len(asked) == backend_client.get_pod_rental_active.await_count == cap
+    assert sorted(removed) == sorted(f"pod_{i}" for i in asked)
+    sent = " ".join(call.args[1] for call in retry_ssh_mock.await_args_list)
+    for unchecked in set(ids) - asked:
+        assert f"pod_{unchecked}" not in removed and f"pod_{unchecked}" not in sent
