@@ -64,12 +64,14 @@ class CustomOptions(BaseModel):
             # container side of the pod's own named volume. Only a plain absolute path is taken, and one
             # that came with flags is refused whole rather than stripped.
             if ':' not in clean_volume:
+                # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace"
+                bare = volume.strip().rstrip('/')
                 if (
-                    _BARE_VOLUME_PATH_RE.fullmatch(volume.strip())
-                    and clean_volume.split('/')[1] not in ('lium-cipher', 'mnt')
-                    and not CustomOptions._is_dangerous_path(clean_volume)
+                    _BARE_VOLUME_PATH_RE.fullmatch(bare)
+                    and bare.split('/')[1] not in ('lium-cipher', 'mnt')
+                    and not CustomOptions._is_dangerous_path(bare)
                 ):
-                    sanitized.append(clean_volume)
+                    sanitized.append(bare)
                 continue
 
             host_path, container_path = clean_volume.split(':', 1)
