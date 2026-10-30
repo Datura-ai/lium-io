@@ -704,19 +704,19 @@ _VOLUME_HOST_PROBE_TIMEOUT_SECONDS = 30
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
 def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
-    state = (
+    plugin_state_command = (
         "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
         f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null || echo absent) | tail -n 1"
     )
     marker_path = loopback_plugin_probe_marker_path(loopback_plugin_alias)
     if marker_path is None:
-        return state
+        return plugin_state_command
     # "true" only once the setup script's probe volume mounted on this pinned build (the marker
     # holds its digest); an enabled plugin still being probed, whose probe was cut short, or probed
     # as an earlier build reads "unverified" and goes through setup
     digest = LOOPBACK_PLUGIN_BUILDS[loopback_plugin_alias].digest
     return (
-        f'state="$( {state})"; '
+        f'state="$( {plugin_state_command})"; '
         f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != {shlex.quote(digest)} ]; '
         'then echo unverified; else echo "$state"; fi'
     )
@@ -727,8 +727,8 @@ def _current_loopback_plugin_state_command() -> str:
 
 
 class NoUsableLoopbackPluginError(Exception):
-    """The current plugin cannot be used and neither older plugin is enabled: the validator never
-    installs or enables an older plugin, so the rent fails naming them."""
+    """The current plugin cannot be used and no fallback plugin can be: the validator never installs
+    or enables the legacy plugin, so the rent fails naming the fallbacks' states."""
 
     def __init__(self, current_plugin_unusable_reason: str, current_alias: str, old_plugin_states: dict[str, str]):
         # "plugin vloopback" + "disabled" is what the stats classifier files as volume.plugin_disabled
@@ -6582,19 +6582,22 @@ class DockerService:
         # probed); returns why it cannot be used, None once it can
         generation = LOOPBACK_PLUGIN_BUILDS[alias].generation
         try:
-            setup_timeout = (
+            setup_timeout_seconds = (
                 _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
                 if loopback_plugin_probe_marker_path(alias)
                 else _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
             )
-            result = await _run_with_host_timeout(
+            setup_execution = await _run_with_host_timeout(
                 ssh_client,
                 loopback_plugin_setup_command(docker_root_dir, alias),
-                setup_timeout,
+                setup_timeout_seconds,
             )
-            if result.exit_status == 0:
+            if setup_execution.exit_status == 0:
                 return None
-            return f"{generation} setup exit {result.exit_status}: {(result.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
+            return (
+                f"{generation} setup exit {setup_execution.exit_status}: "
+                f"{(setup_execution.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
+            )
         except (SshSessionMayStillBeTakenError, asyncssh.Error):
             raise
         except TimeoutError:
