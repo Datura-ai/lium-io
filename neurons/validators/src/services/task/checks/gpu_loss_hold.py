@@ -9,7 +9,8 @@ was listed again on its first clean scrape, and a rented one passed the rented c
 Every cycle this check judges the scrape with `judge_rented_gpus` (the rental's GPU count, the driver's count, the
 anchored UUID set, the NVML error code; an idle node counts as renting one GPU). A full set of other cards
 (`full_set_changed`) is no fault, rented or idle: it is judged without the anchor, a hold an earlier dropout left
-is dropped, and GpuFingerprintCheck re-anchors it the same cycle. Under a rental, a pod whose container was made
+is dropped when no anchored card is left (a partial swap keeps it and still owes the load test below), and
+GpuFingerprintCheck re-anchors it the same cycle. Under a rental, a pod whose container was made
 for the old cards (the host's docker record of it names GPUs the host no longer lists) has no GPU: the cycle fails
 here with a GPU_LOST entry (POD_GPUS_GONE), so the node is hidden, scores 0 and is not re-anchored, until the pod is
 recreated on the new cards or the rental ends. A fault (fewer cards, a card missing, an NVML error) puts the node on a hold; weak
@@ -164,7 +165,10 @@ class GpuLossHoldCheck:
             return CheckResult(passed=False, event=event)
         drop = judge_scrape(ctx, pods)
         listed = sorted(set(_listed_uuids(gpu_details)))
-        set_changed = full_set_changed(split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or ""), listed)
+        anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+        set_changed = full_set_changed(anchor, listed)
+        # a complete replacement (no anchored card left) ends a dropout hold; a partial swap still owes the load test
+        replaced_all = set_changed and not set(anchor) & set(listed)
         key = _key(ctx)
         mark: DropMark | None = None
         try:
@@ -204,7 +208,7 @@ class GpuLossHoldCheck:
             # the node may take its new cards, but a pod made for the old ones has no GPU: it stays unavailable
             stranded = await self._pods_without_their_gpus(ctx, pods, listed)
             if stranded is not None:
-                if mark is not None:
+                if mark is not None and replaced_all:
                     await self._forget(ctx, key)
                 stamp = now.isoformat()
                 # fatal: the cycle scores 0 (no passing report for a pod with no GPU) and nothing re-anchors yet
@@ -219,9 +223,10 @@ class GpuLossHoldCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
-        if not mark.is_held or mark.replaced or set_changed:
+        if not mark.is_held or mark.replaced or replaced_all:
             # a weak sighting the next cycle did not confirm, a hold for a changed set (no fault), or a hold an
-            # earlier dropout left on a node now back with a full set of other cards: it re-anchors and lists
+            # earlier dropout left on a node now back with a full set of other cards: it re-anchors and lists.
+            # A partial swap goes on below: its remaining old cards still owe the load test.
             await self._forget(ctx, key)
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)

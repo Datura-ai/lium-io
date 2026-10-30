@@ -617,6 +617,31 @@ async def test_a_dropout_hold_ends_when_the_node_is_back_with_a_full_set_of_othe
     assert fingerprint.passed and fingerprint.updates == {"gpu_reanchor": True}
 
 
+PARTLY_SWAPPED = UUIDS[:3] + OTHER_CARDS[:1]
+
+
+@pytest.mark.asyncio
+async def test_a_dropout_hold_on_a_node_back_with_a_partial_swap_still_owes_the_load_test(context_factory):
+    """Regression (review of #1956): a partial swap at equal count cleared the hold without the load-test marker."""
+    redis = FakeRedis()
+    rented = _ctx(context_factory, redis, listed=PARTLY_SWAPPED, pods=(4,))
+    redis.store[gpu_loss_hold._key(rented)] = json.dumps(HELD_BY_A_DROPOUT)
+
+    # under a rental the test cannot run: the node stays hidden (not fatal) and the hold keeps the obligation
+    result = await GpuLossHoldCheck().run(rented)
+    assert not result.passed and not _fatal(result) and _hidden(result)
+    assert gpu_loss_hold._key(rented) in redis.store and RECHECK_KEY not in redis.store
+
+    # the first idle cycle (re-anchored or not) ends the hold and owes the load test
+    for anchor in (UUIDS, PARTLY_SWAPPED):
+        redis.store[gpu_loss_hold._key(rented)] = json.dumps(HELD_BY_A_DROPOUT)
+        redis.store.pop(RECHECK_KEY, None)
+        result = await _cycle(context_factory, redis, listed=PARTLY_SWAPPED, anchor=anchor, pods=())
+        assert result.passed and result.event.reason_code == Msg.CLEAN_AGAIN.reason
+        assert gpu_loss_hold._key(rented) not in redis.store
+        assert json.loads(redis.store[RECHECK_KEY])["source"] == "gpu_loss_hold"
+
+
 @pytest.mark.asyncio
 async def test_a_pod_on_the_old_cards_keeps_the_node_back_and_drops_the_dropout_hold(context_factory):
     redis = FakeRedis()
