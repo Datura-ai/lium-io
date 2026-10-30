@@ -58,6 +58,38 @@ async def test_fallback_stops_when_a_container_start_hangs(mocker):
     assert runner.run.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_dind_probe_fails_when_its_container_start_hangs(mocker):
+    # DAH-5419: the DinD start runs on the same daemon right after the fallback, so it needs its own bound
+    from services.executor_connectivity import dind_probe
+
+    commands = []
+
+    async def run(cmd):
+        commands.append(cmd)
+        if "docker run" in cmd:
+            await asyncio.sleep(5)
+        return mocker.Mock(exit_status=0, stdout="", stderr="")
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
+    mocker.patch.object(dind_probe, "DIND_RUN_TIMEOUT_SECONDS", 0.1)
+
+    result = await asyncio.wait_for(  # without the bound the start would hold the probe for the full 5 s
+        dind_probe.DindVerifier(ssh_service).verify(
+            PortPair(9000, 9000),
+            ssh_client=mocker.Mock(run=run),
+            host="1.2.3.4",
+            container_name_prefix="container_x",
+            sysbox=False,
+        ),
+        2,
+    )
+
+    assert result.success is False
+    assert any("docker run" not in c for c in commands)  # the probe container is still removed
+
+
 def _batch_verifier(mocker, test_many, external=None):
     from services.executor_connectivity.port_verifiers import BatchVerifier
 
