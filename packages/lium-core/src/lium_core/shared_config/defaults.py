@@ -81,6 +81,8 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
         "NVIDIA RTX 5000 Ada Generation": 0.27,
         "NVIDIA RTX 5880 Ada Generation": 0.34,
         "NVIDIA A800 80GB PCIe": 0.31,
+        "NVIDIA A100-PCIE-40GB": 0.37,
+        "NVIDIA A100-SXM4-40GB": 0.47,
         "NVIDIA A10 Tensor Core GPU": 0.20,
         "NVIDIA RTX A2000": 0.06,
         "NVIDIA T4 Tensor Core GPU": 0.15,

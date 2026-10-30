@@ -52,6 +52,8 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
+    "NVIDIA A100-PCIE-40GB": 0.0,  # idle pay only, no mining share (DAH-5088)
+    "NVIDIA A100-SXM4-40GB": 0.0,
     "NVIDIA A800 80GB PCIe": 0.0,
     "NVIDIA CMP 170HX": 0.0,
     "NVIDIA A10 Tensor Core GPU": 0.0,

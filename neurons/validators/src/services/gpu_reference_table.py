@@ -16,6 +16,8 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
     "NVIDIA A10 Tensor Core GPU": (0.2, (24,)),
     "NVIDIA A100 80GB PCIe": (0.45, (80,)),
     "NVIDIA A100-SXM4-80GB": (0.7, (80,)),
+    "NVIDIA A100-PCIE-40GB": (0.37, (40,)),
+    "NVIDIA A100-SXM4-40GB": (0.47, (40,)),
     "NVIDIA A800 80GB PCIe": (0.31, (80,)),
     "NVIDIA B200": (5.6, (192,)),
     "NVIDIA B300 SXM6 AC": (8.0, (288,)),
@@ -107,26 +109,13 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
 }
 
 
-# A real smaller variant of a candidate, with no rate or price of its own: name -> (reference, nominal VRAM in
-# GB). It takes that reference only at its own memory, like a known name. No rule by family name: a renamed
-# card would step up to a bigger model of the family (lium-io#1959 review).
-GPU_VARIANT_REFERENCES: dict[str, tuple[str, int]] = {
-    "NVIDIA A100-PCIE-40GB": ("NVIDIA A100 80GB PCIe", 40),
-    "NVIDIA A100-SXM4-40GB": ("NVIDIA A100 80GB PCIe", 40),
-}
-
-
-def pick_reference(vram_mib: float | None, name: str | None = None) -> str | None:
-    """A GPU_VARIANT_REFERENCES `name` reporting its own size (within REFERENCE_VRAM_BAND) gets its reference.
-    Else the cheapest candidate with a nominal size within REFERENCE_VRAM_BAND of `vram_mib` (MiB, as
+def pick_reference(vram_mib: float | None) -> str | None:
+    """The cheapest candidate with a nominal size within REFERENCE_VRAM_BAND of `vram_mib` (MiB, as
     nvidia-smi reports it), else the cheapest with the largest size below it; a price tie goes to
     the first name. None for an unknown VRAM or one below every candidate."""
     if not vram_mib or vram_mib <= 0:
         return None
     low, high = REFERENCE_VRAM_BAND
-    reference, size_gb = GPU_VARIANT_REFERENCES.get(name or "", (None, 0))
-    if reference and low <= size_gb * 1024 / vram_mib <= high:
-        return reference
     sizes = [
         (size_gb * 1024, price, model)
         for model, (price, sizes_gb) in GPU_REFERENCE_TABLE.items()

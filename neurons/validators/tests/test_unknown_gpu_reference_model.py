@@ -1,9 +1,8 @@
 """DAH-5088: an unknown NVIDIA model passes validation and is scored as its reference model.
 
-A real smaller variant listed in services/gpu_reference_table.py (A100 40GB) at its own memory gets
-its listed reference. Any other name gets the cheapest model whose nominal VRAM is within 0.90-1.10x
-of the card's reported VRAM, else the cheapest with the largest size below it, else none (still
-unsupported).
+The reference is the cheapest model in services/gpu_reference_table.py whose nominal VRAM is
+within 0.90-1.10x of the card's reported VRAM, else the cheapest with the largest size below it,
+else none (still unsupported).
 """
 
 import hashlib
@@ -35,7 +34,7 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "a9deb3a1245d039c6739fa1d0cf888965d0987ef96766ffd987a56e091489aec"
+GPU_REFERENCE_TABLE_SHA256 = "032eff33bb4a278f4cbb54ed887da0cd2003ac6cdd2e8d4923b7920cca1b139c"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = list(GPU_REFERENCE_TABLE)
 
@@ -90,23 +89,6 @@ def test_the_reference_matches_the_backends(vram_mb, reference):
     assert reference_gpu_model(UNKNOWN, vram_mb) == reference
 
 
-# the same cases as lium-platform's src/test/test_unknown_gpu_reference_model.py: a real smaller variant at its own
-# memory gets its reference; any other name, a renamed one included, gets the memory-only pick
-VARIANT_CASES = [
-    # the 29 Oct 2026 prod card, the memory-only pick made it a CMP 170HX mining card
-    ("NVIDIA A100-SXM4-40GB", 40960, "NVIDIA A100 80GB PCIe"),
-    ("NVIDIA A100-PCIE-40GB", 40536, "NVIDIA A100 80GB PCIe"),
-    ("NVIDIA A100-SXM4-40GB", 8192, "NVIDIA GeForce GTX 1080"),
-    ("NVIDIA H200 80GB", 81920, "NVIDIA A800 80GB PCIe"),
-    ("NVIDIA B300 X", 143771, "NVIDIA H200 NVL"),
-]
-
-
-@pytest.mark.parametrize(("name", "vram_mb", "reference"), VARIANT_CASES)
-def test_only_a_listed_variant_at_its_own_memory_steps_off_the_memory_pick(name, vram_mb, reference):
-    assert reference_gpu_model(name, vram_mb) == reference
-
-
 def test_with_none_that_close_it_falls_back_to_the_largest_size_below():
     vram_mb = 400_000
     assert not [m for m in CANDIDATES if _in_band(m, vram_mb)]
@@ -134,6 +116,19 @@ def test_no_reference_for_a_non_nvidia_name_or_too_little_memory(name, vram_mb):
 def test_a_known_name_is_its_own_reference_whatever_its_vram():
     assert reference_gpu_model("NVIDIA H100 80GB HBM3", 8000) == "NVIDIA H100 80GB HBM3"
     assert reference_gpu_model("Tesla T4", None) == "NVIDIA T4 Tensor Core GPU"
+
+
+@pytest.mark.parametrize(("name", "anchor"), [("NVIDIA A100-PCIE-40GB", 0.37), ("NVIDIA A100-SXM4-40GB", 0.47)])
+def test_an_a100_40gb_is_paid_as_itself_not_as_an_a100_80gb_or_a_mining_card(name, anchor):
+    from incentive.config import BASE_GPU_MAP, MAX_UNRENTED_GPUS_BY_TYPE, IncentiveConfig
+    from incentive.utils import get_hourly_rate
+
+    config = IncentiveConfig()
+    assert reference_gpu_model(name, 40960) == name
+    assert BASE_GPU_MAP[name] == "A100 40GB" and MAX_UNRENTED_GPUS_BY_TYPE["A100 40GB"] == {1: 10, 8: 64}
+    for gpu_count in (1, 8):
+        assert get_hourly_rate(name, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour) == anchor
+    assert PRICES[name] == anchor
 
 
 def test_precheck_and_matmul_sizing_take_the_reported_vram_of_an_unknown_card():
