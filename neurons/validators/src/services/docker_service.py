@@ -7944,16 +7944,15 @@ class DockerService:
         backend's rented-machine cache answers first: the host can hide its containers, not that (F-12)."""
         if executor_info is not None:
             try:
+                # marker first: it is never unset and the list swaps atomically, so a list read after a
+                # set marker is a synced one; read the other way round a first sync could land between
+                synced = await redis_service.rented_machines_synced()
                 rented = await redis_service.get_rented_machine(executor_info)
             except Exception as exc:
                 # a guess either way records the wrong start for good; the create fails and is retried
                 raise GpuPowerRestoreStateError("rented-machine cache could not be read") from exc
             if any(c.get("pod_id") == pod_id for c in (rented or {}).get("containers", [])):
                 return True
-            try:
-                synced = await redis_service.rented_machines_synced()
-            except Exception as exc:
-                raise GpuPowerRestoreStateError("rented-machine cache could not be read") from exc
             if not synced:
                 # no backend list yet (fresh Redis): absence proves nothing; the create is retried
                 raise GpuPowerRestoreStateError("rented-machine cache not synced from the backend yet")

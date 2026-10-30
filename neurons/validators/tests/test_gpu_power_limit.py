@@ -403,3 +403,24 @@ async def test_an_unreadable_rented_list_fails_the_create_instead_of_guessing(mo
             record_rental_start=True, executor_info=object(),
         )
     raise_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_synced_marker_is_read_before_the_list(monkeypatch) -> None:
+    # F-12: list read unsynced, then the first sync lands, then a set marker would vouch for a stale "absent"
+    import services.docker_service as ds
+
+    monkeypatch.setattr(ds, "restore_tracked_gpu_power_limits", AsyncMock())
+    monkeypatch.setattr(ds, "raise_low_power_limits_to_default", AsyncMock(return_value=0))
+    order: list[str] = []
+    redis_service = SimpleNamespace(
+        rented_machines_synced=AsyncMock(side_effect=lambda: order.append("marker") or False),
+        get_rented_machine=AsyncMock(side_effect=lambda _: order.append("list")),
+    )
+    payload = SimpleNamespace(gpu_uuids=["GPU-0"], executor_id="ex-1", pod_id="pod-1")
+    with pytest.raises(ds.GpuPowerRestoreStateError):
+        await ds.DockerService._restore_gpu_power_for_uncapped_pod(
+            SimpleNamespace(redis_service=redis_service), AsyncMock(), payload, SimpleNamespace(container_names=()), {},
+            record_rental_start=True, executor_info=object(),
+        )
+    assert order == ["marker", "list"]
