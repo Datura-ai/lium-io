@@ -1280,3 +1280,17 @@ async def test_create_container_skips_the_pod_ssh_host_key_without_a_master_secr
     )
 
     assert _pod_host_key_commands(ssh_client) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rm_exit, plugin_removed", [(0, True), (1, False)])
+async def test_a_refused_create_drops_the_s3fs_plugin_only_once_its_volume_is_gone(
+    docker_service, rm_exit, plugin_removed
+):
+    # A volume still in use (rm fails) keeps its plugin, so a pod mounting it keeps its mount (jam_bot, lio#1579).
+    ssh_client = RecordingSSHClient(exit_status=rm_exit)
+
+    await docker_service._remove_host_volumes_of_refused_create(ssh_client, {}, None, "celium-volume-safe")
+
+    assert any("docker volume rm celium-volume-safe" in c for c in ssh_client.commands)
+    assert any("docker plugin rm s3fs-celium-volume-safe" in c for c in ssh_client.commands) is plugin_removed

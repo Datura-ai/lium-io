@@ -6342,10 +6342,15 @@ class DockerService:
         the external volume with its plugin instance. Best effort; the refusal goes out anyway."""
         try:
             if external_volume_name:
+                # The plugin goes only once the volume is gone, as in delete_container: a volume still in use
+                # keeps its mount. The rm raises here (so the plugin stays) unless the volume no longer exists.
+                quoted = shlex.quote(external_volume_name)
                 await retry_ssh_command(
                     ssh_client,
-                    f"/usr/bin/docker volume rm {shlex.quote(external_volume_name)} 2>/dev/null || true",
+                    f"/usr/bin/docker volume rm {quoted} 2>/dev/null"
+                    f" || ! /usr/bin/docker volume inspect {quoted} >/dev/null 2>&1",
                     "drop_refused_create_volumes",
+                    max_attempts=1,
                 )
                 await self.remove_s3fs_volume_plugin(ssh_client, external_volume_name)
             if local_volume:
