@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import asyncssh
 import pytest
 from helpers import build_context_config, build_services, build_state
-from neurons.validators.src.core.docker_utils import _collect_host_context
+from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
@@ -1530,7 +1530,7 @@ async def test_unnamed_pod_never_runs_a_docker_filter_on_an_empty_name(context_f
     await TenantEnforcementCheck().run(ctx)
 
     ps_commands = [c for c in ssh.commands_called if "docker ps" in c]
-    assert ps_commands == ["/usr/bin/docker ps -q -f name=pod_53a68595"]
+    assert ps_commands == ["/usr/bin/docker ps -q -f 'name=^/?pod_53a68595$'"]
     assert not any(c.rstrip().endswith("name=") for c in ssh.commands_called)
 
 
@@ -1574,3 +1574,8 @@ async def test_unnamed_pod_whose_create_is_still_running_after_the_grace_is_not_
     assert result.passed
     assert result.event.reason_code == Msg.ALREADY_RENTED.reason
     assert "clear_verified_job_reason" not in result.updates
+
+
+def test_ps_running_matches_the_whole_container_name_only():
+    # Docker's name filter is an unanchored regex: `name=pod_1` also listed a `pod_12` container as this pod
+    assert DockerCommand.ps_running("pod_1.a") == "/usr/bin/docker ps -q -f 'name=^/?pod_1\\.a$'"

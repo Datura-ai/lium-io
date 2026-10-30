@@ -7501,6 +7501,49 @@ async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
 
 
 @pytest.mark.parametrize(
+    "status, expected_recovered",
+    [
+        # restarting keeps True so the caller's `docker ps` re-read decides the verdict as before
+        pytest.param("restarting", True, id="crash_loop_keeps_todays_verdict"),
+        pytest.param("exited", False, id="start_did_not_stick"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_logs_a_start_that_did_not_stick_with_its_exit_code(
+    docker_service, monkeypatch, caplog, status, expected_recovered
+):
+    # pod da05c116 (30 Oct): the repaired container came back restarting with exit 126, yet the
+    # recovery logged POD_STALE_MOUNT_RECOVERED and no exit code anywhere
+    state = {"Status": status, "ExitCode": 126, "OOMKilled": False, "Error": ""}
+    ssh_client = _recovery_ssh_client()
+    plain_run = ssh_client.run.side_effect
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _make_ssh_command_result(stdout=json.dumps(state))
+        if "docker logs" in command:
+            return _make_ssh_command_result(stdout="exec /entrypoint.sh: permission denied\n")
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "start_existing_container", AsyncMock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    events = [str(record.msg) for record in caplog.records]
+    assert "POD_STALE_MOUNT_RECOVERED" not in events
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_NOT_RUNNING"]
+    assert record.msg.extra["container_status"] == status
+    assert record.msg.extra["container_exit_code"] == 126
+    assert "permission denied" in record.msg.extra["container_logs_tail"]
+
+
+@pytest.mark.parametrize(
     "local_volume_path",
     [
         pytest.param(None, id="path_absent"),
@@ -7575,6 +7618,133 @@ async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_
 
     assert recovered is True
     assert start_existing_container.await_args.kwargs["local_volume_path"] == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_keeps_the_exit_code_when_the_encrypted_remount_hits_a_crash_loop(
+    docker_service, monkeypatch, caplog
+):
+    # review on #1973: an encrypted pod whose entrypoint exits 126 at once fails the remount's
+    # `docker exec` (container restarting), and the stop in the failure branch used to run before
+    # anything read the exit code. Drives the real start_existing_container and remount.
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    state = {"Status": "restarting", "ExitCode": 126, "OOMKilled": False, "Error": ""}
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+    plain_run = ssh_client.run.side_effect
+    commands: list[str] = []
+
+    async def run(command, *args, **kwargs):
+        commands.append(command)
+        if "docker exec" in command:
+            return _make_ssh_command_result(
+                exit_status=1,
+                stderr="Error response from daemon: Container abc is restarting, wait until the container is running",
+            )
+        if "{{json .State}}" in command:
+            return _make_ssh_command_result(stdout=json.dumps(state))
+        if "docker logs" in command:
+            return _make_ssh_command_result(stdout="exec /entrypoint.sh: permission denied\n")
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
+    docker_service.rental_docker_client_factory.client.mount_source_for_destination = AsyncMock(
+        return_value="volume_pod-1"
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(
+            docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+        )
+
+    assert recovered is False
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_START_FAILED"]
+    assert record.msg.extra["container_exit_code"] == 126
+    assert record.msg.extra["container_status"] == "restarting"
+    assert "permission denied" in record.msg.extra["container_logs_tail"]
+    assert "is restarting" in record.msg.extra["error"]
+    assert record.msg.extra["container_stopped"] is True
+    state_read = next(i for i, c in enumerate(commands) if "{{json .State}}" in c)
+    stop = next(i for i, c in enumerate(commands) if "docker stop pod_pod-1" in c)
+    assert state_read < stop
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_keeps_the_crash_state_when_the_log_read_hangs(
+    docker_service, monkeypatch, caplog
+):
+    # review F-4 on #1973: inspect answered "exited 126", then `docker logs` hung; the timeout used
+    # to discard the state and the recovery logged POD_STALE_MOUNT_RECOVERED and returned True
+    monkeypatch.setattr(docker_service_module, "_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC", 0.05)
+    state = {"Status": "exited", "ExitCode": 126, "OOMKilled": False, "Error": ""}
+    ssh_client = _recovery_ssh_client()
+    plain_run = ssh_client.run.side_effect
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _make_ssh_command_result(stdout=json.dumps(state))
+        if "docker logs" in command:
+            await asyncio.sleep(10)
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "start_existing_container", AsyncMock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is False
+    assert "POD_STALE_MOUNT_RECOVERED" not in [str(r.msg) for r in caplog.records]
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_NOT_RUNNING"]
+    assert record.msg.extra["container_status"] == "exited"
+    assert record.msg.extra["container_exit_code"] == 126
+    assert record.msg.extra["diagnostics_capture_error"] == "diagnostics timed out"
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_still_stops_the_container_when_diagnostics_hang(
+    docker_service, monkeypatch, caplog
+):
+    monkeypatch.setattr(docker_service_module, "_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC", 0.01)
+    ssh_client = _recovery_ssh_client()
+    plain_run = ssh_client.run.side_effect
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            await asyncio.sleep(10)
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    monkeypatch.setattr(
+        docker_service, "start_existing_container", AsyncMock(side_effect=RuntimeError("remount failed"))
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is False
+    assert "docker stop pod_pod-1" in ssh_client.run.await_args.args[0]
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_START_FAILED"]
+    assert record.msg.extra["diagnostics_capture_error"] == "diagnostics timed out"
 
 
 @pytest.mark.parametrize(
