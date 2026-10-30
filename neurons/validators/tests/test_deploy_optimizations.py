@@ -280,6 +280,15 @@ def test_a_rental_sent_without_a_memory_limit_is_capped_below_host_ram():
 
 def test_a_rental_with_a_memory_limit_keeps_the_backend_value():
     assert DockerService._rental_memory_gb(8, 64 * 1024 * 1024) == 8
+    # unreadable host RAM keeps the backend's limit, as before
+    assert DockerService._rental_memory_gb(64, None) == 64
+
+
+def test_a_backend_memory_limit_at_or_above_host_ram_is_clamped_below_it():
+    """ticket-0903: a pod limit of 64 GiB on a host with 65290844 KiB (~62.3 GiB) let the renter push the host into
+    a global OOM. The limit is clamped to host RAM less the reserve: 62.3 - 4 = 58 GiB."""
+    assert DockerService._rental_memory_gb(64, 65290844) == 58
+    assert DockerService._rental_memory_gb(62, 65290844) == 58
 
 
 def test_an_unreadable_host_ram_leaves_a_limitless_rental_as_it_was():
