@@ -388,6 +388,17 @@ class PortConnectivityCheck:
                     _m("disk pressure deferral not recorded", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
                 )
                 deferred = False
+            else:
+                if deferrals > DISK_PRESSURE_MAX_DEFERRALS:
+                    # the slot INCR handed out is past the bound: another cycle took the last one between the read
+                    # above and this write, so this cycle runs the check
+                    logger.info(
+                        _m(
+                            "deferral_blocked: streak bound reached",
+                            extra=get_extra_info({**ctx.default_extra, "deferrals": deferrals}),
+                        )
+                    )
+                    deferred = False
         gate = _PressureGate(
             reading=reading,
             deferral_eligible=deferral_eligible,

@@ -1042,6 +1042,30 @@ async def test_a_deferral_redis_refuses_to_record_runs_the_check(context_factory
 
 
 @pytest.mark.asyncio
+async def test_a_deferral_slot_past_the_bound_runs_the_check(context_factory, monkeypatch):
+    # DAH-5244 review: the count is read before the write; a cycle that took the last slot in between must not
+    # let this one defer a fourth time
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+
+    class SlotTakenInBetween(DummyRedis):
+        async def record_disk_pressure_deferral(self, miner_hotkey, executor_id, *, shadow, ttl_seconds):
+            key = (miner_hotkey, executor_id, shadow)
+            self.deferrals[key] = self.deferrals.get(key, 0) + 2  # the other cycle's INCR landed first
+            return self.deferrals[key]
+
+    redis_service = SlotTakenInBetween()
+    redis_service.deferrals[("miner-hotkey", "executor-123", False)] = 2
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+    _remember(redis_service, ctx)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.VERIFY_OK.reason
+    assert connectivity.called_with is not None
+    assert result.updates["state"].port_check_deferred is False
+
+
+@pytest.mark.asyncio
 async def test_a_deferred_cycle_is_marked_in_the_state_and_a_completed_one_is_not(context_factory, monkeypatch):
     # lium-io#1937's successor stores "last good ports" from the state: a republished cycle must be tellable apart
     monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
