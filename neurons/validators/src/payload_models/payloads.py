@@ -7,7 +7,8 @@ from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
-# absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` is the encrypted volume's ciphertext mount
+# absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` (the encrypted volume's ciphertext mount) and
+# `/mnt` (where an attached Volume mounts) are reserved
 _BARE_VOLUME_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
 
 
@@ -65,7 +66,7 @@ class CustomOptions(BaseModel):
             if ':' not in clean_volume:
                 if (
                     _BARE_VOLUME_PATH_RE.fullmatch(volume.strip())
-                    and clean_volume.split('/')[1] != 'lium-cipher'
+                    and clean_volume.split('/')[1] not in ('lium-cipher', 'mnt')
                     and not CustomOptions._is_dangerous_path(clean_volume)
                 ):
                     sanitized.append(clean_volume)

@@ -96,6 +96,8 @@ def test_sanitize_volumes_refuses_unsafe_bare_paths():
         "/proc/self",
         "/lium-cipher",
         "/lium-cipher/data",
+        "/mnt",
+        "/mnt/data",
         "-v",
     ]
 

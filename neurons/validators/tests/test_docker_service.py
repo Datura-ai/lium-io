@@ -6973,7 +6973,7 @@ async def test_run_jupyter_with_encrypted_volume_installs_into_plaintext_mount(
     install = [call for call in calls if "cat > /root/run_jupyter.sh" in call.kwargs["command"]]
     assert install, commands
     install_command = install[0].kwargs["command"]
-    assert "cat /root/app/run_jupyter.sh |" in install_command
+    assert "/root/app/run_jupyter.sh | /usr/bin/docker exec" in install_command
     assert "docker exec -i -u 0 pod_test" in install_command
     # nothing is fed from the executor process: the host shell owns the pipe
     assert install[0].kwargs.get("stdin_data") is None

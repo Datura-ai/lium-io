@@ -2549,6 +2549,12 @@ def _build_volume_setup_exec_script(
     return "\n".join(lines)
 
 
+def _jupyter_root_sed(root: str) -> str:
+    # DAH-5426: Jupyter serves the pod volume, wherever it is mounted; the executor's run_jupyter.sh hardcodes
+    # /root and older executors refuse an unknown option, so the validator rewrites the line as it copies it
+    return shlex.quote(f"s#--ServerApp.root_dir=/root #--ServerApp.root_dir={root} #")
+
+
 class DockerService:
     def __init__(
         self,
@@ -6363,7 +6369,8 @@ class DockerService:
                 command = (
                     f"/usr/bin/docker run -d --rm -v {local_volume}:/mnt "
                     f"--name {temp_container_name} --entrypoint sh "
-                    f"daturaai/compute-subnet-executor:latest -c 'cp /root/app/run_jupyter.sh /mnt/'"
+                    f"daturaai/compute-subnet-executor:latest "
+                    f"-c {shlex.quote(f'sed {_jupyter_root_sed(local_volume_path)} /root/app/run_jupyter.sh > /mnt/run_jupyter.sh')}"
                 )
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -6438,7 +6445,7 @@ class DockerService:
             command = (
                 f"test -s /root/app/run_jupyter.sh || "
                 f"{{ echo 'run_jupyter.sh is missing on the executor host' >&2; exit 1; }}; "
-                f"cat /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
+                f"sed {_jupyter_root_sed(target_path)} /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'cat > {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
