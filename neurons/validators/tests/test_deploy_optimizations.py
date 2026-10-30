@@ -291,6 +291,14 @@ def test_a_backend_memory_limit_at_or_above_host_ram_is_clamped_below_it():
     assert DockerService._rental_memory_gb(62, 65290844) == 58
 
 
+def test_a_split_host_backend_memory_limit_is_clamped_to_its_gpu_share():
+    """Review 5713873335: two 4-of-8-GPU pods sized on 68 GiB saved specs get 32 GiB each; on a 62.3 GiB host
+    they sum above its RAM. Each is clamped to its share: (62.3 - 4) * 4/8 = 29 GiB."""
+    assert DockerService._rental_memory_gb(32, 65290844, 0.5) == 29
+    # a limit already under its share is kept
+    assert DockerService._rental_memory_gb(16, 65290844, 0.5) == 16
+
+
 def test_an_unreadable_host_ram_leaves_a_limitless_rental_as_it_was():
     # host RAM unreadable -> the backend's falsy value is kept, so the rental stays limitless as before
     assert not DockerService._rental_memory_gb(0, None)
@@ -489,6 +497,49 @@ async def test_a_split_legacy_rental_is_sized_to_its_gpu_share(svc, monkeypatch)
 
     assert isinstance(result, ContainerCreated)
     assert _created_run_spec(svc).memory_gb == 30
+
+
+@pytest.mark.asyncio
+async def test_a_sent_split_memory_limit_above_its_share_of_host_ram_is_clamped_in_the_run_spec(svc, monkeypatch):
+    """Review 5713873335: the create flow reads host RAM and GPU count for a rental sent WITH a limit too, and
+    the run spec carries the clamped value: 32 GiB sent for 4 of 8 GPUs on a 62.3 GiB host -> 29 GiB."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    def _host_reads(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
+        if cmd == "cat /proc/meminfo":
+            return _ssh_result(exit_status=0, stdout="MemTotal:       65290844 kB\n")
+        if cmd == "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l":
+            return _ssh_result(exit_status=0, stdout="8\n")
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_host_reads)
+
+    result = await _run(svc, _payload(memory_gb=32, gpu_uuids=["GPU-a", "GPU-b", "GPU-c", "GPU-d"]))
+
+    assert isinstance(result, ContainerCreated)
+    assert _created_run_spec(svc).memory_gb == 29
+
+
+@pytest.mark.asyncio
+async def test_a_sent_whole_host_memory_limit_above_host_ram_is_clamped_in_the_run_spec(svc, monkeypatch):
+    """ticket-0903 wiring: 64 GiB sent on a 62.3 GiB host -> the run spec carries 58 GiB."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    def _host_reads(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
+        if cmd == "cat /proc/meminfo":
+            return _ssh_result(exit_status=0, stdout="MemTotal:       65290844 kB\n")
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_host_reads)
+
+    result = await _run(svc, _payload(memory_gb=64))
+
+    assert isinstance(result, ContainerCreated)
+    assert _created_run_spec(svc).memory_gb == 58
 
 
 # ------------------------------------------------------------------
