@@ -315,6 +315,16 @@ async def test_an_unsized_rental_takes_the_listed_engy_cache_but_keeps_the_dolph
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("held_kb", "removed"), [("0", []), (f"{200 * 1024**2}", [_KIMI])])
+async def test_an_unsized_rental_needs_only_the_free_disk_it_was_listed(docker_service, held_kb, removed):
+    # the listing offered df free plus what the Engy cache holds: an empty cache offered nothing, so it stays
+    ssh_client = DuHostSshClient([_KIMI, "volume_pod"], free_gb=100, du_stdout=f"{held_kb}\t/cache\n")
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(None), {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed
+
+
+@pytest.mark.asyncio
 async def test_an_unsized_rental_on_a_node_without_an_engy_cache_removes_nothing(docker_service):
     ssh_client = HostSshClient(["dphn_cache_hf_x", "volume_pod"], free_gb=10)
 
