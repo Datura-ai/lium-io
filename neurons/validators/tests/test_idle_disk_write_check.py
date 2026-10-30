@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -9,11 +10,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-
 from services.task.checks import idle_disk_write as module
 from services.task.checks import task_time
 from services.task.checks.idle_disk_write import IdleDiskWriteCheck
 from services.task.runner import SSHCommandResult
+
 from tests.helpers import build_services, build_state, default_executor, make_context
 
 EXECUTOR = default_executor()
@@ -95,6 +96,7 @@ def flags(enabled=True):
         IDLE_DISK_WRITE_CHECK_ENABLED=enabled,
         RENTED_THROUGHPUT_DISK_MIN_MB_PER_S=50.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
+        IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S=5.0,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
         JOB_TIME_OUT=900,
     )
@@ -149,12 +151,84 @@ async def test_measures_a_filler_node_but_not_while_its_docker_root_disk_is_busy
         assert float(redis.store[KEY]) < clock.now - 86400  # not stamped: the next cycle tries again
 
 
-async def test_skips_a_node_rented_at_cycle_start_or_since():
+async def test_a_filler_writing_under_the_rented_busy_line_still_skips_the_probe():
     with flags() as clock:
-        ctx, runner, _ = make_ctx(clock, rented_data=POD)
-        await IdleDiskWriteCheck().run(ctx)
-        assert not runner.commands
+        ctx, runner, _ = make_ctx(clock, snap(20), rented_data=FILLER)
+        res = await IdleDiskWriteCheck().run(ctx)
+        assert writes(runner) == 0 and res.event.what_we_saw["reason"] == "disk busy (20 MB/s)"
 
+        ctx, runner, _ = make_ctx(clock, snap(20), write(400))  # no filler: 20 MB/s is the provider's, not busy
+        await IdleDiskWriteCheck().run(ctx)
+        assert writes(runner) == 1
+
+
+async def test_the_last_reading_goes_to_the_backend_every_cycle_until_the_next():
+    """DAH-5385: the backend keeps only the latest specs, so a day without a probe still carries the reading."""
+    with flags() as clock:
+        ctx, _, redis = make_ctx(clock, due=False)
+        assert not (await IdleDiskWriteCheck().run(ctx)).updates  # never measured: nothing sent
+
+        ctx, _, redis = make_ctx(clock, IDLE, write(13))
+        res = await IdleDiskWriteCheck().run(ctx)
+        assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
+
+        ctx2, runner, _ = make_ctx(clock, due=False)  # not due: the stored reading still rides along
+        ctx2.services.redis.store.update(redis.store)
+        res = await IdleDiskWriteCheck().run(ctx2)
+        assert writes(runner) == 0
+        assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
+
+
+async def test_a_stored_reading_is_not_refreshed_on_read_so_it_expires_after_its_probe():
+    with flags() as clock:
+        ctx, _, redis = make_ctx(clock, due=False)
+        key = f"{module._READING_PREFIX}:miner-hotkey:{EXECUTOR.uuid}"
+        redis.store[key] = f"13.0:{clock.now - 3600}"
+        redis.set = AsyncMock()
+        res = await IdleDiskWriteCheck().run(ctx)
+    specs = res.updates["state"].specs
+    assert specs[module.SPECS_KEY] == 13.0 and specs[module.SPECS_MEASURED_AT_KEY] == clock.now - 3600
+    assert all(c.args[0] != key for c in redis.set.await_args_list)
+
+
+async def test_the_reading_is_sent_even_when_redis_fails_to_keep_it():
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(clock, IDLE, write(13))
+        real_set = redis.set
+
+        async def set_(k, v, ex=None):
+            if k.startswith(module._READING_PREFIX):
+                raise ConnectionError
+            await real_set(k, v, ex)
+
+        redis.set = set_
+        res = await IdleDiskWriteCheck().run(ctx)
+    assert writes(runner) == 1
+    assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(13, rel=0.01)
+    assert res.updates["state"].specs[module.SPECS_MEASURED_AT_KEY] == clock.now
+    assert res.event.what_we_saw["mb_per_s_sent"] == pytest.approx(13, rel=0.01)
+
+
+async def test_a_filler_started_since_cycle_start_keeps_its_download_from_being_measured():
+    """lio#1953 review: the snapshot has no filler, the fresh list has one; 20 MB/s is its download."""
+    with flags() as clock:
+        ctx, runner, _ = make_ctx(clock, snap(20), write(400), fresh=FILLER)
+        res = await IdleDiskWriteCheck().run(ctx)
+    assert writes(runner) == 0 and res.event.what_we_saw["reason"] == "disk busy (20 MB/s)"
+    assert res.event.what_we_saw["disk_busy_mb_per_s"] == pytest.approx(20, rel=0.01)
+
+
+async def test_a_write_that_timed_out_with_nothing_written_sends_no_reading():
+    """lio#1953 review: bytes=0 parses as 0.0 MB/s, which the backend would hold as a slow disk for a day."""
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(clock, IDLE, "lium_disk bytes=0 start=0.00 end=150.00 rc=124\n")
+        res = await IdleDiskWriteCheck().run(ctx)
+    assert writes(runner) == 1 and not res.updates
+    assert not any(k.startswith(module._READING_PREFIX) for k in redis.store)
+
+
+async def test_skips_a_node_rented_since_cycle_start():
+    with flags() as clock:
         ctx, runner, _ = make_ctx(clock, IDLE, fresh=POD)
         await IdleDiskWriteCheck().run(ctx)
         assert writes(runner) == 0
@@ -208,3 +282,24 @@ async def test_an_unresolvable_docker_root_disk_is_its_own_reason_and_stamps_the
         res = await IdleDiskWriteCheck().run(ctx)
     assert writes(runner) == 0 and float(redis.store[KEY]) == clock.now
     assert res.event.what_we_saw["reason"] == "docker root disk not resolvable"
+
+
+
+class CutRunner(FakeRunner):
+    """The task ends (cancelled at its timeout) while the write runs."""
+
+    async def run(self, cmd, **kwargs):
+        if "lium_disk" in cmd:
+            raise asyncio.CancelledError
+        return await super().run(cmd, **kwargs)
+
+
+async def test_a_write_cut_by_the_task_end_is_retried_within_the_hour_not_the_day():
+    with flags() as clock:
+        ctx, _, _ = make_ctx(clock)
+        with pytest.raises(asyncio.CancelledError):
+            await IdleDiskWriteCheck().run(ctx.model_copy(update={"runner": CutRunner(IDLE)}))
+        clock.now += 3600
+        runner = FakeRunner(IDLE, write(400))
+        await IdleDiskWriteCheck().run(ctx.model_copy(update={"runner": runner}))
+    assert writes(runner) == 1

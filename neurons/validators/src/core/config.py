@@ -369,12 +369,6 @@ class Settings(BaseSettings):
     # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
     # matched on the reported list until this is flipped from a week of clean fleet data.
     KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
-    # DAH-4547 - HardwareIdentityCheck: DMI files not served by sysfs (a cloak script's overlay), the
-    # kernel and NVML GPU lists disagreeing, or DMI identity changing under an unchanged GPU set.
-    # Shadow by default: the finding is logged as a warning event and the node passes.
-    HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED: bool = Field(
-        env="HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED", default=False
-    )
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count); a kernel list that is
@@ -565,6 +559,11 @@ class Settings(BaseSettings):
     # yet (the follow-up zeroes the score on a slow disk).
     IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
     IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
+    # a node running a filler is busy from this rate of sectors read plus written on the docker root disks: a filler
+    # moving less than DISK_BUSY_MB_PER_S would otherwise share the disk with the probe and lower the reading
+    IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S: float = Field(
+        env="IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S", default=5.0, gt=0
+    )
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and

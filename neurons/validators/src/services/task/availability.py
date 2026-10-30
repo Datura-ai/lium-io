@@ -61,11 +61,17 @@ class AvailabilityErrorCode(StrEnum):
     GPU_MEMORY_HEALTH_FAILED = "GPU_MEMORY_HEALTH_FAILED"
     # DAH-5395: a fatal check that means the node cannot serve a rental failed this cycle (failed_check_event).
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
+    # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
+    GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
 
 
 # Faults of the node's own cards: never a sign of our own outage, and never silenced with one.
 NODE_GPU_FAULT_CODES = frozenset(
-    {AvailabilityErrorCode.GPU_LOST, AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED}
+    {
+        AvailabilityErrorCode.GPU_LOST,
+        AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
+        AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
+    }
 )
 
 
