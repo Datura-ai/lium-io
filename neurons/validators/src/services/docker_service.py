@@ -562,6 +562,8 @@ _POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
+# a filler the probe found not exiting may still be removed by dockerd before the cleanup deadline: re-list this often
+_STUCK_FILLER_RELIST_SECONDS = 3
 # DAH-5019: a filler's rm takes 1-2 s, but on some hosts its killed processes take 12-60 s to exit (GPU teardown)
 # and dockerd waits for that; the customer needs only that they are exiting, so the settle step reads it this soon
 _FILLER_ONLY_RM_TIMEOUT_SECONDS = 5
@@ -4614,7 +4616,7 @@ class DockerService:
         if timeout_error is not None:
             if fillers_only:
                 return await self._settle_stuck_filler_removal(
-                    ssh_client, default_extra, stale_containers, targets, timeout_error
+                    ssh_client, default_extra, stale_containers, targets, timeout_error, cleanup_deadline
                 )
             raise Exception(
                 f"[clean_existing_containers] docker rm -fv did not finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
@@ -4655,7 +4657,7 @@ class DockerService:
             # DAH-5012 (22 Oct 22:32Z, 8x aad247c2): the rm of our filler can also exit 1 and then its retry hang
             if stale_containers and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in stale_containers):
                 return await self._settle_stuck_filler_removal(
-                    ssh_client, default_extra, stale_containers, targets, exc
+                    ssh_client, default_extra, stale_containers, targets, exc, cleanup_deadline
                 )
             raise Exception(
                 "[clean_existing_containers] the steps after a failed docker rm -fv did not finish in "
@@ -4670,6 +4672,7 @@ class DockerService:
         fillers: list[str],
         targets: list[str],
         timeout_error: TimeoutError,
+        cleanup_deadline: float,
     ) -> CustomerContainerRemoval:
         """DAH-5012: a customer create's `docker rm -fv` of our fillers did not finish in time. In prod (22 Oct,
         ENGY_TEE fillers on 8x B300) dockerd kept removing them: one went 62 s after the rm was sent, the
@@ -4678,7 +4681,11 @@ class DockerService:
         So the filler processes are killed directly and read once (bounded): when dockerd is visible and every
         process left is exiting (PF_EXITING, or a zombie) the filler can run nothing more, dockerd finishes
         the removal, and the create goes on. Otherwise the create fails at its own step,
-        FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours."""
+        FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours.
+
+        Before failing, the listing is read again until ``cleanup_deadline``: a filler gone from it was removed
+        by dockerd (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still pending, and
+        dockerd removed it about 30 s after the rm, 4 s after the create had already failed)."""
         error = (
             f"[clean_existing_containers] docker rm -fv of filler {fillers} did not finish in time"
         )
@@ -4724,9 +4731,35 @@ class DockerService:
             )
         )
         if not exiting:
-            raise _FillerRemovalStuck(f"{error}; a filler process is not exiting after SIGKILL") from timeout_error
+            listing = await self._listing_once_gone(ssh_client, targets, cleanup_deadline)
+            if listing is None:
+                raise _FillerRemovalStuck(f"{error}; a filler process is not exiting after SIGKILL") from timeout_error
+            logger.info(
+                _m(
+                    "Stuck filler removed by dockerd before the customer create's cleanup deadline",
+                    extra=get_extra_info({**default_extra, "container_names": fillers}),
+                )
+            )
+            return CustomerContainerRemoval(False, listing)
         fillers_exiting_after_kill.update(targets)
         return CustomerContainerRemoval(False, await self._list_all_containers(ssh_client))
+
+    async def _listing_once_gone(
+        self, ssh_client: asyncssh.SSHClientConnection, targets: list[str], deadline: float
+    ) -> ContainerListing | None:
+        """The host listing once none of ``targets`` is on it, read every few seconds until ``deadline``; None if
+        they are still listed (or the host cannot be listed) by then."""
+        loop = asyncio.get_running_loop()
+        while (remaining := deadline - loop.time()) > 0:
+            await asyncio.sleep(min(_STUCK_FILLER_RELIST_SECONDS, remaining))
+            try:
+                async with asyncio.timeout_at(deadline):
+                    listing = await self._list_all_containers(ssh_client)
+            except TimeoutError:
+                return None
+            if listing is not None and not set(targets) & (set(listing[0]) | set(listing[1].values())):
+                return listing
+        return None
 
     @staticmethod
     async def _rm_containers(
