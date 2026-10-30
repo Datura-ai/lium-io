@@ -13,8 +13,11 @@ from ..pipeline import CheckResult, Context
 WINDOW_SECONDS = 24 * 3600
 SSH_TIMEOUT_SECONDS = 10
 # The executor container is privileged (CAP_SYSLOG), so its dmesg is the host kernel's ring buffer.
+# dmesg exit status is lost in the pipe: a failed read prints UNREADABLE so it never reads as quiet.
+UNREADABLE = "DMESG_UNREADABLE"
 READ_COMMAND = (
-    "cat /proc/uptime; dmesg 2>/dev/null | grep -E 'oom-kill:|Killed process' | tail -n 40"
+    f"cat /proc/uptime; {{ dmesg 2>/dev/null || echo {UNREADABLE}; }}"
+    f" | grep -E 'oom-kill:|Killed process|{UNREADABLE}' | tail -n 40"
 )
 
 _LINE_TIME = re.compile(r"^\[\s*(\d+(?:\.\d+)?)\]\s*")
@@ -28,12 +31,15 @@ def parse_global_oom_kills(stdout: str) -> list[dict]:
     """Host-wide (CONSTRAINT_NONE) kernel OOM kills in `READ_COMMAND` output, oldest first, with their age.
 
     A kill inside a container's own memory limit (CONSTRAINT_MEMCG) is the workload's business and is left out.
+    Raises ValueError when the kernel log or the uptime could not be read, so it is never reported as quiet.
     """
     lines = stdout.splitlines()
+    if UNREADABLE in lines:
+        raise ValueError("dmesg unreadable")
     try:
         uptime = float(lines[0].split()[0])
-    except (IndexError, ValueError):
-        return []
+    except (IndexError, ValueError) as exc:
+        raise ValueError("uptime unreadable") from exc
     rss_by_pid = {m.group(1): int(m.group(2)) for line in lines if (m := _KILLED.search(line))}
     kills = []
     for line in lines[1:]:

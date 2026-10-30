@@ -49,8 +49,7 @@ def test_parser_keeps_global_kills_with_container_size_and_age():
 def test_parser_reads_cgroupfs_paths_and_survives_junk():
     line = GLOBAL_POD_KILL.replace("/system.slice/docker-" + POD_ID + ".scope", "/docker/" + POD_ID)
     assert parse_global_oom_kills("9001 1\n" + line)[0]["container_id"] == POD_ID
-    assert parse_global_oom_kills("") == []
-    assert parse_global_oom_kills("not uptime\n" + GLOBAL_POD_KILL) == []
+    assert parse_global_oom_kills("9001 1\nnot a kill line\n") == []
 
 
 class FakeShell:
@@ -123,6 +122,16 @@ async def test_no_recent_global_kill_leaves_the_context_alone(context_factory, d
     result = await _run(context_factory, FakeShell(dmesg))
     assert result.passed and not result.updates
     assert result.event.reason_code == "HOST_OOM_KILL_NONE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dmesg", ["9600 1\nDMESG_UNREADABLE\n", "not uptime\n" + GLOBAL_POD_KILL, ""]
+)
+async def test_an_unreadable_kernel_log_is_unread_not_quiet(context_factory, dmesg):
+    result = await _run(context_factory, FakeShell(dmesg))
+    assert result.passed and not result.updates
+    assert result.event.reason_code == "HOST_OOM_KILL_UNREAD"
 
 
 @pytest.mark.asyncio
