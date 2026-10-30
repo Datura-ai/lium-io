@@ -6,6 +6,7 @@ from dataclasses import replace
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 from ..messages import IdleDiskWriteMessages as Msg
 from ..messages import render_message
@@ -57,8 +58,9 @@ class IdleDiskWriteCheck:
     A node running a filler counts as busy from IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S (sectors read plus written): a
     filler moving its disk under the rented busy line would otherwise lower the reading. DAH-5385: every cycle that
     reaches this check sends the last reading to the backend as specs[SPECS_KEY]; filler start keeps the big fillers
-    off a slow disk. A rented node never gets here (TenantEnforcementCheck halts its cycle earlier), so its cycles send
-    no reading and the backend holds the last one it had.
+    off a slow disk. A node the backend still rents is never measured: TenantEnforcementCheck halts most such cycles
+    earlier, and its passing returns (a rental of another hotkey or address, a stale pod) reach _skip_reason's re-read
+    of the rented list, so the backend holds the last reading it had.
     """
 
     check_id = "executor.validate.idle_disk_write"
@@ -194,5 +196,5 @@ def _node_fraction_of_day(ctx: Context) -> float:
     return phase_offset_seconds(ctx.executor.uuid) / (settings.RENTED_THROUGHPUT_INTERVAL_HOURS * 3600)
 
 
-def _has_filler(rented_data, ctx: Context) -> bool:
+def _has_filler(rented_data: RentedExecutorsResponse | None, ctx: Context) -> bool:
     return bool(rented_data and rented_data.get_filler_containers(ctx.executor.uuid))
