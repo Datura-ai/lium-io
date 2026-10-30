@@ -17,15 +17,18 @@ set -e
 # 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
 # and 0.7.0 brings the runc container-escape fixes (CVE-2025-52565, CVE-2025-52881)
 SYSBOX_VERSION="0.7.1"
-SYSBOX_DEB_NAME="sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
+# nestybox publishes amd64 and arm64 .debs; arm64 is for GB300 / Grace hosts (check_arch refuses the rest)
+case "$(uname -m)" in
+    aarch64|arm64) SYSBOX_ARCH=arm64; SYSBOX_SHA="04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b" ;;
+    *) SYSBOX_ARCH=amd64; SYSBOX_SHA="9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5" ;;
+esac
+SYSBOX_DEB_NAME="sysbox-ce_${SYSBOX_VERSION}.linux_${SYSBOX_ARCH}.deb"
 SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/${SYSBOX_DEB_NAME}"
-SYSBOX_SHA="9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
-# the validators' _LOOPBACK_PLUGIN_ALIAS / _LOOPBACK_PLUGIN_IMAGE (neurons/validators/src/services/docker_service.py):
+# the validators' old plugin, LEGACY_LOOPBACK_PLUGIN_ALIAS (neurons/validators/src/services/const.py):
 # a rental with a disk limit gets a volume from this plugin, mounted into its sysbox container. The plugin runs
-# as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13),
-# the image the validators' rental path installs by tag today.
+# as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13).
 VLOOPBACK_PLUGIN="vloopback"
 VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170"
 VLOOPBACK_DOC_URL="https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
@@ -139,6 +142,14 @@ daemon_feature_state() {
         || echo "unreadable (invalid JSON, or jq missing)"
 }
 
+# only for that error: a host without its NVIDIA driver on Docker 29.9 was told to downgrade Docker (24 Oct 2026)
+time_namespace_hint() {
+    docker_version_ge 29 5 && [[ "$1" == *'namespace {"time"'* ]] || return 0
+    fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
+    fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
+    fail "  if the error is still there, downgrade the daemon to Docker 28.x."
+}
+
 failure_diagnostics() {
     # what a provider pastes into a ticket when the verify container did not start
     echo "    Docker daemon:       $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
@@ -179,7 +190,7 @@ fail_no_idmapped() {
 
 # ── Preflight ───────────────────────────────────────────
 # One PASS / FIX line per requirement, each FIX with the command that fixes it. The host checks
-# run before anything is installed: a FIX in what sysbox itself needs (root, x86_64, kernel,
+# run before anything is installed: a FIX in what sysbox itself needs (root, architecture, kernel,
 # Docker) ends the run with nothing changed; the rest (driver, iptables modules, disk, ports)
 # print the fix and the install goes on, because the node cannot be listed at all without
 # sysbox. `--check` runs them all plus the checks on what this script installs. Paths under
@@ -246,8 +257,8 @@ check_root() {
 check_arch() {
     local arch
     arch=$(uname -m)
-    [ "$arch" = "x86_64" ] && { pf_pass "Architecture $arch."; return 0; }
-    pf_fix "Architecture $arch — sysbox ships for x86_64 only." "Use an x86_64 host."
+    case "$arch" in x86_64|aarch64|arm64) pf_pass "Architecture $arch."; return 0 ;; esac
+    pf_fix "Architecture $arch — sysbox ships for x86_64 and aarch64 only." "Use an x86_64 or aarch64 host."
 }
 
 check_kernel() {
@@ -437,6 +448,26 @@ check_total_disk_for_vram() {
     fi
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
         "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+}
+
+check_data_root_loop_dio() {
+    # DAH-5150: a data-root on a buffered loop image caches every pod write twice; a renter writing ~480 GB/h
+    # stalled host writeback, `docker run` hung ~8 minutes and the node was delisted. Direct I/O on that loop
+    # fixed it in the lab (worst `docker run` 20 s). A data-root on a real disk is not checked.
+    local data_root src loop dio
+    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
+    [ -d "$data_root" ] || data_root=/
+    src=$(df -P "$data_root" 2>/dev/null | awk 'NR == 2 {print $1}')
+    case "$src" in /dev/loop[0-9]*) loop=${src#/dev/} ;; *) return 0 ;; esac
+    dio=$(cat "$(host_path "/sys/block/$loop/loop/dio")" 2>/dev/null)
+    if [ "$dio" = 1 ]; then
+        pf_pass "Docker's data-root $data_root is on $src with direct I/O."
+        return 0
+    fi
+    pf_fix "Docker's data-root $data_root is on the loop device $src without direct I/O — a rented pod's heavy writes can stall Docker for minutes and the node gets delisted." \
+        "With no rental running: sudo losetup --direct-io=on $src" \
+        "Keep it across reboots: https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#docker-data-root-on-a-loop-image, or move the data-root to a real disk."
 }
 
 check_free_disk_for_node() {
@@ -775,7 +806,7 @@ preflight_summary() {
 }
 
 preflight_blocking() {
-    # what sysbox itself needs before it can go on this host: x86_64 (the .deb is amd64 only), a kernel with
+    # what sysbox itself needs before it can go on this host: x86_64 or aarch64 (the .debs), a kernel with
     # ID-mapped mounts (or the override), Docker installed and running (the runtime is registered in its
     # daemon.json and it is restarted). Returns 1 when any of them is a FIX; install mode stops there.
     local fixes_before=$PREFLIGHT_FIX
@@ -792,6 +823,7 @@ preflight_advisory() {
     check_iptables_modules || true
     check_total_disk_for_vram || true
     check_free_disk_for_node || true
+    check_data_root_loop_dio || true
     check_ports || true
 }
 
@@ -823,7 +855,7 @@ case "${1:-}" in
     -h|--help)
         echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
-        echo "               a FIX on root, x86_64, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
+        echo "               a FIX on root, architecture, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
         echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
@@ -1107,11 +1139,7 @@ else
     echo ""
     failure_diagnostics
     echo ""
-    if docker_version_ge 29 5; then
-        fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
-        fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
-        fail "  if the error is still there, downgrade the daemon to Docker 28.x."
-    fi
+    time_namespace_hint "$VERIFY_OUT"
     fail "Check: journalctl -u docker.service --no-pager -n 20"
     fail "Check: journalctl -u sysbox-mgr.service --no-pager -n 20"
     exit 1

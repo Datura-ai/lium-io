@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
@@ -50,6 +51,7 @@ class DummyBackendClient:
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
+        loopback_plugin: str | None = None,
     ):
         self.called_with = {
             "miner_address": miner_address,
@@ -60,8 +62,27 @@ class DummyBackendClient:
             "rental_in_progress": rental_in_progress,
             "gpu_uuids": gpu_uuids,
             "cpu_count": cpu_count,
+            "loopback_plugin": loopback_plugin,
         }
         return self.response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled, alias", [(True, "vloopback:v2"), (False, "vloopback")])
+async def test_rental_verification_selects_loopback_alias_from_v2_switch(context_factory, enabled, alias):
+    # Arrange
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+
+    # Act
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as config:
+        config.LOOPBACK_PLUGIN_V2_ENABLED = enabled
+        result = await RentalVerificationCheck().run(ctx)
+
+    # Assert: the backend probes the plugin selected for new rental volumes by this validator.
+    assert result.passed is True
+    assert backend.called_with["loopback_plugin"] == alias
 
 
 @pytest.mark.asyncio
@@ -140,6 +161,7 @@ async def test_rental_verification_success():
         "rental_in_progress": False,  # no customer rental in this state
         "gpu_uuids": [],  # this state carries no scraped gpu details
         "cpu_count": None,  # this state carries no scraped cpu count
+        "loopback_plugin": "vloopback:v2",  # the plugin alias new rental volumes are created on
     }
 
 
@@ -169,6 +191,28 @@ async def test_rental_verification_failed():
     assert result.event.what_we_saw["details"]["timeout"] is True
     assert "clear_verified_job_info" not in result.updates
     assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_empty_kernel_gpu_list_says_restart_the_executor():
+    """An empty kernel GPU list is a stale executor container, so the remediation must say restart it."""
+    error = "GPU 'GPU-4edea549-e08e-fdc6-09f2-b3c7880cc708' requested by tenant not present on executor; visible: []"
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=False, error=error, details={"docker_stderr": error})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FAILED.reason
+    assert "docker restart executor-executor-1" in result.event.remediation
+    assert result.event.what_we_saw["error"] == error
 
 
 @pytest.mark.asyncio
@@ -446,7 +490,9 @@ class FillerSSHClient:
         removed_from_host: bool = True,
         exit_code: int = 255,
         oom_killed: bool = False,
+        error: str = "error while mounting volume",
     ):
+        self.error = error
         # True = `docker inspect` says "No such object" (a removal); False = still there, exited.
         self.removed_from_host = removed_from_host
         self.exit_code = exit_code
@@ -481,7 +527,7 @@ class FillerSSHClient:
                 result.stdout = (
                     f'{{"Status": "exited", "ExitCode": {self.exit_code},'
                     f' "OOMKilled": {str(self.oom_killed).lower()},'
-                    ' "Error": "error while mounting volume", "StartedAt": "2026-08-18T06:45:54Z",'
+                    f' "Error": {json.dumps(self.error)}, "StartedAt": "2026-08-18T06:45:54Z",'
                     ' "FinishedAt": "2026-08-18T22:44:30Z"}'
                 )
         return result
@@ -534,10 +580,8 @@ def _filler_context(
     return make_context(services=services, state=state, ssh=ssh_client)
 
 
-async def _run_filler_check(ctx: Context, *, check_enabled: bool = True, enforcement: bool = False) -> CheckResult:
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.FILLER_LIVENESS_CHECK_ENABLED = check_enabled
-        mock_settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED = enforcement
+async def _run_filler_check(ctx: Context) -> CheckResult:
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         return await RentalVerificationCheck().run(ctx)
 
 
@@ -550,24 +594,6 @@ def _killed_filler_backend() -> DummyBackendClient:
             started_at=datetime.utcnow() - timedelta(minutes=30),
         ),
     )
-
-
-@pytest.mark.parametrize("enforcement", [False, True])
-@pytest.mark.asyncio
-async def test_rental_verification_filler_liveness_disabled_keeps_legacy_skip(enforcement: bool):
-    """CHECK_ENABLED is the master kill switch: off means no probe, even with enforcement on."""
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    ssh_client = FillerSSHClient(running=False)
-    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
-
-    result = await _run_filler_check(ctx, check_enabled=False, enforcement=enforcement)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.SKIPPED.reason
-    assert ssh_client.commands == []
-    assert backend_client.filler_run_active_calls == []
 
 
 @pytest.mark.asyncio
@@ -588,31 +614,13 @@ async def test_rental_verification_filler_running_passes():
 
 
 @pytest.mark.asyncio
-async def test_rental_verification_filler_killed_shadow_mode_passes_but_logs():
-    """Shadow mode: a killed filler is logged with enforced=False but incentive is untouched."""
-    backend_client = _killed_filler_backend()
-    ssh_client = FillerSSHClient(running=False)
-    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
-
-    result = await _run_filler_check(ctx, enforcement=False)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.FILLER_KILLED.reason
-    assert result.event.what_we_saw["enforced"] is False
-    assert backend_client.filler_run_active_calls == ["11111111-2222-3333-4444-555555555555"]
-    # The re-check only happens when the container is gone, and it must SAY so — the backend's
-    # zombie-run reconciliation (DAH-2471) is fed by this flag.
-    assert backend_client.filler_run_container_missing_flags == [True]
-
-
-@pytest.mark.asyncio
 async def test_rental_verification_filler_killed_enforcement_fails():
     """Enforcement mode: a killed filler fails the fatal check -> no unrented incentive."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False, removed_from_host=True)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
@@ -634,15 +642,14 @@ async def test_rental_verification_filler_missing_within_grace_passes():
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
 
 
-@pytest.mark.parametrize("enforcement", [False, True])
 @pytest.mark.asyncio
-async def test_rental_verification_filler_not_running_state_is_benign(enforcement: bool):
+async def test_rental_verification_filler_not_running_state_is_benign():
     """A run not in RUNNING (stopped or mid-transition) is benign: pass, no health check."""
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, details={}),
@@ -651,7 +658,7 @@ async def test_rental_verification_filler_not_running_state_is_benign(enforcemen
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=enforcement)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
@@ -665,7 +672,7 @@ async def test_rental_verification_filler_docker_ps_error_fails_open():
     ssh_client = FillerSSHClient(running=False, exit_status=1)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
@@ -682,7 +689,7 @@ async def test_rental_verification_filler_active_api_error_fails_open():
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
@@ -698,26 +705,12 @@ async def test_rental_verification_filler_ssh_transport_error_fails_without_rech
     ssh_client = FillerSSHClient(raise_on_run=asyncssh.Error(code=1, reason="connection lost"))
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
+    assert result.event.severity == "error"
     assert backend_client.filler_run_active_calls == []
-
-
-@pytest.mark.asyncio
-async def test_rental_verification_filler_ssh_transport_error_shadow_mode_passes():
-    """Shadow mode: a dead SSH transport is logged but never fails the cycle."""
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    ssh_client = FillerSSHClient(raise_on_run=asyncssh.Error(code=1, reason="connection lost"))
-    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
-
-    result = await _run_filler_check(ctx, enforcement=False)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
 
 
 @pytest.mark.asyncio
@@ -812,7 +805,7 @@ async def test_filler_liveness_reports_dead_non_first_bundle_to_backend():
         backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
     )
 
-    await _run_filler_check(ctx, enforcement=False)
+    await _run_filler_check(ctx)
 
     # Only the dead sibling triggers the live re-check, and it carries the reconciliation flag.
     assert backend_client.filler_run_active_calls == [_BUNDLE_B.removeprefix("filler_")]
@@ -828,7 +821,7 @@ async def test_filler_liveness_dead_sibling_decides_the_node_under_enforcement()
         backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
     )
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     reason_codes = [entry["reason_code"] for entry in result.event.what_we_saw["checked_containers"]]
@@ -838,8 +831,8 @@ async def test_filler_liveness_dead_sibling_decides_the_node_under_enforcement()
 
 @pytest.mark.asyncio
 async def test_killed_bundle_decides_even_when_a_healthy_sibling_comes_last():
-    """Shadow: every verdict passes, so a positional pick would emit the healthy sibling's event
-    and the kill would never surface — the node must be judged by its worst container."""
+    """A positional pick would emit the healthy sibling's event and the kill would never
+    surface — the node must be judged by its worst container."""
     backend_client = _killed_filler_backend()
     # A is removed, B is alive and LAST in the list.
     ssh_client = FillerSSHClient(dead_containers={_BUNDLE_A})
@@ -847,11 +840,11 @@ async def test_killed_bundle_decides_even_when_a_healthy_sibling_comes_last():
         backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
     )
 
-    result = await _run_filler_check(ctx, enforcement=False)
+    result = await _run_filler_check(ctx)
 
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
     assert result.event.what_we_saw["filler_container"] == _BUNDLE_A
-    assert result.passed is True  # shadow never withholds incentive
+    assert result.passed is False
 
 
 @pytest.mark.asyncio
@@ -864,7 +857,7 @@ async def test_unreachable_bundle_does_not_mask_a_kill_behind_it():
         backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
     )
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
     assert result.event.what_we_saw["filler_container"] == _BUNDLE_B
@@ -1001,8 +994,7 @@ def _cpu_quota_response() -> ExecutorHealthCheckResponse:
 
 
 @pytest.mark.asyncio
-async def test_cpu_quota_verdict_is_observe_only_in_shadow():
-    """CHECK on, ENFORCEMENT off: the daemon-rejected count is logged but the score is untouched."""
+async def test_cpu_quota_verdict_zeroes_score():
     backend_client = DummyBackendClient(response=_cpu_quota_response())
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
@@ -1010,30 +1002,7 @@ async def test_cpu_quota_verdict_is_observe_only_in_shadow():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = False
-        result = await RentalVerificationCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON
-    assert result.updates == {}
-    assert result.event.what_we_saw["advertised_cpu_count"] == 176
-    assert "Range of CPUs is from" in result.event.what_we_saw["stderr"]
-
-
-@pytest.mark.asyncio
-async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
-    backend_client = DummyBackendClient(response=_cpu_quota_response())
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         result = await RentalVerificationCheck().run(ctx)
 
     assert result.passed is False
@@ -1054,8 +1023,7 @@ async def test_advertised_cpu_count_is_sent_to_the_backend():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 44
@@ -1076,29 +1044,10 @@ async def test_fake_present_population_does_not_cap_the_advertised_count():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44, present=176))
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 176
-
-
-@pytest.mark.asyncio
-async def test_cpu_count_is_not_sent_when_the_check_is_disabled():
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 44}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state)
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = False
-        await RentalVerificationCheck().run(ctx)
-
-    assert backend_client.called_with["cpu_count"] is None
 
 
 @pytest.mark.asyncio
@@ -1115,8 +1064,7 @@ async def test_cpu_count_is_not_sent_for_a_tdx_host():
     executor.tdx_quote = '{"quote": "..."}'
     ctx = make_context(executor=executor, services=services, state=state)
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] is None
@@ -1124,32 +1072,6 @@ async def test_cpu_count_is_not_sent_for_a_tdx_host():
 
 # DAH-2703: a host reaper that removes the filler seconds after `docker run` leaves no container
 # to probe, so the liveness check above never runs. The backend reports the kill streak instead.
-
-
-@pytest.mark.asyncio
-async def test_rental_verification_filler_create_kill_shadow_mode_only_observes():
-    """Shadow mode observes and then verifies as usual — it must never replace the normal check."""
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    ctx = _filler_context(
-        backend_client=backend_client,
-        ssh_client=FillerSSHClient(),
-        running_fillers=False,
-        create_killed=True,
-    )
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.logger") as mock_logger:
-        result = await _run_filler_check(ctx, enforcement=False)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.VERIFIED.reason
-    # The node still went through the backend health check it would have had without this feature.
-    assert backend_client.called_with is not None
-    assert any(
-        Msg.FILLER_KILLED_AT_CREATE.reason in str(call.args[0].extra)
-        for call in mock_logger.warning.call_args_list
-    )
 
 
 @pytest.mark.asyncio
@@ -1165,32 +1087,13 @@ async def test_rental_verification_filler_create_kill_enforcement_fails():
         create_killed=True,
     )
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
     assert result.event.what_we_saw["enforced"] is True
     # The node is never contacted for a health check once the streak decides the verdict.
     assert backend_client.called_with is None
-
-
-@pytest.mark.asyncio
-async def test_rental_verification_filler_create_kill_ignored_when_check_disabled():
-    """CHECK_ENABLED off is the master kill switch here too: normal verification runs."""
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    ctx = _filler_context(
-        backend_client=backend_client,
-        ssh_client=FillerSSHClient(),
-        running_fillers=False,
-        create_killed=True,
-    )
-
-    result = await _run_filler_check(ctx, check_enabled=False, enforcement=True)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.VERIFIED.reason
 
 
 @pytest.mark.asyncio
@@ -1207,7 +1110,7 @@ async def test_rental_verification_filler_create_kill_ignored_for_a_customer_ren
         rented_pods=[RentedPod(pod_id="pod-1", container_name="pod_1")],
     )
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.VERIFIED.reason
@@ -1225,7 +1128,7 @@ async def test_rental_verification_create_kill_is_not_masked_by_a_surviving_fill
         create_killed=True,
     )
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
@@ -1238,7 +1141,7 @@ async def test_filler_that_exited_on_the_host_is_not_a_kill():
     ssh_client = FillerSSHClient(running=False, removed_from_host=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
@@ -1253,10 +1156,10 @@ async def test_filler_terminated_by_a_signal_is_a_kill():
     back anything else. Prod: all 4 such runs in 7 days came from the one host with a container
     auto-killer."""
     backend_client = _killed_filler_backend()
-    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=143)
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=143, error="")
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_STOPPED_BY_HOST.reason
@@ -1267,10 +1170,10 @@ async def test_filler_terminated_by_a_signal_is_a_kill():
 async def test_filler_killed_by_sigkill_is_a_kill():
     """Exit 137 = SIGKILL from outside the container."""
     backend_client = _killed_filler_backend()
-    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=137)
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=137, error="")
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_STOPPED_BY_HOST.reason
@@ -1285,7 +1188,26 @@ async def test_out_of_memory_kill_is_not_a_host_kill():
     )
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
+
+
+@pytest.mark.asyncio
+async def test_signal_stop_docker_could_not_restart_is_not_a_host_kill():
+    """A VM reboot SIGTERMs the filler (143) and docker's restart then fails on a GPU device that is gone:
+    docker never restarts a container stopped on purpose, so this is not the host's choice."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(
+        running=False,
+        removed_from_host=False,
+        exit_code=143,
+        error='error gathering device information while adding custom device "/dev/nvidia4": no such file or directory',
+    )
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
@@ -1298,7 +1220,7 @@ async def test_signal_killed_bundle_outranks_a_healthy_sibling_on_a_split_node()
     healthy_container = "filler_11111111-2222-3333-4444-555555555555"
     stopped_container = "filler_99999999-8888-7777-6666-555555555555"
     ssh_client = FillerSSHClient(
-        dead_containers={stopped_container}, removed_from_host=False, exit_code=143
+        dead_containers={stopped_container}, removed_from_host=False, exit_code=143, error=""
     )
     ctx = _filler_context(
         backend_client=backend_client,
@@ -1306,7 +1228,7 @@ async def test_signal_killed_bundle_outranks_a_healthy_sibling_on_a_split_node()
         filler_containers=[healthy_container, stopped_container],
     )
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_STOPPED_BY_HOST.reason
@@ -1323,7 +1245,7 @@ async def test_container_state_without_evidence_is_unknown_not_exited():
         "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
         return_value=ContainerDeathDiagnostics(capture_error="inspect: Cannot connect to the Docker daemon"),
     ):
-        result = await _run_filler_check(ctx, enforcement=True)
+        result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
@@ -1342,7 +1264,7 @@ async def test_exited_bundle_outranks_a_healthy_sibling_on_a_split_node():
         filler_containers=[healthy_container, exited_container],
     )
 
-    result = await _run_filler_check(ctx, enforcement=True)
+    result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
@@ -1360,7 +1282,7 @@ async def test_container_running_again_by_the_time_we_inspect_is_not_a_death():
         "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
         return_value=ContainerDeathDiagnostics(status="running"),
     ):
-        result = await _run_filler_check(ctx, enforcement=True)
+        result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
@@ -1378,7 +1300,7 @@ async def test_container_caught_mid_removal_is_still_a_kill():
         "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
         return_value=ContainerDeathDiagnostics(status="removing"),
     ):
-        result = await _run_filler_check(ctx, enforcement=True)
+        result = await _run_filler_check(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
@@ -1395,7 +1317,7 @@ async def test_states_that_do_not_prove_a_death_are_never_punished(docker_status
         "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
         return_value=ContainerDeathDiagnostics(status=docker_status),
     ):
-        result = await _run_filler_check(ctx, enforcement=True)
+        result = await _run_filler_check(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason

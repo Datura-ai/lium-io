@@ -255,6 +255,14 @@ class VolumeMount:
 
 
 @dataclass(slots=True)
+class DriverVolumeMount:
+    """An anonymous volume Docker creates from ``driver`` at create and removes with the container (`rm -v`)."""
+    target: str
+    driver: str
+    driver_opts: dict[str, str]
+
+
+@dataclass(slots=True)
 class DeviceMount:
     path_on_host: str
     path_in_container: str | None = None
@@ -289,6 +297,7 @@ class ContainerRunSpec:
     environment: dict[str, str] = field(default_factory=dict)
     ports: tuple[PortBinding, ...] = ()
     volumes: tuple[VolumeMount, ...] = ()
+    driver_volumes: tuple[DriverVolumeMount, ...] = ()
     restart_policy: str | None = "unless-stopped"
     runtime: str | None = None
     cap_add: tuple[str, ...] = ()
@@ -301,7 +310,7 @@ class ContainerRunSpec:
     # --memory-swap; equal to memory_gb means the container gets no swap
     memory_swap_gb: int | None = None
     oom_score_adj: int | None = None
-    storage_limit_gb: int | None = None
+    storage_limit_gb: float | None = None  # fractional when a sysbox pod shares it with DinD
     # cgroup pids.max for the container. Caps total tasks (processes + threads) so a tenant fork
     # bomb cannot exhaust the host's global PID space and starve the executor/sshd of forks. None
     # keeps the daemon default (unlimited); the memory cgroup is no ceiling here because on a
@@ -431,7 +440,11 @@ class RentalDockerSdkClient:
     async def pull(self, *, image: str) -> None:
         timeout_seconds = self._normalized_pull_timeout_seconds()
         try:
-            pull_call = _in_docker_thread(self._pull_sync, image)
+            # a pull is idempotent (dockerd keeps finished layers), so a dropped SSH channel
+            # mid-stream gets the same one re-open + retry as other calls, inside the one deadline
+            pull_call = self._retry_once_on_transport_drop(
+                operation="pull", attempt=lambda: _in_docker_thread(self._pull_sync, image)
+            )
             if timeout_seconds is not None:
                 await asyncio.wait_for(
                     pull_call,
@@ -673,6 +686,18 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
+
+    async def container_log_tail(self, *, container_name: str, lines: int) -> str:
+        """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
+        try:
+            raw = await _in_docker_thread(
+                self._api_client.logs, container_name, stdout=True, stderr=True, tail=lines
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK container logs failed", exc)
+            ) from exc
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
 
     async def container_image_id(self, *, container: str) -> str:
         """The image ID (`sha256:…`) the container was created from; a later tag move does not change it."""
@@ -1171,8 +1196,9 @@ class RentalDockerSdkClient:
             raise
         existing_driver = info.get("Driver") if isinstance(info, dict) else None
         wanted_driver = driver or "local"
-        # a plugin driver is inspected as `<alias>:<tag>` while it is requested as `<alias>`
-        if isinstance(existing_driver, str) and existing_driver.split(":", 1)[0] == wanted_driver.split(":", 1)[0]:
+        # a plugin driver is inspected as `<alias>:<tag>` while it may be requested as `<alias>`,
+        # which is `<alias>:latest`; another tag is another plugin (vloopback:v2 beside vloopback)
+        if isinstance(existing_driver, str) and _with_default_tag(existing_driver) == _with_default_tag(wanted_driver):
             return True
         raise RentalDockerOperationError(
             "Docker SDK create volume refused after a transport retry: a volume named "
@@ -1736,6 +1762,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
     kwargs = {
         "port_bindings": _port_bindings(spec.ports),
         "binds": _binds(spec.volumes),
+        "mounts": _driver_mounts(spec.driver_volumes),
         "restart_policy": _restart_policy(spec.restart_policy),
         "runtime": spec.runtime,
         "cap_add": list(spec.cap_add) or None,
@@ -1752,7 +1779,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "oom_score_adj": spec.oom_score_adj,
         "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
-            {"size": f"{spec.storage_limit_gb}g"}
+            {"size": f"{spec.storage_limit_gb:.10g}g"}
             if spec.storage_limit_gb
             else None
         ),
@@ -1801,6 +1828,17 @@ def _container_volumes(volumes: tuple[VolumeMount, ...]) -> list[str]:
 def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
     return [
         f"{volume.source}:{volume.target}:{'ro' if volume.read_only else 'rw'}"
+        for volume in volumes
+    ]
+
+
+def _driver_mounts(volumes: tuple[DriverVolumeMount, ...]) -> list | None:
+    if not volumes:
+        return None
+    from docker.types import DriverConfig, Mount
+
+    return [
+        Mount(target=volume.target, source=None, driver_config=DriverConfig(volume.driver, volume.driver_opts))
         for volume in volumes
     ]
 
@@ -1953,6 +1991,10 @@ def _raise_pull_event_error(event) -> None:
     from docker.errors import APIError
 
     raise APIError("Docker image pull failed", explanation=str(message))
+
+
+def _with_default_tag(driver: str) -> str:
+    return driver if ":" in driver else f"{driver}:latest"
 
 
 def _is_docker_not_found_error(exc: Exception) -> bool:

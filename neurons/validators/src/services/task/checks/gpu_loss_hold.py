@@ -38,7 +38,7 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .gpu_fingerprint import split_uuids
+from .gpu_fingerprint import split_uuids, whole_set_replaced
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -46,6 +46,7 @@ from .rented_gpu_drop import (
     _listed_uuids,
     _rented_gpu_count,
     judge_rented_gpus,
+    missing_gpus_under_reset,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,10 @@ logger = logging.getLogger(__name__)
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
+# An idle node back with a whole new card set (a VM host reboot) is re-anchored by GpuFingerprintCheck
+# but held like a lost card: 27 Oct, 8x H100 fcd3835d re-anchored 3 times in 5 h and was rented
+# between two reboots.
+FAULT_SET_REPLACED = "gpu_set_replaced"
 
 
 def _key(ctx: Context) -> str:
@@ -61,11 +66,13 @@ def _key(ctx: Context) -> str:
 
 @dataclass(frozen=True)
 class DropMark:
-    """The hold as kept in Redis; stored as {"held", "since", "last_seen"}."""
+    """The hold as kept in Redis; stored as {"held", "since", "last_seen", "replaced"}."""
 
     is_held: bool
     since: str
     last_seen: str
+    # the hold came from a whole replaced GPU set, not a lost card: its clean cycles say so
+    replaced: bool = False
 
     @classmethod
     def load(cls, raw: object) -> DropMark | None:
@@ -73,10 +80,14 @@ class DropMark:
         if not isinstance(loaded, dict) or not loaded.get("last_seen"):
             return None
         last_seen = loaded["last_seen"]
-        return cls(bool(loaded.get("held")), loaded.get("since") or last_seen, last_seen)
+        return cls(
+            bool(loaded.get("held")), loaded.get("since") or last_seen, last_seen, bool(loaded.get("replaced"))
+        )
 
     def dump(self) -> str:
-        return json.dumps({"held": self.is_held, "since": self.since, "last_seen": self.last_seen})
+        return json.dumps(
+            {"held": self.is_held, "since": self.since, "last_seen": self.last_seen, "replaced": self.replaced}
+        )
 
 
 def rented_pods(ctx: Context) -> list:
@@ -95,9 +106,12 @@ def judge_scrape(ctx: Context, pods: list) -> GpuDrop | None:
     nvml_count = ctx.state.gpu_count
     if nvml_count is None:
         nvml_count = (specs.get("gpu") or {}).get("count", 0) or 0
+    anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+    if whole_set_replaced(anchor, sorted(set(_listed_uuids(gpu_details))), rented=bool(pods)):
+        anchor = []  # replaced cards, not lost ones: GpuFingerprintCheck re-anchors them
     return judge_rented_gpus(
         rented_gpu_count=_rented_gpu_count(pods),
-        anchor_uuids=split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or ""),
+        anchor_uuids=anchor,
         nvml_count=nvml_count,
         listed_uuids=_listed_uuids(gpu_details),
         listed_count=len(gpu_details),
@@ -117,7 +131,26 @@ class GpuLossHoldCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         pods = rented_pods(ctx)
+        gpu_details = list(ctx.state.gpu_details or [])
+        # DAH-4658: the cards leave nvidia-smi while the renter resets them; that cycle neither starts nor clears a hold.
+        # Cards missing then are held as a zero-GPU scrape is (the score carries); GpuFingerprintCheck would zero it.
+        anchored_missing = set(split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")) - set(_listed_uuids(gpu_details))
+        if await missing_gpus_under_reset(ctx, gpu_details):
+            if not anchored_missing:
+                return CheckResult(
+                    passed=True, event=render_message(Msg.GPU_RESET_IN_PROGRESS, ctx=ctx, check_id=self.check_id)
+                )
+            event = render_message(
+                Msg.MISSING_GPUS_UNDER_RESET,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"missing_uuids": sorted(anchored_missing)},
+            )
+            return CheckResult(passed=False, event=event)
         drop = judge_scrape(ctx, pods)
+        anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+        listed = sorted(set(_listed_uuids(gpu_details)))
+        replaced = drop is None and whole_set_replaced(anchor, listed, rented=bool(pods))
         key = _key(ctx)
         mark: DropMark | None = None
         try:
@@ -153,6 +186,14 @@ class GpuLossHoldCheck:
             nvml_only = drop.faults == [FAULT_NVML_ERROR]
             return self._lost(ctx, mark, what, fatal=nvml_only and not pods)
 
+        if replaced:
+            mark = DropMark(is_held=True, since=now.isoformat(), last_seen=now.isoformat(), replaced=True)
+            await self._save(ctx, key, mark, settings.GPU_LOSS_HOLD_SECONDS)
+            # not fatal: GpuFingerprintCheck still runs and re-anchors the new cards this cycle
+            return self._lost(
+                ctx, mark, {"faults": [FAULT_SET_REPLACED]}, fatal=False, msg=Msg.SET_REPLACED
+            )
+
         if mark is None:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
@@ -163,12 +204,16 @@ class GpuLossHoldCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
-        return self._lost(ctx, mark, {"faults": []}, fatal=not pods)
+        return self._lost(
+            ctx, mark, {"faults": []}, fatal=not pods, msg=Msg.SET_REPLACED if mark.replaced else Msg.LOST
+        )
 
-    def _lost(self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool) -> CheckResult:
+    def _lost(
+        self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool, msg=Msg.LOST
+    ) -> CheckResult:
         last_seen = datetime.fromisoformat(mark.last_seen)
         event = render_message(
-            Msg.LOST,
+            msg,
             ctx=ctx,
             check_id=self.check_id,
             what={

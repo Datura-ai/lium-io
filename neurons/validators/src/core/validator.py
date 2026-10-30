@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
+from core.loop_sampler import start_loop_sampler
 from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
@@ -24,6 +25,10 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
+    carry_renter_gpu_reset_results,
+    has_renter_gpu_reset_holds,
+    remember_rented_scored_results,
+    withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -117,14 +122,20 @@ def settle_cycle_results(
                 and not (
                     job_result.is_new_rentals_paused and not job_result.is_rented
                 )
+                and not job_result.is_in_maintenance
             ):
                 total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
     return total_gpu_model_count_map
 
 
 def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
-    """All but a zeroed duplicate under the keeper's own executor UUID: that backend row hears the keeper."""
-    return [result for result in results if not result.duplicate_shares_kept_row]
+    """All but a zeroed duplicate under the keeper's own executor UUID (that backend row hears the keeper) and a
+    result carried over a renter GPU reset (the backend keeps the row it has)."""
+    return [
+        result
+        for result in results
+        if not result.duplicate_shares_kept_row and not result.carried_for_renter_gpu_reset
+    ]
 
 
 class Validator:
@@ -189,6 +200,7 @@ class Validator:
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+            backend_client=self.backend_client,
         )
         task_service = TaskService(
             ssh_service=ssh_service,
@@ -488,7 +500,7 @@ class Validator:
                 # request jobs
                 jobs = [
                     asyncio.create_task(
-                        self.miner_service.request_job_to_miner(
+                        self.request_wave_job(
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
@@ -600,6 +612,8 @@ class Validator:
                             )
                             task.cancel()
 
+                    # DAH-4658: before the duplicate pass and the GPU count, so a carried result counts in both
+                    await self.carry_scores_over_renter_gpu_resets(all_job_results, rented_executors, miner_coldkeys)
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
                         {**self.default_extra, "job_batch_id": job_batch_id},
@@ -632,6 +646,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window
                     )
+                    await remember_rented_scored_results(all_job_results, self.redis_service)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -1364,6 +1379,12 @@ class Validator:
             )
         )
 
+    async def request_wave_job(self, **kwargs) -> dict | None:
+        """One miner's wave request; its new executors that passed are listed now, not at the cycle's end."""
+        job = await self.miner_service.request_job_to_miner(**kwargs)
+        await self.miner_service.publish_new_executors_at_pass(job)
+        return job
+
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
         if not settings.RENTED_POD_SSH_PROBE_ENABLED:
@@ -1474,6 +1495,22 @@ class Validator:
                 grace_cycles=0,
             )
 
+    async def carry_scores_over_renter_gpu_resets(
+        self,
+        all_job_results: dict[str, list[JobResult]],
+        rented_executors: RentedExecutorsResponse | None,
+        miner_coldkeys: dict[str, str | None],
+    ) -> None:
+        """DAH-4658: only a node the backend still lists as rented carries its score: right now, or in this
+        cycle's snapshot when the backend does not answer."""
+        if not has_renter_gpu_reset_holds(all_job_results):
+            return
+        rented = await self.backend_client.get_rented_executors_now() or rented_executors
+        rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
+        await carry_renter_gpu_reset_results(
+            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+        )
+
     async def withhold_verdicts_for_rollout(
         self,
         all_job_results: dict[str, list[JobResult]],
@@ -1492,7 +1529,8 @@ class Validator:
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
-        return standing, withheld_results
+        standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
+        return standing, withheld_results + held_for_gpu_reset
 
     async def record_withheld_verdicts(
         self,
@@ -1547,6 +1585,8 @@ class Validator:
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
+                # which code saturates the loop the lane shares with the wave (core/loop_sampler.py)
+                self.loop_sampler_stop = start_loop_sampler()
 
             while not self.should_exit:
                 await self.sync()
@@ -1579,6 +1619,8 @@ class Validator:
         )
 
         self.should_exit = True
+        if getattr(self, "loop_sampler_stop", None) is not None:
+            self.loop_sampler_stop.set()
 
         # Cleanup subtensor client
         if hasattr(self, 'subtensor_client'):

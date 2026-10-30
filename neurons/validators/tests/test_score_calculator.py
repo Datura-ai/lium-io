@@ -133,6 +133,13 @@ def test_rented_pod_resources_flag_zeroes_a_rented_score():
     assert "below its deployed CPUs" in warning
 
 
+def test_rented_throughput_flag_zeroes_a_rented_score():
+    ctx = _ctx(500.0).model_copy(update={"rented_throughput_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "network or disk throughput" in warning
+
+
 def test_gpu_identity_flag_zeroes_a_rented_score():
     """GpuAttestationIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
     ctx = _ctx(500.0).model_copy(update={"gpu_attestation_identity_passed": False})
@@ -166,3 +173,11 @@ def test_gpu_kernel_count_passed_keeps_a_rented_score():
     assert actual_score == 1.0
     assert job_score == 1.0
     assert warning == ""
+
+
+def test_hardware_identity_flag_zeroes_a_rented_score():
+    """HardwareIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"hardware_identity_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "Host hardware identity" in warning

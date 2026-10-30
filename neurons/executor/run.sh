@@ -4,6 +4,8 @@ set -eux -o pipefail
 # disk reserve: validator-cycle writes must survive a 100%-full host disk
 bash setup_disk_reserve.sh || echo "[disk-reserve] setup failed; continuing without reserve"
 bash setup_disk_reserve.sh janitor &
+# executor-v1.151 capped vm.dirty_bytes on every host; put the kernel defaults back (DAH-4978 revert)
+bash restore_dirty_defaults.sh || echo "[dirty-cap] restore failed; continuing with the host's current setting"
 # re-enter cwd through the overlay mount (the old dentry would bypass it)
 cd /root/app
 

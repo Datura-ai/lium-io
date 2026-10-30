@@ -13,6 +13,7 @@ import aiohttp
 from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE
 from core.utils import _m, get_extra_info
+from services.redis_service import get_or_adopt_legacy
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 
 from ..messages import ContainerDownloadSpeedMessages as Msg
@@ -66,7 +67,7 @@ _FETCH_SCRIPT = (
 )
 
 
-def download_speed_command(sysbox: bool) -> str:
+def download_speed_command(sysbox: bool, script: str = _FETCH_SCRIPT) -> str:
     """A throwaway container on the rentals bridge, under sysbox-runc where renters get it.
 
     Pods run on RENTAL_NETWORK_NAME (own DNS and MTU), so that is the path to measure. The node creates it at its
@@ -77,7 +78,7 @@ def download_speed_command(sysbox: bool) -> str:
         f"net=bridge; /usr/bin/docker network inspect {RENTAL_NETWORK_NAME} >/dev/null 2>&1 && "
         f"net={RENTAL_NETWORK_NAME}; echo \"{MARKER}_net name=$net\"; "
         f"/usr/bin/docker run --rm --network \"$net\" {runtime}--entrypoint /bin/sh {ALPINE_HELPER_IMAGE} "
-        f"-c {shlex.quote(_FETCH_SCRIPT)}"
+        f"-c {shlex.quote(script)}"
     )
 
 
@@ -231,10 +232,12 @@ class ContainerDownloadSpeedCheck:
         if rented_data is not None and rented_data.get_filler_containers(ctx.executor.uuid):
             return self._skipped(ctx, "filler running")
 
-        key = f"{_REDIS_PREFIX}:{ctx.executor.uuid}"
+        # with the hotkey: a node copying another miner's UUID cannot write a slow streak onto the owner's
+        key = f"{_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
         redis = ctx.services.redis
         try:
-            raw = await redis.get(key)
+            legacy_key = f"{_REDIS_PREFIX}:{ctx.executor.uuid}"
+            raw = await get_or_adopt_legacy(redis, key, legacy_key)
         except Exception:
             # without the last reading the interval cannot be kept; measuring every cycle is the cost to avoid
             logger.warning(_m("Container download speed: Redis unreadable", extra=get_extra_info(ctx.default_extra)))

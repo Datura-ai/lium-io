@@ -9,7 +9,6 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 
 from core.config import settings
-from core.utils import _m, get_extra_info
 
 from ..messages import CachedTemplateMessages as Msg
 from ..messages import render_message
@@ -259,11 +258,9 @@ class CachedTemplateVerificationCheck:
     holds a stale image is readable in Grafana without SSHing anywhere. The failure's remediation
     quotes that document: the executor's own pull error and the step it points to.
 
-    With ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED``, a node this validator has only just
-    found without the image is held as PENDING (passed, score untouched by this check) while its
-    executor's first pre-pull sweep is still running, for at most
-    ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS`` (see ``_fresh_node_grace``). With it off
-    the node fails as before and the would-be hold is only logged.
+    A node this validator has only just found without the image is held as PENDING (passed,
+    score untouched by this check) while its executor's first pre-pull sweep is still running,
+    for at most ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS`` (see ``_fresh_node_grace``).
     """
 
     check_id = "executor.validate.cached_template"
@@ -337,24 +334,12 @@ class CachedTemplateVerificationCheck:
         )
 
     async def _apply_fresh_node_grace(self, ctx: Context, prefetch_state: dict, what: dict) -> bool:
-        """True when the grace holds this NOT_CACHED node as pending.
-
-        Flag on, the grace is added to ``what``. Flag off, a would-be hold is only logged.
-        """
+        """True when the grace holds this NOT_CACHED node as pending; the grace is added to ``what``."""
         grace = await self._fresh_node_grace(ctx, prefetch_state)
         if grace is None:
             return False
-        if settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED:
-            what["fresh_node_grace"] = asdict(grace)
-            return grace.pending
-        if grace.pending:
-            logger.info(
-                _m(
-                    "Fresh-node grace is off: this node would have been held as pending",
-                    extra=get_extra_info({**ctx.default_extra, "fresh_node_grace": asdict(grace)}),
-                )
-            )
-        return False
+        what["fresh_node_grace"] = asdict(grace)
+        return grace.pending
 
     async def run(self, ctx: Context) -> CheckResult:
         gpu_model = ctx.state.gpu_model

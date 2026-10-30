@@ -2,6 +2,8 @@
 
 import importlib.util
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -33,3 +35,27 @@ def test_canary_ok_reports_each_target(monkeypatch):
     res = handler.handler(EVENT, None)
     assert res["statusCode"] == 200
     assert json.loads(res["body"])["results"] == [{"host": "1.2.3.4", "port": 8080, "body": None}]
+
+
+def test_redirects_are_not_followed():
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/":
+                self.send_response(302)
+                self.send_header("Location", "/private")
+                self.end_headers()
+                self.wfile.write(b"moved")
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"private")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Redirect)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert handler._fetch("127.0.0.1", server.server_port, 3) == "moved"
+    finally:
+        server.shutdown()
