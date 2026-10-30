@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 import time
@@ -424,3 +425,27 @@ async def test_the_synced_marker_is_read_before_the_list(monkeypatch) -> None:
             record_rental_start=True, executor_info=object(),
         )
     assert order == ["marker", "list"]
+
+
+@pytest.mark.parametrize(
+    ("query", "recovered_ratio"),
+    [
+        (AsyncMock(side_effect=asyncio.TimeoutError()), 0.8),  # nvidia-smi timed out
+        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), 0.8),  # partial output: GPU-1 missing
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unreadable_rental_start_fails_the_create_and_a_retry_records_the_tier(
+    monkeypatch, query, recovered_ratio
+) -> None:
+    # 280/350 W is the 80 % tier: a create that went on without its record would be held at 90 % for good
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    monkeypatch.setattr(gpl, "_query_power_state", query)
+    redis = SharedFakeRedis()
+    with pytest.raises(RuntimeError):
+        await gpl.raise_low_power_limits_to_default(AsyncMock(), "ex-1", ["GPU-0", "GPU-1"], redis=redis, pod_id="pod-1")
+    assert not any(key.startswith("gpu_power_rental_start_ratio:") for key in redis.store)
+    await _rental_start(monkeypatch, redis, _power(280, 280))  # recovered: the retried create
+    assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == [recovered_ratio] * 2
+    await _rental_start(monkeypatch, redis, _power(280, 280))  # a reboot keeps the tier start
+    assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == [recovered_ratio] * 2

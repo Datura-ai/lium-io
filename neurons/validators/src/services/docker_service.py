@@ -9180,6 +9180,7 @@ class DockerService:
                     # restore a filler create may have capped these GPUs (its Redis records) or the
                     # host may have lowered a limit with no record (the live floor raise).
                     if not beside_fillers:
+                        current_step = "gpu_power_restore"  # the host's nvidia-smi, unless the state error below
                         try:
                             await self._restore_gpu_power_for_uncapped_pod(
                                 ssh_client,

@@ -722,13 +722,15 @@ async def raise_low_power_limits_to_default(
     GpuPowerLimitCheck holds a rented GPU at min(that, RENTED_MIN_POWER_LIMIT_RATIO) while the pod
     is rented. ``pod_on_host`` (the pod's container was on the host before this create: a reboot or
     edit) records 1.0 for a GPU with no record, so a rental from before the records keeps 90 %.
-    Raises GpuPowerRestoreStateError when a record cannot be made, so the create fails and is
-    retried instead of starting a rental without its baseline.
+    Raises GpuPowerRestoreStateError when a record cannot be made (RuntimeError when the host cannot
+    report a GPU's limits), so the create fails and is retried instead of starting without its baseline.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)
     except Exception as exc:
-        # the host's nvidia-smi, not our state: no record, so the check holds this rental at 90 %
+        if redis is not None and pod_id:
+            # a rental started without its baseline would be held at 90 % (then marked legacy) for good
+            raise RuntimeError(f"GPU power state could not be read to record the rental start: {exc}") from exc
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
     raised = await _raise_below_floor(ssh, executor_id, gpu_uuids, state_by_uuid, log_extra, concurrency)
@@ -771,7 +773,8 @@ async def _record_rental_start_ratios(
             continue  # a reboot or edit of the same rental keeps the limit it started on
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None or state.default_watts <= 0:
-            continue  # nothing to record; the check rejects a GPU it cannot read anyway
+            # every GPU of the pod gets its start, or the create fails and is retried
+            raise RuntimeError(f"GPU power state of {gpu_uuid} unreadable; rental start not recorded")
         ratio = state.current_watts / state.default_watts
         if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
             # raised to its default just above, or a running rental from before the records: it stays at 90 %
