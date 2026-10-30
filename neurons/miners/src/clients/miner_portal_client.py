@@ -81,6 +81,9 @@ class MinerPortalClient:
                 "hotkey": authRequest.payload.miner_hotkey,
                 "timestamp": authRequest.payload.timestamp,
                 "signature": authRequest.signature,
+                # DAH-2865: this release applies an address-only UpdateExecutorRequest (ExecutorService.update); the
+                # portal sends a self-hosted address edit only to a miner that says so
+                "capabilities": "address_update",
             }
         )
 
