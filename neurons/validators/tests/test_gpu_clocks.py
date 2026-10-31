@@ -173,7 +173,7 @@ async def test_the_pods_delete_resets_its_locks_and_a_failed_reset_is_caught_by_
 
     host.rgc_exit, host.commands = 0, []
     # U[2] has no record (a lost one looks the same): reset too
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1], U[2]]) == 3
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1], U[2]]) == []
     assert len(host.commands) == 1 and _reset_uuids(host.commands[0]) == [U[0], U[1], U[2]], "one SSH call"
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
 
@@ -184,9 +184,44 @@ async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_chec
     redis = FakeRedis()
     assert await reset_pod_clock_locks(host, redis, "pod1") == 0 and host.commands == []
     redis.store[f"gpu_clock_lock:{U[3]}"] = json.dumps({"pod_id": "old"})
-    assert await reset_leftover_clock_locks(host, redis, []) == 4
+    assert await reset_leftover_clock_locks(host, redis, []) == []
     assert len(host.commands) == 2 and _reset_uuids(host.commands[1]) == U
     assert f"gpu_clock_lock:{U[3]}" not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_create_reset_answers_only_the_recorded_gpus_it_could_not_reset_and_keeps_their_records():
+    host, redis = FakeHost(rgc_exit=1), FakeRedis()
+    redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
+
+    # U[1] has no record: a GPU without -rgc support, never locked here, does not count
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0]]
+    assert f"gpu_clock_lock:{U[0]}" in redis.store, "kept for the next try"
+
+
+@pytest.mark.asyncio
+async def test_a_create_reset_whose_ssh_call_fails_answers_every_recorded_gpu():
+    host, redis = FakeHost(), FakeRedis()
+    redis.store[f"gpu_clock_lock:{U[1]}"] = json.dumps({"pod_id": "old"})
+    host.run = AsyncMock(side_effect=OSError("connection lost"))
+
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[1]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("still_locked", "refused"), [([], False), ([U[0]], True)])
+async def test_a_create_is_refused_only_when_a_recorded_lock_could_not_be_reset(monkeypatch, still_locked, refused):
+    import services.docker_service as ds
+
+    service, _gates, _started = _service_with_gated_steps([])
+    service.redis_service = None
+    monkeypatch.setattr(ds, "reset_leftover_clock_locks", AsyncMock(return_value=still_locked))
+
+    if refused:
+        with pytest.raises(RuntimeError, match=U[0]):
+            await service._reset_leftover_clock_locks_before_create(None, _create_payload(), {})
+    else:
+        await service._reset_leftover_clock_locks_before_create(None, _create_payload(), {})
 
 
 def test_the_clock_command_always_names_one_pod_gpu():

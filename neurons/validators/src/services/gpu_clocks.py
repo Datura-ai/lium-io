@@ -256,15 +256,25 @@ async def reset_pod_clock_locks(runner: SSHCommandRunner, redis: RedisService, p
     return sum(1 for failure in failures.values() if failure is None)
 
 
-async def reset_leftover_clock_locks(runner: SSHCommandRunner, redis: RedisService, gpu_uuids: list[str] | None) -> int:
+async def reset_leftover_clock_locks(
+    runner: SSHCommandRunner, redis: RedisService, gpu_uuids: list[str] | None
+) -> list[str]:
     """Safety net before a create: `-rgc` every GPU of the new pod (None/empty = every host GPU), with or
     without a lock record, so a lost record never hands a renter another's locked clocks (as
-    raise_low_power_limits_to_default does for power); the reset count. The caller makes it best-effort."""
+    raise_low_power_limits_to_default does for power). Answers the GPUs with a lock record whose reset failed
+    (their records stay): the create must not start on them. A failed reset of a GPU with no record (one that
+    does not support -rgc, never locked here) is not counted."""
     if not gpu_uuids:
         host = await _run(runner, HOST_GPUS_COMMAND)
         gpu_uuids = [gpu.uuid for gpu in parse_host_gpus(host.stdout or "")]
-    failures = await _reset_gpus(runner, redis, gpu_uuids)
-    return sum(1 for failure in failures.values() if failure is None)
+    recorded = await clock_locked_gpu_uuids(redis, gpu_uuids)
+    try:
+        failures = await _reset_gpus(runner, redis, gpu_uuids)
+    except Exception:
+        if not recorded:
+            raise
+        failures = dict.fromkeys(gpu_uuids, "the reset did not run")
+    return [uuid for uuid in gpu_uuids if uuid in recorded and failures[uuid] is not None]
 
 
 async def clock_locked_gpu_uuids(redis: RedisService, gpu_uuids: list[str]) -> set[str]:

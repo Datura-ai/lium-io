@@ -9334,6 +9334,7 @@ class DockerService:
                     current_step = "cluster_overlay_port"
                     await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
 
+                current_step = "gpu_clock_reset"
                 await self._reset_leftover_clock_locks_before_create(ssh_client, payload, default_extra)
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
@@ -11362,20 +11363,25 @@ class DockerService:
         self, ssh_client, payload: ContainerCreateRequest, default_extra: dict
     ) -> None:
         """DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed) is reset before anyone starts
-        on it. Best-effort, never blocks the rental."""
+        on it. A GPU with a lock record that still cannot be reset fails the create (its record stays for the next
+        try); anything else here is best-effort and never blocks the rental."""
         # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
         # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
         async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
             if not held:
                 logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
             try:
-                await reset_leftover_clock_locks(
+                still_locked = await reset_leftover_clock_locks(
                     SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids
                 )
             except Exception as exc:
                 logger.warning(
                     _m("GPU clock lock safety net failed", extra=get_extra_info({**default_extra, "error": str(exc)}))
                 )
+                return
+        if still_locked:
+            # never hand a renter the previous renter's locked clocks
+            raise RuntimeError(f"GPU clocks a previous rental locked could not be reset: {', '.join(still_locked)}")
 
     async def delete_container(
         self,
