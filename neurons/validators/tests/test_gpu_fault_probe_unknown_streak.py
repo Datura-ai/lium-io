@@ -34,7 +34,7 @@ async def test_a_no_verdict_streak_is_logged_from_the_limit_and_still_passes(
 ):
     with caplog.at_level(logging.WARNING, logger=module.logger.name):
         results = await _cycles(
-            context_factory, [NO_VERDICT] * (UNKNOWN_STREAK_LIMIT + 1), enforce=True
+            context_factory, [NO_VERDICT] * (UNKNOWN_STREAK_LIMIT + 1)
         )
 
     assert all(result.passed for result in results)
@@ -60,26 +60,12 @@ async def test_under_both_switches_a_no_verdict_streak_fails_like_a_fault(contex
     results = await _cycles(
         context_factory,
         [NO_VERDICT] * UNKNOWN_STREAK_LIMIT,
-        enforce=True,
         enforce_unknown_streak=True,
     )
 
     assert [result.passed for result in results] == [True] * (UNKNOWN_STREAK_LIMIT - 1) + [False]
     assert results[-1].event.reason_code == Msg.PROBE_FAILED.reason
     assert "no verdict" in results[-1].event.what_we_saw["error"]
-
-
-@pytest.mark.asyncio
-async def test_the_streak_switch_alone_stays_in_shadow(context_factory):
-    results = await _cycles(
-        context_factory,
-        [NO_VERDICT] * UNKNOWN_STREAK_LIMIT,
-        enforce=False,
-        enforce_unknown_streak=True,
-    )
-
-    assert all(result.passed for result in results)
-    assert results[-1].event.reason_code == Msg.PROBE_FAILED.reason
 
 
 def test_unknown_streak_enforcement_is_off_by_default():

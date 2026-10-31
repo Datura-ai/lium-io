@@ -1941,8 +1941,8 @@ class GpuMemoryHealthMessages:
 
 
 class GpuFaultProbeMessages:
-    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
-    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+    """DAH-3035 — the kernel-fault probe that follows the matmul. It always runs; PROBE_FAILED is an
+    error and zeroes the score."""
 
     FILLER_SKIPPED = MessageTemplate(
         event="GPU kernel-fault probe skipped for active filler",
@@ -1950,13 +1950,6 @@ class GpuFaultProbeMessages:
         severity="info",
         category="policy",
         impact="Active filler runtime preserved; the probe would compete for VRAM.",
-    )
-    FIRST_PASS_SKIPPED = MessageTemplate(
-        event="GPU kernel-fault probe skipped on the first pass",
-        reason="GPU_FAULT_PROBE_SKIPPED_FIRST_PASS",
-        severity="info",
-        category="policy",
-        impact="Proceed; in shadow the verdict changes nothing, so the probe waits for the next cycle.",
     )
     PROBE_OK = MessageTemplate(
         event="GPU kernel-fault probe passed",
