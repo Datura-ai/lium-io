@@ -394,7 +394,9 @@ async def test_the_retry_only_gets_the_time_the_other_checks_left(
 
     assert service.calls == (2 if retried else 1)
     assert result.passed is retried
-    assert timeouts == ([left_before_score - verifyx_check.COLD_RETRY_MARGIN_SECONDS] if retried else [])
+    # with room to retry, the rental-state lookup (capped) and then the retry itself
+    expected = [verifyx_check.RENTAL_STATE_TIMEOUT_SECONDS, left_before_score - verifyx_check.COLD_RETRY_MARGIN_SECONDS]
+    assert timeouts == (expected if retried else [])
 
 
 def _pod_on(uuid):
@@ -440,3 +442,34 @@ async def test_the_retry_runs_only_on_a_node_still_idle(context_factory, state, 
         assert result.event.what_we_saw["cold_sample_retry"]["skipped"] in {
             "rented", "rental_create_in_progress", "rental_state_unavailable"
         }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_left", [200.0, 900.0])
+async def test_a_slow_rental_lookup_never_costs_the_first_sample(context_factory, monkeypatch, seconds_left):
+    # PR review F-16, 31 Oct: the rental-state re-read ran before the time check and unbounded, so a
+    # hung backend or Redis could carry the cycle past its deadline. Too little time: no lookup at
+    # all. Otherwise the lookup is cut at its cap and the first sample decides.
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: seconds_left)
+    monkeypatch.setattr(verifyx_check, "RENTAL_STATE_TIMEOUT_SECONDS", 0.05)
+    service = _ProbeSequence(_probe(88.0), _probe(760.0))
+    ctx = _ctx(context_factory, service, _never_measured())
+    _idle_now(ctx.services)
+
+    async def hang(*_):
+        await asyncio.sleep(3600)
+
+    ctx.services.redis.renting_in_progress = AsyncMock(side_effect=hang)
+    first = await VerifyXCheck().run(ctx)
+
+    result = await asyncio.wait_for(VerifyXColdRetryCheck().run(ctx.model_copy(update=first.updates)), 5)
+
+    assert service.calls == 1
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+    saw = result.event.what_we_saw["cold_sample_retry"]
+    if seconds_left == 200.0:
+        assert saw == {"skipped_task_seconds_left": 200}
+        ctx.services.redis.renting_in_progress.assert_not_awaited()
+    else:
+        assert saw == {"skipped": "rental_state_unavailable"}

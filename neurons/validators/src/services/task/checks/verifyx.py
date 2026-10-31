@@ -45,6 +45,8 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 # margin for scoring, publishing and cleanup; with less than MIN_COLD_RETRY_SECONDS of that it is skipped.
 MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
+# cap on the rental-state re-read before the retry; a slower answer counts as unknown (busy)
+RENTAL_STATE_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -554,18 +556,24 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
-async def _not_idle_now(ctx: Context) -> str | None:
+async def _not_idle_now(ctx: Context, timeout: float) -> str | None:
     """Why the cold retry must not run now, or None: a customer pod on the node (in the cycle-start
     snapshot, as refreshed by earlier checks, or in the backend's answer now), a rental being
-    created, or a rental state that cannot be read. A filler alone keeps the node eligible, as for
-    the first sample."""
+    created, or a rental state that cannot be read within `timeout`. A filler alone keeps the node
+    eligible, as for the first sample."""
     uuid = str(ctx.executor.uuid)
-    try:
+
+    async def read() -> tuple[bool, Any]:
         if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, uuid):
-            return "rental_create_in_progress"
-        fresh = await ctx.services.backend.get_rented_executors_now()
-    except Exception:  # noqa: BLE001 — unknown counts as busy
+            return True, None
+        return False, await ctx.services.backend.get_rented_executors_now()
+
+    try:
+        creating, fresh = await asyncio.wait_for(read(), timeout=timeout)
+    except Exception:  # noqa: BLE001 — unknown (incl. too slow) counts as busy
         return "rental_state_unavailable"
+    if creating:
+        return "rental_create_in_progress"
     if fresh is None:
         return "rental_state_unavailable"
     for rented_data in (ctx.state.rented_data, fresh):
@@ -680,7 +688,15 @@ class VerifyXColdRetryCheck:
                 ),
             )
         cleared = {"state": replace(ctx.state, verifyx_cold_retry=None)}
-        busy = await _not_idle_now(ctx)
+        busy = None
+        if task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS >= MIN_COLD_RETRY_SECONDS:
+            # never let the lookup itself run into the margin and cost the first sample
+            busy = await _not_idle_now(
+                ctx,
+                min(
+                    RENTAL_STATE_TIMEOUT_SECONDS, task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
+                ),
+            )
         if busy is not None:
             # a renter may be on the node now: never load it with a second RAM, disk and network test
             return self._first_sample_stands(ctx, pending, cleared, {"skipped": busy})
