@@ -592,6 +592,10 @@ class RentedGpuDropCheck:
                 pod_gpu_count=_gpus(pod.gpu_count),
                 rented_gpu_count=_gpus(rented_total),
                 nvml_gpu_count=_gpus(nvml_count),
+                # the anchored cards are gone: the cards the node lists now, so the pod can move onto them
+                gpu_details=((ctx.state.specs or {}).get("gpu") or {}).get("details")
+                if drop and FAULT_ANCHORED_MISSING in drop.faults
+                else None,
             )
         except Exception:
             logger.warning(
