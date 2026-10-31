@@ -341,10 +341,10 @@ def _vloopback_fields(vloopback: dict[str, Any]) -> dict[str, Any]:
 
 def _storage_limit_summary(specs: dict[str, Any], vloopback: Any) -> dict[str, Any]:
     # the storage-limit verdict and the vloopback mount test's own verdict, in the validator's own log
-    supported = bool(specs.get("storage_limit_supported", False))
+    supported = specs.get("storage_limit_supported", False)  # None: the probe gave no verdict
     summary: dict[str, Any] = {"supported": supported}
     scrape_error = specs.get("storage_limit_scrape_error")
-    if not supported and scrape_error:
+    if supported is not True and scrape_error:
         summary["detail"] = str(scrape_error)[:VLOOPBACK_TEXT_CAP]
     if isinstance(vloopback, dict):
         summary["vloopback"] = _vloopback_fields(vloopback)
@@ -534,7 +534,7 @@ class MachineSpecScrapeCheck:
             gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
             gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
             sysbox_runtime = specs.get("sysbox_runtime", False)
-            hardware_supports = specs.get("storage_limit_supported", False)
+            hardware_supports = specs.get("storage_limit_supported") is True
             gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
             gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
             supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None

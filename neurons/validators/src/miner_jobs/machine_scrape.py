@@ -101,11 +101,11 @@ COMMANDS = {
         "--gpus", "all",
         "daturaai/compute-subnet-executor:latest", "nvidia-smi"
     ],
+    # no GPU: image, NVIDIA hook or GPU trouble is not a disk finding
     "CHECK_STORAGE_LIMIT_ABILITY": [
         "docker", "run", "--rm",
         "--storage-opt", "size=1g",
-        "--gpus", "all",
-        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+        "daturaai/compute-subnet-executor:latest", "/usr/bin/true"
     ],
 }
 
@@ -1272,29 +1272,62 @@ def get_sysbox_version() -> str | None:
     return None
 
 
-def check_storage_limit_ability() -> tuple[bool, str]:
+# /proc/mounts spells xfs's `pquota` mount option `prjquota`; `pqnoenforce` only accounts, so it does not count
+PROJECT_QUOTA_MOUNT_OPTIONS = frozenset({"pquota", "prjquota"})
+
+
+def storage_limit_setup_gap(docker_info: dict, mounts_text: str) -> tuple[bool | None, str]:
+    """Whether docker can enforce a per-container disk limit: (True, '') only for the overlay2 storage driver on an
+    xfs data root mounted with project quota (DAH-1997, 26 Oct plan); (False, the first thing missing) for a
+    confirmed gap; (None, why) when docker or the mounts did not say."""
+    driver = docker_info.get("Driver") or ""
+    if not driver:
+        return None, "docker info did not report a storage driver"
+    if driver != "overlay2":
+        return False, f"docker storage driver is {driver}, not overlay2"
+    docker_root_dir = docker_info.get("DockerRootDir") or "/var/lib/docker"
+    covering = covering_mount(mounts_text, docker_root_dir)
+    if covering is None:
+        return None, f"no mount found covering {docker_root_dir}"
+    if covering.fstype != "xfs":
+        return False, f"{docker_root_dir} is on {covering.fstype}, not xfs"
+    if not PROJECT_QUOTA_MOUNT_OPTIONS & set(covering.options):
+        return False, f"{covering.mount_point} (xfs) is not mounted with pquota"
+    return True, ""
+
+
+def check_storage_limit_ability() -> tuple[bool | None, str]:
     """
-    Checks if the system supports limiting the storage size of a container.
+    Checks if the system supports limiting the storage size of a container: overlay2 on xfs with pquota, and a
+    `--storage-opt size=` container that runs. None when the probe gave no verdict (timed out, crashed, the
+    container exited nonzero after the setup passed) - that is not a finding that the limit is missing.
     """
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
+        with open(HOST_MOUNTS_PATH) as mounts_file:
+            setup, gap = storage_limit_setup_gap(docker_api_get("/info") or {}, mounts_file.read())
+        if setup is False:
+            return False, f"Storage limit is not supported: {gap}."
+        if setup is None:
+            return None, f"Storage limit setup unknown: {gap}."
+
         result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Storage limit is supported."
-        else:
-            return False, "Storage limit is not supported."
+        stderr = (result.stderr or "").strip()[:300]
+        return None, f"Test container exited {result.returncode}: {stderr}"
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        return None, "Test command timed out."
 
     except Exception as e:
-        return False, f"An unexpected error occurred: {e}"
+        return None, f"An unexpected error occurred: {e}"
 
 
 def run_checks_concurrently(checks):
-    # Each capability test is a `docker run --gpus all` that takes seconds and shares nothing with
+    # Each capability test is a `docker run` that takes seconds and shares nothing with
     # the other, so they run side by side instead of one after the other; each keeps its own timeout.
     results = [None] * len(checks)
     threads = [
@@ -1780,10 +1813,11 @@ def mounts_holding(mounts_text: str, path: str) -> list[str]:
 class MountLine:
     # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
     # allowlist into the packaged scrape, so this file must not grow new ones.
-    def __init__(self, source: str, mount_point: str, options: list[str]) -> None:
+    def __init__(self, source: str, mount_point: str, options: list[str], fstype: str = "") -> None:
         self.source = source
         self.mount_point = mount_point
         self.options = options
+        self.fstype = fstype
 
 
 def covering_mount(mounts_text: str, path: str) -> MountLine | None:
@@ -1802,7 +1836,7 @@ def covering_mount(mounts_text: str, path: str) -> MountLine | None:
         if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
             continue
         if covering is None or len(mount_point) >= len(covering.mount_point):
-            covering = MountLine(fields[0], mount_point, fields[3].split(","))
+            covering = MountLine(fields[0], mount_point, fields[3].split(","), fields[2])
     return covering
 
 
@@ -2036,6 +2070,51 @@ def get_docker_root_disk_type() -> str:
     return disk_type_of(block_device_holding(mounts_text, docker_root_dir))
 
 
+# DAH-1997 (26 Oct plan): the storage limit is required only of hosts that can build it - the rule
+# `lium gpu-splitting setup` (lium/cli/mine/storage.py plan_loop_file_target) uses for its xfs image file: a local
+# filesystem other than docker's own mount with this much left after a reserve of max(10%, 20 GiB) for the system
+# (or the manual steps at docs.lium.io/providers/nodes/docker-storage). Less than that keeps the warning only.
+STORAGE_CAPABLE_MIN_BYTES = 100 * 1024**3
+STORAGE_IMAGE_FILE_RESERVE_FRACTION = 0.10
+STORAGE_IMAGE_FILE_MIN_RESERVE_BYTES = 20 * 1024**3
+# setup's LOOP_FILE_HOST_FSTYPES: never btrfs or zfs, where fallocate reserves no blocks
+STORAGE_IMAGE_FILE_FSTYPES = ("ext2", "ext3", "ext4", "xfs", "f2fs")
+
+
+def image_file_room(size_bytes: int, avail_bytes: int) -> int:
+    """What setup's xfs image file would get on a filesystem: its free space minus the system's reserve."""
+    reserve = max(
+        int(size_bytes * STORAGE_IMAGE_FILE_RESERVE_FRACTION), STORAGE_IMAGE_FILE_MIN_RESERVE_BYTES
+    )
+    return avail_bytes - reserve
+
+
+def storage_limit_capable() -> bool:
+    """True when `lium gpu-splitting setup` could place a STORAGE_CAPABLE_MIN_BYTES image file on this host."""
+    docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    with open(HOST_MOUNTS_PATH) as mounts_file:
+        mounts_text = mounts_file.read()
+    # setup picks the candidate filesystem with the most free space and sizes the file on that one alone
+    # shortcut: setup also refuses removable / usb / iscsi disks, which the scrape does not read; a host whose only
+    # room is on one counts as capable and gets the REQUIRED message pointing at the manual steps
+    best = None
+    for line in mounts_text.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[0].startswith("/dev/") or fields[2] not in STORAGE_IMAGE_FILE_FSTYPES:
+            continue
+        if fields[1] == docker_root_dir:
+            continue
+        try:
+            stats = os.statvfs(f"{HOST_ROOT_PREFIX}{fields[1]}")
+        except OSError:
+            continue
+        if best is None or stats.f_bavail * stats.f_frsize > best.f_bavail * best.f_frsize:
+            best = stats
+    if best is None:
+        return False
+    return image_file_room(best.f_blocks * best.f_frsize, best.f_bavail * best.f_frsize) >= STORAGE_CAPABLE_MIN_BYTES
+
+
 def write_probe_failure_reason(errno_value) -> str:
     """The reason a write failed because of the disk itself - a container cannot start on any of
     these - or '' when the errno says where the scrape runs from (EACCES, ENOENT), not what the disk
@@ -2243,6 +2322,10 @@ def get_machine_specs():
     data["data_storage_limit_supported"] = is_supported
     if not is_supported:
         data["data_storage_limit_scrape_error"] = log_text
+        try:
+            data["data_storage_limit_capable"] = storage_limit_capable()
+        except Exception:
+            data["data_storage_limit_capable"] = None  # unknown: the check keeps requiring the limit
     data["data_vloopback_check"] = vloopback_check_payload(is_supported, data["data_sysbox_runtime"])
 
     ncu_profiling = check_ncu_profiling_access()

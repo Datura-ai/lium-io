@@ -33,6 +33,8 @@ class ReachTarget(StrEnum):
     EXECUTOR_API = "executor_api"
     # A card on the node (GpuLossHoldCheck): the validator cannot reach it through NVML.
     GPU = "gpu"
+    # The node's Docker storage (StorageLimitCheck): it cannot cap a container's disk.
+    DOCKER_STORAGE = "docker_storage"
 
 
 # The longest peer-supplied text a reading may keep: the node writes it, the portal shows it.
@@ -57,15 +59,26 @@ class AvailabilityErrorCode(StrEnum):
     GPU_LOST = "GPU_LOST"
     # DAH-4683: NVML reports a card's memory broken (GpuMemoryHealthCheck).
     GPU_MEMORY_HEALTH_FAILED = "GPU_MEMORY_HEALTH_FAILED"
+    # DAH-1997: an unrented node whose Docker cannot cap a container's disk (StorageLimitCheck, when required)
+    STORAGE_LIMIT_REQUIRED = "STORAGE_LIMIT_REQUIRED"
+    # ... or whose disk-limit probe has never given a verdict
+    STORAGE_LIMIT_INCONCLUSIVE = "STORAGE_LIMIT_INCONCLUSIVE"
+    # ... held from new rentals after one failed probe, or after over 24 h without a verdict
+    STORAGE_LIMIT_MISSING = "STORAGE_LIMIT_MISSING"
+    STORAGE_LIMIT_INCONCLUSIVE_LONG = "STORAGE_LIMIT_INCONCLUSIVE_LONG"
     # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
     GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
 
 
-# Faults of the node's own cards: never a sign of our own outage, and never silenced with one.
+# Faults of the node itself (its cards, its Docker storage): never a sign of our own outage, never silenced with one.
 NODE_GPU_FAULT_CODES = frozenset(
     {
         AvailabilityErrorCode.GPU_LOST,
         AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
+        AvailabilityErrorCode.STORAGE_LIMIT_REQUIRED,
+        AvailabilityErrorCode.STORAGE_LIMIT_INCONCLUSIVE,
+        AvailabilityErrorCode.STORAGE_LIMIT_MISSING,
+        AvailabilityErrorCode.STORAGE_LIMIT_INCONCLUSIVE_LONG,
         AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
     }
 )

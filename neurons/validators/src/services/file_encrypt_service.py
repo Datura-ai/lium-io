@@ -154,6 +154,7 @@ ORIGINAL_KEYS = {
     'data_sysbox_version': "sysbox_version",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
+    'data_storage_limit_capable': "storage_limit_capable",
     # ticket-0331: the vloopback mount test. Prefixed so no existing key is a substring of them
     # (ecrypt_miner_job_files renames by sequential str.replace).
     'data_vloopback_check': "vloopback_check",
@@ -370,6 +371,7 @@ class FileEncryptService:
             'data_sysbox_version': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
+            'data_storage_limit_capable': "",
             'data_vloopback_check': "",
             'vc_verdict': "",
             'vc_reason_code': "",

@@ -433,28 +433,57 @@ class GpuThermalThrottleMessages:
     )
 
 
+# the scrape's disk-limit test container, without a GPU
+STORAGE_LIMIT_TEST = (
+    "`sudo docker run --rm --storage-opt size=1g daturaai/compute-subnet-executor:latest /usr/bin/true`"
+)
+
+
 class StorageLimitMessages:
     MISSING = MessageTemplate(
         event="Docker cannot limit a container's disk",
         reason="STORAGE_LIMIT_MISSING",
         severity="warning",
         category="env",
-        impact="Proceed; score not changed while the requirement is not enforced (see enforced). A renter who "
+        impact="Proceed; score not changed while the requirement is not enforced (see enforced) or when the scrape "
+        "found no local filesystem with 100 GiB to spare for the limit's image file (see capable). A renter who "
         "fills their disk fills the host's Docker storage and takes the host and every pod on it down",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
-        "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check with `sudo docker run --rm "
-        "--storage-opt size=1g --gpus all daturaai/compute-subnet-executor:latest nvidia-smi`.",
+        "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check that `docker info` shows Storage Driver "
+        "overlay2 and that " + STORAGE_LIMIT_TEST + " works.",
     )
     REQUIRED = MessageTemplate(
         event="Node rejected: Docker cannot limit a container's disk",
         reason="STORAGE_LIMIT_REQUIRED",
         severity="error",
-        category="env",
-        impact="Job skipped; score set to 0 until the host enforces a per-container storage limit",
+        # an availability error: the backend hides the node at once instead of at the hourly staleness sweep, so a
+        # node whose rental just ended is not re-rented on an uncapped disk in between (only unrented nodes get it)
+        category=AVAILABILITY_CATEGORY,
+        impact="Job skipped; score set to 0 and the node hidden from new rentals after two failed disk-limit tests "
+        "in a row, until the host passes the test",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
         "pquota): https://docs.lium.io/providers/nodes/docker-storage . The node passes again on the next "
-        "validation once `sudo docker run --rm --storage-opt size=1g --gpus all "
-        "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
+        "validation once `docker info` shows Storage Driver overlay2 and " + STORAGE_LIMIT_TEST + " works.",
+    )
+    INCONCLUSIVE = MessageTemplate(
+        event="Node held: the disk-limit test has no result yet",
+        reason="STORAGE_LIMIT_INCONCLUSIVE",
+        severity="warning",
+        # hidden at once: without a verdict the node could otherwise take a whole-host rental uncapped
+        category=AVAILABILITY_CATEGORY,
+        impact="Score not changed; the node is hidden from new rentals until the disk-limit test gives a result "
+        "(it has none on record, see detail; this is not a finding that the limit is missing)",
+        remediation="Usually a busy host or a slow image pull: the node is listed again on the next validation "
+        "once " + STORAGE_LIMIT_TEST + " finishes quickly.",
+    )
+    INCONCLUSIVE_LONG = MessageTemplate(
+        event="The disk-limit test has had no result for over 24 hours",
+        reason="STORAGE_LIMIT_INCONCLUSIVE_LONG",
+        severity="warning",
+        category="env",
+        impact="Score not changed: the node keeps its last disk-limit result (see inconclusive_since, detail)",
+        remediation="Usually a busy host or a slow image pull: check that " + STORAGE_LIMIT_TEST + " finishes within "
+        "30 seconds.",
     )
     OK = MessageTemplate(
         event="Docker limits a container's disk",
@@ -635,8 +664,7 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 90% of the default limit reported by NVML."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(
@@ -1473,9 +1501,7 @@ class PortCountMessages:
     )
 
 
-NO_OUTBOUND_INTERNET_REMEDIATION = (
-    "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
-)
+NO_OUTBOUND_INTERNET_REMEDIATION = "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
 
 
 class OutboundInternetMessages:
@@ -2652,7 +2678,7 @@ class GpuAttestationIdentityMessages:
 SSHD_BOOTSTRAP_REMEDIATION = (
     "sshd does not start inside containers on this node, so renters cannot SSH in. Common cause: the host's "
     "container runtime leaves /run/sshd not owned by root or group/world-writable (sshd refuses to start: "
-    "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
+    '"/run/sshd must be owned by root and not group or world-writable"). Fix the runtime/image setup so '
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
     "succeeds. The node is validated again once a new container on it starts sshd."
