@@ -6,17 +6,19 @@ operator's choice; /proc/driver/nvidia/gpus/*/information is the kernel's and th
 author it (the DAH-2614 truth path). A ban keyed only on the reported UUID is void the moment the
 banned operator re-registers with new UUIDs and a fresh hotkey.
 
-Enforcement sits behind KERNEL_GPU_BAN_ENFORCEMENT_ENABLED (shadow by default, like every other
-fatal-path widening in this repo): the tests that expect a ban through the kernel view flip it on.
+Bans are matched against the reported UUIDs and the kernel's.
 """
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from core.config import settings
 from neurons.validators.src.services.task.checks.banned_provider import BannedProviderCheck
 from neurons.validators.src.services.task.messages import BannedProviderMessages
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
 
 from services import nvidia_devices  # the module banned_provider.py reads the timeout from
 from tests.helpers import build_state
@@ -64,20 +66,8 @@ def _ssh_with_procfs(
     return ssh
 
 
-@pytest.fixture
-def enforcing(monkeypatch):
-    monkeypatch.setattr(settings, "KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", True)
-
-
-@pytest.fixture
-def shadow(monkeypatch):
-    monkeypatch.setattr(settings, "KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", False)
-
-
 @pytest.mark.asyncio
-async def test_provider_ban_catches_spoofed_uuid_through_the_kernel_view(
-    context_factory, enforcing
-):
+async def test_provider_ban_catches_spoofed_uuid_through_the_kernel_view(context_factory):
     rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
     ctx = context_factory(
         state=build_state(gpu_uuids=SPOOFED, rented_data=rented),
@@ -94,9 +84,7 @@ async def test_provider_ban_catches_spoofed_uuid_through_the_kernel_view(
 
 
 @pytest.mark.asyncio
-async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails_when_enforcing(
-    context_factory, enforcing
-):
+async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(context_factory):
     """The shim test: the overlay serves a clean UUID, the kernel list is withheld, the check fails."""
     rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
     ctx = context_factory(
@@ -114,5 +102,48 @@ async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails_when
     ]
     assert "kernel_gpu_uuids" not in result.updates["state"].specs
     assert "is_provider_banned" not in result.updates
+    assert result.fatal is True
 
 
+@pytest.mark.asyncio
+async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factory):
+    """Like a ban, the overlay finding must not stop verifying a node whose pod is in use."""
+    ctx = context_factory(
+        ssh=_ssh_with_procfs([f"{SPOOFED}, 0"], mounts=[*CONTAINER_MOUNTS, OVERLAY_MOUNT])
+    )
+    rented = RentedExecutorsResponse(
+        executors={
+            ctx.executor.uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address=ctx.executor.address,
+                executor_ip_port=str(ctx.executor.port),
+                pods=[RentedPod(pod_id="pod-1", container_name="pod_p1")],
+            )
+        },
+    )
+    ctx = ctx.model_copy(update={"state": build_state(gpu_uuids=SPOOFED, rented_data=rented)})
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
+    assert result.fatal is False
+    assert result.updates["kernel_gpu_view_passed"] is False  # zeroes the score instead
+
+
+@pytest.mark.asyncio
+async def test_stale_procfs_bind_is_unreadable_and_the_node_passes(context_factory):
+    stale = CONTAINER_MOUNTS[1].replace(
+        "/driver/nvidia/gpus/0001:00:00.0 ", "/driver/nvidia/gpus/0001:00:00.0//deleted ", 1
+    )
+    rented = RentedExecutorsResponse(executors={})
+    ctx = context_factory(
+        state=build_state(gpu_uuids=REAL, rented_data=rented),
+        ssh=_ssh_with_procfs([f"{REAL}, 0"], mounts=[CONTAINER_MOUNTS[0], stale]),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []

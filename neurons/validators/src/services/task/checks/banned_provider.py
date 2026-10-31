@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from core.config import settings
 from services.nvidia_devices import KernelGpuView, read_kernel_gpu_view
 
 from ..messages import BannedProviderMessages as Msg, render_message
@@ -31,9 +30,7 @@ async def kernel_gpu_uuids(ctx: Context) -> list[str] | None:
 
 
 def uuids_to_match_bans_against(reported: list[str], kernel: list[str] | None) -> list[str]:
-    """The UUID list a ban is matched against: reported + kernel once enforcement is on, reported only in shadow."""
-    if not settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED:
-        return reported
+    """The UUID list a ban is matched against: reported + kernel."""
     return list(dict.fromkeys(reported + (kernel or [])))
 
 
@@ -58,7 +55,7 @@ class BannedProviderCheck:
     async def run(self, ctx: Context) -> CheckResult:
         rented_data = ctx.state.rented_data
         gpu_uuids = reported_gpu_uuids(ctx)
-        # DAH-2662: match bans against the kernel's GPU list too (flag and shapes: config.py, kernel_gpu_view)
+        # DAH-2662: match bans against the kernel's GPU list too (shapes: kernel_gpu_view)
         kernel_uuids, foreign_mounts = await kernel_gpu_view(ctx)
         is_banned = bool(
             rented_data
@@ -69,8 +66,7 @@ class BannedProviderCheck:
                 executor_uuid=ctx.executor.uuid,
             )
         )
-        # what flipping enforcement changes: a kernel UUID on the ban list (hotkey/coldkey bans
-        # already apply on both sides of the flag)
+        # a kernel UUID on the GPU ban list (hotkey/coldkey bans match without the kernel view)
         kernel_view_would_ban = bool(
             rented_data
             and any(
@@ -85,7 +81,7 @@ class BannedProviderCheck:
             "reported_uuids_differ_from_kernel": bool(kernel_uuids)
             and set(gpu_uuids) != set(kernel_uuids),
             "kernel_view_would_ban": kernel_view_would_ban,
-            "kernel_ban_enforced": settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED,
+            "kernel_ban_enforced": True,
             "kernel_gpu_foreign_mounts": foreign_mounts,
         }
         specs = ctx.state.specs
@@ -110,11 +106,16 @@ class BannedProviderCheck:
                 fatal=not has_live_rental(ctx),
             )
 
-        if foreign_mounts and settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED:
+        if foreign_mounts:
             event = render_message(
                 Msg.KERNEL_GPU_VIEW_OVERLAID, ctx=ctx, check_id=self.check_id, what=what
             )
-            return CheckResult(passed=False, event=event, updates=updates)
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={**updates, "kernel_gpu_view_passed": False},
+                fatal=not has_live_rental(ctx),
+            )
 
         event = render_message(Msg.PROVIDER_ALLOWED, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event, updates=updates)

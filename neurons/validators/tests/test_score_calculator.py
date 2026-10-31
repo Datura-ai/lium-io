@@ -155,6 +155,15 @@ def test_inspector_host_write_flag_zeroes_a_rented_score():
     assert "The host wrote into a renter's container" in warning
 
 
+@pytest.mark.parametrize("passed", [True, False])
+def test_kernel_gpu_view_flag_zeroes_a_rented_score(passed):
+    """BannedProviderCheck's overlay fail is non-fatal on a live rental: only this flag zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"kernel_gpu_view_passed": passed})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == (1.0 if passed else 0.0)
+    assert ("Kernel GPU list was overlaid" in warning) is not passed
+
+
 def test_hardware_identity_flag_zeroes_a_rented_score():
     """HardwareIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
     ctx = _ctx(500.0).model_copy(update={"hardware_identity_passed": False})

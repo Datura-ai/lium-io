@@ -807,7 +807,7 @@ class BannedProviderMessages:
         impact="Proceed",
     )
     # DAH-2662: a mount that is not procfs sits on /proc/driver/nvidia/gpus, so the kernel's GPU
-    # list cannot be read (the 2026-08-19 kit). Emitted only when KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # list cannot be read (the 2026-08-19 kit).
     KERNEL_GPU_VIEW_OVERLAID = MessageTemplate(
         event="A foreign mount covers the kernel's GPU list",
         reason="KERNEL_GPU_VIEW_OVERLAID",
