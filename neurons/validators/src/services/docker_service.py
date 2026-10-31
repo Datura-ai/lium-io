@@ -7705,6 +7705,8 @@ class DockerService:
                     log_extra={**default_extra, "build_image_tag": image_tag},
                     timeout=timeout_s,
                     raise_exception=False,
+                    # an exec killed with its DinD (exit 137, empty stderr) is a failed build
+                    check_exit_status=True,
                 )
             except Exception as exc:
                 logger.error(
@@ -7741,7 +7743,12 @@ class DockerService:
                         )
                     )
                     return CustomBuildOutcome(False, "docker_build", CUSTOM_BUILD_INTERRUPTED_REASON)
-                return CustomBuildOutcome(False, "docker_build", custom_build_log_tail(err))
+                # cut at the marker: after it comes the streamer's "Process exited with status" line
+                return CustomBuildOutcome(
+                    False,
+                    "docker_build",
+                    custom_build_log_tail(err.rsplit(CUSTOM_BUILD_FAILED_MARKER, 1)[0]),
+                )
 
             # 7. Export the image from DinD and load it onto the host daemon so
             #    the rental `docker run` (host-side) can use it.

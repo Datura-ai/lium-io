@@ -680,3 +680,68 @@ def test_A17e_a_stack_trace_longer_than_the_tail_still_reaches_the_renter_with_i
         "#5 [2/3] RUN pip install nope",
         "ERROR: failed to solve: pip install nope did not complete",
     ]
+
+
+# ------------------------------------------------------------------
+# The build exec ends with its exit status: a DinD removed mid-build kills the
+# exec silently (exit 137, nothing on stderr), which is no success.
+# ------------------------------------------------------------------
+
+
+def _make_exit_status_esl(*, build_exit: int, build_stderr: str = ""):
+    """Like `_make_esl`, but the build step answers as the real streamer does: stderr fails it, and
+    a non-zero exit fails it only when the caller asked for `check_exit_status`."""
+
+    async def _esl(**kwargs):
+        cmd = kwargs.get("command", "")
+        if "docker build" not in cmd:
+            return (True, "")
+        err = build_stderr
+        if build_exit != 0 and kwargs.get("check_exit_status"):
+            err += f"Process exited with status {build_exit}\n"
+        return (not err, err)
+
+    return _esl
+
+
+async def _build(svc, monkeypatch, esl):
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    return await svc._custom_build_image(
+        ssh_client=_make_dind_ssh(),
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_build_exec_killed_with_its_dind_is_an_interrupted_build(
+    svc, monkeypatch
+):
+    from services.docker_service import CUSTOM_BUILD_INTERRUPTED_REASON
+
+    ok, step, reason = await _build(
+        svc, monkeypatch, _make_exit_status_esl(build_exit=137)
+    )
+
+    assert ok is False
+    assert step == "docker_build"
+    assert reason == CUSTOM_BUILD_INTERRUPTED_REASON
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_tail_carries_no_streamer_exit_status_line(
+    svc, monkeypatch
+):
+    esl = _make_exit_status_esl(
+        build_exit=1,
+        build_stderr="ERROR: failed to solve: bad RUN\nBUILD_FAILED_RC=1\n",
+    )
+
+    ok, step, reason = await _build(svc, monkeypatch, esl)
+
+    assert ok is False
+    assert step == "docker_build"
+    assert reason == "ERROR: failed to solve: bad RUN"
