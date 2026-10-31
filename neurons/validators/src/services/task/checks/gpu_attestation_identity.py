@@ -279,6 +279,8 @@ class GpuAttestationIdentityCheck:
         moved: dict[str, str] = {}
         changed: dict[str, list[str]] = {}
         slots = host_slots(hw_by_uuid)
+        # every card's serial, or none: a partial set cannot show that the whole set is new hardware
+        host_serials = sorted(serials) if len(serials) == len(hw_by_uuid) else []
         host_key = f"{KEY_HOST}:{ctx.executor.address}:{ctx.executor.port}"
         try:
             redis = ctx.services.redis
@@ -317,9 +319,15 @@ class GpuAttestationIdentityCheck:
                             findings.append("serial_moved")
             previous_host = stored[host_key]
             previous_host = json.loads(previous_host) if previous_host else None
-            if previous_host and slots and previous_host.get("slots") == slots and not set(previous_host.get("uuids") or []) & set(reported):
+            if (
+                previous_host
+                and slots
+                and previous_host.get("slots") == slots
+                and not set(previous_host.get("uuids") or []) & set(reported)
+                and not (host_serials and previous_host.get("serials") and not set(previous_host["serials"]) & set(host_serials))
+            ):
                 # every UUID new, same models in the same slots: renamed cards. Replacing one failed card keeps the
-                # other UUIDs and does not match; replacing every card in place with the same model would.
+                # other UUIDs and does not match; a new set whose serials all differ is new hardware, not a rename.
                 findings.append("uuids_changed_same_slots")
             if any(m.startswith("identity_was_under") for m in moved.values()):
                 findings.append("identity_moved")  # the attested card under a new UUID: a swap
@@ -327,8 +335,8 @@ class GpuAttestationIdentityCheck:
                 findings.append("identity_changed")  # the UUID now on another card, or gone dark
             if changed:
                 findings.append("hardware_changed_under_uuid")
-            if not findings:  # a node under a finding cannot rewrite its pins
-                writes = RedisWrites()
+            writes = RedisWrites()
+            if not findings:  # a node under a finding cannot rewrite its per-card pins
                 for gpu_uuid, v in verified.items():
                     writes.set(f"{KEY_UUID}:{gpu_uuid}", v["identity"], ex=KEY_TTL_SECONDS)
                     writes.set(f"{KEY_IDENTITY}:{v['identity']}", gpu_uuid, ex=KEY_TTL_SECONDS)
@@ -336,9 +344,11 @@ class GpuAttestationIdentityCheck:
                     writes.set(f"{KEY_HW}:{gpu_uuid}", json.dumps(hw), ex=KEY_TTL_SECONDS)
                     if serial := _serial(hw):
                         writes.set(f"{KEY_SERIAL}:{serial}", gpu_uuid, ex=KEY_TTL_SECONDS)
-                if slots:
-                    writes.set(host_key, json.dumps({"uuids": reported, "slots": slots}), ex=KEY_TTL_SECONDS)
-                await redis.write_atomically(writes)
+            if slots:  # always: a whole-set change is reported once, not on every cycle for the TTL
+                writes.set(
+                    host_key, json.dumps({"uuids": reported, "slots": slots, "serials": host_serials}), ex=KEY_TTL_SECONDS
+                )
+            await redis.write_atomically(writes)
         except Exception:
             logger.warning("gpu identity record unavailable", exc_info=True, extra=ctx.default_extra)
 

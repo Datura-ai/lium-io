@@ -328,6 +328,58 @@ async def test_every_uuid_new_in_the_same_slots_is_a_swap(context_factory):
     assert "same cards" not in result.event.event
 
 
+A_SLOTS = ("00000000:17:00.0", "00000000:65:00.0")
+
+
+def _set(uuids, serials=(None, None)):
+    return [_hw(u, serial=s, pci=p) for u, s, p in zip(uuids, serials, A_SLOTS)], tuple(uuids), None
+
+
+async def _cycles(context_factory, *cycles):
+    """Run each (rows, gpus, details) cycle on one Redis; return every result."""
+    ca, redis, results = FakeCa(), None, []
+    for rows, gpus, details in cycles:
+        ctx = _ctx(context_factory, ca, lambda n, rows=rows: rows, gpus=gpus, details=details, redis=redis)
+        results.append(await _run(ctx, ca, enforce=True))
+        redis = ctx.services.redis
+    return results
+
+
+@pytest.mark.asyncio
+async def test_whole_set_change_is_reported_once_then_the_new_set_is_the_baseline(context_factory):
+    first, changed, again = await _cycles(
+        context_factory, _set(("GPU-a", "GPU-b")), _set(("GPU-y", "GPU-z")), _set(("GPU-y", "GPU-z"))
+    )
+    assert first.passed is True
+    assert changed.event.what_we_saw["findings"] == ["uuids_changed_same_slots"]
+    assert again.passed is True
+    assert again.event.what_we_saw["findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_new_set_with_all_new_serials_in_the_same_slots_is_not_a_swap(context_factory):
+    results = await _cycles(
+        context_factory,
+        _set(("GPU-a", "GPU-b"), ("1650000000001", "1650000000002")),
+        _set(("GPU-y", "GPU-z"), ("1650000000003", "1650000000004")),
+        _set(("GPU-p", "GPU-q"), ("1650000000005", "1650000000006")),
+    )
+    assert [r.passed for r in results] == [True, True, True]
+    assert all(r.event.what_we_saw["findings"] == [] for r in results)
+
+
+@pytest.mark.asyncio
+async def test_new_uuids_keeping_the_serials_stay_flagged_every_cycle(context_factory):
+    serials = ("1650000000001", "1650000000002")
+    _, changed, again = await _cycles(
+        context_factory, _set(("GPU-a", "GPU-b"), serials), _set(("GPU-y", "GPU-z"), serials), _set(("GPU-y", "GPU-z"), serials)
+    )
+    for result in (changed, again):
+        assert result.passed is False
+        assert result.event.reason_code == Msg.SWAPPED.reason
+        assert "serial_moved" in result.event.what_we_saw["findings"]
+
+
 @pytest.mark.asyncio
 async def test_replacing_one_failed_card_in_place_is_not_a_swap(context_factory):
     result = await _twice(
