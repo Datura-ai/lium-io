@@ -2,8 +2,11 @@
 (the EMA bootstraps from it). The check takes one more sample inside the same task and gates on the
 better one."""
 
+import time
+
 import pytest
 
+from core.config import settings
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
@@ -168,3 +171,20 @@ async def test_ram_or_disk_failure_on_the_first_sample_is_not_retried(context_fa
     assert service.calls == 1
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+
+
+@pytest.mark.asyncio
+async def test_cold_retry_is_skipped_when_it_would_not_fit_before_the_task_deadline(context_factory):
+    # ad2382f9, 31 Oct: first run ended with ~208 s left, the retry ran into the task deadline and
+    # the cycle was dropped with no result. Too little time left: judge on the first sample.
+    service = _ProbeSequence(_probe(88.0), _probe(760.0))
+    ctx = _ctx(context_factory, service, _never_measured())
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - (settings.JOB_TIME_OUT - 120 - 200)})
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert service.calls == 1
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+    assert "cold_sample_retry" not in result.event.what_we_saw
+    assert 0 < result.event.what_we_saw["cold_sample_retry_skipped_task_seconds_left"] <= 200

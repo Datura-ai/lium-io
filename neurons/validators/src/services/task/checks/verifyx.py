@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -18,6 +19,7 @@ from services.verifyx_validation_service import (
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,11 @@ _kept_upload_probes: dict[tuple[str, str], int] = {}
 # the missing capacity reading is fed as the 0 it is.
 MAX_PACKAGE_FALLBACK_PROBES = 8
 _package_fallback_probes: dict[tuple[str, str], int] = {}
+# The cold-sample retry runs only if a second VerifyX run fits before the task deadline: it takes
+# about as long as the first (3-15 min in prod), never less than this, plus the reserve for the
+# checks after it. Otherwise the deadline cancelled the task and the cycle had no result at all.
+MIN_COLD_RETRY_SECONDS = 240
+COLD_RETRY_RESERVE_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -116,10 +123,12 @@ class VerifyXCheck:
         # over SSH exactly as before.
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
+        first_run_started = None
         if local is not None and local.verifyx is not None:
             result = local.verifyx
             transport = "local_verify"
         else:
+            first_run_started = time.monotonic()
             result = await verifyx_service.validate_verifyx_and_process_job(
                 shell=ctx.services.shell,
                 executor_info=ctx.executor,
@@ -135,7 +144,22 @@ class VerifyXCheck:
         )
 
         cold_sample_retry: ColdSampleRetry | None = None
-        if _is_cold_sample_below_gate(ctx, result, prev_ema):
+        retry_skipped_seconds_left: int | None = None
+        cold = _is_cold_sample_below_gate(ctx, result, prev_ema)
+        if cold:
+            first_run_seconds = time.monotonic() - first_run_started if first_run_started else 0.0
+            seconds_left = task_seconds_left(ctx)
+            if seconds_left < max(first_run_seconds, MIN_COLD_RETRY_SECONDS) + COLD_RETRY_RESERVE_SECONDS:
+                retry_skipped_seconds_left = int(seconds_left)
+                logger.info(
+                    _m(
+                        "VerifyX cold first sample below the gate, no time left to re-measure",
+                        extra=get_extra_info(
+                            {**ctx.default_extra, "task_seconds_left": retry_skipped_seconds_left}
+                        ),
+                    )
+                )
+        if cold and retry_skipped_seconds_left is None:
             # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
             # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
             # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps
@@ -304,6 +328,10 @@ class VerifyXCheck:
                 )
                 if cold_sample_retry is not None:
                     slow_event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
+                if retry_skipped_seconds_left is not None:
+                    slow_event.what_we_saw["cold_sample_retry_skipped_task_seconds_left"] = (
+                        retry_skipped_seconds_left
+                    )
                 if network_gate is not None:
                     slow_event.what_we_saw["network_gate"] = network_gate
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
