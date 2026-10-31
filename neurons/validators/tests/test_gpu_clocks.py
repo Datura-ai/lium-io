@@ -137,19 +137,24 @@ async def test_a_backend_subset_of_a_whole_host_container_touches_only_the_backe
 
 
 @pytest.mark.asyncio
-async def test_a_refused_lock_is_reported_and_leaves_the_record_it_found():
-    host = FakeHost()
-    _, redis = await _lock(host, indices=[0])  # an earlier lock that holds: container index 0 is U[1] here
-    earlier = redis.store[f"gpu_clock_lock:{U[1]}"]
-    host.lgc_exit, host.rgc_exit = 1, 1  # a GPU that now refuses both -lgc and -rgc
-
-    report, redis = await _lock(host, redis)
+async def test_a_refused_lock_is_reset_and_its_record_goes_only_once_that_reset_succeeded():
+    report, redis = await _lock(FakeHost(lgc_exit=1))
 
     assert not report.ok and report.error_code == GpuResetErrorCode.ClockLockNotSupported
     assert {g.result for g in report.gpus} == {"failed"}
-    assert redis.store[f"gpu_clock_lock:{U[1]}"] == earlier, "its clocks are still locked"
-    assert f"gpu_clock_lock:{U[0]}" not in redis.store, "never locked: nothing for a create to refuse on"
-    assert await reset_leftover_clock_locks(host, redis, [U[0]]) == []
+    assert all(g.detail.endswith("clocks reset to default") for g in report.gpus)
+    assert not any(k.startswith("gpu_clock_lock:") for k in redis.store), "reset: nothing for a create to refuse on"
+
+
+@pytest.mark.asyncio
+async def test_a_lock_whose_answer_was_lost_and_whose_reset_failed_keeps_its_record_and_refuses_the_next_create():
+    # -lgc may have applied on the host though its answer timed out; the cleanup -rgc fails
+    host = FakeHost(lgc_exit=124, rgc_exit=1)
+    report, redis = await _lock(host)
+    assert not report.ok
+
+    assert await reset_pod_clock_locks(host, redis, "pod1") == 0  # teardown -rgc fails as well
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]], "the next renter is refused"
 
 
 @pytest.mark.asyncio
