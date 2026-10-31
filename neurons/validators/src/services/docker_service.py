@@ -496,6 +496,13 @@ _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # DAH-2475: slack kept free above a rental's requested volume before a filler cache has to go. Covers the
 # image layers and scratch the pod needs beyond its own volume.
 RENTAL_DISK_HEADROOM_GB = 20
+# a clamp within 5% is df/listing drift (a ~15 min old scrape, GB vs GiB); below it the renter is short-changed,
+# so the create fails and the backend's rent retry moves the pod to another node
+RENTAL_VOLUME_CLAMP_MIN_SHARE = 0.95
+RENTAL_DISK_SHORT_STEP = "rental_disk_short"
+# DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
+# extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
+CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
@@ -5070,29 +5077,50 @@ class DockerService:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
 
-        DAH-5192: the caches are kept across rentals and listed as used disk, so a renter offered the listed
-        free disk normally fits and nothing is evicted. The listing can still be stale (it is ~15 min old, and
-        an Engy download writes ~1 GB/s until the filler is removed), so an idle cache must never be the reason
-        a paid create fails: when the requested volume does not fit, caches go oldest first until it does.
-        With no requested size (no --storage-opt) the renter gets the disk beside the cache, as listed.
+        DAH-5260: the scrape lists the Engy checkpoint cache as free disk (the Dolphin cache stays used), and the
+        backend sizes the renter's volume and container storage on that listing. So the caches stay while the
+        rental fits beside them, and go oldest first until it does; the listing can also be stale (~15 min old,
+        an Engy download writes ~1 GB/s until the filler is removed). With no requested size (no --storage-opt)
+        the renter needs the free disk it was listed, so the Engy caches go until df shows that much. Every
+        removal is awaited before this returns; a sized rental that still does not fit (a removal failed or
+        timed out) has its volume clamped to the disk actually free, so the pod volume is never sized on
+        disk that was not freed (create_container then warns, or refuses a clamp far below the order). A
+        re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
+        there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
+        at the volume step instead of short-changing the renter.
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
             return False
-        requested_gb: int | None = payload.volume_limit_gb
         try:
             # DAH-5014: the Engy checkpoint cache gives way to the renter too.
             cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
                 ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES, host_probe=host_probe
             )
+            if not payload.volume_limit_gb:
+                cache_volumes = [name for name in cache_volumes if name.startswith(ENGY_CACHE_VOLUME_PREFIX)]
             if not cache_volumes:
                 return False
 
-            if not requested_gb:
-                return False
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
             free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-            if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
+            if payload.volume_limit_gb:
+                # a re-create's volume is already preallocated, outside df free: counting it again never fits
+                rental_needs_free_gb: float = (
+                    (0 if payload.local_volume else payload.volume_limit_gb)
+                    + (payload.storage_limit_gb or 0)
+                    + RENTAL_DISK_HEADROOM_GB
+                )
+            else:
+                # unsized (no --storage-opt): the renter needs the free disk it was listed, df free plus the Engy
+                # caches; one that cannot be measured counts as its checkpoint size (inf when unknown: it goes);
+                # all in GiB, the unit df free is read in
+                held_kb = [await self._cache_volume_held_kb(ssh_client, name) for name in cache_volumes]
+                rental_needs_free_gb = free_gb + sum(
+                    kb * 1024 / 1024**3 if kb is not None else _cache_download_gb(name) * 1e9 / 1024**3
+                    for name, kb in zip(cache_volumes, held_kb)
+                )
+            if free_gb >= rental_needs_free_gb:
                 return False
 
             logger.info(
@@ -5102,19 +5130,44 @@ class DockerService:
                         **default_extra,
                         "volumes": cache_volumes,
                         "free_gb": round(free_gb, 1),
-                        "requested_gb": requested_gb,
+                        # json.dumps writes inf as bare Infinity (invalid JSON)
+                        "rental_needs_free_gb": (
+                            round(rental_needs_free_gb, 1) if math.isfinite(rental_needs_free_gb) else None
+                        ),
                     }),
                 )
             )
             async def remove(command: str) -> object:
-                return await retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental")
+                return await asyncio.wait_for(
+                    retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental"),
+                    CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
+                )
 
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB
+                return free_now_gb >= rental_needs_free_gb
 
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
-            await evict_cache_volumes_oldest_first(ssh_client, cache_volumes, remove, rental_fits)
+            try:
+                await evict_cache_volumes_oldest_first(
+                    ssh_client, cache_volumes, remove, rental_fits, evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "DPHN cache reclaim for rental failed; continuing with the rent",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    ),
+                    exc_info=True,
+                )
+            # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed
+            if payload.volume_limit_gb and not payload.local_volume and not await rental_fits():
+                free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+                payload.volume_limit_gb = max(
+                    int(free_now_gb - (payload.storage_limit_gb or 0) - RENTAL_DISK_HEADROOM_GB), 1
+                )
             return True
         except asyncio.CancelledError:
             raise
@@ -5235,20 +5288,10 @@ class DockerService:
         expected_gb: float = _cache_download_gb(volume_name)
         if math.isinf(expected_gb):
             return 0
-        try:
-            result = await ssh_client.run(
-                f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
-                f"-v {shlex.quote(volume_name)}:/cache:ro {ALPINE_HELPER_IMAGE} du -sk /cache; "
-                f"{REMOVE_CACHE_SWEEP_CONTAINER}"
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
+        used_kb: int | None = await self._cache_volume_held_kb(ssh_client, volume_name)
+        if used_kb is None:
             return 0
-        used_kb: str = ((result.stdout or "").split() or [""])[0]
-        if not used_kb.isdigit():
-            return 0
-        held_gb: float = int(used_kb) * 1024 / 10**9
+        held_gb: float = used_kb * 1024 / 10**9
         if held_gb >= expected_gb * ENGY_CACHE_COMPLETE_SHARE:
             return 0
         logger.info(
@@ -5258,6 +5301,21 @@ class DockerService:
             )
         )
         return expected_gb - held_gb
+
+    async def _cache_volume_held_kb(self, ssh_client: asyncssh.SSHClientConnection, volume_name: str) -> int | None:
+        """kB a cache volume holds, measured in a helper container that mounts it by name; None when unmeasurable."""
+        try:
+            result = await ssh_client.run(
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
+                f"-v {shlex.quote(volume_name)}:/cache:ro {ALPINE_HELPER_IMAGE} du -sk /cache; "
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        used_kb: str = ((result.stdout or "").split() or [""])[0]
+        return int(used_kb) if used_kb.isdigit() else None
 
     @staticmethod
     def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
@@ -9018,8 +9076,9 @@ class DockerService:
                 )
                 payload.volume_limit_gb = _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes)
 
-                # Fish 26 Oct: the filler caches are kept across rentals and listed as used disk, so a renter
-                # offered the listed free disk fits beside them; they go only when the requested volume does not.
+                # DAH-5260: the Engy cache is listed as free disk; the caches go only when the rental does not fit
+                # beside them, and every removal is awaited here, before the volume is sized and docker run.
+                ordered_volume_gb = payload.volume_limit_gb
                 reclaimed_cache_volumes = (
                     False
                     if beside_fillers
@@ -9030,6 +9089,15 @@ class DockerService:
                         host_probe=docker_listing_probe,
                     )
                 )
+                if ordered_volume_gb and payload.volume_limit_gb < ordered_volume_gb:
+                    # the reclaim clamped the volume to the disk actually free
+                    if payload.volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_CLAMP_MIN_SHARE:
+                        current_step = RENTAL_DISK_SHORT_STEP
+                        raise RuntimeError(
+                            f"Not enough free disk for the ordered volume: {payload.volume_limit_gb} GB free "
+                            f"of {ordered_volume_gb} GB ordered"
+                        )
+                    warnings.append(ContainerWarningCode.VolumeSmallerThanRequested)
                 cleanup_changed_host = bool(
                     removal_at_ssh_connect_lost_its_channel
                     or removed_containers

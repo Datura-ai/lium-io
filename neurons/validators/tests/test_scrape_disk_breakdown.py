@@ -82,7 +82,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_images": (45079943748 + 2000000000) // 1024,
         "hard_disk_containers": (282628096 + 1024) // 1024,
         "hard_disk_volumes": 5454000000 // 1024,
-        "filler_run_volume_kb": 0,
+        "filler_released_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
     }
 
@@ -110,7 +110,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
         "hard_disk_volumes": 0,
-        "filler_run_volume_kb": 0,
+        "filler_released_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
     }
 
@@ -443,9 +443,9 @@ def test_disk_usage_survives_a_silent_docker_socket(scrape: dict, monkeypatch) -
     assert asked == ["/proc/1/root/var/lib/docker"]
 
 
-def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
-    # Arrange — an engy checkpoint and a dolphin cache next to a renter's volume. Kept across rentals
-    # (Fish 26 Oct), so a renter is listed the free disk beside them, not the disk they hold.
+def test_the_engy_cache_is_reported_as_free_disk_and_the_dolphin_cache_stays_used(scrape: dict) -> None:
+    # Arrange — an engy checkpoint and a dolphin cache next to a renter's volume. DAH-5260: a customer create
+    # removes the Engy cache when the renter needs its space, so an idle node lists it as free.
     _stub_docker_api(
         scrape,
         {
@@ -473,15 +473,15 @@ def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
     hard_disk.update(scrape["get_docker_disk_usage"]())
     scrape["release_filler_cache"](hard_disk)
 
-    # Assert — used/free untouched, the caches counted in the volumes breakdown
+    # Assert — the engy cache moved from used to free and out of the volumes breakdown
     assert hard_disk == {
         "hard_disk_total": 4000 * 1024**2,
-        "hard_disk_used": 1600 * 1024**2,
-        "hard_disk_free": 2400 * 1024**2,
-        "hard_disk_utilization": 40.0,
+        "hard_disk_used": 100 * 1024**2,
+        "hard_disk_free": 3900 * 1024**2,
+        "hard_disk_utilization": 2.5,
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
-        "hard_disk_volumes": 1550 * 1024**2,
+        "hard_disk_volumes": 50 * 1024**2,
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
     }
@@ -527,7 +527,7 @@ def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeyp
 
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:
     # Arrange — the host half of the scrape failed, the docker half did not
-    hard_disk = {"hard_disk_volumes": 0, "filler_run_volume_kb": 5}
+    hard_disk = {"hard_disk_volumes": 0, "filler_released_kb": 5}
 
     # Act
     scrape["release_filler_cache"](hard_disk)

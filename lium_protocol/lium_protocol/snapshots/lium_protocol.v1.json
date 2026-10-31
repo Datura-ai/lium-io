@@ -1726,7 +1726,8 @@
     "ContainerWarningCode": {
       "enum": [
         "ExternalVolumeFailed",
-        "DockerInDockerDisabled"
+        "DockerInDockerDisabled",
+        "VolumeSmallerThanRequested"
       ],
       "title": "ContainerWarningCode",
       "type": "string"
@@ -6199,7 +6200,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.18.0",
+  "protocol_version": "1.21.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

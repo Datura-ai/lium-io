@@ -106,6 +106,8 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     # the external volume is attached, nested Docker is turned off for it on this node
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    # the host had less free disk than the listing: the pod volume is smaller than ordered (within a 5% tolerance)
+    VolumeSmallerThanRequested = "VolumeSmallerThanRequested"
 
 
 class ValidatorMessage(Message, DeliveryStamps):

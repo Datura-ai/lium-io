@@ -826,9 +826,12 @@ def get_docker_disk_usage():
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     # A filler's own run volume is preallocated to its full size, but any rental removes the filler
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
-    # renters were shown half of an idle node's disk. The model caches stay: rentals keep them.
+    # renters were shown half of an idle node's disk. DAH-5260: so does the Engy checkpoint cache
+    # (1561 GB on an 8x B300), which a customer create removes when the renter needs the space.
+    # The Dolphin cache (~40 GB) stays used.
+    engy_cache = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX)
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
-    volumes += get_vloopback_volume_bytes(docker_root_dir) - filler_run_volumes
+    volumes += get_vloopback_volume_bytes(docker_root_dir) - filler_run_volumes - engy_cache
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
@@ -841,17 +844,17 @@ def get_docker_disk_usage():
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_run_volume_kb": filler_run_volumes // 1024,
+        "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
-        "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
+        "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
     }
 
 
 def release_filler_cache(hard_disk):
-    # DAH-5192: report the filler run volumes as free disk (a rental removes them), so the listing floor,
-    # the disk a renter is offered and the filler fit checks see that space. The model caches are not in
-    # it: kept across rentals, they stay used. The key is dropped: not part of the reported block.
-    cache_kb = hard_disk.pop("filler_run_volume_kb", 0)
+    # DAH-5192: report the filler run volumes and the Engy cache as free disk (a rental removes them), so the
+    # listing floor, the disk a renter is offered and the filler fit checks see that space. The Dolphin cache
+    # is not in it: it stays used. The key is dropped: not part of the reported block.
+    cache_kb = hard_disk.pop("filler_released_kb", 0)
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)
