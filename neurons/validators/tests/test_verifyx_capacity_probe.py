@@ -368,7 +368,8 @@ async def test_two_miner_hotkeys_on_one_executor_uuid_count_kept_upload_probes_a
     payloads = {
         "429": _cloudflare_unreachable_payload,
         "measured": _probe_payload,
-        "timeout": lambda: _cloudflare_unreachable_payload(error=DOWNLOAD_TIMEOUT_ERROR),
+        # an upload timeout after a measured download is judged; a download fault would count as kept
+        "timeout": lambda: _upload_only_failure_payload("Cloudflare up speedtest timeout after 120 seconds"),
     }
     uploads = {hotkey: [HOST_UPLOAD_MBPS] for hotkey in expected}
     for hotkey, kind in steps:
@@ -415,13 +416,14 @@ def _package_and_cloudflare_failed_payload(error: str) -> dict:
     return payload
 
 
-# (payload, previous upload EMA, upload EMA after). None after: no upload EMA is written. Only
-# Cloudflare's 429 keeps the EMA; a transport error or a timeout can be the host's own doing.
+# (payload, previous upload EMA, upload EMA after). None after: no upload EMA is written. A download
+# that fell back on a Cloudflare fault never ran the upload, so its 0.0 keeps the EMA (capped at
+# MAX_KEPT_UPLOAD_PROBES, review 5695182456); after a measured download only Cloudflare's 429 keeps it.
 UPLOAD_OUTCOMES = [
     (_cloudflare_unreachable_payload(error=DOWNLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
     (_cloudflare_unreachable_payload(error=DOWNLOAD_RATE_LIMITED_ERROR), None, None),
-    (_cloudflare_unreachable_payload(error=DOWNLOAD_TRANSPORT_ERROR), HOST_UPLOAD_MBPS, 950.0),
-    (_cloudflare_unreachable_payload(error=DOWNLOAD_TIMEOUT_ERROR), HOST_UPLOAD_MBPS, 950.0),
+    (_cloudflare_unreachable_payload(error=DOWNLOAD_TRANSPORT_ERROR), HOST_UPLOAD_MBPS, 1900.0),
+    (_cloudflare_unreachable_payload(error=DOWNLOAD_TIMEOUT_ERROR), HOST_UPLOAD_MBPS, 1900.0),
     (_package_and_cloudflare_failed_payload(DOWNLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
     (_upload_only_failure_payload(UPLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
     (_upload_only_failure_payload(PACKAGE_404 + UPLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
@@ -443,7 +445,7 @@ UPLOAD_OUTCOMES = [
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("payload", "prev_upload", "upload_after"), UPLOAD_OUTCOMES)
-async def test_an_upload_of_zero_keeps_the_ema_only_on_a_cloudflare_429(
+async def test_an_upload_of_zero_keeps_the_ema_only_when_cloudflare_failed_it(
     context_factory, payload, prev_upload, upload_after
 ):
     """A kept upload writes no raw `verifyx_upload_speed` and reports upload as unmeasured; any

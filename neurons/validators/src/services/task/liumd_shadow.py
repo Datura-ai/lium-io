@@ -51,9 +51,11 @@ from core.utils import _m, get_extra_info
 from .checks.capability import CapabilityCheck
 from .checks.local_verify import _step_reason
 from .checks.verifyx import (
+    MAX_KEPT_UPLOAD_PROBES,
     MAX_PACKAGE_FALLBACK_PROBES,
     VerifyXCheck,
     _first_pass_challenge_config,
+    _kept_upload_probes,
     _package_fallback_probes,
     verifyx_verdict,
 )
@@ -214,11 +216,19 @@ async def _compare(
         _package_fallback_probes.get((ctx.miner_hotkey, ctx.executor.uuid), 0)
         > MAX_PACKAGE_FALLBACK_PROBES
     )
+    # Past the upload keep cap today's check feeds the 429's 0; the shadow's verdict keeps the EMA.
+    upload_cap = (
+        _kept_upload_probes.get((ctx.miner_hotkey, ctx.executor.uuid), 0) > MAX_KEPT_UPLOAD_PROBES
+    )
     if cold_retry:
         steps["verifyx"]["liumd_reason"] = "cold_sample_retry"
     elif fallback_cap:
         steps["verifyx"]["liumd_reason"] = "package_fallback_cap"
-    ask_verifyx = today["verifyx"].verdict in RAN and not cold_retry and not fallback_cap
+    elif upload_cap:
+        steps["verifyx"]["liumd_reason"] = "upload_fallback_cap"
+    ask_verifyx = (
+        today["verifyx"].verdict in RAN and not cold_retry and not fallback_cap and not upload_cap
+    )
     if not (ask_matmul or ask_verifyx):
         return _skipped("no_gpu_step_ran", steps=steps)
     specs = ctx.state.specs

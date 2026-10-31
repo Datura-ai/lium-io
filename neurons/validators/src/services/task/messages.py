@@ -1762,7 +1762,8 @@ class VerifyXMessages:
         label="network speed too slow",
         reason_suffix="NETWORK_SPEED_TOO_SLOW",
         remediation=(
-            "EMA download speed is below the minimum threshold. "
+            "EMA download speed (100 Mbps) or upload speed (10 Mbps) is below the minimum "
+            "threshold. "
             "Improve the executor's network connection or wait for the EMA to recover "
             "once speeds improve."
         ),
