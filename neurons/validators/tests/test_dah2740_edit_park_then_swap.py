@@ -26,7 +26,7 @@ from services.prerun_host_probe import prerun_host_probe_command
 def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
     # pyflakes reads as a name every `svc` parameter below redefines (F811)
-    service = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     return service
@@ -132,6 +132,9 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # no parsed probe here: one inspect asks whether the pod (or its parked copy) is on the host
+        f"/usr/bin/docker container inspect {name} >/dev/null 2>&1"
+        f" || /usr/bin/docker container inspect {parked} >/dev/null 2>&1",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         host_key,

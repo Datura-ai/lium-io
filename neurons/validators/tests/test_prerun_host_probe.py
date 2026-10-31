@@ -137,7 +137,7 @@ def _stdout(
 def docker_service():
     return DockerService(
         ssh_service=Mock(),
-        redis_service=Mock(),
+        redis_service=Mock(get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)),
         attestation_service=Mock(),
     )
 
@@ -921,7 +921,7 @@ async def test_discarded_early_probe_ends_before_the_volume_probe_runs_again(svc
 def svc_fixture():
     return DockerService(
         ssh_service=Mock(),
-        redis_service=Mock(),
+        redis_service=Mock(get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)),
         attestation_service=Mock(),
     )
 

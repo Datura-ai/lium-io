@@ -44,7 +44,7 @@ async def _hang(command: str):
 def docker_service():
     return DockerService(
         ssh_service=Mock(),
-        redis_service=Mock(),
+        redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)),
         attestation_service=Mock(),
         rental_docker_client_factory=_FakeRentalDockerFactory(),
     )
@@ -355,7 +355,7 @@ async def test_create_local_volume_sends_no_fallback_command_when_a_channel_may_
 
 @pytest.fixture
 def svc():
-    return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    return DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
 
 
 def _create_payload() -> ContainerCreateRequest:

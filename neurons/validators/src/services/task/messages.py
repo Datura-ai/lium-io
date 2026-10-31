@@ -635,8 +635,9 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 80% of the default limit "
+            "reported by NVML, or during a rental to at least 90% (or the limit "
+            "the rental started on, if lower)."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(

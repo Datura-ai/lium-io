@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 import asyncssh
 from payload_models.payloads import GpuPowerLimit
 from pydantic import BaseModel, ValidationError
-from services.redis_service import RedisService
+from services.redis_service import RedisService, RedisWrites
 
 from core.utils import _m, get_extra_info
 
@@ -87,11 +87,17 @@ _POD_INDEX_KEY_PREFIX = "gpu_power_restore_pod:"
 # (backend marks owner="lium" from STARTING, but the snapshot is taken at cycle start) — the check
 # must not uncap it. Comfortably above the backend's 15-minute STARTING/STOPPING transitional window.
 STALE_CAP_GRACE_SECONDS = 30 * 60
-# Floor enforced by GpuPowerLimitCheck. Doubles as the raise trigger at rental start: a limit
-# below this can't be a legitimate miner setting (the check would zero-score it anyway).
-MIN_POWER_LIMIT_RATIO = 0.9
-# Floor a rented GPU must hold when its customer's container starts; kept apart from the check's floor.
+# Floor enforced by GpuPowerLimitCheck: the optional 80 % tier (owner, 28 Oct 2026), shown to
+# renters by the backend's Reduced power limit badge. Doubles as the raise trigger at rental start:
+# a limit below this can't be a legitimate miner setting (the check would zero-score it anyway).
+MIN_POWER_LIMIT_RATIO = 0.8
+# Floor while a GPU is rented, unless it was already lower when the rental started: a host must
+# not cut a renter's power below 90 % mid-rental, since the renter rented it without the badge.
 RENTED_MIN_POWER_LIMIT_RATIO = 0.9
+_RENTAL_START_RATIO_KEY_PREFIX = "gpu_power_rental_start_ratio:"
+_RENTAL_LEGACY_POD_KEY_PREFIX = "gpu_power_rental_legacy_pod:"
+# Outlives any rental; a record counts only while the pod it names is rented.
+RENTAL_START_RATIO_TTL_SECONDS = 365 * 24 * 3600
 # GPUs restored (or raised) at the same time. One verified set is three nvidia-smi round trips
 # (-pm 1, -pl, readback), about 1.8 s on a loaded host; done one GPU after another an 8-GPU PEARL
 # node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
@@ -178,6 +184,15 @@ _UNREADABLE_READBACK = GpuPowerReadback(watts=None, persistence_enabled=None)
 
 def _restore_key(gpu_uuid: str) -> str:
     return f"{_RESTORE_KEY_PREFIX}{gpu_uuid}"
+
+
+def rental_start_ratio_key(executor_id: str, gpu_uuid: str) -> str:
+    return f"{_RENTAL_START_RATIO_KEY_PREFIX}{executor_id}:{gpu_uuid}"
+
+
+def rental_legacy_pod_key(pod_id: str) -> str:
+    # set by GpuPowerLimitCheck for a rented pod with no records: its next create records 1.0
+    return f"{_RENTAL_LEGACY_POD_KEY_PREFIX}{pod_id}"
 
 
 def _pod_index_key(pod_id: str) -> str:
@@ -619,7 +634,7 @@ async def restore_tracked_gpu_power_limits(
 
     Best-effort by default; returns the number of records restored and cleared.
     ``require_complete`` raises on unreadable records or any restore not confirmed and cleared, and
-    on a GPU without a record that the host does not show at 90 % of its default limit or more.
+    on a GPU without a record that the host does not show at 80 % of its default limit or more.
     """
     read_result = await read_gpu_power_restore_records(
         redis, gpu_uuids, log_extra, require_complete=require_complete
@@ -641,7 +656,8 @@ async def restore_tracked_gpu_power_limits(
         for gpu_uuid in read_result.missing:
             state = state_by_uuid.get(gpu_uuid)
             if state is None or state.default_watts is None or (
-                state.current_watts < RENTED_MIN_POWER_LIMIT_RATIO * state.default_watts
+                # a host may set 80 %; the rental-start record, not this check, then holds the rental there
+                state.current_watts < MIN_POWER_LIMIT_RATIO * state.default_watts
             ):
                 raise GpuPowerRestoreStateError(f"GPU power restore record is missing and {gpu_uuid} is below its floor")
     if not read_result.records:
@@ -683,6 +699,9 @@ async def raise_low_power_limits_to_default(
     log_extra: dict[str, object] | None = None,
     *,
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
+    redis: RedisService | None = None,
+    pod_id: str | None = None,
+    pod_on_host: bool = False,
 ) -> int:
     """State-free last-resort net for rental start: lift every GPU sitting below
     ``MIN_POWER_LIMIT_RATIO`` x its default limit back to the default.
@@ -691,18 +710,96 @@ async def raise_low_power_limits_to_default(
     the exact pre-cap value is gone, but the default equals the post-reboot state, so a customer
     never starts on a below-floor GPU no matter what happened to our state. GPUs between the
     floor and the default are left alone (a miner may legitimately run there). ``gpu_uuids=None``
-    means every host GPU. Best-effort (never raises); returns the raised count.
+    means every host GPU. Best-effort (never raises) without ``redis``; returns the raised count.
 
     Always a live query, never the pre-run probe (DAH-3257): volume creation and a bootstrap restore
     run between the probe and this call, so the probe's power state can be minutes old. Outside a
     bootstrap restore the create calls it beside the volume create and again right before the
     customer's container starts; that second call is the create's last power read.
+
+    The last call of a customer create passes ``redis`` and ``pod_id``: each of the pod's GPUs gets
+    its limit / default as the rental starts (1.0 once raised) recorded under the pod, so
+    GpuPowerLimitCheck holds a rented GPU at min(that, RENTED_MIN_POWER_LIMIT_RATIO) while the pod
+    is rented. ``pod_on_host`` (the pod's container was on the host before this create: a reboot or
+    edit) records 1.0 for a GPU with no record, so a rental from before the records keeps 90 %.
+    Raises GpuPowerRestoreStateError when a record cannot be made (RuntimeError when the host cannot
+    report a GPU's limits), so the create fails and is retried instead of starting without its baseline.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)
     except Exception as exc:
+        if redis is not None and pod_id:
+            # a rental started without its baseline would be held at 90 % (then marked legacy) for good
+            raise RuntimeError(f"GPU power state could not be read to record the rental start: {exc}") from exc
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
+    raised = await _raise_below_floor(ssh, executor_id, gpu_uuids, state_by_uuid, log_extra, concurrency)
+    if redis is not None and pod_id:
+        await _record_rental_start_ratios(
+            redis, executor_id, pod_id, gpu_uuids, state_by_uuid, log_extra, pod_on_host
+        )
+    return raised
+
+
+def rental_record_pod_id(raw: str | bytes | None) -> str | None:
+    """The pod a rental-start record names, or None for a missing or corrupt record."""
+    if not raw:
+        return None
+    try:
+        return str(json.loads(raw)["pod_id"])
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+async def _record_rental_start_ratios(
+    redis: RedisService,
+    executor_id: str,
+    pod_id: str,
+    gpu_uuids: list[str] | None,
+    state_by_uuid: dict[str, GpuPowerState],
+    log_extra: dict[str, object] | None,
+    pod_on_host: bool = False,
+) -> None:
+    uuids = list(gpu_uuids or state_by_uuid)
+    keys = [rental_start_ratio_key(executor_id, gpu_uuid) for gpu_uuid in uuids]
+    try:
+        *existing, legacy = await redis.mget([*keys, rental_legacy_pod_key(pod_id)])
+    except Exception as exc:
+        # without the old records a reboot could replace its rental's start with today's limit
+        raise GpuPowerRestoreStateError("GPU power rental-start records could not be read") from exc
+    writes = RedisWrites()
+    unreadable: list[str] = []
+    for gpu_uuid, key, old in zip(uuids, keys, existing):
+        if rental_record_pod_id(old) == pod_id:
+            continue  # a reboot or edit of the same rental keeps the limit it started on
+        state = state_by_uuid.get(gpu_uuid)
+        if state is None or state.default_watts is None or state.default_watts <= 0:
+            # held at 90 %; the GPUs read now keep this start too, so a retry cannot re-read them lower
+            unreadable.append(gpu_uuid)
+            ratio = 1.0
+        else:
+            ratio = state.current_watts / state.default_watts
+        if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
+            # raised to its default just above, or a running rental from before the records: it stays at 90 %
+            ratio = 1.0
+        writes.set(key, json.dumps({"pod_id": pod_id, "ratio": round(ratio, 4)}), ex=RENTAL_START_RATIO_TTL_SECONDS)
+    try:
+        # one MULTI/EXEC: a pod's GPUs are recorded together or not at all, so a retry never mixes starts
+        await redis.write_atomically(writes)
+    except Exception as exc:
+        raise GpuPowerRestoreStateError(f"GPU power rental-start ratios not recorded: {exc}") from exc
+    if unreadable:
+        raise RuntimeError(f"GPU power state of {', '.join(unreadable)} unreadable; recorded at stock, create retried")
+
+
+async def _raise_below_floor(
+    ssh: asyncssh.SSHClientConnection,
+    executor_id: str,
+    gpu_uuids: list[str] | None,
+    state_by_uuid: dict[str, GpuPowerState],
+    log_extra: dict[str, object] | None,
+    concurrency: int,
+) -> int:
     target_uuids: list[str] = gpu_uuids if gpu_uuids else list(state_by_uuid)
     below_floor: list[_BelowFloorGpu] = []
     for gpu_uuid in target_uuids:

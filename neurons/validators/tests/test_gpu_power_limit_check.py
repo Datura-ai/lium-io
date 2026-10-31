@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import json
 import time
 from unittest.mock import AsyncMock
 
 import pytest
-from helpers import build_state
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from helpers import FakeRedis, build_services, build_state
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.gpu_power_limit import (
     STALE_CAP_GRACE_SECONDS,
     GpuPowerRestoreReadResult,
     GpuPowerRestoreRecord,
+    rental_legacy_pod_key,
+    rental_start_ratio_key,
 )
 from services.task.checks import gpu_power_limit as check_module
 from services.task.checks.gpu_power_limit import GpuPowerLimitCheck
@@ -136,12 +139,126 @@ async def test_power_limit_allows_exact_threshold(context_factory, read_records_
 
 
 @pytest.mark.asyncio
-async def test_power_limit_rejects_between_old_and_new_floor(context_factory, read_records_mock) -> None:
-    ctx = context_factory(state=_state(current_limit=300, default_limit=350))
+async def test_power_limit_80_percent_tier_passes_on_an_unrented_node(context_factory, read_records_mock) -> None:
+    ctx = context_factory(state=_state(current_limit=280, default_limit=350))  # exactly 80 %
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_OK"
+
+
+@pytest.mark.asyncio
+async def test_power_limit_rejects_below_the_80_percent_tier(context_factory, read_records_mock) -> None:
+    ctx = context_factory(state=_state(current_limit=276, default_limit=350))
     result = await GpuPowerLimitCheck().run(ctx)
     assert result.passed is False
     assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
     assert result.updates["score"] == 0.0
+
+
+def _rented_ctx(
+    context_factory,
+    current_limit: float,
+    records: dict[str, dict],
+    count: int = 1,
+    redis: FakeRedis | None = None,
+    gpu_count: int | None = None,
+    container_name: str = "pod_pod-1",
+):
+    state = _state(current_limit=current_limit, default_limit=350, count=count)
+    state.rented_data.executors[_EXECUTOR_UUID] = RentedExecutor(
+        miner_hotkey="hk",
+        executor_ip_address="1.2.3.4",
+        executor_ip_port="22",
+        pods=[RentedPod(pod_id="pod-1", container_name=container_name, gpu_count=gpu_count)],
+    )
+    redis = redis or FakeRedis()
+    redis.store.update(
+        {rental_start_ratio_key(_EXECUTOR_UUID, u): json.dumps(r) for u, r in records.items()}
+    )
+    return context_factory(state=state, services=build_services(redis=redis))
+
+
+_AT_STOCK = {"pod_id": "pod-1", "ratio": 1.0}
+_IN_TIER = {"pod_id": "pod-1", "ratio": 0.8514}
+
+
+@pytest.mark.parametrize(
+    ("current_limit", "records", "passed"),
+    [
+        # rented at stock power, cut to 85 % mid-rental: the renter never saw a badge
+        (298, {"GPU-abc": _AT_STOCK}, False),
+        (315, {"GPU-abc": _AT_STOCK}, True),
+        # rented in the 80 % tier: keeps its own cap, never lower
+        (280, {"GPU-abc": {"pod_id": "pod-1", "ratio": 0.8}}, True),
+        (298, {"GPU-abc": _IN_TIER}, True),
+        (285, {"GPU-abc": _IN_TIER}, False),
+        # a rental from before the records, or a record of a pod no longer rented: 90 %
+        (298, {}, False),
+        (298, {"GPU-abc": {"pod_id": "old-pod", "ratio": 0.8}}, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_power_limit_rented_gpu_keeps_its_rental_start_cap(
+    context_factory, read_records_mock, current_limit, records, passed
+) -> None:
+    result = await GpuPowerLimitCheck().run(_rented_ctx(context_factory, current_limit, records))
+    assert result.passed is passed
+
+
+@pytest.mark.parametrize(
+    ("records", "gpu_count", "passed"),
+    [
+        # pod-1 holds GPU-abc only (recorded): GPU-abc-1 is the free bundle and stays in the tier
+        ({"GPU-abc": _IN_TIER}, 1, True),
+        # pod-1 holds both GPUs but only GPU-abc's record survived: GPU-abc-1 is held at 90 %
+        ({"GPU-abc": _IN_TIER}, 2, False),
+        ({"GPU-abc": _IN_TIER, "GPU-abc-1": _IN_TIER}, 2, True),
+        # the backend predates gpu_count: which GPUs are rented is unknown, so 90 %
+        ({"GPU-abc": _IN_TIER}, None, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_power_limit_split_node_free_gpu_floor_needs_every_rented_gpu_recorded(
+    context_factory, read_records_mock, records, gpu_count, passed
+) -> None:
+    ctx = _rented_ctx(context_factory, 298, records, count=2, gpu_count=gpu_count)
+    assert (await GpuPowerLimitCheck().run(ctx)).passed is passed
+
+
+@pytest.mark.asyncio
+async def test_power_limit_partial_record_holds_the_unrecorded_rented_gpu(context_factory, read_records_mock) -> None:
+    # a 2-GPU rental at stock power whose GPU-abc-1 record was lost: GPU-abc-1 cut to 85 % fails
+    ctx = _rented_ctx(context_factory, 298, {"GPU-abc": _AT_STOCK}, count=2, gpu_count=2)
+    ctx.state.gpu_details[0]["power_limit"] = 350
+    assert (await GpuPowerLimitCheck().run(ctx)).passed is False
+
+
+@pytest.mark.asyncio
+async def test_power_limit_pod_still_being_created_is_not_judged(context_factory, read_records_mock) -> None:
+    # rented in the tier; the backend lists the pod before its record is written
+    redis = FakeRedis()
+    ctx = _rented_ctx(context_factory, 298, {}, gpu_count=1, container_name="", redis=redis)
+    assert (await GpuPowerLimitCheck().run(ctx)).passed is True
+    assert rental_legacy_pod_key("pod-1") not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_power_limit_marks_a_rental_from_before_the_records(context_factory, read_records_mock) -> None:
+    redis = FakeRedis()
+    ctx = _rented_ctx(context_factory, 350, {}, gpu_count=1, redis=redis)
+    assert (await GpuPowerLimitCheck().run(ctx)).passed is True
+    assert rental_legacy_pod_key("pod-1") in redis.store
+    dry = _rented_ctx(context_factory, 350, {}, gpu_count=1, redis=FakeRedis())
+    await GpuPowerLimitCheck(restore_stale_caps=False).run(dry)
+    assert rental_legacy_pod_key("pod-1") not in dry.services.redis.store
+
+
+@pytest.mark.asyncio
+async def test_power_limit_rented_node_redis_outage_falls_back_to_the_80_percent_floor(
+    context_factory, read_records_mock
+) -> None:
+    ctx = _rented_ctx(context_factory, 298, {}, redis=FakeRedis(failing=True))
+    assert (await GpuPowerLimitCheck().run(ctx)).passed is True
 
 
 @pytest.mark.asyncio

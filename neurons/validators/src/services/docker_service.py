@@ -5035,7 +5035,7 @@ class DockerService:
         """Record the new container in the rented-machine cache; never fail the create over it.
 
         DAH-2475: this hash is a CACHE, not the source of truth — the backend rebuilds it wholesale
-        every ~10 min (RentedMachineRequest -> delete(RENTED_MACHINE_PREFIX) + re-add) and already
+        every ~10 min (RentedMachineRequest -> replace_rented_machines, one MULTI/EXEC) and already
         learns about this container from the ContainerCreated callback. Before this, a Redis blip at
         this last step raised and tripped cleanup_failed_container_creation, destroying a container
         that was already built and running: on 2026-07-22 a "Timeout connecting to server" here tore
@@ -8059,6 +8059,8 @@ class DockerService:
         host_probe: PrerunHostProbe | None,
         default_extra: dict,
         concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
+        record_rental_start: bool = False,
+        executor_info: ExecutorSSHInfo | None = None,
     ) -> None:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
@@ -8092,7 +8094,59 @@ class DockerService:
             payload.gpu_uuids or None,
             log_extra=default_extra,
             concurrency=concurrency,
+            # the create's last power read is the limit the rental starts on (DAH-5302)
+            redis=self.redis_service if record_rental_start else None,
+            pod_id=payload.pod_id if record_rental_start else None,
+            pod_on_host=await DockerService._pod_existed_before_create(
+                ssh_client, self.redis_service, executor_info, payload.pod_id, host_probe
+            )
+            if record_rental_start
+            else False,
         )
+
+    @staticmethod
+    async def _pod_existed_before_create(
+        ssh_client: asyncssh.SSHClientConnection,
+        redis_service: RedisService,
+        executor_info: ExecutorSSHInfo | None,
+        pod_id: str,
+        host_probe: PrerunHostProbe | None,
+    ) -> bool:
+        """A reboot or edit of a running rental, so a rental from before the records keeps 90 %. The
+        backend's rented-machine cache answers first: the host can hide its containers, not that (F-12)."""
+        if executor_info is not None:
+            try:
+                # marker first: it is never unset and the list swaps atomically, so a list read after a
+                # set marker is a synced one; read the other way round a first sync could land between
+                synced = await redis_service.rented_machines_synced()
+                rented = await redis_service.get_rented_machine(executor_info)
+            except Exception as exc:
+                # a guess either way records the wrong start for good; the create fails and is retried
+                raise GpuPowerRestoreStateError("rented-machine cache could not be read") from exc
+            if any(c.get("pod_id") == pod_id for c in (rented or {}).get("containers", [])):
+                return True
+            if not synced:
+                # no backend list yet (fresh Redis): absence proves nothing; the create is retried
+                raise GpuPowerRestoreStateError("rented-machine cache not synced from the backend yet")
+        return await DockerService._pod_container_on_host(ssh_client, pod_id, host_probe)
+
+    @staticmethod
+    async def _pod_container_on_host(
+        ssh_client: asyncssh.SSHClientConnection, pod_id: str, host_probe: PrerunHostProbe | None
+    ) -> bool:
+        """A reboot or edit re-creates a pod whose container is still listed (`ps -a`). Without a probe,
+        one `docker inspect` asks, so a rebooted legacy rental is not taken for a new one (F-12)."""
+        name = f"{POD_CONTAINER_PREFIX}{pod_id}"
+        names = (name, name + EDIT_PARKED_SUFFIX)  # an edit parks the old container before the probe
+        if host_probe is not None:
+            return any(n in (host_probe.container_names or ()) for n in names)
+        try:
+            result = await ssh_client.run(
+                " || ".join(f"/usr/bin/docker container inspect {shlex.quote(n)} >/dev/null 2>&1" for n in names)
+            )
+        except Exception:
+            return False
+        return result.exit_status == 0
 
     async def _run_create_steps_after_reply(
         self,
@@ -9300,9 +9354,19 @@ class DockerService:
                     # restore a filler create may have capped these GPUs (its Redis records) or the
                     # host may have lowered a limit with no record (the live floor raise).
                     if not beside_fillers:
-                        await self._restore_gpu_power_for_uncapped_pod(
-                            ssh_client, payload, host_probe, default_extra
-                        )
+                        current_step = "gpu_power_restore"  # the host's nvidia-smi, unless the state error below
+                        try:
+                            await self._restore_gpu_power_for_uncapped_pod(
+                                ssh_client,
+                                payload,
+                                host_probe,
+                                default_extra,
+                                record_rental_start=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
+                                executor_info=executor_info,
+                            )
+                        except GpuPowerRestoreStateError:
+                            current_step = "gpu_power_restore_state"  # our Redis, not the host's fault
+                            raise
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
