@@ -55,12 +55,12 @@ RENTAL_WATCH_INTERVAL_SECONDS = 5
 # the pre-retry rental lookup shares one backend read among all executors (single flight), reused
 # this long: N cold executors in a cycle cost one fleet-wide read, not N
 RENTED_NOW_TTL_SECONDS = 30
-_rented_now: tuple[Any, float, asyncio.Future] | None = None  # (backend, started_at, read)
+_rented_now: tuple[Any, float, float, asyncio.Future] | None = None  # (backend, monotonic, epoch, read)
 
 
-async def _rented_executors_now_shared(backend) -> Any:
-    """`backend.get_rented_executors_now()`, one call in flight and reused for
-    RENTED_NOW_TTL_SECONDS by every caller. A failed or empty answer is not reused."""
+async def _rented_executors_now_shared(backend) -> tuple[Any, float]:
+    """(`backend.get_rented_executors_now()`, epoch time the read began), one call in flight and
+    reused for RENTED_NOW_TTL_SECONDS by every caller. A failed or empty answer is not reused."""
     global _rented_now
     now = time.monotonic()
     cached = _rented_now
@@ -68,12 +68,14 @@ async def _rented_executors_now_shared(backend) -> Any:
         cached is None
         or cached[0] is not backend
         or now - cached[1] > RENTED_NOW_TTL_SECONDS
-        or (cached[2].done() and (cached[2].cancelled() or cached[2].exception() or cached[2].result() is None))
+        or (cached[3].done() and (cached[3].cancelled() or cached[3].exception() or cached[3].result() is None))
     )
     if stale:
-        cached = _rented_now = (backend, now, asyncio.ensure_future(backend.get_rented_executors_now()))
+        cached = _rented_now = (
+            backend, now, time.time(), asyncio.ensure_future(backend.get_rented_executors_now())
+        )
     # shield: one caller's timeout must not cancel the read the others wait on
-    return await asyncio.shield(cached[2])
+    return await asyncio.shield(cached[3]), cached[2]
 
 
 @dataclass(frozen=True)
@@ -585,38 +587,43 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
 
 async def _not_idle_now(
     ctx: Context, timeout: float, *, backend: bool = True, created_since: float | None = None
-) -> str | None:
-    """Why the cold retry must not run now, or None: a customer pod on the node (in the cycle-start
-    snapshot, as refreshed by earlier checks, or in the backend's shared recent answer), a rental being
-    created, or a rental state that cannot be read within `timeout`. A filler alone keeps the node
-    eligible, as for the first sample. `backend=False` re-reads only the pending-pod marker. With
-    `created_since` (epoch s) a create started after it counts too, though its marker is already gone."""
+) -> tuple[str | None, float | None]:
+    """(Why the cold retry must not run now or None, the time the stamp was compared against).
+
+    Busy: a customer pod on the node (in the cycle-start snapshot, as refreshed by earlier checks, or
+    in the backend's shared recent answer), a rental being created, a create stamped after the rental
+    data in use was read (its pod may be in neither source and its marker already gone), or a rental
+    state that cannot be read within `timeout`. A filler alone keeps the node eligible, as for the
+    first sample. `backend=False` re-reads only the pending-pod marker and the stamp. The stamp is
+    compared against the earlier of `created_since` (epoch s) and the backend read's start."""
     uuid = str(ctx.executor.uuid)
 
-    async def read() -> tuple[bool, Any]:
+    async def read() -> tuple[bool, Any, float | None]:
         if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, uuid):
-            return True, None
-        if created_since is not None:
+            return True, None, created_since
+        fresh, since = ctx.state.rented_data, created_since
+        if backend:
+            fresh, read_at = await _rented_executors_now_shared(ctx.services.backend)
+            since = read_at if since is None else min(since, read_at)
+        if since is not None:
             started = await ctx.services.redis.get(create_started_at_key(ctx.miner_hotkey, uuid))
-            if started is not None and float(started) > created_since:
-                return True, None
-        if not backend:
-            return False, ctx.state.rented_data
-        return False, await _rented_executors_now_shared(ctx.services.backend)
+            if started is not None and float(started) > since:
+                return True, None, since
+        return False, fresh, since
 
     try:
-        creating, fresh = await asyncio.wait_for(read(), timeout=timeout)
+        creating, fresh, since = await asyncio.wait_for(read(), timeout=timeout)
     except Exception:  # noqa: BLE001 — unknown (incl. too slow) counts as busy
-        return "rental_state_unavailable"
+        return "rental_state_unavailable", created_since
     if creating:
-        return "rental_create_in_progress"
+        return "rental_create_in_progress", since
     if fresh is None:
-        return "rental_state_unavailable"
+        return "rental_state_unavailable", since
     for rented_data in (ctx.state.rented_data, fresh):
         rented = rented_data.executors.get(uuid) if rented_data else None
         if rented is not None and rented.pods:
-            return "rented"
-    return None
+            return "rented", since
+    return None, since
 
 
 async def _until_not_idle(ctx: Context, since: float) -> str:
@@ -625,7 +632,7 @@ async def _until_not_idle(ctx: Context, since: float) -> str:
     went between two polls."""
     while True:
         await asyncio.sleep(RENTAL_WATCH_INTERVAL_SECONDS)
-        busy = await _not_idle_now(ctx, RENTAL_STATE_TIMEOUT_SECONDS, backend=False, created_since=since)
+        busy, _ = await _not_idle_now(ctx, RENTAL_STATE_TIMEOUT_SECONDS, backend=False, created_since=since)
         if busy is not None:
             return busy
 
@@ -736,15 +743,17 @@ class VerifyXColdRetryCheck:
             )
         cleared = {"state": replace(ctx.state, verifyx_cold_retry=None)}
         busy = None
-        # creates started from here on cut the retry off: the lookup below sees the earlier ones
+        # creates started after the rental data the lookup relies on was read (or after now, if
+        # earlier) cut the retry off; the lookup's data shows the earlier ones
         idle_since = time.time()
         if task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS >= MIN_COLD_RETRY_SECONDS:
             # never let the lookup itself run into the margin and cost the first sample
-            busy = await _not_idle_now(
+            busy, idle_since = await _not_idle_now(
                 ctx,
                 min(
                     RENTAL_STATE_TIMEOUT_SECONDS, task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
                 ),
+                created_since=idle_since,
             )
         if busy is not None:
             # a renter may be on the node now: never load it with a second RAM, disk and network test
@@ -771,7 +780,7 @@ class VerifyXColdRetryCheck:
 
         # Cut at the deadline less the margin (never past its own SSH timeout) and judge on the
         # first sample. Raced against a rental-state watcher: a create (customer or filler) started
-        # since just before the pre-retry lookup cuts it off at the next poll, within RENTAL_WATCH_INTERVAL_SECONDS
+        # after the rental data the pre-retry lookup used was read cuts it off at the next poll, within RENTAL_WATCH_INTERVAL_SECONDS
         # plus one Redis read, even if its pending-pod marker is already gone. A pod can share the node
         # for that long at most. An outer cancel still propagates.
         verifyx_service = ctx.services.verifyx
