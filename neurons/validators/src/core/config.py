@@ -628,6 +628,15 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
+    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
+    # GPU power limit back while a Lium idle job was running, often enough inside the window,
+    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
+    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
+    # are read first. Set to True to enforce.
+    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
+        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
+    )
+
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
     # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
