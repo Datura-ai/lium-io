@@ -63,3 +63,17 @@ def test_maintenance_windows_arrived_in_1_16_and_are_empty_from_an_older_backend
     window = reply.maintenance_windows_by_executor[executor]
     assert window.starting_at.utcoffset().total_seconds() == 0
     assert (window.expiring_at - window.starting_at).total_seconds() == 6 * 3600
+
+
+def test_self_rent_round_trips_and_is_false_from_an_older_backend() -> None:
+    from lium_protocol.backend_to_validator import RentedMachine
+    from lium_protocol.http import RentedExecutor
+
+    executor = {"miner_hotkey": "5M", "executor_ip_address": "10.0.0.1", "executor_ip_port": "22", "pods": []}
+    machine = {**executor, "executor_id": "e", "containers": []}
+    del machine["pods"]
+    for model, older in ((RentedExecutor, executor), (RentedMachine, machine)):
+        assert model.model_validate(older).self_rent is False
+        sent = model.model_validate({**older, "self_rent": True})
+        assert model.model_validate_json(sent.model_dump_json()).self_rent is True
+        assert sent.owner_flag is False  # separate from owner_flag

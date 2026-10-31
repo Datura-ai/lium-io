@@ -3620,6 +3620,8 @@ async def test_clean_stale_vloopback_volumes_skips_mounted_and_backend_known(
                 )
             ),
             _make_ssh_command_result(stdout="volume_mounted\n"),
+            # the dm-crypt check of the unmounted local volume: a plain one
+            _make_ssh_command_result(stdout="volume_local <no value>\n"),
         ]
     )
 
@@ -3640,6 +3642,7 @@ async def test_clean_stale_vloopback_volumes_skips_mounted_and_backend_known(
     assert "custom_loopback" not in volume_command
     assert "volume_local" not in volume_command
     assert "volume_other" not in volume_command
+    assert ssh_client.run.await_count == 3  # a plain local volume is inspected, never removed
 
 
 @pytest.mark.asyncio

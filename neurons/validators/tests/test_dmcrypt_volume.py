@@ -248,6 +248,73 @@ async def test_a_failed_create_removes_the_dmcrypt_volume(docker_service, monkey
 
 
 @pytest.mark.asyncio
+async def test_a_create_failing_after_docker_run_removes_its_container_before_the_volume(docker_service, monkeypatch):
+    # the running container pins the volume and keeps the mapping mounted: it must go first, also when
+    # the create's own container cleanup did not remove it
+    ssh_client, spies = _wire_create(docker_service, monkeypatch, capable=True)
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock(return_value="cid"))
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(side_effect=RuntimeError("not healthy")))
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", AsyncMock(return_value=False))
+    events: list[str] = []
+    ssh_client.run.side_effect = lambda command, **kwargs: events.append(command) or _make_ssh_command_result()
+    spies["delete_dmcrypt_volume"].side_effect = lambda *args: events.append("dmcrypt delete")
+    payload = _payload()
+
+    result = await _create(docker_service, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    teardown = [e for e in events if e.startswith(("/usr/bin/docker rm -fv cid", "/usr/bin/docker volume rm")) or e == "dmcrypt delete"]
+    assert teardown == [
+        "/usr/bin/docker rm -fv cid >/dev/null 2>&1",
+        f"/usr/bin/docker volume rm volume_{payload.pod_id} >/dev/null 2>&1",
+        "dmcrypt delete",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_stale_sweep_removes_an_orphaned_dmcrypt_volume_and_its_mapping(docker_service, monkeypatch):
+    orphan, mounted, plain = str(uuid4()), str(uuid4()), str(uuid4())
+    delete = AsyncMock()
+    monkeypatch.setattr(docker_service, "delete_dmcrypt_volume", delete)
+    commands: list[str] = []
+
+    async def run(command, **kwargs):
+        commands.append(command)
+        if command.startswith("/usr/bin/docker volume ls"):
+            return _make_ssh_command_result(
+                stdout=f"volume_{orphan} local\nvolume_{mounted} local\nvolume_{plain} local\n"
+            )
+        if "xargs -r /usr/bin/docker inspect" in command:
+            return _make_ssh_command_result(stdout=f"volume_{mounted}\n")
+        if command.startswith("/usr/bin/docker volume inspect"):
+            return _make_ssh_command_result(
+                stdout=f"volume_{orphan} /dev/mapper/lium-{orphan}\nvolume_{plain} <no value>\n"
+            )
+        return _make_ssh_command_result()
+
+    ssh_client = Mock(run=AsyncMock(side_effect=run))
+
+    removed = await docker_service.clean_stale_vloopback_volumes(ssh_client=ssh_client, default_extra={})
+
+    assert removed == [f"volume_{orphan}"]
+    assert f"volume_{mounted}" not in commands[2]  # a mounted volume is never even inspected
+    assert commands[3:] == [f"/usr/bin/docker volume rm volume_{orphan}"]
+    assert delete.await_args.args[:2] == (ssh_client, orphan)
+
+
+@pytest.mark.asyncio
+async def test_a_filler_sweep_never_touches_a_dmcrypt_volume(docker_service, monkeypatch):
+    pod = str(uuid4())
+    monkeypatch.setattr(docker_service, "delete_dmcrypt_volume", AsyncMock())
+    ssh_client = Mock(
+        run=AsyncMock(side_effect=[_make_ssh_command_result(stdout=f"volume_{pod} local\n"), _make_ssh_command_result()])
+    )
+
+    assert await docker_service.clean_stale_vloopback_volumes(ssh_client=ssh_client, default_extra={}, filler_volumes_only=True) == []
+    docker_service.delete_dmcrypt_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_an_edit_of_a_dmcrypt_pod_opens_its_volume_and_skips_gocryptfs(docker_service, monkeypatch):
     ssh_client, spies = _wire_create(docker_service, monkeypatch, capable=True)
     payload = _payload()

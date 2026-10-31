@@ -4873,6 +4873,11 @@
           },
           "title": "Pods",
           "type": "array"
+        },
+        "self_rent": {
+          "default": false,
+          "title": "Self Rent",
+          "type": "boolean"
         }
       },
       "required": [
@@ -5127,6 +5132,11 @@
           },
           "title": "Rented Ports",
           "type": "array"
+        },
+        "self_rent": {
+          "default": false,
+          "title": "Self Rent",
+          "type": "boolean"
         }
       },
       "required": [

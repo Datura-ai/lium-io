@@ -4956,14 +4956,16 @@ class DockerService:
                         volume_rows.append((parts[0], parts[1]))
 
             vloopback_volumes = set()
+            # dm-crypt pod volumes are `local` ones; a filler never has one
+            local_volumes = set()
             for name, driver in volume_rows:
-                if not (
-                    name.startswith("volume_")
-                    and _is_vloopback_driver(driver)
-                ):
+                if not name.startswith("volume_"):
                     continue
-                vloopback_volumes.add(name)
-            if not vloopback_volumes:
+                if _is_vloopback_driver(driver):
+                    vloopback_volumes.add(name)
+                elif driver == "local" and not filler_volumes_only:
+                    local_volumes.add(name)
+            if not vloopback_volumes and not local_volumes:
                 return []
 
             if host_probe is not None and host_probe.mounted_volume_names is not None:
@@ -4985,9 +4987,12 @@ class DockerService:
                 mounted_volumes = {
                     name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
                 }
+            removed_dmcrypt = await self._remove_orphaned_dmcrypt_volumes(
+                ssh_client, sorted(local_volumes - mounted_volumes - skip_set), default_extra
+            )
             stale_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
             if not stale_volumes:
-                return []
+                return removed_dmcrypt
 
             logger.info(
                 _m(
@@ -5005,7 +5010,7 @@ class DockerService:
                 f"/usr/bin/docker volume rm {volumes} 2>/dev/null || true",
                 "clean_stale_vloopback_volumes",
             )
-            return stale_volumes
+            return stale_volumes + removed_dmcrypt
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5017,6 +5022,40 @@ class DockerService:
                 exc_info=True,
             )
             return []
+
+    async def _remove_orphaned_dmcrypt_volumes(
+        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str], default_extra: dict
+    ) -> list[str]:
+        """Remove the dm-crypt volumes among these unmounted `local` volumes, then their mappings and
+        backing files: a create whose undo lost its SSH session leaves them, and no delete names them.
+        Plain local volumes are left alone. Returns the volumes removed."""
+        if not volume_names:
+            return []
+        removed: list[str] = []
+        try:
+            names = " ".join(shlex.quote(name) for name in volume_names)
+            listing = await ssh_client.run(
+                f"/usr/bin/docker volume inspect -f '{{{{.Name}}}} {{{{index .Options \"device\"}}}}' {names}",
+                check=False,
+                timeout=_DMCRYPT_PROBE_TIMEOUT_SEC,
+            )
+            for line in (listing.stdout or "").splitlines():
+                name, _, device = line.strip().partition(" ")
+                pod_ids = dmcrypt_pod_ids(device)
+                if not pod_ids or name != f"volume_{pod_ids[0]}" or name not in volume_names:
+                    continue
+                # a volume a container took meanwhile refuses the rm, and its mapping stays open
+                result = await ssh_client.run(f"/usr/bin/docker volume rm {shlex.quote(name)}", check=False)
+                if result.exit_status == 0:
+                    await self.delete_dmcrypt_volume(ssh_client, pod_ids[0], default_extra)
+                    removed.append(name)
+            if removed:
+                logger.info(_m("Removed orphaned dm-crypt volumes", extra=get_extra_info({**default_extra, "volumes": removed})))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(_m("Failed to remove orphaned dm-crypt volumes", extra=get_extra_info({**default_extra, "error": str(exc)})))
+        return removed
 
     async def _record_filler_image_best_effort(
         self,
@@ -9374,6 +9413,14 @@ class DockerService:
                             # mapping and its file are not something the stale-volume sweep finds
                             if not dmcrypt_volume_kept:
                                 # never replaces the create's own error
+                                with contextlib.suppress(Exception):
+                                    if edit_swap.replacement_id:
+                                        # a running container pins the volume and keeps the mapping
+                                        # mounted, so neither the rm nor the close below would succeed
+                                        await ssh_client.run(
+                                            f"/usr/bin/docker rm -fv {shlex.quote(edit_swap.replacement_id)} >/dev/null 2>&1",
+                                            check=False,
+                                        )
                                 with contextlib.suppress(Exception):
                                     await ssh_client.run(
                                         f"/usr/bin/docker volume rm {shlex.quote(local_volume)} >/dev/null 2>&1",

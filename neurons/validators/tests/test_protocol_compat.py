@@ -155,3 +155,15 @@ def test_validator_preserves_command_id(entry: dict) -> None:
         for command_id in ("", "retry"):
             message = {**entry["message"], "command_id": command_id}
             assert payloads.BaseServerRequest.parse(json.dumps(message)).command_id == command_id
+
+
+def test_the_validator_accepts_and_ignores_self_rent() -> None:
+    """lium-platform sends `self_rent` (DAH-5244) on RentedMachine and RentedExecutor; the validator does not act on it."""
+    from protocol.vc_protocol import compute_requests
+
+    machine = {"miner_hotkey": "m", "executor_id": "e", "executor_ip_address": "a", "executor_ip_port": "1",
+               "containers": [], "owner_flag": False, "self_rent": True}
+    reply = compute_requests.RentedMachineResponse.model_validate({"machines": [machine]})
+    assert "self_rent" not in reply.machines[0].model_dump()
+    executor = {"miner_hotkey": "m", "executor_ip_address": "a", "executor_ip_port": "1", "pods": [], "self_rent": True}
+    assert compute_requests.RentedExecutor.model_validate(executor).owner_flag is False
