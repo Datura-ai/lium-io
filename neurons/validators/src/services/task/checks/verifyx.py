@@ -47,9 +47,9 @@ MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
 # cap on the rental-state re-read before the retry; a slower answer counts as unknown (busy)
 RENTAL_STATE_TIMEOUT_SECONDS = 30
-# during the retry: the pending-pod marker is re-read every interval, the backend's pod list every Nth
+# during the retry only the per-executor pending-pod marker is re-read, every interval; the backend's
+# fleet-wide rental list is read once, before the retry, so concurrent retries do not multiply its load
 RENTAL_WATCH_INTERVAL_SECONDS = 5
-RENTAL_WATCH_BACKEND_EVERY = 6
 
 
 @dataclass(frozen=True)
@@ -589,14 +589,10 @@ async def _not_idle_now(ctx: Context, timeout: float, *, backend: bool = True) -
 
 
 async def _until_not_idle(ctx: Context) -> str:
-    """Polls the rental state while the retry runs; returns why the node stopped being idle."""
-    tick = 0
+    """Polls the pending-pod marker while the retry runs; returns why the node stopped being idle."""
     while True:
         await asyncio.sleep(RENTAL_WATCH_INTERVAL_SECONDS)
-        tick += 1
-        busy = await _not_idle_now(
-            ctx, RENTAL_STATE_TIMEOUT_SECONDS, backend=tick % RENTAL_WATCH_BACKEND_EVERY == 0
-        )
+        busy = await _not_idle_now(ctx, RENTAL_STATE_TIMEOUT_SECONDS, backend=False)
         if busy is not None:
             return busy
 

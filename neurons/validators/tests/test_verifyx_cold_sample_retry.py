@@ -478,38 +478,24 @@ async def test_a_slow_rental_lookup_never_costs_the_first_sample(context_factory
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("flip", "reason"),
-    [
-        ("marker", "rental_create_in_progress"),
-        ("pod", "rented"),
-        ("unavailable", "rental_state_unavailable"),
-    ],
+    [("marker", "rental_create_in_progress"), ("unavailable", "rental_state_unavailable")],
 )
 async def test_a_rental_starting_during_the_retry_cuts_it_off(
     context_factory, monkeypatch, flip, reason
 ):
     # PR review, 31 Oct: the node was idle at the lookup, then a renter's create began (pending-pod
-    # marker) or a pod appeared while the retry ran. The retry is cancelled, its remote run killed by
-    # its PID, and the first sample decides.
+    # marker) or the marker could not be read while the retry ran. The retry is cancelled, its remote
+    # run killed by its PID, and the first sample decides. During the retry only the per-executor
+    # marker is watched: the backend's fleet-wide rental list is read once, before the retry.
     monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
     monkeypatch.setattr(verifyx_check, "RENTAL_WATCH_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(verifyx_check, "RENTAL_WATCH_BACKEND_EVERY", 1)
     service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=5.0)
     ctx = _ctx(context_factory, service, _never_measured())
     _idle_now(ctx.services)
     first = await VerifyXCheck().run(ctx)
-    later = {
-        "marker": ([False, True], [_never_measured()]),
-        "pod": (
-            [False, False],
-            [
-                _never_measured(),
-                _never_measured().model_copy(update={"executors": {EXECUTOR: _pod_on(EXECUTOR)}}),
-            ],
-        ),
-        "unavailable": ([False, False], [_never_measured(), None]),
-    }[flip]
-    ctx.services.redis.renting_in_progress = AsyncMock(side_effect=later[0] + [True] * 10)
-    ctx.services.backend.get_rented_executors_now = AsyncMock(side_effect=later[1] + [None] * 10)
+    later = {"marker": [False, False, True], "unavailable": [False, False, ConnectionError("redis down")]}[flip]
+    ctx.services.redis.renting_in_progress = AsyncMock(side_effect=later + [True] * 10)
+    ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_never_measured())
 
     result = await asyncio.wait_for(
         VerifyXColdRetryCheck().run(ctx.model_copy(update=first.updates)), 2
@@ -518,6 +504,7 @@ async def test_a_rental_starting_during_the_retry_cuts_it_off(
     assert (service.calls, service.kills, result.passed) == (2, 1, False)
     assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
     assert result.event.what_we_saw["cold_sample_retry"] == {"cancelled": reason}
+    assert ctx.services.backend.get_rented_executors_now.await_count == 1  # pre-retry check only
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(
         88.0
     )
