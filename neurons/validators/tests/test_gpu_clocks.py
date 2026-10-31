@@ -516,6 +516,38 @@ async def test_a_delete_cancels_a_create_before_taking_the_pod_lock_its_clock_re
     create_go.set()
     gates["delete"].set()
 
-    # before the fix the delete held the lock the create's -rgc waited on: each waited for the other
-    assert await asyncio.wait_for(asyncio.gather(creating, delete), 5) == [None, "deleted"]
-    assert order == ["rgc", "delete"]
+    # before the fix the delete held the lock the create's clock reset waited on: each waited for the other.
+    # The cancelled create now stops at that step, running no -rgc on GPUs that may be rented again.
+    created, deleted = await asyncio.wait_for(asyncio.gather(creating, delete, return_exceptions=True), 5)
+    assert isinstance(created, ds._CreateCancelledByDelete) and deleted == "deleted"
+    assert order == ["delete"]
+
+
+@pytest.mark.asyncio
+async def test_a_create_reset_after_every_gpu_was_reset_passes_even_when_redis_then_fails():
+    host, redis = FakeHost(), FakeRedis()
+    redis.get = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    # the records are unknown, but every -rgc exited 0: nothing is still locked
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_create_its_delete_cancelled_runs_no_clock_reset(monkeypatch):
+    import services.docker_service as ds
+    from payload_models.payloads import WorkloadKind
+
+    service, _gates, _started = _service_with_gated_steps([])
+    service.redis_service = None
+    reset = AsyncMock(return_value=[])
+    monkeypatch.setattr(ds, "reset_leftover_clock_locks", reset)
+    payload = _create_payload()
+    payload.workload_kind = WorkloadKind.CUSTOMER_RENTAL
+
+    with ds.inflight_creates.track("pod1"):
+        ds.inflight_creates.cancel("pod1")
+        with pytest.raises(ds._CreateCancelledByDelete):
+            await service._reset_leftover_clock_locks_before_create(None, payload, {})
+
+    reset.assert_not_awaited()  # the GPUs may already be the next renter's
+    assert not ds.pod_gpu_operation_locks._locks

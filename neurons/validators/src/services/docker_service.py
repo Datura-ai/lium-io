@@ -11370,6 +11370,9 @@ class DockerService:
         async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
             if not held:
                 logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
+            # DAH-4663 (review): a create its delete cancelled during a long pull or build stops here, before an -rgc
+            # on GPUs the backend may have rented again (it would undo the next renter's lock and drop its records)
+            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
             try:
                 still_locked = await reset_leftover_clock_locks(
                     SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids

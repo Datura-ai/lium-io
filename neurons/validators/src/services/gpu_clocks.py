@@ -144,10 +144,15 @@ async def _forget(redis: RedisService, uuids: list[str]) -> None:
 
 
 async def _reset_gpus(
-    runner: SSHCommandRunner, redis: RedisService, uuids: list[str], pod_gpu_uuids: set[str] | None = None
+    runner: SSHCommandRunner,
+    redis: RedisService,
+    uuids: list[str],
+    pod_gpu_uuids: set[str] | None = None,
+    *,
+    forget: bool = True,
 ) -> dict[str, str | None]:
     """`-rgc` each GPU in one SSH call (a create runs this on every GPU); the record goes only once its reset
-    succeeded. uuid -> failure (None = reset)."""
+    succeeded (forget=False: the caller drops it). uuid -> failure (None = reset)."""
     if not uuids:
         return {}
     # each reset echoes "<uuid> <exit>", so one GPU's failure never hides another's result
@@ -161,7 +166,8 @@ async def _reset_gpus(
         uuid: None if exits.get(uuid) == "0" else f"nvidia-smi -rgc failed (exit {exits.get(uuid, 'unknown')})"
         for uuid in uuids
     }
-    await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
+    if forget:
+        await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     return failures
 
 
@@ -282,11 +288,15 @@ async def reset_leftover_clock_locks(
     except Exception:
         recorded = set(gpu_uuids)  # unknown (review): every failed reset counts, never a silent pass
     try:
-        failures = await _reset_gpus(runner, redis, gpu_uuids)
+        failures = await _reset_gpus(runner, redis, gpu_uuids, forget=False)
     except Exception:
         if not recorded:
             raise
         failures = dict.fromkeys(gpu_uuids, "the reset did not run")
+    try:
+        await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
+    except Exception:
+        pass  # the GPUs are reset; a record left over costs the next create one more -rgc (review)
     return [uuid for uuid in gpu_uuids if uuid in recorded and failures[uuid] is not None]
 
 
