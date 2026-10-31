@@ -614,6 +614,18 @@ class VerifyXValidationService:
             f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
         )
 
+    async def kill_remote_verifyx(self, shell, executor_info, default_extra: dict) -> None:
+        """Best-effort kill of a VerifyX run cut off by the validator, so it stops loading the host."""
+        script = f"{executor_info.root_dir}/src/verifyx_executor.py"
+        capture = await self._run_ssh_command(shell, f"pkill -9 -f {shlex.quote(script)}", timeout=10)
+        if capture.transport_error is not None:
+            logger.warning(
+                _m(
+                    "Failed to kill remote VerifyX process",
+                    extra=get_extra_info({**default_extra, "transport_error": capture.transport_error}),
+                )
+            )
+
     async def _run_ssh_command(
         self, shell, command: str, timeout: float = VERIFYX_COMMAND_TIMEOUT_SECONDS
     ) -> SSHCapture:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import asdict, dataclass, replace
@@ -56,6 +57,7 @@ class ColdSampleRetry:
     first_download_speed_mbps: float | None
     retry_download_speed_mbps: float | None
     used: Literal["first", "retry"]
+    timed_out: bool = False
 
 
 class VerifyXCheck:
@@ -123,10 +125,10 @@ class VerifyXCheck:
         # over SSH exactly as before.
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
-        first_run_started = None
         if local is not None and local.verifyx is not None:
             result = local.verifyx
             transport = "local_verify"
+            first_run_seconds = local.round_trip_ms / 1000
         else:
             first_run_started = time.monotonic()
             result = await verifyx_service.validate_verifyx_and_process_job(
@@ -136,6 +138,7 @@ class VerifyXCheck:
                 machine_spec=specs,
                 **sizing,
             )
+            first_run_seconds = time.monotonic() - first_run_started
 
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
@@ -147,7 +150,6 @@ class VerifyXCheck:
         retry_skipped_seconds_left: int | None = None
         cold = _is_cold_sample_below_gate(ctx, result, prev_ema)
         if cold:
-            first_run_seconds = time.monotonic() - first_run_started if first_run_started else 0.0
             seconds_left = task_seconds_left(ctx)
             if seconds_left < max(first_run_seconds, MIN_COLD_RETRY_SECONDS) + COLD_RETRY_RESERVE_SECONDS:
                 retry_skipped_seconds_left = int(seconds_left)
@@ -168,17 +170,27 @@ class VerifyXCheck:
             # sample inside the same task costs at most one VerifyX run; the failure costs the
             # provider a whole cycle. Known hosts (any prior EMA) are not retried, and the gate is
             # unchanged: one of the two samples must clear it.
-            retry = await verifyx_service.validate_verifyx_and_process_job(
-                shell=ctx.services.shell,
-                executor_info=ctx.executor,
-                default_extra=ctx.default_extra,
-                machine_spec=specs,
-                **sizing,
-            )
+            # The estimate does not bound the retry itself (its SSH timeout is 600 s): cut it at the
+            # deadline less the reserve and judge on the first sample. An outer cancel still propagates.
+            try:
+                retry = await asyncio.wait_for(
+                    verifyx_service.validate_verifyx_and_process_job(
+                        shell=ctx.services.shell,
+                        executor_info=ctx.executor,
+                        default_extra=ctx.default_extra,
+                        machine_spec=specs,
+                        **sizing,
+                    ),
+                    timeout=task_seconds_left(ctx) - COLD_RETRY_RESERVE_SECONDS,
+                )
+            except TimeoutError:
+                retry = None
+                await verifyx_service.kill_remote_verifyx(ctx.services.shell, ctx.executor, ctx.default_extra)
             first_speed = _download_speed(result)
-            retry_speed = _download_speed(retry)
+            retry_speed = _download_speed(retry) if retry is not None else None
             use_retry = (
-                retry.data is not None
+                retry is not None
+                and retry.data is not None
                 and bool(retry.data.get("success"))
                 and (retry_speed or 0.0) > (first_speed or 0.0)
             )
@@ -186,6 +198,7 @@ class VerifyXCheck:
                 first_download_speed_mbps=first_speed,
                 retry_download_speed_mbps=retry_speed,
                 used="retry" if use_retry else "first",
+                timed_out=retry is None,
             )
             logger.info(
                 _m(

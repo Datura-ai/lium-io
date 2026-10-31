@@ -2,11 +2,11 @@
 (the EMA bootstraps from it). The check takes one more sample inside the same task and gates on the
 better one."""
 
-import time
+import asyncio
 
 import pytest
 
-from core.config import settings
+from neurons.validators.src.services.task.checks import verifyx as verifyx_check
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
@@ -74,6 +74,7 @@ async def test_cold_first_sample_is_re_measured_and_the_better_one_seeds_the_ema
         "first_download_speed_mbps": 59.9,
         "retry_download_speed_mbps": 760.0,
         "used": "retry",
+        "timed_out": False,
     }
 
 
@@ -173,18 +174,68 @@ async def test_ram_or_disk_failure_on_the_first_sample_is_not_retried(context_fa
     assert result.event.reason_code == Msg.VERIFY_FAILED.reason
 
 
+class _TimedProbeSequence(_ProbeSequence):
+    """A _ProbeSequence whose retry takes `retry_s` and which counts remote kills."""
+
+    def __init__(self, *responses, retry_s: float = 0.0):
+        super().__init__(*responses)
+        self.retry_s = retry_s
+        self.kills = 0
+
+    async def validate_verifyx_and_process_job(self, **kwargs):
+        response = await super().validate_verifyx_and_process_job(**kwargs)
+        if self.calls == 2:
+            await asyncio.sleep(self.retry_s)
+        return response
+
+    async def kill_remote_verifyx(self, shell, executor_info, default_extra):
+        self.kills += 1
+
+
 @pytest.mark.asyncio
-async def test_cold_retry_is_skipped_when_it_would_not_fit_before_the_task_deadline(context_factory):
-    # ad2382f9, 31 Oct: first run ended with ~208 s left, the retry ran into the task deadline and
-    # the cycle was dropped with no result. Too little time left: judge on the first sample.
-    service = _ProbeSequence(_probe(88.0), _probe(760.0))
-    ctx = _ctx(context_factory, service, _never_measured())
-    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - (settings.JOB_TIME_OUT - 120 - 200)})
+@pytest.mark.parametrize(
+    ("case", "seconds_left", "retry_s", "calls", "kills", "passed", "retry"),
+    [
+        # ad2382f9, 31 Oct: the first run ended with ~208 s left and the retry ran into the task
+        # deadline, dropping the cycle. Too little time left: judged on the first sample.
+        ("skipped", [200.0], 0.0, 1, 0, False, None),
+        ("completed", [400.0, 400.0], 0.0, 2, 0, True, {"used": "retry", "timed_out": False}),
+        # admitted by the estimate, but the retry outlives its budget (deadline less the reserve):
+        # cut off, remote run killed, judged on the first sample instead of losing the whole result
+        ("over_budget", [330.0, 60.05], 5.0, 2, 1, False, {"used": "first", "timed_out": True}),
+    ],
+)
+async def test_cold_retry_against_the_task_deadline(
+    context_factory, monkeypatch, case, seconds_left, retry_s, calls, kills, passed, retry
+):
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: seconds_left.pop(0))
+    service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=retry_s)
 
-    result = await VerifyXCheck().run(ctx)
+    result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
 
-    assert service.calls == 1
-    assert result.passed is False
-    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
-    assert "cold_sample_retry" not in result.event.what_we_saw
-    assert 0 < result.event.what_we_saw["cold_sample_retry_skipped_task_seconds_left"] <= 200
+    assert (service.calls, service.kills, result.passed) == (calls, kills, passed)
+    saw = result.event.what_we_saw
+    if retry is None:
+        assert "cold_sample_retry" not in saw
+        assert saw["cold_sample_retry_skipped_task_seconds_left"] == 200
+    else:
+        assert {k: saw["cold_sample_retry"][k] for k in retry} == retry
+        assert "cold_sample_retry_skipped_task_seconds_left" not in saw
+    if not passed:
+        assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+        assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(88.0)
+
+
+@pytest.mark.asyncio
+async def test_an_outer_cancel_during_the_retry_still_cancels_the_task(context_factory, monkeypatch):
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 400.0)
+    service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=5.0)
+    task = asyncio.create_task(VerifyXCheck().run(_ctx(context_factory, service, _never_measured())))
+    while service.calls < 2:
+        await asyncio.sleep(0)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert service.kills == 0
