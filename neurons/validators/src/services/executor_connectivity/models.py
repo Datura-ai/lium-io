@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+# DAH-4537: the outside prober's reading of a node; None when it did not run
+ExternalReading = Literal["passed", "blocked"] | None
 
 
 @dataclass(frozen=True)
@@ -16,14 +20,15 @@ class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
     tier: str = "batch"
+    external: ExternalReading = None
 
 
 @dataclass(frozen=True)
 class BatchResult:
     successful: list[PortPair]
     failed: list[PortPair]
-    # DAH-4537: the validator reached the sampled ports but the outside prober reached none of them
-    external_blocked: bool = False
+    # DAH-4537: "blocked" when the validator reached the sampled ports but the outside prober reached none of them
+    external: ExternalReading = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +104,8 @@ class PortVerificationResult:
     # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending.
     port_ranges: tuple[PortRangeResult, ...] = ()
     probe_tier: str | None = None
+    # DAH-4537: PortProbeResult.external; PortConnectivityCheck turns a confirmed "blocked" into externally_unreachable
+    external_probe: ExternalReading = None
     # len(get_all_ports(...)) for the executor's declared range or mappings; None when they could not be parsed
     declared_port_count: int | None = None
     # ticket-0494: the DinD probe's own sysbox reading, before any fallback. True/False only when the
