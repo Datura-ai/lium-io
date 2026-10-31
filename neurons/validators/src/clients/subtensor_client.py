@@ -54,6 +54,33 @@ class ProviderPortalDataUnavailable(RuntimeError):
     """No live or Redis-cached provider snapshot is available."""
 
 
+def _close_subtensor_safely(subtensor) -> None:
+    """Close a bittensor.subtensor and its substrate/WS independently.
+
+    Why: the leaking-mid-rate-limit case can leave the WS in a half-broken
+    state where one close path raises while a sibling still works; we want
+    to drive the TCP FIN through whichever path still functions.
+    """
+    if subtensor is None:
+        return
+    try:
+        subtensor.close()
+    except Exception:
+        pass
+    substrate = getattr(subtensor, "substrate", None)
+    if substrate is not None:
+        try:
+            substrate.close()
+        except Exception:
+            pass
+        ws = getattr(substrate, "ws", None)
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
 def scored_registered_neurons(
     miners: Sequence[bittensor.NeuronInfo],
     registered: Sequence[bittensor.NeuronInfo],
@@ -381,6 +408,7 @@ class SubtensorClient:
         )
 
     def initialize_subtensor(self):
+        new_subtensor = None
         try:
             logger.info(
                 _m(
@@ -388,13 +416,19 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            subtensor, endpoint_source = self._connect_subtensor()
-            self._log_subtensor_connected(subtensor, endpoint_source)
+            new_subtensor, endpoint_source = self._connect_subtensor()
+            self._log_subtensor_connected(new_subtensor, endpoint_source)
 
             # check registered
-            self.check_registered(subtensor)
+            self.check_registered(new_subtensor)
 
-            SubtensorClient._subtensor = subtensor
+            old_subtensor = SubtensorClient._subtensor
+            SubtensorClient._subtensor = new_subtensor
+            # Hand-off complete; clear local ref so the finally block does not
+            # close the now-installed instance.
+            new_subtensor = None
+            if old_subtensor is not None:
+                _close_subtensor_safely(old_subtensor)
         except Exception as e:
             logger.error(
                 _m(
@@ -408,6 +442,11 @@ class SubtensorClient:
                 ),
                 exc_info=True,
             )
+        finally:
+            # If construction succeeded but install failed, close the orphan
+            # before its WS becomes a zombie counted against our source-IP cap.
+            if new_subtensor is not None:
+                _close_subtensor_safely(new_subtensor)
 
     def set_subtensor(self):
         if (
