@@ -536,6 +536,27 @@ async def test_the_reset_leaves_a_recent_mark_when_its_pending_mark_goes():
 
 
 @pytest.mark.asyncio
+async def test_a_reset_slower_than_the_clock_lock_deadline_still_finishes_its_restart(monkeypatch):
+    import asyncio
+
+    import services.docker_service as ds
+
+    monkeypatch.setattr(ds, "POD_GPU_OPERATION_DEADLINE_SECONDS", 0.01)
+    service = _redis_service()
+    connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))
+
+    async def slow_reset(*_args, **_kwargs):
+        await asyncio.sleep(0.05)  # the container restart, past the clock lock's deadline
+        return GpuResetReport(ok=True, pod_stopped=True, container_restarted=True)
+
+    with patch("services.docker_service.reset_pod_gpus", slow_reset):
+        result = await _run_reset(service, return_value=connection)
+
+    assert (result.ok, result.container_restarted) == (True, True)
+    assert not ds.pod_gpu_operation_locks._locks
+
+
+@pytest.mark.asyncio
 async def test_a_redis_error_on_the_pending_mark_removal_still_answers_the_reset():
     service = _redis_service()
     service.remove_pending_pod = AsyncMock(side_effect=ConnectionError("redis down"))

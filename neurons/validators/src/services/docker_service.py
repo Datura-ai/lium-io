@@ -2105,7 +2105,7 @@ class _PendingDeletionRegistry:
 # DAH-4663 (review): how long a delete waits for a renter's GPU operation on the same pod before it answers
 # DeletionInProgress (the backend re-asks); the operation itself ends by its deadline, so a delete always gets through
 POD_GPU_OPERATION_DELETE_WAIT_SECONDS = 120
-# the longest a renter's GPU operation holds the pod (the 8x H200 reset with its container restart took 68-84 s)
+# the longest a renter's clock lock holds the pod; a GPU reset has none, so its container restart is never cut off
 POD_GPU_OPERATION_DEADLINE_SECONDS = 600
 
 
@@ -11751,13 +11751,15 @@ class DockerService:
                     failed("Another operation on this pod is running"),
                     error_code=GpuResetErrorCode.OperationInProgress,
                 )
+            # DAH-4663 (review): a reset is never cancelled, since cancelling it could stop its container restart
+            deadline = POD_GPU_OPERATION_DEADLINE_SECONDS if kind == GPU_CLOCKS_PENDING_KIND else None
             try:
                 return await asyncio.wait_for(
                     self._pod_gpu_operation_held(
                         payload, executor_info, keypair, private_key, label, kind, operate, failed, gpu_uuids, after,
                         default_extra,
                     ),
-                    POD_GPU_OPERATION_DEADLINE_SECONDS,
+                    deadline,
                 )
             except TimeoutError:
                 logger.error(_m(f"{label}: past its deadline, cancelled", extra=get_extra_info(default_extra)))
