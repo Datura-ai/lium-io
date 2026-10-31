@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -50,6 +51,28 @@ RENTAL_STATE_TIMEOUT_SECONDS = 30
 # during the retry only the per-executor pending-pod marker is re-read, every interval; the backend's
 # fleet-wide rental list is read once, before the retry, so concurrent retries do not multiply its load
 RENTAL_WATCH_INTERVAL_SECONDS = 5
+# the pre-retry rental lookup shares one backend read among all executors (single flight), reused
+# this long: N cold executors in a cycle cost one fleet-wide read, not N
+RENTED_NOW_TTL_SECONDS = 30
+_rented_now: tuple[Any, float, asyncio.Future] | None = None  # (backend, started_at, read)
+
+
+async def _rented_executors_now_shared(backend) -> Any:
+    """`backend.get_rented_executors_now()`, one call in flight and reused for
+    RENTED_NOW_TTL_SECONDS by every caller. A failed or empty answer is not reused."""
+    global _rented_now
+    now = time.monotonic()
+    cached = _rented_now
+    stale = (
+        cached is None
+        or cached[0] is not backend
+        or now - cached[1] > RENTED_NOW_TTL_SECONDS
+        or (cached[2].done() and (cached[2].cancelled() or cached[2].exception() or cached[2].result() is None))
+    )
+    if stale:
+        cached = _rented_now = (backend, now, asyncio.ensure_future(backend.get_rented_executors_now()))
+    # shield: one caller's timeout must not cancel the read the others wait on
+    return await asyncio.shield(cached[2])
 
 
 @dataclass(frozen=True)
@@ -561,7 +584,7 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
 
 async def _not_idle_now(ctx: Context, timeout: float, *, backend: bool = True) -> str | None:
     """Why the cold retry must not run now, or None: a customer pod on the node (in the cycle-start
-    snapshot, as refreshed by earlier checks, or in the backend's answer now), a rental being
+    snapshot, as refreshed by earlier checks, or in the backend's shared recent answer), a rental being
     created, or a rental state that cannot be read within `timeout`. A filler alone keeps the node
     eligible, as for the first sample. `backend=False` re-reads only the pending-pod marker."""
     uuid = str(ctx.executor.uuid)
@@ -571,7 +594,7 @@ async def _not_idle_now(ctx: Context, timeout: float, *, backend: bool = True) -
             return True, None
         if not backend:
             return False, ctx.state.rented_data
-        return False, await ctx.services.backend.get_rented_executors_now()
+        return False, await _rented_executors_now_shared(ctx.services.backend)
 
     try:
         creating, fresh = await asyncio.wait_for(read(), timeout=timeout)

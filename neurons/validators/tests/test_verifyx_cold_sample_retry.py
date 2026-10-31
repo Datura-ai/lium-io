@@ -508,3 +508,33 @@ async def test_a_rental_starting_during_the_retry_cuts_it_off(
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(
         88.0
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_retries_share_one_backend_read(context_factory, monkeypatch):
+    # PR review, 31 Oct: each cold executor read the fleet-wide rented list before its retry, so N cold
+    # executors cost N backend reads. They now share one in-flight read; the snapshot still counts.
+    monkeypatch.setattr(verifyx_check, "_rented_now", None)
+    backend = AsyncMock()
+
+    async def slow_read():
+        await asyncio.sleep(0.05)
+        return _never_measured()
+
+    backend.get_rented_executors_now = AsyncMock(side_effect=slow_read)
+    rented = _never_measured().model_copy(update={"executors": {EXECUTOR: _pod_on(EXECUTOR)}})
+    ctxs = [
+        context_factory(
+            services=build_services(backend=backend),
+            config=build_context_config(),
+            state=build_state(specs={}, rented_data=rented if i == 0 else _never_measured()),
+        )
+        for i in range(8)
+    ]
+    for ctx in ctxs:
+        ctx.services.redis.renting_in_progress = AsyncMock(return_value=False)
+
+    busy = await asyncio.gather(*(verifyx_check._not_idle_now(ctx, 5) for ctx in ctxs))
+
+    assert busy == ["rented"] + [None] * 7
+    assert backend.get_rented_executors_now.await_count == 1
