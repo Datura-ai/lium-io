@@ -400,6 +400,11 @@ class Settings(BaseSettings):
     RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
     RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0, gt=0)
     RENTED_POD_SSH_PROBE_CONCURRENCY: int = Field(env="RENTED_POD_SSH_PROBE_CONCURRENCY", default=64, ge=1)
+    # DAH-5215: the per-cycle probe sees a dead pod up to 15 min late. The watch
+    # (services/rented_pod_watch.py) re-probes the rented RUNNING pods every INTERVAL seconds (0 = off)
+    # with the same TIMEOUT and CONCURRENCY and reports a pod unreachable after MISSES missed probes in a row.
+    RENTED_POD_WATCH_INTERVAL_SECONDS: int = Field(env="RENTED_POD_WATCH_INTERVAL_SECONDS", default=60, ge=0)
+    RENTED_POD_WATCH_MISSES: int = Field(env="RENTED_POD_WATCH_MISSES", default=2, ge=1)
     # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
     # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
     # stores such a report as evidence only (lium-platform) is deployed:

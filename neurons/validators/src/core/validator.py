@@ -50,6 +50,7 @@ from services.redis_service import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
+from services.rented_pod_watch import RentedPodWatch
 from services.task.availability import silence_availability_errors_on_our_own_outage
 from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
@@ -225,6 +226,8 @@ class Validator:
             subtensor_client=self.subtensor_client,
             cycle_inputs=self.express_lane_cycle_inputs,
         )
+        # DAH-5215: re-probes rented pods' SSH between cycles; observe only.
+        self.rented_pod_watch = RentedPodWatch(backend_client=self.backend_client)
 
         # the tempo index already submitted (or read, in shadow, or found empty): should_set_weights stays true for a
         # tick or two after a submission, and a second attempt for the same frozen window would be rejected as too fast
@@ -1585,6 +1588,10 @@ class Validator:
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
+                if settings.RENTED_POD_WATCH_INTERVAL_SECONDS > 0:
+                    self.rented_pod_watch_task = asyncio.create_task(
+                        self.rented_pod_watch.run(lambda: self.should_exit)
+                    )
                 # which code saturates the loop the lane shares with the wave (core/loop_sampler.py)
                 self.loop_sampler_stop = start_loop_sampler()
 
