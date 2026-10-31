@@ -151,7 +151,6 @@ def _app(validator_keypair, monkeypatch) -> FastAPI:
     monkeypatch.setattr(
         "dependencies.auth.VALIDATOR_HOTKEYS_SS58", {"current": validator_keypair.ss58_address}
     )
-    monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_ENABLED", True)
     monkeypatch.setattr(settings, "RENTING_PORT_RANGE", "40000-40009")
     # The configured miner and the shared portal hotkey are two different keys here, so the
     # "portal hotkey binds nothing" refusal is tested against a real difference, not conftest's.
