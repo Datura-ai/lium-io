@@ -2110,7 +2110,8 @@ POD_GPU_OPERATION_DEADLINE_SECONDS = 600
 
 
 class _PodGpuOperationLocks:
-    """One lock per pod shared by a renter's GPU operations (reset, clock lock) and the pod's delete.
+    """One lock per pod shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
+    reset before its (re)create.
 
     The pending-pod check and its mark are separate steps, and a delete takes no mark, so a clock lock and a
     delete could both run: a -lgc finishing after the delete's clock reset left the GPUs locked with no record
@@ -9333,16 +9334,7 @@ class DockerService:
                     current_step = "cluster_overlay_port"
                     await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
 
-                # DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed) is reset
-                # before anyone starts on it. Best-effort, never blocks the rental.
-                try:
-                    await reset_leftover_clock_locks(
-                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        _m("GPU clock lock safety net failed", extra=get_extra_info({**default_extra, "error": str(exc)}))
-                    )
+                await self._reset_leftover_clock_locks_before_create(ssh_client, payload, default_extra)
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
                 # gpu_power_limits). Fail-closed: apply undoes any partial work on failure, and the
@@ -11365,6 +11357,25 @@ class DockerService:
         killed = await ssh_client.run(DockerCommand.kill_container_processes(payload.container_name))
         log.info("Killed the container's processes", result=(killed.stdout or "").strip())
         return await self._force_remove_container(docker_client, payload, log)
+
+    async def _reset_leftover_clock_locks_before_create(
+        self, ssh_client, payload: ContainerCreateRequest, default_extra: dict
+    ) -> None:
+        """DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed) is reset before anyone starts
+        on it. Best-effort, never blocks the rental."""
+        # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
+        # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
+        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+            if not held:
+                logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
+            try:
+                await reset_leftover_clock_locks(
+                    SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m("GPU clock lock safety net failed", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
 
     async def delete_container(
         self,

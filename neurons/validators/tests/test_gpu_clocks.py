@@ -385,3 +385,60 @@ async def test_a_gpu_operation_past_its_deadline_is_cancelled_and_frees_the_pod(
 
     assert (report.ok, report.error_code) == (False, GpuResetErrorCode.ExecutorUnreachable)
     assert not ds.pod_gpu_operation_locks._locks  # a delete gets the pod
+
+
+def _create_payload():
+    from payload_models.payloads import ContainerCreateRequest
+
+    return ContainerCreateRequest.model_construct(pod_id="pod1", gpu_uuids=U[:2])
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_waits_for_a_clock_lock_in_flight_so_its_clock_reset_runs_after_the_lgc(monkeypatch):
+    import asyncio
+
+    import services.docker_service as ds
+
+    order: list[str] = []
+    service, gates, started = _service_with_gated_steps(order)
+    service.redis_service = None
+    monkeypatch.setattr(ds, "reset_leftover_clock_locks", AsyncMock(side_effect=lambda *_a: order.append("rgc")))
+
+    gpu = asyncio.create_task(_gpu_operation(service))
+    await started["gpu"].wait()
+    create = asyncio.create_task(service._reset_leftover_clock_locks_before_create(None, _create_payload(), {}))
+    await asyncio.sleep(0.05)
+    assert order == []  # the create's -rgc waits for the -lgc
+    gates["gpu"].set()
+    await asyncio.gather(gpu, create)
+
+    assert order == ["gpu", "rgc"]
+    assert not ds.pod_gpu_operation_locks._locks
+
+
+@pytest.mark.asyncio
+async def test_a_clock_lock_during_a_reboots_clock_reset_is_declined_and_touches_nothing(monkeypatch):
+    import asyncio
+
+    import services.docker_service as ds
+
+    order: list[str] = []
+    service, _gates, _started = _service_with_gated_steps(order)
+    service.redis_service = None
+    rgc_started, rgc_gate = asyncio.Event(), asyncio.Event()
+
+    async def gated_rgc(*_args):
+        rgc_started.set()
+        await rgc_gate.wait()
+        order.append("rgc")
+
+    monkeypatch.setattr(ds, "reset_leftover_clock_locks", gated_rgc)
+
+    create = asyncio.create_task(service._reset_leftover_clock_locks_before_create(None, _create_payload(), {}))
+    await rgc_started.wait()
+    report = await _gpu_operation(service)
+    rgc_gate.set()
+    await create
+
+    assert (report.ok, report.error_code) == (False, GpuResetErrorCode.OperationInProgress)
+    assert order == ["rgc"]  # the clock lock never ran
