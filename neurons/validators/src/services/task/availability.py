@@ -33,6 +33,8 @@ class ReachTarget(StrEnum):
     EXECUTOR_API = "executor_api"
     # A card on the node (GpuLossHoldCheck): the validator cannot reach it through NVML.
     GPU = "gpu"
+    # The node as a whole: a fatal check failed (failed_check_event).
+    NODE = "node"
 
 
 # The longest peer-supplied text a reading may keep: the node writes it, the portal shows it.
@@ -57,6 +59,8 @@ class AvailabilityErrorCode(StrEnum):
     GPU_LOST = "GPU_LOST"
     # DAH-4683: NVML reports a card's memory broken (GpuMemoryHealthCheck).
     GPU_MEMORY_HEALTH_FAILED = "GPU_MEMORY_HEALTH_FAILED"
+    # DAH-5395: a fatal check that means the node cannot serve a rental failed this cycle (failed_check_event).
+    VERIFICATION_FAILED = "VERIFICATION_FAILED"
     # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
     GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
 
@@ -291,3 +295,47 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
         ]
         result.availability_errors = node_gpu_fault_entries or None
     return len(checked_results)
+
+
+# DAH-5395: fatal checks whose failure leaves the node on the market. The backend drops a report that did not score
+# (it only refreshes a node on a pass), so without an availability entry a node that failed stays listed and
+# rentable until the staleness sweep. These are not "the node cannot serve a rental": the duplicate copy's verdict
+# (the kept copy stays listed), the executor image version (the backend acts on it itself), the rented pod's own
+# state (the renter's container, not the node) and an advisory template check.
+CHECKS_THAT_KEEP_THE_LISTING = frozenset(
+    {
+        "executor.validate.duplicate",
+        "executor.validate.image_version",
+        "executor.validate.rented_state",
+        "executor.validate.cached_template",
+    }
+)
+
+
+def failed_check_event(ok: bool, events: list[ValidationEvent]) -> ValidationEvent | None:
+    """The availability entry for a run a fatal check ended, so the backend hides the node until a cycle passes.
+
+    None for a run that did not fail, one that already raised an availability error, and one
+    ended by a check in CHECKS_THAT_KEEP_THE_LISTING. Policy score-zero outcomes never end the run (they zero the
+    score of a run that completes), so they never get one.
+    """
+    if ok or not events or any(e.is_availability_error for e in events):
+        return None
+    last_event = events[-1]
+    if last_event.check_id in CHECKS_THAT_KEEP_THE_LISTING:
+        return None
+    return verification_failed_event(last_event.check_id, last_event.reason_code)
+
+
+def verification_failed_event(check_id: str, reason: str | None) -> ValidationEvent:
+    """VERIFICATION_FAILED: the node could not finish a verification this cycle (see failed_check_event)."""
+    return build_availability_event(
+        code=AvailabilityErrorCode.VERIFICATION_FAILED,
+        reach_source=ReachSource.VALIDATOR,
+        reach_target=ReachTarget.NODE,
+        event_text="The node failed a verification check",
+        impact="Hidden and takes no new rentals until a check passes; a rental already on it is not touched",
+        remediation="See the failed check's message for the cause. The node is listed again on the first check "
+        "that passes.",
+        what_we_saw={"failed_check": check_id, "failed_reason": reason},
+    )
