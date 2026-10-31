@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
+# nvidia-smi's exit code for an operation the GPU does not support (a completed answer: nothing was changed)
+NVSMI_NOT_SUPPORTED = 3
 
 
 @dataclass
@@ -247,10 +249,20 @@ async def _lock_one_gpu(
     # record first, as the power cap does: never change a GPU without a stored way back. Only right before the
     # -lgc, so a GPU this request never changes gets no record a create would then refuse on (review F-46)
     record = {"gpu_uuid": uuid, "pod_id": pod_id, "executor_id": executor_id, "locked_at": time.time()}
+    previous = await redis.get(_lock_key(uuid))
     await redis.set(_lock_key(uuid), json.dumps(record))
     locked = await _run(runner, build_clock_command("lock", uuid, pod_gpu_uuids=pod_gpu_uuids, min_mhz=low, max_mhz=high))
+    if locked.exit_code == NVSMI_NOT_SUPPORTED:
+        # a completed "not supported" answer changed no clocks: the GPU's record goes back to what it was, so a GPU
+        # without clock control (that may refuse -rgc too) never carries a record a create would refuse on (review)
+        if previous:
+            await redis.set(_lock_key(uuid), previous)
+        else:
+            await redis.delete(_lock_key(uuid))
+        outcome.detail = _tail(locked.stdout or locked.stderr) or "nvidia-smi -lgc is not supported on this GPU"
+        return outcome
     if locked.exit_code != 0:
-        # the outcome is unknown (a lost or timed-out answer may hide an applied -lgc): reset the GPU, and its record
+        # any other failure: the outcome is unknown (a lost or timed-out answer may hide an applied -lgc): reset the GPU, and its record
         # goes only once that reset succeeded; else it stays, so a later create refuses rather than hand it on locked
         reset_failure = (await _reset_gpus(runner, redis, [uuid], pod_gpu_uuids))[uuid]
         outcome.detail = _tail(locked.stdout or locked.stderr) or "nvidia-smi -lgc failed"

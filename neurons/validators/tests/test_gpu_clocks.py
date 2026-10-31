@@ -147,6 +147,21 @@ async def test_a_refused_lock_is_reset_and_its_record_goes_only_once_that_reset_
 
 
 @pytest.mark.asyncio
+async def test_an_unsupported_lock_runs_no_reset_and_leaves_the_record_it_found():
+    host = FakeHost()
+    _, redis = await _lock(host, indices=[0])  # an earlier lock that holds: container index 0 is U[1] here
+    earlier = redis.store[f"gpu_clock_lock:{U[1]}"]
+    host.lgc_exit, host.rgc_exit, host.commands = 3, 3, []  # nvidia-smi: not supported, for both
+
+    report, redis = await _lock(host, redis)
+
+    assert not report.ok and not any(" -rgc " in c for c in host.commands)
+    assert redis.store[f"gpu_clock_lock:{U[1]}"] == earlier, "its clocks are still locked"
+    assert f"gpu_clock_lock:{U[0]}" not in redis.store, "never locked: rentals on it go on"
+    assert await reset_leftover_clock_locks(host, redis, [U[0]]) == []
+
+
+@pytest.mark.asyncio
 async def test_a_lock_whose_answer_was_lost_and_whose_reset_failed_keeps_its_record_and_refuses_the_next_create():
     # -lgc may have applied on the host though its answer timed out; the cleanup -rgc fails
     host = FakeHost(lgc_exit=124, rgc_exit=1)
