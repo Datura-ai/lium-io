@@ -8481,6 +8481,6 @@ async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(m
 def test_no_usable_loopback_plugin_error_preserves_the_disabled_classification():
     # the stats classifier files any error with "plugin vloopback" + "disabled" as
     # volume.plugin_disabled; the message names the plugin the rent used
-    message = str(NoUsableLoopbackPluginError("verified v2 plugin remains disabled", "false"))
+    message = str(NoUsableLoopbackPluginError("verified plugin remains disabled", "vloopback:v3", {"vloopback:v2": "absent", "vloopback": "false"}))
 
     assert "plugin vloopback" in message and "disabled" in message
