@@ -12,8 +12,10 @@ from protocol.vc_protocol.compute_requests import NetworkEMA
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.matrix_validation_service import MATRIX_VERIFY_TIMEOUT_SECONDS
 from services.verifyx_validation_service import (
     NETWORK_GATE_TALLY,
+    VERIFYX_COMMAND_TIMEOUT_SECONDS,
     _is_positive_number,
     _is_speed_reading,
 )
@@ -45,7 +47,9 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 # about as long as the first (3-15 min in prod), never less than this, plus the reserve for the
 # checks after it. Otherwise the deadline cancelled the task and the cycle had no result at all.
 MIN_COLD_RETRY_SECONDS = 240
-COLD_RETRY_RESERVE_SECONDS = 60
+# The checks after VerifyX: CapabilityCheck's matmul may use its whole SSH cap, plus a minute for
+# the rest of the pipeline and its cleanup.
+COLD_RETRY_RESERVE_SECONDS = MATRIX_VERIFY_TIMEOUT_SECONDS + 60
 
 
 @dataclass(frozen=True)
@@ -152,7 +156,10 @@ class VerifyXCheck:
         cold = _is_cold_sample_below_gate(ctx, result, prev_ema)
         if cold:
             seconds_left = task_seconds_left(ctx)
-            if seconds_left < max(first_run_seconds, MIN_COLD_RETRY_SECONDS) + COLD_RETRY_RESERVE_SECONDS:
+            if (
+                seconds_left
+                < max(first_run_seconds, MIN_COLD_RETRY_SECONDS) + COLD_RETRY_RESERVE_SECONDS
+            ):
                 retry_skipped_seconds_left = int(seconds_left)
                 logger.info(
                     _m(
@@ -171,9 +178,12 @@ class VerifyXCheck:
             # sample inside the same task costs at most one VerifyX run; the failure costs the
             # provider a whole cycle. Known hosts (any prior EMA) are not retried, and the gate is
             # unchanged: one of the two samples must clear it.
-            # The estimate does not bound the retry itself (its SSH timeout is 600 s): cut it at the
-            # deadline less the reserve and judge on the first sample. An outer cancel still propagates.
+            # The estimate does not bound the retry itself: cut it at the deadline less the reserve
+            # (never past its own SSH timeout) and judge on the first sample. An outer cancel still
+            # propagates.
             run_dir = f".verifyx-retry-{secrets.token_hex(8)}"
+            retry = None
+            transport_error = None
             try:
                 retry = await asyncio.wait_for(
                     verifyx_service.validate_verifyx_and_process_job(
@@ -184,11 +194,21 @@ class VerifyXCheck:
                         run_dir=run_dir,
                         **sizing,
                     ),
-                    timeout=task_seconds_left(ctx) - COLD_RETRY_RESERVE_SECONDS,
+                    timeout=min(
+                        task_seconds_left(ctx) - COLD_RETRY_RESERVE_SECONDS,
+                        VERIFYX_COMMAND_TIMEOUT_SECONDS,
+                    ),
                 )
+                transport_error = (retry.diagnostics or {}).get("transport_error")
             except TimeoutError:
-                retry = None
-                await verifyx_service.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra)
+                pass
+            finally:
+                # Cut off (deadline, SSH timeout, lost connection, outer cancel): the remote run may live on.
+                if retry is None or transport_error is not None:
+                    await verifyx_service.kill_remote_verifyx(
+                        ctx.services.shell, run_dir, ctx.default_extra
+                    )
+            timed_out = retry is None or "TimeoutError" in (transport_error or "")
             first_speed = _download_speed(result)
             retry_speed = _download_speed(retry) if retry is not None else None
             use_retry = (
@@ -201,7 +221,7 @@ class VerifyXCheck:
                 first_download_speed_mbps=first_speed,
                 retry_download_speed_mbps=retry_speed,
                 used="retry" if use_retry else "first",
-                timed_out=retry is None,
+                timed_out=timed_out,
             )
             logger.info(
                 _m(

@@ -207,16 +207,23 @@ class _TimedProbeSequence(_ProbeSequence):
         # ad2382f9, 31 Oct: the first run ended with ~208 s left and the retry ran into the task
         # deadline, dropping the cycle. Too little time left: judged on the first sample.
         ("skipped", [200.0], 0.0, 1, 0, False, None),
-        ("completed", [400.0, 400.0], 0.0, 2, 0, True, {"used": "retry", "timed_out": False}),
+        # a 265 s retry would leave 65 s, less than CapabilityCheck's matmul may take: not admitted
+        ("no_room_for_capability", [330.0], 0.0, 1, 0, False, None),
+        ("completed", [500.0, 500.0], 0.0, 2, 0, True, {"used": "retry", "timed_out": False}),
         # admitted by the estimate, but the retry outlives its budget (deadline less the reserve):
         # cut off, remote run killed, judged on the first sample instead of losing the whole result
-        ("over_budget", [330.0, 60.05], 5.0, 2, 1, False, {"used": "first", "timed_out": True}),
+        ("over_budget", [500.0, 180.05], 5.0, 2, 1, False, {"used": "first", "timed_out": True}),
+        # plenty of task time left: the budget stops at the SSH command timeout (patched to 0.05 s)
+        ("ssh_timeout_cap", [900.0, 900.0], 5.0, 2, 1, False, {"used": "first", "timed_out": True}),
     ],
 )
 async def test_cold_retry_against_the_task_deadline(
     context_factory, monkeypatch, case, seconds_left, retry_s, calls, kills, passed, retry
 ):
+    first_seconds_left = int(seconds_left[0])
     monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: seconds_left.pop(0))
+    if case == "ssh_timeout_cap":
+        monkeypatch.setattr(verifyx_check, "VERIFYX_COMMAND_TIMEOUT_SECONDS", 0.05)
     service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=retry_s)
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
@@ -225,7 +232,7 @@ async def test_cold_retry_against_the_task_deadline(
     saw = result.event.what_we_saw
     if retry is None:
         assert "cold_sample_retry" not in saw
-        assert saw["cold_sample_retry_skipped_task_seconds_left"] == 200
+        assert saw["cold_sample_retry_skipped_task_seconds_left"] == first_seconds_left
     else:
         assert {k: saw["cold_sample_retry"][k] for k in retry} == retry
         assert "cold_sample_retry_skipped_task_seconds_left" not in saw
@@ -235,8 +242,29 @@ async def test_cold_retry_against_the_task_deadline(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transport_error", "timed_out"),
+    [("TimeoutError: ", True), ("ConnectionLost: connection reset", False)],
+)
+async def test_a_retry_whose_ssh_call_failed_kills_the_remote_run(
+    context_factory, monkeypatch, transport_error, timed_out
+):
+    # _run_ssh_command returns its own timeout (or a dropped connection) as an error response; the
+    # remote run may still be going, so it is killed by its PID like a deadline cut-off.
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
+    failed = MockVerifyXResponse(error="ssh failed", diagnostics={"transport_error": transport_error})
+    service = _TimedProbeSequence(_probe(88.0), failed)
+
+    result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
+
+    assert (service.calls, service.kills, result.passed) == (2, 1, False)
+    assert result.event.what_we_saw["cold_sample_retry"]["used"] == "first"
+    assert result.event.what_we_saw["cold_sample_retry"]["timed_out"] is timed_out
+
+
+@pytest.mark.asyncio
 async def test_an_outer_cancel_during_the_retry_still_cancels_the_task(context_factory, monkeypatch):
-    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 400.0)
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 500.0)
     service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=5.0)
     task = asyncio.create_task(VerifyXCheck().run(_ctx(context_factory, service, _never_measured())))
     while service.calls < 2:
@@ -246,7 +274,7 @@ async def test_an_outer_cancel_during_the_retry_still_cancels_the_task(context_f
 
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert service.kills == 0
+    assert service.kills == 1  # the cut-off remote run is killed on the way out
 
 
 class _LocalShell:
