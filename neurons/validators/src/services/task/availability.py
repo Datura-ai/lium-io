@@ -164,9 +164,9 @@ def build_ssh_unreachable_event(
         if host_key_mismatch
         else (
             "Check that sshd on the node accepts the validator on its management port, "
-            "and that no firewall or rate limit rejects the connection. If your host NATs or "
-            "proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false in the executor .env and "
-            "restart the executor."
+            "and that no firewall or rate limit rejects the connection. Inbound SSH must reach the "
+            "executor directly: the validator's keys log in only from the validator's addresses, so "
+            "a relay, tunnel or Docker userland-proxy in front of sshd makes every login fail."
         ),
         what_we_saw={
             "executor_uuid": executor_uuid,

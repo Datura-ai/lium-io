@@ -197,9 +197,6 @@ class Settings(BaseSettings):
     EXECUTOR_UPLOADED_KEY_TTL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_TTL_S", default=900, ge=1)
     # How often the purge looks at authorized_keys; a key lives at most TTL + this.
     EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S", default=60, ge=1)
-    # I-78: off by default until approved; about 5% of nodes relay inbound ssh (sshd sees the relay,
-    # not the validator) and would fail. Safe as an env value: whoever writes this .env is root on the host.
-    EXECUTOR_SSH_SOURCE_PIN: bool = Field(env="EXECUTOR_SSH_SOURCE_PIN", default=False)
 
     # liumd phase 1 (DAH-2834): `POST /verify` runs the verification suite locally from one
     # validator-signed intent instead of 25–40 SSH commands. Off: the route answers 404 and

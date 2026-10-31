@@ -1,5 +1,6 @@
 """I-78: a key uploaded through /upload_ssh_key logs in only from the validator's addresses."""
 
+import socket
 import time
 
 import pytest
@@ -25,12 +26,11 @@ def test_prod_build_pins_the_nat_gateways():
     assert config.VALIDATOR_SSH_SOURCES == "54.163.250.18,13.223.237.157"
 
 
-def test_the_pin_is_off_by_default():
-    assert config.Settings.model_fields["EXECUTOR_SSH_SOURCE_PIN"].default is False
+def test_the_pin_has_no_opt_out():
+    assert "EXECUTOR_SSH_SOURCE_PIN" not in config.Settings.model_fields
 
 
-def test_upload_is_pinned_and_removal_and_expiry_still_find_it(authorized_keys, monkeypatch):
-    monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", True)
+def test_upload_is_pinned_and_removal_and_expiry_still_find_it(authorized_keys):
     SSHService().add_pubkey_to_host(KEY)
     assert authorized_keys.read_text().startswith(RENTER_KEY + f'from="{config.VALIDATOR_SSH_SOURCES}" {KEY} ')
 
@@ -48,12 +48,31 @@ def test_a_key_pinned_by_an_older_list_is_still_removed(authorized_keys):
     assert authorized_keys.read_text() == RENTER_KEY
 
 
-@pytest.mark.parametrize("sources,pin_on", [("", True), ("54.163.250.18", False)])
-def test_no_pin_without_sources_or_with_the_opt_out(authorized_keys, monkeypatch, sources, pin_on):
-    monkeypatch.setattr(ssh_service, "VALIDATOR_SSH_SOURCES", sources)
-    monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", pin_on)
+def test_no_pin_without_sources(authorized_keys, monkeypatch):
+    monkeypatch.setattr(ssh_service, "VALIDATOR_SSH_SOURCES", "")
     SSHService().add_pubkey_to_host(KEY)
     assert authorized_keys.read_text().startswith(RENTER_KEY + KEY + " ")
+
+
+def test_no_pin_in_a_cvm(authorized_keys, tmp_path, monkeypatch):
+    # QEMU user networking shows sshd 10.0.2.2, never the validator's address
+    sock_path = tmp_path / "dstack.sock"
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(sock_path))
+    monkeypatch.setattr(ssh_service.settings, "DSTACK_SOCKET_PATH", str(sock_path))
+    try:
+        SSHService().add_pubkey_to_host(KEY)
+    finally:
+        sock.close()
+    assert authorized_keys.read_text().startswith(RENTER_KEY + KEY + " ")
+
+
+def test_a_dstack_path_that_is_not_a_socket_still_pins(authorized_keys, tmp_path, monkeypatch):
+    # docker-compose.app.yml bind-mounts the path on every host; without dstack docker makes a directory
+    (tmp_path / "dstack.sock").mkdir()
+    monkeypatch.setattr(ssh_service.settings, "DSTACK_SOCKET_PATH", str(tmp_path / "dstack.sock"))
+    SSHService().add_pubkey_to_host(KEY)
+    assert authorized_keys.read_text().startswith(RENTER_KEY + f'from="{config.VALIDATOR_SSH_SOURCES}" ')
 
 
 def test_a_malformed_source_fails_at_import(monkeypatch):

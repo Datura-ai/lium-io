@@ -2,6 +2,7 @@ import asyncio
 import getpass
 import logging
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -54,9 +55,21 @@ def _split_marker(line: bytes) -> tuple[bytes, bytes | None]:
     return parts[0], parts[1][len(UPLOADED_KEY_MARKER):]
 
 
+def _in_cvm() -> bool:
+    """A dstack CVM: QEMU user networking shows sshd 10.0.2.2, never the validator's address.
+
+    A socket, not just a path: docker-compose.app.yml bind-mounts /var/run/dstack.sock on every host,
+    and on a host without dstack docker creates an empty directory there.
+    """
+    try:
+        return stat.S_ISSOCK(os.stat(settings.DSTACK_SOCKET_PATH).st_mode)
+    except OSError:
+        return False
+
+
 def _validator_source_pin_option() -> bytes:
     """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin."""
-    if not VALIDATOR_SSH_SOURCES or not settings.EXECUTOR_SSH_SOURCE_PIN:
+    if not VALIDATOR_SSH_SOURCES or _in_cvm():
         return b""
     return b'from="' + VALIDATOR_SSH_SOURCES.encode() + b'" '
 
