@@ -47,6 +47,9 @@ MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
 # cap on the rental-state re-read before the retry; a slower answer counts as unknown (busy)
 RENTAL_STATE_TIMEOUT_SECONDS = 30
+# during the retry: the pending-pod marker is re-read every interval, the backend's pod list every Nth
+RENTAL_WATCH_INTERVAL_SECONDS = 5
+RENTAL_WATCH_BACKEND_EVERY = 6
 
 
 @dataclass(frozen=True)
@@ -556,16 +559,18 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
-async def _not_idle_now(ctx: Context, timeout: float) -> str | None:
+async def _not_idle_now(ctx: Context, timeout: float, *, backend: bool = True) -> str | None:
     """Why the cold retry must not run now, or None: a customer pod on the node (in the cycle-start
     snapshot, as refreshed by earlier checks, or in the backend's answer now), a rental being
     created, or a rental state that cannot be read within `timeout`. A filler alone keeps the node
-    eligible, as for the first sample."""
+    eligible, as for the first sample. `backend=False` re-reads only the pending-pod marker."""
     uuid = str(ctx.executor.uuid)
 
     async def read() -> tuple[bool, Any]:
         if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, uuid):
             return True, None
+        if not backend:
+            return False, ctx.state.rented_data
         return False, await ctx.services.backend.get_rented_executors_now()
 
     try:
@@ -581,6 +586,19 @@ async def _not_idle_now(ctx: Context, timeout: float) -> str | None:
         if rented is not None and rented.pods:
             return "rented"
     return None
+
+
+async def _until_not_idle(ctx: Context) -> str:
+    """Polls the rental state while the retry runs; returns why the node stopped being idle."""
+    tick = 0
+    while True:
+        await asyncio.sleep(RENTAL_WATCH_INTERVAL_SECONDS)
+        tick += 1
+        busy = await _not_idle_now(
+            ctx, RENTAL_STATE_TIMEOUT_SECONDS, backend=tick % RENTAL_WATCH_BACKEND_EVERY == 0
+        )
+        if busy is not None:
+            return busy
 
 
 def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
@@ -721,13 +739,14 @@ class VerifyXColdRetryCheck:
             )
 
         # Cut at the deadline less the margin (never past its own SSH timeout) and judge on the
-        # first sample. An outer cancel still propagates.
+        # first sample. Raced against a rental-state watcher: a rental starting meanwhile cuts it
+        # off too, so a renter's pod never shares the node with it. An outer cancel still propagates.
         verifyx_service = ctx.services.verifyx
         run_dir = f".verifyx-retry-{secrets.token_hex(8)}"
         retry = None
         transport_error = None
-        try:
-            retry = await asyncio.wait_for(
+        probe = asyncio.ensure_future(
+            asyncio.wait_for(
                 verifyx_service.validate_verifyx_and_process_job(
                     shell=ctx.services.shell,
                     executor_info=ctx.executor,
@@ -738,15 +757,35 @@ class VerifyXColdRetryCheck:
                 ),
                 timeout=min(budget, VERIFYX_COMMAND_TIMEOUT_SECONDS),
             )
-            transport_error = (retry.diagnostics or {}).get("transport_error")
-        except TimeoutError:
-            pass
+        )
+        watch = asyncio.ensure_future(_until_not_idle(ctx))
+        try:
+            await asyncio.wait({probe, watch}, return_when=asyncio.FIRST_COMPLETED)
+            if probe.done():
+                try:
+                    retry = probe.result()
+                    transport_error = (retry.diagnostics or {}).get("transport_error")
+                except TimeoutError:
+                    pass
+            else:
+                busy = watch.result()
         finally:
-            # Cut off (deadline, SSH timeout, lost connection, outer cancel): the remote run may live on.
+            probe.cancel()
+            watch.cancel()
+            await asyncio.gather(probe, watch, return_exceptions=True)
+            # Cut off (deadline, SSH timeout, lost connection, rental, outer cancel): the remote run may live on.
             if retry is None or transport_error is not None:
                 await verifyx_service.kill_remote_verifyx(
                     ctx.services.shell, run_dir, ctx.default_extra
                 )
+        if busy is not None:
+            logger.info(
+                _m(
+                    "VerifyX cold retry cut off: the node stopped being idle",
+                    extra=get_extra_info({**ctx.default_extra, "reason": busy}),
+                )
+            )
+            return self._first_sample_stands(ctx, pending, cleared, {"cancelled": busy})
         retry_speed = _download_speed(retry) if retry is not None else None
         use_retry = (
             retry is not None
