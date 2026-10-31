@@ -115,3 +115,73 @@ def test_host_write_findings_reads_only_the_sensor_verdict():
 
     assert host_write_findings(report, findings, ["pod-1"]) == ([HOST_WRITE], [HOST_READ])
     assert host_write_findings({}, findings, ["pod-1"]) is None
+
+
+# DAH-5058: a provider's own docker exec from the host into a rented pod
+HOST_EXEC = {
+    "category": "RuntimeInterference",
+    "kind": "DockerExec",
+    "severity": "critical",
+    "command": f"exec -it {POD} bash",
+    "binary": "/usr/bin/docker",
+    "container": POD,
+    "host": True,
+    "policy": "tamper-docker-cli",
+    "rental_interference": False,
+    "time": "2026-10-23T10:00:00Z",
+}
+
+
+@pytest.fixture
+def exec_enforced(monkeypatch):
+    monkeypatch.setattr(inspector.settings, "INSPECTOR_HOST_EXEC_ENFORCEMENT_ENABLED", True)
+
+
+@pytest.mark.asyncio
+async def test_host_exec_with_the_flag_off_is_only_logged(context_factory, caplog):
+    with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
+        result = await _run(context_factory, [HOST_EXEC])
+
+    assert result.passed is True
+    assert "inspector_host_write_passed" not in result.updates
+    logs = _logs(caplog, "INSPECTOR_HOST_EXEC")
+    assert len(logs) == 1 and logs[0]["enforced"] is False
+    assert logs[0]["execs"][0] == {
+        "kind": "DockerExec",
+        "command": f"exec -it {POD} bash",
+        "container": POD,
+        "time": "2026-10-23T10:00:00Z",
+    }
+
+
+@pytest.mark.asyncio
+async def test_host_exec_into_a_rented_pod_fails_the_node_when_enforced(
+    context_factory, exec_enforced, caplog
+):
+    with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
+        result = await _run(context_factory, [HOST_EXEC])
+
+    assert result.passed is False
+    assert result.updates["inspector_host_write_passed"] is False
+    assert "entered a rented pod" in result.event.impact
+    assert [log["enforced"] for log in _logs(caplog, "INSPECTOR_HOST_EXEC")] == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finding",
+    [
+        {**HOST_EXEC, "container": "pod_other"},
+        {**HOST_EXEC, "container": "my-sidecar"},
+        {**HOST_EXEC, "host": False},
+    ],
+)
+async def test_host_exec_into_a_non_rented_container_passes(
+    context_factory, exec_enforced, caplog, finding
+):
+    with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
+        result = await _run(context_factory, [finding])
+
+    assert result.passed is True
+    assert "inspector_host_write_passed" not in result.updates
+    assert _logs(caplog, "INSPECTOR_HOST_EXEC") == []

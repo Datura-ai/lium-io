@@ -258,6 +258,12 @@ class Settings(BaseSettings):
     INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
         env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
     )
+    # DAH-5058: on, a provider's host-side docker exec / attach / nsenter into a rented pod fails
+    # the Inspector check and zeroes the score (the same gate as a host write). Off: unchanged,
+    # logged as INSPECTOR_HOST_EXEC with enforced=false.
+    INSPECTOR_HOST_EXEC_ENFORCEMENT_ENABLED: bool = Field(
+        env="INSPECTOR_HOST_EXEC_ENFORCEMENT_ENABLED", default=False
+    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a

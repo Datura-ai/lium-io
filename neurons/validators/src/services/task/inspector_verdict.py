@@ -76,6 +76,8 @@ _PATH_SHAPED_KINDS = frozenset({"OverlayFsRead", "OverlayFsWrite", "DockerVolume
 _DOCKER_CONTROL_PLANE_KINDS = (
     frozenset(kind for kind in KNOWN_FINDING_KINDS if kind.startswith("Docker")) - _PATH_SHAPED_KINDS
 )
+# a provider's own entry into a container from the host: an exec, an attach, a setns (DAH-5058)
+HOST_ENTRY_KINDS = frozenset({"DockerExec", "DockerAttach", "NamespaceEnter"})
 RENTAL_VOLUME_TAG = "rental_volume"
 UNKNOWN_KIND = "unknown"
 _PAYLOAD_PREVIEW_CHARS = 160
@@ -363,3 +365,19 @@ def host_write_findings(
             continue
         (writes if finding.get("direction") == "write" else reads).append(finding)
     return writes, reads
+
+
+def host_exec_findings(
+    provider_findings: list[dict[str, Any]], rented_pod_ids: list[str]
+) -> list[dict[str, Any]]:
+    """The provider's own entries from the host (`host=true` exec / attach / nsenter) into one of
+    this rental's pods (DAH-5058). Read from the finding itself, so it needs no sensor verdict; an
+    entry into a container that is not a rented pod is not one."""
+    rented = set(rented_pod_ids)
+    return [
+        finding
+        for finding in provider_findings
+        if finding.get("host") is True
+        and _kind(finding) in HOST_ENTRY_KINDS
+        and pod_id_of(_named_container(finding) or "") in rented
+    ]
