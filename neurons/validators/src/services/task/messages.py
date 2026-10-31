@@ -515,23 +515,30 @@ class GpuLossHoldMessages:
         severity="error",
         # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
         category=AVAILABILITY_CATEGORY,
-        impact="The node is hidden and takes no new rentals until its GPUs read clean for the hold window "
-        "(see hold_until); an idle node scores 0 meanwhile, a rental already on it is not touched",
+        impact="The node is hidden and takes no new rentals until every GPU reads clean again and passes a load "
+        "test on every card; an idle node scores 0 meanwhile, a rental already on it is not touched",
         remediation="A card fell out of NVML (see faults, missing_uuids, nvml_error_code). Run `nvidia-smi` and "
         "`dmesg | grep -i xid` on the host; 'Unknown Error' or Xid 79 ('fallen off the bus') means the card must "
-        "be reseated, reset or replaced. The node is listed again once every card has read clean for the hold "
-        "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
-        "a node keeps the cards it was first verified with.",
+        "be reseated, reset or replaced. On the first check that sees every GPU again while the node is not "
+        "rented, every card is load-tested, and the node is listed again when they pass.",
     )
-    SET_REPLACED = MessageTemplate(
-        event="The node came back with a different set of GPUs",
+    # DAH-5393: same code as LOST (an availability error that is never silenced as our own outage)
+    POD_GPUS_GONE = MessageTemplate(
+        event="A rented pod on this node was made for GPUs the node no longer has",
         reason="GPU_LOST",
         severity="error",
         category=AVAILABILITY_CATEGORY,
-        impact="The new GPUs are verified and kept for this node, but it is hidden and takes no new rentals until "
-        "they read clean for the hold window (see hold_until); it scores 0 meanwhile",
-        remediation="Nothing to do, and do not remove or re-add the node: it is listed again on its own once all "
-        "its GPUs have been present for 2 hours. To avoid this, pass the same GPUs through on every host restart.",
+        impact="The node is hidden, takes no new rentals and scores 0 while the pod has none of its GPUs",
+        remediation="The node came back with other GPUs while a pod made for the old ones was running (see "
+        "missing_uuids). The pod cannot use the new cards until it is recreated; the node is verified on its new "
+        "cards on the first check after that, or after the rental ends.",
+    )
+    CLEAN_AGAIN = MessageTemplate(
+        event="Every GPU is listed again; each card is load-tested before the node is listed",
+        reason="GPU_LOST_CLEAN_AGAIN",
+        severity="info",
+        category="env",
+        impact="Proceed; the node is listed if every card passes the load test in this check",
     )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
@@ -588,6 +595,16 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Proceed; the recheck runs again next cycle.",
     )
+    # a node back from a GPU dropout: no listing until the every-card test has passed. GPU_LOST, an availability
+    # error: a failed cycle alone does not hide a node the backend still holds active, this entry does.
+    WAITING_AFTER_GPU_LOSS = MessageTemplate(
+        event="GPUs back; waiting for the load test on every card",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Not listed until every card has passed the load test; it runs again on the next check",
+        remediation="Nothing to do while every GPU stays visible; the test runs again on the next check.",
+    )
     PASSED = MessageTemplate(
         event="Post-rental GPU recheck passed",
         reason="POST_RENTAL_GPU_RECHECK_PASSED",
@@ -602,7 +619,7 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Score set to 0",
         remediation=(
-            "A GPU showed a fault during the last rental, and after it at least one card failed the "
+            "A GPU showed a fault (during a rental, or it dropped out), and after it at least one card failed the "
             "all-cards matmul or the kernel-fault probe. Check `nvidia-smi -q` and the host `dmesg` for NVRM "
             "Xid lines; reset the card (`nvidia-smi -r`) or reboot the host, replace a card that still fails, "
             "and wait one cycle."
@@ -714,17 +731,16 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
-    # Warn mode (GPU_ANCHOR_HARD_ENABLED off): the legacy verdict. Its what_we_saw carries `anchor_hard_would_be`
-    # (GPU_MISSING or ANCHOR_BROKEN) so the hard rule can be read from a week of rows before it is switched on.
+    # A set that lost or gained cards (a full set of other cards is re-anchored, not this). Its what_we_saw carries
+    # `anchor_hard_would_be`: GPU_MISSING (only anchored cards missing) or ANCHOR_BROKEN (other cards among them).
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
         severity="warning",
         category="env",
         impact="Verification reset; score set to 0",
-        remediation="Ensure the same physical GPUs remain attached and stable. If you replaced the cards on "
-        "purpose, remove the node in the portal and add it again: a node keeps the cards it was first "
-        "verified with.",
+        remediation="Ensure every GPU of the node stays attached and visible. A node that comes back with the same "
+        "number of GPUs, all of them other cards, is verified again on its own.",
     )
     # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
@@ -737,19 +753,6 @@ class GpuFingerprintMessages:
         remediation=(
             "One or more GPUs this node listed are not visible. Check `nvidia-smi -L` and `dmesg` on the host. "
             "The node scores again when the full set is back."
-        ),
-    )
-    # Hard mode: the scrape shows a GPU that is not in the anchored set (swap, added card, or a set
-    # replaced by a different one). Permanent for this executor id; re-registering the node is the only way out.
-    ANCHOR_BROKEN = MessageTemplate(
-        event="GPU set differs from the listed set",
-        reason="GPU_UUID_CHANGED",
-        severity="error",
-        category="env",
-        impact="Score 0 on every cycle for this node id; verification does not restart",
-        remediation=(
-            "A listed node keeps one fixed set of GPUs. To list a different set, re-register the node. "
-            "Uptime starts over; penalties stay."
         ),
     )
     UUID_OK = MessageTemplate(
