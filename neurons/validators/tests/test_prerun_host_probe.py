@@ -595,11 +595,13 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the fail-closed pid_max read every rental makes first, then the listing that finds the filler and the
-    # rm with its confirming listing in one command — the removal starts only once the host reads succeed
+    # the fail-closed pid_max read every rental makes first and the host RAM read that clamps its memory limit,
+    # then the listing that finds the filler and the rm with its confirming listing in one command — the
+    # removal starts only once the host reads succeed
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
+        "cat /proc/meminfo",
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
     ]
     assert _relisting_commands(ssh_client) == []
@@ -837,10 +839,10 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the fail-closed pid_max read every rental makes comes first; only then does the removal run (at SSH
-    # connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
+    # the fail-closed pid_max read every rental makes and the host RAM read come first; only then does the removal
+    # run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
-    assert _cmds(ssh_client)[:-1] == ["cat /proc/sys/kernel/pid_max", *commands]
+    assert _cmds(ssh_client)[:-1] == ["cat /proc/sys/kernel/pid_max", "cat /proc/meminfo", *commands]
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)

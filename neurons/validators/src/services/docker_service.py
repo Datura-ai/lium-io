@@ -3359,6 +3359,11 @@ class DockerService:
     def _rental_memory_gb(memory_gb: int | None, host_ram_kib: int | None, gpu_share: float = 1.0) -> int | None:
         """The rental's memory limit: the backend's, or host RAM less the host reserve when it sent none.
 
+        The backend's limit is clamped to the rental's GPU share of host RAM less the reserve: it is sized
+        from the specs the pod row was saved with, so a host whose RAM reads lower now would get a limit at
+        or above its RAM (or, split, co-tenant limits summing above it) and the renter could take the host
+        into a global OOM instead of hitting its own cgroup limit.
+
         A pod row saved before the backend sized RAM carries ram_total 0, which arrives as memory_gb 0 and
         used to mean no mem_limit: the renter could take every byte and the kernel OOM killer would pick
         sshd or the executor, taking the node offline mid-rental on the provider's account.
@@ -3368,14 +3373,15 @@ class DockerService:
         the share, two legacy zero-RAM pods on different GPUs of one host would each be capped near the
         full host RAM and could together exceed it, re-opening the OOM path this limit exists to close.
         """
-        if memory_gb or not host_ram_kib:
+        if not host_ram_kib:
             return memory_gb
         reserve_kib = max(
             settings.RENTAL_HOST_RAM_RESERVE_GB * _KIB_PER_GIB,
             host_ram_kib * settings.RENTAL_HOST_RAM_RESERVE_PERCENT / 100,
         )
         share = min(max(gpu_share, 0.0), 1.0)
-        return max(int(((host_ram_kib - reserve_kib) * share) // _KIB_PER_GIB), 1)
+        ceiling_gb = max(int(((host_ram_kib - reserve_kib) * share) // _KIB_PER_GIB), 1)
+        return min(memory_gb, ceiling_gb) if memory_gb else ceiling_gb
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
@@ -8527,33 +8533,35 @@ class DockerService:
                             "margin; refusing to start a rental"
                         )
 
-                # host RAM: needed only when the rental was sent without a memory limit, to size one.
-                # That is the legacy ram_total 0 pod rows AND the validator's own rental probe, whose
-                # _probe_payload sends no memory_gb — so the messages below say "a rental sent without
-                # a memory limit", not "legacy". Under host contention — the exact condition that
-                # delays this SSH probe — an unlimited rental lets the renter exhaust host RAM and OOM
-                # the executor/sshd, so refuse rather than fall through to no mem_limit.
-                host_ram_kib: int | None = None
+                # host RAM: sizes a rental sent without a memory limit, and clamps one that was sent
+                # (_rental_memory_gb) so it never reaches the host's RAM. A miss on a sent limit keeps
+                # it as before. Without one — the legacy ram_total 0 pod rows AND the validator's own
+                # rental probe, whose _probe_payload sends no memory_gb, so the messages below say "a
+                # rental sent without a memory limit", not "legacy" — a miss refuses: under host
+                # contention, the exact condition that delays this SSH probe, an unlimited rental lets
+                # the renter exhaust host RAM and OOM the executor/sshd.
+                current_step = "host_ram_kib"
+                host_ram_kib = await self._read_host_ram_kib(ssh_client)
                 rental_gpu_share = 1.0
-                if not payload.memory_gb:
-                    current_step = "host_ram_kib"
-                    host_ram_kib = await self._read_host_ram_kib(ssh_client)
-                    if host_ram_kib is None:
-                        raise RuntimeError(
-                            "host MemTotal could not be read; refusing to start a rental sent without a memory limit"
-                        )
-                    # A split-host rental gets its GPU share of host RAM, matching the backend's own
-                    # sizing (models.executor.pod_ram_total_kib). Two zero-RAM pods on one split host
-                    # must not each be capped near the whole host. Whole-node rentals keep share 1.0.
-                    if payload.gpu_uuids:
-                        current_step = "host_gpu_count"
-                        host_gpu_count = await self._read_host_gpu_count(ssh_client)
-                        if not host_gpu_count or len(payload.gpu_uuids) > host_gpu_count:
-                            raise RuntimeError(
-                                "host GPU count could not be read or is below the rented GPU count; "
-                                "refusing to start a split rental sent without a memory limit"
-                            )
+                if not payload.memory_gb and host_ram_kib is None:
+                    raise RuntimeError(
+                        "host MemTotal could not be read; refusing to start a rental sent without a memory limit"
+                    )
+                # A split-host rental gets its GPU share of host RAM, matching the backend's own
+                # sizing (models.executor.pod_ram_total_kib), whether it sizes or clamps the limit: two
+                # pods on one split host must not each be capped near the whole host. Whole-node
+                # rentals keep share 1.0. A miss refuses a limitless rental; a sent limit keeps the
+                # host-wide clamp.
+                if host_ram_kib is not None and payload.gpu_uuids:
+                    current_step = "host_gpu_count"
+                    host_gpu_count = await self._read_host_gpu_count(ssh_client)
+                    if host_gpu_count and len(payload.gpu_uuids) <= host_gpu_count:
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
+                    elif not payload.memory_gb:
+                        raise RuntimeError(
+                            "host GPU count could not be read or is below the rented GPU count; "
+                            "refusing to start a split rental sent without a memory limit"
+                        )
 
                 # DAH-3980 overlaps the filler's irreversible rm with the image inspect/pull. It must not
                 # precede the fail-closed reads above: a probe that then refused (a transient /proc read, or
