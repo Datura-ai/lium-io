@@ -36,6 +36,7 @@ from services.task.service import TaskService
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
 from tests.test_local_verify import _FakeVerifyXValidator, matmul_service, matmul_stdout
+from tests.test_verifyx_cold_sample_retry import _idle_now
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
 UUID = "exec-shadow"
@@ -467,6 +468,7 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
         state=build_state(specs=SPECS, rented_data=rented),
     )
     stored_before = rented.network_ema[UUID].model_dump()
+    _idle_now(todays_ctx.services)
     checked = await VerifyXCheck().run(todays_ctx)
     if checked.passed and checked.updates["state"].verifyx_cold_retry is not None:
         # the cold retry, last before scoring, gives today's verdict on a cold first sample

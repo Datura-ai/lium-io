@@ -25,7 +25,7 @@ from tests.test_cached_template_verification import (
     _result,
     _ssh_seq,
 )
-from tests.test_verifyx_cold_sample_retry import _known, _never_measured, _probe, _ProbeSequence
+from tests.test_verifyx_cold_sample_retry import _idle_now, _known, _never_measured, _probe, _ProbeSequence
 
 IMAGE_CHECK = "executor.validate.cached_template"
 
@@ -171,6 +171,7 @@ async def _cycle_with_the_image_check(context_factory, probes, rented_data, redi
         ssh=ssh,
         ssh_pub_keys=[],
     )
+    _idle_now(ctx.services)
     pipeline = Pipeline([VerifyXCheck(), CachedTemplateVerificationCheck(), VerifyXColdRetryCheck()], AsyncMock())
     ok, events, last = await pipeline.run(ctx)
     return ok, events, await _published_network(last, success=ok, event=events[-1])

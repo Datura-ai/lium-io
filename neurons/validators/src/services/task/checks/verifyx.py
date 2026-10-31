@@ -554,6 +554,27 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
+async def _not_idle_now(ctx: Context) -> str | None:
+    """Why the cold retry must not run now, or None: a customer pod on the node (in the cycle-start
+    snapshot, as refreshed by earlier checks, or in the backend's answer now), a rental being
+    created, or a rental state that cannot be read. A filler alone keeps the node eligible, as for
+    the first sample."""
+    uuid = str(ctx.executor.uuid)
+    try:
+        if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, uuid):
+            return "rental_create_in_progress"
+        fresh = await ctx.services.backend.get_rented_executors_now()
+    except Exception:  # noqa: BLE001 — unknown counts as busy
+        return "rental_state_unavailable"
+    if fresh is None:
+        return "rental_state_unavailable"
+    for rented_data in (ctx.state.rented_data, fresh):
+        rented = rented_data.executors.get(uuid) if rented_data else None
+        if rented is not None and rented.pods:
+            return "rented"
+    return None
+
+
 def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
     """Why this cycle's VerifyX sample must not move the published EMA, or None.
 
@@ -659,6 +680,10 @@ class VerifyXColdRetryCheck:
                 ),
             )
         cleared = {"state": replace(ctx.state, verifyx_cold_retry=None)}
+        busy = await _not_idle_now(ctx)
+        if busy is not None:
+            # a renter may be on the node now: never load it with a second RAM, disk and network test
+            return self._first_sample_stands(ctx, pending, cleared, {"skipped": busy})
         budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
         if budget < MIN_COLD_RETRY_SECONDS:
             logger.info(

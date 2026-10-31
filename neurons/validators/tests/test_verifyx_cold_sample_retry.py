@@ -3,9 +3,11 @@
 better one."""
 
 import asyncio
+import dataclasses
 import os
 import stat
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -65,8 +67,17 @@ def _ctx(context_factory, service, rented_data):
     )
 
 
-async def _run(ctx):
-    """VerifyXCheck, then (as the pipeline does, last before scoring) VerifyXColdRetryCheck."""
+def _idle_now(services, fresh=None, creating=False):
+    """The backend's rental list now (no pod, no filler unless given) and no rental being created."""
+    services.backend.get_rented_executors_now = AsyncMock(return_value=fresh or _never_measured())
+    services.redis.renting_in_progress = AsyncMock(return_value=creating)
+
+
+async def _run(ctx, idle=True):
+    """VerifyXCheck, then (as the pipeline does, last before scoring) VerifyXColdRetryCheck, on a
+    node still idle then unless `idle` is False (the test set the rental state itself)."""
+    if idle:
+        _idle_now(ctx.services)
     first = await VerifyXCheck().run(ctx)
     if not first.passed:
         return first
@@ -384,3 +395,48 @@ async def test_the_retry_only_gets_the_time_the_other_checks_left(
     assert service.calls == (2 if retried else 1)
     assert result.passed is retried
     assert timeouts == ([left_before_score - verifyx_check.COLD_RETRY_MARGIN_SECONDS] if retried else [])
+
+
+def _pod_on(uuid):
+    pod = SimpleNamespace(container_name="container_1", rented_ports=[])
+    return SimpleNamespace(pods=[pod])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "retried"),
+    [("idle", True), ("filler_only", True), ("newly_rented", False), ("seen_rented_by_a_check", False),
+     ("create_in_progress", False), ("unavailable", False), ("lookup_failed", False)],
+)
+async def test_the_retry_runs_only_on_a_node_still_idle(context_factory, state, retried):
+    # PR review, 31 Oct: a customer pod started after the first 88 Mbps sample must not get a second
+    # RAM, disk and network test beside its workload. Busy or unknown: the first sample decides.
+    service = _ProbeSequence(_probe(88.0), _probe(760.0))
+    ctx = _ctx(context_factory, service, _never_measured())
+    fresh = _never_measured()
+    if state == "filler_only":
+        fresh = RentedExecutorsResponse(
+            executors={}, banned_guids=[], network_ema={}, all_filler_containers_by_executor={EXECUTOR: ["filler_1"]}
+        )
+    if state == "newly_rented":
+        fresh = _never_measured().model_copy(update={"executors": {EXECUTOR: _pod_on(EXECUTOR)}})
+    _idle_now(ctx.services, fresh=fresh, creating=state == "create_in_progress")
+    if state == "unavailable":
+        ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=None)
+    if state == "lookup_failed":
+        ctx.services.redis.renting_in_progress = AsyncMock(side_effect=ConnectionError("redis down"))
+    first = await VerifyXCheck().run(ctx)
+    ctx = ctx.model_copy(update=first.updates)
+    if state == "seen_rented_by_a_check":  # e.g. CapabilityCheck refreshed the snapshot
+        rented = ctx.state.rented_data.model_copy(update={"executors": {EXECUTOR: _pod_on(EXECUTOR)}})
+        ctx = ctx.model_copy(update={"state": dataclasses.replace(ctx.state, rented_data=rented)})
+
+    result = await VerifyXColdRetryCheck().run(ctx)
+
+    assert service.calls == (2 if retried else 1)
+    assert result.passed is retried
+    if not retried:
+        assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+        assert result.event.what_we_saw["cold_sample_retry"]["skipped"] in {
+            "rented", "rental_create_in_progress", "rental_state_unavailable"
+        }
