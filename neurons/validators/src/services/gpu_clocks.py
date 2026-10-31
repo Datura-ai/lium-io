@@ -196,16 +196,17 @@ async def lock_pod_gpu_clocks(
         ok = all(f is None for f in failures.values())
         return GpuClocksReport(ok=ok, error_code=None if ok else GpuResetErrorCode.ClockLockNotSupported, gpus=gpus)
 
-    # record first, as the power cap does: never change a GPU without a stored way back
+    # the pod's index first, so its delete resets every GPU this request may lock (a GPU never locked costs one -rgc)
     raw_index = await redis.get(_pod_key(pod_id))
     pod_uuids = list(dict.fromkeys([*(json.loads(raw_index) if raw_index else []), *targets]))
-    for uuid in targets:
-        record = {"gpu_uuid": uuid, "pod_id": pod_id, "executor_id": executor_id, "locked_at": time.time()}
-        await redis.set(_lock_key(uuid), json.dumps(record))
     await redis.set(_pod_key(pod_id), json.dumps(pod_uuids))
 
     gpus = [
-        await _lock_one_gpu(runner, uuid, index_by_uuid[uuid], pod_gpu_uuids, min_mhz, max_mhz) for uuid in targets
+        await _lock_one_gpu(
+            runner, redis, uuid, index_by_uuid[uuid], pod_gpu_uuids, min_mhz, max_mhz, pod_id=pod_id,
+            executor_id=executor_id,
+        )
+        for uuid in targets
     ]
     # a failed lock keeps its record: the pod's delete still runs -rgc on it, which is harmless
     ok = all(gpu.result == "locked" for gpu in gpus)
@@ -214,13 +215,17 @@ async def lock_pod_gpu_clocks(
 
 async def _lock_one_gpu(
     runner: SSHCommandRunner,
+    redis: RedisService,
     uuid: str,
     index: int,
     pod_gpu_uuids: set[str],
     min_mhz: int | None,
     max_mhz: int | None,
+    *,
+    pod_id: str,
+    executor_id: str,
 ) -> GpuClockOutcome:
-    """-pm 1, clamp to the GPU's supported clocks, -lgc, read the clock back."""
+    """-pm 1, clamp to the GPU's supported clocks, record the lock, -lgc, read the clock back."""
     outcome = GpuClockOutcome(index=index, uuid=uuid, result="failed")
     # best-effort, as in gpu_power_limit: without persistence the driver drops the lock on an idle GPU.
     # Intended: -rgc leaves persistence on (it only keeps the driver loaded; the provider's settings are unchanged)
@@ -233,6 +238,10 @@ async def _lock_one_gpu(
         outcome.detail = "the GPU reports no supported graphics clocks"
         return outcome
     low, high = clamp_range(min_mhz, max_mhz, supported_mhz)
+    # record first, as the power cap does: never change a GPU without a stored way back. Only right before the
+    # -lgc, so a GPU this request never changes gets no record a create would then refuse on (review F-46)
+    record = {"gpu_uuid": uuid, "pod_id": pod_id, "executor_id": executor_id, "locked_at": time.time()}
+    await redis.set(_lock_key(uuid), json.dumps(record))
     locked = await _run(runner, build_clock_command("lock", uuid, pod_gpu_uuids=pod_gpu_uuids, min_mhz=low, max_mhz=high))
     if locked.exit_code != 0:
         outcome.detail = _tail(locked.stdout or locked.stderr) or "nvidia-smi -lgc failed"
@@ -263,11 +272,15 @@ async def reset_leftover_clock_locks(
     without a lock record, so a lost record never hands a renter another's locked clocks (as
     raise_low_power_limits_to_default does for power). Answers the GPUs with a lock record whose reset failed
     (their records stay): the create must not start on them. A failed reset of a GPU with no record (one that
-    does not support -rgc, never locked here) is not counted."""
+    does not support -rgc, never locked here) is not counted; while Redis cannot say which GPUs have a record,
+    every failed reset counts."""
     if not gpu_uuids:
         host = await _run(runner, HOST_GPUS_COMMAND)
         gpu_uuids = [gpu.uuid for gpu in parse_host_gpus(host.stdout or "")]
-    recorded = await clock_locked_gpu_uuids(redis, gpu_uuids)
+    try:
+        recorded = {uuid for uuid in gpu_uuids if isinstance(await redis.get(_lock_key(uuid)), (str, bytes))}
+    except Exception:
+        recorded = set(gpu_uuids)  # unknown (review): every failed reset counts, never a silent pass
     try:
         failures = await _reset_gpus(runner, redis, gpu_uuids)
     except Exception:

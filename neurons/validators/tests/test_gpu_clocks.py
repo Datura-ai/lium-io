@@ -145,10 +145,22 @@ async def test_a_refused_lock_is_reported_and_its_record_kept_for_teardown():
 
 
 @pytest.mark.asyncio
-async def test_no_supported_clocks_fails_without_running_lgc():
-    host = FakeHost(supported="")
-    report, _ = await _lock(host)
+async def test_no_supported_clocks_fails_without_running_lgc_and_leaves_no_lock_record():
+    host = FakeHost(supported="", rgc_exit=1)
+    report, redis = await _lock(host)
     assert not report.ok and not any(" -lgc" in c for c in host.commands)
+    # nothing was changed, so nothing for a create to refuse on, even where -rgc is unsupported too
+    assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
+    assert await reset_pod_clock_locks(host, redis, "pod1") == 0
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_create_reset_counts_every_failed_reset_while_redis_cannot_say_which_gpus_are_recorded():
+    host, redis = FakeHost(rgc_exit=1), FakeRedis()
+    redis.get = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]
 
 
 @pytest.mark.asyncio

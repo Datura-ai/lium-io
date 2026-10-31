@@ -109,6 +109,13 @@ def no_docker_hub_digest_on_rent_path():
 
 
 @pytest.fixture(autouse=True)
+def no_leftover_clock_locks_on_create_path():
+    """create_container resets leftover GPU clock locks (Redis + -rgc); test_gpu_clocks.py covers that step."""
+    with patch("services.docker_service.reset_leftover_clock_locks", AsyncMock(return_value=[])) as reset:
+        yield reset
+
+
+@pytest.fixture(autouse=True)
 def no_kept_upload_probes_carried_between_tests():
     """The VerifyX check counts kept upload probes per (hotkey, uuid) for the process; tests share both."""
     yield
