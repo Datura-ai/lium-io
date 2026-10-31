@@ -28,6 +28,8 @@ POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 GPU_RESET_PENDING_KIND = "gpu_reset"
+# DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
+GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
 # DAH-4658: the pod of a renter GPU reset that ended a moment ago, per node, for a short TTL
 GPU_RESET_RECENT_PREFIX = "gpu_reset_recent"
 # DAH-4658: a rented node's last scored result, carried into a cycle where the renter's own GPU reset hides the cards

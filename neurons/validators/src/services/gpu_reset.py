@@ -105,6 +105,39 @@ def container_gpu_uuids(device_requests: list[dict] | None, host_gpus: list[Host
     return list(dict.fromkeys(uuids))
 
 
+@dataclass
+class PodGpus:
+    ordered: list[str]  # the container's GPUs in pod order
+    requested: list[str]  # the ones gpu_indices picks (None: the backend's)
+    index_by_uuid: dict[str, int]  # uuid -> pod index
+
+
+def pod_gpus(
+    device_requests: list[dict] | None,
+    host_gpus: list[HostGpu],
+    pod_gpu_uuids: list[str],
+    gpu_indices: list[int] | None,
+) -> PodGpus:
+    """The one numbering the reset and the clock lock share. Pod index = the container's GPUs by host PCI bus
+    id, the 0..n-1 order nvidia-smi shows inside the pod. Refuses a backend GPU the container was not given,
+    or an index it lacks."""
+    host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
+    container_uuids = [uuid for uuid in container_gpu_uuids(device_requests, host_gpus) if uuid in host_by_uuid]
+    missing = [uuid for uuid in pod_gpu_uuids if uuid not in container_uuids]
+    if not container_uuids or not pod_gpu_uuids or missing:
+        raise GpuResetRefused(
+            GpuResetErrorCode.GpuNotInContainer, f"GPUs not given to the container: {missing or pod_gpu_uuids}"
+        )
+    ordered = sorted(container_uuids, key=lambda uuid: host_by_uuid[uuid].bus_id)
+    index_by_uuid = {uuid: index for index, uuid in enumerate(ordered)}
+    if gpu_indices is None:
+        # all of the pod's GPUs: the backend's, also in a `--gpus all` container that sees more of the host
+        return PodGpus(ordered, [uuid for uuid in ordered if uuid in pod_gpu_uuids], index_by_uuid)
+    if any(index < 0 or index >= len(ordered) for index in gpu_indices):
+        raise GpuResetRefused(GpuResetErrorCode.GpuNotInContainer, f"no pod GPU at index {gpu_indices}")
+    return PodGpus(ordered, [ordered[index] for index in sorted(set(gpu_indices))], index_by_uuid)
+
+
 def parse_nvlink_peers(topology: str, host_gpus: list[HostGpu]) -> dict[str, set[str]]:
     """uuid -> the uuids it reaches over NVLink (`NV<n>` cells of `nvidia-smi topo -m`)."""
     uuid_by_index = {gpu.index: gpu.uuid for gpu in host_gpus}
@@ -228,22 +261,8 @@ async def _precheck(
     if host_gpus_result.exit_code != 0 or not host_gpus:
         raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "nvidia-smi listed no GPU on the host")
     host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
-
-    container_uuids = [uuid for uuid in container_gpu_uuids(device_requests, host_gpus) if uuid in host_by_uuid]
-    missing = [uuid for uuid in pod_gpu_uuids if uuid not in container_uuids]
-    if not container_uuids or missing:
-        raise GpuResetRefused(
-            GpuResetErrorCode.GpuNotInContainer, f"GPUs not given to the container: {missing or pod_gpu_uuids}"
-        )
-    # pod GPU index = the container's GPUs by host PCI bus id: the 0..n-1 order nvidia-smi shows in the pod
-    ordered = sorted(container_uuids, key=lambda uuid: host_by_uuid[uuid].bus_id)
-    index_by_uuid = {uuid: index for index, uuid in enumerate(ordered)}
-    if gpu_indices is None:
-        requested = list(ordered)
-    else:
-        if any(index < 0 or index >= len(ordered) for index in gpu_indices):
-            raise GpuResetRefused(GpuResetErrorCode.GpuNotInContainer, f"no pod GPU at index {gpu_indices}")
-        requested = [ordered[index] for index in sorted(set(gpu_indices))]
+    gpus = pod_gpus(device_requests, host_gpus, pod_gpu_uuids, gpu_indices)
+    ordered, requested, index_by_uuid = gpus.ordered, gpus.requested, gpus.index_by_uuid
 
     targets = await _widen_targets_to_nvlink_peers(runner, requested, ordered, host_gpus)
     # on the final set: an NVLink peer reset with the requested GPUs must not be MIG either
@@ -258,7 +277,7 @@ async def _precheck(
         raise GpuResetRefused(
             GpuResetErrorCode.GpuInUseOutsidePod, f"processes outside the pod use the GPUs: {outside}"
         )
-    return _Plan(container_id, container_uuids, targets, index_by_uuid, widened=set(targets) != set(requested))
+    return _Plan(container_id, ordered, targets, index_by_uuid, widened=set(targets) != set(requested))
 
 
 async def _widen_targets_to_nvlink_peers(

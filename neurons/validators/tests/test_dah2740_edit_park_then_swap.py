@@ -110,9 +110,14 @@ async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_
 
 @pytest.mark.asyncio
 async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
+    from services import gpu_clocks
+
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
+    # the real clock-lock safety net (conftest stubs it): its -rgc is one of the host commands
+    monkeypatch.setattr("services.docker_service.reset_leftover_clock_locks", gpu_clocks.reset_leftover_clock_locks)
+    monkeypatch.setattr(svc.redis_service, "get", AsyncMock(return_value=None), raising=False)  # no lock records
 
     name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
 
@@ -132,6 +137,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # DAH-4663: the clock-lock safety net resets the pod's GPUs before the create
+        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         host_key,

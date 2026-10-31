@@ -48,6 +48,8 @@ from payload_models.payloads import (
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
     InstallJupyterServerRequest,
+    LockPodGpuClocksRequest,
+    PodGpuClocksResult,
     PodGpuResetResult,
     ResetPodGpuRequest,
     JupyterServerInstalled,
@@ -1075,7 +1077,8 @@ class ComputeClient:
         | BackupContainerRequest
         | RestoreContainerRequest
         | InstallJupyterServerRequest
-        | ResetPodGpuRequest,
+        | ResetPodGpuRequest
+        | LockPodGpuClocksRequest,
     ):
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
@@ -1197,6 +1200,7 @@ class ComputeClient:
         | RestoreContainerRequest
         | InstallJupyterServerRequest
         | ResetPodGpuRequest
+        | LockPodGpuClocksRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -1368,6 +1372,13 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: PodGpuResetResult = await self.miner_service.handle_container(job_request)
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, LockPodGpuClocksRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: PodGpuClocksResult = await self.miner_service.handle_container(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)

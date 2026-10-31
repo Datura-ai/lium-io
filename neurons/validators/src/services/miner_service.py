@@ -53,6 +53,8 @@ from payload_models.payloads import (
     GpuResetErrorCode,
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
+    LockPodGpuClocksRequest,
+    PodGpuClocksResult,
     PodGpuResetResult,
     ResetPodGpuRequest,
     WorkloadKind,
@@ -1442,6 +1444,19 @@ class MinerService:
                 else GpuResetErrorCode.ExecutorUnreachable,
                 detail=headline,
             )
+        elif isinstance(payload, LockPodGpuClocksRequest):
+            # nothing on the host changed: the request never reached the executor
+            return PodGpuClocksResult(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                request_id=payload.request_id,
+                ok=False,
+                error_code=GpuResetErrorCode.OperationInProgress
+                if error_code == FailedContainerErrorCodes.RentingInProgress
+                else GpuResetErrorCode.ExecutorUnreachable,
+            )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -2419,6 +2434,8 @@ class MinerService:
                     result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, ResetPodGpuRequest):
                     result = await docker_service.reset_pod_gpus(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, LockPodGpuClocksRequest):
+                    result = await docker_service.lock_pod_gpu_clocks(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, BackupContainerRequest):
                     result = await self.handle_backup_container_req(executor, payload, ssh_pkey, docker_service)
                 elif isinstance(payload, RestoreContainerRequest):

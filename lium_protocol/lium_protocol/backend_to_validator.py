@@ -41,6 +41,8 @@ class BackendMessageType(enum.Enum):
     GetEstimateRequest = "GetEstimateRequest"
     # 1.16.0: reset a running pod's GPUs; the validator answers with PodGpuResetResult
     ResetPodGpuRequest = "ResetPodGpuRequest"
+    # 1.19.0: lock or reset a running pod's GPU clocks; the validator answers with PodGpuClocksResult
+    LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -312,6 +314,23 @@ class ResetPodGpuRequest(ContainerRequest):
     request_id: str
     # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
     local_volume_path: str | None = None
+
+
+@BACKEND_MESSAGES.register
+class LockPodGpuClocksRequest(ContainerRequest):
+    """1.19.0: the renter asked to lock the graphics clocks of their running pod's GPUs to
+    `[min_mhz, max_mhz]` (None = the GPU's own bound; clamped to its supported clocks), or with `reset`
+    to give them back to the driver. `gpu_uuids` and `gpu_indices` as in `ResetPodGpuRequest`. Answered
+    by `validator_to_backend.PodGpuClocksResult` with the same `request_id`."""
+
+    message_type: BackendMessageType = BackendMessageType.LockPodGpuClocksRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    min_mhz: int | None = None
+    max_mhz: int | None = None
+    reset: bool = False
+    request_id: str
 
 
 @BACKEND_MESSAGES.register

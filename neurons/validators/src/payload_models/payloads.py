@@ -198,6 +198,7 @@ class ContainerRequestType(enum.Enum):
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
     ResetPodGpuRequest = "ResetPodGpuRequest"
+    LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
 
 
 class ForcedValidationCycleRequest(BaseModel):
@@ -441,6 +442,20 @@ class ResetPodGpuRequest(ContainerBaseRequest):
     local_volume_path: str | None = None
 
 
+class LockPodGpuClocksRequest(ContainerBaseRequest):
+    """DAH-4663: lock (or with reset, release) a running pod's GPU clocks; answered by PodGpuClocksResult
+    (lium_protocol 1.19.0)."""
+
+    message_type: ContainerRequestType = ContainerRequestType.LockPodGpuClocksRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    min_mhz: int | None = None
+    max_mhz: int | None = None
+    reset: bool = False
+    request_id: str
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -520,6 +535,7 @@ class ContainerResponseType(enum.Enum):
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
     PodGpuResetResult = "PodGpuResetResult"
+    PodGpuClocksResult = "PodGpuClocksResult"
 
 
 class DeliveryStamps(BaseModel):
@@ -823,6 +839,7 @@ class GpuResetErrorCode(enum.Enum):
     ContainerNotFound = "ContainerNotFound"
     OperationInProgress = "OperationInProgress"
     ExecutorUnreachable = "ExecutorUnreachable"
+    ClockLockNotSupported = "ClockLockNotSupported"
 
 
 class GpuResetOutcome(BaseModel):
@@ -839,6 +856,24 @@ class PodGpuResetResult(ContainerBaseResponse):
     error_code: GpuResetErrorCode | None = None
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
+    detail: str | None = None
+
+
+class GpuClockOutcome(BaseModel):
+    index: int
+    uuid: str
+    result: Literal["locked", "reset", "failed"]
+    applied_min_mhz: int | None = None
+    applied_max_mhz: int | None = None
+    detail: str | None = None
+
+
+class PodGpuClocksResult(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodGpuClocksResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    gpus: list[GpuClockOutcome] = []
     detail: str | None = None
 
 
