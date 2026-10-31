@@ -2357,10 +2357,8 @@ class GpuKernelCountMessages:
 
 class ProviderSideLoadMessages:
     """DAH-2734 — the CPU/disk twin of the foreign-GPU gate: a provider who runs another
-    subnet's miner on a listed machine sells capacity he already uses himself. Shadow
-    (without enforcement) renders LOAD_ABOVE_LIMIT as a
-    warning and keeps passed=True; only PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED zeroes the
-    score, and only for the CPU half — a disk figure above the limit is reported, never
+    subnet's miner on a listed machine sells capacity he already uses himself. LOAD_ABOVE_LIMIT
+    zeroes the score only for the CPU half — a disk figure above the limit is reported, never
     scored, because it is read once and carries every docker category nobody enumerated."""
 
     LOAD_OK = MessageTemplate(
