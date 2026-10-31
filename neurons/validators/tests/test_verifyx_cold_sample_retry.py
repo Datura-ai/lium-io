@@ -3,12 +3,16 @@
 better one."""
 
 import asyncio
+import os
+import stat
+from types import SimpleNamespace
 
 import pytest
 
 from neurons.validators.src.services.task.checks import verifyx as verifyx_check
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
+from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
 from tests.helpers import build_context_config, build_services, build_state
@@ -31,8 +35,11 @@ class _ProbeSequence:
         self._responses = list(responses)
         self.calls = 0
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+    ):
         self.calls += 1
+        self.run_dir = run_dir
         return self._responses.pop(0)
 
 
@@ -188,7 +195,8 @@ class _TimedProbeSequence(_ProbeSequence):
             await asyncio.sleep(self.retry_s)
         return response
 
-    async def kill_remote_verifyx(self, shell, executor_info, default_extra):
+    async def kill_remote_verifyx(self, shell, run_dir, default_extra):
+        assert run_dir == self.run_dir  # the retry's own scratch dir and PID, nothing else
         self.kills += 1
 
 
@@ -239,3 +247,65 @@ async def test_an_outer_cancel_during_the_retry_still_cancels_the_task(context_f
     with pytest.raises(asyncio.CancelledError):
         await task
     assert service.kills == 0
+
+
+class _LocalShell:
+    """Runs the 'SSH' commands in a local bash, in `home` (the login dir)."""
+
+    def __init__(self, home):
+        self.ssh_client = self
+        self.home = home
+
+    async def run(self, command, timeout=None):
+        proc = await asyncio.create_subprocess_shell(
+            command, cwd=self.home, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        return SimpleNamespace(stdout=out.decode(), stderr=err.decode(), exit_status=proc.returncode)
+
+
+def _fake_python(tmp_path, body: str):
+    path = tmp_path / "python"
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return SimpleNamespace(python_path=str(path), root_dir=str(tmp_path / "app"))
+
+
+@pytest.mark.asyncio
+async def test_a_retry_run_cleans_its_scratch_dir_and_keeps_its_exit_status(tmp_path):
+    executor = _fake_python(tmp_path, "touch temp_1.dat; echo answer; exit 3")
+    service = VerifyXValidationService()
+    command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="c"), "lib", ".vx-run")
+
+    capture = await service._run_ssh_command(_LocalShell(tmp_path), command)
+
+    assert (capture.stdout.strip(), capture.exit_status) == ("answer", 3)
+    assert not (tmp_path / ".vx-run").exists()
+
+
+@pytest.mark.asyncio
+async def test_killing_a_cut_off_retry_during_the_disk_test_spares_other_processes(tmp_path):
+    # the disk test writes ./temp_<ts>.dat and removes it only when it finishes; SIGKILL skips that
+    executor = _fake_python(tmp_path, "touch temp_1.dat; exec sleep 60")
+    service = VerifyXValidationService()
+    shell = _LocalShell(tmp_path)
+    # the same command line in another container (the executor shares the host PID namespace)
+    decoy = await asyncio.create_subprocess_exec(
+        executor.python_path, f"{executor.root_dir}/src/verifyx_executor.py", "--seed", "1", cwd=tmp_path
+    )
+    command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="c"), "lib", ".vx-run")
+    run = asyncio.create_task(service._run_ssh_command(shell, command))
+    while not (tmp_path / ".vx-run" / "temp_1.dat").exists() or not (tmp_path / ".vx-run" / "pid").exists():
+        await asyncio.sleep(0.05)
+    pid = int((tmp_path / ".vx-run" / "pid").read_text())
+
+    await service.kill_remote_verifyx(shell, ".vx-run", {})
+
+    capture = await asyncio.wait_for(run, 10)
+    assert capture.exit_status == 137
+    assert not (tmp_path / ".vx-run").exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert decoy.returncode is None
+    decoy.kill()
+    await decoy.wait()

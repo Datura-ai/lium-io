@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -172,6 +173,7 @@ class VerifyXCheck:
             # unchanged: one of the two samples must clear it.
             # The estimate does not bound the retry itself (its SSH timeout is 600 s): cut it at the
             # deadline less the reserve and judge on the first sample. An outer cancel still propagates.
+            run_dir = f".verifyx-retry-{secrets.token_hex(8)}"
             try:
                 retry = await asyncio.wait_for(
                     verifyx_service.validate_verifyx_and_process_job(
@@ -179,13 +181,14 @@ class VerifyXCheck:
                         executor_info=ctx.executor,
                         default_extra=ctx.default_extra,
                         machine_spec=specs,
+                        run_dir=run_dir,
                         **sizing,
                     ),
                     timeout=task_seconds_left(ctx) - COLD_RETRY_RESERVE_SECONDS,
                 )
             except TimeoutError:
                 retry = None
-                await verifyx_service.kill_remote_verifyx(ctx.services.shell, ctx.executor, ctx.default_extra)
+                await verifyx_service.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra)
             first_speed = _download_speed(result)
             retry_speed = _download_speed(retry) if retry is not None else None
             use_retry = (
