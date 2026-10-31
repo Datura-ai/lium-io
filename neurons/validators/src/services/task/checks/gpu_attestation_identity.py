@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import json
 import logging
+import re
 import secrets
 import shlex
 from functools import cache
@@ -18,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from core.config import settings
+from core.utils import _m
 from services.redis_service import RedisWrites
 
 from ..messages import GpuAttestationIdentityMessages as Msg, render_message
@@ -197,6 +199,44 @@ def host_slots(hw_by_uuid: dict[str, dict]) -> list[str]:
     return sorted(slots) if hw_by_uuid and all(hw.get("pci") for hw in hw_by_uuid.values()) else []
 
 
+def vbios_below(seen, minimum: str) -> bool | None:
+    """Whether `seen` is below `minimum`, comparing the dotted hex fields in order; an "XX" field in `minimum` matches
+    any value and the comparison goes on. None when `seen` does not parse as the same number of hex fields."""
+    try:
+        fields = [int(f, 16) for f in seen.strip().split(".")]
+    except (AttributeError, ValueError):
+        return None
+    floor = minimum.split(".")
+    if len(fields) != len(floor):
+        return None
+    for got, need in zip(fields, floor):
+        if need.upper() == "XX":
+            continue
+        if got != int(need, 16):
+            return got < int(need, 16)
+    return False
+
+
+def cc_vbios_findings(hw_by_uuid: dict[str, dict], rows: list[dict], minimums: dict[str, str]) -> dict[str, dict]:
+    """Per GPU of a multi-GPU node in Confidential Computing mode: a B200/B300 (any model in `minimums`) whose VBIOS
+    is below NVIDIA's minimum VBIOS for CC in R595 ("below") or does not parse ("unparseable"). NVML hands out a card's
+    CC certificate only with CC on, so one card with cert_rc 0 marks the node as CC."""
+    if len(hw_by_uuid) < 2 or not any(row.get("cert_rc") == 0 for row in rows):
+        return {}
+    found = {}
+    for gpu_uuid, hw in hw_by_uuid.items():
+        name = hw.get("name") or ""
+        minimum = next((m for model, m in minimums.items() if re.search(rf"\b{re.escape(model)}\b", name)), None)
+        if minimum and (below := vbios_below(hw.get("vbios"), minimum)) is not False:
+            found[gpu_uuid] = {
+                "name": name,
+                "vbios": hw.get("vbios"),
+                "minimum": minimum,
+                "status": "below" if below else "unparseable",
+            }
+    return found
+
+
 class GpuAttestationIdentityCheck:
     """Pin each GPU to the identity NVIDIA signed into the card (DAH-4551).
 
@@ -218,6 +258,9 @@ class GpuAttestationIdentityCheck:
     listing several models, a serial under a second UUID, or a host whose every UUID is new while its slots
     (bus id + model) are the same, is a finding. VBIOS changes are recorded only (legit updates). A root
     provider can fake all of these consistently: this catches inconsistent fakes, it is not proof.
+
+    On a multi-GPU node in CC mode, a B200/B300 whose VBIOS is below NVIDIA's minimum VBIOS for CC in R595
+    (CC_VBIOS_MINIMUMS) is logged, and fails the node under CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED (on by default).
     """
 
     check_id = "gpu.validate.attestation_identity"
@@ -342,6 +385,18 @@ class GpuAttestationIdentityCheck:
         except Exception:
             logger.warning("gpu identity record unavailable", exc_info=True, extra=ctx.default_extra)
 
+        cc_vbios = cc_vbios_findings(hw_by_uuid, rows, settings.CC_VBIOS_MINIMUMS)
+        cc_vbios_fails = settings.CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED and any(
+            v["status"] == "below" for v in cc_vbios.values()
+        )
+        if cc_vbios:
+            logger.warning(
+                _m(
+                    "CC multi-GPU node: GPU VBIOS below NVIDIA's minimum or unparseable",
+                    extra={**ctx.default_extra, "cc_vbios": cc_vbios, "enforced": cc_vbios_fails},
+                )
+            )
+
         enforce = settings.GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED
         findings = list(dict.fromkeys(findings))
         what = {
@@ -353,9 +408,14 @@ class GpuAttestationIdentityCheck:
             "hardware": hw_by_uuid,
             "findings": findings,
             "enforced": enforce,
+            **({"cc_vbios": cc_vbios} if cc_vbios else {}),
         }
+        # non-fatal on a live rental, so calculate_scores reads this flag to zero the score
+        cc_updates = {"cc_vbios_passed": False} if cc_vbios_fails else {}
         if findings:
-            if SWAP_FINDINGS & set(findings):
+            if cc_vbios_fails and not enforce:  # identity is shadow-only here: lead with the enforced VBIOS finding
+                template = Msg.CC_VBIOS_BELOW_MINIMUM
+            elif SWAP_FINDINGS & set(findings):
                 template = Msg.SWAPPED
             elif {"attestation_invalid", "one_card_under_several_uuids", "identity_changed"} & set(findings):
                 template = Msg.MISMATCH
@@ -365,12 +425,15 @@ class GpuAttestationIdentityCheck:
                 template,
                 ctx=ctx,
                 check_id=self.check_id,
-                impact=None if enforce else "Shadow observation only: score was NOT changed",
+                impact=None if enforce or cc_vbios_fails else "Shadow observation only: score was NOT changed",
                 what=what,
             )
-            updates = {"gpu_attestation_identity_passed": False} if enforce else {}
+            updates = {**({"gpu_attestation_identity_passed": False} if enforce else {}), **cc_updates}
             return CheckResult(
-                passed=not enforce, event=event, fatal=not has_live_rental(ctx), updates=updates
+                passed=not (enforce or cc_vbios_fails), event=event, fatal=not has_live_rental(ctx), updates=updates
             )
+        if cc_vbios_fails:
+            event = render_message(Msg.CC_VBIOS_BELOW_MINIMUM, ctx=ctx, check_id=self.check_id, what=what)
+            return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx), updates=cc_updates)
         template = Msg.OK if verified and not unavailable else Msg.UNAVAILABLE
         return CheckResult(passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what))

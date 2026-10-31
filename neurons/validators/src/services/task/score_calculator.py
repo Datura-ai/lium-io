@@ -118,6 +118,12 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("GPU identity changed or could not be verified against the card")
 
+    # CC VBIOS gate (DAH-5329): same mechanics; shadow leaves the flag True.
+    if not ctx.cc_vbios_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing")
+
     # Host hardware identity gate (DAH-4547): non-fatal on a live rental, so only this line zeroes it.
     if not ctx.hardware_identity_passed:
         actual_score = 0.0
