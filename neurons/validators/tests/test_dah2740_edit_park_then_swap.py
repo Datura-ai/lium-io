@@ -240,11 +240,13 @@ async def test_a_second_edit_cancelled_by_a_delete_while_it_waits_never_parks(sv
     assert ssh.commands.count(f"/usr/bin/docker rename {name} {parked}") == 1
 
 
+@pytest.mark.parametrize("method", [None, "gocryptfs", "dm-crypt"])
 @pytest.mark.asyncio
-async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
-    payload = _edit_payload()
+async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch, method):
+    payload = _edit_payload(volume_encryption_method=method)
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "open_dmcrypt_volumes", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
     monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("gocryptfs: EPERM")))
     name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
@@ -266,6 +268,8 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
     kwargs = bring_up.await_args.kwargs
     assert kwargs["container_name"] == name and kwargs["pod_id"] == payload.pod_id
     assert kwargs["local_volume_path"] == "/root" and kwargs["ssh_client"] is ssh
+    # a dm-crypt pod's undo opens its volume before the start; any other pod starts as before
+    assert kwargs["dmcrypt"] is (method == "dm-crypt")
 
 
 @pytest.mark.parametrize(

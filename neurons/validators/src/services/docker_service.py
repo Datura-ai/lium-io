@@ -8998,6 +8998,7 @@ class DockerService:
                         local_volume_path=local_volume_path,
                         pod_id=payload.pod_id,
                         default_extra=default_extra,
+                        dmcrypt=payload.volume_encryption_method == DMCRYPT_METHOD,
                     )
                     current_step = "park_current_container"
                     # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
@@ -10756,9 +10757,12 @@ class DockerService:
         local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
+        dmcrypt: bool = False,
     ) -> None:
         """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
-        holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
+        holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway.
+        ``dmcrypt``: the pod's stored method is dm-crypt, so its volume is opened (a no-op when open,
+        then udev settle) before the start, not only after a start failed on a closed mapping."""
 
         async def _start() -> None:
             await run_logged_rental_docker_sdk_operation(
@@ -10770,6 +10774,10 @@ class DockerService:
                 container_name=container_name,
             )
 
+        if dmcrypt:
+            await self.open_dmcrypt_volumes(
+                ssh_client, mounted_volume_devices_command(container_name), default_extra
+            )
         try:
             await _start()
         except Exception as exc:

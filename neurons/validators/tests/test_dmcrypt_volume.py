@@ -340,6 +340,46 @@ async def test_start_after_a_reboot_opens_the_mapping_then_starts(docker_service
     assert events == ["start", "open", "start"]
 
 
+@pytest.mark.parametrize("dmcrypt", [True, False])
+@pytest.mark.asyncio
+async def test_the_edit_swap_undo_opens_a_closed_dmcrypt_mapping_before_the_start(docker_service, monkeypatch, dmcrypt):
+    """A failed edit brings the parked container back (_EditSwap.restore -> _bring_up_existing_container). Park
+    stopped it; the mapping may be closed by then (a reboot meanwhile). A dm-crypt pod opens its volume, key on
+    stdin only, before the one start; a gocryptfs pod starts exactly as before and runs nothing over SSH first."""
+    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", _MASTER)
+    pod = str(uuid4())
+    key = derive_dmcrypt_key(_MASTER, pod)
+    events: list[str] = []
+
+    async def run(command, **kwargs):
+        events.append("open" if command == dm.dmcrypt_open_command(pod) else "list")
+        if command == dm.dmcrypt_open_command(pod):
+            assert kwargs["input"] == f"{key}\n"
+        assert key not in command
+        if command == dm.mounted_volume_devices_command("pod_x"):
+            return _make_ssh_command_result(stdout=f"/dev/mapper/lium-{pod}\n")
+        return _make_ssh_command_result()
+
+    async def start(*, container_name, network=None):
+        events.append("start")
+
+    docker_client = Mock(start=start)
+    monkeypatch.setattr(docker_service, "_restore_mount_and_sshd_after_start", AsyncMock())
+
+    await docker_service._bring_up_existing_container(
+        docker_client=docker_client,
+        ssh_client=Mock(run=AsyncMock(side_effect=run)),
+        container_name="pod_x",
+        local_volume_path="/root",
+        pod_id=pod,
+        default_extra={},
+        dmcrypt=dmcrypt,
+    )
+
+    assert events == (["list", "open", "start"] if dmcrypt else ["start"])
+    docker_service._restore_mount_and_sshd_after_start.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_any_other_start_failure_does_not_open_anything(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
