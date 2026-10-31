@@ -9,10 +9,14 @@ from services.redis_service import InflightBackendCreate, RedisService
 
 
 class _FakeRedis:
-    """the hash commands RedisService uses, in memory"""
+    """the hash commands (and SET) RedisService uses, in memory"""
 
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}
+        self.strings: dict[str, str] = {}
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self.strings[key] = value
 
     async def hset(self, key: str, field: str, value: str) -> None:
         self.hashes.setdefault(key, {})[field] = value

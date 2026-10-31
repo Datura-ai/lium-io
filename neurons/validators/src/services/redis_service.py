@@ -27,6 +27,10 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
+# epoch seconds of the node's latest create (add_pending_pod); outlives VERIFYX_COMMAND_TIMEOUT_SECONDS (600) so a
+# VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
+CREATE_STARTED_AT_PREFIX = "create_started_at"
+CREATE_STARTED_AT_TTL_SECONDS = 900
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4658: the pod of a renter GPU reset that ended a moment ago, per node, for a short TTL
 GPU_RESET_RECENT_PREFIX = "gpu_reset_recent"
@@ -50,6 +54,10 @@ SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
 SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
+
+
+def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
+    return f"{CREATE_STARTED_AT_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
 def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
@@ -647,6 +655,9 @@ class RedisService:
             item["gpu_uuids"] = list(gpu_uuids)
         pending_pods.append(item)
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        await self.set(
+            create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
+        )
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)

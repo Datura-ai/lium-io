@@ -16,10 +16,14 @@ from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck, Ve
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from neurons.validators.src.services.task.pipeline import ParallelStage
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
-from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
+from neurons.validators.src.services.redis_service import CREATE_STARTED_AT_TTL_SECONDS, RedisService
+from neurons.validators.src.services.verifyx_validation_service import (
+    VERIFYX_COMMAND_TIMEOUT_SECONDS,
+    VerifyXValidationService,
+)
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
-from tests.helpers import build_context_config, build_services, build_state
+from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_verifyx_check import MockVerifyXResponse
 
 EXECUTOR = "executor-123"  # tests.helpers.default_executor().uuid
@@ -508,6 +512,67 @@ async def test_a_rental_starting_during_the_retry_cuts_it_off(
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(
         88.0
     )
+
+
+class _PendingRedis(FakeRedis):
+    get_pending_pods = RedisService.get_pending_pods
+    add_pending_pod = RedisService.add_pending_pod
+    remove_pending_pod = RedisService.remove_pending_pod
+    renting_in_progress = RedisService.renting_in_progress
+
+
+class _CreateDuringRetry(_TimedProbeSequence):
+    """The retry, during which a create's pending-pod marker is set and cleared inside one watcher interval."""
+
+    def __init__(self, redis, hotkey, *responses, retry_s):
+        super().__init__(*responses, retry_s=retry_s)
+        self.redis, self.hotkey = redis, hotkey
+
+    async def validate_verifyx_and_process_job(self, **kwargs):
+        if self.calls == 1:
+            await asyncio.sleep(0.01)  # just after a watcher read
+            await self.redis.add_pending_pod(self.hotkey, EXECUTOR, "pod-fast")
+            await self.redis.remove_pending_pod(self.hotkey, EXECUTOR, "pod-fast")
+        return await super().validate_verifyx_and_process_job(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create", ["during_retry", "before_retry"])
+async def test_a_create_between_two_watcher_reads_still_cuts_the_retry_off(context_factory, monkeypatch, create):
+    # PR review, 31 Oct: the watcher reads only the pending-pod marker, every interval, so a fast create
+    # whose marker came and went between two reads was missed. Its create-started stamp is read too: a
+    # create after the retry began cuts it off; an older one (seen by the pre-retry lookup) does not.
+    assert CREATE_STARTED_AT_TTL_SECONDS > VERIFYX_COMMAND_TIMEOUT_SECONDS
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
+    monkeypatch.setattr(verifyx_check, "RENTAL_WATCH_INTERVAL_SECONDS", 0.05)
+    redis = _PendingRedis()
+    if create == "during_retry":
+        service = _CreateDuringRetry(redis, None, _probe(88.0), _probe(760.0), retry_s=5.0)
+    else:
+        service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=0.2)
+    ctx = context_factory(
+        services=build_services(redis=redis, verifyx=service),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}}, rented_data=_never_measured()),
+    )
+    service.hotkey = ctx.miner_hotkey
+    if create == "before_retry":
+        await redis.add_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-old")
+        await redis.remove_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-old")
+        await asyncio.sleep(0.01)
+    ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_never_measured())
+    first = await VerifyXCheck().run(ctx)
+
+    result = await asyncio.wait_for(VerifyXColdRetryCheck().run(ctx.model_copy(update=first.updates)), 2)
+
+    assert service.calls == 2
+    if create == "during_retry":
+        assert (service.kills, result.passed) == (1, False)
+        assert result.event.what_we_saw["cold_sample_retry"] == {"cancelled": "rental_create_in_progress"}
+        assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(88.0)
+    else:
+        assert (service.kills, result.passed) == (0, True)
+        assert result.event.what_we_saw["cold_sample_retry"]["used"] == "retry"
 
 
 @pytest.mark.asyncio

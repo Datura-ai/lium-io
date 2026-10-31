@@ -12,6 +12,7 @@ from protocol.vc_protocol.compute_requests import NetworkEMA
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.redis_service import create_started_at_key
 from services.verifyx_validation_service import (
     NETWORK_GATE_TALLY,
     VERIFYX_COMMAND_TIMEOUT_SECONDS,
@@ -582,16 +583,23 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
-async def _not_idle_now(ctx: Context, timeout: float, *, backend: bool = True) -> str | None:
+async def _not_idle_now(
+    ctx: Context, timeout: float, *, backend: bool = True, created_since: float | None = None
+) -> str | None:
     """Why the cold retry must not run now, or None: a customer pod on the node (in the cycle-start
     snapshot, as refreshed by earlier checks, or in the backend's shared recent answer), a rental being
     created, or a rental state that cannot be read within `timeout`. A filler alone keeps the node
-    eligible, as for the first sample. `backend=False` re-reads only the pending-pod marker."""
+    eligible, as for the first sample. `backend=False` re-reads only the pending-pod marker. With
+    `created_since` (epoch s) a create started after it counts too, though its marker is already gone."""
     uuid = str(ctx.executor.uuid)
 
     async def read() -> tuple[bool, Any]:
         if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, uuid):
             return True, None
+        if created_since is not None:
+            started = await ctx.services.redis.get(create_started_at_key(ctx.miner_hotkey, uuid))
+            if started is not None and float(started) > created_since:
+                return True, None
         if not backend:
             return False, ctx.state.rented_data
         return False, await _rented_executors_now_shared(ctx.services.backend)
@@ -611,11 +619,13 @@ async def _not_idle_now(ctx: Context, timeout: float, *, backend: bool = True) -
     return None
 
 
-async def _until_not_idle(ctx: Context) -> str:
-    """Polls the pending-pod marker while the retry runs; returns why the node stopped being idle."""
+async def _until_not_idle(ctx: Context, since: float) -> str:
+    """Polls the pending-pod marker and the node's create-started stamp while the retry runs; returns
+    why the node stopped being idle. The stamp catches a create (after `since`) whose marker came and
+    went between two polls."""
     while True:
         await asyncio.sleep(RENTAL_WATCH_INTERVAL_SECONDS)
-        busy = await _not_idle_now(ctx, RENTAL_STATE_TIMEOUT_SECONDS, backend=False)
+        busy = await _not_idle_now(ctx, RENTAL_STATE_TIMEOUT_SECONDS, backend=False, created_since=since)
         if busy is not None:
             return busy
 
@@ -726,6 +736,8 @@ class VerifyXColdRetryCheck:
             )
         cleared = {"state": replace(ctx.state, verifyx_cold_retry=None)}
         busy = None
+        # creates started from here on cut the retry off: the lookup below sees the earlier ones
+        idle_since = time.time()
         if task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS >= MIN_COLD_RETRY_SECONDS:
             # never let the lookup itself run into the margin and cost the first sample
             busy = await _not_idle_now(
@@ -758,8 +770,10 @@ class VerifyXColdRetryCheck:
             )
 
         # Cut at the deadline less the margin (never past its own SSH timeout) and judge on the
-        # first sample. Raced against a rental-state watcher: a rental starting meanwhile cuts it
-        # off too, so a renter's pod never shares the node with it. An outer cancel still propagates.
+        # first sample. Raced against a rental-state watcher: a create (customer or filler) started
+        # since just before the pre-retry lookup cuts it off at the next poll, within RENTAL_WATCH_INTERVAL_SECONDS
+        # plus one Redis read, even if its pending-pod marker is already gone. A pod can share the node
+        # for that long at most. An outer cancel still propagates.
         verifyx_service = ctx.services.verifyx
         run_dir = f".verifyx-retry-{secrets.token_hex(8)}"
         retry = None
@@ -777,7 +791,7 @@ class VerifyXColdRetryCheck:
                 timeout=min(budget, VERIFYX_COMMAND_TIMEOUT_SECONDS),
             )
         )
-        watch = asyncio.ensure_future(_until_not_idle(ctx))
+        watch = asyncio.ensure_future(_until_not_idle(ctx, idle_since))
         try:
             await asyncio.wait({probe, watch}, return_when=asyncio.FIRST_COMPLETED)
             if probe.done():
