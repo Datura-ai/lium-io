@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import secrets
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -11,6 +13,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.verifyx_validation_service import (
     NETWORK_GATE_TALLY,
+    VERIFYX_COMMAND_TIMEOUT_SECONDS,
     _is_positive_number,
     _is_speed_reading,
 )
@@ -18,6 +21,7 @@ from services.verifyx_validation_service import (
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,10 @@ _kept_upload_probes: dict[tuple[str, str], int] = {}
 # the missing capacity reading is fed as the 0 it is.
 MAX_PACKAGE_FALLBACK_PROBES = 8
 _package_fallback_probes: dict[tuple[str, str], int] = {}
+# The cold-sample retry runs last, before scoring, with the time the other checks left less this
+# margin for scoring, publishing and cleanup; with less than MIN_COLD_RETRY_SECONDS of that it is skipped.
+MIN_COLD_RETRY_SECONDS = 240
+COLD_RETRY_MARGIN_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,19 @@ class ColdSampleRetry:
     first_download_speed_mbps: float | None
     retry_download_speed_mbps: float | None
     used: Literal["first", "retry"]
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class ColdRetryPending:
+    """What VerifyXCheck leaves for VerifyXColdRetryCheck: how to re-run the probe and judge it,
+    and the first sample's verdict, which stands unless the retry replaces it."""
+
+    sizing: dict
+    prev_ema: NetworkEMA | None
+    first_download_speed_mbps: float | None
+    first_passed: bool
+    first_event: Any
 
 
 class VerifyXCheck:
@@ -134,47 +155,46 @@ class VerifyXCheck:
             else None
         )
 
-        cold_sample_retry: ColdSampleRetry | None = None
-        if _is_cold_sample_below_gate(ctx, result, prev_ema):
-            # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
-            # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
-            # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps
-            # on two of the traced hosts, 104 Mbps on the third whose link the executor's on-boot
-            # template pre-pull was sharing) — and passed the next cycle at 205–760 Mbps. One more
-            # sample inside the same task costs at most one VerifyX run; the failure costs the
-            # provider a whole cycle. Known hosts (any prior EMA) are not retried, and the gate is
-            # unchanged: one of the two samples must clear it.
-            retry = await verifyx_service.validate_verifyx_and_process_job(
-                shell=ctx.services.shell,
-                executor_info=ctx.executor,
-                default_extra=ctx.default_extra,
-                machine_spec=specs,
-                **sizing,
-            )
-            first_speed = _download_speed(result)
-            retry_speed = _download_speed(retry)
-            use_retry = (
-                retry.data is not None
-                and bool(retry.data.get("success"))
-                and (retry_speed or 0.0) > (first_speed or 0.0)
-            )
-            cold_sample_retry = ColdSampleRetry(
-                first_download_speed_mbps=first_speed,
-                retry_download_speed_mbps=retry_speed,
-                used="retry" if use_retry else "first",
-            )
-            logger.info(
-                _m(
-                    "VerifyX cold first sample below the gate, re-measured once",
-                    extra=get_extra_info({**ctx.default_extra, **asdict(cold_sample_retry)}),
-                )
-            )
-            if use_retry:
-                # The retry always runs over SSH, so a consumed local answer that loses to it is
-                # no longer what the event describes.
-                result = retry
-                transport = "ssh"
+        judged = self._judge(ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema)
+        if not _is_cold_sample_below_gate(ctx, result, prev_ema):
+            return judged
+        # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
+        # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
+        # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps
+        # on two of the traced hosts, 104 Mbps on the third whose link the executor's on-boot
+        # template pre-pull was sharing) — and passed the next cycle at 205–760 Mbps. One more
+        # sample inside the same task costs at most one VerifyX run; the failure costs the
+        # provider a whole cycle. Known hosts (any prior EMA) are not retried, and the gate is
+        # unchanged: one of the two samples must clear it.
+        # DAH-5462: the second sample is taken by VerifyXColdRetryCheck, last before scoring, so it
+        # only ever uses time the other checks left. Until then the first sample stands; a gate it
+        # failed is held back and decided there.
+        pending = ColdRetryPending(
+            sizing=sizing,
+            prev_ema=prev_ema,
+            first_download_speed_mbps=_download_speed(result),
+            first_passed=judged.passed,
+            first_event=judged.event.model_copy(deep=True),
+        )
+        state = (judged.updates or {}).get("state", ctx.state)
+        judged.event.what_we_saw["cold_sample_retry"] = "pending"
+        return CheckResult(
+            passed=True,
+            event=judged.event,
+            updates={**(judged.updates or {}), "state": replace(state, verifyx_cold_retry=pending)},
+        )
 
+    def _judge(
+        self,
+        ctx: Context,
+        result,
+        *,
+        transport: str,
+        sizing: dict,
+        prev_ema: NetworkEMA | None,
+        cold_sample_retry: ColdSampleRetry | None = None,
+    ) -> CheckResult:
+        """Judge one VerifyX result: the specs it updates, the EMA it feeds and the download gate."""
         # Extract errors with clear priority: data.errors > result.error
         errors = self._extract_errors(result)
 
@@ -534,6 +554,27 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
+async def _not_idle_now(ctx: Context) -> str | None:
+    """Why the cold retry must not run now, or None: a customer pod on the node (in the cycle-start
+    snapshot, as refreshed by earlier checks, or in the backend's answer now), a rental being
+    created, or a rental state that cannot be read. A filler alone keeps the node eligible, as for
+    the first sample."""
+    uuid = str(ctx.executor.uuid)
+    try:
+        if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, uuid):
+            return "rental_create_in_progress"
+        fresh = await ctx.services.backend.get_rented_executors_now()
+    except Exception:  # noqa: BLE001 — unknown counts as busy
+        return "rental_state_unavailable"
+    if fresh is None:
+        return "rental_state_unavailable"
+    for rented_data in (ctx.state.rented_data, fresh):
+        rented = rented_data.executors.get(uuid) if rented_data else None
+        if rented is not None and rented.pods:
+            return "rented"
+    return None
+
+
 def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
     """Why this cycle's VerifyX sample must not move the published EMA, or None.
 
@@ -544,7 +585,7 @@ def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | 
     if ctx.state.rented_data is None:
         return None
     if failed_check_id:
-        if failed_check_id != VerifyXCheck.check_id:
+        if failed_check_id not in (VerifyXCheck.check_id, VerifyXColdRetryCheck.check_id):
             return f"cycle failed {failed_check_id}"
         return None
     if ctx.state.recommended_image_cached is False:
@@ -617,3 +658,113 @@ def _to_iso(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_to_iso(v) for v in value)
     return value
+
+
+class VerifyXColdRetryCheck:
+    """DAH-5462: the second VerifyX sample of a never-measured node whose first one was below the
+    gate (VerifyXCheck leaves `verifyx_cold_retry`). Runs last before scoring, with the time the
+    other checks left less COLD_RETRY_MARGIN_SECONDS, so it can never push them past the task
+    deadline. A better, successful retry replaces the first sample's network reading; otherwise the
+    first sample stands, and a gate it failed fails the node here."""
+
+    check_id = "gpu.validate.verifyx_cold_retry"
+    fatal = True
+
+    async def run(self, ctx: Context) -> CheckResult:
+        pending: ColdRetryPending | None = ctx.state.verifyx_cold_retry
+        if pending is None:
+            return CheckResult(
+                passed=True,
+                event=render_message(
+                    Msg.COLD_RETRY, ctx=ctx, check_id=self.check_id, what={"pending": False}
+                ),
+            )
+        cleared = {"state": replace(ctx.state, verifyx_cold_retry=None)}
+        busy = await _not_idle_now(ctx)
+        if busy is not None:
+            # a renter may be on the node now: never load it with a second RAM, disk and network test
+            return self._first_sample_stands(ctx, pending, cleared, {"skipped": busy})
+        budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
+        if budget < MIN_COLD_RETRY_SECONDS:
+            logger.info(
+                _m(
+                    "VerifyX cold first sample below the gate, no time left to re-measure",
+                    extra=get_extra_info(
+                        {
+                            **ctx.default_extra,
+                            "task_seconds_left": int(budget + COLD_RETRY_MARGIN_SECONDS),
+                        }
+                    ),
+                )
+            )
+            return self._first_sample_stands(
+                ctx,
+                pending,
+                cleared,
+                {"skipped_task_seconds_left": int(budget + COLD_RETRY_MARGIN_SECONDS)},
+            )
+
+        # Cut at the deadline less the margin (never past its own SSH timeout) and judge on the
+        # first sample. An outer cancel still propagates.
+        verifyx_service = ctx.services.verifyx
+        run_dir = f".verifyx-retry-{secrets.token_hex(8)}"
+        retry = None
+        transport_error = None
+        try:
+            retry = await asyncio.wait_for(
+                verifyx_service.validate_verifyx_and_process_job(
+                    shell=ctx.services.shell,
+                    executor_info=ctx.executor,
+                    default_extra=ctx.default_extra,
+                    machine_spec=ctx.state.specs,
+                    run_dir=run_dir,
+                    **pending.sizing,
+                ),
+                timeout=min(budget, VERIFYX_COMMAND_TIMEOUT_SECONDS),
+            )
+            transport_error = (retry.diagnostics or {}).get("transport_error")
+        except TimeoutError:
+            pass
+        finally:
+            # Cut off (deadline, SSH timeout, lost connection, outer cancel): the remote run may live on.
+            if retry is None or transport_error is not None:
+                await verifyx_service.kill_remote_verifyx(
+                    ctx.services.shell, run_dir, ctx.default_extra
+                )
+        retry_speed = _download_speed(retry) if retry is not None else None
+        use_retry = (
+            retry is not None
+            and retry.data is not None
+            and bool(retry.data.get("success"))
+            and (retry_speed or 0.0) > (pending.first_download_speed_mbps or 0.0)
+        )
+        cold_sample_retry = ColdSampleRetry(
+            first_download_speed_mbps=pending.first_download_speed_mbps,
+            retry_download_speed_mbps=retry_speed,
+            used="retry" if use_retry else "first",
+            timed_out=retry is None or "TimeoutError" in (transport_error or ""),
+        )
+        logger.info(
+            _m(
+                "VerifyX cold first sample below the gate, re-measured once",
+                extra=get_extra_info({**ctx.default_extra, **asdict(cold_sample_retry)}),
+            )
+        )
+        if not use_retry:
+            return self._first_sample_stands(ctx, pending, cleared, asdict(cold_sample_retry))
+        judged = VerifyXCheck()._judge(
+            ctx.model_copy(update=cleared),
+            retry,
+            transport="ssh",
+            sizing=pending.sizing,
+            prev_ema=pending.prev_ema,
+        )
+        judged.event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
+        return judged
+
+    def _first_sample_stands(
+        self, ctx: Context, pending: ColdRetryPending, cleared: dict, what: dict
+    ) -> CheckResult:
+        event = pending.first_event.model_copy(deep=True)
+        event.what_we_saw["cold_sample_retry"] = what
+        return CheckResult(passed=pending.first_passed, event=event, updates=cleared)

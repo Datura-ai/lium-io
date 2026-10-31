@@ -47,6 +47,7 @@ class DummyVerifyXService:
         default_extra: dict,
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
+        run_dir: str | None = None,
     ) -> MockVerifyXResponse:
         """Mock method that mimics the real verifyx service."""
         # Track what parameters we were called with
@@ -163,7 +164,7 @@ class _VerifyXServiceReturning:
         self._response = response
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
     ):
         return self._response
 

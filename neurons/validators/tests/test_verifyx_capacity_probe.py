@@ -29,7 +29,6 @@ from neurons.validators.src.services.task.checks.network_ema import compute_ema
 from neurons.validators.src.services.task.checks.verifyx import (
     MAX_KEPT_UPLOAD_PROBES,
     MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
-    VerifyXCheck,
 )
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from neurons.validators.src.services.verifyx_validation_service import (
@@ -41,6 +40,7 @@ from neurons.validators.src.services.verifyx_validation_service import (
 )
 from tests.helpers import build_context_config, build_services, build_state
 from tests.test_verifyx_check import DummyVerifyXService, _rented_data_with_ema
+from tests.test_verifyx_cold_sample_retry import _run as _verifyx_then_cold_retry
 
 SERVICE = "neurons.validators.src.services.verifyx_validation_service"
 
@@ -154,7 +154,7 @@ async def _run_check(
         rented_data=_rented_data_with_ema("executor-123", download=prev_ema, upload=prev_upload),
     )
     ctx = context_factory(services=services, config=config, state=state, miner_hotkey=miner_hotkey)
-    return await VerifyXCheck().run(ctx)
+    return await _verifyx_then_cold_retry(ctx)
 
 
 # 1. capacity, not the single-stream figure ---------------------------------------------------
