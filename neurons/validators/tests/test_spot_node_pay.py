@@ -1546,3 +1546,16 @@ def test_older_backend_sends_no_averages():
     assert data.filler_revenue_by_gpu_config == []
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) is None
     assert data.provider_spot_executor_ids == []
+
+
+def test_a_lone_one_gpu_node_has_an_average_after_two_filler_hours():
+    # a lone 1x node earns from its first 2 Default Job hours, not after a full day
+    data = _rented_data(
+        FillerRevenueByGpuConfig(
+            base_model="RTX 3090", gpu_count=1, usd_per_gpu_hour=0.08, gpu_hours=2.0
+        )
+    )
+
+    floor = settings.FILLER_REVENUE_MIN_GPU_HOURS
+    assert floor == 2.0
+    assert data.get_filler_revenue_per_gpu_hour("RTX 3090", 1, floor) == 0.08
