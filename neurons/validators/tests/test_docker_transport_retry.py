@@ -16,6 +16,7 @@ from docker.errors import NotFound
 from services.node_host import node_owner
 from services.rental_docker_sdk import (
     ContainerExecSpec,
+    ContainerNameTakenOnRetry,
     ContainerRunSpec,
     RentalDockerConnectionError,
     RentalDockerOperationError,
@@ -174,7 +175,7 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
     api.existing_containers["pod_test"] = {"Config": {"Image": "someone/else:latest"}}
 
     with pytest.raises(
-        RentalDockerOperationError, match="already exists with image 'someone/else:latest'"
+        ContainerNameTakenOnRetry, match="already exists with image 'someone/else:latest'"
     ):
         await _client(api).run_container(_run_spec())
 

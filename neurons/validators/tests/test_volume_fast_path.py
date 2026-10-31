@@ -11,6 +11,7 @@ import pytest
 from core.config import settings
 from payload_models.payloads import ContainerCreateRequest
 from services import docker_service as docker_service_module
+from services.image_flatten import FlattenMeasureFailed
 from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.docker_service import (
     DockerService,
@@ -380,6 +381,55 @@ async def test_create_container_probes_once_and_passes_it_on(svc, monkeypatch):
     assert svc.probe_volume_host.await_args.kwargs["with_df"] is True
     assert svc.resolve_volume_sizing.await_args.kwargs["host_probe"] is probe
     assert svc.create_local_volume.await_args.kwargs["host_probe"] is probe
+
+
+@pytest.mark.asyncio
+async def test_create_container_sizes_on_the_disk_measured_under_the_flatten_lock(svc, monkeypatch):
+    # review: the early probe measured 120 GiB while a deleted rental's 30 GiB copy was still being written;
+    # the sizing takes the 90 GiB read under the flatten lock, not the early probe's figure
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    early = VolumeHostProbe("/var/lib/docker", 120 * _SIZING_GB, [], True)
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=early))
+    wait = AsyncMock(return_value=90 * _SIZING_GB)
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", wait)
+
+    await _run_create_container(svc, _create_payload())
+
+    wait.assert_awaited_once()
+    assert svc.resolve_volume_sizing.await_args.kwargs["host_probe"] is early
+    assert svc.resolve_volume_sizing.await_args.kwargs["locked_df_avail_bytes"] == 90 * _SIZING_GB
+
+
+@pytest.mark.asyncio
+async def test_a_failed_measure_under_the_flatten_lock_takes_the_sizing_fallback(svc, monkeypatch):
+    # review: a transient failure of the locked measure must not abort the create
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+    error = FlattenMeasureFailed("measure failed")
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", AsyncMock(side_effect=error))
+
+    await _run_create_container(svc, _create_payload())
+
+    assert svc.resolve_volume_sizing.await_args.kwargs["locked_df_error"] is error
+    assert svc.resolve_volume_sizing.await_args.kwargs["locked_df_avail_bytes"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_flatten_lock_or_mark_failure_stops_the_create_before_any_sizing(svc, monkeypatch):
+    # review: without the lock or the mark, no sizing is safe (a copy may hold disk it would grant)
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+    error = RuntimeError("waiting for any image copy on this node failed (exit 1)")
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", AsyncMock(side_effect=error))
+
+    result = await _run_create_container(svc, _create_payload())
+
+    assert type(result).__name__ != "ContainerCreated"
+    svc.resolve_volume_sizing.assert_not_awaited()
+    svc.create_local_volume.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -123,6 +123,16 @@ from services.prerun_host_probe import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.image_flatten import (
+    FLATTEN_NO_DISK_RENTER_SENTENCE,
+    FlattenMeasureFailed,
+    ImageFlattenNoDisk,
+    flatten_copy_bytes,
+    flatten_image_on_host,
+    flatten_lease_release_command,
+    flatten_sized_mark_command,
+    wait_for_node_flatten,
+)
 from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
@@ -150,6 +160,7 @@ from services.rental_docker_sdk import (
     HOST_KILL_EXIT_CODES,
     ContainerCreateRefused,
     ContainerExecSpec,
+    ContainerNameTakenOnRetry,
     ContainerGoneBeforeExec,
     ContainerRunSpec,
     ContainerStateSnapshot,
@@ -1083,6 +1094,60 @@ def is_host_fault_create_failure(current_step: str | None) -> bool:
     return current_step in _HOST_FAULT_CREATE_STEPS
 
 
+# DAH-5118: once an image has more layers than fit in one page of overlayfs mount options (no fixed count:
+# it depends on the data-root path length, ~50 layers with a long root), Docker passes them as relative paths, and Sysbox 0.7.1 cannot ID-map them: `l/<id>` on the classic
+# overlay2 store (nestybox/sysbox#725, fixed in sysbox-runc main 90a493b, not in a release yet), `<n>/fs`
+# on the containerd store with Sysbox 0.6.6 and older. The same image starts on other nodes.
+_SYSBOX_RELATIVE_LAYER_RE = re.compile(r"setting up ID-mapped mount on path (?:l/[A-Z0-9]+|\d+/fs) ")
+SYSBOX_MANY_LAYERS_RENTER_SENTENCE = (
+    "this image has too many layers for this node's storage driver; "
+    "rent another node or flatten the image into fewer layers"
+)
+
+
+def _flatten_reserved_bytes(
+    storage_limit_gb: int | None, volume_limit_gb: int | None, disk_share: float | None
+) -> int | None:
+    """Disk a full-node pod's limits granted but have not taken yet (its writable layer and sparse volume),
+    or None (no flatten) for a split or legacy rental: a sibling rental sized now or later can be granted
+    the disk the copy takes, and the node cannot see a grant before its container exists."""
+    if disk_share is None or disk_share < 1.0:
+        return None
+    return ((storage_limit_gb or 0) + (volume_limit_gb or 0)) * 1024**3
+
+
+# name, --storage-opt size (empty without one) and bytes written, for every container on the node
+_WRITABLE_LAYERS_COMMAND = (
+    "/usr/bin/docker ps -aq | xargs -r /usr/bin/docker inspect --size "
+    "--format '{{.Name}} {{index .HostConfig.StorageOpt \"size\"}} {{.SizeRw}}'"
+)
+
+
+def _neighbours_unwritten_bytes(inspect_stdout: str, container_name: str) -> int:
+    """What the node's other containers may still write into their writable layers: each one's size cap
+    less what it wrote. Their preallocated volumes already took their disk; a sparse volume is
+    full-node only, so it has no neighbour. Raises ValueError on a line it cannot read."""
+    total = 0
+    for line in inspect_stdout.splitlines():
+        if not line.strip():
+            continue
+        name, cap, written = line.split(" ")
+        if name.lstrip("/") == container_name or not cap:
+            continue  # the pod's own cap is in its reserve; no cap: Docker cannot bound that layer either
+        cap_bytes = _parse_volume_size_to_bytes(cap)
+        if cap_bytes is None:
+            raise ValueError(f"unreadable storage size {cap!r} on {name}")
+        total += max(cap_bytes - int(written or 0), 0)
+    return total
+
+
+def sysbox_many_layers_sentence(exc: Exception) -> str | None:
+    """The renter sentence when `docker run` died on Sysbox's ID-mapping of a many-layer image, else None."""
+    if any(_SYSBOX_RELATIVE_LAYER_RE.search(text) for text in _exception_texts(exc)):
+        return SYSBOX_MANY_LAYERS_RENTER_SENTENCE
+    return None
+
+
 def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
     """Volume steps return the daemon reason via volume_step_detail. Other steps return
     DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
@@ -1122,6 +1187,10 @@ def _last_attempt_exception(exc: Exception) -> BaseException:
 
 class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
+
+
+class _SameNameContainerKept(Exception):
+    """A re-sent create met the pod's own container already running (or unreadable): it is the renter's, never removed."""
 
 
 class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
@@ -1868,6 +1937,12 @@ class _CustomerCreateRegistry:
     def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
         with self._lock:
             return (miner_hotkey, executor_id) in self._running_by_executor
+
+    def others_running(self, payload: ContainerCreateRequest) -> bool:
+        """Another customer create than `payload`'s runs on its executor now."""
+        with self._lock:
+            running = self._running_by_executor[(payload.miner_hotkey, payload.executor_id)]
+            return running - (id(payload) in self._customer_create_reached_create_container) > 0
 
     def ran_since_filler_started(self, filler: ContainerCreateRequest) -> bool:
         # a customer create on the filler's executor running now or ended since the filler's track();
@@ -2760,9 +2835,78 @@ class DockerService:
         port_maps: list[tuple[int, int, int]] | None = None,
         spare_port_pairs: list[PayloadPortMapping] | None = None,
         remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
+        flatten_reserved_bytes: int | None = None,
+        before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
+        flatten_beside_other_create: Callable[[], bool] | None = None,
+        pod_id: str | None = None,
+    ) -> str | None:
+        """`_run_rental_docker_create_attempts`, then the release of the flattened copy's lease (when a
+        flatten ran) however the create ended: success (the container now keeps the copy), failure or
+        cancel (the copy is free for the next flatten's cleanup)."""
+        flatten_lease: list[str] = []
+        try:
+            return await self._run_rental_docker_create_attempts(
+                docker_client=docker_client,
+                ssh_client=ssh_client,
+                run_spec=run_spec,
+                container_name=container_name,
+                default_extra=default_extra,
+                local_volume=local_volume,
+                log_tag=log_tag,
+                port_maps=port_maps,
+                spare_port_pairs=spare_port_pairs,
+                remove_port_checks_listed_live=remove_port_checks_listed_live,
+                flatten_reserved_bytes=flatten_reserved_bytes,
+                before_flatten_retry=before_flatten_retry,
+                flatten_beside_other_create=flatten_beside_other_create,
+                flatten_lease=flatten_lease,
+                pod_id=pod_id,
+            )
+        finally:
+            for lease in flatten_lease:
+                try:
+                    await ssh_client.run(flatten_lease_release_command(lease), check=False, timeout=60)
+                except Exception:  # the lease expires on its own; a failed release only delays the cleanup
+                    logger.warning(_m("SYSBOX_FLATTEN_LEASE_RELEASE_FAILED", extra=get_extra_info(default_extra)))
+
+    @staticmethod
+    async def _leftover_container_never_started(
+        docker_client: RentalDockerSdkClient, container_name: str
+    ) -> bool:
+        """True only when the same-name container is known to be stopped (created, exited or dead)."""
+        try:
+            status = await docker_client.container_status(container_name=container_name)
+        except Exception:
+            return False
+        return status in ("created", "exited", "dead")
+
+    async def _run_rental_docker_create_attempts(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        ssh_client: asyncssh.SSHClientConnection,
+        run_spec: ContainerRunSpec,
+        container_name: str,
+        default_extra: dict,
+        local_volume: str | None = None,
+        log_tag: str = "container_creation",
+        port_maps: list[tuple[int, int, int]] | None = None,
+        spare_port_pairs: list[PayloadPortMapping] | None = None,
+        remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
+        flatten_reserved_bytes: int | None = None,
+        before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
+        flatten_beside_other_create: Callable[[], bool] | None = None,
+        flatten_lease: list[str],
         pod_id: str | None = None,
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
+
+        Sysbox many-layer failure: only when `flatten_reserved_bytes` is given (full-node customer rentals), the
+        image is copied into one layer on the node, keeping free the disk the pod's limits already
+        granted (`flatten_reserved_bytes`), and the run is retried once after `before_flatten_retry`
+        (the delete-cancellation check, which raises when the pod was deleted meanwhile). The copy also
+        keeps free what the node's other containers may still write into their writable layers, and is
+        refused while `flatten_beside_other_create` says another create on the node is still sizing.
 
         Returns the container's ID, or None when the client gave none. A ContainerCreateRefused of
         the spec's `before_create` or `before_start` (checked on every attempt) is raised as is.
@@ -2782,6 +2926,7 @@ class DockerService:
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
         vloopback_mount_repair_attempted = False
+        image_flattened = False
         remaps = 0
         own_leftover_removed = False
         while True:
@@ -2802,20 +2947,35 @@ class DockerService:
                 # Only that exact name is removed, once, and only while no other create for this pod is
                 # registered: a live attempt (registered until its own failure cleanup ends) may still own
                 # that container, so then the conflict fails as before. Any other name conflict fails too.
+                # A container the earlier attempt already started (or one whose state cannot be read) is
+                # the renter's pod and is never removed: the conflict then fails as before.
                 if (
                     not own_leftover_removed
                     and pod_id is not None
                     and inflight_creates.is_only_create(pod_id)
-                    and f'"/{container_name}" is already in use' in str(exc)
+                    and (
+                        f'"/{container_name}" is already in use' in str(exc)
+                        # the SDK's transport retry met the same name on another image (a flattened copy)
+                        or isinstance(exc, ContainerNameTakenOnRetry)
+                    )
                 ):
+                    if not (
+                        await self._leftover_container_never_started(docker_client, container_name)
+                        # another create may have registered (and started the pod) during the status read
+                        and inflight_creates.is_only_create(pod_id)
+                    ):
+                        raise _SameNameContainerKept(str(exc)) from exc
                     own_leftover_removed = True
                     attempt += 1
-                    await self._remove_failed_rental_container_for_retry(
+                    # not forced: dockerd itself refuses the removal if the pod was started meanwhile
+                    if not await self._remove_failed_rental_container_for_retry(
                         docker_client=docker_client,
                         container_name=container_name,
                         default_extra=default_extra,
                         warning_event="OWN_LEFTOVER_CONTAINER_RM_FAILED",
-                    )
+                        force=False,
+                    ):
+                        raise _SameNameContainerKept(str(exc)) from exc
                     continue
                 if _should_repair_stale_mountpoint(
                     exc,
@@ -2844,6 +3004,36 @@ class DockerService:
                             default_extra=default_extra,
                             warning_event="STALE_MOUNT_RETRY_RM_FAILED",
                         )
+                        continue
+
+                if flatten_reserved_bytes is not None and not image_flattened and sysbox_many_layers_sentence(exc):
+                    # the renter picked this node: start a one-layer copy of the image here (owner, 26 Oct)
+                    image_flattened = True
+                    flatten_lease.append(secrets.token_hex(8))
+                    flat_image = await self._flatten_rental_image(
+                        ssh_client=ssh_client,
+                        image=run_spec.image,
+                        lease=flatten_lease[0],
+                        reserved_bytes=flatten_reserved_bytes,
+                        default_extra=default_extra,
+                        log_tag=log_tag,
+                        container_name=container_name,
+                        beside_other_create=flatten_beside_other_create,
+                    )
+                    if before_flatten_retry is not None:
+                        await before_flatten_retry()
+                    if flat_image is not None:
+                        await self._remove_failed_rental_container_for_retry(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            warning_event="FLATTEN_RETRY_RM_FAILED",
+                        )
+                        if before_flatten_retry is not None:
+                            # a delete can land during the awaited rm: check again right before the run
+                            await before_flatten_retry()
+                        run_spec = dataclasses.replace(run_spec, image=flat_image)
+                        attempt += 1
                         continue
 
                 port_allocation_phrase = _port_allocated_phrase(exc)
@@ -2939,6 +3129,66 @@ class DockerService:
                 await self.stream_log(error_text, "error", log_tag)
                 raise
 
+    async def _flatten_rental_image(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        image: str,
+        lease: str,
+        reserved_bytes: int,
+        default_extra: dict,
+        log_tag: str,
+        container_name: str = "",
+        beside_other_create: Callable[[], bool] | None = None,
+    ) -> str | None:
+        """The one-layer copy's tag, or None when the flatten failed (the create then fails with
+        Sysbox's error). Raises ImageFlattenNoDisk when the node has no room for the copy beside this
+        pod's and its neighbours' unwritten grants, or another create on the node has not taken its own yet."""
+        await self.stream_log(
+            "This image has too many layers for this node's storage driver; "
+            "preparing a single-layer copy (a large image takes several minutes)",
+            "info",
+            log_tag,
+        )
+        started = time.monotonic()
+        try:
+            # read before the check: a create that marks the node sized after it makes the flatten refuse
+            sized_mark = str((await ssh_client.run(flatten_sized_mark_command(), check=True, timeout=120)).stdout or "")
+            if beside_other_create is not None and beside_other_create():
+                # its grant is not on the node yet, so the copy cannot keep it free
+                raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
+            layers = await ssh_client.run(_WRITABLE_LAYERS_COMMAND, check=True, timeout=120)
+            reserved_bytes += _neighbours_unwritten_bytes(str(layers.stdout or ""), container_name)
+            flat_image = await flatten_image_on_host(
+                ssh_client, image, lease=lease, reserved_bytes=reserved_bytes, sized_mark=sized_mark.strip()
+            )
+        except ImageFlattenNoDisk:
+            logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info({**default_extra, "image": image})))
+            await self.stream_log(FLATTEN_NO_DISK_RENTER_SENTENCE, "error", log_tag)
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "SYSBOX_FLATTEN_FAILED",
+                    extra=get_extra_info({**default_extra, "image": image, "error": str(exc)[:2000]}),
+                ),
+                exc_info=True,
+            )
+            return None
+        logger.info(
+            _m(
+                "SYSBOX_FLATTEN_RETRY",
+                extra=get_extra_info({
+                    **default_extra,
+                    "image": image,
+                    "flat_image": flat_image,
+                    "seconds": int(time.monotonic() - started),
+                }),
+            )
+        )
+        await self.stream_log("Single-layer copy ready; starting the pod", "success", log_tag)
+        return flat_image
+
     async def _remove_failed_rental_container_for_retry(
         self,
         *,
@@ -2946,20 +3196,23 @@ class DockerService:
         container_name: str,
         default_extra: dict,
         warning_event: str,
-    ) -> None:
+        force: bool = True,
+    ) -> bool:
+        """False when the removal failed (logged as `warning_event`)."""
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_failed_container_for_retry",
                 log_extra=default_extra,
                 call=lambda: docker_client.remove_container(
                     container_name=container_name,
-                    force=True,
+                    force=force,
                     remove_volumes=True,
                 ),
                 container_name=container_name,
-                force=True,
+                force=force,
                 remove_volumes=True,
             )
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as rm_exc:
@@ -2973,6 +3226,7 @@ class DockerService:
                     }),
                 )
             )
+            return False
 
     async def _remap_colliding_port(
         self,
@@ -5433,19 +5687,23 @@ class DockerService:
         remove_volume: bool = False,
         container_id: str | None = None,
         pod_id: str | None = None,
+        keep_container: bool = False,
     ) -> bool:
         """Remove the failed container's artifacts; report whether it was already gone.
 
         ``container_id``, once the create has one, is what gets read and removed: a concurrent
         retry for the same pod can be running its own container under ``container_name``.
         Without an id, the name is removed only while no other create for ``pod_id`` is live.
+        ``keep_container`` leaves the container alone: a re-sent create met the pod already running.
 
         DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
         on missing evidence.
         """
         container_missing = False
         # without an id, the container under this name may be another live create's: leave it to that create
-        owns_container = container_id is not None or pod_id is None or inflight_creates.is_only_create(pod_id)
+        owns_container = not keep_container and (
+            container_id is not None or pod_id is None or inflight_creates.is_only_create(pod_id)
+        )
         try:
             if owns_container:
                 # DAH-2395: read the death evidence before `rm -fv` destroys it —
@@ -6934,8 +7192,17 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
         host_probe: VolumeHostProbe | None = None,
+        locked_df_avail_bytes: int | None = None,
+        locked_df_error: Exception | None = None,
+        flatten_copy_bytes: int | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
+        still fits beside it, never below `payload.min_volume_gb`.
+
+        `locked_df_avail_bytes` (wait_for_node_flatten) replaces any other free-disk measure;
+        `locked_df_error` (that measure failed) takes the measurement-failure fallback below.
 
         With `host_probe` (DAH-3240) the fresh path reads DockerRootDir,
         df and the vloopback volume names from the probe instead of running three commands;
@@ -6970,15 +7237,21 @@ class DockerService:
             )
 
         try:
+            if locked_df_error is not None:
+                # never size on another measure: it may predate a copy
+                raise locked_df_error
+            df_avail_bytes = locked_df_avail_bytes
             if host_probe is not None and host_probe.df_avail_bytes is not None:
                 docker_root_dir = host_probe.docker_root_dir
-                df_avail_bytes = host_probe.df_avail_bytes
+                if df_avail_bytes is None:
+                    df_avail_bytes = host_probe.df_avail_bytes
                 existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
                     ssh_client, host_probe.vloopback_volume_names
                 )
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
-                df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                if df_avail_bytes is None:
+                    df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
         except asyncio.CancelledError:
             raise
@@ -7019,6 +7292,10 @@ class DockerService:
                 ),
             )
         )
+        if flatten_copy_bytes is not None:
+            # the flatten keeps this grant free on top of the copy: leave the copy room before granting
+            min_slice_bytes = (payload.min_volume_gb or 0) * _FRESH_SIZING_GB_BYTES * 1.5
+            slice_candidates.append(("flatten_copy", max(df_avail_bytes - flatten_copy_bytes, min_slice_bytes, 0)))
         capped_by, slice_bytes = min(slice_candidates, key=lambda item: item[1])
 
         # -o size= requires a positive integer; floor to at least 1 GB before
@@ -9145,12 +9422,31 @@ class DockerService:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (a failed probe → None → the per-command path below).
                     volume_probe: VolumeHostProbe | None = None
+                    locked_df_avail_bytes: int | None = None
+                    locked_df_error: Exception | None = None
+                    if measures_host:
+                        # a copy (its pod maybe deleted meanwhile) takes disk this sizing would otherwise
+                        # grant: size on df measured under the flatten lock, never on a probe that may
+                        # predate the copy; after the early probe's channel closed (MaxSessions=1)
+                        if early_volume_probe is not None and not early_volume_probe.cancelled():
+                            await early_volume_probe
+                        current_step = "flatten_wait"
+                        try:
+                            locked_df_avail_bytes = await wait_for_node_flatten(ssh_client)
+                        except FlattenMeasureFailed as exc:
+                            # lock held and mark written: the sizing's measurement-failure fallback;
+                            # a lock or mark failure propagates and stops the create
+                            locked_df_error = exc
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
                     if wants_volume_probe:
                         current_step = "volume_host_probe"
-                        if early_volume_probe is not None and image_present and not cleanup_changed_host:
+                        if (
+                            early_volume_probe is not None
+                            and image_present
+                            and not cleanup_changed_host
+                        ):
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
                         else:
@@ -9164,6 +9460,15 @@ class DockerService:
                                 log_extra=default_extra,
                             )
 
+                    flatten_copy: int | None = None
+                    if (
+                        measures_host
+                        and payload.is_sysbox
+                        and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                        and _flatten_reserved_bytes(None, None, payload.disk_share) is not None
+                    ):
+                        flatten_copy = await flatten_copy_bytes(ssh_client, payload.docker_image)
+
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
                     sizing = await self.resolve_volume_sizing(
@@ -9172,6 +9477,9 @@ class DockerService:
                         log_tag=log_tag,
                         log_extra=default_extra,
                         host_probe=volume_probe,
+                        locked_df_avail_bytes=locked_df_avail_bytes,
+                        locked_df_error=locked_df_error,
+                        flatten_copy_bytes=flatten_copy,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
@@ -9453,6 +9761,18 @@ class DockerService:
                                 ssh_client=ssh_client,
                             )
                         ),
+                        # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
+                        flatten_reserved_bytes=(
+                            _flatten_reserved_bytes(
+                                effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
+                            )
+                            if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                            else None
+                        ),
+                        before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
+                            ssh_client, payload, default_extra
+                        ),
+                        flatten_beside_other_create=lambda: customer_creates.others_running(payload),
                     )
                     edit_swap.replacement_id = container_id
                     # A customer create that ran while the daemon created this container may have
@@ -9543,6 +9863,7 @@ class DockerService:
                         remove_volume=created_local_volume,
                         container_id=container_id,
                         pod_id=payload.pod_id,
+                        keep_container=isinstance(docker_run_error, _SameNameContainerKept),
                     )
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
@@ -10077,8 +10398,8 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=(
                     last_exc.renter_sentence
-                    if isinstance(last_exc, ContainerKilledDuringBootstrap)
-                    else str(log_text)
+                    if isinstance(last_exc, (ContainerKilledDuringBootstrap, ImageFlattenNoDisk))
+                    else sysbox_many_layers_sentence(e) or str(log_text)
                 ),
                 detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
