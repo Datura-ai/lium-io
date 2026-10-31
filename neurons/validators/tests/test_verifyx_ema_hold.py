@@ -9,7 +9,7 @@ from core.config import settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
 )
-from neurons.validators.src.services.task.checks.verifyx import _EMA_KEYS, VerifyXCheck
+from neurons.validators.src.services.task.checks.verifyx import _EMA_KEYS, VerifyXCheck, VerifyXColdRetryCheck
 from neurons.validators.src.services.task.messages import CachedTemplateMessages
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from neurons.validators.src.services.task.pipeline import Pipeline
@@ -171,7 +171,7 @@ async def _cycle_with_the_image_check(context_factory, probes, rented_data, redi
         ssh=ssh,
         ssh_pub_keys=[],
     )
-    pipeline = Pipeline([VerifyXCheck(), CachedTemplateVerificationCheck()], AsyncMock())
+    pipeline = Pipeline([VerifyXCheck(), CachedTemplateVerificationCheck(), VerifyXColdRetryCheck()], AsyncMock())
     ok, events, last = await pipeline.run(ctx)
     return ok, events, await _published_network(last, success=ok, event=events[-1])
 
@@ -193,7 +193,7 @@ async def test_the_incident_with_the_fresh_node_grace(monkeypatch, context_facto
         context_factory, _ProbeSequence(_probe(120.0)), _never_measured(), redis, cached=False
     )
     assert ok is True
-    assert events[-1].reason_code == CachedTemplateMessages.PENDING.reason
+    assert events[1].reason_code == CachedTemplateMessages.PENDING.reason
     assert "ema_verifyx_download_speed" not in network
 
     # Cycle 2: the image is on disk now; the first sample reads 53.4, a re-measure 238.
@@ -201,7 +201,7 @@ async def test_the_incident_with_the_fresh_node_grace(monkeypatch, context_facto
     ok, events, network = await _cycle_with_the_image_check(
         context_factory, probes, _as_backend_would_store(network), redis, cached=True
     )
-    verifyx_event = events[0]
+    verifyx_event = events[-1]  # the cold retry, last before scoring, judges the sample it keeps
     assert ok is cycle_2_passes
     if cycle_2_passes:
         assert probes.calls == 2

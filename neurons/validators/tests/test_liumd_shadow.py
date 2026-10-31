@@ -23,7 +23,7 @@ from services.local_verify_client import SCHEMA, LocalVerifyUnavailable, parse_a
 from services.task import liumd_shadow
 from services.task import service as task_service_module
 from services.task.checks import verifyx as verifyx_check
-from services.task.checks.verifyx import VerifyXCheck
+from services.task.checks.verifyx import VerifyXCheck, VerifyXColdRetryCheck
 from services.task.liumd_shadow import (
     LIUMD_SHADOW_EVENT,
     TodayStep,
@@ -468,6 +468,9 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
     )
     stored_before = rented.network_ema[UUID].model_dump()
     checked = await VerifyXCheck().run(todays_ctx)
+    if checked.passed and checked.updates["state"].verifyx_cold_retry is not None:
+        # the cold retry, last before scoring, gives today's verdict on a cold first sample
+        checked = await VerifyXColdRetryCheck().run(todays_ctx.model_copy(update=checked.updates))
     assert ("pass" if checked.passed else "fail") == today
     events = (
         [checked.event, _event(CAPABILITY, "GPU_VERIFY_OK")] if checked.passed else [checked.event]

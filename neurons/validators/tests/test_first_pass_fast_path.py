@@ -22,6 +22,7 @@ from neurons.validators.src.services.task.pipeline_factory import PipelineFactor
 from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
+from tests.test_verifyx_cold_sample_retry import _run as _verifyx_then_cold_retry
 from tests.helpers import build_context_config, build_services, build_state
 from tests.test_capability_check import DummyValidationService
 from tests.test_verifyx_check import MockVerifyXResponse
@@ -218,7 +219,7 @@ def _never_measured():
 async def test_scored_verifyx_call_passes_no_overrides_and_keeps_the_gate(context_factory):
     service = _ConfigAwareVerifyX(_probe(59.9))
 
-    result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=False, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=False, rented_data=_never_measured()))
 
     assert service.kwargs == {}
     assert result.passed is False
@@ -293,7 +294,7 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
     probe too — the 128 GB / 5 GB write must not come back on the second sample."""
     service = _ConfigAwareSequence(_probe(59.9), _probe(500.0))
 
-    result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 
     first_pass_overrides = {"challenge_config_overrides": {"memory_max_test_gb": 16, "storage_throughput_test_gb": 1}}
     assert service.kwargs_per_call == [first_pass_overrides, first_pass_overrides]
@@ -329,7 +330,7 @@ async def test_first_pass_ram_or_disk_failure_still_fails(context_factory):
 async def test_scored_pass_is_todays_behaviour(context_factory):
     # A scored cycle has ContextConfig.first_pass False; the checks do nothing special then.
     verifyx = _ConfigAwareVerifyX(_probe(59.9))
-    result = await VerifyXCheck().run(_ctx(context_factory, verifyx, first_pass=False, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, verifyx, first_pass=False, rented_data=_never_measured()))
     assert verifyx.kwargs == {}
     assert result.passed is False
 

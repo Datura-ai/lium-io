@@ -1717,6 +1717,13 @@ class VerifyXMessages:
         category="env",
         impact="Proceed",
     )
+    COLD_RETRY = MessageTemplate(
+        event="VerifyX second download sample",
+        reason="VERIFYX_COLD_RETRY",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
     VERIFY_FAILED = _verify_failed(
         label="",
         reason_suffix="",

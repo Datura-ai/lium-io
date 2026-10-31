@@ -193,6 +193,8 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
+    verifyx_cold_retry: Any = None
 
 
 class CheckResult(BaseModel):

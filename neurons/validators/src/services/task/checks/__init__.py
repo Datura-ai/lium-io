@@ -55,7 +55,7 @@ from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
-from .verifyx import VerifyXCheck
+from .verifyx import VerifyXCheck, VerifyXColdRetryCheck
 
 __all__ = [
     "BannedGpuCheck",
@@ -116,4 +116,5 @@ __all__ = [
     "SshdBootstrapCheck",
     "UploadFilesCheck",
     "VerifyXCheck",
+    "VerifyXColdRetryCheck",
 ]
