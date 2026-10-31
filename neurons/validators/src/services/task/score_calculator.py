@@ -131,6 +131,12 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("The host wrote into a renter's container")
 
+    # Kernel GPU-count gate (DAH-4982): same mechanics as the CPU-truth gate above.
+    if not ctx.gpu_kernel_count_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The kernel lists fewer GPUs than the node reports")
+
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"

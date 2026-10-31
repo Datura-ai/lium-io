@@ -29,7 +29,7 @@ from neurons.validators.src.services.task.checks.gpu_kernel_count import (
     evaluate_kernel_view,
 )
 from neurons.validators.src.services.task.messages import GpuKernelCountMessages as Msg
-from neurons.validators.src.services.task.pipeline import Pipeline
+from neurons.validators.src.services.task.pipeline import Context, Pipeline
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -102,6 +102,20 @@ def _ctx(
     )
 
 
+def _with_live_rental(ctx: Context) -> Context:
+    rented = RentedExecutorsResponse(
+        executors={
+            ctx.executor.uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address=ctx.executor.address,
+                executor_ip_port=str(ctx.executor.port),
+                pods=[RentedPod(pod_id="pod-1", container_name="pod_p1")],
+            )
+        }
+    )
+    return ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented)})
+
+
 @pytest.fixture
 def check_enabled(monkeypatch):
     monkeypatch.setattr(settings, "GPU_KERNEL_COUNT_CHECK_ENABLED", True)
@@ -133,26 +147,44 @@ async def test_mismatch_on_a_rented_node_fails_but_does_not_stop_the_run(
     context_factory, check_enabled
 ):
     # same rule as the ban checks: a node with a renter's pod on it keeps being verified
-    ctx = _ctx(context_factory, reported=[REAL[0], *OTHER_CARDS], kernel=[REAL[0]])
-    rented = RentedExecutorsResponse(
-        executors={
-            ctx.executor.uuid: RentedExecutor(
-                miner_hotkey="miner-hotkey",
-                executor_ip_address=ctx.executor.address,
-                executor_ip_port=str(ctx.executor.port),
-                pods=[RentedPod(pod_id="pod-1", container_name="pod_p1")],
-            )
-        }
+    ctx = _with_live_rental(
+        _ctx(context_factory, reported=[REAL[0], *OTHER_CARDS], kernel=[REAL[0]])
     )
-    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented)})
 
     result = await GpuKernelCountCheck().run(ctx)
     ok, _, _ = await Pipeline([GpuKernelCountCheck()], _Sink()).run(ctx)
 
     assert result.passed is False
     assert result.fatal is False
+    assert result.updates == {"gpu_kernel_count_passed": False}
     assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_match_on_a_rented_node_passes_and_keeps_the_score_flag(
+    context_factory, check_enabled
+):
+    ctx = _with_live_rental(_ctx(context_factory, reported=REAL, kernel=REAL))
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert "gpu_kernel_count_passed" not in result.updates
+    assert result.event.reason_code == Msg.COUNT_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_not_evaluated_on_a_rented_node_passes_and_keeps_the_score_flag(
+    context_factory, check_enabled
+):
+    ctx = _with_live_rental(_ctx(context_factory, reported=REAL, kernel=None))
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert "gpu_kernel_count_passed" not in result.updates
+    assert result.event.reason_code == Msg.NOT_EVALUATED.reason
 
 
 @pytest.mark.asyncio

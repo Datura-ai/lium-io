@@ -155,6 +155,26 @@ def test_inspector_host_write_flag_zeroes_a_rented_score():
     assert "The host wrote into a renter's container" in warning
 
 
+def test_gpu_kernel_count_flag_zeroes_a_rented_score_and_keeps_job_score():
+    ctx = _ctx(500.0).model_copy(update={"gpu_kernel_count_passed": False})
+
+    actual_score, job_score, warning = calculate_scores(ctx, rented=True)
+
+    assert actual_score == 0.0
+    assert job_score == 1.0
+    assert "The kernel lists fewer GPUs than the node reports" in warning
+
+
+def test_gpu_kernel_count_passed_keeps_a_rented_score():
+    ctx = _ctx(500.0)
+
+    actual_score, job_score, warning = calculate_scores(ctx, rented=True)
+
+    assert actual_score == 1.0
+    assert job_score == 1.0
+    assert warning == ""
+
+
 def test_hardware_identity_flag_zeroes_a_rented_score():
     """HardwareIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
     ctx = _ctx(500.0).model_copy(update={"hardware_identity_passed": False})
