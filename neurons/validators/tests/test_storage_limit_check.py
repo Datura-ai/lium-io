@@ -1,7 +1,7 @@
 """StorageLimitCheck: a node whose Docker cannot cap a container's disk (18 Oct 2026, serdkey node 4837fec9).
 
-A renter filled the disk of a node without a per-container storage limit and took the host down. Off by default:
-a warning only. With REQUIRE_STORAGE_LIMIT_SUPPORTED an unrented node without the limit scores 0.
+A renter filled the disk of a node without a per-container storage limit and took the host down. An unrented
+node without the limit scores 0; a rented one only gets a warning.
 """
 
 from __future__ import annotations
@@ -31,15 +31,8 @@ async def run(context_factory, specs: dict, *, rented: bool = False):
     return await StorageLimitCheck().run(ctx)
 
 
-@pytest.fixture
-def enforced(monkeypatch):
-    monkeypatch.setattr(
-        "services.task.checks.storage_limit.settings.REQUIRE_STORAGE_LIMIT_SUPPORTED", True
-    )
-
-
 @pytest.mark.asyncio
-async def test_a_node_with_the_limit_passes(context_factory, enforced):
+async def test_a_node_with_the_limit_passes(context_factory):
     result = await run(context_factory, {"storage_limit_supported": True})
 
     assert result.passed is True
@@ -47,23 +40,8 @@ async def test_a_node_with_the_limit_passes(context_factory, enforced):
 
 
 @pytest.mark.asyncio
-async def test_without_enforcement_a_node_without_the_limit_only_warns(context_factory):
-    result = await run(
-        context_factory,
-        {"storage_limit_supported": False, "storage_limit_scrape_error": "pquota missing"},
-    )
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.MISSING.reason
-    assert result.event.what_we_saw["detail"] == "pquota missing"
-    assert not result.updates
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("specs", [{"storage_limit_supported": False}, {}])
-async def test_enforced_an_unrented_node_without_the_limit_scores_zero(
-    context_factory, enforced, specs
-):
+async def test_an_unrented_node_without_the_limit_scores_zero(context_factory, specs):
     result = await run(context_factory, specs)
 
     assert result.passed is False
@@ -72,11 +50,17 @@ async def test_enforced_an_unrented_node_without_the_limit_scores_zero(
 
 
 @pytest.mark.asyncio
-async def test_enforced_a_rented_node_without_the_limit_only_warns(context_factory, enforced):
-    result = await run(context_factory, {"storage_limit_supported": False}, rented=True)
+async def test_a_rented_node_without_the_limit_only_warns(context_factory):
+    result = await run(
+        context_factory,
+        {"storage_limit_supported": False, "storage_limit_scrape_error": "pquota missing"},
+        rented=True,
+    )
 
     assert result.passed is True
     assert result.event.reason_code == Msg.MISSING.reason
+    assert result.event.what_we_saw["detail"] == "pquota missing"
+    assert not result.updates
 
 
 @pytest.mark.parametrize(

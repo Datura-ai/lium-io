@@ -296,10 +296,6 @@ class Settings(BaseSettings):
     # passes `first_pass=True` to TaskService.create_task gets the fast path (the settings below);
     # the wave never does, so every scored verification is unchanged. Measured (Loki,
     # 2–6 Sep, idle runs): matmul p50 26 s (74 s on the fresh dogfood node), VerifyX p50 78 s.
-    # A node whose Docker cannot cap a container's disk (specs.storage_limit_supported) lets one renter fill the
-    # host's Docker storage and take every pod down. Off: a STORAGE_LIMIT_MISSING warning only, so providers get
-    # notice first. On: an unrented node without the limit scores 0 (StorageLimitCheck).
-    REQUIRE_STORAGE_LIMIT_SUPPORTED: bool = Field(env="REQUIRE_STORAGE_LIMIT_SUPPORTED", default=False)
     # The matmul is sized from min(card VRAM, this) instead of the whole card: same challenge,
     # seal and UUID check, 5–17x less data to generate and copy.
     FIRST_PASS_MATMUL_VRAM_MB: int = Field(env="FIRST_PASS_MATMUL_VRAM_MB", default=8192)
