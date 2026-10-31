@@ -12,6 +12,11 @@ runs — same job files, digests and image snapshot, same checks, as a first pas
 each one, alone, then publishes the result spec-only (scored_at stays None, so the backend creates
 the executor row but writes no incentive ledger row) under that cycle's job_batch_id, so its
 prod_executors row lands on the cycle's time. The next scored cycle overwrites it as today.
+
+The portal snapshot lists a self-hosted miner's node only after its first publish, so every
+SELF_HOSTED_LIST_SECONDS the lane also asks each serving miner that is not routed through the
+central miner for its executor list (the miner's POST /executors, a DB read) and adds the nodes
+that appeared since its first answer to the snapshot.
 """
 
 import asyncio
@@ -54,6 +59,12 @@ MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
 FIRST_PASS_FAILED = "first pass failed"
 FIRST_PASS_FAILED_RETRY_SECONDS = 60
 FIRST_PASS_MAX_RUNS = 3
+# Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
+# that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
+# Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
+SELF_HOSTED_LIST_SECONDS = 60
+SELF_HOSTED_LIST_CONCURRENCY = 8
+SELF_HOSTED_LIST_FAILURE_BACKOFF_SECONDS = 600
 # job_batch_id format the backend parses into the prod_executors row's time.
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -130,6 +141,13 @@ class ExpressLane:
         # Job-files directory -> running verifications reading it. The validator keeps these
         # directories when it prepares the next cycle's files (FileEncryptService).
         self._directories_in_use: Counter[str] = Counter()
+        # Self-hosted miner hotkey -> {executor id: when this lane first saw it listed}. None for
+        # what the miner's first answer listed: known before this lane looked, the cycle's.
+        self._self_hosted: dict[str, dict[str, datetime | None]] = {}
+        self._self_hosted_backoff: dict[str, float] = {}  # miner hotkey -> monotonic
+        self._self_hosted_misses: Counter[str] = Counter()  # miner hotkey -> misses in a row
+        self._next_self_hosted_listing = 0.0  # monotonic
+        self._listing: asyncio.Task | None = None
 
     def directories_in_use(self) -> set[str]:
         """Job-files directories a running express verification still reads."""
@@ -170,15 +188,88 @@ class ExpressLane:
         if inputs is None:
             return 0
 
+        self._start_self_hosted_listing()
         snapshot = await self.portal_api.get_all_executors()
         if snapshot is None:
             return 0
+        snapshot = self._with_self_hosted(snapshot)
 
         validated = await self.redis_service.get_validated_executors()
         chosen = self._select(snapshot, validated, inputs.fleet_known_since)
         if not chosen:
             return 0
         return await self._launch(chosen)
+
+    def _start_self_hosted_listing(self) -> None:
+        """Every SELF_HOSTED_LIST_SECONDS, in the background so a slow miner never holds a tick."""
+        if (self._listing is not None and not self._listing.done()) or (
+            time.monotonic() < self._next_self_hosted_listing
+        ):
+            return
+        self._next_self_hosted_listing = time.monotonic() + SELF_HOSTED_LIST_SECONDS
+        self._listing = asyncio.create_task(self._list_self_hosted_miners())
+
+    async def _list_self_hosted_miners(self) -> None:
+        try:
+            central = self.subtensor_client.hotkeys_routed_via_central_miner
+            now = time.monotonic()
+            miners = [
+                miner
+                for miner in await self.subtensor_client.get_miners()
+                if miner.axon_info.is_serving
+                and miner.hotkey not in central
+                and self._self_hosted_backoff.get(miner.hotkey, 0.0) <= now
+            ]
+            limit = asyncio.Semaphore(SELF_HOSTED_LIST_CONCURRENCY)
+
+            async def list_one(miner: bittensor.NeuronInfo) -> None:
+                async with limit:
+                    executor_ids = await self.miner_service.list_executor_ids(miner)
+                if executor_ids is None:
+                    self._self_hosted_misses[miner.hotkey] += 1
+                    # From the listing's start, so a one-interval skip ends at the next listing.
+                    self._self_hosted_backoff[miner.hotkey] = now + min(
+                        SELF_HOSTED_LIST_SECONDS
+                        * 2 ** (self._self_hosted_misses[miner.hotkey] - 1),
+                        SELF_HOSTED_LIST_FAILURE_BACKOFF_SECONDS,
+                    )
+                    return
+                self._self_hosted_misses.pop(miner.hotkey, None)
+                known = self._self_hosted.get(miner.hotkey)
+                seen_at = datetime.now(UTC) if known is not None else None
+                self._self_hosted[miner.hotkey] = {
+                    executor_id: (known or {}).get(executor_id, seen_at)
+                    for executor_id in executor_ids
+                }
+
+            await asyncio.gather(*(list_one(miner) for miner in miners))
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[express] Self-hosted miner listing failed",
+                    extra=get_extra_info({"error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+
+    def _with_self_hosted(
+        self, snapshot: dict[str, list[PortalExecutor]]
+    ) -> dict[str, list[PortalExecutor]]:
+        """The snapshot plus the self-hosted miners' listed nodes it lacks, registered (as far as
+        _select goes) when this lane first saw them; None keeps the cycle's ones out."""
+        merged = dict(snapshot)
+        my_hotkey = self._hotkey()
+        for miner_hotkey, listed in self._self_hosted.items():
+            in_snapshot = {executor.id for executor in snapshot.get(miner_hotkey, [])}
+            merged[miner_hotkey] = [
+                *snapshot.get(miner_hotkey, []),
+                *(
+                    PortalExecutor(id=executor_id, validator_hotkey=my_hotkey, created_at=seen_at)
+                    for executor_id, seen_at in listed.items()
+                    if executor_id not in in_snapshot
+                ),
+            ]
+        return merged
 
     def _select(
         self,
