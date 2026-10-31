@@ -83,6 +83,8 @@ class PodContainerRental:
     # Completes "no live rental on this node uses it: ..." in the remediation.
     provider_facing_rental_status: str
     rental_closed_at: datetime | None = None
+    # the node the backend's closed-rental record names; None when the record names none
+    rental_executor_id: str | None = None
 
 
 class GpuUsageCheck:
@@ -327,6 +329,14 @@ class GpuUsageCheck:
             # This node's portal page shows no rental for a pod registered elsewhere, so the usual
             # "confirm, then remove" advice would clear the removal of a live rental's container.
             remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
+        elif (
+            orphan.pod_id is None
+            or orphan.rental_closed_at is None
+            or orphan.rental_executor_id is None
+            or str(orphan.rental_executor_id) != str(ctx.executor.uuid)
+        ):
+            # the stale cleanup removes only a container whose ended rental the backend places on this node
+            remediation_template = Msg.ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION
         else:
             remediation_template = Msg.ORPHANED_CONTAINER.remediation
         event = render_message(
@@ -668,7 +678,9 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             status = (
                 f"its rental's close time is {_in_minutes(-since_closed)} ahead of the validator's clock"
             )
-            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+            return PodContainerRental(
+                container_name, pod_id, PodRentalState.ORPHAN, status, closed_at, pod_rental.executor_id
+            )
         # A close time slightly ahead of this clock is backend-validator skew on a rental that just ended.
         status = (
             f"its rental ended {_in_minutes(since_closed)} ago"
@@ -676,7 +688,9 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             else "its rental ended just now"
         )
         if since_closed >= timedelta(minutes=RENTAL_TEARDOWN_GRACE_MINUTES):
-            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+            return PodContainerRental(
+                container_name, pod_id, PodRentalState.ORPHAN, status, closed_at, pod_rental.executor_id
+            )
         if rented_at_run_start:
             return PodContainerRental(container_name, pod_id, PodRentalState.ENDED_DURING_RUN, status, closed_at)
         # The backend deletes the pod row as it closes the rental, so a closed rental usually comes

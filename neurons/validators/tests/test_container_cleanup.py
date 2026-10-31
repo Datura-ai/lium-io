@@ -6,12 +6,15 @@ DAH-1991: cleanup must pick up `health_check_*` in addition to `pod_*` and
 DAH-2375: prune_dangling_anonymous_volumes must reap orphaned anonymous
 volumes left behind by historical `docker rm` without `-v`.
 """
+import json
 import logging
+import random
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+from services.const import EDIT_PARKED_SUFFIX
 from services.container_cleanup import (
     RENTED_LIST_EMPTY,
     RENTED_LIST_UNAVAILABLE,
@@ -29,9 +32,28 @@ def _ssh_mock_from_calls(call_handler):
     return ssh
 
 
-def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_ts: int = 1_000_000_000):
+def _ps_line(name: str, label: str) -> str:
+    """One `docker ps` line as the listing's format prints it: a JSON [name, pod id label]."""
+    return json.dumps([name, label])
+
+
+def _label_of(name: str) -> str:
+    """The LIUM_POD_ID_LABEL a Lium create gives; the backend's health_check_ probe has none."""
+    if name.startswith("health_check_"):
+        return ""
+    if name.startswith("container_"):
+        return name
+    return name.removeprefix("pod_").removeprefix("filler_").removesuffix("__prev")
+
+
+def _make_ssh_mock(
+    containers: list[str],
+    ages_by_name: dict[str, int],
+    current_ts: int = 1_000_000_000,
+    unlabelled: tuple[str, ...] = (),
+):
     """Build an ssh mock that simulates:
-      - docker ps -a filter -> newline list of containers
+      - docker ps -a filter -> newline list of `name|pod id label` (none for `unlabelled`)
       - docker inspect ... Created -> age seconds (current_ts - age_seconds*60)
       - date +%s -> current_ts
       - docker rm -fv / volume rm -> success
@@ -41,7 +63,10 @@ def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_
     async def handler(cmd, *args, **kwargs):
         # docker ps -a ... --filter name=... returns the container list
         if "docker ps -a" in cmd:
-            return MagicMock(exit_status=0, stdout="\n".join(containers), stderr="")
+            lines = [
+                _ps_line(name, "" if name in unlabelled else _label_of(name)) for name in containers
+            ]
+            return MagicMock(exit_status=0, stdout="\n".join(lines), stderr="")
         # current time on host
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
@@ -182,8 +207,8 @@ def _removed_volume_names(rm_calls: list[str]) -> list[str]:
 async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
     """A filler create sweeps only filler-labelled volumes, so the reaper must take the `volume_<run id>` of a
     filler it removes, or the preallocated volume holds the disk."""
-    filler = "filler_run-1"
-    customer_pod = "pod_customer"
+    filler = "filler_00000000-0000-4000-8000-0000000000a1"
+    customer_pod = "pod_00000000-0000-4000-8000-0000000000c1"
     ssh, rm_calls = _make_ssh_mock(containers=[filler, customer_pod], ages_by_name={filler: 30, customer_pod: 30})
 
     _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
@@ -191,7 +216,7 @@ async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
     )
 
     assert removed_names == [filler]
-    assert _removed_volume_names(rm_calls) == ["volume_run-1"]
+    assert _removed_volume_names(rm_calls) == ["volume_00000000-0000-4000-8000-0000000000a1"]
 
 
 @pytest.mark.parametrize(
@@ -205,7 +230,7 @@ async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
 )
 @pytest.mark.asyncio
 async def test_a_failed_filler_volume_rm_is_logged_unless_the_volume_is_gone(caplog, stderr: str, warned: bool):
-    filler = "filler_run-1"
+    filler = "filler_00000000-0000-4000-8000-0000000000a1"
     ssh, _ = _make_ssh_mock(containers=[filler], ages_by_name={filler: 30})
     plain_handler = ssh.run.side_effect
 
@@ -375,7 +400,7 @@ async def test_cleanup_preserves_young_unknown_filler_container():
 
 @pytest.mark.asyncio
 async def test_cleanup_removes_stale_unknown_filler_container():
-    name = "filler_stale"
+    name = "filler_00000000-0000-4000-8000-0000000000a2"
     ssh, rm_calls = _make_ssh_mock(
         containers=[name],
         ages_by_name={name: 30},
@@ -419,8 +444,9 @@ async def test_force_remove_health_checks_issues_filtered_rm_command():
     assert count == 2
     assert len(seen_cmds) == 1
     cmd = seen_cmds[0]
-    assert "docker ps -q" in cmd
+    assert "docker ps --format" in cmd
     assert "name=^health_check_" in cmd
+    assert "grep -xE 'health_check_([0-9a-f]{32}|[0-9]{10})'" in cmd
     assert "docker rm -f" in cmd
     # Must NOT mention pod_ or container_ — this method is health_check_-only.
     assert "pod_" not in cmd
@@ -632,7 +658,7 @@ def _make_unkillable_ssh_mock(name: str, rm_failures: int, current_ts: int = 1_0
     async def handler(cmd, *args, **kwargs):
         calls.append(cmd)
         if "docker ps -a" in cmd:
-            return MagicMock(exit_status=0, stdout=name, stderr="")
+            return MagicMock(exit_status=0, stdout=_ps_line(name, _label_of(name)), stderr="")
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
         if "docker inspect" in cmd and "Created" in cmd:
@@ -685,10 +711,10 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
 # Only an empty or missing fleet snapshot means "don't know"; any listed name is protected on every host
 # ---------------------------------------------------------------------------
 
-LIVE_POD = "pod_live-0000-4000-8000-000000000001"
-LIVE_FILLER = "filler_live_bundle"
-STRAY_POD = "pod_stray-0000-4000-8000-000000000002"
-ELSEWHERE_POD = "pod_elsewhere-0000-4000-8000-000000000003"
+LIVE_POD = "pod_00000000-0000-4000-8000-000000000001"
+LIVE_FILLER = "filler_00000000-0000-4000-8000-0000000000f1"
+STRAY_POD = "pod_00000000-0000-4000-8000-000000000002"
+ELSEWHERE_POD = "pod_00000000-0000-4000-8000-000000000003"
 
 
 def _real_rented_data(executor_uuid: str, pods: list[str], fillers: list[str] | None = None, key: str | None = None):
@@ -767,8 +793,8 @@ async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_list
 
 @pytest.mark.asyncio
 async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
-    fleet_pods = [f"pod_fleet-{i:04d}" for i in range(500)]
-    stale = [f"pod_stale-{i:02d}" for i in range(5)]
+    fleet_pods = [f"pod_00000000-0000-4000-8000-{i:012d}" for i in range(500)]
+    stale = [f"pod_00000000-0000-4000-9000-{i:012d}" for i in range(5)]
     ssh, _ = _make_ssh_mock(containers=stale, ages_by_name={name: 60 for name in stale})
     rented_data = _real_rented_data("another-node", fleet_pods)
 
@@ -781,7 +807,7 @@ async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
     assert removed_count == len(stale) and len(cleanup_logs) == len(stale) + 1
     for msg in cleanup_logs:
         assert msg.extra["rented_container_count"] == len(listed_container_names(rented_data))
-        assert "pod_fleet-" not in msg.to_full_string()
+        assert "4000-8000" not in msg.to_full_string()
 
 
 @pytest.mark.parametrize("rented_data", [None, _listed(), _rented_data("twin-executor-id", ["pod_on_twin"])])
@@ -812,3 +838,557 @@ def test_listed_container_names_protects_the_pod_container_of_an_unnamed_pod():
 
     assert "pod_pod-0" in names and "pod_pod-0__prev" in names
     assert "" not in names and "__prev" not in names
+
+
+PROVIDER_NAMES = [
+    "podman",
+    "mypod_x",
+    "pod_customer",
+    "filler_1",
+    "container_dindtest",
+    "health_check_customer",
+    "health_check_",
+    "my_pod_00000000-0000-4000-8000-000000000001",
+]
+# a name Lium gives, on a container without the label, and no backend record to confirm it by
+LEGACY_UNPROVABLE_NAMES = ["container_5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p_40016"]
+LEGACY_POD = "pod_00000000-0000-4000-8000-0000000000e1"
+LEGACY_FILLER = "filler_00000000-0000-4000-8000-0000000000e2"
+
+
+@pytest.mark.asyncio
+async def test_an_unlabelled_container_is_never_removed_whatever_its_name():
+    """DAH-5117: prod removed a provider's "podman" (25 Oct); only Lium's label authorises it."""
+    legacy = [LEGACY_POD, f"{LEGACY_POD}__prev", LEGACY_FILLER]
+    names = PROVIDER_NAMES + LEGACY_UNPROVABLE_NAMES + legacy
+    ssh, rm_calls = _make_ssh_mock(names, {name: 60 for name in names}, unlabelled=tuple(names))
+    ended = AsyncMock(return_value=False)
+
+    result = await ContainerCleanup().cleanup(
+        ssh, _listed(), EXECUTOR_UUID, lium_workload_ended=ended
+    )
+
+    assert result == (0, [], [])
+    assert not any("docker rm -f" in c for c in rm_calls)
+    # only Lium's exact pod/filler names are worth asking the backend about
+    assert sorted(call.args[0] for call in ended.await_args_list) == sorted(legacy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name, removed",
+    [
+        ("health_check_0123456789abcdef0123456789abcdef", True),  # health_check_{uuid4().hex}
+        ("health_check_1777040800", True),  # the backend's older int(time.time()) suffix
+        ("health_check_customer", False),
+        ("health_check_", False),
+        ("health_check_0123456789ABCDEF0123456789ABCDEF", False),
+        ("health_check_17770408001", False),
+    ],
+)
+async def test_an_unlabelled_health_check_is_removed_only_under_the_backends_exact_name(
+    name, removed
+):
+    ssh, commands = _make_ssh_mock([name], {name: 30})
+
+    result = await ContainerCleanup().cleanup(ssh, _listed(), EXECUTOR_UUID)
+
+    assert result == ((1, [name], []) if removed else (0, [], []))
+    assert any("docker rm -f" in c for c in commands) is removed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [LEGACY_POD, f"{LEGACY_POD}__prev", LEGACY_FILLER])
+@pytest.mark.parametrize("ended", [None, False, True])
+async def test_a_legacy_container_is_removed_only_when_the_backends_record_shows_it_ended(
+    name, ended
+):
+    ssh, rm_calls = _make_ssh_mock([name], {name: 60}, unlabelled=(name,))
+    callback = None if ended is None else AsyncMock(return_value=ended)
+
+    result = await ContainerCleanup().cleanup(
+        ssh, _listed(), EXECUTOR_UUID, lium_workload_ended=callback
+    )
+
+    assert result == ((1, [name], []) if ended else (0, [], []))
+    if callback is not None:
+        callback.assert_awaited_once_with(name)
+
+
+@pytest.mark.asyncio
+async def test_a_labelled_container_whose_pod_is_live_stays_under_any_name():
+    """The label names the pod: a live pod's container stays under a name the snapshot does not list."""
+    renamed = "pod_00000000-0000-4000-8000-0000000000d1"
+    ssh, rm_calls = _make_ssh_mock([renamed], {renamed: 60})
+    rented_data = _real_rented_data(EXECUTOR_UUID, [])
+    rented_data.executors[EXECUTOR_UUID].pods = [
+        RentedPod(pod_id=renamed.removeprefix("pod_"), container_name="pod_named_otherwise")
+    ]
+
+    result = await ContainerCleanup().cleanup(ssh, rented_data, EXECUTOR_UUID)
+
+    assert result == (0, [], [])
+    assert not any("docker rm -f" in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [STRAY_POD, f"{STRAY_POD}__prev", LEGACY_FILLER])
+async def test_an_inherited_label_naming_another_live_pod_does_not_keep_an_ended_container(name):
+    """A renter's image can carry io.lium.pod_id=<another live pod>; only a label bound to the name counts."""
+    ssh, rm_calls = _make_ssh_mock([name], {name: 60})
+    handler = ssh.run.side_effect
+
+    async def inherited_label(cmd, *args, **kwargs):
+        if "docker ps -a" in cmd:
+            return MagicMock(exit_status=0, stdout=_ps_line(name, LIVE_POD.removeprefix("pod_")), stderr="")
+        return await handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = inherited_label
+    ended = AsyncMock(return_value=True)
+
+    result = await ContainerCleanup().cleanup(
+        ssh, _real_rented_data(EXECUTOR_UUID, [LIVE_POD]), EXECUTOR_UUID, lium_workload_ended=ended
+    )
+
+    assert result == (1, [name], [])
+    ended.assert_awaited_once_with(name)  # treated as unlabelled: the legacy rule decides
+
+
+@pytest.mark.parametrize(
+    "name, label, bound",
+    [
+        ("pod_a", "a", True),
+        ("pod_a__prev", "a", True),
+        ("filler_r", "r", True),
+        ("pod_a", "b", False),
+        ("pod_a", "pod_a", False),
+        ("container_x_1", "container_x_1", True),
+        ("container_x_1", "x_1", False),
+        ("health_check_1777040800", "other", False),
+        ("pod_a", "", False),
+    ],
+)
+def test_a_pod_id_label_counts_only_when_bound_to_the_name(name, label, bound):
+    from services.container_cleanup import _bound_pod_id_label
+
+    assert _bound_pod_id_label(name, label) == (label if bound else "")
+
+
+@pytest.mark.asyncio
+async def test_the_listing_reads_each_containers_pod_id_label():
+    seen: list[str] = []
+
+    async def handler(cmd, *args, **kwargs):
+        seen.append(cmd)
+        stdout = f'{_ps_line("pod_a", "a")}\n{_ps_line("podman", "")}\n'
+        return MagicMock(exit_status=0, stdout=stdout, stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+
+    listed = await ContainerCleanup()._get_all_rental_containers(ssh)
+
+    assert listed == [("pod_a", "a"), ("podman", "")]
+    assert """--format '[{{json .Names}},{{json (.Label "io.lium.pod_id")}}]'""" in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_a_multiline_pod_id_label_cannot_forge_a_second_container_record():
+    forged = "ignored\nprovider_db|provider_db\n[\"provider_db\",\"provider_db\"]"
+
+    async def handler(cmd, *args, **kwargs):
+        return MagicMock(exit_status=0, stdout=_ps_line("pod_a", forged) + "\n", stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+
+    listed = await ContainerCleanup()._get_all_rental_containers(ssh)
+
+    assert listed == [("pod_a", forged)]  # one container, one record; the label stays inside it
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_listing_line_is_skipped():
+    async def handler(cmd, *args, **kwargs):
+        stdout = 'provider_db|provider_db\n["x"]\n' + _ps_line("pod_a", "a")
+        return MagicMock(exit_status=0, stdout=stdout, stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+
+    assert await ContainerCleanup()._get_all_rental_containers(ssh) == [("pod_a", "a")]
+
+
+def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=None, redis=None):
+    from tests.helpers import build_services, build_state, make_context
+
+    cleanup = AsyncMock()
+
+    async def remove(**kwargs):  # as the real cleanup: a labelled removal asks for its lookup slot first
+        gone = [name for name in removed if kwargs["reserve_removal"](name)]
+        return len(gone), gone, []
+
+    cleanup.cleanup.side_effect = remove
+    cleanup.sweep_abandoned_download_temporaries.return_value = 0
+    cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
+    if redis is None:
+        redis = AsyncMock()
+        redis.sadd.return_value = 0  # seen before: no first-sight grace
+        redis.hgetall.return_value = {}
+    overrides = {"backend": backend} if backend else {}
+    return make_context(
+        services=build_services(container_cleanup=cleanup, redis=redis, **overrides),
+        state=build_state(
+            rented_data=_real_rented_data("another-node", [LIVE_POD]), gpu_processes=gpu_processes
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "removed, owner, dropped",
+    [
+        ("filler_00000000-0000-4000-8000-0000000000a1", "THIS", True),
+        ("pod_00000000-0000-4000-8000-0000000000a1", "THIS", True),
+        # review 5644590326: removed by label alone, no backend record of it ending here
+        ("filler_00000000-0000-4000-8000-0000000000a1", None, False),
+        ("pod_00000000-0000-4000-8000-0000000000a1", "another-node", False),
+        ("health_check_1777040800", None, False),
+    ],
+)
+async def test_the_check_drops_the_gpu_processes_only_of_backend_confirmed_removals(
+    removed, owner, dropped
+):
+    """The processes were read before the cleanup; a reaped container's count in no later check,
+    but only when the backend confirms it was Lium's: a forged label recreated each cycle must not
+    exempt its GPU load from the gate every cycle."""
+    from protocol.vc_protocol.compute_requests import (
+        FillerRunActiveResponse,
+        PodRentalActiveResponse,
+    )
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    backend = AsyncMock()
+    reaped = {"pid": 1, "container_name": removed}
+    foreign = {"pid": 2, "container_name": "my_miner"}
+    ctx = _cleanup_check_ctx([removed], [reaped, foreign], backend=backend)
+    executor_id = str(ctx.executor.uuid) if owner == "THIS" else owner
+    backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=False, status="STOPPED", executor_id=executor_id
+    )
+    backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, rental_closed_at=CLOSED, executor_id=executor_id
+    )
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates["state"].gpu_processes == ([foreign] if dropped else [reaped, foreign])
+
+
+def _ended_here_backend(ctx_holder: dict):
+    """A backend whose records show every pod and filler ended on the context's node."""
+    from protocol.vc_protocol.compute_requests import (
+        FillerRunActiveResponse,
+        PodRentalActiveResponse,
+    )
+
+    backend = AsyncMock()
+
+    async def pod(_id):
+        return PodRentalActiveResponse(
+            active=False, rental_closed_at=CLOSED, executor_id=str(ctx_holder["ctx"].executor.uuid)
+        )
+
+    async def filler(_id):
+        return FillerRunActiveResponse(
+            active=False, status="STOPPED", executor_id=str(ctx_holder["ctx"].executor.uuid)
+        )
+
+    backend.get_pod_rental_active.side_effect = pod
+    backend.get_filler_run_active.side_effect = filler
+    return backend
+
+
+class _DictRedis:
+    """Just the hash calls the check makes, kept across runs like the real redis."""
+
+    def __init__(self):
+        self.hashes: dict[str, dict[str, str]] = {}
+
+    async def sadd(self, key, member):
+        return 0  # seen before: no first-sight grace
+
+    async def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+    async def hset(self, key, field, value):
+        self.hashes.setdefault(key, {})[field] = value
+
+    async def hdel(self, key, *fields):
+        for field in fields:
+            self.hashes.get(key, {}).pop(field, None)
+
+    async def expire(self, key, seconds):
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        ("pod_00000000-0000-4000-8000-0000000000a1", "pod_00000000-0000-4000-8000-0000000000a1"),
+        ("filler_00000000-0000-4000-8000-0000000000a1", "filler_00000000-0000-4000-8000-0000000000a1"),
+        # an edit-parked copy is the same record
+        ("pod_00000000-0000-4000-8000-0000000000a1", f"pod_00000000-0000-4000-8000-0000000000a1{EDIT_PARKED_SUFFIX}"),
+        # review 4392604823: another spelling of the same UUID is the same record
+        ("pod_00000000-0000-4000-8000-0000000000a1", "pod_00000000-0000-4000-8000-0000000000A1"),
+        ("pod_00000000-0000-4000-8000-0000000000a1", "pod_000000000000400080000000000000a1"),
+        ("filler_00000000-0000-4000-8000-0000000000a1", "filler_00000000-0000-4000-8000-0000000000A1"),
+        ("filler_00000000-0000-4000-8000-0000000000a1", f"filler_000000000000400080000000000000a1{EDIT_PARKED_SUFFIX}"),
+    ],
+)
+async def test_a_container_recreated_under_an_ended_id_keeps_its_gpu_processes_the_second_time(first, second):
+    """Review 4373847343: the ended record replays, so the exemption is one-shot. Cycle 1 removes
+    the leftover and drops its processes; the provider recreates it, cycle 2 removes it again and
+    its processes count, so the GPU and tenant checks fail the node."""
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    redis = _DictRedis()
+    check = StaleContainerCleanupCheck()
+    results = []
+    for name in (first, second):
+        holder: dict = {}
+        processes = [{"pid": 1, "container_name": name}]
+        ctx = holder["ctx"] = _cleanup_check_ctx([name], processes, backend=_ended_here_backend(holder), redis=redis)
+        results.append((await check.run(ctx)).updates["state"].gpu_processes)
+
+    assert results == [[], [{"pid": 1, "container_name": second}]]
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_exemption_never_re_arms_with_age(monkeypatch):
+    """Review 4374006889: a marker written long ago still blocks a recreated container, and the
+    exemption hash is never given a TTL."""
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    redis = _DictRedis()
+    expired: list[str] = []
+
+    async def expire(key, seconds):
+        expired.append(key)
+
+    monkeypatch.setattr(redis, "expire", expire)
+    redis.hashes["reaped_gpu_exempt:executor-123"] = {name: "2020-01-01T00:00:00+00:00"}
+    processes = [{"pid": 1, "container_name": name}]
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx([name], processes, backend=_ended_here_backend(holder), redis=redis)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
+    assert redis.hashes["reaped_gpu_exempt:executor-123"] == {name: "2020-01-01T00:00:00+00:00"}
+    assert not [key for key in expired if key.startswith("reaped_gpu_exempt:")]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_exemption_record_keeps_the_removed_containers_gpu_processes():
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    processes = [{"pid": 1, "container_name": name}]
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx([name], processes, backend=_ended_here_backend(holder))
+    ctx.services.redis.hgetall.side_effect = RuntimeError("redis down")
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_container_that_survives_docker_rm_keeps_its_gpu_processes():
+    """Review 4371963872: confirmed STOPPED and owned here, but docker rm failed: still running."""
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    name = "filler_00000000-0000-4000-8000-0000000000a1"
+    processes = [{"pid": 1, "container_name": name}]
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx([], processes, backend=_ended_here_backend(holder))
+
+    async def cleanup(**kwargs):
+        assert await kwargs["lium_workload_ended"](name) is True
+        return 0, [], [name]  # the rm failed
+
+    ctx.services.container_cleanup.cleanup.side_effect = cleanup
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
+    assert result.updates["state"].orphaned_containers == [name]
+
+
+@pytest.mark.asyncio
+async def test_backend_lookups_are_capped_per_node_per_cycle(caplog):
+    """Review 4371963877: thousands of unlabelled pod_/filler_ names must not each cost a backend
+    request; the excess is left alone (not removed, its GPU load still counts) and the cap is logged."""
+    from services.const import LIUM_WORKLOAD_LOOKUPS_PER_CYCLE as CAP
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    names = [f"pod_00000000-0000-4000-8000-{i:012x}" for i in range(CAP + 5)]
+    processes = [{"pid": i, "container_name": name} for i, name in enumerate(names)]
+    holder: dict = {}
+    backend = _ended_here_backend(holder)
+    ctx = holder["ctx"] = _cleanup_check_ctx([], processes, backend=backend)
+
+    async def cleanup(**kwargs):
+        removed = [name for name in names if await kwargs["lium_workload_ended"](name)]
+        return len(removed), removed, []
+
+    ctx.services.container_cleanup.cleanup.side_effect = cleanup
+
+    with caplog.at_level(logging.WARNING):
+        result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert backend.get_pod_rental_active.await_count == CAP
+    assert result.updates["state"].gpu_processes == processes[CAP:]
+    assert "Backend lookup cap reached" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_lookup_order_rotates_so_forged_names_cannot_starve_a_real_leftover():
+    """With more unlabelled candidates than the lookup cap, each cycle asks about a fresh random
+    order, so a real leftover behind 10+ forged names is checked within a few cycles."""
+    from services.const import LIUM_WORKLOAD_LOOKUPS_PER_CYCLE as CAP
+
+    forged = [f"pod_00000000-0000-4000-8000-{i:012x}" for i in range(1, CAP + 6)]
+    real = "filler_00000000-0000-4000-8000-0000000000ff"
+    names = [*forged, real]  # docker lists the real one last
+    ssh, _ = _make_ssh_mock(names, {name: 60 for name in names}, unlabelled=tuple(names))
+
+    async def cycle(seed: int) -> list[str]:
+        asked: list[str] = []
+
+        async def ended(name: str) -> bool:
+            if len(asked) >= CAP:
+                return False  # the check's cap: no lookup made
+            asked.append(name)
+            return False
+
+        random.seed(seed)
+        await ContainerCleanup().cleanup(ssh, _listed(), EXECUTOR_UUID, lium_workload_ended=ended)
+        return asked
+
+    first, second = await cycle(1), await cycle(2)
+    assert len(first) == len(second) == CAP
+    assert first != second
+    assert any([real in await cycle(seed) for seed in range(20)])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [9, 10, 11])
+async def test_no_container_is_removed_without_a_lookup_slot_for_its_gpu_exemption(count):
+    """Review 4372126117: past the lookup cap a GPU-holding pod is deferred, never removed and still
+    counted; every removal holding a GPU process drops it; a foreign process always counts."""
+    from services.const import LIUM_WORKLOAD_LOOKUPS_PER_CYCLE as CAP
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+    from tests.helpers import build_services
+
+    names = [
+        f"{'filler' if i % 3 == 2 else 'pod'}_00000000-0000-4000-8000-{i + 0xa0:012x}" for i in range(count)
+    ]
+    legacy = tuple(names[1::2])  # unlabelled: confirmed before removal; the rest carry their label
+    ssh, _ = _make_ssh_mock(names, {name: 60 for name in names}, unlabelled=legacy)
+    foreign = {"pid": 999, "container_name": "my_miner"}
+    processes = [*({"pid": i, "container_name": name} for i, name in enumerate(names)), foreign]
+    holder: dict = {}
+    backend = _ended_here_backend(holder)
+    ctx = holder["ctx"] = _cleanup_check_ctx([], processes, backend=backend)
+    ctx = holder["ctx"] = ctx.model_copy(
+        update={
+            "ssh": ssh,
+            "services": build_services(
+                container_cleanup=ContainerCleanup(), redis=ctx.services.redis, backend=backend
+            ),
+        }
+    )
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    removed = set(result.event.what_we_saw["removed_containers"])
+    left = result.updates["state"].gpu_processes
+    assert len(removed) == min(count, CAP)
+    assert foreign in left
+    assert {p["container_name"] for p in left} == {*(set(names) - removed), "my_miner"}
+    lookups = backend.get_pod_rental_active.await_count + backend.get_filler_run_active.await_count
+    assert lookups <= CAP
+
+
+@pytest.mark.asyncio
+async def test_a_failed_backend_read_keeps_the_removed_containers_gpu_processes():
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    backend = AsyncMock()
+    backend.get_pod_rental_active.side_effect = RuntimeError("backend down")
+    removed = "pod_00000000-0000-4000-8000-0000000000a1"
+    processes = [{"pid": 1, "container_name": removed}]
+    ctx = _cleanup_check_ctx([removed], processes, backend=backend)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
+
+
+CLOSED = "2026-10-25T00:00:00Z"
+ENDED = {"active": False, "rental_closed_at": CLOSED}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name, pod_answer, filler_answer, ended",
+    [
+        (LEGACY_POD, {**ENDED, "executor_id": "THIS"}, None, True),  # owner matches
+        (f"{LEGACY_POD}__prev", {**ENDED, "executor_id": "THIS"}, None, True),
+        (LEGACY_POD, {**ENDED, "executor_id": "another-node"}, None, False),  # owner mismatches
+        (LEGACY_POD, ENDED, None, False),  # owner missing: never matches
+        # no close time: no proof Lium's rental ended
+        (LEGACY_POD, {"active": False, "executor_id": "THIS"}, None, False),
+        (LEGACY_POD, {"active": True}, None, False),
+        (LEGACY_POD, None, None, False),  # no record (404) or the backend did not answer
+        (LEGACY_FILLER, None, {"active": False, "status": "STOPPED", "executor_id": "THIS"}, True),
+        (LEGACY_FILLER, None, {"active": False, "status": "FAILED", "executor_id": "x"}, False),
+        (LEGACY_FILLER, None, {"active": False, "status": "STOPPED"}, False),  # owner missing
+        (LEGACY_FILLER, None, {"active": False, "status": "STARTING"}, False),
+        (LEGACY_FILLER, None, {"active": False}, False),  # no status: proves nothing
+        (LEGACY_FILLER, None, None, False),
+    ],
+)
+async def test_the_check_confirms_a_legacy_container_ended_from_the_backends_record(
+    name, pod_answer, filler_answer, ended
+):
+    from protocol.vc_protocol.compute_requests import (
+        FillerRunActiveResponse,
+        PodRentalActiveResponse,
+    )
+    from services.task.checks.stale_container_cleanup import _lium_workload_ended_here
+
+    backend = AsyncMock()
+    ctx = _cleanup_check_ctx([], [], backend=backend)
+
+    def answer(fields, model):
+        if fields is None:
+            return None
+        if fields.get("executor_id") == "THIS":
+            fields = {**fields, "executor_id": str(ctx.executor.uuid)}
+        return model(**fields)
+
+    backend.get_pod_rental_active.return_value = answer(pod_answer, PodRentalActiveResponse)
+    backend.get_filler_run_active.return_value = answer(filler_answer, FillerRunActiveResponse)
+
+    assert await _lium_workload_ended_here(ctx, name) is ended
+    record_id = name.removesuffix("__prev").partition("_")[2]
+    if name.startswith("filler_"):
+        backend.get_filler_run_active.assert_awaited_once_with(record_id)
+    else:
+        backend.get_pod_rental_active.assert_awaited_once_with(record_id)

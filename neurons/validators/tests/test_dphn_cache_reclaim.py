@@ -307,16 +307,16 @@ async def test_the_download_sweep_removes_its_helper_container_after_the_run_too
 def test_only_never_started_capability_checks_are_picked():
     listing = "\n".join(
         [
-            "a1 lium_capability_check_12_ab daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
-            "b2 eager_kalam daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
-            "c3 executor daturaai/compute-subnet-executor:latest \"/start.sh\"",
-            "d4 his_job nvidia/cuda:12.4 \"nvidia-smi\"",
-            "e5 pod_0b1c2d3e daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
-            "f6 filler_run7 daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
+            "a1 lium_capability_check_12_0a1b2c",
+            # a provider's container: a lookalike name, or an unnamed executor-image diagnostic, survives
+            "b2 lium_capability_check_backup",
+            "b3 lium_capability_check_12_0a1b2c_mine",
+            "b4 eager_kalam",
+            "c3 executor",
         ]
     )
 
-    assert never_started_check_containers(listing) == ["a1", "b2"]
+    assert never_started_check_containers(listing) == ["a1"]
 
 
 @pytest.mark.asyncio
@@ -325,7 +325,7 @@ async def test_the_stale_cleanup_removes_never_started_check_containers(cleanup)
         async def run(self, command: str, *args, **kwargs):
             if "status=created" in command:
                 self.commands.append(command)
-                body = "a1 lium_capability_check_12_ab daturaai/compute-subnet-executor:latest nvidia-smi"
+                body = "a1 lium_capability_check_12_0a1b2c"
                 return SimpleNamespace(exit_status=0, stdout=body, stderr="")
             return await super().run(command, *args, **kwargs)
 

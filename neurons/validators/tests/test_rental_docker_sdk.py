@@ -768,6 +768,20 @@ async def test_run_container_refuses_a_same_named_network_that_does_not_isolate(
 
 
 @pytest.mark.asyncio
+async def test_run_container_creates_the_container_with_the_spec_labels_and_the_cpu_label():
+    api_client = FakeApiClient()
+
+    await RentalDockerSdkClient(api_client).run_container(
+        ContainerRunSpec(image="img", name="pod_t", labels={"io.lium.pod_id": "t"}, cpu_count=4)
+    )
+
+    assert api_client.created_container["labels"] == {
+        "io.lium.pod_id": "t",
+        "io.lium.cpu_count": "4",
+    }
+
+
+@pytest.mark.asyncio
 async def test_run_container_without_a_network_stays_on_the_default_bridge():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
