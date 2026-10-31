@@ -2102,6 +2102,49 @@ class _PendingDeletionRegistry:
         return len(self._marked_at)
 
 
+# DAH-4663 (review): how long a delete waits for a renter's GPU operation on the same pod (SSH and nvidia-smi,
+# seconds) before it runs anyway
+POD_GPU_OPERATION_DELETE_WAIT_SECONDS = 120
+
+
+class _PodGpuOperationLocks:
+    """One lock per pod shared by a renter's GPU operations (reset, clock lock) and the pod's delete.
+
+    The pending-pod check and its mark are separate steps, and a delete takes no mark, so a clock lock and a
+    delete could both run: a -lgc finishing after the delete's clock reset left the GPUs locked with no record
+    to undo it. A GPU operation now declines while the lock is held; a delete waits for it, so its clock reset
+    runs after any -lgc. In-process like inflight_creates: one validator process owns the executor.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._holders: dict[str, int] = {}
+
+    @contextlib.asynccontextmanager
+    async def hold(self, pod_id: str, wait: float):
+        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between."""
+        lock = self._locks.setdefault(pod_id, asyncio.Lock())
+        self._holders[pod_id] = self._holders.get(pod_id, 0) + 1
+        acquired = False
+        try:
+            if wait == 0:
+                acquired = not lock.locked() and await lock.acquire()
+            else:
+                try:
+                    acquired = await asyncio.wait_for(lock.acquire(), wait)
+                except TimeoutError:
+                    acquired = False
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
+            self._holders[pod_id] -= 1
+            if not self._holders[pod_id]:
+                del self._holders[pod_id], self._locks[pod_id]
+
+
+pod_gpu_operation_locks = _PodGpuOperationLocks()
+
 # In-process like inflight_creates: the backend re-asks the validator that owns the executor. A
 # validator restart forgets the marker, and the re-ask then runs the plain best-effort volume remove.
 pending_deletions = _PendingDeletionRegistry()
@@ -11328,6 +11371,24 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        # DAH-4663 (review): after a renter's GPU operation on the pod, so the clock reset below runs after any -lgc
+        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DELETE_WAIT_SECONDS) as held:
+            if not held:
+                logger.warning(
+                    _m(
+                        "A GPU operation on the pod is still running; deleting anyway",
+                        extra=get_extra_info(_delete_container_log_extra(payload, executor_info)),
+                    )
+                )
+            return await self._delete_container(payload, executor_info, keypair, private_key)
+
+    async def _delete_container(
+        self,
+        payload: ContainerDeleteRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
         default_extra = _delete_container_log_extra(payload, executor_info)
         log = _BoundLog(default_extra)
 
@@ -11679,7 +11740,32 @@ class DockerService:
             "executor_ssh_port": executor_info.ssh_port,
         }
         logger.info(_m(label, extra=get_extra_info({**default_extra, "payload": str(payload)})))
+        # DAH-4663 (review): never alongside the pod's delete or another GPU operation
+        async with pod_gpu_operation_locks.hold(payload.pod_id, 0) as held:
+            if not held:
+                logger.info(_m(f"{label}: another operation on the pod is running", extra=get_extra_info(default_extra)))
+                return dataclasses.replace(
+                    failed("Another operation on this pod is running"),
+                    error_code=GpuResetErrorCode.OperationInProgress,
+                )
+            return await self._pod_gpu_operation_held(
+                payload, executor_info, keypair, private_key, label, kind, operate, failed, gpu_uuids, after, default_extra
+            )
 
+    async def _pod_gpu_operation_held(
+        self,
+        payload: ResetPodGpuRequest | LockPodGpuClocksRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+        label: str,
+        kind: str,
+        operate: Callable[[SSHCommandRunner, str, Any, dict], Awaitable[_PodGpuReport]],
+        failed: Callable[[str], _PodGpuReport],
+        gpu_uuids: list[str] | None,
+        after: Callable[[_PodGpuReport | None, dict], Awaitable[None]] | None,
+        default_extra: dict,
+    ) -> _PodGpuReport:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
         try:

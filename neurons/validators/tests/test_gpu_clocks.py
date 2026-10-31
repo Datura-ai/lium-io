@@ -262,3 +262,89 @@ def test_a_lock_that_never_reached_the_executor_answers_with_a_clocks_result():
     busy = service._handle_container_error(payload, "busy", FailedContainerErrorCodes.RentingInProgress)
     assert isinstance(busy, PodGpuClocksResult) and busy.request_id == "r1" and not busy.ok
     assert busy.error_code == GpuResetErrorCode.OperationInProgress
+
+
+def _service_with_gated_steps(order: list[str]):
+    """A DockerService whose delete body and GPU operation body each wait on their own gate."""
+    import asyncio
+
+    from services.docker_service import DockerService
+
+    gates = {"delete": asyncio.Event(), "gpu": asyncio.Event()}
+    started = {"delete": asyncio.Event(), "gpu": asyncio.Event()}
+
+    def step(name: str, answer):
+        async def run(*_args, **_kwargs):
+            started[name].set()
+            await gates[name].wait()
+            order.append(name)
+            return answer
+
+        return run
+
+    service = DockerService.__new__(DockerService)
+    service._delete_container = step("delete", "deleted")
+    service._pod_gpu_operation_held = step("gpu", "locked")
+    return service, gates, started
+
+
+async def _gpu_operation(service):
+    from payload_models.payloads import LockPodGpuClocksRequest
+    from services.gpu_clocks import GpuClocksReport
+
+    payload = LockPodGpuClocksRequest(
+        miner_hotkey="hk", executor_id="ex", pod_id="pod1", container_name=NAME, gpu_uuids=U[:2],
+        min_mhz=1200, max_mhz=1500, request_id="r1",
+    )
+    info = type("Info", (), {"address": "h", "ssh_port": 22})()
+    return await service._pod_gpu_operation(
+        payload, info, None, "key", label="Lock pod GPU clocks", kind="gpu_clocks", operate=AsyncMock(),
+        failed=lambda detail: GpuClocksReport(ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=detail),
+    )
+
+
+def _delete_payload():
+    from payload_models.payloads import ContainerDeleteRequest
+
+    return ContainerDeleteRequest(miner_hotkey="hk", executor_id="ex", pod_id="pod1", container_name=NAME)
+
+
+@pytest.mark.asyncio
+async def test_a_delete_waits_for_a_clock_lock_in_flight_so_its_reset_runs_after_the_lgc():
+    import asyncio
+
+    from services.docker_service import pod_gpu_operation_locks
+
+    order: list[str] = []
+    service, gates, started = _service_with_gated_steps(order)
+    info = type("Info", (), {"address": "h", "ssh_port": 22})()
+
+    gpu = asyncio.create_task(_gpu_operation(service))
+    await started["gpu"].wait()
+    delete = asyncio.create_task(service.delete_container(_delete_payload(), info, None, "key"))
+    gates["delete"].set()
+    await asyncio.sleep(0.05)
+    assert not started["delete"].is_set()  # the delete waits for the -lgc
+    gates["gpu"].set()
+
+    assert await asyncio.gather(gpu, delete) == ["locked", "deleted"]
+    assert order == ["gpu", "delete"]
+    assert not pod_gpu_operation_locks._locks  # nothing kept per pod
+
+
+@pytest.mark.asyncio
+async def test_a_clock_lock_during_a_delete_is_declined_and_touches_nothing():
+    import asyncio
+
+    order: list[str] = []
+    service, gates, started = _service_with_gated_steps(order)
+    info = type("Info", (), {"address": "h", "ssh_port": 22})()
+
+    delete = asyncio.create_task(service.delete_container(_delete_payload(), info, None, "key"))
+    await started["delete"].wait()
+    report = await _gpu_operation(service)
+    gates["delete"].set()
+    await delete
+
+    assert (report.ok, report.error_code) == (False, GpuResetErrorCode.OperationInProgress)
+    assert order == ["delete"]  # the GPU operation never ran
