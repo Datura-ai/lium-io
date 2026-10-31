@@ -8,10 +8,18 @@ import stat
 from types import SimpleNamespace
 
 import pytest
-
+from neurons.validators.src.services.matrix_validation_service import MATRIX_VERIFY_TIMEOUT_SECONDS
+from neurons.validators.src.services.task.checks import (
+    gpu_fault_probe,
+    nvlink_fault,
+    pinned_memory_probe,
+)
 from neurons.validators.src.services.task.checks import verifyx as verifyx_check
+from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
+from neurons.validators.src.services.task.pipeline import ParallelStage
+from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
@@ -36,7 +44,7 @@ class _ProbeSequence:
         self.calls = 0
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **sizing
     ):
         self.calls += 1
         self.run_dir = run_dir
@@ -55,11 +63,11 @@ def _known(download: float) -> RentedExecutorsResponse:
     )
 
 
-def _ctx(context_factory, service, rented_data):
+def _ctx(context_factory, service, rented_data, first_pass=False, specs=None):
     return context_factory(
         services=build_services(verifyx=service),
-        config=build_context_config(),
-        state=build_state(specs={"gpu": {"count": 1}}, rented_data=rented_data),
+        config=build_context_config(first_pass=first_pass),
+        state=build_state(specs=specs or {"gpu": {"count": 1}}, rented_data=rented_data),
     )
 
 
@@ -207,12 +215,13 @@ class _TimedProbeSequence(_ProbeSequence):
         # ad2382f9, 31 Oct: the first run ended with ~208 s left and the retry ran into the task
         # deadline, dropping the cycle. Too little time left: judged on the first sample.
         ("skipped", [200.0], 0.0, 1, 0, False, None),
-        # a 265 s retry would leave 65 s, less than CapabilityCheck's matmul may take: not admitted
-        ("no_room_for_capability", [330.0], 0.0, 1, 0, False, None),
-        ("completed", [500.0, 500.0], 0.0, 2, 0, True, {"used": "retry", "timed_out": False}),
+        # a scored cycle reserves 420 s (matmul 120 + fault probe 150 + pinned memory 90 + 60):
+        # a 240 s retry would leave the later checks too little: not admitted
+        ("no_room_for_later_checks", [600.0], 0.0, 1, 0, False, None),
+        ("completed", [700.0, 700.0], 0.0, 2, 0, True, {"used": "retry", "timed_out": False}),
         # admitted by the estimate, but the retry outlives its budget (deadline less the reserve):
         # cut off, remote run killed, judged on the first sample instead of losing the whole result
-        ("over_budget", [500.0, 180.05], 5.0, 2, 1, False, {"used": "first", "timed_out": True}),
+        ("over_budget", [700.0, 420.05], 5.0, 2, 1, False, {"used": "first", "timed_out": True}),
         # plenty of task time left: the budget stops at the SSH command timeout (patched to 0.05 s)
         ("ssh_timeout_cap", [900.0, 900.0], 5.0, 2, 1, False, {"used": "first", "timed_out": True}),
     ],
@@ -264,7 +273,7 @@ async def test_a_retry_whose_ssh_call_failed_kills_the_remote_run(
 
 @pytest.mark.asyncio
 async def test_an_outer_cancel_during_the_retry_still_cancels_the_task(context_factory, monkeypatch):
-    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 500.0)
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
     service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=5.0)
     task = asyncio.create_task(VerifyXCheck().run(_ctx(context_factory, service, _never_measured())))
     while service.calls < 2:
@@ -337,3 +346,70 @@ async def test_killing_a_cut_off_retry_during_the_disk_test_spares_other_process
     assert decoy.returncode is None
     decoy.kill()
     await decoy.wait()
+
+
+# The SSH cap of each GPU probe after VerifyX, and whether it runs on a (shadow) first pass.
+_LATER_PROBE_CAPS = {
+    CapabilityCheck: (MATRIX_VERIFY_TIMEOUT_SECONDS, True),
+    gpu_fault_probe.GpuFaultProbeCheck: (gpu_fault_probe.PROBE_TIMEOUT_SECONDS, False),
+    pinned_memory_probe.PinnedMemoryProbeCheck: (pinned_memory_probe.PROBE_TIMEOUT_SECONDS, True),
+    nvlink_fault.NvlinkFaultCheck: (nvlink_fault.PROBE_TIMEOUT_SECONDS, True),
+}
+
+
+def _gpu_probes_after_verifyx(checks, first_pass):
+    """The capped GPU probes the real pipeline runs after VerifyX, one after another (the fast
+    path's GPU lane is the one holding CapabilityCheck)."""
+    after = checks[[type(c) for c in checks].index(VerifyXCheck) + 1 :]
+    flat = []
+    for c in after:
+        if isinstance(c, ParallelStage):
+            c = next(lane for lane in c.lanes if any(isinstance(x, CapabilityCheck) for x in lane))
+        flat += c if isinstance(c, list) else [c]
+    caps = [_LATER_PROBE_CAPS[type(c)] for c in flat if type(c) in _LATER_PROBE_CAPS]
+    return [cap for cap, on_first_pass in caps if on_first_pass or not first_pass]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("order", "first_pass"),
+    [("serial", False), ("serial", True), ("fast_path", True)],
+)
+@pytest.mark.parametrize("nvlink", [False, True])
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_a_cold_retry_leaves_every_later_probe_its_full_cap(
+    context_factory, monkeypatch, order, first_pass, nvlink, admitted
+):
+    # PR review, 31 Oct: a 240 s first sample left 500 s, the retry took 300 s, then the matmul 100 s
+    # and the fault probe 110 s, and the deadline cancelled the cycle. Every probe after VerifyX in
+    # the real pipeline is given its whole SSH cap; the retry is admitted only if they all still fit.
+    checks = PipelineFactory.build_checks(fast_path=order == "fast_path")
+    probe_caps = _gpu_probes_after_verifyx(checks, first_pass)
+    assert len(probe_caps) == (3 if first_pass else 4)  # matmul, [fault probe], pinned memory, nvlink
+    if not nvlink:
+        probe_caps.remove(nvlink_fault.PROBE_TIMEOUT_SECONDS)  # skipped on a board without NVLink
+    first_sample_s = 240.0
+    needed = first_sample_s + sum(probe_caps) + verifyx_check.COLD_RETRY_SLACK_SECONDS
+    clock = {"left": needed + (0.0 if admitted else -1.0)}
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: clock["left"])
+    monkeypatch.setattr(verifyx_check.time, "monotonic", lambda: 0.0)
+
+    class _SlowRetry(_TimedProbeSequence):
+        async def validate_verifyx_and_process_job(self, **kwargs):
+            response = await super().validate_verifyx_and_process_job(**kwargs)
+            if self.calls == 2:
+                clock["left"] -= first_sample_s  # the retry takes as long as the first sample
+            return response
+
+    service = _SlowRetry(_probe(88.0), _probe(760.0))
+    specs = {"gpu": {"count": 1}, "interconnect": {"nvlink": nvlink}}
+    ctx = _ctx(context_factory, service, _never_measured(), first_pass=first_pass, specs=specs)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert service.calls == (2 if admitted else 1)
+    if not first_pass:  # a first pass does not fail on the network gate
+        assert result.passed is admitted
+    if admitted:
+        # what the later probes still have, each at its full cap, before the task is cancelled
+        assert clock["left"] - sum(probe_caps) >= verifyx_check.COLD_RETRY_SLACK_SECONDS

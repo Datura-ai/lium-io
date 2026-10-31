@@ -22,7 +22,10 @@ from services.verifyx_validation_service import (
 
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .gpu_fault_probe import PROBE_TIMEOUT_SECONDS as GPU_FAULT_PROBE_TIMEOUT_SECONDS
 from .network_ema import compute_ema
+from .nvlink_fault import PROBE_TIMEOUT_SECONDS as NVLINK_PROBE_TIMEOUT_SECONDS
+from .pinned_memory_probe import PROBE_TIMEOUT_SECONDS as PINNED_MEMORY_PROBE_TIMEOUT_SECONDS
 from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
@@ -47,9 +50,25 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 # about as long as the first (3-15 min in prod), never less than this, plus the reserve for the
 # checks after it. Otherwise the deadline cancelled the task and the cycle had no result at all.
 MIN_COLD_RETRY_SECONDS = 240
-# The checks after VerifyX: CapabilityCheck's matmul may use its whole SSH cap, plus a minute for
-# the rest of the pipeline and its cleanup.
-COLD_RETRY_RESERVE_SECONDS = MATRIX_VERIFY_TIMEOUT_SECONDS + 60
+# A minute for the uncapped rest of the pipeline and its cleanup.
+COLD_RETRY_SLACK_SECONDS = 60
+
+
+def cold_retry_reserve_seconds(ctx: Context) -> int:
+    """The time the checks after VerifyX may take: the SSH cap of every GPU probe that will run
+    (in both orders they run one after another: serially, or in the fast path's GPU lane), plus slack.
+    RentalProbeCheck and IdleDiskWriteCheck size themselves to task_seconds_left, so they are not counted.
+    shortcut: the fast path's host lane (port checks, registry pull) runs beside the GPU lane and is
+    not budgeted; count it if VALIDATION_FAST_PATH_ENABLED goes on by default."""
+    reserve = MATRIX_VERIFY_TIMEOUT_SECONDS + COLD_RETRY_SLACK_SECONDS
+    if not ctx.config.first_pass or settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED:
+        reserve += GPU_FAULT_PROBE_TIMEOUT_SECONDS  # skipped on a shadow first pass
+    if settings.PINNED_MEMORY_PROBE_CHECK_ENABLED:
+        reserve += PINNED_MEMORY_PROBE_TIMEOUT_SECONDS
+    interconnect = (ctx.state.specs or {}).get("interconnect")
+    if isinstance(interconnect, dict) and interconnect.get("nvlink") is True:
+        reserve += NVLINK_PROBE_TIMEOUT_SECONDS
+    return reserve
 
 
 @dataclass(frozen=True)
@@ -156,10 +175,8 @@ class VerifyXCheck:
         cold = _is_cold_sample_below_gate(ctx, result, prev_ema)
         if cold:
             seconds_left = task_seconds_left(ctx)
-            if (
-                seconds_left
-                < max(first_run_seconds, MIN_COLD_RETRY_SECONDS) + COLD_RETRY_RESERVE_SECONDS
-            ):
+            reserve = cold_retry_reserve_seconds(ctx)
+            if seconds_left < max(first_run_seconds, MIN_COLD_RETRY_SECONDS) + reserve:
                 retry_skipped_seconds_left = int(seconds_left)
                 logger.info(
                     _m(
@@ -195,7 +212,7 @@ class VerifyXCheck:
                         **sizing,
                     ),
                     timeout=min(
-                        task_seconds_left(ctx) - COLD_RETRY_RESERVE_SECONDS,
+                        task_seconds_left(ctx) - reserve,
                         VERIFYX_COMMAND_TIMEOUT_SECONDS,
                     ),
                 )
