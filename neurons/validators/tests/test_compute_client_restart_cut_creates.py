@@ -4,7 +4,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from clients.compute_client import CREATE_CUT_OFF_BY_RESTART_STEP, ComputeClient, OutgoingMessages
-from payload_models.payloads import ContainerCreateRequest, FailedContainerRequest, WorkloadKind
+from payload_models.payloads import (
+    ContainerCreated,
+    ContainerCreateRequest,
+    ExecutorRentFinishedRequest,
+    FailedContainerRequest,
+    WorkloadKind,
+)
+from protocol.vc_protocol.compute_requests import Response
 from services.redis_service import InflightBackendCreate, RedisService
 
 
@@ -145,3 +152,122 @@ async def test_a_create_still_runs_and_returns_when_redis_cannot_track_it() -> N
     )
 
     assert await client.miner_driver(request) == "created"
+
+
+class _ReconnectedSocket:
+    """a backend socket that accepts the auth and then closes"""
+
+    def __init__(self) -> None:
+        self.send = AsyncMock()
+
+    async def recv(self) -> str:
+        return Response(status="success").model_dump_json()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+async def _create_and_send_container_created(redis_service: RedisService) -> ComputeClient:
+    client = _client(redis_service)
+    client.message_queue = OutgoingMessages()
+    client.lock = asyncio.Lock()
+    client.keypair = MagicMock()
+    client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="1.2.3.4", port=8000))
+
+    async def handle_container(job_request: ContainerCreateRequest) -> ContainerCreated:
+        await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1")  # what the create does
+        return ContainerCreated(
+            miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1",
+            container_name="c-1", volume_name="v-1", port_maps=[(22, 40022)],
+        )
+
+    client.miner_service.handle_container = handle_container
+    request = ContainerCreateRequest.model_construct(
+        pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1", workload_kind=WorkloadKind.CUSTOMER_RENTAL
+    )
+    await client._drive_miner_job(request)
+    # the send loop takes it off the queue and the socket accepts it; the backend then restarts (1012)
+    client.message_queue.pop(0)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_a_container_created_lost_to_a_backend_reconnect_is_resent_once(monkeypatch) -> None:
+    monkeypatch.setattr("clients.compute_client.AuthenticateRequest.from_keypair", lambda _: Response(status="success"))
+    redis_service = _redis_service()
+    client = await _create_and_send_container_created(redis_service)
+
+    await client.handle_connection(_ReconnectedSocket())
+
+    assert len(client.message_queue) == 1
+    resent = client.message_queue[0]
+    assert isinstance(resent, ContainerCreated)
+    assert (resent.pod_id, resent.container_name, resent.port_maps) == ("pod-1", "c-1", [(22, 40022)])
+
+    await client.handle_connection(_ReconnectedSocket())  # still queued: not doubled
+    assert len(client.message_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_rent_finished_receipt_stops_the_resend() -> None:
+    redis_service = _redis_service()
+    client = await _create_and_send_container_created(redis_service)
+
+    await client._drive_miner_job(
+        ExecutorRentFinishedRequest.model_construct(miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1")
+    )
+    await client.resend_unacked_container_created()
+
+    assert client.message_queue == []
+    assert await redis_service.unacked_container_created() == {}
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_container_created_is_dropped_once_its_pending_flag_is_gone() -> None:
+    redis_service = _redis_service()
+    client = await _create_and_send_container_created(redis_service)
+    await redis_service.hdel("pending_pods_prefix", "miner-hk:exec-1")  # aged out / wiped on a validator start
+
+    await client.resend_unacked_container_created()
+
+    assert client.message_queue == []
+    assert await redis_service.unacked_container_created() == {}
+
+
+@pytest.mark.parametrize(
+    ("saved_success", "pending", "expected"),
+    [
+        # created, report unanswered: the startup sweep leaves it to the replay
+        (True, True, ContainerCreated),
+        # no saved success: the create was cut off, reported failed as before
+        (False, True, FailedContainerRequest),
+        # a saved success whose pending flag is gone is never replayed, so the create is reported failed
+        (True, False, FailedContainerRequest),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_startup_sweep_leaves_a_saved_success_to_the_replay(saved_success, pending, expected) -> None:
+    redis_service = _redis_service()
+    if saved_success:
+        client = await _create_and_send_container_created(redis_service)
+    else:
+        client = _client(redis_service)
+        client.message_queue = OutgoingMessages()
+        client.lock = asyncio.Lock()
+        await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1")
+    if not pending:
+        await redis_service.hdel("pending_pods_prefix", "miner-hk:exec-1")
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL)
+
+    await client.fail_creates_cut_off_by_restart()
+    await client.resend_unacked_container_created()
+
+    assert len(client.message_queue) == 1
+    assert isinstance(client.message_queue[0], expected)
+    assert await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1") == (expected is ContainerCreated)
+    if expected is ContainerCreated:
+        assert await redis_service.inflight_backend_creates() == {}
+    assert (await redis_service.unacked_container_created() != {}) == (expected is ContainerCreated)
