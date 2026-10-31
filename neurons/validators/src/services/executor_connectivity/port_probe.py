@@ -1,6 +1,7 @@
 import logging
 
 from core.utils import _m, get_extra_info
+from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.models import PortPair, PortProbeResult
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
 
@@ -27,13 +28,16 @@ class PortProbe:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
     ) -> PortProbeResult:
+        """`min_ports`: the verified ports PortCountCheck needs to list the node (more for a split node)."""
         log_ctx = log_ctx or {}
         batch = await self.batch_verifier.verify(
             ports,
             ssh_client=ssh_client,
             host=host,
             log_ctx=log_ctx,
+            min_ports=min_ports,
         )
         if batch.external_blocked:
             # the other tiers probe from the validator too, so they would pass the same host
@@ -41,31 +45,39 @@ class PortProbe:
         successful, failed = batch.successful, batch.failed
         tier = "batch"
 
-        if not successful:
+        def short(ok) -> bool:
+            # a split node (min_ports above the floor) keeps probing until it has its ports or every selected port
+            # answered; the tier that verified most wins. Otherwise a later tier runs only when the earlier one
+            # verified nothing.
+            return not ok or (min_ports > MIN_PORT_COUNT and len(ok) < min(min_ports, len(ports)))
+
+        if short(successful):
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
             logger.debug(
-                _m("batch verification failed, trying semi-batch", extra=get_extra_info(log_ctx))
+                _m("batch verification short, trying semi-batch", extra=get_extra_info(log_ctx))
             )
-            successful, failed = await self.semi_batch_verifier.verify(
+            semi_ok, semi_failed = await self.semi_batch_verifier.verify(
                 ports,
                 ssh_client=ssh_client,
                 host=host,
-                max_ports=50,
+                max_ports=max(50, min_ports),
                 log_ctx=log_ctx,
             )
-            tier = "semi_batch"
+            if len(semi_ok) >= len(successful):
+                successful, failed, tier = semi_ok, semi_failed, "semi_batch"
 
-        if not successful:
+        if short(successful):
             logger.debug(
-                _m("semi-batch verification failed, trying fallback", extra=get_extra_info(log_ctx))
+                _m("semi-batch verification short, trying fallback", extra=get_extra_info(log_ctx))
             )
-            successful, failed = await self.fallback_verifier.verify(
+            fb_ok, fb_failed = await self.fallback_verifier.verify(
                 ports,
                 ssh_client=ssh_client,
                 host=host,
-                max_ports=10,
+                max_ports=max(10, min_ports),
                 log_ctx=log_ctx,
             )
-            tier = "fallback"
+            if len(fb_ok) >= len(successful):
+                successful, failed, tier = fb_ok, fb_failed, "fallback"
 
         return PortProbeResult(tuple(successful), tuple(failed), tier)

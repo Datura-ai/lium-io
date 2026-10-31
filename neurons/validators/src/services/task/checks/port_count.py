@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from typing import Any
 
 from services.const import MIN_PORT_COUNT
 from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
+from ..availability import AVAILABILITY_CATEGORY, ReachSource, ReachTarget
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
+
+logger = logging.getLogger(__name__)
 
 
 def port_count_below_listing_floor(state: ContextState) -> int | None:
@@ -24,6 +28,74 @@ def port_count_below_listing_floor(state: ContextState) -> int | None:
     if not isinstance(available, int) or isinstance(available, bool):
         return None
     return available if available < MIN_PORT_COUNT else None
+
+
+def split_port_requirement(state: ContextState) -> tuple[int, int] | None:
+    """(max splits, ports needed) for a node offered as GPU splits, else None.
+
+    DAH-3698 (owner, 29 Oct 2026): a split node lists only with MIN_PORT_COUNT free verified ports
+    for each of its gpu_count // gpu_splitting_min_count splits, so every split can be rented at once.
+    """
+    min_count = state.gpu_splitting_min_count
+    if not state.supports_gpu_splitting or not min_count or min_count <= 0:
+        return None
+    max_splits = (state.gpu_count or 0) // min_count
+    return max_splits, max(max_splits * MIN_PORT_COUNT, MIN_PORT_COUNT)
+
+
+def split_port_shortfall(
+    state: ContextState, verified_override: int | None = None
+) -> tuple[int, tuple[int, int]] | None:
+    """(port count, split_port_requirement) when a split node has the plain floor but not MIN_PORT_COUNT
+    ports per split, else None (below the floor, the floor reports it). The count is the published
+    `available_port_count`, or `verified_override` when the caller re-probed the node itself."""
+    need = split_port_requirement(state)
+    available: Any = state.specs.get("available_port_count")
+    if not need or not isinstance(available, int) or isinstance(available, bool):
+        return None
+    count = available if verified_override is None else verified_override
+    return (count, need) if MIN_PORT_COUNT <= available and count < need[1] else None
+
+
+def split_ports_event(
+    ctx: Context,
+    check_id: str,
+    state: ContextState,
+    port_count: int,
+    split_need: tuple[int, int],
+    *,
+    what: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+):
+    """INSUFFICIENT_PORTS for an idle split node short of its ports.
+
+    An availability entry, not a runtime event: the backend does not store a zero-score report, so
+    only an availability entry takes an already-listed node off the market; the next passing cycle
+    lists it again.
+    """
+    max_splits, required = split_need
+    return render_message(
+        Msg.INSUFFICIENT_PORTS,
+        ctx=ctx,
+        check_id=check_id,
+        category=AVAILABILITY_CATEGORY,
+        what={
+            "reach_source": str(ReachSource.VALIDATOR),
+            "reach_target": str(ReachTarget.EXECUTOR_PORTS),
+            **port_floor_what(state, port_count),
+            "required": required,
+            "max_splits": max_splits,
+            "gpu_splitting_min_count": state.gpu_splitting_min_count,
+            **(what or {}),
+        },
+        remediation=(
+            f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
+            f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
+            "then run `docker compose restart executor-runner` in neurons/executor. Edit .env with nano: "
+            "vim and sed -i replace the file, and the running executor keeps the old copy."
+        ),
+        extra=extra,
+    )
 
 
 def hidden_from_renters_text(available_port_count: int) -> str:
@@ -78,8 +150,9 @@ class PortCountCheck:
     check_id = "executor.validate.port_count"
     fatal = True
 
-    async def run(self, ctx: Context) -> CheckResult:
-        rented_data = ctx.state.rented_data
+    @staticmethod
+    def _count(ctx: Context, rented_data) -> tuple[int, bool, ContextState]:
+        """(port count, rented, state with the published port specs) as `rented_data` sees the node."""
         # The probe skips our idle filler's ports, but a rental removes the filler (create-time
         # cleanup) and frees them, so they join both the count and verified_ports, the set the
         # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
@@ -89,8 +162,12 @@ class PortCountCheck:
         verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
         port_count = ctx.state.verified_port_count + len(filler_ports)
 
-        # Check if executor is rented (same pattern as rented_machine.py)
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        # the rental TenantEnforcementCheck judges: another miner's on another endpoint is not this node's
+        from .rented_machine import _rental_of_validated_miner  # rented_machine imports this module
+
+        rented_executor = _rental_of_validated_miner(
+            ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        )
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         updated_state = replace(
@@ -103,6 +180,32 @@ class PortCountCheck:
                 "port_mappings": ctx.executor.port_mappings,
             },
         )
+        return port_count, is_rented, updated_state
+
+    async def run(self, ctx: Context) -> CheckResult:
+        port_count, is_rented, updated_state = self._count(ctx, ctx.state.rented_data)
+
+        split_need = split_port_requirement(ctx.state)
+        if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
+            # a rent or filler that started after the cycle's rental snapshot holds ports the probe found
+            # busy; re-read the backend once before failing, and a backend that does not answer keeps it
+            try:
+                fresh = await ctx.services.backend.get_rented_executors_now()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Rented-executors re-read failed; the split port verdict stands: %s", exc)
+                fresh = None
+            if fresh is not None:
+                port_count, is_rented, updated_state = self._count(ctx, fresh)
+                updated_state = replace(updated_state, rented_data=fresh)
+
+        # below MIN_PORT_COUNT the plain floor below reports it; a rented node keeps its exemption
+        if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
+            event = split_ports_event(ctx, self.check_id, updated_state, port_count, split_need)
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={"port_count": port_count, "state": updated_state},
+            )
 
         if not is_rented and port_count < MIN_PORT_COUNT:
             # DAH-2991: when the shortfall is our own leftover — an orphaned rental container the
