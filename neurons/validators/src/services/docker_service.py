@@ -11384,7 +11384,11 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        # DAH-4663 (review): after a renter's GPU operation on the pod, so the clock reset below runs after any -lgc
+        refused = await self._stop_create_before_delete(payload, executor_info)
+        if refused is not None:
+            return refused
+        # DAH-4663 (review): after a renter's GPU operation on the pod, so the clock reset below runs after any -lgc.
+        # Taken only once the cancelled create is done: its own clock reset waits on this lock.
         async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DELETE_WAIT_SECONDS) as held:
             if not held:
                 logger.warning(
@@ -11396,15 +11400,9 @@ class DockerService:
                 return self._deletion_in_progress(payload, msg="A GPU operation is still running; retry deletion")
             return await self._delete_container(payload, executor_info, keypair, private_key)
 
-    async def _delete_container(
-        self,
-        payload: ContainerDeleteRequest,
-        executor_info: ExecutorSSHInfo,
-        keypair: bittensor.Keypair,
-        private_key: str,
-    ):
-        default_extra = _delete_container_log_extra(payload, executor_info)
-        log = _BoundLog(default_extra)
+    async def _stop_create_before_delete(self, payload: ContainerDeleteRequest, executor_info: ExecutorSSHInfo):
+        """The delete's steps before its teardown: the refusal to answer, or None."""
+        log = _BoundLog(_delete_container_log_extra(payload, executor_info))
 
         # DAH-2728: a delete that races an in-flight create can arrive before any container name
         # exists. The create built its name from the pod id, so the same rule reconstructs it here
@@ -11441,6 +11439,18 @@ class DockerService:
             payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
         ):
             log.warning("Cancelled the create's steps after its reply; deleting without them")
+
+        return None
+
+    async def _delete_container(
+        self,
+        payload: ContainerDeleteRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        default_extra = _delete_container_log_extra(payload, executor_info)
+        log = _BoundLog(default_extra)
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)

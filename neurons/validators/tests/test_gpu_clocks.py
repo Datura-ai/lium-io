@@ -442,3 +442,33 @@ async def test_a_clock_lock_during_a_reboots_clock_reset_is_declined_and_touches
 
     assert (report.ok, report.error_code) == (False, GpuResetErrorCode.OperationInProgress)
     assert order == ["rgc"]  # the clock lock never ran
+
+
+@pytest.mark.asyncio
+async def test_a_delete_cancels_a_create_before_taking_the_pod_lock_its_clock_reset_needs(monkeypatch):
+    import asyncio
+
+    import services.docker_service as ds
+
+    order: list[str] = []
+    service, gates, _started = _service_with_gated_steps(order)
+    service.redis_service = None
+    monkeypatch.setattr(ds, "reset_leftover_clock_locks", AsyncMock(side_effect=lambda *_a: order.append("rgc")))
+    info = type("Info", (), {"address": "h", "port": 8001, "ssh_username": "u", "ssh_port": 22})()
+    create_go = asyncio.Event()
+
+    async def create():
+        with ds.inflight_creates.track("pod1"):
+            await create_go.wait()
+            await service._reset_leftover_clock_locks_before_create(None, _create_payload(), {})
+
+    creating = asyncio.create_task(create())
+    await asyncio.sleep(0)
+    delete = asyncio.create_task(service.delete_container(_delete_payload(), info, None, "key"))
+    await asyncio.sleep(0.05)  # the delete has cancelled the create and waits for it
+    create_go.set()
+    gates["delete"].set()
+
+    # before the fix the delete held the lock the create's -rgc waited on: each waited for the other
+    assert await asyncio.wait_for(asyncio.gather(creating, delete), 5) == [None, "deleted"]
+    assert order == ["rgc", "delete"]
