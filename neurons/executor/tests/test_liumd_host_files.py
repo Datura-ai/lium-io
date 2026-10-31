@@ -82,6 +82,7 @@ def test_the_host_files_have_the_shapes_liumd_reads(tmp_path):
         nonce_dir=nonces,
         validator_hotkeys={"current": "5Current", "next": "5Next"},
         miner_hotkey=" 5Miner \n",
+        pool_hotkey="5Pool",
         port_range="20000-20010",
         port_mappings=None,
         ssh_port=2200,
@@ -89,12 +90,13 @@ def test_the_host_files_have_the_shapes_liumd_reads(tmp_path):
 
     assert (etc / "validator_hotkeys").read_text() == "5Current\n5Next\n"
     assert (etc / "miner_hotkey").read_text() == "5Miner\n"
+    assert (etc / "pool_hotkey").read_text() == "5Pool\n"
     assert json.loads((etc / "ports.json").read_text()) == {
         "port_range": "20000-20010",
         "port_mappings": None,
         "ssh_port": 2200,
     }
-    for name in ("validator_hotkeys", "miner_hotkey", "ports.json"):
+    for name in ("validator_hotkeys", "miner_hotkey", "pool_hotkey", "ports.json"):
         assert stat.S_IMODE((etc / name).stat().st_mode) == 0o644
     assert nonces.is_dir() and os.access(nonces, os.W_OK)
     assert stat.S_IMODE(nonces.stat().st_mode) == 0o700
@@ -114,6 +116,7 @@ def test_host_reads_the_executor_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(config.settings, "RENTING_PORT_RANGE", "30000-30004")
     monkeypatch.setattr(config.settings, "RENTING_PORT_MAPPINGS", None)
     monkeypatch.setattr(config.settings, "SSH_PORT", 2222)
+    monkeypatch.setattr(config.settings, "LIUM_POOL_HOTKEY", "5StagingPool")
 
     assert hf.main(["host"]) == 0
 
@@ -123,6 +126,7 @@ def test_host_reads_the_executor_settings(tmp_path, monkeypatch):
     assert (
         tmp_path / "etc/miner_hotkey"
     ).read_text() == f"{config.settings.MINER_HOTKEY_SS58_ADDRESS}\n"
+    assert (tmp_path / "etc/pool_hotkey").read_text() == "5StagingPool\n"
     assert json.loads((tmp_path / "etc/ports.json").read_text()) == {
         "port_range": "30000-30004",
         "port_mappings": None,
@@ -154,3 +158,16 @@ def test_the_wrapper_hands_the_image_manifest_to_the_binary(tmp_path):
     )
 
     assert out.stdout.strip() == "/etc/liumd/children.json|unset|run"
+
+
+def test_a_pool_equal_to_the_portal_hotkey_reaches_liumd_as_no_pool(tmp_path, monkeypatch):
+    """liumd knows no portal hotkey of its own; the executor drops one here, as accepted_miner_hotkeys does."""
+    import core.config as config
+
+    monkeypatch.setattr(hf, "ETC_DIR", tmp_path / "etc")
+    monkeypatch.setattr(hf, "NONCE_DIR", tmp_path / "nonces")
+    monkeypatch.setattr(config.settings, "LIUM_POOL_HOTKEY", config.settings.DEFAULT_MINER_HOTKEY)
+
+    assert hf.main(["host"]) == 0
+
+    assert (tmp_path / "etc/pool_hotkey").read_text() == "\n"

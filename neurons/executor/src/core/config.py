@@ -122,6 +122,11 @@ class Settings(BaseSettings):
         env="DEFAULT_MINER_HOTKEY",
         default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
     )
+    # DAH-5296: a provider moved to Lium-held payouts is served under the Lium pool hotkey, so
+    # validators bind SSH keys and /verify intents to it. Empty = accept only the own hotkey.
+    LIUM_POOL_HOTKEY: str = Field(
+        env="LIUM_POOL_HOTKEY", default="5DksAY4DE3Xo9LCa4XvGM9T4Eq3Zi9jZjGXfNtuHfqMB24NM"
+    )
 
     RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
