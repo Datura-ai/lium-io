@@ -657,8 +657,10 @@ class Settings(BaseSettings):
     # False: dilution applies as before.
     ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
     # A configuration's filler average is used only when it was taken over at least this many
-    # filler GPU-hours; a thinner sample reads as no average.
-    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
+    # filler GPU-hours; a thinner sample reads as no average. 2 = the backend's floor for the
+    # per-card rate the average is built from (lium-platform MIN_SAMPLE_GPU_HOURS); 24 left a
+    # lone 1-GPU Spot node unpaid for its first day of Default Job and after every restart.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=2.0)
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
     # unrented node) when every pod in the batch-start rented list is stale: not running and its
