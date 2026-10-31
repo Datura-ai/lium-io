@@ -137,11 +137,19 @@ async def test_a_backend_subset_of_a_whole_host_container_touches_only_the_backe
 
 
 @pytest.mark.asyncio
-async def test_a_refused_lock_is_reported_and_its_record_kept_for_teardown():
-    report, redis = await _lock(FakeHost(lgc_exit=1))
+async def test_a_refused_lock_is_reported_and_leaves_the_record_it_found():
+    host = FakeHost()
+    _, redis = await _lock(host, indices=[0])  # an earlier lock that holds: container index 0 is U[1] here
+    earlier = redis.store[f"gpu_clock_lock:{U[1]}"]
+    host.lgc_exit, host.rgc_exit = 1, 1  # a GPU that now refuses both -lgc and -rgc
+
+    report, redis = await _lock(host, redis)
+
     assert not report.ok and report.error_code == GpuResetErrorCode.ClockLockNotSupported
     assert {g.result for g in report.gpus} == {"failed"}
-    assert f"gpu_clock_lock:{U[0]}" in redis.store
+    assert redis.store[f"gpu_clock_lock:{U[1]}"] == earlier, "its clocks are still locked"
+    assert f"gpu_clock_lock:{U[0]}" not in redis.store, "never locked: nothing for a create to refuse on"
+    assert await reset_leftover_clock_locks(host, redis, [U[0]]) == []
 
 
 @pytest.mark.asyncio
@@ -517,9 +525,8 @@ async def test_a_delete_cancels_a_create_before_taking_the_pod_lock_its_clock_re
     gates["delete"].set()
 
     # before the fix the delete held the lock the create's clock reset waited on: each waited for the other.
-    # The cancelled create now stops at that step, running no -rgc on GPUs that may be rented again.
-    created, deleted = await asyncio.wait_for(asyncio.gather(creating, delete, return_exceptions=True), 5)
-    assert isinstance(created, ds._CreateCancelledByDelete) and deleted == "deleted"
+    # The cancelled create now skips that step: no -rgc on GPUs that may be rented again.
+    assert await asyncio.wait_for(asyncio.gather(creating, delete), 5) == [None, "deleted"]
     assert order == ["delete"]
 
 
@@ -546,8 +553,8 @@ async def test_a_create_its_delete_cancelled_runs_no_clock_reset(monkeypatch):
 
     with ds.inflight_creates.track("pod1"):
         ds.inflight_creates.cancel("pod1")
-        with pytest.raises(ds._CreateCancelledByDelete):
-            await service._reset_leftover_clock_locks_before_create(None, payload, {})
+        # no raise: the create's next cancel check, inside its cleanup block, removes its volume and image
+        await service._reset_leftover_clock_locks_before_create(None, payload, {})
 
     reset.assert_not_awaited()  # the GPUs may already be the next renter's
     assert not ds.pod_gpu_operation_locks._locks

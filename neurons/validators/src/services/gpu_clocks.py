@@ -214,7 +214,7 @@ async def lock_pod_gpu_clocks(
         )
         for uuid in targets
     ]
-    # a failed lock keeps its record: the pod's delete still runs -rgc on it, which is harmless
+    # a refused -lgc leaves the record it found; the pod's delete still runs -rgc on every GPU in its index
     ok = all(gpu.result == "locked" for gpu in gpus)
     return GpuClocksReport(ok=ok, error_code=None if ok else GpuResetErrorCode.ClockLockNotSupported, gpus=gpus)
 
@@ -247,9 +247,16 @@ async def _lock_one_gpu(
     # record first, as the power cap does: never change a GPU without a stored way back. Only right before the
     # -lgc, so a GPU this request never changes gets no record a create would then refuse on (review F-46)
     record = {"gpu_uuid": uuid, "pod_id": pod_id, "executor_id": executor_id, "locked_at": time.time()}
+    previous = await redis.get(_lock_key(uuid))
     await redis.set(_lock_key(uuid), json.dumps(record))
     locked = await _run(runner, build_clock_command("lock", uuid, pod_gpu_uuids=pod_gpu_uuids, min_mhz=low, max_mhz=high))
     if locked.exit_code != 0:
+        # a refused -lgc changed nothing: back to the record before it (review: else a GPU that also refuses -rgc
+        # would carry a record for clocks never locked, and every later create on it would be refused)
+        if previous:
+            await redis.set(_lock_key(uuid), previous)
+        else:
+            await redis.delete(_lock_key(uuid))
         outcome.detail = _tail(locked.stdout or locked.stderr) or "nvidia-smi -lgc failed"
         return outcome
     readback = await _run(
