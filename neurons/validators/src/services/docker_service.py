@@ -2102,9 +2102,11 @@ class _PendingDeletionRegistry:
         return len(self._marked_at)
 
 
-# DAH-4663 (review): how long a delete waits for a renter's GPU operation on the same pod (SSH and nvidia-smi,
-# seconds) before it runs anyway
+# DAH-4663 (review): how long a delete waits for a renter's GPU operation on the same pod before it answers
+# DeletionInProgress (the backend re-asks); the operation itself ends by its deadline, so a delete always gets through
 POD_GPU_OPERATION_DELETE_WAIT_SECONDS = 120
+# the longest a renter's GPU operation holds the pod (the 8x H200 reset with its container restart took 68-84 s)
+POD_GPU_OPERATION_DEADLINE_SECONDS = 600
 
 
 class _PodGpuOperationLocks:
@@ -11376,10 +11378,11 @@ class DockerService:
             if not held:
                 logger.warning(
                     _m(
-                        "A GPU operation on the pod is still running; deleting anyway",
+                        "A GPU operation on the pod is still running; the backend re-asks the delete",
                         extra=get_extra_info(_delete_container_log_extra(payload, executor_info)),
                     )
                 )
+                return self._deletion_in_progress(payload, msg="A GPU operation is still running; retry deletion")
             return await self._delete_container(payload, executor_info, keypair, private_key)
 
     async def _delete_container(
@@ -11748,9 +11751,17 @@ class DockerService:
                     failed("Another operation on this pod is running"),
                     error_code=GpuResetErrorCode.OperationInProgress,
                 )
-            return await self._pod_gpu_operation_held(
-                payload, executor_info, keypair, private_key, label, kind, operate, failed, gpu_uuids, after, default_extra
-            )
+            try:
+                return await asyncio.wait_for(
+                    self._pod_gpu_operation_held(
+                        payload, executor_info, keypair, private_key, label, kind, operate, failed, gpu_uuids, after,
+                        default_extra,
+                    ),
+                    POD_GPU_OPERATION_DEADLINE_SECONDS,
+                )
+            except TimeoutError:
+                logger.error(_m(f"{label}: past its deadline, cancelled", extra=get_extra_info(default_extra)))
+                return failed(f"The GPU operation did not finish in {POD_GPU_OPERATION_DEADLINE_SECONDS} s")
 
     async def _pod_gpu_operation_held(
         self,
