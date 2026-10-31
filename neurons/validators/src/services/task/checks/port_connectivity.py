@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
@@ -13,6 +14,10 @@ from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
+
+# machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
+# out: a busy host, not a verdict on Sysbox
+SYSBOX_TEST_TIMED_OUT = "Test command timed out."
 
 
 class PortConnectivityCheck:
@@ -45,12 +50,18 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        # 26 Oct: an unrented node's scrape sysbox test timed out under load, so the probe ran without sysbox-runc,
+        # failed, and the node scored 0 with Sysbox working. The timeout is provider-reported, so it is neither a
+        # pass nor a miss: the validator's own probe measures Sysbox with sysbox-runc instead.
+        scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+        probe_sysbox = ctx.state.sysbox_runtime or (rented_executor is None and scrape_error == SYSBOX_TEST_TIMED_OUT)
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
             ctx.miner_hotkey,
             ctx.executor,
-            ctx.state.sysbox_runtime,
+            probe_sysbox,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
             filler_ports=filler_ports,
@@ -62,6 +73,10 @@ class PortConnectivityCheck:
                 "executor_ip": ctx.executor.address,
             },
         )
+        if probe_sysbox and not ctx.state.sysbox_runtime:
+            # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
+            # own in-container measurement may say Sysbox works
+            result = replace(result, sysbox_runtime=result.sysbox_measured is True)
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
         declared_port_count = result.declared_port_count
@@ -82,7 +97,8 @@ class PortConnectivityCheck:
         updated_state = replace(
             ctx.state,
             specs={
-                **ctx.state.specs,
+                # DAH-3698: the grace marker is the validator's alone; one the provider's specs carry never survives
+                **{key: value for key, value in ctx.state.specs.items() if key != "port_verify_first_miss"},
                 "sysbox_runtime": result.sysbox_runtime,
                 "verified_ports": [p.external for p in result.successful_ports],
             },
@@ -113,6 +129,14 @@ class PortConnectivityCheck:
                 updated_state,
                 specs={**updated_state.specs, "sysbox_runtime": True},
                 sysbox_runtime=True,
+            )
+
+        # status "ok" means at least one port answered; a partial loss is a miss too, or one transient probe
+        # failure would cut a split remainder's idle pay at once
+        if await self._is_first_port_verify_miss(ctx, ok=result.status == "ok" and not result.failed_ports):
+            extra_info["port_verify_first_miss"] = True
+            updated_state = replace(
+                updated_state, specs={**updated_state.specs, "port_verify_first_miss": True}
             )
 
         total = len(result.successful_ports) + len(result.failed_ports)
@@ -214,6 +238,24 @@ class PortConnectivityCheck:
         )
 
     @staticmethod
+    async def _is_first_port_verify_miss(ctx: Context, *, ok: bool) -> bool:
+        """DAH-3698: the first failed verification inside the window is not a verdict on the
+        node's ports; the split-remainder port gate skips that cycle. A repeat inside the window
+        counts, even with passes in between: a pass never clears the record, or alternating a
+        pass and a failure would earn grace every time. Fails closed (no grace) on a Redis error."""
+        try:
+            if ok:
+                return False
+            return await ctx.services.redis.record_port_verify_miss(
+                ctx.miner_hotkey, ctx.executor.uuid, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
+            )
+        except Exception as e:  # noqa: BLE001 — never fail the port check over the grace
+            logger.warning(
+                _m("port verify miss record unavailable", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+            )
+            return False
+
+    @staticmethod
     async def _should_keep_last_known_sysbox(
         ctx: Context, result: PortVerificationResult, extra_info: dict[str, object]
     ) -> bool:
@@ -273,7 +315,14 @@ class PortConnectivityCheck:
                 )
             elif result.sysbox_measured is False:
                 await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            if not rented or sysbox_now or result.dind_ok:
+            if not rented:
+                # a scrape sysbox test that ran and said no supersedes the last pass; an unrented node never reads
+                # it (only a validator probe counts there), but a later rented cycle would
+                scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+                if result.sysbox_measured is None and scrape_error and scrape_error != SYSBOX_TEST_TIMED_OUT:
+                    await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+                return False
+            if sysbox_now or result.dind_ok:
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
