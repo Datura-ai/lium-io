@@ -20,7 +20,7 @@ FILLER = "filler_run-1"
 FAILED_RUN = "sshd verification failed after 15s\n(running=yes, listening=no)\n"
 
 
-def _ctx(context_factory, redis, rented=False, filler_owner=None, ssh=None, backend=None):
+def _ctx(context_factory, redis, rented=False, filler_owner=None, ssh=None, backend=None, rental_port="22"):
     filler_fields = (
         {
             "all_filler_containers_by_executor": {EXECUTOR: [FILLER]},
@@ -35,7 +35,7 @@ def _ctx(context_factory, redis, rented=False, filler_owner=None, ssh=None, back
             EXECUTOR: RentedExecutor(
                 miner_hotkey="m",
                 executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
+                executor_ip_port=rental_port,
                 pods=[RentedPod(pod_id="p", container_name="c")],
             )
         }
@@ -310,6 +310,16 @@ def test_the_probe_reruns_the_bootstrap_only_past_the_grace(tmp_path):
         assert subprocess.run(["sh", "-c", probe], timeout=10, env=env).returncode == want
         assert fed.exists() is (want == 0)
     assert fed.read_bytes() == _BOOTSTRAP_SCRIPT.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_node_under_another_miners_rental_on_a_different_endpoint_fails(context_factory):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental. ("m" is not the validated miner.)
+    redis = FakeRedis()
+    redis.store[KEY] = "1"
+    result = await SshdBootstrapCheck().run(_ctx(context_factory, redis, rented=True, rental_port="2222"))
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FAILED.reason
 
 
 @pytest.mark.asyncio

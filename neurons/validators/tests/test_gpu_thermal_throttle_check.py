@@ -51,13 +51,15 @@ def h100(**overrides: Any) -> dict[str, Any]:
     return row
 
 
-async def run(context_factory, *rows: dict[str, Any], rented: bool = False, redis=None):
+async def run(
+    context_factory, *rows: dict[str, Any], rented: bool = False, rental_hotkey: str = "miner-hotkey", redis=None
+):
     rented_data = None
     if rented:
         pod = {"pod_id": "pod-1", "container_name": "c", "gpu_count": 1}
         executor = RentedExecutor.model_validate(
             {
-                "miner_hotkey": "hk",
+                "miner_hotkey": rental_hotkey,
                 "executor_ip_address": "1.2.3.4",
                 "executor_ip_port": "8080",
                 "pods": [pod],
@@ -453,3 +455,13 @@ def test_clocks_event_reasons_fall_back_to_the_throttle_reasons_call():
         "nvmlDeviceGetCurrentClocksEventReasons",
         "nvmlDeviceGetCurrentClocksThrottleReasons",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_collapsed_gpu_under_another_miners_rental_on_a_different_endpoint_fails(context_factory):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    row = h100(graphics_speed=345, temperature=95, clocks_event_reasons=SW_THERMAL | HW_THERMAL)
+
+    result = await run(context_factory, row, rented=True, rental_hotkey="other-miner-hotkey")
+
+    assert result.passed is False

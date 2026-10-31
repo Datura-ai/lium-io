@@ -517,11 +517,11 @@ async def test_port_connectivity_event_carries_the_range_tallies(context_factory
 # reached its container keeps the sysbox an earlier probe verified.
 
 
-def _rented_state(*, scrape_sysbox: bool = False):
+def _rented_state(*, scrape_sysbox: bool = False, miner_hotkey: str = "miner-hotkey", port: str = "22"):
     rented = RentedExecutor(
-        miner_hotkey="miner-hotkey",
+        miner_hotkey=miner_hotkey,
         executor_ip_address="127.0.0.1",
-        executor_ip_port="22",
+        executor_ip_port=port,
         pods=[RentedPod(pod_id="pod-1", container_name="container_pod-1", rented_ports=[40010, 40011])],
     )
     return build_state(
@@ -635,6 +635,19 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
     result = await PortConnectivityCheck().run(ctx)
 
     assert result.passed is True
+    assert result.updates["state"].sysbox_runtime is False
+
+
+@pytest.mark.asyncio
+async def test_another_miners_rental_on_a_different_endpoint_does_not_read_the_verified_sysbox(context_factory):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    state = _rented_state(miner_hotkey="other-miner-hotkey", port="2222")
+    ctx = _verified_ctx(context_factory, redis_service=redis_service, state=state, dind_ok=False, sysbox_measured=None)
+
+    result = await PortConnectivityCheck().run(ctx)
+
     assert result.updates["state"].sysbox_runtime is False
 
 

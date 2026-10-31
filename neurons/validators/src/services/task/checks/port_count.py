@@ -9,6 +9,7 @@ from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
+from .rental_owner import rental_of_this_node
 
 
 def port_count_below_listing_floor(state: ContextState) -> int | None:
@@ -89,8 +90,7 @@ class PortCountCheck:
         verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
         port_count = ctx.state.verified_port_count + len(filler_ports)
 
-        # Check if executor is rented (same pattern as rented_machine.py)
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         updated_state = replace(

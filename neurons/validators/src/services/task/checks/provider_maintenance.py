@@ -15,6 +15,7 @@ from protocol.vc_protocol.compute_requests import MaintenanceWindow
 
 from ..messages import ProviderMaintenanceMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -76,14 +77,8 @@ class ProviderMaintenanceCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        from .rented_machine import _rental_of_validated_miner  # rented_machine imports this module
-
         window = maintenance_window_at_cycle_start(ctx)
-        rented_executor = (
-            _rental_of_validated_miner(ctx, ctx.state.rented_data.executors.get(ctx.executor.uuid))
-            if window
-            else None
-        )
+        rented_executor = rental_of_this_node(ctx) if window else None
         if window is None or (rented_executor and rented_executor.pods):
             event = render_message(
                 Msg.NONE, ctx=ctx, check_id=self.check_id, what={"executor_uuid": ctx.executor.uuid}

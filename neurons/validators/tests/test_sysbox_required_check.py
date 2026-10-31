@@ -20,13 +20,13 @@ from services.executor_connectivity.models import DindLogCause
 from tests.helpers import build_state
 
 
-def _rented_data() -> RentedExecutorsResponse:
+def _rented_data(miner_hotkey: str = "test-miner", port: str = "22") -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
-                miner_hotkey="test-miner",
+                miner_hotkey=miner_hotkey,
                 executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
+                executor_ip_port=port,
                 pods=[RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[8080, 8081])],
             )
         },
@@ -287,3 +287,15 @@ async def test_dind_cause_from_the_container_log_keeps_sysbox_required_missing(c
 
     assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
     assert cause.text in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_no_sysbox_under_another_miners_rental_on_a_different_endpoint_fails(context_factory):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    rented_data = _rented_data(miner_hotkey="other-miner-hotkey", port="2222")
+    ctx = context_factory(state=build_state(sysbox_runtime=False, rented_data=rented_data))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SYSBOX_MISSING.reason

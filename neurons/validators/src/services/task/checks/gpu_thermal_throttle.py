@@ -49,6 +49,7 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuThermalThrottleMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 from .rented_gpu_drop import GPU_DROP_REDIS_ERRORS
 
 logger = logging.getLogger(__name__)
@@ -149,11 +150,7 @@ class GpuThermalThrottleCheck:
             )
             if finding is not None
         ]
-        rented_executor = (
-            ctx.state.rented_data.executors.get(ctx.executor.uuid)
-            if ctx.state.rented_data
-            else None
-        )
+        rented_executor = rental_of_this_node(ctx)
         rented = bool(rented_executor and rented_executor.pods)
         collapsed = [finding for finding in throttled if finding["collapsed"]]
         held, since = await self._update_hold(ctx, collapsed)

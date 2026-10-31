@@ -1493,6 +1493,7 @@ def test_lium_workload_containers_counts_the_pod_container_of_an_unnamed_pod():
     )
     ctx = MagicMock()
     ctx.executor = default_executor()
+    ctx.miner_hotkey = "miner-hotkey"
     ctx.state.rented_data = rented_data
 
     assert gpu_usage.lium_workload_containers(ctx) == {f"{POD_CONTAINER_PREFIX}53a68595"}
@@ -1604,3 +1605,25 @@ async def test_swapped_filler_is_judged_beside_a_rental_pod(context_factory, mon
 
     assert result.passed is False
     assert result.event.what_we_saw["filler_containers_off_their_image"] == ["filler_swapped"]
+
+
+def test_lium_workload_containers_skips_another_miners_rental_on_a_different_endpoint():
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="other-miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="2222",
+                pods=[RentedPod(pod_id="53a68595", container_name="pod_53a68595")],
+            )
+        },
+        banned_guids=[],
+    )
+    ctx = MagicMock()
+    ctx.executor = default_executor()
+    ctx.miner_hotkey = "miner-hotkey"
+    ctx.default_extra = {}
+    ctx.state.rented_data = rented_data
+
+    assert gpu_usage.lium_workload_containers(ctx) == set()
