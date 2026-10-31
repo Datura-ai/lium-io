@@ -2486,13 +2486,6 @@ class CachedTemplateMessages:
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 
-    DISABLED = MessageTemplate(
-        event="Local verification disabled",
-        reason="LOCAL_VERIFY_DISABLED",
-        severity="info",
-        category="transport",
-        impact="None — every check runs over SSH as before",
-    )
     SKIPPED = MessageTemplate(
         event="Local verification skipped",
         reason="LOCAL_VERIFY_SKIPPED",

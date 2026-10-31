@@ -20,7 +20,6 @@ matmul path and a consumed local pass must not skip it), nor when VerifyX runs f
 series with it (`ctx.config.first_pass` off): the round trip then measures both steps
 and is no bound on the matmul alone, see `_matmul_ssh_reason`. Every outcome is one
 `[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
-Off by default (VALIDATOR_LOCAL_VERIFY_ENABLED).
 """
 
 from __future__ import annotations
@@ -134,10 +133,6 @@ class LocalVerifyCheck:
         )
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.VALIDATOR_LOCAL_VERIFY_ENABLED:
-            return CheckResult(
-                passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
-            )
         try:
             return await self._run(ctx)
         except Exception as exc:  # noqa: BLE001 — the pipeline has no guard; a bug here must not end the node's cycle

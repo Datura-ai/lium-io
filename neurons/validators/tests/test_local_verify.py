@@ -75,7 +75,6 @@ def keypair():
 
 @pytest.fixture
 def local_verify_on(monkeypatch):
-    monkeypatch.setattr(settings, "VALIDATOR_LOCAL_VERIFY_ENABLED", True)
     monkeypatch.setattr(settings, "LOCAL_VERIFY_TIMEOUT_SECONDS", 5)
     monkeypatch.setattr(settings, "LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", 2)
 
@@ -657,33 +656,6 @@ async def test_client_reports_absent_route_dead_tunnel_and_dead_host_as_fallback
 
 
 # --- the check and its consumers ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_flag_off_leaves_everything_to_ssh(keypair, monkeypatch, verifyx_service):
-    monkeypatch.setattr(settings, "VALIDATOR_LOCAL_VERIFY_ENABLED", False)
-    validation = matmul_service(monkeypatch)
-    validation.validate_gpu_model_and_process_job = AsyncMock(
-        return_value=mvs.ValidationResult(success=True, metrics={"t": 1})
-    )
-    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
-        return_value=vvs.VerifyXResponse(
-            data={"success": True, "network": {"download_speed": 900.0}}
-        )
-    )
-    ctx = context(keypair, make_context().executor, validation=validation, verifyx=verifyx_service)
-    factory = MagicMock(side_effect=AssertionError("no client when the flag is off"))
-
-    local, verifyx, capability = await run_local_then_consumers(
-        ctx, LocalVerifyCheck(client_factory=factory)
-    )
-
-    assert local.passed and local.event.reason_code == "LOCAL_VERIFY_DISABLED"
-    assert "state" not in local.updates
-    assert capability.passed and capability.event.what_we_saw["transport"] == "ssh"
-    assert verifyx.passed and verifyx.event.what_we_saw["transport"] == "ssh"
-    validation.validate_gpu_model_and_process_job.assert_awaited_once()
-    verifyx_service.validate_verifyx_and_process_job.assert_awaited_once()
 
 
 @pytest.mark.asyncio
