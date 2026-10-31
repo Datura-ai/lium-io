@@ -115,7 +115,7 @@ class AttestationService:
 
     @property
     def nonce_enabled(self) -> bool:
-        return self.enabled and settings.ENABLE_ATTESTATION_NONCE
+        return self.enabled
 
     async def maybe_issue_nonce(self, miner_hotkey: str) -> AttestationNonce | None:
         """Mint a fresh attestation nonce when this miner is due for a

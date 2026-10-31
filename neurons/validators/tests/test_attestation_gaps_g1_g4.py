@@ -124,7 +124,6 @@ def service(monkeypatch):
     monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", False)
     monkeypatch.setattr(settings, "ENABLE_GPU_ATTESTATION_ENFORCEMENT", False)
-    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_NONCE", False)
     return AttestationService()
 
 
@@ -406,7 +405,6 @@ async def test_verify_tdx_no_retry_on_report_data_or_nonce_mismatch(service, mon
 async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
     # Arrange
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
-    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_NONCE", True)
     monkeypatch.setattr(settings, "TDX_REATTEST_INTERVAL_SECONDS", 3600)
     service = AttestationService(redis_service=FakeRedis())
 
@@ -418,13 +416,6 @@ async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
     assert first is not None
     assert len(first.value_bytes) == 32
     assert second is None
-
-
-async def test_g3_maybe_issue_nonce_disabled_returns_none(service):
-    # Arrange — ENABLE_ATTESTATION_NONCE is off in the service fixture
-
-    # Act / Assert
-    assert await service.maybe_issue_nonce("miner-hotkey") is None
 
 
 def test_g3_signing_blob_covers_nonce():

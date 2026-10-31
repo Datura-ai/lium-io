@@ -701,10 +701,6 @@ class Settings(BaseSettings):
     TDX_ALLOWED_TCB_STATUSES: str = Field(env="TDX_ALLOWED_TCB_STATUSES", default="UpToDate")
     TDX_ALLOWED_ADVISORY_IDS: str = Field(env="TDX_ALLOWED_ADVISORY_IDS", default="")
 
-    # G3 — freshness/anti-replay nonce channel. When enabled the validator mints a
-    # 32-byte challenge per attestation event, folds it into the signed SSH-key
-    # request, and requires the executor to echo it in TDX report_data[32:64].
-    ENABLE_ATTESTATION_NONCE: bool = Field(env="ENABLE_ATTESTATION_NONCE", default=False)
     # A nonce-bound attestation event is required at most once per this interval per
     # miner (freshness = "bounded, provably recent", not "every wave") — GPU evidence
     # collection is too expensive to force fleet-wide every cycle.
