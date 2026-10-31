@@ -71,6 +71,8 @@ STUBS = {
             "info --format")
                 case "$3" in
                     *DockerRootDir*) echo "$root" ;;
+                    *DriverStatus*) echo "${STUB_DRIVER_STATUS:-[[\\"Backing Filesystem\\",\\"extfs\\"]]}" ;;
+                    *Containerd*) echo "${STUB_CONTAINERD_ADDRESS:-}" ;;
                     *Runtimes*) echo "${STUB_DOCKER_RUNTIMES:-\\"runc\\", \\"sysbox-runc\\"}" ;;
                 esac ;;
             "plugin inspect")
@@ -160,7 +162,20 @@ STUBS = {
         """\
         #!/bin/bash
         echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+        case "${!#}" in   # STUB_DATA_DF_TOTAL_KB: a data-root on its own big disk, the rest on the root disk
+            */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 $STUB_DATA_DF_TOTAL_KB 1% /data"; exit 0; } ;;
+        esac
         echo "${STUB_DF_SOURCE:-/dev/nvme0n1p1} ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
+        """
+    ),
+    # `containerd --config <file> config dump`: the fixture <file> itself when there is one, else the root in
+    # 1.x quotes "..." or 2.x quotes '...'
+    "containerd": textwrap.dedent(
+        """\
+        #!/bin/bash
+        [ "$1 $3 $4" = "--config config dump" ] && [ -z "${STUB_CONTAINERD_DUMP_FAILS:-}" ] || exit 1
+        [ ! -f "$SYSBOX_SETUP_HOST_ROOT$2" ] || exec cat "$SYSBOX_SETUP_HOST_ROOT$2"
+        [ -z "${STUB_CONTAINERD_ROOT:-}" ] || printf "version = 3\\nroot = %s\\n" "$STUB_CONTAINERD_ROOT"
         """
     ),
 }
@@ -324,6 +339,184 @@ def test_blackwell_without_a_driver_gets_the_open_module_from_pci(tmp_path):
 
 
 # ── disk >= 1.5x VRAM (validators' MIN_DISK_TO_VRAM_RATE) ────────────────────
+
+
+SNAPSHOTTER = {"STUB_DRIVER_STATUS": '[["driver-type","io.containerd.snapshotter.v1"]]'}
+
+
+def test_disk_is_measured_where_the_containerd_image_store_keeps_containers(tmp_path):
+    # webg8845, 27 Oct 2026: data-root on a 14 TB disk, but Docker 29's containerd image store kept the
+    # containers on the 436 GB root disk; the check read the data-root and passed
+    env = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+    files = {"var/lib/containerd/.keep": ""}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files)
+    assert rc == 1, out
+    assert "FIX  Disk 436.0 GB on " in out and "/var/lib/containerd is below" in out
+    assert '"features": {"containerd-snapshotter": false}' in out
+
+
+def test_disk_follows_the_data_root_without_the_containerd_image_store(tmp_path):
+    env = {"STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files={"var/lib/containerd/.keep": ""})
+    assert rc == 0, out
+    assert "containerd" not in out
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_free_disk_reads_containerds_configured_root(tmp_path, quote):
+    ctrd = tmp_path / "root" / "nvme" / "containerd"
+    ctrd.mkdir(parents=True)
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_ROOT": f"{quote}{ctrd}{quote}", "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3),
+           "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {ctrd} is below" in out
+    assert "containerd-snapshotter" in out
+
+
+MANAGED_CONFIG = "/var/run/docker/containerd/containerd.toml"
+
+
+def _containerd_fixture(tmp_path, *daemons):
+    """Host files for running containerd daemons: (argv, config text) pairs, plus a leftover /var/lib/containerd
+    on the root disk and a system /etc/containerd/config.toml on the 14 TB disk."""
+    root = tmp_path / "root"
+    files = {"var/lib/containerd/.keep": "",
+             "etc/containerd/config.toml": f'version = 2\nroot = "{root}/data/containerd"\n[grpc]\n  address = "/run/containerd/containerd.sock"\n',
+             MANAGED_CONFIG.lstrip("/"): f'version = 2\nroot = "{root}/data/docker/containerd/daemon"\n[grpc]\n  address = "/var/run/docker/containerd/containerd.sock"\n'}
+    for pid, argv in enumerate(daemons, start=100):
+        files[f"proc/{pid}/cmdline"] = "\0".join(arg.replace("{root}", str(root)) for arg in argv) + "\0"
+    files["proc/99/cmdline"] = "/usr/bin/dockerd\0-H\0fd://\0"
+    (root / "data" / "containerd").mkdir(parents=True)
+    (root / "data" / "docker" / "containerd" / "daemon").mkdir(parents=True)
+    (root / "data" / "flag").mkdir()
+    return root, files
+
+
+_MANAGED = ["containerd", "--config", MANAGED_CONFIG, "--log-level", "info"]
+_EXTERNAL = ["containerd"]  # /usr/bin/containerd on a host; the stub is on PATH here
+
+
+@pytest.mark.parametrize(
+    "daemons, address, expected",
+    [
+        # Docker runs its own containerd on a generated --config: not /etc/containerd/config.toml
+        ([_MANAGED], "", "data/docker/containerd/daemon"),
+        # an external (systemd) containerd: the host config
+        ([_EXTERNAL], "/run/containerd/containerd.sock", "data/containerd"),
+        # both run: the one on Docker's address, /var/run being /run
+        ([_EXTERNAL, _MANAGED], "/var/run/docker/containerd/containerd.sock", "data/docker/containerd/daemon"),
+        ([_MANAGED, _EXTERNAL], "/var/run/containerd/containerd.sock", "data/containerd"),
+        # a --root flag beats any config
+        ([["containerd", "--root={root}/data/flag", "-c", MANAGED_CONFIG]], "", "data/flag"),
+    ],
+)
+def test_disk_is_read_from_the_containerd_docker_uses(tmp_path, daemons, address, expected):
+    root, files = _containerd_fixture(tmp_path, *daemons)
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_ADDRESS": address, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/{expected} is below" in out
+
+
+def test_two_containerd_daemons_without_dockers_address_are_not_measured(tmp_path):
+    _, files = _containerd_fixture(tmp_path, _EXTERNAL, _MANAGED)
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=SNAPSHOTTER, files=files)
+    assert rc == 0, out
+    assert "SKIP" in out and "neither on Docker's address" in out
+
+
+def test_a_rentals_nested_containerd_is_not_a_candidate(tmp_path):
+    # a rental's own containerd reads its container's config, so it would match Docker's address as well
+    root, files = _containerd_fixture(tmp_path, _EXTERNAL, _EXTERNAL)
+    (root / "rental").mkdir()
+    for pid, pid_root in {1: root, 100: root, 101: root / "rental"}.items():
+        (root / "proc" / str(pid)).mkdir(parents=True, exist_ok=True)
+        (root / "proc" / str(pid) / "root").symlink_to(pid_root)
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_ADDRESS": "/run/containerd/containerd.sock", "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/data/containerd is below" in out
+
+
+def test_no_visible_daemon_on_dockers_own_address_reads_its_generated_config(tmp_path):
+    # Docker's address names its own containerd: the generated config, not /etc/containerd/config.toml
+    root, files = _containerd_fixture(tmp_path)
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_ADDRESS": "/var/run/docker/containerd/containerd.sock",
+           "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/data/docker/containerd/daemon is below" in out
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        None,  # the managed daemon's generated config cannot be read (and so not dumped)
+        'version = 2\nroot = "/gone/containerd/daemon"\n',  # a root that is not on the host
+    ],
+)
+def test_an_unreadable_managed_root_is_skipped_not_read_as_the_leftover(tmp_path, config_text):
+    # a leftover /var/lib/containerd on the root disk must not stand in for Docker's containerd
+    _, files = _containerd_fixture(tmp_path, _MANAGED)
+    files[MANAGED_CONFIG.lstrip("/")] = config_text
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 0, out
+    assert "SKIP" in out and "root cannot be read" in out
+    assert "/var/lib/containerd is below" not in out
+
+
+_OVERLAYFS = "io.containerd.snapshotter.v1.overlayfs"
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("snapshots", ["data/snapshots", "var/lib/containerd/snaps"])  # another disk, or inside the root
+def test_disk_is_measured_at_the_snapshotters_root_path(tmp_path, quote, snapshots):
+    # containerd's root on the 436 GiB disk, [plugins."...overlayfs"].root_path on the 14 TiB one: the snapshots
+    root = tmp_path / "root"
+    (root / snapshots).mkdir(parents=True)
+    config = (f'version = 2\nroot = "{root}/var/lib/containerd"\n[plugins]\n  [plugins.{quote}{_OVERLAYFS}{quote}]\n'
+              f'    root_path = {quote}{root}/{snapshots}{quote}\n')
+    files = {"var/lib/containerd/.keep": "", "etc/containerd/config.toml": config}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/{snapshots} is below" in out
+
+
+def test_the_snapshotters_directory_in_the_root_is_measured(tmp_path):
+    # no root_path: the snapshotter's own directory, which may be a mount of another disk beneath the root
+    root = tmp_path / "root"
+    files = {f"var/lib/containerd/{_OVERLAYFS}/.keep": "",
+             "etc/containerd/config.toml": f'version = 2\nroot = "{root}/var/lib/containerd"\n'}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/var/lib/containerd/{_OVERLAYFS} is below" in out
+
+
+@pytest.mark.parametrize("imports, measured", [("", "data/snapshots"), ('imports = ["/etc/containerd/conf.d/*.toml"]\n', None)])
+def test_without_a_dump_the_config_file_is_read_unless_it_imports_others(tmp_path, imports, measured):
+    # an imported file may set root or root_path; without containerd's own merge that is unknown, not the main file
+    root = tmp_path / "root"
+    (root / "data" / "snapshots").mkdir(parents=True)
+    config = f'{imports}root = "{root}/var/lib/containerd"\n[plugins."{_OVERLAYFS}"]\n  root_path = "{root}/data/snapshots"\n'
+    files = {"var/lib/containerd/.keep": "", "etc/containerd/config.toml": config}
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_DUMP_FAILS": "1", "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    if measured:
+        assert rc == 1, out
+        assert f"FIX  Free disk 50.0 GB on {root}/{measured} is below" in out
+    else:
+        assert rc == 0, out
+        assert "SKIP" in out and "is below" not in out
+
+
+def test_a_root_path_that_is_not_on_the_host_is_skipped(tmp_path):
+    root = tmp_path / "root"
+    config = f'root = "{root}/var/lib/containerd"\n[plugins."{_OVERLAYFS}"]\n  root_path = "/gone/snapshots"\n'
+    files = {"var/lib/containerd/.keep": "", "etc/containerd/config.toml": config}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 0, out
+    assert "SKIP" in out and "is below" not in out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────

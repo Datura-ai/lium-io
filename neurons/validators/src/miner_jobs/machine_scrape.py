@@ -15,6 +15,7 @@ import hashlib
 from base64 import b64encode
 from cryptography.fernet import Fernet
 import tempfile
+import tomllib
 
 
 nvmlLib = None
@@ -676,6 +677,9 @@ def run_cmd(cmd):
 
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+CONTAINERD_CONFIG_PATH = "/etc/containerd/config.toml"
+# the validator's disk gate reads this marker in hard_disk_scrape_error: an unknown root is not a passed check
+CONTAINERD_ROOT_UNKNOWN = "containerd root unknown"
 # /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
 # let a scrape round hang on it.
 DOCKER_API_TIMEOUT_SECONDS = 20
@@ -688,6 +692,8 @@ ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
 # the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
 FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
+# the filler container's name prefix (services/const.py FILLER_CONTAINER_PREFIX): the rental path removes these
+FILLER_CONTAINER_PREFIX = "filler_"
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -742,6 +748,17 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
         and "/" not in volume.get("Name")
         and (not filler_only or (volume.get("Labels") or {}).get(FILLER_VOLUME_LABEL_KEY) == FILLER_VOLUME_LABEL_VALUE)
     ]
+    if filler_only and names:
+        # the label is free to set: the rental cleanup (docker_service clean_stale_vloopback_volumes) removes
+        # only unmounted `volume_*` vloopback volumes once the filler_* containers are gone, so only those count
+        names = [name for name in names if name.startswith("volume_")]
+        held = {
+            mount.get("Name")
+            for container in docker_api_get("/containers/json?all=1") or []
+            if not all(name.lstrip("/").startswith(FILLER_CONTAINER_PREFIX) for name in container.get("Names") or [""])
+            for mount in container.get("Mounts") or []
+        }
+        names = [name for name in names if name not in held]
     if not names:
         return 0
 
@@ -795,13 +812,184 @@ def get_host_disk_usage():
     # root partition, so a 5 TB docker volume listed as 1.8 TB (ticket-0286, DAH-2771). Without a
     # docker answer, or outside the executor container, `/` stays the measurement.
     try:
-        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+        info = docker_api_get("/info") or {}
     except Exception:
-        docker_root_dir = "/var/lib/docker"
-    host_docker_root = f"/proc/1/root{docker_root_dir}"
-    if os.path.isdir(host_docker_root):
-        return shutil.disk_usage(host_docker_root)
+        info = {}
+    host_disk_root = f"/proc/1/root{disk_root_dir(info)}"
+    if os.path.isdir(host_disk_root):
+        return shutil.disk_usage(host_disk_root)
     return shutil.disk_usage("/")
+
+
+def disk_root_dir(info):
+    # Docker's containerd image store (default on Docker 29+) keeps container root filesystems in
+    # containerd's root whatever data-root says: a 14 TB data-root over a 436 GB root disk (webg8845).
+    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
+    if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        return docker_root_dir
+    return containerd_root(*docker_containerd(info), snapshotter=info.get("Driver") or "overlayfs")
+
+
+def containerd_processes():
+    # argv of every containerd daemon on the host (the executor shares the host's pid namespace). Only those in
+    # the host's own root: a rental's nested containerd reads its container's config, so it would also match the
+    # host config's address and leave two candidates.
+    return [
+        process.info["cmdline"]
+        for process in psutil.process_iter(["cmdline"])
+        if (process.info["cmdline"] or [""])[0].rsplit("/", 1)[-1] == "containerd"
+        and in_host_root(process.pid)
+    ]
+
+
+def in_host_root(pid):
+    try:
+        root, host_root = os.stat(f"/proc/{pid}/root"), os.stat("/proc/1/root")
+    except OSError:
+        return False  # gone, or not readable: not a daemon we can resolve
+    return (root.st_dev, root.st_ino) == (host_root.st_dev, host_root.st_ino)
+
+
+def docker_containerd(info):
+    # (binary, --config, --root) of the containerd Docker uses. Without --containerd Docker runs its own on a
+    # generated --config whose root is <DockerRootDir>/containerd/daemon: /etc/containerd/config.toml and a
+    # leftover /var/lib/containerd say nothing about it. Two daemons: the one on Docker's /info address.
+    daemons = []
+    for argv in containerd_processes():
+        flags, args = {}, iter(argv[1:])
+        for arg in args:
+            name, equals, value = arg.partition("=")
+            name = {"-c": "--config", "-a": "--address"}.get(name, name)
+            if name in ("--config", "--root", "--address"):
+                flags[name] = value if equals else next(args, "")
+        daemons.append(
+            (
+                argv[0],
+                flags.get("--config") or CONTAINERD_CONFIG_PATH,
+                flags.get("--root"),
+                flags.get("--address"),
+            )
+        )
+    if len(daemons) > 1:
+        address = (info.get("Containerd") or {}).get("Address")
+        daemons = [
+            daemon
+            for daemon in daemons
+            if address
+            and same_socket(
+                address,
+                daemon[3]
+                or (containerd_dump(daemon[0], daemon[1]).get("grpc") or {}).get("address"),
+            )
+        ]
+        if len(daemons) != 1:
+            raise RuntimeError(
+                f"{CONTAINERD_ROOT_UNKNOWN}: cannot tell which containerd Docker uses"
+            )
+    if daemons:
+        return daemons[0][:3]
+    # no daemon seen: a Docker-managed address (<exec-root>/containerd/containerd.sock) still names Docker's own
+    # containerd, whose generated config sits beside the socket; the system config would point at a leftover root
+    address = (info.get("Containerd") or {}).get("Address") or ""
+    if "/docker/containerd/" in address:
+        return "containerd", f"{os.path.dirname(address)}/containerd.toml", None
+    return "containerd", CONTAINERD_CONFIG_PATH, None
+
+
+def same_socket(address, other):
+    # /var/run is /run
+    return bool(other) and address.removeprefix("/var") == other.removeprefix("/var")
+
+
+def containerd_dump(binary, config_path):
+    # the daemon's merged config, imports resolved, as the installer's preflight reads it; {} when it cannot run
+    if not all(re.fullmatch(r"[\w./+-]+", part) for part in (binary, config_path)):
+        return {}  # never handed to a shell
+    try:
+        return tomllib.loads(
+            run_cmd(f"timeout 20 chroot /proc/1/root {binary} --config {config_path} config dump")
+        )
+    except Exception:
+        return {}
+
+
+def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, root=None, snapshotter="overlayfs"):
+    # where containerd's snapshotter keeps container filesystems on the host: its root_path, else its directory in
+    # containerd's effective root (a mount there counts), else that root. A leftover /var/lib/containerd proves
+    # nothing: a root moved in an imported config file leaves it behind, so the default is used only when no config
+    # sets one, and a root that cannot be read raises (CONTAINERD_ROOT_UNKNOWN) instead of measuring it.
+    plugin = f"io.containerd.snapshotter.v1.{snapshotter}"
+    dump = containerd_dump(binary, config_path)
+    dumped = dump.get("root")
+    root_path = ((dump.get("plugins") or {}).get(plugin) or {}).get("root_path")
+    # walked even after a dump: a missing literal import can still dump exit 0 with the default root
+    roots, root_paths = [], []
+    pending, seen = [config_path], set()
+    try:
+        while pending:
+            path = pending.pop(0)
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                # /var/run is a symlink to /run: absolute, so through /proc/1/root it would land in this container
+                with open(f"/proc/1/root{re.sub(r'^/var/run/', '/run/', path)}") as config_file:
+                    config = tomllib.loads(config_file.read())
+            except FileNotFoundError:
+                if path != CONTAINERD_CONFIG_PATH:
+                    raise
+                config = {}  # no config at all: containerd runs on its default root
+            # containerd keeps an earlier nonempty value over an empty one
+            roots += [config["root"]] if isinstance(config.get("root"), str) and config["root"] else []
+            path_value = ((config.get("plugins") or {}).get(plugin) or {}).get("root_path")
+            root_paths += [path_value] if isinstance(path_value, str) and path_value else []
+            for pattern in config.get("imports") or []:
+                # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
+                pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
+                if "*" not in pattern:
+                    pending.append(pattern)  # literal: containerd opens it, a missing one fails
+                    continue
+                # a later file overrides an earlier one, in the order containerd merges them
+                pending += sorted(match[len("/proc/1/root"):] for match in glob.glob(f"/proc/1/root{pattern}"))
+    # unreadable, or not TOML containerd would load
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
+    root = host_realpath(root or dumped or (roots[-1] if roots else "/var/lib/containerd"))
+    if not os.path.isdir(f"/proc/1/root{root}"):
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
+    root_path = root_path or (root_paths[-1] if root_paths else None)
+    if root_path:
+        root_path = host_realpath(root_path)
+        if not os.path.isdir(f"/proc/1/root{root_path}"):
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: snapshotter root_path {root_path!r} is not on the host")
+        return root_path
+    snapshots = host_realpath(f"{root}/{plugin}")
+    return snapshots if os.path.isdir(f"/proc/1/root{snapshots}") else root
+
+
+def host_realpath(path):
+    # path with its symlinks resolved on the host: an absolute link read through /proc/1/root would land in this
+    # container (/var/lib/containerd -> /data/containerd), so each one is followed from the host's root instead
+    parts, resolved, links = path.split("/"), "", 0
+    while parts:
+        part = parts.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            resolved = os.path.dirname(resolved).rstrip("/")
+            continue
+        try:
+            target = os.readlink(f"/proc/1/root{resolved}/{part}")
+        except OSError:  # not a link, or not there: isdir answers for it
+            resolved = f"{resolved}/{part}"
+            continue
+        links += 1
+        if links > 40:
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: symlink loop at {path!r}")
+        parts = target.split("/") + parts
+        if target.startswith("/"):
+            resolved = ""
+    return resolved or "/"
 
 
 def cache_volume_bytes(df, prefixes):
@@ -823,12 +1011,16 @@ def get_docker_disk_usage():
         max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
         for volume in df.get("Volumes") or []
     )
-    docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    info = docker_api_get("/info") or {}
+    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
     # A filler's own run volume is preallocated to its full size, but any rental removes the filler
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
     # renters were shown half of an idle node's disk. The model caches stay: rentals keep them.
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
     volumes += get_vloopback_volume_bytes(docker_root_dir) - filler_run_volumes
+    # the run volumes sit under data-root: they free disk only when that is the measured filesystem
+    if not on_one_filesystem(docker_root_dir, disk_root_dir(info)):
+        filler_run_volumes = 0
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
@@ -845,6 +1037,15 @@ def get_docker_disk_usage():
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
     }
+
+
+def on_one_filesystem(host_dir, other_host_dir):
+    if host_dir == other_host_dir:
+        return True
+    try:
+        return os.stat(f"/proc/1/root{host_dir}").st_dev == os.stat(f"/proc/1/root{other_host_dir}").st_dev
+    except OSError:
+        return False
 
 
 def release_filler_cache(hard_disk):
@@ -2028,7 +2229,7 @@ def disk_type_of(device_name: str | None) -> str:
 def get_docker_root_disk_type() -> str:
     """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
     try:
-        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+        docker_root_dir = disk_root_dir(docker_api_get("/info") or {})
     except Exception:
         docker_root_dir = "/var/lib/docker"
     with open(HOST_MOUNTS_PATH) as mounts_file:

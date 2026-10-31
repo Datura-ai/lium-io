@@ -28,7 +28,7 @@ python_keywords = [
     'c_char_p', 'AttributeError', '_nvmlLib_refcount', 'nvmlLib', 'CDLL', 'os', 'tempfile', 'NVMLError',
     'OSError', 'c_uint', 'c_ulonglong', 'byref', 'create_string_buffer', 'c_int',  'setattr', 'subprocess', 'RuntimeError', 'hashlib',
     'iter', 'next', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'machine_specs', 'hasattr', 'bool',
-    'glob', 'socket', 'http'
+    'glob', 'socket', 'http', 'tomllib'
 ]
 
 

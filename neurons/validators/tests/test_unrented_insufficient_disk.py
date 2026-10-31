@@ -148,3 +148,18 @@ def test_a_node_whose_filler_run_volume_reads_as_free_disk_still_clears_the_gate
     assert hard_disk["hard_disk_free"] == 1761 * KB_PER_GB
     assert hard_disk["hard_disk_total"] == 2000 * KB_PER_GB
     assert _build_incentive()._insufficient_disk(_make_job(spec=spec)) is None
+
+
+def test_an_unknown_containerd_root_fails_the_gate_closed():
+    # the scrape could not tell where Docker's containerd store keeps containers, so it reported no
+    # disk: that must not keep the incentive, or hiding the store's root would pass the gate
+    spec = {
+        "gpu": {"details": [{"capacity": 141 * MB_PER_GB} for _ in range(8)]},
+        "hard_disk": {},
+        "hard_disk_scrape_error": "RuntimeError(\"containerd root unknown: '/gone' is not on the host\")",
+    }
+
+    measured = _build_incentive()._insufficient_disk(_make_job(spec=spec))
+
+    assert measured is not None
+    assert (measured.vram_gb, measured.disk_gb) == (1128.0, 0.0)

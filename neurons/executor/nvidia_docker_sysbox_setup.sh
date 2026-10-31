@@ -426,16 +426,102 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
+CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (two containerd daemons and neither on Docker's address, or its root cannot be read)."
+
+docker_containerd() {
+    # CTRD_BIN, CTRD_CONFIG, CTRD_ROOT (--root, else empty): the containerd Docker uses. Without --containerd Docker
+    # runs its own on a generated --config whose root is <DockerRootDir>/containerd/daemon, so the host's
+    # /etc/containerd/config.toml and a leftover /var/lib/containerd say nothing about it. With two daemons, the one
+    # on Docker's address; fails when that cannot be told.
+    local f i bin cfg root addr address n=0 matches=0
+    local -a argv
+    address=$(docker info --format '{{with .Containerd}}{{.Address}}{{end}}' 2>/dev/null)
+    CTRD_BIN=containerd CTRD_CONFIG=/etc/containerd/config.toml CTRD_ROOT=""
+    # no daemon seen: Docker's own containerd (<exec-root>/containerd/containerd.sock) runs on the config beside it
+    case "$address" in */docker/containerd/*) CTRD_CONFIG=${address%/*}/containerd.toml ;; esac
+    for f in "${SYSBOX_SETUP_HOST_ROOT:-}"/proc/[0-9]*/cmdline; do
+        mapfile -d '' -t argv < "$f" 2>/dev/null || continue
+        [ "${argv[0]##*/}" = containerd ] || continue
+        # a rental's nested containerd (another root) reads its container's config: its address matches the host's too
+        f=${f%/cmdline}/root
+        [ -e "${SYSBOX_SETUP_HOST_ROOT:-}/proc/1/root" ] && [ -e "$f" ] && ! [ "$f" -ef "${SYSBOX_SETUP_HOST_ROOT:-}/proc/1/root" ] && continue
+        bin=${argv[0]} cfg=/etc/containerd/config.toml root="" addr=""
+        for ((i = 1; i < ${#argv[@]}; i++)); do
+            case "${argv[i]}" in
+                --config=*) cfg=${argv[i]#*=} ;;
+                --config | -c) i=$((i + 1)); cfg=${argv[i]:-} ;;
+                --root=*) root=${argv[i]#*=} ;;
+                --root) i=$((i + 1)); root=${argv[i]:-} ;;
+                --address=*) addr=${argv[i]#*=} ;;
+                --address | -a) i=$((i + 1)); addr=${argv[i]:-} ;;
+            esac
+        done
+        [ -n "$addr" ] || addr=$("$bin" --config "$cfg" config dump 2>/dev/null | sed -n "/^\[grpc\]/,/^\[/s/^ *address *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
+        n=$((n + 1))
+        # /var/run is /run
+        if [ -n "$address" ] && [ "${addr#/var}" = "${address#/var}" ]; then
+            matches=$((matches + 1))
+        elif [ "$n" -gt 1 ] || [ "$matches" -gt 0 ]; then
+            continue
+        fi
+        CTRD_BIN=$bin CTRD_CONFIG=$cfg CTRD_ROOT=$root
+    done
+    [ "$n" -le 1 ] || [ "$matches" -eq 1 ]
+}
+
+resolve_disk_dir() {
+    # DISK_DIR: where container root filesystems live. That is Docker's data-root, except under Docker's
+    # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
+    # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
+    # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd or its root cannot be told.
+    local ctrd_root plugin root_path config
+    DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
+    [ -d "$DISK_DIR" ] || DISK_DIR=/
+    SNAPSHOTTER_FIX=""
+    docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
+    docker_containerd || return 1
+    # the merged config (imports resolved); no dump: its config file itself, unless that imports others, whose
+    # root or root_path would be missed: unknown then, as the validator's scrape follows them
+    config=$("$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null) || {
+        config=$(cat "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null)
+        ! sed -n '/^ *\[/q; /^ *imports *=/p' <<<"$config" | grep -q . || return 1
+    }
+    ctrd_root=$CTRD_ROOT
+    # containerd 1.x dumps root = "...", 2.x root = '...'
+    [ -n "$ctrd_root" ] || ctrd_root=$(sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" <<<"$config" | head -1)
+    if [ -z "$ctrd_root" ]; then
+        # containerd's default root only for the system config: an unreadable generated (Docker-managed) or custom
+        # config does not mean a leftover /var/lib/containerd holds the containers
+        [ "$CTRD_CONFIG" = /etc/containerd/config.toml ] || return 1
+        ctrd_root="${SYSBOX_SETUP_HOST_ROOT:-}/var/lib/containerd"
+    fi
+    # a root that is not there is unknown, not the data-root
+    [ -d "$ctrd_root" ] || return 1
+    DISK_DIR=$ctrd_root
+    # the snapshotter's root_path, when set, is where the snapshots really are; else its directory in the root,
+    # which may be a mount of another disk
+    plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
+    [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
+    root_path=$(sed -n "/^ *\[plugins\.[\"']${plugin//./\\.}[\"']\]/,/^ *\[/s/^ *root_path *= *[\"']\([^\"']\+\)[\"'].*/\1/p" <<<"$config" | head -1)
+    if [ -n "$root_path" ]; then
+        [ -d "$root_path" ] || return 1
+        DISK_DIR=$root_path
+    elif [ -d "$ctrd_root/$plugin" ]; then
+        DISK_DIR=$ctrd_root/$plugin
+    fi
+    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (\"root\" in /etc/containerd/config.toml, or the snapshotter's \"root_path\") to the big disk."
+}
+
 check_total_disk_for_vram() {
     # The validators compare the TOTAL size of the filesystem the executor sees as / (its
-    # rootfs lives under Docker's data-root) with total GPU VRAM; free space is not the rule.
+    # rootfs lives under DISK_DIR) with total GPU VRAM; free space is not the rule.
     local vram_mib vram_gb data_root total_kb total_gb needed_gb
     command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
     vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
-    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
-    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
-    [ -d "$data_root" ] || data_root=/
+    resolve_disk_dir || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — $CTRD_UNKNOWN"; return 0; }
+    data_root=$DISK_DIR
     total_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $2}')
     [ "${total_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — cannot read the filesystem size of $data_root."; return 0; }
     vram_gb=$(awk -v m="$vram_mib" 'BEGIN {printf "%.1f", m / 1024}')
@@ -447,7 +533,8 @@ check_total_disk_for_vram() {
         return 0
     fi
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
-        "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+        "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
+        ${SNAPSHOTTER_FIX:+"$SNAPSHOTTER_FIX"}
 }
 
 check_data_root_loop_dio() {
@@ -474,9 +561,8 @@ check_free_disk_for_node() {
     # VerifyX allocates MIN_FREE_STORAGE_GB on the node's filesystem; before the first `lium mine` the node's images
     # still have to come out of the same free space
     local data_root free_kb free_gb needed_gb
-    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
-    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
-    [ -d "$data_root" ] || data_root=/
+    resolve_disk_dir || { pf_skip "Free disk for the node — $CTRD_UNKNOWN"; return 0; }
+    data_root=$DISK_DIR
     free_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $4}')
     [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $data_root."; return 0; }
     free_gb=$(awk -v k="$free_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
@@ -488,7 +574,8 @@ check_free_disk_for_node() {
         return 0
     fi
     pf_fix "Free disk ${free_gb} GB on $data_root is below ${needed_gb} GB — the validators' storage test needs ${MIN_FREE_STORAGE_GB} GB free after the node's images (~${NODE_IMAGES_GB} GB) are pulled, so \`lium mine\` would fail at validation." \
-        "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+        "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
+        ${SNAPSHOTTER_FIX:+"$SNAPSHOTTER_FIX"}
 }
 
 resolve_preflight_ports() {
