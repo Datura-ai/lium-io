@@ -949,6 +949,8 @@ CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the ex
 # stderr with no BUILD_FAILED_RC= marker: the build script never finished and the text is the host
 # daemon's `docker exec` error, so the renter gets this fixed line.
 CUSTOM_BUILD_INTERRUPTED_REASON = "build container stopped before the build finished"
+# The SSH connection to the node dropped mid-build: not the renter's Dockerfile, so its own step.
+CUSTOM_BUILD_SSH_LOST_REASON = "the connection to the node was lost during the build; please retry"
 # The build's exit code round-trips through a file in the DinD container's /tmp. When that file
 # cannot be written or read (the overlay is full or read-only) the build is treated as failed and
 # this line ends its tail, so the renter and the tests see WHY rather than `[: Illegal number:`.
@@ -7714,6 +7716,8 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
+                if isinstance(exc, asyncssh.ConnectionLost):
+                    return CustomBuildOutcome(False, "build_ssh_lost", CUSTOM_BUILD_SSH_LOST_REASON)
                 return CustomBuildOutcome(False, "docker_build", "build command could not be run on the executor")
             if not ok:
                 # A build that printed "process timed out" and failed carries BUILD_FAILED_RC= too;
