@@ -465,9 +465,6 @@ class Settings(BaseSettings):
     PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED", default=False
     )
-    FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
-        env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
-    )
     # DAH-3035 — a ~6 s kernel-fault probe after the matmul: indexed/scattered access, atomics, a pointer
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in
     # uncorrected ECC or remapped rows, a pending or failed remap, or a required recovery action is a fault.

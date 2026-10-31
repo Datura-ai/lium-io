@@ -127,17 +127,14 @@ class GpuUsageCheck:
         come from the backend (`rented_data`), never from a container-name prefix — the whole
         point of the ticket is a verdict `docker rename` cannot defeat. A container named like
         ours but missing from the snapshot is asked about directly (DAH-2757); the prefix only
-        decides whom to ask, the backend still gives the answer. Shadow by default like
-        every other money-withholding gate: without FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
-        the verdict is logged, not scored. Returns None when the card is clean, leaving the
-        legacy verdict to the caller.
+        decides whom to ask, the backend still gives the answer. A foreign holder fails the
+        check. Returns None when the card is clean, leaving the legacy verdict to the caller.
         """
         # No backend truth this cycle means no allowlist to judge against — an inability to
         # measure, which never withholds money here.
         if ctx.state.rented_data is None:
             return None
 
-        enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
         workload_containers: set[str] = lium_workload_containers(ctx)
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
@@ -175,11 +172,9 @@ class GpuUsageCheck:
             template,
             ctx=ctx,
             check_id=self.check_id,
-            severity=None if enforce else "warning",
-            impact=None if enforce else "Shadow observation only: score was NOT changed",
             what=what,
         )
-        return CheckResult(passed=not enforce, event=event)
+        return CheckResult(passed=False, event=event)
 
     async def _card_still_holds_vram_with_no_owner(
         self, ctx: Context, held_vram: list[HeldVram]
