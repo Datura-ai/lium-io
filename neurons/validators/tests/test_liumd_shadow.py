@@ -171,7 +171,9 @@ def _ctx(keypair, monkeypatch, verifyx_service, *, sealed="challenge", state=Non
         services=build_services(
             validation=matmul_service(monkeypatch, sealed=sealed),
             verifyx=verifyx_service,
-            redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
+            redis=SimpleNamespace(
+                renting_in_progress=AsyncMock(return_value=False), get=AsyncMock(return_value=None)
+            ),
         ),
         config=build_context_config(
             validator_keypair=keypair,
