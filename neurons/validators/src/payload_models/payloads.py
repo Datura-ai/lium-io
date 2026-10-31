@@ -333,6 +333,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     bootstrap_restore: BootstrapRestoreSpec | None = None
     enable_jupyter: bool | None = None
     enable_volume_encryption: bool | None = None
+    # "dm-crypt" asks for a dm-crypt volume (a host that cannot run it gets gocryptfs); None/"gocryptfs" as before
+    volume_encryption_method: str | None = None
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
@@ -694,6 +696,8 @@ class ContainerCreated(ContainerBaseResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # "dm-crypt" or "gocryptfs" when the volume is encrypted (what was made, after any fallback)
+    volume_encryption_method: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):

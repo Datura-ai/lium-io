@@ -415,6 +415,8 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # "dm-crypt" or "gocryptfs" when the volume is encrypted (what was made, after any fallback)
+    volume_encryption_method: str | None = None
 
 
 @VALIDATOR_MESSAGES.register

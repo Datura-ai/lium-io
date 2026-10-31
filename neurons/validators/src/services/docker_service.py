@@ -190,6 +190,21 @@ from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
 from services.pod_ssh_host_key import derive_pod_ssh_host_key
 from services.volume_keys import VolumeKeyDeriver
+from services.dmcrypt_volume import (
+    DMCRYPT_METHOD,
+    GOCRYPTFS_METHOD,
+    dmcrypt_backing_bytes_command,
+    dmcrypt_capability_command,
+    dmcrypt_create_command,
+    dmcrypt_delete_command,
+    dmcrypt_device,
+    dmcrypt_open_command,
+    dmcrypt_pod_ids,
+    is_closed_dmcrypt_mapping_error,
+    is_dmcrypt_pod_id,
+    mounted_volume_devices_command,
+    volume_devices_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +539,10 @@ _VOLUME_SETUP_TMPFS = "/dev/shm"
 # pod exist. Not a setting: nothing in config can lift it. The follow-up that holds the workload
 # removes this constant; the probes and the post-mount restore below it are the path it holds back.
 _ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD = True
+_DMCRYPT_PROBE_TIMEOUT_SEC = 20
+_DMCRYPT_OPEN_TIMEOUT_SEC = 60
+# loop file, luksFormat (pbkdf2, 0.1 s), open, udev settle (10 s cap) and mkfs: about 2 s in the tests
+_DMCRYPT_CREATE_TIMEOUT_SEC = 180
 # the path comes from a customer-authored template and the backend only requires a leading slash,
 # so anything that is not a plain absolute path is refused here rather than mounted over
 _PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
@@ -735,6 +754,7 @@ class VolumeHostProbe:
     vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
     loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
     loopback_plugin_installed: bool = False  # said true or false (installed, maybe disabled)
+    dmcrypt_backing_bytes: int = 0      # apparent size of the dm-crypt volumes' backing files
 
 
 @dataclass
@@ -853,6 +873,7 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
         f"{df_part}"
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
         "printf 'VOLS\\t%s\\n' \"$?\"; "
+        f"printf 'CRYPT\\t%s\\n' \"$({dmcrypt_backing_bytes_command()})\"; "
         # the space keeps `$( (` from reading as arithmetic `$((`
         f"printf 'PLUGIN\\t%s\\n' \"$( {_LOOPBACK_PLUGIN_STATE_COMMAND})\""
     )
@@ -864,6 +885,7 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
     volume_names: list[str] = []
     volume_ls_status: str | None = None
     plugin_state: str | None = None
+    dmcrypt_backing_bytes = 0
     # the echoed output is host-controlled: cap what reaches the log
     shown = stdout[:_PROBE_OUTPUT_LOG_CAP]
     # split on "\n" only: str.splitlines() would also split at the "\r" the DF record uses
@@ -885,6 +907,8 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
             volume_ls_status = rest.strip()
         elif tag == "PLUGIN":
             plugin_state = rest.strip()
+        elif tag == "CRYPT" and rest.strip().isdigit():
+            dmcrypt_backing_bytes = int(rest.strip())
     if not docker_root_dir:
         raise Exception(f"volume host probe: no DockerRootDir in {shown!r}")
     if with_df and df_avail_bytes is None:
@@ -901,6 +925,7 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
         vloopback_volume_names=volume_names,
         loopback_plugin_enabled=plugin_state == "true",
         loopback_plugin_installed=plugin_state in ("true", "false"),
+        dmcrypt_backing_bytes=dmcrypt_backing_bytes,
     )
 
 
@@ -5757,6 +5782,107 @@ class DockerService:
             ),
         )
 
+    async def dmcrypt_capable(self, ssh_client: asyncssh.SSHClientConnection, log_extra: dict) -> bool:
+        """The host can run dm-crypt pod volumes now (the scrape's answer may be older than this create)."""
+        try:
+            result = await _run_with_host_timeout(ssh_client, dmcrypt_capability_command(), _DMCRYPT_PROBE_TIMEOUT_SEC)
+        except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
+            raise
+        except Exception as exc:
+            logger.warning(_m("dm-crypt capability probe failed", extra=get_extra_info({**log_extra, "error": str(exc)})))
+            return False
+        return result.exit_status == 0
+
+    async def create_dmcrypt_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_client: RentalDockerSdkClient,
+        *,
+        local_volume: str,
+        pod_id: str,
+        size_gb: int,
+        sparse: bool,
+        log_extra: dict,
+        labels: dict[str, str] | None = None,
+    ) -> None:
+        """The loop file, LUKS2 and ext4 (one command, key on stdin), then the Docker `local` volume over
+        the mapping. Its options name only the device: no key ever reaches Docker."""
+        _quote_safe_docker_volume_name(local_volume, field_name="local_volume")
+        key = VolumeKeyDeriver.from_settings(settings).dmcrypt_key(pod_id)
+        result = await ssh_client.run(
+            dmcrypt_create_command(pod_id, size_gb, sparse=sparse),
+            input=f"{key}\n",
+            check=False,
+            timeout=_DMCRYPT_CREATE_TIMEOUT_SEC,
+        )
+        if result.exit_status != 0:
+            raise RuntimeError(
+                f"dm-crypt volume create failed (exit_status={result.exit_status}): "
+                f"{(result.stderr or '').strip()[-500:]}"
+            )
+        driver_opts = {"type": "ext4", "device": dmcrypt_device(pod_id)}
+        try:
+            await run_logged_rental_docker_sdk_operation(
+                operation="create_volume",
+                log_extra=log_extra,
+                call=lambda: docker_client.create_volume(
+                    volume_name=local_volume, driver="local", driver_opts=driver_opts, timeout=30, labels=labels
+                ),
+                volume_name=local_volume,
+                volume_driver="local",
+                volume_driver_opts=driver_opts,
+                timeout_seconds=30,
+            )
+        except BaseException:
+            await self.delete_dmcrypt_volume(ssh_client, pod_id, log_extra)
+            raise
+        logger.info(_m("dm-crypt volume created", extra=get_extra_info({**log_extra, "local_volume": local_volume, "size_gb": size_gb, "sparse": sparse})))
+
+    async def open_dmcrypt_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        device_listing_command: str,
+        log_extra: dict,
+    ) -> list[str]:
+        """Open every dm-crypt volume the listing names (no-op when open) before anything mounts it. A
+        host reboot closes them all, and dockerd's own restart then fails at the mount: every start of
+        a dm-crypt pod goes through here. Returns the pod ids of the dm-crypt volumes found."""
+        listing = await ssh_client.run(device_listing_command, check=False, timeout=_DMCRYPT_PROBE_TIMEOUT_SEC)
+        pod_ids = dmcrypt_pod_ids(listing.stdout or "")
+        for pod_id in pod_ids:
+            key = VolumeKeyDeriver.from_settings(settings).dmcrypt_key(pod_id)
+            result = await ssh_client.run(
+                dmcrypt_open_command(pod_id), input=f"{key}\n", check=False, timeout=_DMCRYPT_OPEN_TIMEOUT_SEC
+            )
+            if result.exit_status != 0:
+                raise RuntimeError(
+                    f"dm-crypt volume open failed for pod {pod_id} (exit_status={result.exit_status}): "
+                    f"{(result.stderr or '').strip()[-500:]}"
+                )
+            logger.info(_m("dm-crypt volume open", extra=get_extra_info({**log_extra, "dmcrypt_pod_id": pod_id})))
+        return pod_ids
+
+    async def delete_dmcrypt_volume(self, ssh_client: asyncssh.SSHClientConnection, pod_id: str, log_extra: dict) -> None:
+        """Best effort: close, detach and remove the pod's backing file; a pod without one costs one
+        command that finds nothing. Run after its Docker volume is removed (a mounted mapping refuses)."""
+        if not is_dmcrypt_pod_id(pod_id):
+            return  # only a UUID pod id names a dm-crypt volume
+        try:
+            result = await ssh_client.run(
+                dmcrypt_delete_command(pod_id), check=False, timeout=_DMCRYPT_OPEN_TIMEOUT_SEC
+            )
+            if result.exit_status != 0:
+                logger.warning(
+                    _m(
+                        "dm-crypt volume delete failed; the backing file stays",
+                        extra=get_extra_info({**log_extra, "dmcrypt_pod_id": pod_id, "exit_status": result.exit_status, "stderr": (result.stderr or "").strip()[-500:]}),
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(_m("dm-crypt volume delete failed; the backing file stays", extra=get_extra_info({**log_extra, "dmcrypt_pod_id": pod_id, "error": str(exc)})))
+
     async def _grant_workspace_to_container_user(
         self,
         *,
@@ -6828,6 +6954,12 @@ class DockerService:
                 volume_names.append(name)
         return await self._inspect_vloopback_volumes_bytes(ssh_client, volume_names)
 
+    async def _dmcrypt_backing_bytes(self, ssh_client: asyncssh.SSHClientConnection, docker_root_dir: str) -> int:
+        # dm-crypt pod volumes are `local` volumes with no declared size: their backing files count instead
+        result = await ssh_client.run(dmcrypt_backing_bytes_command(shlex.quote(docker_root_dir)), check=False)
+        out = (result.stdout or "").strip()
+        return int(out) if out.isdigit() else 0
+
     async def _inspect_vloopback_volumes_bytes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -6975,11 +7107,13 @@ class DockerService:
                 df_avail_bytes = host_probe.df_avail_bytes
                 existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
                     ssh_client, host_probe.vloopback_volume_names
-                )
+                ) + host_probe.dmcrypt_backing_bytes
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
                 df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+                existing_volumes_bytes = await self._get_existing_vloopback_bytes(
+                    ssh_client
+                ) + await self._dmcrypt_backing_bytes(ssh_client, docker_root_dir)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -9072,13 +9206,45 @@ class DockerService:
                 effective_storage_limit_gb = payload.storage_limit_gb
                 local_volume_driver = None
 
+                # An existing volume the backend made dm-crypt (an edit or reboot sends the pod's
+                # method): opened here, before anything mounts it, and never gocryptfs. The host has
+                # the last word: a volume that is not dm-crypt there takes the usual path.
+                use_dmcrypt_volume = False
+                if local_volume and payload.volume_encryption_method == DMCRYPT_METHOD:
+                    current_step = "dmcrypt_volume_open"
+                    use_dmcrypt_volume = bool(
+                        await self.open_dmcrypt_volumes(
+                            ssh_client, volume_devices_command([local_volume]), default_extra
+                        )
+                    )
                 # Decided before the volume exists so a refusal below leaves nothing behind.
-                use_encrypted_volume = _should_encrypt_local_volume(
+                use_encrypted_volume = not use_dmcrypt_volume and _should_encrypt_local_volume(
                     local_volume or f"volume_{payload.pod_id}",
                     payload.workload_kind,
                     payload.is_sysbox,
                     payload.enable_volume_encryption,
                 )
+                if (
+                    use_encrypted_volume
+                    and not local_volume
+                    and payload.volume_encryption_method == DMCRYPT_METHOD
+                    and payload.volume_limit_gb
+                    and settings.VOLUME_MASTER_SECRET
+                ):
+                    # a new volume the backend asked to make dm-crypt; a host that cannot (any more)
+                    # gets gocryptfs, as every pod did before
+                    current_step = "dmcrypt_capability_probe"
+                    if await self.dmcrypt_capable(ssh_client, default_extra):
+                        use_dmcrypt_volume, use_encrypted_volume = True, False
+                    else:
+                        logger.warning(
+                            _m(
+                                "dm-crypt asked for but the host cannot run it; using gocryptfs",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
+                if use_dmcrypt_volume:
+                    volume_encryption_status = VolumeEncryptionStatus.ENABLED
                 if use_encrypted_volume:
                     current_step = "encrypted_volume_image_inspect"
                     if not await self._image_has_encrypted_volume_label(
@@ -9186,18 +9352,53 @@ class DockerService:
                     full_node_rental = (
                         payload.disk_share is not None and payload.disk_share >= 1.0
                     )
-                    local_volume_driver = await self.create_local_volume(
-                        ssh_client=ssh_client,
-                        docker_client=docker_client,
-                        local_volume=local_volume,
-                        log_tag=log_tag,
-                        log_text=f"Creating docker volume {local_volume}",
-                        log_extra=default_extra,
-                        limit=effective_volume_limit_gb,
-                        sparse=full_node_rental,
-                        host_probe=volume_probe,
-                        labels=FILLER_VOLUME_LABELS if payload.workload_kind == WorkloadKind.FILLER else None,
-                    )
+                    if use_dmcrypt_volume:
+                        current_step = "dmcrypt_volume_creation"
+                        if not effective_volume_limit_gb:
+                            raise RuntimeError("a dm-crypt volume needs a size and the sizing gave none")
+                        await self.stream_log(f"Creating encrypted docker volume {local_volume}", "success", log_tag)
+                        await self.create_dmcrypt_volume(
+                            ssh_client,
+                            docker_client,
+                            local_volume=local_volume,
+                            pod_id=payload.pod_id,
+                            size_gb=effective_volume_limit_gb,
+                            sparse=full_node_rental,
+                            log_extra=default_extra,
+                        )
+                        dmcrypt_volume_kept = False
+
+                        async def _undo_dmcrypt_volume() -> None:
+                            # every failure path of this create, before or after `docker run`: the
+                            # mapping and its file are not something the stale-volume sweep finds
+                            if not dmcrypt_volume_kept:
+                                # never replaces the create's own error
+                                with contextlib.suppress(Exception):
+                                    await ssh_client.run(
+                                        f"/usr/bin/docker volume rm {shlex.quote(local_volume)} >/dev/null 2>&1",
+                                        check=False,
+                                    )
+                                await self.delete_dmcrypt_volume(ssh_client, payload.pod_id, default_extra)
+
+                        connections.push_async_callback(_undo_dmcrypt_volume)
+                        # inner Docker of a sysbox pod stays on the loopback plugin, as for any pod
+                        if payload.is_sysbox and effective_storage_limit_gb:
+                            local_volume_driver = await self._pick_loopback_driver_for_new_volume(
+                                ssh_client, 10, default_extra, volume_probe
+                            )
+                    else:
+                        local_volume_driver = await self.create_local_volume(
+                            ssh_client=ssh_client,
+                            docker_client=docker_client,
+                            local_volume=local_volume,
+                            log_tag=log_tag,
+                            log_text=f"Creating docker volume {local_volume}",
+                            log_extra=default_extra,
+                            limit=effective_volume_limit_gb,
+                            sparse=full_node_rental,
+                            host_probe=volume_probe,
+                            labels=FILLER_VOLUME_LABELS if payload.workload_kind == WorkloadKind.FILLER else None,
+                        )
                     created_local_volume = True
 
                     # DAH-1524: profile local volume sizing + creation on its own;
@@ -9351,10 +9552,13 @@ class DockerService:
                         )
                 if payload.is_sysbox and effective_storage_limit_gb and not created_local_volume:
                     # restart/edit reuses the workspace volume: inner Docker goes on the same
-                    # loopback plugin, read from the volume itself
+                    # loopback plugin, read from the volume itself (a dm-crypt workspace is a
+                    # `local` volume, so its pod's inner Docker takes the plugin a new pod would)
                     current_step = "docker_data_volume_driver"
-                    local_volume_driver = await self._vloopback_driver_of_volume(
-                        ssh_client, local_volume, default_extra
+                    local_volume_driver = (
+                        await self._pick_loopback_driver_for_new_volume(ssh_client, 10, default_extra, None)
+                        if use_dmcrypt_volume
+                        else await self._vloopback_driver_of_volume(ssh_client, local_volume, default_extra)
                     )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
@@ -9961,7 +10165,16 @@ class DockerService:
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
+                    volume_encryption_method=(
+                        DMCRYPT_METHOD
+                        if use_dmcrypt_volume
+                        else GOCRYPTFS_METHOD
+                        if volume_encryption_status == VolumeEncryptionStatus.ENABLED
+                        else None
+                    ),
                 )
+                if use_dmcrypt_volume:
+                    dmcrypt_volume_kept = True
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.
                 edit_swap.replacement_is_up = True
@@ -10096,6 +10309,8 @@ class DockerService:
                     in {
                         "encrypted_volume_image_inspect",
                         "encrypted_volume_setup",
+                        "dmcrypt_volume_open",
+                        "dmcrypt_volume_creation",
                     }
                     else None
                 ),
@@ -10486,18 +10701,30 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
+
+            async def _start() -> None:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="start_container",
+                    log_extra=default_extra,
+                    # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
+                    # every `docker start`; start moves it onto the rental network
+                    call=lambda: docker_client.start(
+                        container_name=container_name, network=RENTAL_NETWORK_NAME
+                    ),
+                    container_name=container_name,
+                )
+
             # the start goes through the docker SDK; the SSH session is opened only once it
-            # succeeded, for the remount (no shell fallback for a failed start)
-            await run_logged_rental_docker_sdk_operation(
-                operation="start_container",
-                log_extra=default_extra,
-                # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
-                # every `docker start`; start moves it onto the rental network
-                call=lambda: docker_client.start(
-                    container_name=container_name, network=RENTAL_NETWORK_NAME
-                ),
-                container_name=container_name,
-            )
+            # succeeded, for the remount (no shell fallback for a failed start). The one exception:
+            # a dm-crypt volume whose mapping is closed (every host reboot closes it) fails the
+            # start at the mount, so nothing ran without it; it is opened, then started again.
+            mapping_closed = False
+            try:
+                await _start()
+            except Exception as exc:
+                if not is_closed_dmcrypt_mapping_error(str(exc)):
+                    raise
+                mapping_closed = True
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
@@ -10506,6 +10733,11 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
+                if mapping_closed:
+                    await self.open_dmcrypt_volumes(
+                        ssh_client, mounted_volume_devices_command(container_name), default_extra
+                    )
+                    await _start()
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
@@ -10541,11 +10773,16 @@ class DockerService:
         try:
             await _start()
         except Exception as exc:
+            if is_closed_dmcrypt_mapping_error(str(exc)):
+                # a dm-crypt volume's closed mapping: open it, then start
+                await self.open_dmcrypt_volumes(
+                    ssh_client, mounted_volume_devices_command(container_name), default_extra
+                )
             # park's `docker stop` can leave the vloopback mountpoint dir behind, so the parked
             # container's own start fails on "file exists" and the customer's pod stays down
             # (pod 6577912c, 22 Oct). Same repair as the create retry: rmdir only an empty,
             # unmounted mountpoint, then start once more.
-            if not _is_stale_vloopback_mountpoint_error(str(exc)) or not await self._repair_stale_mountpoint_of_container_volume(
+            elif not _is_stale_vloopback_mountpoint_error(str(exc)) or not await self._repair_stale_mountpoint_of_container_volume(
                 ssh_client, container_name, default_extra
             ):
                 raise
@@ -10636,9 +10873,12 @@ class DockerService:
         # and never matches, so a customer's stop is never overridden.
         # ticket-0729: the same pod can first be stuck behind an orphaned shim of its own old task;
         # that shim is cleared below, then the stale-mountpoint repair runs as usual.
+        # A dm-crypt volume's closed mapping (every host reboot closes them) is the same story: the
+        # start below opens it first.
         orphaned_task_id = _orphaned_task_id(container_error or "")
+        dmcrypt_closed = is_closed_dmcrypt_mapping_error(container_error or "")
         if not container_error or not (
-            orphaned_task_id or _is_stale_vloopback_mountpoint_error(container_error)
+            orphaned_task_id or dmcrypt_closed or _is_stale_vloopback_mountpoint_error(container_error)
         ):
             return False
         # one recovery per pod at a time: a second check cycle acting on the same stale verdict
@@ -10657,6 +10897,7 @@ class DockerService:
                 orphaned_task_id=orphaned_task_id,
                 local_volume_path=local_volume_path,
                 default_extra=default_extra,
+                dmcrypt_closed=dmcrypt_closed,
             )
         finally:
             self._pods_in_recovery.discard(container_name)
@@ -10673,6 +10914,7 @@ class DockerService:
         orphaned_task_id: str | None,
         local_volume_path: str | None,
         default_extra: dict[str, Any],
+        dmcrypt_closed: bool = False,
     ) -> bool:
         log_extra = {**default_extra, "container_name": container_name}
         try:
@@ -10713,8 +10955,8 @@ class DockerService:
                 )
             )
             return False
-        # an orphaned-shim pod may have no stale mountpoint at all; its start is the test
-        if not repaired_volume and not orphaned_task_id:
+        # an orphaned-shim pod may have no stale mountpoint at all, nor a dm-crypt one; its start is the test
+        if not repaired_volume and not orphaned_task_id and not dmcrypt_closed:
             logger.warning(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED",
@@ -11458,6 +11700,8 @@ class DockerService:
                             log,
                             retry_in_use=retry_volume_in_use,
                         )
+                    # a dm-crypt volume's mapping and backing file (nothing to do for any other pod)
+                    await self.delete_dmcrypt_volume(ssh_client, payload.pod_id, default_extra)
 
                 if payload.external_volume:
                     with _best_effort_delete_step(

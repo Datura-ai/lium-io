@@ -1023,6 +1023,18 @@
           "title": "User Public Keys",
           "type": "array"
         },
+        "volume_encryption_method": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Volume Encryption Method"
+        },
         "volume_limit_gb": {
           "anyOf": [
             {
@@ -1217,6 +1229,18 @@
           ],
           "default": null,
           "title": "Storage Limit Gb"
+        },
+        "volume_encryption_method": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Volume Encryption Method"
         },
         "volume_encryption_status": {
           "anyOf": [
@@ -6199,7 +6223,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.18.0",
+  "protocol_version": "1.19.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

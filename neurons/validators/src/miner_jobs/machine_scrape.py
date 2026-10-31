@@ -1272,6 +1272,33 @@ def get_sysbox_version() -> str | None:
     return None
 
 
+# Kept identical to services/dmcrypt_volume.DMCRYPT_CAPABILITY_PROBE (this script runs alone on the
+# executor and cannot import it; a test holds the two together): the host tools dm-crypt pod volumes run
+# in the host's mount namespace.
+DMCRYPT_CAPABILITY_PROBE = (
+    "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
+    "for t in cryptsetup dmsetup losetup udevadm mkfs.ext4 fallocate truncate; do "
+    "command -v $t >/dev/null || exit 1; done; "
+    "cryptsetup --help | grep -q perf-no_read_workqueue || exit 1; "
+    "[ -e /dev/loop-control ] || exit 1; "
+    "[ -d /sys/module/dm_crypt ] || modprobe -nq dm_crypt"
+)
+
+
+def check_dmcrypt_volume_ability() -> bool:
+    """The host can make dm-crypt pod volumes (the backend offers them only where this is true)."""
+    try:
+        result = subprocess.run(
+            ["nsenter", "-t", "1", "-m", "--", "sh", "-c", DMCRYPT_CAPABILITY_PROBE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def check_storage_limit_ability() -> tuple[bool, str]:
     """
     Checks if the system supports limiting the storage size of a container.
@@ -2244,6 +2271,7 @@ def get_machine_specs():
     if not is_supported:
         data["data_storage_limit_scrape_error"] = log_text
     data["data_vloopback_check"] = vloopback_check_payload(is_supported, data["data_sysbox_runtime"])
+    data["data_dmcrypt_volume"] = check_dmcrypt_volume_ability()
 
     ncu_profiling = check_ncu_profiling_access()
     data["data_ncu_profiling_access"] = ncu_profiling.access

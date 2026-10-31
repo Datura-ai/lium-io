@@ -157,6 +157,8 @@ ORIGINAL_KEYS = {
     # ticket-0331: the vloopback mount test. Prefixed so no existing key is a substring of them
     # (ecrypt_miner_job_files renames by sequential str.replace).
     'data_vloopback_check': "vloopback_check",
+    # dm-crypt pod volumes: the host has cryptsetup, dm_crypt, loop and udev (machine_scrape.DMCRYPT_CAPABILITY_PROBE)
+    'data_dmcrypt_volume': "dmcrypt_volume",
     'vc_verdict': "verdict",
     'vc_reason_code': "reason_code",
     'vc_detail': "detail",
@@ -371,6 +373,7 @@ class FileEncryptService:
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
             'data_vloopback_check': "",
+            'data_dmcrypt_volume': "",
             'vc_verdict': "",
             'vc_reason_code': "",
             'vc_detail': "",

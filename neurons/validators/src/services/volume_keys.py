@@ -1,4 +1,4 @@
-"""Per-volume gocryptfs passphrase derivation."""
+"""Per-volume key derivation: the gocryptfs passphrase and the dm-crypt (LUKS2) key file."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from core.config import Settings
 
 _HKDF_INFO = b"lium-gocryptfs/v1"
+_DMCRYPT_HKDF_INFO = b"lium-dmcrypt/v1"
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,20 @@ def derive_volume_passphrase(master_secret: str, key_id: str) -> str:
     return base64.urlsafe_b64encode(derived).decode("ascii").rstrip("=")
 
 
+def derive_dmcrypt_key(master_secret: str, key_id: str) -> str:
+    """The LUKS2 key file of a dm-crypt pod volume: 512 bits of HKDF as base64url text, so it travels
+    as text on the SSH channel's stdin and `cryptsetup --key-file -` reads every byte of it."""
+    if not key_id:
+        raise ValueError("key_id is required to derive volume keys")
+    derived = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=key_id.encode("utf-8"),
+        info=_DMCRYPT_HKDF_INFO,
+    ).derive(master_secret.encode("utf-8"))
+    return base64.urlsafe_b64encode(derived).decode("ascii").rstrip("=")
+
+
 class VolumeKeyDeriver:
     def __init__(self, master_secret: str) -> None:
         self._master_secret = master_secret
@@ -46,3 +61,6 @@ class VolumeKeyDeriver:
             passphrase=derive_volume_passphrase(self._master_secret, key_id),
             key_id=key_id,
         )
+
+    def dmcrypt_key(self, key_id: str) -> str:
+        return derive_dmcrypt_key(self._master_secret, key_id)

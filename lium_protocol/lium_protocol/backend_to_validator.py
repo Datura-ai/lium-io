@@ -160,6 +160,8 @@ class ContainerCreateRequest(ContainerRequest):
     bootstrap_restore: BootstrapRestoreSpec | None = None
     enable_jupyter: bool | None = None
     enable_volume_encryption: bool | None = None
+    # "dm-crypt" asks for a dm-crypt volume (a host that cannot run it gets gocryptfs); None/"gocryptfs" as before
+    volume_encryption_method: str | None = None
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None

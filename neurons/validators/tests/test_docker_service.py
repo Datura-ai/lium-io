@@ -5651,8 +5651,11 @@ def _make_sizing_ssh_client(
     volume_ls_stdout: str = "",
     volume_inspect_stdout: str = "",
     df_error: bool = False,
+    dmcrypt_backing_stdout: str = "",
 ) -> Mock:
     def run(command, **kwargs):
+        if "lium-crypt" in command:
+            return Mock(stdout=dmcrypt_backing_stdout, exit_status=0)
         if "docker info" in command:
             return Mock(stdout="/var/lib/docker\n", exit_status=0)
         if "df -P -B1 /hostfs" in command:
@@ -5767,6 +5770,23 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     assert result.storage_limit_gb == 196
     assert result.df_avail_bytes == 900 * _SIZING_GB
     assert result.existing_volumes_bytes == 300 * _SIZING_GB
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_counts_dmcrypt_backing_files(docker_service):
+    # dm-crypt pod volumes are `local` volumes with no declared size: their backing files count instead
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=900 * _SIZING_GB,
+        volume_ls_stdout="volume_abc vloopback:latest\n",
+        volume_inspect_stdout=f"{300 * _SIZING_GB}|<no value>\n",
+        dmcrypt_backing_stdout=f"{100 * _SIZING_GB}\n",
+    )
+
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    assert result.path == "fresh"
+    assert result.existing_volumes_bytes == 400 * _SIZING_GB
 
 
 @pytest.mark.asyncio
