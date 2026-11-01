@@ -4761,9 +4761,10 @@ class DockerService:
         the removal, and the create goes on. Otherwise the create fails at its own step,
         FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours.
 
-        Before failing, the listing is read again until ``cleanup_deadline``: a filler gone from it was removed
-        by dockerd (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still pending, and
-        dockerd removed it about 30 s after the rm, 4 s after the create had already failed)."""
+        Before failing, `docker rm -fv` is sent again with the listing until ``cleanup_deadline``: a filler gone
+        from it is removed (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still
+        pending). dockerd gives up an rm whose kill does not land in time and never retries it: the killed
+        filler stays listed, stopped, until another rm, which then removes it in seconds."""
         error = (
             f"[clean_existing_containers] docker rm -fv of filler {fillers} did not finish in time"
         )
@@ -4825,16 +4826,25 @@ class DockerService:
     async def _listing_once_gone(
         self, ssh_client: asyncssh.SSHClientConnection, targets: list[str], deadline: float
     ) -> ContainerListing | None:
-        """The host listing once none of ``targets`` is on it, read every few seconds until ``deadline``; None if
-        they are still listed (or the host cannot be listed) by then."""
+        """The host listing once none of ``targets`` is on it, `docker rm -fv` of them sent again with each
+        listing every few seconds until ``deadline``; None if they are still listed (or the host cannot be
+        listed) by then."""
         loop = asyncio.get_running_loop()
         while (remaining := deadline - loop.time()) > 0:
             await asyncio.sleep(min(_STUCK_FILLER_RELIST_SECONDS, remaining))
             try:
+                # asyncssh's timeout= bounds only the command, not its channel open
                 async with asyncio.timeout_at(deadline):
-                    listing = await self._list_all_containers(ssh_client)
+                    result = await ssh_client.run(
+                        _remove_and_list_containers_command(targets, []),
+                        check=False,
+                        timeout=max(deadline - loop.time(), 0.001),
+                    )
             except TimeoutError:
                 return None
+            except Exception:
+                continue
+            listing = _parse_remove_and_list_containers(result.stdout or "").listing_after_rm
             if listing is not None and not set(targets) & (set(listing[0]) | set(listing[1].values())):
                 return listing
         return None
