@@ -69,8 +69,8 @@ async def test_renter_volume_path_stays_one_token_at_both_layers(encrypted: bool
 
 @pytest.mark.asyncio
 async def test_volume_script_copy_finishes_before_the_temp_container_is_removed():
-    # a detached (`-d`) copy was force-removed by the cleanup before cp ran (pod 77e886f8 reboot,
-    # 1 Nov 2026): the chmod then failed with "No such file or directory"
+    # a detached (`-d`) copy can be force-removed by the cleanup before cp runs, so the chmod
+    # then fails with "No such file or directory"
     service = _RecordingDockerService()
 
     await service.run_jupyter(
