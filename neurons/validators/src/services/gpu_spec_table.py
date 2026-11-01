@@ -88,7 +88,7 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     "NVIDIA GeForce RTX 4090": [24576],  # 24 GB; observed: 24564 (99.6%), 23028 (0.4%)
     "NVIDIA GeForce RTX 4090 D": [24576],  # 24 GB
     # DAH-5508: a 48 GB RTX 4090 reports the plain 4090 name; classify_gpu_model names it this, only
-    # while RTX_4090_48GB_MODEL_ENABLED is on. Placeholder model for review, not launched.
+    # while RTX_4090_48GB_MODEL_ENABLED is on. Not launched.
     "NVIDIA GeForce RTX 4090 48GB": [49152],  # 48 GB
     "NVIDIA GeForce RTX 4080 SUPER": [16384],  # 16 GB
     "NVIDIA GeForce RTX 4080": [16384],  # 16 GB

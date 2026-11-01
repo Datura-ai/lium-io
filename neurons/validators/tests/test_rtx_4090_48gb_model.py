@@ -59,9 +59,9 @@ def test_other_48gb_cards_are_untouched(enabled):
 
 def test_the_48gb_model_has_its_own_economics():
     assert GPU_MODEL_RATES[RTX_4090_48GB] == 0.0
-    assert RENTAL_PRICES_PER_HOUR[RTX_4090_48GB] == 0.30
+    assert RENTAL_PRICES_PER_HOUR[RTX_4090_48GB] == 0.48  # the backend MACHINE_PRICES
     assert BASE_GPU_MAP[RTX_4090_48GB] == "RTX 4090 48GB" != BASE_GPU_MAP[RTX_4090]
-    assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] == {1: 2, 8: 16}
+    assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] == {1: 10, 8: 64}  # the default tier
     # the standard card keeps its numbers
     assert GPU_MODEL_RATES[RTX_4090] == 0.05
     assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090"] == {1: 10, 8: 64}
