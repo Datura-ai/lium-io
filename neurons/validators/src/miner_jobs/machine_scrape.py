@@ -791,10 +791,15 @@ def host_mount_points():
     try:
         with open("/proc/1/mountinfo") as mountinfo:
             fields = [line.split() for line in mountinfo]
-    except OSError:
+    except (OSError, ValueError):
         return set()
-    # mountinfo escapes space, tab, newline and backslash as \ooo
-    return {re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), f[4]) for f in fields if len(f) > 4}
+    # the kernel escapes only space, tab, newline and backslash (as \ooo); backslash last. No lambda
+    # or re callback: the obfuscator renames a lambda's body but not its argument (F-5)
+    mount_points = set()
+    for f in fields:
+        if len(f) > 4:
+            mount_points.add(f[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\"))
+    return mount_points
 
 
 def mounted_fs_used_bytes(host_path, mount_points):

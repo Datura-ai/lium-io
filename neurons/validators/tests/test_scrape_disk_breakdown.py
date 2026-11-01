@@ -727,3 +727,35 @@ def test_host_mount_points_decodes_mountinfo_escapes(scrape: dict, monkeypatch) 
     monkeypatch.setitem(scrape, "open", lambda path: io.StringIO(mountinfo))
 
     assert scrape["host_mount_points"]() == {"/", "/mnt/my disk"}
+
+
+@pytest.mark.parametrize(
+    "line, mount_point",
+    [
+        ("31 22 7:4 / /var/lib/docker/volumes/v/_data rw - ext4 /dev/loop4 rw", "/var/lib/docker/volumes/v/_data"),
+        ("30 22 7:3 / /mnt/my\\040disk rw - ext4 /dev/loop3 rw", "/mnt/my disk"),
+        ("32 22 7:5 / /mnt/tab\\011and\\134slash rw - ext4 /dev/loop5 rw", "/mnt/tab\tand\\slash"),
+        ("garbage", None),
+    ],
+    ids=["plain", "escaped-space", "escaped-tab-backslash", "short-line"],
+)
+def test_packaged_scrape_reads_escaped_mount_points(monkeypatch, line, mount_point) -> None:
+    # F-5: run host_mount_points as it ships, out of obfuscator.py's output. A lambda there kept its
+    # argument name while its body was renamed, so an escaped path raised NameError and the whole
+    # docker disk breakdown fell into the error key.
+    from miner_jobs.obfuscator import obfuscate_code
+
+    tree = ast.parse(obfuscate_code((SRC / "miner_jobs" / "machine_scrape.py").read_text()))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(isinstance(child, ast.Constant) and child.value == "/proc/1/mountinfo" for child in ast.walk(node))
+    )
+    mountinfo = f"22 1 259:2 / / rw - ext4 /dev/root rw\n{line}\n"
+    namespace = {"re": re, "open": lambda path: io.StringIO(mountinfo)}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "obfuscated", "exec"), namespace)
+
+    mount_points = namespace[function.name]()
+
+    assert mount_points == {"/"} | ({mount_point} if mount_point else set())
