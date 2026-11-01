@@ -515,6 +515,32 @@ async def test_A6_build_timeout_carries_the_step_that_was_running(svc, monkeypat
     assert tail.endswith("docker build exceeded 1200 s")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("only_create", [True, False])
+async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_attempt_left(svc, monkeypatch, only_create):
+    """DAH-5437: a create run again after a connector restart meets the DinD (and helpers) of the
+    attempt the restart cut off; it removes them first, but never while another create of the pod runs."""
+    from services.docker_service import inflight_creates
+
+    ssh_client = _make_dind_ssh()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    dind = svc._dind_container_name(payload.pod_id)
+
+    with inflight_creates.track(payload.pod_id):
+        if not only_create:
+            inflight_creates._creates_by_pod_id[payload.pod_id].running += 1  # a second live create
+        await svc._custom_build_image(
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+        )
+        inflight_creates._creates_by_pod_id[payload.pod_id].running = 1
+
+    run_at = next(i for i, c in enumerate(ssh_client.calls) if "run -d --runtime=sysbox-runc" in c)
+    leftover_rm = f"/usr/bin/docker rm -fv {dind} {dind}-fw-apply {dind}-fw-remove"
+    assert any(c.startswith(leftover_rm) for c in ssh_client.calls[:run_at]) is only_create
+
+
 # ------------------------------------------------------------------
 # A.13 — egress firewall failure → build_egress_setup, NO build attempted
 # ------------------------------------------------------------------

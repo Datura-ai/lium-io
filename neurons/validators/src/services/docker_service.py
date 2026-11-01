@@ -7466,6 +7466,16 @@ class DockerService:
             await self.stream_log(
                 f"Starting isolated build container {dind_name}", "success", log_tag
             )
+            if inflight_creates.is_only_create(pod_id):
+                # DAH-5437: a create resumed after a connector restart meets the build container its cut-off
+                # attempt left under this pod's name; no other create of this pod runs, so it is ours to replace
+                await ssh_client.run(
+                    "/usr/bin/docker rm -fv "
+                    + " ".join(shlex.quote(name) for name in (dind_name, *self._dind_firewall_helper_names(dind_name)))
+                    + " 2>/dev/null || true",
+                    check=False,
+                    timeout=setup_timeout_s,
+                )
             # `timeout(1)` on the executor kills the `docker run` (and so the
             # image pull) when it outlives the bound: asyncssh's own `timeout=`
             # only stops waiting, the remote command would run on. The

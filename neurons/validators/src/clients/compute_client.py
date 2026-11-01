@@ -114,6 +114,9 @@ MAX_FRAME_BYTES = 4 * 1024 * 1024
 EVENT_REPORT_MAX_BYTES = MAX_FRAME_BYTES - 64 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
+# DAH-5437: a create cut off by a connector restart runs again this many times; past it (say the create itself
+# kills the connector) it is reported failed
+MAX_CREATE_RESUMES = 1
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
 # pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
 # so the backend loses the validator for seconds, not the whole startup.
@@ -215,6 +218,8 @@ class ComputeClient:
         self.miner_service = miner_service
         self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
+        # pod id -> resume count of a create the restart sweep runs again, read when that create is tracked
+        self.resumed_creates: dict[str, int] = {}
 
         self.logging_extra = {
             "validator_hotkey": self.my_hotkey(),
@@ -282,6 +287,11 @@ class ComputeClient:
         await self.take_connector_lead()
 
         try:
+            await self.miner_service.redis_service.clear_running_backend_commands()
+        except Exception:
+            logger.exception("Failed to clear running backend commands on connector start")
+        # after the clear: a resumed create claims its command id again, so a backend re-send of it is a duplicate
+        try:
             await self.fail_creates_cut_off_by_restart()
         except Exception as exc:  # the sweep is best-effort; it must never keep the connector from starting
             logger.error(
@@ -290,10 +300,6 @@ class ComputeClient:
                     extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
                 )
             )
-        try:
-            await self.miner_service.redis_service.clear_running_backend_commands()
-        except Exception:
-            logger.exception("Failed to clear running backend commands on connector start")
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
@@ -1093,7 +1099,12 @@ class ComputeClient:
         # best-effort: a Redis error loses only the restart report, never the create itself
         try:
             await self.miner_service.redis_service.add_inflight_backend_create(
-                job_request.pod_id, job_request.miner_hotkey, job_request.executor_id, job_request.workload_kind
+                job_request.pod_id,
+                job_request.miner_hotkey,
+                job_request.executor_id,
+                job_request.workload_kind,
+                request=job_request.model_dump_json(),
+                resumes=self.resumed_creates.pop(job_request.pod_id, 0),
             )
         except Exception as exc:
             self._log_backend_create_tracking_error(job_request.pod_id, exc)
@@ -1156,12 +1167,31 @@ class ComputeClient:
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never
         replied, so the backend kept the pod PENDING / the filler STARTING, and its pending-pod flag refused the
-        delete for 30 min. Each one is reported failed now, which frees the node, and its flag is cleared."""
+        delete for 30 min. DAH-5437: each one runs again from its stored request (a re-run replaces what the cut-off
+        attempt left under the pod's names), so the backend still gets one reply; one without a stored request, or
+        already resumed MAX_CREATE_RESUMES times, is reported failed, which frees the node, and its flag is cleared."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
         for pod_id, create in creates.items():
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
+            if create.request and create.resumes < MAX_CREATE_RESUMES:
+                try:
+                    request = ContainerCreateRequest.model_validate_json(create.request)
+                except pydantic.ValidationError:
+                    request = None
+                if request is not None and request.pod_id == pod_id:
+                    self.resumed_creates[pod_id] = create.resumes + 1
+                    await self.miner_drivers.put(asyncio.create_task(self.miner_driver(request)))
+                    logger.warning(
+                        _m(
+                            "Create cut off by a connector restart, running it again",
+                            extra=get_extra_info(
+                                {**self.logging_extra, "pod_id": pod_id, "resumes": create.resumes + 1}
+                            ),
+                        )
+                    )
+                    continue
             self.message_queue.append(
                 FailedContainerRequest(
                     miner_hotkey=create.miner_hotkey,
@@ -1178,7 +1208,9 @@ class ComputeClient:
             logger.warning(
                 _m(
                     "Create cut off by a connector restart, reported failed",
-                    extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json")}),
+                    extra=get_extra_info(
+                        {**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json", exclude={"request"})}
+                    ),
                 )
             )
 

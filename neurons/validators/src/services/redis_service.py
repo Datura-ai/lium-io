@@ -173,6 +173,10 @@ class InflightBackendCreate(BaseModel):
     executor_id: str
     workload_kind: WorkloadKind
     started_at_unix_seconds: int
+    # DAH-5437: the create request itself, so the next connector can run it again; "" in entries written before
+    request: str = ""
+    # how many connector restarts this create has already been resumed after
+    resumes: int = 0
 
 
 class RedisWrite(NamedTuple):
@@ -696,13 +700,21 @@ class RedisService:
                 await self.redis.delete(key)
 
     async def add_inflight_backend_create(
-        self, pod_id: str, miner_hotkey: str, executor_id: str, workload_kind: WorkloadKind
+        self,
+        pod_id: str,
+        miner_hotkey: str,
+        executor_id: str,
+        workload_kind: WorkloadKind,
+        request: str = "",
+        resumes: int = 0,
     ) -> None:
         create = InflightBackendCreate(
             miner_hotkey=miner_hotkey,
             executor_id=executor_id,
             workload_kind=workload_kind,
             started_at_unix_seconds=int(time.time()),
+            request=request,
+            resumes=resumes,
         )
         await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
 
