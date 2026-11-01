@@ -33,6 +33,8 @@ DISK_HELPERS = {
     "UnixSocketHTTPConnection",
     "docker_api_get",
     "get_vloopback_volume_bytes",
+    "mounted_fs_used_bytes",
+    "get_dmcrypt_volume_bytes",
     "get_container_log_bytes",
     "get_host_disk_usage",
     "get_docker_disk_usage",
@@ -147,6 +149,81 @@ def test_docker_disk_usage_reports_each_pods_share(scrape: dict, monkeypatch) ->
     assert usage["hard_disk_by_volume"] == {"volume_pod1": 2048 * 512 // 1024, dind_volume: 10}
     assert usage["hard_disk_containers"] == 5
     assert usage["hard_disk_volumes"] == (10240 + 2048 * 512) // 1024
+
+
+GIB = 1024**3
+POD_ID = "0f5e6a3c-1b2d-4e5f-8a9b-0c1d2e3f4a5b"
+DMCRYPT = {"Driver": "local", "Options": {"type": "ext4", "device": f"/dev/mapper/lium-{POD_ID}"}}
+
+
+@pytest.mark.parametrize(
+    "volume, df_size, backing_bytes, mounted_used, by_volume, total",
+    [
+        # plain local volume: /system/df walks its files, nothing else to read
+        ({"Driver": "local"}, 3 * GIB, None, None, 3 * GIB, 3 * GIB),
+        # preallocated vloopback (partial rental): the file holds 600 GiB, its filesystem 1 GiB
+        ({"Driver": "vloopback:v2"}, -1, 600 * GIB, 1 * GIB, 1 * GIB, 600 * GIB),
+        # sparse vloopback after writing 50 GiB and deleting 48: the file keeps the blocks
+        ({"Driver": "vloopback:v2"}, -1, 50 * GIB, 2 * GIB, 2 * GIB, 50 * GIB),
+        # a stopped pod's volume is not mounted: its file is all there is to read
+        ({"Driver": "vloopback:v2"}, -1, 600 * GIB, None, 600 * GIB, 600 * GIB),
+        # dm-crypt (lium-io#1986), preallocated, sparse and unmounted: /system/df leaves it out
+        (DMCRYPT, None, 600 * GIB, 1 * GIB, 1 * GIB, 600 * GIB),
+        (DMCRYPT, None, 50 * GIB, 2 * GIB, 2 * GIB, 50 * GIB),
+        (DMCRYPT, None, 600 * GIB, None, 600 * GIB, 600 * GIB),
+    ],
+    ids=[
+        "local",
+        "vloopback-prealloc",
+        "vloopback-sparse-deleted",
+        "vloopback-unmounted",
+        "dmcrypt-prealloc",
+        "dmcrypt-sparse",
+        "dmcrypt-unmounted",
+    ],
+)
+def test_by_volume_reports_what_the_pods_filesystem_holds(
+    scrape: dict, monkeypatch, volume, df_size, backing_bytes, mounted_used, by_volume, total
+) -> None:
+    # Arrange — review on #1989: a pod's share is its mounted filesystem's used bytes; the disk
+    # total stays what the backing file takes
+    root = "/proc/1/root/var/lib/docker"
+    dmcrypt = "Options" in volume
+    mountpoint = "/var/lib/docker/volumes/volume_pod/_data" if dmcrypt else "/mnt/volume_pod"
+    mount = f"/proc/1/root{mountpoint}" if dmcrypt else f"{root}/plugins/abc/propagated-mount/volume_pod"
+    backing = f"{root}/lium-crypt/{POD_ID}.img" if dmcrypt else f"{root}/vloopback-v2/volume_pod"
+
+    def stat(path):
+        if path != backing or backing_bytes is None:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_blocks=backing_bytes // 512)
+
+    def statvfs(path):
+        return SimpleNamespace(f_blocks=1000 * GIB // 4096, f_bfree=(1000 * GIB - mounted_used) // 4096, f_frsize=4096)
+
+    path = SimpleNamespace(
+        join=os.path.join,
+        isdir=lambda candidate: candidate == f"{root}/vloopback-v2",
+        ismount=lambda candidate: mounted_used is not None and candidate == mount,
+    )
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat, statvfs=statvfs))
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [mount] if "propagated-mount" in pattern else []))
+    df_volumes = [] if df_size is None else [{"Name": "volume_pod", "UsageData": {"Size": df_size}}]
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {"LayersSize": 0, "Containers": [], "Volumes": df_volumes},
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": [{"Name": "volume_pod", "Mountpoint": mountpoint, **volume}]},
+        },
+    )
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert
+    assert usage["hard_disk_by_volume"] == {"volume_pod": by_volume // 1024}
+    assert usage["hard_disk_volumes"] == total // 1024
 
 
 def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:

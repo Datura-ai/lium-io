@@ -768,10 +768,48 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
                 size = os.stat(os.path.join(data_dir, name)).st_blocks * 512
                 total += size
                 if sizes is not None:
-                    sizes[name] = size
+                    # the pod's share is what its filesystem holds: a preallocated file is its full
+                    # size from the start, a sparse one keeps the blocks of deleted data
+                    used = None
+                    for mount in glob.glob(f"/proc/1/root{docker_root_dir}/plugins/*/propagated-mount/{name}"):
+                        used = mounted_fs_used_bytes(mount)
+                        if used is not None:
+                            break
+                    sizes[name] = size if used is None else used
                 break
             except OSError:
                 continue
+    return total
+
+
+def mounted_fs_used_bytes(path):
+    # bytes in use on the filesystem mounted at path; None when nothing is mounted there (a stopped pod)
+    try:
+        if not os.path.ismount(path):
+            return None
+        stat = os.statvfs(path)
+    except OSError:
+        return None
+    return (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+
+
+def get_dmcrypt_volume_bytes(docker_root_dir, sizes):
+    # DAH-5487 dm-crypt pod volumes: `local` volumes of type ext4 over /dev/mapper/lium-<pod id>, which
+    # /system/df skips (a volume with mount options). On disk they hold their loop file under lium-crypt.
+    total = 0
+    for volume in (docker_api_get("/volumes") or {}).get("Volumes") or []:
+        device = str((volume.get("Options") or {}).get("device") or "")
+        match = re.fullmatch(r"/dev/mapper/lium-([0-9a-f-]{36})", device)
+        if volume.get("Driver") != "local" or not match or not volume.get("Name"):
+            continue
+        try:
+            size = os.stat(f"/proc/1/root{docker_root_dir}/lium-crypt/{match.group(1)}.img").st_blocks * 512
+        except OSError:
+            continue
+        total += size
+        mountpoint = volume.get("Mountpoint")
+        used = mounted_fs_used_bytes(f"/proc/1/root{mountpoint}") if mountpoint else None
+        sizes[volume["Name"]] = size if used is None else used
     return total
 
 
@@ -837,6 +875,7 @@ def get_docker_disk_usage():
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
+    volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
