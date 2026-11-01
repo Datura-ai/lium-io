@@ -83,6 +83,8 @@ async def test_volume_script_copy_finishes_before_the_temp_container_is_removed(
         local_volume="vol",
     )
 
-    copy_index = next(i for i, c in enumerate(service.commands) if "cp /root/app/run_jupyter.sh /mnt/" in c)
+    copy_index = next(i for i, c in enumerate(service.commands) if "/root/app/run_jupyter.sh /mnt/" in c)
     assert " -d " not in service.commands[copy_index]
+    # a renter-placed FIFO at the target must be unlinked, not opened
+    assert "cp --remove-destination " in service.commands[copy_index]
     assert "docker rm -fv" in service.commands[copy_index + 1]
