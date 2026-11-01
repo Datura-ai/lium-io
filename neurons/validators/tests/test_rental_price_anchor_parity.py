@@ -107,6 +107,7 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
         "NVIDIA GeForce GTX 1070",
         "NVIDIA GeForce GTX 1060",
         "NVIDIA Tesla M40",
+        "NVIDIA GeForce RTX 4090 48GB",  # DAH-5508, behind RTX_4090_48GB_MODEL_ENABLED
     }
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300", MAX_Q} | added_types
     assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]

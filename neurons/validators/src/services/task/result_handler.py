@@ -12,7 +12,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
-from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
+from services.gpu_spec_table import classify_gpu_model, reference_gpu_model
 from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
@@ -36,7 +36,12 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
         return specs
 
     canonical_details = [
-        {**detail, "name": normalize_gpu_model(detail.get("name"))}
+        {
+            **detail,
+            "name": classify_gpu_model(
+                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
+            ),
+        }
         if isinstance(detail, dict) and detail.get("name")
         else detail
         for detail in details

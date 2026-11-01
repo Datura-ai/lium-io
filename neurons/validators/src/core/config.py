@@ -453,6 +453,9 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
+    # DAH-5508: an RTX 4090 reporting ~48 GB is scored as its own model "NVIDIA GeForce RTX 4090 48GB" (own VRAM
+    # window, rate, anchor and idle tier) instead of failing the 24 GB window. Off: such a card is rejected as before.
+    RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )

@@ -36,6 +36,9 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce RTX 4060": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
+    # DAH-5508: placeholder for review; no share until the owner signs off. Only reachable with
+    # RTX_4090_48GB_MODEL_ENABLED on (see gpu_spec_table.classify_gpu_model).
+    "NVIDIA GeForce RTX 4090 48GB": 0.0,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
     "NVIDIA RTX PRO 2000 Blackwell": 0.0,
     "NVIDIA RTX PRO 4000 Blackwell": 0.0,

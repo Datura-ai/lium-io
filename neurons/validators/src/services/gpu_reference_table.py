@@ -54,6 +54,7 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
     "NVIDIA GeForce RTX 4080": (0.16, (16,)),
     "NVIDIA GeForce RTX 4080 SUPER": (0.16, (16,)),
     "NVIDIA GeForce RTX 4090": (0.3, (24,)),
+    "NVIDIA GeForce RTX 4090 48GB": (0.3, (48,)),
     "NVIDIA GeForce RTX 4090 D": (0.11, (24,)),
     "NVIDIA GeForce RTX 5060": (0.11, (8,)),
     "NVIDIA GeForce RTX 5060 Ti": (0.12, (8, 16)),
