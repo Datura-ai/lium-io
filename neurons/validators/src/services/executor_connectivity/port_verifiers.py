@@ -168,6 +168,9 @@ class BatchVerifier:
 class FallbackVerifier:
     """Verifies ports sequentially using -p publish."""
 
+    # DAH-5419: `docker run` over SSH has no timeout of its own; a stuck daemon held it until the task was dropped
+    START_TIMEOUT_SEC = 30
+
     def __init__(self, port_tester: PortTester, runner: ContainerRunner):
         self.port_tester = port_tester
         self.runner = runner
@@ -199,7 +202,9 @@ class FallbackVerifier:
 
                 started = False
                 try:
-                    start_result = await self.runner.run(ssh_client, name, script, network_flag, 10)
+                    start_result = await asyncio.wait_for(
+                        self.runner.run(ssh_client, name, script, network_flag, 10), self.START_TIMEOUT_SEC
+                    )
                     if not start_result.ok:
                         logger.debug(
                             _m(
@@ -223,6 +228,18 @@ class FallbackVerifier:
                         successful.append(port)
                     else:
                         failed.append(port)
+
+                except TimeoutError:
+                    # the later ports would hang the same way; ending here lets the round report the port check
+                    logger.warning(
+                        _m(
+                            f"fallback: container start timed out after {self.START_TIMEOUT_SEC}s, "
+                            f"{len(ports_to_test) - idx + 1} port(s) left untested",
+                            extra=get_extra_info(log_ctx),
+                        )
+                    )
+                    failed.extend(ports_to_test[idx - 1:])
+                    break
 
                 except Exception as e:
                     logger.error(

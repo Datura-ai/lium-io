@@ -112,7 +112,8 @@
         "dockerfile_content": null,
         "ships_sshd": true,
         "gpu_power_limits": null,
-        "cache_volumes": null
+        "cache_volumes": null,
+        "whole_host": true
       }
     },
     {

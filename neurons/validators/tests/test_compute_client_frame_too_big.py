@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -31,7 +32,7 @@ async def _drain(client: ComputeClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_oversized_message_is_dropped_before_sending_and_the_next_one_still_goes():
+async def test_an_oversized_message_is_dropped_before_sending_and_the_next_one_still_goes(caplog):
     ws = AsyncMock()
     client = _client(ws)
     big = _message("x" * MAX_FRAME_BYTES)
@@ -39,7 +40,11 @@ async def test_an_oversized_message_is_dropped_before_sending_and_the_next_one_s
     client.message_queue.append(big)
     client.message_queue.append(small)
 
-    await _drain(client)
+    with caplog.at_level(logging.ERROR, logger="clients.compute_client"):
+        await _drain(client)
+
+    (drop,) = [r.msg.extra for r in caplog.records if "too big" in r.getMessage()]
+    assert (drop["executor_id"], drop["miner_hotkey"]) == ("ex", "hk")
 
     assert len(client.message_queue) == 0
     assert ws.send.await_count == 1

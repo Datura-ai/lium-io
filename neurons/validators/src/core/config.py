@@ -217,6 +217,9 @@ class Settings(BaseSettings):
     # is zeroed (every pool, spot pay and referral), and the share they would have taken is
     # left to burn. Empty (the default) changes nothing. Burner hotkeys are never affected.
     SCORING_EXCLUDED_HOTKEYS: str = Field(env="SCORING_EXCLUDED_HOTKEYS", default="")
+    # Comma-separated miner hotkeys whose unrented (idle) executors earn no incentive, same format
+    # and effect as SCORING_EXCLUDED_HOTKEYS but only while not rented; rented GPUs score as usual.
+    IDLE_INCENTIVE_EXCLUDED_HOTKEYS: str = Field(env="IDLE_INCENTIVE_EXCLUDED_HOTKEYS", default="")
 
     # DAH-2251 — referral incentive paid via emission, to referrer hotkeys weighted by
     # the backend's epoch-stable EMA feed. There is no funding wallet, so unlike the
@@ -366,12 +369,6 @@ class Settings(BaseSettings):
     # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
     # matched on the reported list until this is flipped from a week of clean fleet data.
     KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
-    # DAH-4547 - HardwareIdentityCheck: DMI files not served by sysfs (a cloak script's overlay), the
-    # kernel and NVML GPU lists disagreeing, or DMI identity changing under an unchanged GPU set.
-    # Shadow by default: the finding is logged as a warning event and the node passes.
-    HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED: bool = Field(
-        env="HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED", default=False
-    )
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count); a kernel list that is
@@ -431,11 +428,12 @@ class Settings(BaseSettings):
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.
     RENTED_POD_RESOURCES_CHECK_ENABLED: bool = Field(env="RENTED_POD_RESOURCES_CHECK_ENABLED", default=True)
+    # RentedPodNetworkCheck logs a pod's network summary as a warning for review from this count up.
+    RENTED_POD_OUTBOUND_FANOUT_DESTINATIONS: int = Field(
+        env="RENTED_POD_OUTBOUND_FANOUT_DESTINATIONS", default=256, gt=0
+    )
     # The per-pod incident mark expires this long after the last cycle that saw the fault.
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
-    # DAH-4457: a node whose GPU dropped out stays hidden (GPU_LOST availability entry, no new rentals) until its
-    # cards have read clean this long after the last faulty cycle (GpuLossHoldCheck).
-    GPU_LOSS_HOLD_SECONDS: int = Field(env="GPU_LOSS_HOLD_SECONDS", default=7200, gt=0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
@@ -539,12 +537,15 @@ class Settings(BaseSettings):
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
+    # DiskSpaceCheck: free-space floor for an idle node, matching the renter listing of the same environment
+    MIN_FREE_DISK_GB: int = Field(env="MIN_FREE_DISK_GB", default=50, ge=0)
     # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
     # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
     # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
     # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
     # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
     # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
+    # So is a failing side the rented pods' own counters show they used while the probe measured it (rented_throughput.DURING_*).
     RENTED_THROUGHPUT_CHECK_ENABLED: bool = Field(env="RENTED_THROUGHPUT_CHECK_ENABLED", default=True)
     RENTED_THROUGHPUT_INTERVAL_HOURS: float = Field(env="RENTED_THROUGHPUT_INTERVAL_HOURS", default=3.0, gt=0)
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
@@ -556,6 +557,11 @@ class Settings(BaseSettings):
     # yet (the follow-up zeroes the score on a slow disk).
     IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
     IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
+    # a node running a filler is busy from this rate of sectors read plus written on the docker root disks: a filler
+    # moving less than DISK_BUSY_MB_PER_S would otherwise share the disk with the probe and lower the reading
+    IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S: float = Field(
+        env="IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S", default=5.0, gt=0
+    )
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and
@@ -621,12 +627,6 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
-
-    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
-    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
-    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
-        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
-    )
 
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
@@ -775,6 +775,9 @@ class Settings(BaseSettings):
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
+
+    def get_idle_incentive_excluded_hotkeys(self) -> set[str]:
+        return {s.strip() for s in self.IDLE_INCENTIVE_EXCLUDED_HOTKEYS.split(",") if s.strip()}
 
     # DAH-2958 — express lane for never-validated executors. A new node is published only by
     # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and
