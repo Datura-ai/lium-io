@@ -13,6 +13,7 @@ import glob
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 from collections import namedtuple
@@ -49,7 +50,7 @@ def scrape() -> dict:
     return build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HELPERS,
-        {"glob": glob, "http": http, "json": json, "os": os, "shutil": shutil, "socket": socket},
+        {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket},
     )
 
 
@@ -84,7 +85,68 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_volumes": 5454000000 // 1024,
         "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
+        "hard_disk_by_container": {},
+        "hard_disk_by_volume": {},
     }
+
+
+def test_docker_disk_usage_reports_each_pods_share(scrape: dict, monkeypatch) -> None:
+    # Arrange — DAH-5059: a pod with a named vloopback workspace, a dind pod whose anonymous
+    # /var/lib/docker volume has no name the backend knows, and a stopped container with no size.
+    dind_volume = "ab" * 32
+    blocks_by_path = {"/proc/1/root/var/lib/docker/vloopback-v2/volume_pod1": 2048}
+    monkeypatch.setitem(scrape, "glob", type("_Glob", (), {"glob": staticmethod(lambda pattern: [])}))
+    monkeypatch.setitem(
+        scrape,
+        "os",
+        type(
+            "_Os",
+            (),
+            {
+                "path": type("_Path", (), {"join": staticmethod(os.path.join), "isdir": staticmethod(lambda path: True)}),
+                "stat": staticmethod(lambda path: type("_Stat", (), {"st_blocks": blocks_by_path[path]})),
+            },
+        ),
+    )
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {
+                "LayersSize": 0,
+                "Containers": [
+                    {
+                        "Names": ["/container_pod1"],
+                        "SizeRw": 4096,
+                        "Mounts": [{"Type": "volume", "Name": "volume_pod1", "Destination": "/root"}],
+                    },
+                    {
+                        "Names": ["/container_dind"],
+                        "SizeRw": 1024,
+                        "Mounts": [
+                            {"Type": "volume", "Name": dind_volume, "Destination": "/var/lib/docker"},
+                            {"Type": "bind", "Source": "/tmp", "Destination": "/tmp"},
+                        ],
+                    },
+                    {"Names": ["/stopped"]},
+                ],
+                "Volumes": [
+                    {"Name": "volume_pod1", "UsageData": {"Size": -1}},
+                    {"Name": dind_volume, "UsageData": {"Size": 10240}},
+                ],
+            },
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": [{"Name": "volume_pod1", "Driver": "vloopback-v2"}]},
+        },
+    )
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert — kB; the vloopback volume by its real blocks, the dind volume under its container
+    assert usage["hard_disk_by_container"] == {"container_pod1": 4, "container_dind": 11, "stopped": 0}
+    assert usage["hard_disk_by_volume"] == {"volume_pod1": 2048 * 512 // 1024, dind_volume: 10}
+    assert usage["hard_disk_containers"] == 5
+    assert usage["hard_disk_volumes"] == (10240 + 2048 * 512) // 1024
 
 
 def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
@@ -112,6 +174,8 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_volumes": 0,
         "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
+        "hard_disk_by_container": {},
+        "hard_disk_by_volume": {},
     }
 
 
@@ -484,6 +548,12 @@ def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
         "hard_disk_volumes": 1550 * 1024**2,
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
+        "hard_disk_by_container": {},
+        "hard_disk_by_volume": {
+            "engy_cache_hf_kimi-k3-0123abcd": 1500 * 1024**2,
+            "dphn_cache_hf_x": 40 * 1024**2,
+            "volume_renter": 10 * 1024**2,
+        },
     }
 
 

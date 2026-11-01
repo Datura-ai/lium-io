@@ -728,11 +728,11 @@ def get_executor_pid_mode():
     return pid_mode
 
 
-def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
+def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
     # filler_only: just the volumes a filler create labelled as its own (pass it positionally: the
-    # obfuscator renames arguments, not call keywords).
+    # obfuscator renames arguments, not call keywords). sizes: a dict to fill with bytes per volume.
     volumes = (docker_api_get("/volumes") or {}).get("Volumes") or []
     names = [
         volume.get("Name")
@@ -765,7 +765,10 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
             try:
                 # st_blocks, not st_size: a preallocated volume takes its whole declared size on
                 # disk while holding nothing, a sparse one takes only what it wrote.
-                total += os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                size = os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                total += size
+                if sizes is not None:
+                    sizes[name] = size
                 break
             except OSError:
                 continue
@@ -828,7 +831,12 @@ def get_docker_disk_usage():
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
     # renters were shown half of an idle node's disk. The model caches stay: rentals keep them.
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
-    volumes += get_vloopback_volume_bytes(docker_root_dir) - filler_run_volumes
+    by_volume = {
+        str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
+        if volume.get("Name")
+    }
+    volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
@@ -837,6 +845,20 @@ def get_docker_disk_usage():
         max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
     )
 
+    # DAH-5059: each pod's own share, so the pod page can show used against its limits: the writable
+    # layer per container name, plus the anonymous volumes it mounts (a dind image's VOLUME
+    # /var/lib/docker has no name the backend knows); named volumes stand alone under their name.
+    by_container = {}
+    for container in df.get("Containers") or []:
+        name = str((container.get("Names") or [""])[0]).lstrip("/")
+        if not name:
+            continue
+        by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(
+            by_volume.get(str(mount.get("Name")), 0)
+            for mount in container.get("Mounts") or []
+            if mount.get("Type") == "volume" and re.fullmatch(r"[0-9a-f]{64}", str(mount.get("Name")))
+        )
+
     return {
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
@@ -844,6 +866,8 @@ def get_docker_disk_usage():
         "filler_run_volume_kb": filler_run_volumes // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
+        "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
+        "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
     }
 
 
