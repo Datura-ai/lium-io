@@ -760,6 +760,7 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
         raise RuntimeError(f"no vloopback plugin data dir under {docker_root_dir} for {len(names)} volumes")
 
     total = 0
+    mount_points = None
     for name in names:
         for data_dir in data_dirs:
             try:
@@ -770,9 +771,11 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
                 if sizes is not None:
                     # the pod's share is what its filesystem holds: a preallocated file is its full
                     # size from the start, a sparse one keeps the blocks of deleted data
+                    if mount_points is None:
+                        mount_points = host_mount_points()
                     used = None
                     for mount in glob.glob(f"/proc/1/root{docker_root_dir}/plugins/*/propagated-mount/{name}"):
-                        used = mounted_fs_used_bytes(mount)
+                        used = mounted_fs_used_bytes(mount[len("/proc/1/root"):], mount_points)
                         if used is not None:
                             break
                     sizes[name] = size if used is None else used
@@ -782,12 +785,24 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     return total
 
 
-def mounted_fs_used_bytes(path):
-    # bytes in use on the filesystem mounted at path; None when nothing is mounted there (a stopped pod)
+def host_mount_points():
+    # the host's mount points, from its own mount table: os.path.ismount under /proc/1/root resolves the
+    # parent with realpath into this container's filesystem, so a host mount reads as a plain dir
     try:
-        if not os.path.ismount(path):
-            return None
-        stat = os.statvfs(path)
+        with open("/proc/1/mountinfo") as mountinfo:
+            fields = [line.split() for line in mountinfo]
+    except OSError:
+        return set()
+    # mountinfo escapes space, tab, newline and backslash as \ooo
+    return {re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), f[4]) for f in fields if len(f) > 4}
+
+
+def mounted_fs_used_bytes(host_path, mount_points):
+    # bytes in use on the filesystem mounted at host_path; None when nothing is mounted there (a stopped pod)
+    if host_path not in mount_points:
+        return None
+    try:
+        stat = os.statvfs(f"/proc/1/root{host_path}")
     except OSError:
         return None
     return (stat.f_blocks - stat.f_bfree) * stat.f_frsize
@@ -797,6 +812,7 @@ def get_dmcrypt_volume_bytes(docker_root_dir, sizes):
     # DAH-5487 dm-crypt pod volumes: `local` volumes of type ext4 over /dev/mapper/lium-<pod id>, which
     # /system/df skips (a volume with mount options). On disk they hold their loop file under lium-crypt.
     total = 0
+    mount_points = None
     for volume in (docker_api_get("/volumes") or {}).get("Volumes") or []:
         device = str((volume.get("Options") or {}).get("device") or "")
         match = re.fullmatch(r"/dev/mapper/lium-([0-9a-f-]{36})", device)
@@ -808,7 +824,9 @@ def get_dmcrypt_volume_bytes(docker_root_dir, sizes):
             continue
         total += size
         mountpoint = volume.get("Mountpoint")
-        used = mounted_fs_used_bytes(f"/proc/1/root{mountpoint}") if mountpoint else None
+        if mount_points is None:
+            mount_points = host_mount_points()
+        used = mounted_fs_used_bytes(mountpoint, mount_points) if mountpoint else None
         sizes[volume["Name"]] = size if used is None else used
     return total
 

@@ -11,6 +11,7 @@ test_scrape_encryption_key_order.py parses rather than imports.
 import ast
 import glob
 import http.client
+import io
 import json
 import os
 import re
@@ -34,6 +35,7 @@ DISK_HELPERS = {
     "docker_api_get",
     "get_vloopback_volume_bytes",
     "mounted_fs_used_bytes",
+    "host_mount_points",
     "get_dmcrypt_volume_bytes",
     "get_container_log_bytes",
     "get_host_disk_usage",
@@ -174,10 +176,10 @@ DMCRYPT = {"Driver": "local", "Options": {"type": "ext4", "device": f"/dev/mappe
     ],
     ids=[
         "local",
-        "vloopback-prealloc",
+        "vloopback-prealloc-parent-absent",
         "vloopback-sparse-deleted",
         "vloopback-unmounted",
-        "dmcrypt-prealloc",
+        "dmcrypt-prealloc-parent-absent",
         "dmcrypt-sparse",
         "dmcrypt-unmounted",
     ],
@@ -190,7 +192,7 @@ def test_by_volume_reports_what_the_pods_filesystem_holds(
     root = "/proc/1/root/var/lib/docker"
     dmcrypt = "Options" in volume
     mountpoint = "/var/lib/docker/volumes/volume_pod/_data" if dmcrypt else "/mnt/volume_pod"
-    mount = f"/proc/1/root{mountpoint}" if dmcrypt else f"{root}/plugins/abc/propagated-mount/volume_pod"
+    host_mount = mountpoint if dmcrypt else "/var/lib/docker/plugins/abc/propagated-mount/volume_pod"
     backing = f"{root}/lium-crypt/{POD_ID}.img" if dmcrypt else f"{root}/vloopback-v2/volume_pod"
 
     def stat(path):
@@ -199,15 +201,25 @@ def test_by_volume_reports_what_the_pods_filesystem_holds(
         return SimpleNamespace(st_blocks=backing_bytes // 512)
 
     def statvfs(path):
+        assert path == f"/proc/1/root{host_mount}"
         return SimpleNamespace(f_blocks=1000 * GIB // 4096, f_bfree=(1000 * GIB - mounted_used) // 4096, f_frsize=4096)
 
     path = SimpleNamespace(
         join=os.path.join,
         isdir=lambda candidate: candidate == f"{root}/vloopback-v2",
-        ismount=lambda candidate: mounted_used is not None and candidate == mount,
+        # F-2: the host-side parent is absent in the executor container, so py3.11's ismount (realpath
+        # of the parent through /proc/1/root) says False for every mount; the host's mountinfo decides
+        ismount=lambda candidate: False,
     )
     monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat, statvfs=statvfs))
-    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [mount] if "propagated-mount" in pattern else []))
+    glob_hit = [f"/proc/1/root{host_mount}"]
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: glob_hit if "propagated-mount" in pattern else []))
+    mountinfo = [
+        "22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n",
+        # an escaped neighbour (a space in its path) must not hide or fake the pod's mount
+        "30 22 7:3 / /mnt/my\\040disk rw shared:9 - ext4 /dev/loop3 rw\n",
+    ] + ([f"31 22 7:4 / {host_mount} rw,relatime shared:10 - ext4 /dev/loop4 rw\n"] if mounted_used is not None else [])
+    monkeypatch.setitem(scrape, "open", lambda path: io.StringIO("".join(mountinfo)) if path == "/proc/1/mountinfo" else None)
     df_volumes = [] if df_size is None else [{"Name": "volume_pod", "UsageData": {"Size": df_size}}]
     _stub_docker_api(
         scrape,
@@ -708,3 +720,10 @@ def test_a_capability_check_is_named_and_removed_even_when_it_times_out() -> Non
     name = command[command.index("--name") + 1]
     assert command[:3] == ["docker", "run", "--rm"] and name.startswith("lium_capability_check_")
     assert removed == [["docker", "rm", "-f", name]]
+
+
+def test_host_mount_points_decodes_mountinfo_escapes(scrape: dict, monkeypatch) -> None:
+    mountinfo = "22 1 259:2 / / rw - ext4 /dev/root rw\n30 22 7:3 / /mnt/my\\040disk rw - ext4 /dev/loop3 rw\n"
+    monkeypatch.setitem(scrape, "open", lambda path: io.StringIO(mountinfo))
+
+    assert scrape["host_mount_points"]() == {"/", "/mnt/my disk"}
