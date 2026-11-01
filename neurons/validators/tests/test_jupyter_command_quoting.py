@@ -65,3 +65,24 @@ async def test_renter_volume_path_stays_one_token_at_both_layers(encrypted: bool
         if stdin_data is not None:
             assert " -i " in command, "docker exec needs -i or the container's read gets EOF"
             assert stdin_data == "tok\n"
+
+
+@pytest.mark.asyncio
+async def test_volume_script_copy_finishes_before_the_temp_container_is_removed():
+    # a detached (`-d`) copy was force-removed by the cleanup before cp ran (pod 77e886f8 reboot,
+    # 1 Nov 2026): the chmod then failed with "No such file or directory"
+    service = _RecordingDockerService()
+
+    await service.run_jupyter(
+        ssh_client=None,
+        container_name="pod_x",
+        jupyter_token="tok",
+        jupyter_port=8888,
+        log_tag="t",
+        log_extra={},
+        local_volume="vol",
+    )
+
+    copy_index = next(i for i, c in enumerate(service.commands) if "cp /root/app/run_jupyter.sh /mnt/" in c)
+    assert " -d " not in service.commands[copy_index]
+    assert "docker rm -fv" in service.commands[copy_index + 1]
