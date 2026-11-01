@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from services.gpu_spec_table import reference_gpu_model
 from services.redis_service import GPU_ANCHOR_KEY
 
 from ..messages import GpuModelMessages as Msg
@@ -55,11 +56,20 @@ class GpuModelValidCheck:
             gpu_details = specs.get("gpu", {}).get("details", [])
 
         card_models = []
+        card_references = []
         if gpu_count > 0:
             card_models = [detail.get("name", None) for detail in gpu_details]
+            # DAH-5088: an unknown NVIDIA model passes, scored as its reference model
+            card_references = [
+                model
+                if model in gpu_model_rates_map
+                else reference_gpu_model(model, detail.get("capacity"))
+                for model, detail in zip(card_models, gpu_details)
+            ]
         gpu_model = card_models[0] if card_models else None
+        reference = card_references[0] if card_references else None
 
-        if gpu_model not in gpu_model_rates_map:
+        if reference not in gpu_model_rates_map:
             return self._unsupported_model_result(ctx, gpu_model, gpu_count, fatal=True)
 
         if gpu_count == 0:
@@ -82,7 +92,9 @@ class GpuModelValidCheck:
             await record_gpu_drop(ctx, sorted(set(anchor) - set(_listed_uuids(gpu_details))))
             return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
 
-        card_mismatch = self._mixed_or_unsupported_card_result(ctx, card_models, gpu_count)
+        card_mismatch = self._mixed_or_unsupported_card_result(
+            ctx, card_models, card_references, gpu_count
+        )
         if card_mismatch is not None:
             return card_mismatch
 
@@ -90,21 +102,39 @@ class GpuModelValidCheck:
             Msg.MODEL_OK,
             ctx=ctx,
             check_id=self.check_id,
-            what={"gpu_model": gpu_model, "gpu_count": gpu_count},
+            what={
+                "gpu_model": gpu_model,
+                "gpu_count": gpu_count,
+                **({"reference_gpu_model": reference} if reference != gpu_model else {}),
+            },
         )
         return CheckResult(passed=True, event=event)
 
     def _mixed_or_unsupported_card_result(
-        self, ctx: Context, card_models: list[str | None], gpu_count: int
+        self,
+        ctx: Context,
+        card_models: list[str | None],
+        card_references: list[str | None],
+        gpu_count: int,
     ) -> CheckResult | None:
         """DAH-4304: a node is listed, priced and rented as one model, so every GPU on it must be
         the same supported model. A live rental is not cut, as with a GPU ban."""
         fatal = not has_live_rental(ctx)
-        unsupported = [model for model in card_models if model not in ctx.config.gpu_model_rates]
+        unsupported = [
+            model
+            for model, reference in zip(card_models, card_references)
+            if reference not in ctx.config.gpu_model_rates
+        ]
         if unsupported:
             return self._unsupported_model_result(ctx, unsupported[0], gpu_count, fatal=fatal)
 
-        model_counts = dict(Counter(card_models))
+        # DAH-5088: one unknown name with different memory gets different references, so key by both
+        model_counts = dict(
+            Counter(
+                model if model == reference else f"{model} (as {reference})"
+                for model, reference in zip(card_models, card_references)
+            )
+        )
         if len(model_counts) == 1:
             return None
         models_found = ", ".join(f"{count}x {model}" for model, count in model_counts.items())

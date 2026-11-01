@@ -8,7 +8,7 @@ the raw output back in one document. Nothing here decides pass or fail: the vali
 matmul blob and decrypts the VerifyX response with the keys only it holds, exactly as it does with
 SSH output, so the two paths are judged by one function and stay comparable.
 
-Off unless `EXECUTOR_LOCAL_VERIFY_ENABLED=true`; `/version` advertises `local_verify/1` only then.
+`/version` advertises it as `local_verify/1`.
 """
 
 from __future__ import annotations

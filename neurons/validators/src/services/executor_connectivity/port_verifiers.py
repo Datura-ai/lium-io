@@ -6,7 +6,9 @@ import uuid
 import aiohttp
 from asyncssh import SSHClientConnection
 
+from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.external_probe import ExternalPortProbe
 from services.executor_connectivity.models import BatchResult, PortPair
@@ -24,6 +26,9 @@ EXTERNAL_PROBE_SAMPLE = 3
 
 class BatchVerifier:
     """Verifies ports using --network=host in batches."""
+
+    REPROBE_DELAY_SEC = 3
+    REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
 
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
@@ -129,21 +134,35 @@ class BatchVerifier:
                 successful, failed = (
                     await self.port_tester.test_many(session, host, remaining, token, log_ctx) if remaining else ([], [])
                 )
+                first_round = successful
+                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
+                # re-probe the refused ports while the count is below PortCountCheck's floor (the failure condition)
+                for round_no in range(1, self.REPROBE_ROUNDS + 1):
+                    if not failed or len(reached or []) + len(successful) >= MIN_PORT_COUNT:
+                        break
+                    await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                    late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
+                    successful = successful + late
+                    logger.debug(
+                        _m(f"re-probe {round_no}/{self.REPROBE_ROUNDS}: {len(late)} late", extra=get_extra_info(log_ctx))
+                    )
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
         finally:
             await self.runner.cleanup(ssh_client, name)
 
-        external_blocked = reached == [] and all(p in successful for p in sample)
+        # only first-round answers count against the outside prober: it ran before them, so a late bind refuses it too
+        external_blocked = reached == [] and all(p in first_round for p in sample)
         if external_blocked:
             logger.warning(
                 _m(
-                    f"ports {[p.external for p in sample]} answer the validator but not the outside prober",
+                    f"ports {[p.external for p in sample]} answer the validator but not the outside prober"
+                    f"{'' if settings.EXTERNAL_PORT_PROBE_ENFORCE else ' (log-only)'}",
                     extra=get_extra_info(log_ctx),
                 )
             )
-        return BatchResult((reached or []) + successful, failed, external_blocked)
+        return BatchResult((reached or []) + successful, failed, external_blocked and settings.EXTERNAL_PORT_PROBE_ENFORCE)
 
 
 class FallbackVerifier:

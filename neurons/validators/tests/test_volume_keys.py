@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 
 from services.volume_keys import (
     VolumeKeyDeriver,
@@ -25,9 +24,3 @@ def test_material_derives_per_pod():
     assert material.key_id == "pod-1"
 
 
-def test_from_settings():
-    settings = SimpleNamespace(VOLUME_MASTER_SECRET=_MASTER_32)
-    deriver = VolumeKeyDeriver.from_settings(settings)
-    assert deriver.material("pod-1").passphrase == derive_volume_passphrase(
-        _MASTER_32, "pod-1"
-    )

@@ -6,13 +6,14 @@ import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import aiohttp
 import asyncssh
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
+REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
 
 class StorageOperationLaunchError(RuntimeError):
@@ -58,9 +59,17 @@ async def supports_storage_operation(
 # any other status is the probe itself failing (no python at that path = 127, an import error =
 # 1, …) and is reported as such, not read as an old image (review, taiberium).
 # DAH-2002: the same probe for `workspace.exclude_patterns`; an old image would back up what the excludes skip.
+# An image with no `storage` package at all predates every field, so it is an old image too (exit 3);
+# any other import error re-raises, so its traceback reaches the probe's stderr.
 _WORKSPACE_FIELD_PROBE = (
-    "import sys; sys.path.insert(0, '/root/app/src'); "
-    "from storage.models import WorkspaceSpec; "
+    "import sys\n"
+    "sys.path.insert(0, '/root/app/src')\n"
+    "try:\n"
+    "    from storage.models import WorkspaceSpec\n"
+    "except ModuleNotFoundError as e:\n"
+    "    if e.name not in ('storage', 'storage.models'):\n"
+    "        raise\n"
+    "    sys.exit(3)\n"
     "sys.exit(0 if sys.argv[1] in WorkspaceSpec.__dataclass_fields__ else 3)"
 )
 _BOOTSTRAP_PROBE_FIELD_MISSING = 3
@@ -177,7 +186,7 @@ async def start_storage_operation(
         await ssh_client.run(launch_command, check=True)
         return files
     except Exception as error:
-        await _report_launch_failure(operation_id, spec, error)
+        await report_launch_failure(operation_id, spec, error)
         raise
 
 
@@ -269,10 +278,13 @@ async def cancel_storage_operation(
         'if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; '
         'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 20; do '
         "sleep 0.1; attempt=$((attempt + 1)); done; fi; "
+        # the stopped helper still holds the repository credentials; remove it, not just stop it
+        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         "fi; "
         'kill -0 "$pid" 2>/dev/null && exit 3 || true; '
         "else "
         f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
+        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         "fi"
     )
     result = await ssh_client.run(command, check=False)
@@ -347,7 +359,7 @@ async def _remove_operation_artifacts(
     )
 
 
-async def _report_launch_failure(
+async def report_launch_failure(
     operation_id: UUID,
     spec: Mapping[str, object],
     error: Exception,
@@ -422,3 +434,25 @@ async def _report_operation_status(
         if attempt + 1 < attempts:
             await asyncio.sleep(2**attempt)
     return False
+
+
+async def upload_secrets_file(ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info) -> str:
+    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file.
+
+    Keeps the values out of the remote command line. The file is
+    created exclusively with mode 0600 inside a 0700 directory; the script deletes it on read.
+    """
+    path = str(REMOTE_SECRETS_DIRECTORY / f"{uuid4().hex}.json")
+    await ssh_client.run(f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True)
+    async with ssh_client.start_sftp_client() as sftp:
+        async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
+            await remote_file.write(
+                json.dumps(
+                    {
+                        "auth_token": auth_token,
+                        "aws_access_key_id": volume_info.iam_user_access_key,
+                        "aws_secret_access_key": volume_info.iam_user_secret_key,
+                    }
+                )
+            )
+    return path

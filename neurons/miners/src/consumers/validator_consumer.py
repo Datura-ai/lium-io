@@ -184,6 +184,7 @@ class ValidatorConsumer(BaseConsumer):
                     msg.executor_id,
                     nonce=msg.nonce,
                     validator_miner_signature=msg.validator_miner_signature,
+                    is_rental_request=msg.is_rental_request,
                 )
                 executors: list[ExecutorSSHInfo] = registration.accepted
                 if msg.is_rental_request and len(executors) == 1:

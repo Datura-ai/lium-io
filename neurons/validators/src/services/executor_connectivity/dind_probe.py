@@ -6,7 +6,6 @@ from typing import Any
 import asyncssh
 from asyncssh import SSHClientConnection, SSHKey
 
-from core.config import settings
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import (
@@ -307,20 +306,16 @@ class DindVerifier:
 
     @staticmethod
     def _user_namespace_allows_sysbox(uid_map: str, log_ctx: dict[str, Any]) -> bool:
-        """False only for the identity map under SYSBOX_USERNS_ENFORCEMENT_ENABLED. True for a user namespace,
-        for an unreadable map (logged as SYSBOX_UID_MAP_UNREADABLE: no answer decides nothing) and for the
-        identity map while the flag is off (logged as SYSBOX_IDENTITY_UID_MAP).
+        """False only for the identity map (logged as SYSBOX_IDENTITY_UID_MAP). True for a user namespace
+        and for an unreadable map (logged as SYSBOX_UID_MAP_UNREADABLE: no answer decides nothing).
         """
         if uid_map == UID_MAP_USER_NAMESPACE:
             return True
-        enforced = settings.SYSBOX_USERNS_ENFORCEMENT_ENABLED
         if uid_map == UID_MAP_UNREADABLE:
-            logger.warning(
-                _m("SYSBOX_UID_MAP_UNREADABLE", extra=get_extra_info({**log_ctx, "enforced": enforced}))
-            )
+            logger.warning(_m("SYSBOX_UID_MAP_UNREADABLE", extra=get_extra_info(log_ctx)))
             return True
-        logger.warning(_m("SYSBOX_IDENTITY_UID_MAP", extra=get_extra_info({**log_ctx, "enforced": enforced})))
-        return not enforced
+        logger.warning(_m("SYSBOX_IDENTITY_UID_MAP", extra=get_extra_info(log_ctx)))
+        return False
 
     async def _diagnose_unanswered_container(
         self,

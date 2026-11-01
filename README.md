@@ -144,7 +144,7 @@ The validator code here is open so anyone can read what it checks and how it sco
 flowchart LR
     R["Renters<br/>lium.io · CLI · SDK · API"] --> P["Lium platform"]
     P <-->|"WebSocket<br/>lium_protocol"| V["Validator<br/>neurons/validators"]
-    V <-->|"WebSocket<br/>datura"| M["Provider coordinator<br/>neurons/miners"]
+    V <-->|"REST<br/>datura"| M["Provider coordinator<br/>neurons/miners"]
     M -->|"signed HTTP"| E["Node agent<br/>neurons/executor<br/>on each GPU host"]
     V -->|"SSH: checks<br/>and rental pods"| E
     R -.->|"SSH into the pod"| E
@@ -179,7 +179,7 @@ Issues and pull requests are welcome. Open an [issue](https://github.com/Datura-
 cd neurons/validators && pdm install && \
 BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
 SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
-ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
+TDX_VERIFIER_URL=http://localhost:8000/verify \
 pdm run pytest tests/ --tb=short --strict-markers
 ```
 

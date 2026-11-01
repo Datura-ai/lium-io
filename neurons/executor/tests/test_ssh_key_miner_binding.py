@@ -8,7 +8,7 @@ signature (older validators or miners) are logged as legacy.
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
-import bittensor
+from bittensor_wallet import Keypair
 import pytest
 from datura.requests.validator_requests import ssh_pubkey_signing_blob
 from fastapi import FastAPI
@@ -26,17 +26,17 @@ _LOG_KEY = "ssh_key_miner_binding"
 
 @pytest.fixture(scope="module")
 def validator_kp():
-    return bittensor.Keypair.create_from_uri("//LiumTestValidator")
+    return Keypair.create_from_uri("//LiumTestValidator")
 
 
 @pytest.fixture(scope="module")
 def miner_kp():
-    return bittensor.Keypair.create_from_uri("//LiumTestMiner")
+    return Keypair.create_from_uri("//LiumTestMiner")
 
 
 @pytest.fixture(scope="module")
 def other_miner_kp():
-    return bittensor.Keypair.create_from_uri("//LiumTestOtherMiner")
+    return Keypair.create_from_uri("//LiumTestOtherMiner")
 
 
 @pytest.fixture()

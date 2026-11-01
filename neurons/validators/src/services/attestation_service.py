@@ -88,7 +88,7 @@ class AttestationService:
     Validates executor authenticity for Intel TDX deployments by verifying a pre-generated
     quote supplied alongside the executor's SSH host key.
 
-    If attestation is disabled (default), this service becomes a no-op and simply returns
+    If TDX_VERIFIER_URL is unset (default), this service becomes a no-op and simply returns
     the host key policy when possible.
     """
 
@@ -98,8 +98,7 @@ class AttestationService:
         self,
         redis_service: Annotated[RedisService | None, Depends(RedisService)] = None,
     ) -> None:
-        self.enabled: bool = bool(
-            settings.ENABLE_TDX_ATTESTATION and settings.TDX_VERIFIER_URL)
+        self.enabled: bool = bool(settings.TDX_VERIFIER_URL)
         self.verifier_url: str | None = settings.TDX_VERIFIER_URL
         self.quote_timeout: int = 60
         # Injected by FastAPI DI or passed explicitly (ioc / validator core).

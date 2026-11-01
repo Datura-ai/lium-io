@@ -24,10 +24,12 @@ from ...const import (
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
+from services.gpu_reset import renter_gpu_reset_in_progress
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)
@@ -100,8 +102,9 @@ def _gpu_usage_violation_details(
 def _rental_of_validated_miner(
     ctx: Context, rented_executor: RentedExecutor | None
 ) -> RentedExecutor | None:
-    """The rental listed under this executor's UUID, or None when enforcement is on and it belongs
-    to another miner. The mismatch is logged either way."""
+    """The rental listed under this executor's UUID, or None when it belongs to another miner on a
+    different endpoint (logged as RENTED_OWNER_MISMATCH). On the same IP and port the renter's pod
+    is on this box, so it stays rented and the VerifyX/matmul probes never run beside it."""
     if not rented_executor or rented_executor.miner_hotkey == ctx.miner_hotkey:
         return rented_executor
     logger.warning(
@@ -112,12 +115,15 @@ def _rental_of_validated_miner(
                     **ctx.default_extra,
                     "executor_uuid": ctx.executor.uuid,
                     "rental_miner_hotkey": rented_executor.miner_hotkey,
-                    "enforced": settings.RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED,
                 }
             ),
         )
     )
-    return None if settings.RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED else rented_executor
+    same_endpoint = (rented_executor.executor_ip_address, str(rented_executor.executor_ip_port)) == (
+        ctx.executor.address,
+        str(ctx.executor.port),
+    )
+    return rented_executor if same_endpoint else None
 
 
 def _within_container_name_grace(pod: RentedPod) -> bool:
@@ -221,6 +227,10 @@ class TenantEnforcementCheck:
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
+        # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
+        # is the provider's work, not POD_NOT_RUNNING, and is not recovered.
+        maintenance_window = maintenance_window_at_cycle_start(ctx)
+
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
@@ -246,9 +256,18 @@ class TenantEnforcementCheck:
                 extra.setdefault("pods_awaiting_container", []).append(pod_id)
                 ssh_pub_keys = []
                 continue
+            elif await renter_gpu_reset_in_progress(ctx.services.redis, ctx.miner_hotkey, ctx.executor.uuid, pod_id):
+                # DAH-4658: the renter's own GPU reset stops the pod for a moment. Judged next cycle, not penalised.
+                state_by_pod_id[pod_id] = ContainerState.UNKNOWN
+                extra.setdefault("pods_resetting_gpus", []).append(pod_id)
+                ssh_pub_keys = []
+                continue
             else:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
+                if maintenance_window is not None:
+                    ssh_pub_keys = []
+                    continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
                     stale_what = {
@@ -333,6 +352,19 @@ class TenantEnforcementCheck:
             if ssh_pub_keys is None:
                 # dockerd refused the keys read
                 ssh_pub_keys = []
+
+        if maintenance_window is not None:
+            return with_pod_states(
+                maintenance_failure(
+                    ctx,
+                    self.check_id,
+                    maintenance_window,
+                    extra,
+                    default_extra=extra,
+                    rented=True,
+                    ssh_pub_keys=ssh_pub_keys,
+                )
+            )
 
         container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)

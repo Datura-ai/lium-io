@@ -513,10 +513,6 @@ class ProviderSideLoadCheck:
         )
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.PROVIDER_SIDE_LOAD_CHECK_ENABLED:
-            event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
-            return CheckResult(passed=True, event=event)
-
         lium_container_keys = await lium_containers(ctx)
         provider_side_load = await self.measure_provider_side_load(ctx, lium_container_keys)
         if not provider_side_load.is_measured:

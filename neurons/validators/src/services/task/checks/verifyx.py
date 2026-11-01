@@ -56,7 +56,7 @@ class VerifyXCheck:
 
     The check blocks on the probe's success. It always runs (DAH-4328 removed the
     ENABLE_VERIFYX setting, on everywhere since Sep 2025); only an idle filler-only node
-    skips it, keeping its last known EMA.
+    with a stored EMA skips it, keeping that EMA.
     """
 
     check_id = "gpu.validate.verifyx"
@@ -80,7 +80,10 @@ class VerifyXCheck:
             return CheckResult(passed=False, event=event)
 
         filler_container = _get_filler_only_container(ctx)
-        if filler_container:
+        stored_ema = _stored_network_ema(ctx)
+        # A never-measured node is probed even under a filler: with no EMA to reuse it would
+        # score 0 every cycle and stay hidden for as long as the filler runs.
+        if filler_container and stored_ema and stored_ema.ema_verifyx_download_speed is not None:
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -223,11 +226,14 @@ class VerifyXCheck:
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
             # measures only its own df-derived fields, so overwriting the dict wholesale would drop
             # the scrape's docker usage breakdown on every node where VerifyX runs.
+            # The scrape's own total/used/free win: they count the filler's preallocated run volume
+            # as free (a rental removes it), and VerifyX's raw df put it back as used, so an idle
+            # node listed terabytes less free disk until the next cycle without VerifyX.
             if "hard_disk" in sanitized:
                 verifyx_hard_disk = sanitized.get("hard_disk")
                 scraped_hard_disk = updated_specs.get("hard_disk")
                 if isinstance(verifyx_hard_disk, dict) and isinstance(scraped_hard_disk, dict):
-                    updated_specs["hard_disk"] = {**scraped_hard_disk, **verifyx_hard_disk}
+                    updated_specs["hard_disk"] = {**verifyx_hard_disk, **scraped_hard_disk}
                 else:
                     updated_specs["hard_disk"] = verifyx_hard_disk
 
@@ -518,8 +524,6 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     `rented_data` present is required — without the backend's answer every executor looks
     never-measured, and a backend blip must not double VerifyX for the whole fleet.
     """
-    if not settings.VERIFYX_COLD_SAMPLE_RETRY_ENABLED:
-        return False
     if ctx.state.rented_data is None:
         return False
     if prev_ema is not None and prev_ema.ema_verifyx_download_speed is not None:

@@ -11,13 +11,14 @@ from typing import Any, Literal
 from core.config import settings
 
 from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
+from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
 from .gpu_loss_hold import GpuLossHoldCheck
-from .rented_gpu_drop import RentedGpuDropCheck
+from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -253,7 +254,7 @@ def _no_gpu_report_specs(stdout: str, obfuscation_keys: dict[str, str] | None) -
     return specs if isinstance(specs.get("gpu"), dict) else {**specs, "gpu": {}}
 
 
-async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
+async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> list[ValidationEvent]:
     # A scrape that lists no GPU (card 0 lost, the only card lost, the driver down) fails here, and
     # this check is fatal, so RentedGpuDropCheck never runs on that cycle: hand it the empty scrape.
     gpu = specs["gpu"]
@@ -267,13 +268,17 @@ async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
     try:
         lost_ctx = ctx.model_copy(update={"state": state})
         await RentedGpuDropCheck().run(lost_ctx)
-        # DAH-4457: the hold starts here too, so the next clean scrape does not list the node again at once
-        await GpuLossHoldCheck().run(lost_ctx)
+        # DAH-4457: the hold starts here too, so the next clean scrape does not list the node again at once.
+        # This failed scrape ends the run before GpuLossHoldCheck, so its GPU_LOST entry rides on the scrape's
+        # result: without it a node whose driver died stayed listed for as long as the scrape kept failing.
+        hold_result = await GpuLossHoldCheck().run(lost_ctx)
+        return [hold_result.event] if hold_result.event.is_availability_error else []
     except Exception:
         logger.warning(
             _m("RENTED_GPU_DROP_ON_SCRAPE_FAILURE_ERROR", extra=get_extra_info(ctx.default_extra)),
             exc_info=True,
         )
+        return []
 
 
 @dataclass(frozen=True)
@@ -476,8 +481,18 @@ class MachineSpecScrapeCheck:
 
         if not scrape_run.success or not scrape_run.stdout.strip():
             failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            # DAH-4658: every card is missing; held only when each one is a GPU the renter resets
+            if failure.scrape_error == "no_gpu_details" and await missing_gpus_under_reset(ctx, []):
+                event = render_message(
+                    Msg.SCRAPE_GPU_RESET_IN_PROGRESS,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={**what, "held_reason_code": failure.template.reason, **failure.cause_event_fields()},
+                )
+                return CheckResult(passed=False, event=event)
+            gpu_lost_events: list[ValidationEvent] = []
             if failure.scrape_error == "no_gpu_details":
-                await _report_rented_gpu_loss(
+                gpu_lost_events = await _report_rented_gpu_loss(
                     ctx, _no_gpu_report_specs(scrape_run.stdout, ctx.config.obfuscation_keys)
                 )
             reset = _host_gpu_fault_reset(ctx, failure, self.check_id)
@@ -496,7 +511,7 @@ class MachineSpecScrapeCheck:
                     **({"host_gpu_fault_reset": True} if reset else {}),
                 },
             )
-            return CheckResult(passed=False, event=event, updates=reset)
+            return CheckResult(passed=False, event=event, updates=reset, extra_events=gpu_lost_events)
 
         try:
             decrypted = _decrypt_payload(ctx, scrape_run.stdout)
