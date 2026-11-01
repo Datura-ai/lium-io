@@ -6529,6 +6529,8 @@ class DockerService:
                     log_extra=log_extra,
                     timeout=_JUPYTER_SCRIPT_COPY_TIMEOUT_SEC,
                     raise_exception=True,
+                    # a killed cp can leave an empty script and no stderr; only the status shows it
+                    check_exit_status=True,
                 )
             finally:
                 command = f"/usr/bin/docker rm -fv {temp_container_name}"
