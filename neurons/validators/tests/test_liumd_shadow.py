@@ -602,8 +602,8 @@ async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, 
             "workload",
             {},
         ),
-        ([], True, "no_gpu_step_ran", {}),
-        ([_event("gpu.count", "GPU_COUNT_MISMATCH")], False, "no_gpu_step_ran", {}),
+        ([], True, "compared", {}),
+        ([_event("gpu.count", "GPU_COUNT_MISMATCH")], False, "compared", {}),
         (PASSED, True, "workload", {"rented": True}),
         (PASSED, True, "no_budget", {"deadline_s": 59.0}),
         # Only reserved dev executors run the shadow: a rentable executor never does, idle or not.
@@ -657,8 +657,12 @@ async def test_no_gpu_work_where_today_ran_none(
 
     record = await _shadow(ctx, fake, ok=ok, events=events, **extra)
 
-    assert (record["outcome"], record["reason"]) == ("skipped", reason)
-    assert fake.intents == []
+    if reason == "compared":
+        assert record["outcome"] == "compared" and record["agree"] is None
+        assert fake.intents
+    else:
+        assert (record["outcome"], record["reason"]) == ("skipped", reason)
+        assert fake.intents == []
 
 
 @pytest.mark.parametrize("entry", [UUID, f"5Miner/{UUID}/10.0.0.5", f"5Miner/{UUID}/10.0.0.5/ssh"])
