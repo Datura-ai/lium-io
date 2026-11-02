@@ -820,3 +820,11 @@ def test_listed_container_names_keeps_a_moved_pods_retained_old_container():
 
     assert "pod_moved" in listed_container_names(data)
     assert rented_list_unknown_reason(data) is None
+
+
+def test_listed_container_names_reads_a_snapshot_shape_without_the_retained_list():
+    from types import SimpleNamespace
+
+    data = SimpleNamespace(executors={}, all_filler_containers_by_executor={"e": ["filler_x"]}, filler_containers_by_executor={})
+
+    assert listed_container_names(data) == {"filler_x"}

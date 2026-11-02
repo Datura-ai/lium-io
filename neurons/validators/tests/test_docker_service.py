@@ -3237,6 +3237,8 @@ async def test_stop_container_sdk_failure_returns_failed_request_without_shell_f
     )
 
     assert isinstance(result, FailedContainerRequest)
+    # DAH-5510: Docker's own error reaches the backend, the renter-facing headline stays bare
+    assert "SDK stop failed" in result.detail and "SDK stop failed" not in result.msg
     assert connect_mock.call_count == 0
     assert docker_service.rental_docker_client_factory.client.stopped_containers == [
         "pod_test"

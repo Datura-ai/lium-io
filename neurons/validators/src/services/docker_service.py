@@ -10356,6 +10356,8 @@ class DockerService:
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
                 msg=str(log_text),
+                # DAH-5510: Docker's own error ("No such container") lets the backend tell a gone container
+                detail=log_text.to_full_string(),
                 error_type=FailedContainerErrorTypes.ContainerStopFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
