@@ -71,7 +71,6 @@ from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
-from services import efa_link_probe
 from services.ssh_service import SSHService
 from services.task.checks.duplicate_executor import _gpu_uuids
 from services.task.availability import (
@@ -2128,8 +2127,6 @@ class MinerService:
                     default_extra,
                     job_started_at,
                 )
-                # DAH-5269: EFA hosts are a third fabric the RoCE sweep does not see.
-                efa_link_probe.measure_and_attach(results, default_extra)
 
                 logger.info(
                     _m(

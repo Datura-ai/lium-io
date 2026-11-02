@@ -1577,7 +1577,7 @@ class InfinibandPort:
 
 
 def read_driver_name(device_path: str) -> str:
-    # DAH-5269: the kernel driver behind an RDMA device ("mlx5_core", "efa", ...). AWS EFA reports no
+    # The kernel driver behind an RDMA device ("mlx5_core", "efa", ...). AWS EFA reports no
     # Ethernet or InfiniBand link layer, so the driver is the one fact that names it. "" if unreadable.
     try:
         return os.path.basename(os.readlink(f"{device_path}/device/driver"))
