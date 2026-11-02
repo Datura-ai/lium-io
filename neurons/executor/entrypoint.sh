@@ -41,14 +41,14 @@ docker compose up --pull always --detach --wait --force-recreate
 # (2-5 GB per release, every past release too). Remove every executor image but the one now running;
 # Docker refuses to remove an image a container still uses.
 current_image=$(docker inspect --format '{{.Image}}' "$(docker compose ps --quiet executor 2>/dev/null)" 2>/dev/null || true)
-for image in $(docker image ls --quiet --no-trunc daturaai/compute-subnet-executor 2>/dev/null || true); do
-    if [ "$image" != "$current_image" ] && docker image rm "$image" >/dev/null 2>&1; then
-        echo "Removed old executor image $image"
-    fi
-done
-# the validator's per-cycle probes run the :latest tag; keep it local so they never wait on the registry
-if [ -n "$current_image" ]; then
-    docker tag "$current_image" daturaai/compute-subnet-executor:latest || true
+# The validator's probes and Jupyter copies run the :latest tag. Tag the running image first, so removing the
+# previous image (which drops its :latest) never leaves them pulling from the registry; no tag, no cleanup.
+if [ -n "$current_image" ] && docker tag "$current_image" daturaai/compute-subnet-executor:latest; then
+    for image in $(docker image ls --quiet --no-trunc daturaai/compute-subnet-executor 2>/dev/null || true); do
+        if [ "$image" != "$current_image" ] && docker image rm "$image" >/dev/null 2>&1; then
+            echo "Removed old executor image $image"
+        fi
+    done
 fi
 
 # Clean docker images

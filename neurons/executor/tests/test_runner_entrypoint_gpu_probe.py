@@ -29,6 +29,7 @@ DOCKER_STUB = textwrap.dedent(
         "rm --force") exit "${STUB_RM_EXIT:-0}" ;;
         "image ls") echo "${STUB_EXECUTOR_IMAGES:-}" ;;
         "image rm") exit "${STUB_IMAGE_RM_EXIT:-0}" ;;
+        "tag sha256:executorimage") exit "${STUB_TAG_EXIT:-0}" ;;
         "run --rm")
             [ -n "${STUB_PROBE_HANG:-}" ] && exec "$STUB_PROBE_HANG" 30
             [ -z "${STUB_PROBE_ERROR:-}" ] && exit 0
@@ -172,12 +173,26 @@ def test_a_leftover_probe_that_cannot_be_removed_holds_the_update(tmp_path):
     assert "sleep 300" in calls
 
 
-def test_the_running_image_keeps_the_latest_tag_after_the_cleanup(tmp_path):
-    # review 4446885396: the validator's probes run daturaai/compute-subnet-executor:latest; the cleanup must not
-    # leave that tag to the registry
+def test_the_running_image_is_tagged_latest_before_any_old_image_is_removed(tmp_path):
+    # the validator's probes and Jupyter copies run daturaai/compute-subnet-executor:latest; removing the previous
+    # image drops its :latest, so the running image must hold the tag before any removal
     result, calls = run_entrypoint(
-        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage"
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:v163 sha256:previous sha256:executorimage"
     )
 
     tag = calls.index("tag sha256:executorimage daturaai/compute-subnet-executor:latest")
-    assert tag > calls.index("image rm sha256:previous")
+    removals = [i for i, c in enumerate(calls) if c.startswith("image rm")]
+    assert len(removals) == 2
+    assert all(tag < i for i in removals)
+
+
+def test_old_images_are_kept_when_the_running_image_cannot_be_tagged(tmp_path):
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage", STUB_TAG_EXIT="1"
+    )
+
+    assert "tag sha256:executorimage daturaai/compute-subnet-executor:latest" in calls
+    assert not any(c.startswith("image rm") for c in calls)
+    assert recreated(calls)
+    assert "image prune -f" in calls
+    assert any(c.startswith("compose logs") for c in calls)
