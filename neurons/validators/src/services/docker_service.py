@@ -4497,7 +4497,6 @@ class DockerService:
 
         # one deadline for the whole sweep, so a long list never multiplies a stalled backend's wait on the create
         deadline = asyncio.get_running_loop().time() + _POD_RENTAL_ACTIVE_TIMEOUT_SECONDS
-        reads = asyncio.Semaphore(_POD_RENTAL_READS_AT_ONCE)
 
         async def closed(name: str) -> bool:
             pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
@@ -4508,7 +4507,7 @@ class DockerService:
             if self.backend_client is None:
                 return False
             try:
-                async with asyncio.timeout_at(deadline), reads:
+                async with asyncio.timeout_at(deadline):
                     answer = await self.backend_client.get_pod_rental_active(pod_id)
             except Exception as exc:
                 logger.warning(
@@ -4520,7 +4519,16 @@ class DockerService:
                 return False
             return answer is not None and not answer.active
 
-        answers = await asyncio.gather(*(closed(name) for name in names))
+        # a fixed number of workers share the list, so tasks and timers stay bounded however many names it holds
+        pending = iter(names)
+        answer_by_name: dict[str, bool] = {}
+
+        async def read_some() -> None:
+            for name in pending:
+                answer_by_name[name] = await closed(name)
+
+        await asyncio.gather(*(read_some() for _ in range(min(_POD_RENTAL_READS_AT_ONCE, len(names)))))
+        answers = [answer_by_name[name] for name in names]
         kept = [name for name, is_closed in zip(names, answers) if not is_closed]
         if kept:
             logger.info(_m("Keeping unlisted pods whose rental is not confirmed closed", extra=get_extra_info({**default_extra, "container_names": kept})))
