@@ -215,6 +215,14 @@ async def _precheck(
         mounts = container.get("Mounts") or []
     except (ValueError, KeyError, TypeError) as exc:
         raise GpuResetRefused(GpuResetErrorCode.ContainerNotFound, f"unreadable docker inspect: {exc}") from exc
+    # before the not-running check: a stopped pod is started first, and its remount needs the path (review 4447076002)
+    if encrypted_volume_mount and not local_volume_path:
+        if any(mount.get("Destination") == encrypted_volume_mount for mount in mounts):
+            # the restart has to remount the encrypted volume and cannot guess its plaintext path
+            raise GpuResetRefused(
+                GpuResetErrorCode.ResetNotSupported, "encrypted volume without its plaintext path"
+            )
+
     if container_pid <= 0:
         raise ContainerNotRunning()
 
@@ -223,13 +231,6 @@ async def _precheck(
     own = await _cgroups(runner, [container_pid])
     if container_id not in own.get(container_pid, ""):
         raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "the executor has no host PID view")
-
-    if encrypted_volume_mount and not local_volume_path:
-        if any(mount.get("Destination") == encrypted_volume_mount for mount in mounts):
-            # the restart has to remount the encrypted volume and cannot guess its plaintext path
-            raise GpuResetRefused(
-                GpuResetErrorCode.ResetNotSupported, "encrypted volume without its plaintext path"
-            )
 
     host_gpus_result = await _run(runner, HOST_GPUS_COMMAND)
     host_gpus = parse_host_gpus(host_gpus_result.stdout or "")
@@ -444,7 +445,8 @@ async def reset_pod_gpus(
                 break
             except Exception as exc:
                 if attempt:
-                    report.ok = False
+                    # the flag reports the last start: an earlier recovery start does not count (review 4447075986)
+                    report.ok, report.container_restarted = False, False
                     notes.append(f"the container did not start again: {exc}")
     report.detail = "; ".join(notes) or None
     return report

@@ -533,3 +533,30 @@ async def test_a_stopped_container_started_but_refused_by_the_precheck_reports_t
     assert not report.ok and report.container_restarted and report.error_code == GpuResetErrorCode.ResetNotSupported
     assert not any(cmd.startswith("/usr/bin/docker stop") for cmd in host.commands)
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_container_whose_final_start_fails_does_not_report_a_restart():
+    # review 4447075986: the recovery start set the flag; the failed start after the reset must clear it
+    host, running = FakeHost(main_pid=0), FakeHost()
+    starts = 0
+
+    async def start_it():
+        nonlocal starts
+        starts += 1
+        if starts > 1:
+            raise RuntimeError("no start")
+        host.inspect, host.cgroups = running.inspect, running.cgroups
+
+    report, _ = await _reset(host, start=AsyncMock(side_effect=start_it))
+    assert not report.ok and not report.container_restarted and "did not start again" in report.detail
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_encrypted_pod_without_its_plaintext_path_is_refused_before_any_start():
+    # review 4447076002: the start would leave the pod running without its plaintext mount
+    host = FakeHost(main_pid=0, mounts=[{"Destination": "/lium-cipher"}])
+    report, start = await _reset(host, encrypted_volume_mount="/lium-cipher")
+    assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert not report.container_restarted
+    _no_change(host, start)
