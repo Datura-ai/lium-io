@@ -177,6 +177,7 @@ class DindVerifier:
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
         created = False
         sshd_answered = False
+        sysbox_timed_out = False
 
         try:
             logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
@@ -219,7 +220,9 @@ class DindVerifier:
             ) as ssh:
                 sshd_answered = True
                 if sysbox:
-                    sysbox = await self._sysbox_works(ssh, log_ctx)
+                    measured = await self._sysbox_works(ssh, log_ctx)
+                    sysbox_timed_out = measured is None
+                    sysbox = measured is True
 
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
@@ -228,6 +231,7 @@ class DindVerifier:
                 log_text=f"dind: check ok port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
+                sysbox_timed_out=sysbox_timed_out,
             )
 
         except Exception as e:
@@ -274,8 +278,12 @@ class DindVerifier:
                 _m("DinD container removal failed", extra=get_extra_info({**log_ctx, "error": str(e)}))
             )
 
-    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
-        """Run hello-world inside the DinD container; True when it exits 0 within 30s.
+    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool | None:
+        """Run hello-world inside the DinD container; True when it exits 0 within 30s, None when it timed out.
+
+        A timeout measured nothing: on a busy rented host (30 Oct, pod c0877f60) it is load, not a missing
+        Sysbox, and reading it as False forgot the node's verified Sysbox, so the renter's next launches ran
+        their Docker-in-Docker image without Sysbox and Docker could not start inside.
 
         daturaai/dind loads hello-world into the inner dockerd at start (DAH-1959), so no registry
         pull is needed; when that load failed, docker falls back to a Docker Hub pull.
@@ -283,7 +291,9 @@ class DindVerifier:
         try:
             result = await asyncio.wait_for(ssh.run("docker run --rm hello-world"), timeout=30)
         except asyncio.TimeoutError:
-            error_msg = "sysbox check timed out after 30s"
+            timed_out = {**log_ctx, "error": "sysbox check timed out after 30s"}
+            logger.warning(_m("Sysbox check failed", extra=get_extra_info(timed_out)))
+            return None
         else:
             if result.exit_status == 0:
                 uid_map = await self._read_uid_map(ssh)
