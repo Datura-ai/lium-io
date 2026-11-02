@@ -2214,6 +2214,7 @@ class MinerService:
             ssh_service=self.ssh_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+            backend_client=self.task_service.backend_client,
         )
 
         try:
