@@ -98,8 +98,23 @@ async def test_locks_the_pods_gpus_and_records_them():
     assert host.commands.index(f"nvidia-smi -i {U[0]} -pm 1") < host.commands.index(f"nvidia-smi -i {U[0]} -lgc 1200,1500")
     assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "pod1"
     assert set(json.loads(redis.store["gpu_clock_lock_pod:pod1"])) == {U[0], U[1]}
-    # review: a record no -rgc could clear never refuses creates on its GPU for good
+    # gateway review: a confirmed lock's record never expires, so the next rental stays fail-closed
+    assert redis.ttl.get(f"gpu_clock_lock:{U[0]}") is None
+
+
+@pytest.mark.asyncio
+async def test_only_a_record_whose_lock_was_never_confirmed_expires():
+    """taiberium: an unanswered -lgc whose reset was refused keeps a record that expires instead of refusing creates
+    on the GPU for good; a re-lock that the driver refuses puts the confirmed record back without an expiry."""
+    host, redis = FakeHost(device_ids=(U[0],), lgc_exit=-1, rgc_exit=4), FakeRedis()
+    await _lock(host, redis, backend=[U[0]])
     assert redis.ttl[f"gpu_clock_lock:{U[0]}"] == CLOCK_LOCK_TTL_SECONDS
+
+    host, redis = FakeHost(device_ids=(U[0],)), FakeRedis()
+    await _lock(host, redis, backend=[U[0]])
+    host.lgc_exit = 4
+    await _lock(host, redis, backend=[U[0]])
+    assert redis.ttl.get(f"gpu_clock_lock:{U[0]}") is None and f"gpu_clock_lock:{U[0]}" in redis.store
 
 
 @pytest.mark.asyncio
