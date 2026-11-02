@@ -308,8 +308,14 @@ class TenantEnforcementCheck:
                         split_short, reprobed = await _reprobe_split_shortfall(ctx, split_short, rented_pods)
                         if "rented_data" in reprobed:
                             # a replacement rental took the node since the snapshot: judge it as the rented node it is
-                            rented_now = replace(ctx.state, rented_data=reprobed["rented_data"])
-                            return await self.run(ctx.model_copy(update={"state": rented_now}))
+                            # the re-probe's ports and count go with it, so allocation and idle pay read one measurement
+                            rented_now = replace(reprobed["state"], rented_data=reprobed["rented_data"])
+                            rerun = await self.run(
+                                ctx.model_copy(update={"state": rented_now, "port_count": reprobed["port_count"]})
+                            )
+                            return rerun.model_copy(
+                                update={"updates": {"port_count": reprobed["port_count"], **rerun.updates}}
+                            )
                     else:
                         split_short = None
                     if split_short is not None:
@@ -824,7 +830,7 @@ async def _reprobe_split_shortfall(
 
     Returns the shortfall (None once the node has its ports, or a rental started since the snapshot) and the
     updates publishing the re-probed ports and counts, the set the backend allocates from; for a new rental,
-    {"rented_data": the fresh read without the stale pods} instead. On a probe error the
+    those updates plus {"rented_data": the fresh read without the stale pods}. On a probe error the
     shortfall stands and nothing is published, since an unprobed port is never credited."""
     rented_data = ctx.state.rented_data
     filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
@@ -887,7 +893,8 @@ async def _reprobe_split_shortfall(
     if new_pods:
         # rented again: handed back to be judged as rented; the stale pods are dropped so they are not re-judged
         executors = {**fresh.executors, ctx.executor.uuid: rental.model_copy(update={"pods": new_pods})}
-        return None, {"rented_data": fresh.model_copy(update={"executors": executors})}
+        _, updates = published(fresh.get_filler_ports(ctx.executor.uuid))
+        return None, {**updates, "rented_data": fresh.model_copy(update={"executors": executors})}
     return published(fresh.get_filler_ports(ctx.executor.uuid))
 
 

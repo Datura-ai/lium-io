@@ -754,6 +754,15 @@ async def test_a_split_node_declaring_exactly_its_split_target_counts_the_stale_
     assert len(published.verified_port_pairs) == published.verified_port_count == declared
 
 
+class FirewalledDind:
+    def __init__(self, firewall: Firewalled):
+        self.firewall = firewall
+
+    async def verify(self, port, **_):
+        ok = port.external not in self.firewall.blocked
+        return DindProbeResult(success=ok, sysbox_runtime=ok, port=port)
+
+
 class OutsideBlockedAfterFirstProbe(Firewalled):
     """Every port answers the validator; once `blocked_outside` is set the outside prober reaches none."""
 
@@ -880,7 +889,8 @@ async def test_a_stale_split_node_rereads_rentals_before_failing_its_reprobe(con
     elif since_snapshot == "filler":
         assert published["available_port_count"] == 24 and set(taken) <= set(published["verified_ports"])
     else:
-        assert published["available_port_count"] == ctx.state.specs["available_port_count"]  # the renter's ports
+        # the re-probe's reading is published beside the renter: the stale pod's three freed, the new pod's three held
+        assert published["available_port_count"] == tenant_result.updates["port_count"] == 21
 
 
 @pytest.mark.asyncio
@@ -1023,3 +1033,50 @@ async def test_a_redis_outage_never_fails_a_node_on_the_outside_probe(context_fa
 
     assert result.passed is True
     assert ctx.state.externally_unreachable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+@pytest.mark.parametrize("answering", [0, 3, 21])
+async def test_a_stale_split_nodes_reprobe_is_the_measurement_published_and_paid_on(
+    context_factory, replacement, answering
+):
+    """Reviewer's case: the first probe verifies 21, then the re-probe finds `answering` free ports, with or
+    without a one-GPU rental started since the snapshot. Published ports and idle pay use the re-probe."""
+    from incentive.rental_price import RentalPriceIncentive
+
+    from tests.test_split_remainder_port_floor import MINER_HOTKEY, _build_incentive, _make_job
+
+    new_rental = RentedExecutor(
+        miner_hotkey="miner-hotkey",
+        executor_ip_address="127.0.0.1",
+        executor_ip_port="8001",
+        pods=[RentedPod(pod_id="pod-new", container_name="container_pod-new", rented_ports=[40000], gpu_count=1)],
+    )
+    rented_now = RentedExecutorsResponse(executors={EXECUTOR_UUID: new_rental} if replacement else {})
+    probe = Firewalled(blocked=set())
+    ctx = stale_split_ctx(context_factory, probe, 40023, rented_now=rented_now)
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    assert ctx.state.specs["available_port_count"] == 21
+    probe.blocked = set(range(40000, 40024 - answering))  # only the top `answering` ports answer the re-probe
+    ctx.services.connectivity.orchestrator.dind_probe = FirewalledDind(probe)  # a container's port is firewalled too
+    if replacement:
+        ctx.ssh.running.add("container_pod-new")
+        ctx.services.backend.active_pods.add("pod-new")
+    tenant_result, final = await apply(ctx, TenantEnforcementCheck())
+
+    assert final.state.specs["available_port_count"] == final.port_count == answering
+    assert len(final.state.specs["verified_ports"]) == answering
+    assert tenant_result.passed is replacement  # idle and short of its 24 ports: hidden, nothing paid
+    if replacement:
+        assert final.rented is True
+        incentive = _build_incentive(
+            _make_job(spec=final.state.specs, gpu_count=8, rented_gpu_count=1, is_rented=True)
+        )
+        incentive._expand_partially_rented_split_results()
+        _, remainder = incentive.job_results[MINER_HOTKEY]
+        limited = RentalPriceIncentive._port_limited_remainder(remainder)
+        # 7 free one-GPU splits: paid only for as many as the re-probe found ports
+        assert (limited.unpaid_gpu_count if limited else 0) == {0: 7, 3: 4, 21: 0}[answering]
