@@ -494,9 +494,6 @@ _OWN_SSH_CONNECTION_MARGIN_SEC = 5
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
 _ANONYMOUS_VOLUME_NAME_RE = re.compile(r"[0-9a-f]{64}")
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-# DAH-2475: slack kept free above a rental's requested volume before a filler cache has to go. Covers the
-# image layers and scratch the pod needs beyond its own volume.
-RENTAL_DISK_HEADROOM_GB = 20
 # a clamp within 5% is df/listing drift (a ~15 min old scrape, GB vs GiB); below it the renter is short-changed,
 # so the create fails and the backend's rent retry moves the pod to another node
 RENTAL_VOLUME_CLAMP_MIN_SHARE = 0.95
@@ -5159,11 +5156,17 @@ class DockerService:
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
             free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
             # a re-create's volume is already preallocated, outside df free: counting it again never fits
-            rental_needs_free_gb: float = (
-                (0 if payload.local_volume else payload.volume_limit_gb)
-                + (payload.storage_limit_gb or 0)
-                + RENTAL_DISK_HEADROOM_GB
+            rental_own_gb: float = (0 if payload.local_volume else payload.volume_limit_gb) + (
+                payload.storage_limit_gb or 0
             )
+            # a fresh-sized (disk_share) rental gets its share of free disk plus the pod volumes already on it,
+            # so a half-node one needs twice its size there or resolve_volume_sizing short-changes it
+            fresh_sizing = self.measures_host_for_volume_sizing(payload)
+            disk_share: float = payload.disk_share if fresh_sizing and payload.disk_share else 1
+            existing_gb: float = (
+                await self._get_existing_vloopback_bytes(ssh_client) / (1024**3) if fresh_sizing else 0
+            )
+            rental_needs_free_gb: float = rental_own_gb / disk_share - existing_gb
             if free_gb >= rental_needs_free_gb:
                 return False
 
@@ -5206,8 +5209,15 @@ class DockerService:
             # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed
             if not payload.local_volume and not await rental_fits():
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+                rental_gets_gb = (free_now_gb + existing_gb) * disk_share
                 payload.volume_limit_gb = max(
-                    int(free_now_gb - (payload.storage_limit_gb or 0) - RENTAL_DISK_HEADROOM_GB), 1
+                    int(
+                        # fresh sizing splits the slice between volume and storage in the order's proportion
+                        rental_gets_gb * payload.volume_limit_gb / rental_own_gb
+                        if fresh_sizing
+                        else rental_gets_gb - (payload.storage_limit_gb or 0)
+                    ),
+                    1,
                 )
             return True
         except asyncio.CancelledError:
@@ -5329,22 +5339,6 @@ class DockerService:
         expected_gb: float = _cache_download_gb(volume_name)
         if math.isinf(expected_gb):
             return 0
-        used_kb: int | None = await self._cache_volume_held_kb(ssh_client, volume_name)
-        if used_kb is None:
-            return 0
-        held_gb: float = used_kb * 1024 / 10**9
-        if held_gb >= expected_gb * ENGY_CACHE_COMPLETE_SHARE:
-            return 0
-        logger.info(
-            _m(
-                "Engy cache is a partial download; the run resumes it",
-                extra=get_extra_info({**default_extra, "volume": volume_name, "held_gb": round(held_gb, 1)}),
-            )
-        )
-        return expected_gb - held_gb
-
-    async def _cache_volume_held_kb(self, ssh_client: asyncssh.SSHClientConnection, volume_name: str) -> int | None:
-        """kB a cache volume holds, measured in a helper container that mounts it by name; None when unmeasurable."""
         try:
             result = await ssh_client.run(
                 f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
@@ -5354,9 +5348,20 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception:
-            return None
+            return 0
         used_kb: str = ((result.stdout or "").split() or [""])[0]
-        return int(used_kb) if used_kb.isdigit() else None
+        if not used_kb.isdigit():
+            return 0
+        held_gb: float = int(used_kb) * 1024 / 10**9
+        if held_gb >= expected_gb * ENGY_CACHE_COMPLETE_SHARE:
+            return 0
+        logger.info(
+            _m(
+                "Engy cache is a partial download; the run resumes it",
+                extra=get_extra_info({**default_extra, "volume": volume_name, "held_gb": round(held_gb, 1)}),
+            )
+        )
+        return expected_gb - held_gb
 
     @staticmethod
     def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
