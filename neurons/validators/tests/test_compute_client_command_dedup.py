@@ -147,7 +147,8 @@ async def test_same_pod_with_independent_commands(client, ids):
         await client.miner_driver(request(command_id))
     assert client.miner_service.handle_container.await_count == 2
     if not ids[0]:
-        assert client.miner_service.redis_service.mock_calls == []
+        # no command id, no dedup claim (the created-report keep is DAH-5380's, not dedup's)
+        assert not [c for c in client.miner_service.redis_service.mock_calls if "backend_command" in c[0]]
 
 
 @pytest.mark.asyncio
