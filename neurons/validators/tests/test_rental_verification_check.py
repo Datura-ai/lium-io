@@ -194,6 +194,28 @@ async def test_rental_verification_failed():
 
 
 @pytest.mark.asyncio
+async def test_rental_verification_empty_kernel_gpu_list_says_restart_the_executor():
+    """An empty kernel GPU list is a stale executor container, so the remediation must say restart it."""
+    error = "GPU 'GPU-4edea549-e08e-fdc6-09f2-b3c7880cc708' requested by tenant not present on executor; visible: []"
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=False, error=error, details={"docker_stderr": error})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FAILED.reason
+    assert "docker restart executor-executor-1" in result.event.remediation
+    assert result.event.what_we_saw["error"] == error
+
+
+@pytest.mark.asyncio
 async def test_rental_verification_nvml_mismatch_clears_verified_job_info():
     """Exact GPU runtime mismatch should mark the executor unhealthy."""
     stderr = (

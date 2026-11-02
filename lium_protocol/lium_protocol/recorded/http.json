@@ -71,6 +71,15 @@
         "renter_hardware_fault_executor_ids": [
           "9c8d7e6f-5a4b-4c3d-8e2f-1a0b9c8d7e6f"
         ],
+        "maintenance_executor_ids": [
+          "3e2f1a0b-9c8d-4e7f-8a6b-5c4d3e2f1a0b"
+        ],
+        "maintenance_windows_by_executor": {
+          "3e2f1a0b-9c8d-4e7f-8a6b-5c4d3e2f1a0b": {
+            "starting_at": "2026-10-23T10:00:00Z",
+            "expiring_at": "2026-10-23T16:00:00Z"
+          }
+        },
         "default_job_owner_by_executor": {
           "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": "lium"
         },

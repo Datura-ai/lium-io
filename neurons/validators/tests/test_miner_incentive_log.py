@@ -27,6 +27,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_tier",
         "provider_discord_not_connected",
         "new_rentals_paused",
+        "provider_maintenance",
         "miner_default_job",
         "hotkey_excluded_from_scoring",
         "gpu_model_not_eligible_for_unrented_incentive",
@@ -170,10 +171,22 @@ def _job(**overrides) -> JobResult:
         ),
         (
             lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
-                job, PortLimitedRemainder(available_port_count=2, required_port_count=3)
+                job, PortLimitedRemainder(
+                    available_port_count=2, required_port_count=4, free_split_count=4, paid_split_count=0, unpaid_gpu_count=4
+                )
             ),
             "port_limited_remainder",
             "2 free port",
+        ),
+        (
+            # below one whole split: no port remedy (DAH-3698 F15)
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(
+                    available_port_count=3, required_port_count=3, free_split_count=0, paid_split_count=0, unpaid_gpu_count=2
+                )
+            ),
+            "port_limited_remainder",
+            "fewer than its minimum rental",
         ),
     ],
 )

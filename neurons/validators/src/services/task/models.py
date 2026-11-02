@@ -58,14 +58,17 @@ class JobResult(BaseModel):
     # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
+    # DAH-3698: free GPUs of the remainder left out of the idle pool for want of a free port per split
+    port_unpaid_gpu_count: int = 0
     is_spot: bool = False
     # in the backend's provider_spot_executor_ids, the spot pay list: set to Spot by its provider, or
     # force-spot by a penalty demotion; not a banned hotkey, pin or no-incentive rental. Gates spot-node pay.
     is_on_spot_pay_list: bool = False
     is_new_rentals_paused: bool = False
+    is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False
-    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS: no incentive from any pool, set
-    # by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
+    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS (or, while unrented, in
+    # IDLE_INCENTIVE_EXCLUDED_HOTKEYS): no incentive from any pool, set by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
     is_hotkey_excluded_from_scoring: bool = False
     provider_discord_connected: bool = True
     is_provider_email_held: bool = False

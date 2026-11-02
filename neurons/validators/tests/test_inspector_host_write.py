@@ -47,7 +47,7 @@ OTHER_POD_WRITE = {
 async def _run(context_factory, findings, **report):
     report = _healthy_report(findings=findings, **({"interference_rules_version": 1} | report))
     ctx = context_factory(
-        config=build_context_config(inspector_enabled=True),
+        config=build_context_config(),
         services=build_services(
             inspector=DummyInspectorService(InspectorValidationResponse(report=report)),
             redis=FakeRedis(),

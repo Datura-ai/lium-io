@@ -53,9 +53,12 @@ class BaseIncentive(ABC):
         """
         t1 = time.time()
         excluded_hotkeys: set[str] = settings.get_scoring_excluded_hotkeys()
+        idle_excluded_hotkeys: set[str] = settings.get_idle_incentive_excluded_hotkeys()
         for hotkey, results in self.job_results.items():
             for result in results:
-                result.is_hotkey_excluded_from_scoring = hotkey in excluded_hotkeys
+                result.is_hotkey_excluded_from_scoring = hotkey in excluded_hotkeys or (
+                    hotkey in idle_excluded_hotkeys and not result.is_rented
+                )
                 await self._pre_process_job_result(hotkey, result)
 
         await self._on_finish_pre_process()

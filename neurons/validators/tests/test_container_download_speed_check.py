@@ -80,6 +80,9 @@ class FakeRedis:
     async def set(self, key, value, ex=None):
         self.store[key] = value
 
+    async def pttl(self, key):
+        return -1 if key in self.store else -2
+
 
 class Clock:
     now = 1_790_000_000.0
@@ -292,3 +295,39 @@ async def test_first_sight_waits_for_the_node_phase():
         clock.now += 5 * 3600
         await check.run(ctx)
         assert len(runner.commands) == 1
+
+
+async def test_a_node_copying_the_uuid_cannot_fail_the_owner():
+    with flags() as clock:
+        redis = FakeRedis()
+        copycat = make_context(
+            state=build_state(sysbox_runtime=True),
+            runner=FakeRunner(SLOW, SLOW),
+            services=build_services(redis=redis),
+            miner_hotkey="copycat-hotkey",
+        )
+        check = ContainerDownloadSpeedCheck()
+        await check.run(copycat)
+        clock.now += 31 * 60
+        assert not (await check.run(copycat)).passed
+
+        ctx, _, _ = make_ctx(FAST, redis=redis)
+        res = await check.run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OK.reason
+
+
+async def test_a_deploy_keeps_the_open_streak_saved_under_the_uuid_alone():
+    with flags() as clock:
+        redis = FakeRedis()
+        redis.store[f"{module._REDIS_PREFIX}:{EXECUTOR.uuid}"] = json.dumps(
+            {
+                "at": clock.now - 31 * 60,
+                "failures_in_a_row": 1,
+                "readings": [],
+                "measured": True,
+                "failing_readings_on_rentals_network": 1,
+            }
+        )
+        ctx, _, _ = make_ctx(SLOW, redis=redis)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+    assert not res.passed and res.event.reason_code == Msg.SLOW.reason

@@ -660,6 +660,8 @@ async def test_customer_create_whose_filler_removal_times_out_fails_at_its_own_s
 ):
     """A filler rm that times out, its processes not shown exiting, fails the create, never hangs it; at
     filler_removal_stuck (DAH-5012), not container_cleanup, which the backend counts against the node."""
+    # the filler stays listed, so the create re-lists it until this deadline before failing
+    monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 1)
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(
         svc,
@@ -673,7 +675,7 @@ async def test_customer_create_whose_filler_removal_times_out_fails_at_its_own_s
     assert type(result).__name__ == "FailedContainerRequest"
     assert result.failure_step == "filler_removal_stuck"
     [removal] = [call for call in ssh_client.run.await_args_list if call.args[0].startswith("/usr/bin/docker rm -fv")]
-    assert removal.kwargs["timeout"] == ds_module._CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+    assert removal.kwargs["timeout"] == ds_module._FILLER_ONLY_RM_TIMEOUT_SECONDS
 
 
 def _removal_commands(ssh_client) -> list[str]:

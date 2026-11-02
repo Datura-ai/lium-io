@@ -147,7 +147,6 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
 
     async def inspector_start_that_hangs(**kwargs) -> None:
         await asyncio.Event().wait()
@@ -177,7 +176,6 @@ async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     inspector_may_start = asyncio.Event()
 
     async def inspector_start_held(**kwargs) -> None:
@@ -212,7 +210,6 @@ async def test_a_second_edit_cancelled_by_a_delete_while_it_waits_never_parks(sv
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     inspector_may_start = asyncio.Event()
 
     async def inspector_start_held(**kwargs) -> None:
@@ -269,6 +266,42 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
     kwargs = bring_up.await_args.kwargs
     assert kwargs["container_name"] == name and kwargs["pod_id"] == payload.pod_id
     assert kwargs["local_volume_path"] == "/root" and kwargs["ssh_client"] is ssh
+
+
+@pytest.mark.parametrize(
+    ("visible", "starts"),
+    [(["GPU-new"], False), (["GPU-old-2", "GPU-new"], True), ([], True)],
+    ids=["card_set_swapped", "one_card_missing", "procfs_unreadable"],
+)
+@pytest.mark.asyncio
+async def test_a_failed_edit_skips_the_restore_start_only_when_all_pod_gpus_left_the_node(svc, monkeypatch, caplog, visible, starts):
+    # after a VM move swapped the whole card set, the old container's device request names cards the
+    # node no longer has, so it cannot start; it gets its name back, stopped
+    from services.nvidia_devices import MissingRentedGpuError
+
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    requested = ["GPU-old-1", "GPU-old-2"]
+    missing = [u for u in requested if u not in visible]
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(side_effect=MissingRentedGpuError(requested_uuids=requested, visible_uuids=visible, missing_uuids=missing)),
+    )
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert ssh.commands.count(f"/usr/bin/docker rename {parked} {name}") == 1
+    assert f"/usr/bin/docker start {name}" not in ssh.commands
+    if starts:
+        svc._bring_up_existing_container.assert_awaited_once()
+    else:
+        svc._bring_up_existing_container.assert_not_awaited()
+        assert "restore skipped: pod GPUs no longer on node" in caplog.text
+        assert "unknown device" not in caplog.text
 
 
 @pytest.mark.parametrize(

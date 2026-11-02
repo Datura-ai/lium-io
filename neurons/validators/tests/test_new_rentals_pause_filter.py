@@ -103,6 +103,8 @@ def _miner_service() -> MinerService:
     # __new__ skips __init__: give the service the lane map _claim_for_cycle reads (DAH-2958)
     service.in_flight = {}
     service.miners_awaiting_wave_list = {}
+    # the one-cycle not-listed grace (DAH-4829) reads this on every answer
+    service.rented_missed_last_cycle = {}
     return service
 
 

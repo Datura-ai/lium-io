@@ -66,6 +66,12 @@ def make_service() -> MinerService:
     )
 
 
+def missed_last_cycle(service: MinerService, *executor_ids: str) -> MinerService:
+    """The one-cycle grace reports a node from its second consecutive miss: record the first."""
+    service.rented_missed_last_cycle[MINER_HOTKEY] = set(executor_ids)
+    return service
+
+
 def build(service: MinerService, rented_data: RentedExecutorsResponse, *, listed_ids=(LISTED,), executor_id=None):
     return service._build_not_listed_rented_results(make_payload(), rented_data, miner_returned(*listed_ids), executor_id)
 
@@ -78,7 +84,7 @@ def test_rented_executor_the_miner_left_out_gets_one_failed_row():
     with its other executors only. Today the cycle writes nothing about it."""
     rented_data = RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()})
 
-    results = build(make_service(), rented_data)
+    results = build(missed_last_cycle(make_service(), MISSING), rented_data)
 
     assert [r.executor_info.uuid for r in results] == [MISSING]
     result = results[0]
@@ -141,9 +147,8 @@ def test_probe_agrees_with_the_builder():
     assert service._has_not_listed_rented_executors(make_payload(), None, [], None) is False
 
 
-def test_one_cycle_grace_reports_a_rented_node_from_its_second_consecutive_miss(monkeypatch):
+def test_one_cycle_grace_reports_a_rented_node_from_its_second_consecutive_miss():
     """5GN5FgYk/aad247c2, 19 Oct 14:16Z: left out of one answer, back in the next. 86 of 347 rows that day."""
-    monkeypatch.setattr("services.miner_service.settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE", True)
     service = make_service()
     rented_data = RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()})
 
@@ -154,13 +159,6 @@ def test_one_cycle_grace_reports_a_rented_node_from_its_second_consecutive_miss(
 
     assert first == [] and back == [] and missed_again == []
     assert [r.executor_info.uuid for r in second] == [MISSING]
-
-
-def test_one_cycle_grace_off_reports_the_first_miss(monkeypatch):
-    monkeypatch.setattr("services.miner_service.settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE", False)
-    rented_data = RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()})
-
-    assert [r.executor_info.uuid for r in build(make_service(), rented_data)] == [MISSING]
 
 
 # --- the DAH-2748 outage silencer ------------------------------------------------------------
@@ -183,7 +181,7 @@ def test_not_listed_rows_do_not_tip_the_outage_ratio():
     never measured, and they counted on both sides of the DAH-2748 ratio. One miner dropping eight
     rented nodes at once then read as our own outage and silenced a real SSH failure elsewhere."""
     rented_data = RentedExecutorsResponse(executors={str(uuid4()): rented() for _ in range(8)})
-    not_listed = build(make_service(), rented_data, listed_ids=())
+    not_listed = build(missed_last_cycle(make_service(), *rented_data.executors), rented_data, listed_ids=())
     assert len(not_listed) == 8
     ssh_failure = _ssh_unreachable_result(str(uuid4()))
     cycle = not_listed + [ssh_failure] + [_reached_result(str(uuid4())) for _ in range(5)]
@@ -202,7 +200,8 @@ def test_not_listed_rows_are_not_silenced_and_do_not_pad_the_checked_count():
     The not-listed rows neither dilute that share nor lose their error: the miner's answer is not
     a reading our egress can explain."""
     rented_data = RentedExecutorsResponse(executors={str(uuid4()): rented() for _ in range(20)})
-    not_listed = build(make_service(), rented_data, listed_ids=())
+    not_listed = build(missed_last_cycle(make_service(), *rented_data.executors), rented_data, listed_ids=())
+    assert len(not_listed) == 20
     ssh_failures = [_ssh_unreachable_result(str(uuid4())) for _ in range(8)]
     reached = [_reached_result(str(uuid4())) for _ in range(2)]
 
@@ -269,6 +268,7 @@ async def request(service: MinerService, rented_data: RentedExecutorsResponse):
 @pytest.mark.asyncio
 async def test_cycle_result_carries_the_listed_verdict_and_the_missing_rented_node(rest_service):
     rest_service.miner_returns(LISTED)
+    missed_last_cycle(rest_service, MISSING)
     rented_data = RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()})
 
     out = await request(rest_service, rented_data)
@@ -282,8 +282,7 @@ async def test_cycle_result_carries_the_listed_verdict_and_the_missing_rented_no
 
 
 @pytest.mark.asyncio
-async def test_one_cycle_grace_a_miner_answering_zero_executors_twice_gets_the_row_on_the_second(rest_service, monkeypatch):
-    monkeypatch.setattr("services.miner_service.settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE", True)
+async def test_one_cycle_grace_a_miner_answering_zero_executors_twice_gets_the_row_on_the_second(rest_service):
     rest_service.miner_returns()
     rented_data = RentedExecutorsResponse(executors={MISSING: rented()})
 
@@ -300,6 +299,7 @@ async def test_a_miner_whose_only_rented_node_is_down_gets_a_row_for_the_node_no
     """Zero executors used to end as one miner-level failure row (uuid 1111-…) and nothing about
     the node; now the node gets its own row."""
     rest_service.miner_returns()
+    missed_last_cycle(rest_service, MISSING)
     rented_data = RentedExecutorsResponse(executors={MISSING: rented()})
 
     out = await request(rest_service, rented_data)

@@ -182,6 +182,49 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
 
 
 # ---------------------------------------------------------------------------
+# pull: the stream cut mid-pull (27 Oct alert ece89) → one re-open and one more pull
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pull_cut_mid_stream_is_retried_once_after_reopen():
+    import http.client
+
+    adapter = _FakeAdapter()
+    client = _client(_FakeApiClient(adapter=adapter))
+    errors = [http.client.IncompleteRead(b"")]
+    pulls = []
+
+    def pull_sync(image):
+        pulls.append(image)
+        if errors:
+            raise errors.pop(0)
+
+    client._pull_sync = pull_sync
+    await client.pull(image="daturaai/pytorch:x")
+
+    assert pulls == ["daturaai/pytorch:x", "daturaai/pytorch:x"]
+    assert adapter.reopen_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pull_refused_by_the_registry_is_not_retried():
+    adapter = _FakeAdapter()
+    client = _client(_FakeApiClient(adapter=adapter))
+    pulls = []
+
+    def pull_sync(image):
+        pulls.append(image)
+        raise RuntimeError("manifest unknown")
+
+    client._pull_sync = pull_sync
+    with pytest.raises(RentalDockerOperationError, match="Docker SDK pull failed: manifest unknown"):
+        await client.pull(image="nope/nope:1")
+
+    assert len(pulls) == 1 and adapter.reopen_calls == 0
+
+
+# ---------------------------------------------------------------------------
 # exec: only an exec declared idempotent is retried
 # ---------------------------------------------------------------------------
 

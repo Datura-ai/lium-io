@@ -87,6 +87,29 @@ async def test_unlisted_hotkeys_score_as_before(monkeypatch):
     assert result.incentive > 0
 
 
+@pytest.mark.asyncio
+async def test_idle_only_exclusion_drops_idle_and_keeps_rented(monkeypatch):
+    monkeypatch.setattr(settings, "SCORING_EXCLUDED_HOTKEYS", "")
+    monkeypatch.setattr(settings, "IDLE_INCENTIVE_EXCLUDED_HOTKEYS", f" {EXCLUDED} ,")
+    jobs = {
+        EXCLUDED: [
+            _make_pcc_job("exec-idle", B200, 1),
+            _make_pcc_job("exec-rented", B200, 1, is_rented=True),
+        ],
+        "miner_b": [_make_pcc_job("exec-b-idle", B200, 1)],
+    }
+
+    await _run_pcc_incentive(_make_pcc_config(), jobs, monkeypatch)
+
+    idle, rented = jobs[EXCLUDED]
+    assert idle.is_hotkey_excluded_from_scoring
+    assert idle.incentive == 0
+    assert ZeroIncentiveReason.HOTKEY_EXCLUDED_FROM_SCORING in _codes(idle)
+    assert not rented.is_hotkey_excluded_from_scoring
+    assert rented.incentive > 0
+    assert jobs["miner_b"][0].incentive > 0
+
+
 def _job(**overrides) -> JobResult:
     fields: dict = dict(
         executor_info=ExecutorSSHInfo(
