@@ -37,6 +37,9 @@ class RentedExecutor(pydantic.BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-5244: a pod on the node has an open rental contracted as a self-rent (the renter is the node's own
+    # operator). Separate from owner_flag, which keeps its GPU-outside-tenant meaning and stays False.
+    self_rent: bool = False
 
 
 class NetworkEMA(pydantic.BaseModel):
