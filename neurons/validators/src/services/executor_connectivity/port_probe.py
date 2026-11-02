@@ -39,18 +39,19 @@ class PortProbe:
             log_ctx=log_ctx,
             min_ports=min_ports,
         )
-        if batch.external == "blocked":
-            # the other tiers probe from the validator too, so they would pass the same host. The validator's
-            # ports are kept: PortConnectivityCheck decides whether this reading fails the node.
-            return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
-        successful, failed = batch.successful, batch.failed
-        tier = "batch"
-
         def short(ok) -> bool:
             # a split node (min_ports above the floor) keeps probing until it has its ports or every selected port
             # answered; the tier that verified most wins. Otherwise a later tier runs only when the earlier one
             # verified nothing.
             return not ok or (min_ports > MIN_PORT_COUNT and len(ok) < min(min_ports, len(ports)))
+
+        if batch.external == "blocked" and not short(batch.successful):
+            # the other tiers probe from the validator too, so they would pass the same host. The validator's
+            # ports are kept: PortConnectivityCheck decides whether this reading fails the node. A short split
+            # node still runs the later tiers; the result keeps the "blocked" reading.
+            return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
+        successful, failed = batch.successful, batch.failed
+        tier = "batch"
 
         if short(successful):
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.

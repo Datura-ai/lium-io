@@ -165,3 +165,43 @@ async def test_port_probe_stops_once_every_selected_port_answered(mocker):
     assert result.tier == "batch"
     semi.verify.assert_not_called()
     fallback.verify.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external", [None, "passed", "blocked"])
+@pytest.mark.parametrize("batch_ok, expect_tier", [(23, "semi_batch"), (24, "batch")])
+async def test_port_probe_split_node_outside_reading_table(mocker, external, batch_ok, expect_tier):
+    # a short split node runs the later tiers whatever the outside reading; a full batch stops; the reading is kept
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
+    batch = mocker.Mock()
+    batch.verify = mocker.AsyncMock(return_value=BatchResult(ports[:batch_ok], ports[batch_ok:], external))
+    semi = mocker.Mock()
+    semi.verify = mocker.AsyncMock(return_value=(ports, []))
+    fallback = mocker.Mock()
+    fallback.verify = mocker.AsyncMock()
+
+    result = await PortProbe(batch, semi, fallback).probe(
+        ports, ssh_client=mocker.Mock(), host="127.0.0.1", min_ports=24
+    )
+
+    assert result.tier == expect_tier
+    assert len(result.successful) == 24
+    assert result.external == external
+    assert semi.verify.call_count == (batch_ok < 24)
+    fallback.verify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_port_probe_blocked_reading_stops_an_unsplit_node(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(6)]
+    batch = mocker.Mock()
+    batch.verify = mocker.AsyncMock(return_value=BatchResult(ports[:3], ports[3:], "blocked"))
+    semi = mocker.Mock()
+    semi.verify = mocker.AsyncMock()
+    fallback = mocker.Mock()
+    fallback.verify = mocker.AsyncMock()
+
+    result = await PortProbe(batch, semi, fallback).probe(ports, ssh_client=mocker.Mock(), host="127.0.0.1")
+
+    assert result.external == "blocked" and result.tier == "batch"
+    semi.verify.assert_not_called()
