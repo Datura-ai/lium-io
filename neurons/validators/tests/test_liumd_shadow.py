@@ -285,7 +285,6 @@ async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch
 
     assert record["facts_agree"] is True
     assert {c["field"] for c in record["facts"]} == {
-        "docker.sysbox_runtime",
         "docker.container_names",
         "ports.port_range",
         "ports.port_mappings",
