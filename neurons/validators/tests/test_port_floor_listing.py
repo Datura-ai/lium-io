@@ -790,6 +790,25 @@ async def test_a_stale_split_nodes_reprobe_honours_a_confirmed_outside_block(con
 
 
 @pytest.mark.asyncio
+async def test_a_stale_split_nodes_reprobe_never_adds_a_second_outside_miss_in_one_cycle(context_factory, monkeypatch):
+    """Both probes of one cycle read "blocked": that is one outside miss, not the two that fail a node."""
+    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
+    probe = OutsideBlockedAfterFirstProbe(blocked=set())
+    probe.blocked_outside = True
+    ctx = stale_split_ctx(context_factory, probe, 40023)
+    record = _MissRecord()
+    ctx.services.redis.record_external_probe_miss.side_effect = record.record
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert ctx.services.redis.record_external_probe_miss.await_count == 1
+    assert tenant_result.passed is True
+    assert tenant_result.updates["state"].externally_unreachable is False
+
+
+@pytest.mark.asyncio
 async def test_a_stale_split_nodes_freed_ports_that_no_longer_answer_are_not_credited(context_factory):
     """Reviewer's case: 40000-40023 declared, the closed rental's 40000-40002 now firewalled. The other 21
     answer; the re-probe finds the three dead, so the node is still short of its 24."""

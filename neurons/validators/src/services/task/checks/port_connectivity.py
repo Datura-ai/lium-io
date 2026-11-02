@@ -129,6 +129,7 @@ class PortConnectivityCheck:
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
             externally_unreachable=result.status == "externally_unreachable",
+            external_probe_blocked=result.external_probe == "blocked",
         )
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):

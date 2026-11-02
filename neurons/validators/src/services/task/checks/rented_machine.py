@@ -849,7 +849,11 @@ async def _reprobe_split_shortfall(
         logger.warning(_m("SPLIT_PORT_REPROBE_FAILED", extra=get_extra_info(ctx.default_extra)), exc_info=True)
         return split_short, {}
     # DAH-4537: the outside confirmation PortConnectivityCheck applies; a confirmed block credits no port, filler too
-    unreachable = await PortConnectivityCheck._outside_failure_confirmed(ctx, result)
+    # one outside miss per cycle: a blocked re-probe after this cycle's blocked reading keeps that reading's verdict
+    if result.external_probe == "blocked" and ctx.state.external_probe_blocked:
+        unreachable = ctx.state.externally_unreachable
+    else:
+        unreachable = await PortConnectivityCheck._outside_failure_confirmed(ctx, result)
     probed = [] if unreachable else [pair.external for pair in result.successful_ports]
 
     def published(fillers: list[int]) -> tuple[tuple[int, tuple[int, int]] | None, dict[str, Any]]:
