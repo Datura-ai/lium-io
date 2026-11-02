@@ -34,7 +34,7 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "85276a1c60feff9d2ee7fc51366f957d4e4df10ba3039a8f18125e8a80123c77"
+GPU_REFERENCE_TABLE_SHA256 = "611722db5617a2f4a9fb58b8ecd32f8eabf59e6fc0c8d0400e8d757e785b9537"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = list(GPU_REFERENCE_TABLE)
 
@@ -116,6 +116,19 @@ def test_no_reference_for_a_non_nvidia_name_or_too_little_memory(name, vram_mb):
 def test_a_known_name_is_its_own_reference_whatever_its_vram():
     assert reference_gpu_model("NVIDIA H100 80GB HBM3", 8000) == "NVIDIA H100 80GB HBM3"
     assert reference_gpu_model("Tesla T4", None) == "NVIDIA T4 Tensor Core GPU"
+
+
+@pytest.mark.parametrize(("name", "anchor"), [("NVIDIA A100-PCIE-40GB", 0.37), ("NVIDIA A100-SXM4-40GB", 0.48)])
+def test_an_a100_40gb_is_paid_as_itself_not_as_an_a100_80gb_or_a_mining_card(name, anchor):
+    from incentive.config import BASE_GPU_MAP, MAX_UNRENTED_GPUS_BY_TYPE, IncentiveConfig
+    from incentive.utils import get_hourly_rate
+
+    config = IncentiveConfig()
+    assert reference_gpu_model(name, 40960) == name
+    assert BASE_GPU_MAP[name] == "A100 40GB" and MAX_UNRENTED_GPUS_BY_TYPE["A100 40GB"] == {1: 10, 8: 64}
+    for gpu_count in (1, 8):
+        assert get_hourly_rate(name, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour) == anchor
+    assert PRICES[name] == anchor
 
 
 def test_precheck_and_matmul_sizing_take_the_reported_vram_of_an_unknown_card():
