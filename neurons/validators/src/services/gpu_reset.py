@@ -11,7 +11,8 @@ Safety invariants, each pinned by a test:
 - the reset set is a subset of BOTH the container's own DeviceRequests GPUs (from the docker
   daemon) and the GPUs the backend holds for the pod;
 - `nvidia-smi -r` never runs without `-i`;
-- the container is always started again once it was stopped.
+- the container is always started again once it was stopped (or a stop of it failed), and a reset
+  of a pod whose container is not running starts it first.
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ NVSWITCH_COMMAND = (
     'for p in /dev/nvidia-nvswitch[0-9]*; do [ -e "$p" ] && printf "%s\\n" "$p"; done; true'
 )
 STOP_GRACE_SECONDS = 10
+# a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
+EXIT_WAIT_SECONDS = 90
 _QUERY_TIMEOUT_SECONDS = 30
 _RESET_TIMEOUT_SECONDS = 120
 _DETAIL_TAIL_CHARS = 300
@@ -55,6 +58,11 @@ class GpuResetRefused(Exception):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+class ContainerNotRunning(GpuResetRefused):
+    def __init__(self):
+        super().__init__(GpuResetErrorCode.ResetNotSupported, "the container is not running")
 
 
 @dataclass
@@ -208,7 +216,7 @@ async def _precheck(
     except (ValueError, KeyError, TypeError) as exc:
         raise GpuResetRefused(GpuResetErrorCode.ContainerNotFound, f"unreadable docker inspect: {exc}") from exc
     if container_pid <= 0:
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "the container is not running")
+        raise ContainerNotRunning()
 
     # no host PID view = no way to tell whose a GPU process is: the container's own main process must
     # show up in our /proc with the container's cgroup
@@ -333,8 +341,8 @@ async def reset_pod_gpus(
     local_volume_path: str | None = None,
     settle_seconds: float = 2.0,
 ) -> GpuResetReport:
-    try:
-        plan = await _precheck(
+    async def precheck() -> _Plan:
+        return await _precheck(
             runner,
             container_name=container_name,
             pod_gpu_uuids=pod_gpu_uuids,
@@ -343,18 +351,38 @@ async def reset_pod_gpus(
             encrypted_volume_mount=encrypted_volume_mount,
             local_volume_path=local_volume_path,
         )
-    except GpuResetRefused as refused:
-        return GpuResetReport(ok=False, error_code=refused.code, detail=refused.detail)
 
     report = GpuResetReport(ok=False)
     notes: list[str] = []
+    try:
+        plan = await precheck()
+    except ContainerNotRunning as refused:
+        # the backend sends a reset only for a RUNNING pod: a stopped container (an earlier reset whose stop
+        # timed out) is started first, so the renter's next reset is the recovery, not a refusal
+        try:
+            await start_container()
+        except Exception as exc:
+            return GpuResetReport(ok=False, error_code=refused.code, detail=f"{refused.detail}; it did not start: {exc}")
+        report.container_restarted = True
+        notes.append("the container was not running: started it again")
+        try:
+            plan = await precheck()
+        except GpuResetRefused as again:
+            report.error_code = again.code
+            report.detail = "; ".join([*notes, again.detail])
+            return report
+    except GpuResetRefused as refused:
+        return GpuResetReport(ok=False, error_code=refused.code, detail=refused.detail)
+
     if plan.widened:
         notes.append("NVLink peers inside the pod were reset together")
+    stop_failed = False
     try:
         stopped = await _run(
             runner, f"{DOCKER} stop -t {STOP_GRACE_SECONDS} {shlex.quote(container_name)}", timeout=60
         )
         if stopped.exit_code != 0:
+            stop_failed = True
             raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, f"docker stop failed: {_tail(stopped.stderr)}")
         report.pod_stopped = True
         # docker stop killed every process of the pod: anything still on the targets is someone else's,
@@ -404,14 +432,34 @@ async def reset_pod_gpus(
         report.error_code = GpuResetErrorCode.ExecutorUnreachable
         notes.append(f"reset failed: {exc}")
     finally:
-        try:
-            await start_container()
-            report.container_restarted = True
-        except Exception as exc:
-            report.ok = False
-            notes.append(f"the container did not start again: {exc}")
+        # a stop without an exit event leaves the container dying: `docker start` is then a no-op,
+        # the remount's exec fails on setns and the pod exits seconds later. Wait for the exit, then start; a
+        # start that fails for any other reason gets one more try after the same wait.
+        for attempt in range(2):
+            try:
+                if stop_failed or attempt:
+                    await _wait_exited(runner, container_name)
+                await start_container()
+                report.container_restarted = True
+                break
+            except Exception as exc:
+                if attempt:
+                    report.ok = False
+                    notes.append(f"the container did not start again: {exc}")
     report.detail = "; ".join(notes) or None
     return report
+
+
+async def _wait_exited(runner: SSHCommandRunner, container_name: str) -> None:
+    """Until the container has exited, at most EXIT_WAIT_SECONDS (`docker wait` answers at once for a stopped one)."""
+    try:
+        await _run(
+            runner,
+            f"timeout {EXIT_WAIT_SECONDS} {DOCKER} wait {shlex.quote(container_name)}",
+            timeout=EXIT_WAIT_SECONDS + 30,
+        )
+    except Exception:  # best effort: the start runs over its own session either way
+        pass
 
 
 # a scrape this soon after a renter's reset can still miss the cards the driver is bringing back
