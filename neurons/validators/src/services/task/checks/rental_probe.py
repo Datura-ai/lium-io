@@ -576,7 +576,7 @@ async def _busy_now(ctx: Context) -> _BusyNow:
         return _BusyNow(None)
     if rented is None:
         return _BusyNow(None)
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return _BusyNow(_RENTED_SINCE_CYCLE_START)
     fillers = frozenset(rented.get_filler_containers(ctx.executor.uuid))
@@ -818,7 +818,7 @@ async def _rented_meanwhile(ctx: Context, fillers_beside: frozenset[str]) -> str
         return None
     if rented is None:
         return None
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return "rented"
     if set(rented.get_filler_containers(ctx.executor.uuid)) - fillers_beside:

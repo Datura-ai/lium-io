@@ -188,3 +188,10 @@ async def test_rental_probe_runs_beside_another_miners_rental(context_factory):
 
     assert (await _skip_reason(_ctx(context_factory, rental_miner_hotkey="miner-hotkey")))[0] == "rented"
     assert (await _skip_reason(_ctx(context_factory, **OTHER)))[0] != "rented"
+
+
+def test_banned_provider_live_rental_gate_ignores_another_miners_rental(context_factory):
+    from neurons.validators.src.services.task.checks.banned_provider import has_live_rental
+
+    assert has_live_rental(_ctx(context_factory, rental_miner_hotkey="miner-hotkey")) is True
+    assert has_live_rental(_ctx(context_factory, **OTHER)) is False
