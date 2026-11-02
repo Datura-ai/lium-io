@@ -113,3 +113,78 @@ def test_registry_pull_runs_beside_another_miners_rental(context_factory):
     # RegistryPullCheck skips a rented node; another miner's rental on another endpoint is not this node's
     assert registry_pull._is_rented(_ctx(context_factory, rental_miner_hotkey="miner-hotkey")) is True
     assert registry_pull._is_rented(_ctx(context_factory, "other-miner-hotkey", rental_port="2222")) is False
+
+
+# DAH-4263 review on #1834: every other rental reader goes through rental_of_this_node too.
+OTHER = {"rental_miner_hotkey": "other-miner-hotkey", "rental_port": "2222"}
+
+
+@pytest.mark.asyncio
+async def test_capability_re_read_ignores_another_miners_rental(context_factory):
+    from unittest.mock import AsyncMock
+
+    from neurons.validators.src.services.task.checks.capability import lium_workload_live_now
+
+    ctx = _ctx(context_factory, **OTHER)
+    ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_rented_by("other-miner-hotkey", "2222"))
+    assert await lium_workload_live_now(ctx) is None
+    ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_rented_by("miner-hotkey"))
+    assert (await lium_workload_live_now(ctx)).kind == "pod"
+
+
+@pytest.mark.asyncio
+async def test_pid_host_fails_beside_another_miners_rental(context_factory):
+    from neurons.validators.src.services.task.checks.pid_host_required import PidHostRequiredCheck
+
+    def run(rental_miner_hotkey, rental_port="22"):
+        state = build_state(
+            specs={"executor_pid_mode": "private"}, rented_data=_rented_by(rental_miner_hotkey, rental_port)
+        )
+        return PidHostRequiredCheck().run(context_factory(state=state, miner_hotkey="miner-hotkey"))
+
+    assert (await run("miner-hotkey")).passed is True
+    assert (await run(**OTHER)).passed is False
+
+
+@pytest.mark.asyncio
+async def test_container_download_speed_measures_beside_another_miners_rental(context_factory, monkeypatch):
+    from neurons.validators.src.services.task.checks import container_download_speed as cds
+
+    monkeypatch.setattr(cds.settings, "CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED", True)
+
+    async def unreadable(*_args):
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(cds, "get_or_adopt_legacy", unreadable)
+    own = await cds.ContainerDownloadSpeedCheck().run(_ctx(context_factory, rental_miner_hotkey="miner-hotkey"))
+    other = await cds.ContainerDownloadSpeedCheck().run(_ctx(context_factory, **OTHER))
+    assert "rented" in str(own.event) and "rented" not in str(other.event)
+
+
+def test_gpu_usage_backend_answer_is_not_this_nodes_under_another_miners_rental(context_factory):
+    from neurons.validators.src.services.task.checks.gpu_usage import _the_answer_is_about_this_node
+
+    assert _the_answer_is_about_this_node(_ctx(context_factory, rental_miner_hotkey="miner-hotkey"), EXECUTOR_UUID)
+    assert not _the_answer_is_about_this_node(_ctx(context_factory, **OTHER), EXECUTOR_UUID)
+    assert not _the_answer_is_about_this_node(_ctx(context_factory, **OTHER), None)
+
+
+@pytest.mark.asyncio
+async def test_provider_side_load_excuses_no_build_of_another_miners_pod(context_factory, monkeypatch):
+    from neurons.validators.src.services.task.checks import provider_side_load as psl
+
+    async def none_late(*_args):
+        return set()
+
+    monkeypatch.setattr(psl, "late_started_containers_the_backend_owns", none_late)
+    build = f"{psl.BUILD_DIND_PREFIX}pod-1"
+    assert build in await psl.lium_containers(_ctx(context_factory, rental_miner_hotkey="miner-hotkey"))
+    assert build not in await psl.lium_containers(_ctx(context_factory, **OTHER))
+
+
+@pytest.mark.asyncio
+async def test_rental_probe_runs_beside_another_miners_rental(context_factory):
+    from neurons.validators.src.services.task.checks.rental_probe import _skip_reason
+
+    assert (await _skip_reason(_ctx(context_factory, rental_miner_hotkey="miner-hotkey")))[0] == "rented"
+    assert (await _skip_reason(_ctx(context_factory, **OTHER)))[0] != "rented"

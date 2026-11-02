@@ -727,9 +727,12 @@ def _the_answer_is_about_this_node(ctx: Context, owning_executor_id: str | None)
     nodes could name a squatter container after a live run of their honest one. A backend that
     predates the field sends nothing, and then the fleet snapshot is the only owner test we have.
     """
-    if owning_executor_id is None:
-        return True
-    return str(owning_executor_id) == str(ctx.executor.uuid)
+    if owning_executor_id is not None and str(owning_executor_id) != str(ctx.executor.uuid):
+        return False
+    # the UUID is the miner's word: a snapshot that lists it as another miner's rental elsewhere wins
+    rented_data = ctx.state.rented_data
+    listed = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    return listed is None or rental_of_this_node(ctx) is not None
 
 
 def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:

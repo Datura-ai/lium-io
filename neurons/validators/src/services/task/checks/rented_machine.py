@@ -31,8 +31,6 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .rental_owner import rental_of_this_node
-# the old name, for lium-io#1804, so the two PRs merge in either order
-from .rental_owner import rental_of_validated_miner as _rental_of_validated_miner  # noqa: F401
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)

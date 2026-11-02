@@ -1,7 +1,7 @@
 import logging
 
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedExecutor
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 
 from ..pipeline import Context
 
@@ -37,10 +37,13 @@ def rental_of_validated_miner(
     return rented_executor if same_endpoint else None
 
 
-def rental_of_this_node(ctx: Context, log_mismatch: bool = False) -> RentedExecutor | None:
-    """This node's rental from the cycle snapshot, read through rental_of_validated_miner: the
-    executor UUID is the miner's word, so a UUID match alone does not make the rental this node's."""
-    rented_data = ctx.state.rented_data
+def rental_of_this_node(
+    ctx: Context, log_mismatch: bool = False, rented_data: RentedExecutorsResponse | None = None
+) -> RentedExecutor | None:
+    """This node's rental from the cycle snapshot (or a fresh re-read passed as `rented_data`), read
+    through rental_of_validated_miner: the executor UUID is the miner's word, so a UUID match alone
+    does not make the rental this node's."""
+    rented_data = rented_data or ctx.state.rented_data
     return rental_of_validated_miner(
         ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None, log_mismatch
     )

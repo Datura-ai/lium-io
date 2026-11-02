@@ -33,6 +33,7 @@ from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
+from .rental_owner import rental_of_this_node
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 from .task_time import task_seconds_left
 
@@ -522,8 +523,7 @@ def _create_deadline_seconds(ctx: Context) -> float:
 
 
 async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[str | None, dict[str, Any]]:
-    rented_data = ctx.state.rented_data
-    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor and rented_executor.pods:
         return "rented", {"pods": [pod.pod_id for pod in rented_executor.pods]}
     seconds_left = task_seconds_left(ctx)
