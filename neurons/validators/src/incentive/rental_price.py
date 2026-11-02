@@ -1486,6 +1486,8 @@ class RentalPriceIncentive(DefaultIncentive):
         is_rented = params.is_rented
 
         base_model = BASE_GPU_MAP.get(gpu_model)
+        if gpu_model == RTX_4090_48GB and not settings.RTX_4090_48GB_MODEL_ENABLED:
+            base_model = None  # DAH-5508: off, the card is rejected, so answer as for any unknown model
         cap_spec = self.config.max_unrented_gpus.get(base_model, {}) if base_model else {}
         eligible_for_unrented_estimate = (
             base_model is not None and any(v > 0 for v in cap_spec.values())

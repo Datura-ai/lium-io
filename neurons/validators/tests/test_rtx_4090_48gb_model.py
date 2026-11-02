@@ -92,3 +92,23 @@ async def test_published_estimates_follow_the_setting(monkeypatch, enabled):
     assert (RTX_4090_48GB in estimates) is enabled
     assert RTX_4090 in estimates
     assert len(estimates) == len(BASE_GPU_MAP) - (0 if enabled else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_rented", [False, True])
+async def test_off_an_on_demand_48gb_estimate_is_answered_like_an_unknown_model(monkeypatch, is_rented):
+    # Arrange
+    from unittest.mock import AsyncMock
+
+    from incentive.rental_price import ExecutorEstimateParams, RentalPriceIncentive
+
+    monkeypatch.setattr(settings, "RTX_4090_48GB_MODEL_ENABLED", False)
+    estimator = RentalPriceIncentive(settings.incentive, AsyncMock(), jobs_results={}, total_gpu_model_count_map={})
+    estimator._seed_snapshot = object()  # never read: the request stops before any computation
+
+    # Act
+    result = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model=RTX_4090_48GB, is_rented=is_rented))
+    unknown = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model="NVIDIA Unknown", is_rented=is_rented))
+
+    # Assert
+    assert result.model_dump() == {**unknown.model_dump(), "gpu_model": RTX_4090_48GB, "base_model": RTX_4090_48GB}
