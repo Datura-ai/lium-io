@@ -109,7 +109,11 @@ def calculate_scores(
     if not ctx.rented_throughput_passed:
         actual_score = 0.0
         job_score = 0.0
-        warning_messages.append("A rented pod gets far too little network or disk throughput")
+        warning_messages.append(
+            "Rented throughput reading could not run in several cycles in a row"
+            if ctx.rented_throughput_not_run
+            else "A rented pod gets far too little network or disk throughput"
+        )
 
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the
     # score there; shadow leaves the flag True.
@@ -118,12 +122,30 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("GPU identity changed or could not be verified against the card")
 
+    # CC VBIOS gate (DAH-5329): same mechanics; shadow leaves the flag True.
+    if not ctx.cc_vbios_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing")
+
+    # Host hardware identity gate (DAH-4547): non-fatal on a live rental, so only this line zeroes it.
+    if not ctx.hardware_identity_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Host hardware identity does not match the hardware")
+
     # Host-write gate (DAH-4548): same mechanics; it reads only the sensor's verdict that the host
     # wrote into a rented pod under enforcement, and shadow leaves the flag True.
     if not ctx.inspector_host_write_passed:
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("The host wrote into a renter's container")
+
+    # Kernel GPU-count gate (DAH-4982): same mechanics as the CPU-truth gate above.
+    if not ctx.gpu_kernel_count_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The kernel lists fewer GPUs than the node reports")
 
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(

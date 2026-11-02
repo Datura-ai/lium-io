@@ -196,9 +196,6 @@ class RentedExecutorsResponse(BaseModel):
     # and rentals are untouched. A held new node is also absent from the Discord list above.
     # Additive with an empty default: an older backend names nobody.
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters in the
-    # backend's report window (DAH-4482): each owes a post-rental GPU recheck. Additive with an empty default.
-    renter_hardware_fault_executor_ids: list[str] = []
     # executor_ids inside a running provider maintenance window (DAH-4709): no incentive from either pool,
     # rented or not. Additive with an empty default: an older backend names nobody.
     maintenance_executor_ids: list[str] = []
