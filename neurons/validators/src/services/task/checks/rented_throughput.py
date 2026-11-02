@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from .container_download_speed import (
     parse_download_speed,
 )
 from .rented_gpu_drop import POD_STATUS_RUNNING
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,14 @@ DISK_PROBE_BYTES = 256 * 1024 * 1024
 DISK_TIMEOUT_SECONDS = 60
 # the 2 s busy window, the disk probe (direct, then buffered), both fetches and a second container start
 COMMAND_TIMEOUT_SECONDS = 270
+# a reading needs its full command timeout plus the checks after it; started later, the task deadline cuts it off
+# and the node's whole cycle is dropped without a result (316223c6, 30 Oct 17:49Z)
+MIN_TASK_SECONDS_LEFT = COMMAND_TIMEOUT_SECONDS + 30
+# due readings skipped for lack of cycle time, in a row, that count as a failed reading (the provider controls how long
+# the earlier checks take, so endless late cycles must not keep the score)
+LATE_SKIPS_BEFORE_VERDICT = 3
+# cycle time kept after a Redis save, to finish the cycle
+SAVE_RESERVE_SECONDS = 5
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
 BUSY_WINDOW_SECONDS = 2
@@ -343,6 +353,7 @@ class _State:
     disk_failures: int = 0
     reading: dict[str, Any] = field(default_factory=dict)
     measured: bool = False
+    late_skips: int = 0
 
     def next_due_at(self) -> float:
         if self.failures_in_a_row > 0 or self.reading.get("inconclusive"):
@@ -360,6 +371,7 @@ class _State:
                 disk_failures=int(data.get("disk_failures", 0)),
                 reading=dict(data.get("reading") or {}),
                 measured=bool(data.get("measured")),
+                late_skips=int(data.get("late_skips", 0)),
             )
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
@@ -387,7 +399,8 @@ class RentedThroughputCheck:
     failing side inconclusive too. Inconclusive = no strike and no pass however many in a row (owner decision: IO that
     cannot be attributed never fails a node), re-probed after RETRY_SECONDS.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
-    (RENTED_THROUGHPUT_SLOW) until that side passes a reading. Non-fatal: the rental keeps running.
+    (RENTED_THROUGHPUT_SLOW) until that side passes a reading; so do LATE_SKIPS_BEFORE_VERDICT due readings in a row
+    skipped for too little cycle time (RENTED_THROUGHPUT_NOT_RUN), until a reading completes. Non-fatal: the rental keeps running.
     """
 
     check_id = "host.validate.rented_throughput"
@@ -413,16 +426,27 @@ class RentedThroughputCheck:
             return self._skipped(ctx, "last reading unreadable in Redis")
         state = _State.from_raw(raw) if raw is not None else None
         unsaved = _UNSAVED.get(ctx.executor.uuid)
-        if unsaved is not None and (state is None or unsaved.at > state.at):
+        # a late skip keeps .at, so a newer unsaved skip count wins on a tie
+        if unsaved is not None and (
+            state is None or (unsaved.at, unsaved.late_skips) > (state.at, state.late_skips)
+        ):
             state = unsaved
         now = time.time()
         if state is None:
             state = _State(at=now - phase_offset_seconds(ctx.executor.uuid))
-            if not await self._save(ctx, key, state):
-                # else each cycle recreates it and the first reading never comes due
-                _UNSAVED[ctx.executor.uuid] = state
+            # kept even unsaved, else each cycle recreates it and the first reading never comes due
+            await self._bounded_save(ctx, key, state)
         if now < state.next_due_at():
             return self._verdict(ctx, state, probed=False)
+        if task_seconds_left(ctx) < MIN_TASK_SECONDS_LEFT:
+            # no reading this cycle: a standing SLOW stays, otherwise skip; still due, so the next cycle measures
+            if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
+                return self._verdict(ctx, state, probed=False)
+            state.late_skips += 1
+            await self._bounded_save(ctx, key, state)
+            if state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
+                return self._verdict(ctx, state, probed=False)
+            return self._skipped(ctx, "too little cycle time left")
 
         reading, net, disk = await self._measure_and_judge(ctx)
         reading["inconclusive"] = "inconclusive" in (net, disk)
@@ -452,14 +476,7 @@ class RentedThroughputCheck:
                 ),
             )
         )
-        if await self._save(ctx, key, state):
-            _UNSAVED.pop(ctx.executor.uuid, None)
-        else:
-            # bounded like Redis itself: a node not measured for _REDIS_TTL_SECONDS is gone; a due node keeps its
-            # unsaved streak until its own next reading replaces it
-            for uuid in [u for u, s in _UNSAVED.items() if now - s.at > _REDIS_TTL_SECONDS]:
-                del _UNSAVED[uuid]
-            _UNSAVED[ctx.executor.uuid] = state
+        await self._bounded_save(ctx, key, state)
         return self._verdict(ctx, state, probed=True)
 
     async def _measure_and_judge(self, ctx: Context) -> tuple[dict[str, Any], str, str]:
@@ -556,12 +573,22 @@ class RentedThroughputCheck:
             **state.reading,
             "probed_this_cycle": probed,
             "failures_in_a_row": state.failures_in_a_row,
+            "late_skips_in_a_row": state.late_skips,
         }
-        if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
-            event = render_message(Msg.SLOW, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(
-                passed=False, event=event, updates={"rented_throughput_passed": False}
+        slow = state.failures_in_a_row >= READINGS_BEFORE_VERDICT
+        if slow or state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
+            template = Msg.SLOW if slow else Msg.NOT_RUN
+            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
+            # NOT_RUN measured nothing, so scoring and the portal must not call it slow
+            updates = (
+                {"rented_throughput_passed": False}
+                if slow
+                else {
+                    "rented_throughput_passed": False,
+                    "rented_throughput_not_run": True,
+                }
             )
+            return CheckResult(passed=False, event=event, updates=updates)
         if not probed:
             return self._skipped(
                 ctx, "not due", last={**what, "read_at": state.at, "next_at": state.next_due_at()}
@@ -576,7 +603,20 @@ class RentedThroughputCheck:
             passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         )
 
-    async def _save(self, ctx: Context, key: str, state: _State) -> bool:
+    async def _bounded_save(self, ctx: Context, key: str, state: _State) -> None:
+        """In memory first: a refused (READONLY failover) or slow save must not lose the state. The Redis save is
+        bounded by the cycle time left so it cannot itself run into the task deadline and drop the cycle."""
+        # bounded like Redis itself: a node not measured for _REDIS_TTL_SECONDS is gone; a due node keeps its
+        # unsaved streak until its own next reading replaces it
+        now = time.time()
+        for uuid in [u for u, s in _UNSAVED.items() if now - s.at > _REDIS_TTL_SECONDS]:
+            del _UNSAVED[uuid]
+        _UNSAVED[ctx.executor.uuid] = state
+        budget = task_seconds_left(ctx) - SAVE_RESERVE_SECONDS
+        if budget > 0 and await self._save(ctx, key, state, timeout=budget):
+            _UNSAVED.pop(ctx.executor.uuid, None)
+
+    async def _save(self, ctx: Context, key: str, state: _State, *, timeout: float) -> bool:
         payload = {
             "at": state.at,
             "failures_in_a_row": state.failures_in_a_row,
@@ -584,9 +624,12 @@ class RentedThroughputCheck:
             "disk_failures": state.disk_failures,
             "reading": state.reading,
             "measured": state.measured,
+            "late_skips": state.late_skips,
         }
         try:
-            await ctx.services.redis.set(key, json.dumps(payload), ex=_REDIS_TTL_SECONDS)
+            await asyncio.wait_for(
+                ctx.services.redis.set(key, json.dumps(payload), ex=_REDIS_TTL_SECONDS), timeout
+            )
             return True
         except Exception:
             logger.warning(

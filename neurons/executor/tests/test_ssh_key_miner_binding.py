@@ -17,6 +17,7 @@ from middlewares.miner import MinerMiddleware
 
 from core.config import settings
 from routes.apis import apis_router
+from services.local_verify_service import accepted_miner_hotkeys
 from services.miner_service import MinerService
 
 _SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey123456789abcdef user@host"
@@ -129,3 +130,43 @@ def test_signing_blob_without_hotkey_unchanged():
     assert ssh_pubkey_signing_blob(_SSH_KEY) == _SSH_KEY
     assert ssh_pubkey_signing_blob(_SSH_KEY, _NONCE) == f"{_SSH_KEY}\nnonce:{_NONCE}"
     assert ssh_pubkey_signing_blob(_SSH_KEY, None, "5Abc") == f"{_SSH_KEY}\nminer:5Abc"
+
+
+def test_pool_hotkey_accepted_when_enforced(
+    client, miner_kp, validator_kp, other_miner_kp, caplog, monkeypatch
+):
+    # DAH-5296: a provider moved to Lium-held payouts is served under the pool hotkey
+    monkeypatch.setattr(settings, "LIUM_POOL_HOTKEY", other_miner_kp.ss58_address)
+    monkeypatch.setattr(settings, "REQUIRE_MINER_BOUND_SSH_KEY", True)
+    caplog.set_level(logging.INFO)
+    body = _payload(miner_kp, validator_kp, other_miner_kp.ss58_address)
+    assert client.post("/upload_ssh_key", json=body).status_code == 200
+    assert _binding_logs(caplog) == []
+
+
+def test_stranger_hotkey_refused_with_pool_set(
+    client, miner_kp, validator_kp, other_miner_kp, monkeypatch
+):
+    monkeypatch.setattr(settings, "LIUM_POOL_HOTKEY", other_miner_kp.ss58_address)
+    monkeypatch.setattr(settings, "REQUIRE_MINER_BOUND_SSH_KEY", True)
+    stranger = Keypair.create_from_uri("//LiumTestStranger").ss58_address
+    body = _payload(miner_kp, validator_kp, stranger)
+    assert client.post("/upload_ssh_key", json=body).status_code == 403
+
+
+@pytest.mark.parametrize("pool_is_default", [False, True])
+def test_default_miner_hotkey_refused(client, miner_kp, validator_kp, monkeypatch, pool_is_default):
+    # the shared portal hotkey binds nothing, even when configured as the pool hotkey
+    portal = Keypair.create_from_uri("//LiumTestPortal").ss58_address
+    monkeypatch.setattr(settings, "DEFAULT_MINER_HOTKEY", portal)
+    if pool_is_default:
+        monkeypatch.setattr(settings, "LIUM_POOL_HOTKEY", portal)
+    monkeypatch.setattr(settings, "REQUIRE_MINER_BOUND_SSH_KEY", True)
+    body = _payload(miner_kp, validator_kp, portal)
+    assert client.post("/upload_ssh_key", json=body).status_code == 403
+
+
+def test_accepted_hotkeys_never_take_an_empty_or_portal_pool():
+    assert accepted_miner_hotkeys(own="5Own", pool="", shared_portal_hotkey="5Portal") == {"5Own"}
+    assert accepted_miner_hotkeys(own="5Own", pool="5Portal", shared_portal_hotkey="5Portal") == {"5Own"}
+    assert accepted_miner_hotkeys(own="5Own", pool="5Pool", shared_portal_hotkey="5Portal") == {"5Own", "5Pool"}

@@ -76,6 +76,7 @@ from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
     EDIT_PARKED_SUFFIX,
+    LIUM_POD_ID_LABEL,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
@@ -949,6 +950,8 @@ CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the ex
 # stderr with no BUILD_FAILED_RC= marker: the build script never finished and the text is the host
 # daemon's `docker exec` error, so the renter gets this fixed line.
 CUSTOM_BUILD_INTERRUPTED_REASON = "build container stopped before the build finished"
+# The SSH connection to the node dropped mid-build: not the renter's Dockerfile, so its own step.
+CUSTOM_BUILD_SSH_LOST_REASON = "the connection to the node was lost during the build; please retry"
 # The build's exit code round-trips through a file in the DinD container's /tmp. When that file
 # cannot be written or read (the overlay is full or read-only) the build is treated as failed and
 # this line ends its tail, so the renter and the tests see WHY rather than `[: Illegal number:`.
@@ -1005,6 +1008,17 @@ def custom_build_log_tail(output: str | None) -> str | None:
         return None
     tail = "\n".join(lines[-CUSTOM_BUILD_LOG_TAIL_LINES:])
     return tail[-CUSTOM_BUILD_LOG_TAIL_MAX_CHARS:]
+
+
+def custom_build_export_timeout(
+    size_bytes: int | None, floor_s: int, elapsed_s: float, min_bytes_per_s: int, budget_s: int
+) -> int:
+    """Seconds the image export may take: the image's size at `min_bytes_per_s`, at least
+    `floor_s` (the build timeout), but never past what is left of `budget_s` after `elapsed_s`
+    (the backend fails a pod still PENDING after 1 h): the budget wins over the floor."""
+    scaled = math.ceil(size_bytes / min_bytes_per_s) if size_bytes else 0
+    # at least 1: the streamer reads a 0 timeout as no timeout
+    return max(1, min(max(floor_s, scaled), int(budget_s - elapsed_s)))
 
 
 def stream_timed_out(err: str | None) -> bool:
@@ -1261,6 +1275,16 @@ async def _raise_unless_running_before_created(
             container_name=container_name,
             state=state,
         )
+
+
+class RequestedCapabilityUnavailable(RuntimeError):
+    """A fresh create refused itself because this node cannot give what the rental asked for (a Volume that
+    did not mount, sysbox that cannot own the Volume). ``renter_sentence`` is the wire `msg`, like
+    ContainerKilledDuringBootstrap's: it names the cause and carries no host detail."""
+
+    def __init__(self, renter_sentence: str):
+        self.renter_sentence = renter_sentence
+        super().__init__(renter_sentence)
 
 
 class ContainerKilledDuringBootstrap(Exception):
@@ -2419,6 +2443,9 @@ def _should_repair_stale_mountpoint(
         and _is_stale_vloopback_mountpoint_error(str(exc))
     )
 
+_JUPYTER_SCRIPT_COPY_TIMEOUT_SEC = 120
+
+
 def _should_encrypt_local_volume(
     local_volume: str | None,
     workload_kind: WorkloadKind,
@@ -3218,6 +3245,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            labels={LIUM_POD_ID_LABEL: payload.pod_id},
             before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(
@@ -3379,6 +3407,11 @@ class DockerService:
     def _rental_memory_gb(memory_gb: int | None, host_ram_kib: int | None, gpu_share: float = 1.0) -> int | None:
         """The rental's memory limit: the backend's, or host RAM less the host reserve when it sent none.
 
+        The backend's limit is clamped to the rental's GPU share of host RAM less the reserve: it is sized
+        from the specs the pod row was saved with, so a host whose RAM reads lower now would get a limit at
+        or above its RAM (or, split, co-tenant limits summing above it) and the renter could take the host
+        into a global OOM instead of hitting its own cgroup limit.
+
         A pod row saved before the backend sized RAM carries ram_total 0, which arrives as memory_gb 0 and
         used to mean no mem_limit: the renter could take every byte and the kernel OOM killer would pick
         sshd or the executor, taking the node offline mid-rental on the provider's account.
@@ -3388,14 +3421,15 @@ class DockerService:
         the share, two legacy zero-RAM pods on different GPUs of one host would each be capped near the
         full host RAM and could together exceed it, re-opening the OOM path this limit exists to close.
         """
-        if memory_gb or not host_ram_kib:
+        if not host_ram_kib:
             return memory_gb
         reserve_kib = max(
             settings.RENTAL_HOST_RAM_RESERVE_GB * _KIB_PER_GIB,
             host_ram_kib * settings.RENTAL_HOST_RAM_RESERVE_PERCENT / 100,
         )
         share = min(max(gpu_share, 0.0), 1.0)
-        return max(int(((host_ram_kib - reserve_kib) * share) // _KIB_PER_GIB), 1)
+        ceiling_gb = max(int(((host_ram_kib - reserve_kib) * share) // _KIB_PER_GIB), 1)
+        return min(memory_gb, ceiling_gb) if memory_gb else ceiling_gb
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
@@ -6499,6 +6533,44 @@ class DockerService:
             await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}"),
         ]
 
+    async def _remove_host_volumes_of_refused_create(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        local_volume: str | None,
+        external_volume_name: str | None,
+    ) -> None:
+        """Remove what a create made before refusing itself: the local volume it created and
+        the external volume with its plugin instance. Best effort; the refusal goes out anyway."""
+        try:
+            if external_volume_name:
+                # The plugin goes only once the volume is gone, as in delete_container: a volume still in use
+                # keeps its mount. The rm raises here (so the plugin stays) unless the volume no longer exists.
+                quoted = shlex.quote(external_volume_name)
+                await retry_ssh_command(
+                    ssh_client,
+                    f"/usr/bin/docker volume rm {quoted} 2>/dev/null"
+                    f" || ! /usr/bin/docker volume inspect {quoted} >/dev/null 2>&1",
+                    "drop_refused_create_volumes",
+                    max_attempts=1,
+                )
+                await self.remove_s3fs_volume_plugin(ssh_client, external_volume_name)
+            if local_volume:
+                await retry_ssh_command(
+                    ssh_client,
+                    f"/usr/bin/docker volume rm {shlex.quote(local_volume)} 2>/dev/null || true",
+                    "drop_refused_create_volumes",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to remove the volumes of a refused create",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+            )
+
     async def remove_s3fs_volume_plugin(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -6527,10 +6599,16 @@ class DockerService:
         if local_volume and not encrypted_local_volume:
             temp_container_name = f"temp_jupyter_copy_{uuid4()}"
             try:
+                # attached, not -d: a detached copy races the `rm -f` below and a failed cp is
+                # never seen, so the chmod later fails with "No such file or directory".
+                # --remove-destination: the volume is the renter's, so whatever sits at the target
+                # (a FIFO would block the open forever) is unlinked, not opened; the timeout is the
+                # backstop, after which the `rm -fv` below kills the container.
                 command = (
-                    f"/usr/bin/docker run -d --rm -v {local_volume}:/mnt "
+                    f"/usr/bin/docker run --rm -v {local_volume}:/mnt "
                     f"--name {temp_container_name} --entrypoint sh "
-                    f"daturaai/compute-subnet-executor:latest -c 'cp /root/app/run_jupyter.sh /mnt/'"
+                    f"daturaai/compute-subnet-executor:latest -c "
+                    f"'cp --remove-destination /root/app/run_jupyter.sh /mnt/'"
                 )
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -6538,7 +6616,10 @@ class DockerService:
                     log_tag=log_tag,
                     log_text="Creating temporary container for script copy",
                     log_extra=log_extra,
+                    timeout=_JUPYTER_SCRIPT_COPY_TIMEOUT_SEC,
                     raise_exception=True,
+                    # a killed cp can leave an empty script and no stderr; only the status shows it
+                    check_exit_status=True,
                 )
             finally:
                 command = f"/usr/bin/docker rm -fv {temp_container_name}"
@@ -7409,6 +7490,7 @@ class DockerService:
         """
         from core.config import settings
 
+        started = time.monotonic()
         pod_id = payload.pod_id
         image_tag = self._custom_build_image_tag(pod_id)
         dind_name = self._dind_container_name(pod_id)
@@ -7725,6 +7807,8 @@ class DockerService:
                     log_extra={**default_extra, "build_image_tag": image_tag},
                     timeout=timeout_s,
                     raise_exception=False,
+                    # an exec killed with its DinD (exit 137, empty stderr) is a failed build
+                    check_exit_status=True,
                 )
             except Exception as exc:
                 logger.error(
@@ -7734,6 +7818,8 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
+                if isinstance(exc, asyncssh.ConnectionLost):
+                    return CustomBuildOutcome(False, "build_ssh_lost", CUSTOM_BUILD_SSH_LOST_REASON)
                 return CustomBuildOutcome(False, "docker_build", "build command could not be run on the executor")
             if not ok:
                 # A build that printed "process timed out" and failed carries BUILD_FAILED_RC= too;
@@ -7761,10 +7847,36 @@ class DockerService:
                         )
                     )
                     return CustomBuildOutcome(False, "docker_build", CUSTOM_BUILD_INTERRUPTED_REASON)
-                return CustomBuildOutcome(False, "docker_build", custom_build_log_tail(err))
+                # cut at the marker: after it comes the streamer's "Process exited with status" line
+                return CustomBuildOutcome(
+                    False,
+                    "docker_build",
+                    custom_build_log_tail(err.rsplit(CUSTOM_BUILD_FAILED_MARKER, 1)[0]),
+                )
 
             # 7. Export the image from DinD and load it onto the host daemon so
-            #    the rental `docker run` (host-side) can use it.
+            #    the rental `docker run` (host-side) can use it. The export takes
+            #    longer than the build for big images (a 940 s build did not export
+            #    in 1200 s), so its timeout follows the image's size.
+            size_bytes = None
+            try:
+                size_res = await ssh_client.run(
+                    f"/usr/bin/docker exec {shlex.quote(dind_name)} "
+                    f"docker image inspect -f '{{{{.Size}}}}' {shlex.quote(image_tag)}",
+                    check=False,
+                    timeout=setup_timeout_s,
+                )
+                if size_res.exit_status == 0:
+                    size_bytes = int((size_res.stdout or "").strip())
+            except Exception:
+                size_bytes = None  # unknown size: the export keeps the build timeout
+            export_timeout_s = custom_build_export_timeout(
+                size_bytes,
+                timeout_s,
+                time.monotonic() - started,
+                int(settings.CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND),
+                int(settings.CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS),
+            )
             await self.stream_log(
                 f"Loading built image {image_tag} onto host", "success", log_tag
             )
@@ -7777,13 +7889,13 @@ class DockerService:
                 command=export_cmd,
                 log_tag=log_tag,
                 log_text=f"Exporting custom image {image_tag}",
-                log_extra={**default_extra, "build_image_tag": image_tag},
-                timeout=timeout_s,
+                log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
+                timeout=export_timeout_s,
                 raise_exception=False,
             )
             if not ok:
                 if stream_timed_out(err):
-                    return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {timeout_s} s")
+                    return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {export_timeout_s} s")
                 # The stderr here is the HOST daemon's `docker load` (paths, disk state), not the
                 # renter's build: it goes to ops, the renter gets a fixed reason.
                 logger.error(
@@ -8547,33 +8659,35 @@ class DockerService:
                             "margin; refusing to start a rental"
                         )
 
-                # host RAM: needed only when the rental was sent without a memory limit, to size one.
-                # That is the legacy ram_total 0 pod rows AND the validator's own rental probe, whose
-                # _probe_payload sends no memory_gb — so the messages below say "a rental sent without
-                # a memory limit", not "legacy". Under host contention — the exact condition that
-                # delays this SSH probe — an unlimited rental lets the renter exhaust host RAM and OOM
-                # the executor/sshd, so refuse rather than fall through to no mem_limit.
-                host_ram_kib: int | None = None
+                # host RAM: sizes a rental sent without a memory limit, and clamps one that was sent
+                # (_rental_memory_gb) so it never reaches the host's RAM. A miss on a sent limit keeps
+                # it as before. Without one — the legacy ram_total 0 pod rows AND the validator's own
+                # rental probe, whose _probe_payload sends no memory_gb, so the messages below say "a
+                # rental sent without a memory limit", not "legacy" — a miss refuses: under host
+                # contention, the exact condition that delays this SSH probe, an unlimited rental lets
+                # the renter exhaust host RAM and OOM the executor/sshd.
+                current_step = "host_ram_kib"
+                host_ram_kib = await self._read_host_ram_kib(ssh_client)
                 rental_gpu_share = 1.0
-                if not payload.memory_gb:
-                    current_step = "host_ram_kib"
-                    host_ram_kib = await self._read_host_ram_kib(ssh_client)
-                    if host_ram_kib is None:
-                        raise RuntimeError(
-                            "host MemTotal could not be read; refusing to start a rental sent without a memory limit"
-                        )
-                    # A split-host rental gets its GPU share of host RAM, matching the backend's own
-                    # sizing (models.executor.pod_ram_total_kib). Two zero-RAM pods on one split host
-                    # must not each be capped near the whole host. Whole-node rentals keep share 1.0.
-                    if payload.gpu_uuids:
-                        current_step = "host_gpu_count"
-                        host_gpu_count = await self._read_host_gpu_count(ssh_client)
-                        if not host_gpu_count or len(payload.gpu_uuids) > host_gpu_count:
-                            raise RuntimeError(
-                                "host GPU count could not be read or is below the rented GPU count; "
-                                "refusing to start a split rental sent without a memory limit"
-                            )
+                if not payload.memory_gb and host_ram_kib is None:
+                    raise RuntimeError(
+                        "host MemTotal could not be read; refusing to start a rental sent without a memory limit"
+                    )
+                # A split-host rental gets its GPU share of host RAM, matching the backend's own
+                # sizing (models.executor.pod_ram_total_kib), whether it sizes or clamps the limit: two
+                # pods on one split host must not each be capped near the whole host. Whole-node
+                # rentals keep share 1.0. A miss refuses a limitless rental; a sent limit keeps the
+                # host-wide clamp.
+                if host_ram_kib is not None and payload.gpu_uuids:
+                    current_step = "host_gpu_count"
+                    host_gpu_count = await self._read_host_gpu_count(ssh_client)
+                    if host_gpu_count and len(payload.gpu_uuids) <= host_gpu_count:
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
+                    elif not payload.memory_gb:
+                        raise RuntimeError(
+                            "host GPU count could not be read or is below the rented GPU count; "
+                            "refusing to start a split rental sent without a memory limit"
+                        )
 
                 # DAH-3980 overlaps the filler's irreversible rm with the image inspect/pull. It must not
                 # precede the fail-closed reads above: a probe that then refused (a transient /proc read, or
@@ -9245,6 +9359,8 @@ class DockerService:
                         local_volume_path=local_volume_path,
                         encrypted=False,
                     )
+                # a fresh rental fails before its container exists rather than start without what it asked for
+                is_fresh_create = not payload.local_volume
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     sysbox_subuid_base: int | None = None
@@ -9265,6 +9381,18 @@ class DockerService:
                         prev_timestamp = now_ms()
                         external_volume_name = external_volume_info.name
                         if payload.is_sysbox and sysbox_subuid_base is None:
+                            if is_fresh_create:
+                                current_step = "external_volume_sysbox_owner"
+                                await self._remove_host_volumes_of_refused_create(
+                                    ssh_client,
+                                    default_extra,
+                                    local_volume=local_volume if created_local_volume else None,
+                                    external_volume_name=external_volume_name,
+                                )
+                                raise RequestedCapabilityUnavailable(
+                                    "This node cannot run the pod with its Volume attached (its sysbox uid range "
+                                    "cannot own the Volume); rent another node"
+                                )
                             # Decided only once the volume is really attached: runc
                             # keeps /mnt writable, sysbox without the base does not.
                             payload.is_sysbox = False
@@ -9274,6 +9402,16 @@ class DockerService:
                                 "warning",
                                 log_tag,
                             )
+                    elif is_fresh_create:
+                        await self._remove_host_volumes_of_refused_create(
+                            ssh_client,
+                            default_extra,
+                            local_volume=local_volume if created_local_volume else None,
+                            external_volume_name=external_volume_info.name,
+                        )
+                        raise RequestedCapabilityUnavailable(
+                            "The attached Volume could not be mounted on this node; rent again or another node"
+                        )
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, prev_timestamp))
@@ -10097,7 +10235,7 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=(
                     last_exc.renter_sentence
-                    if isinstance(last_exc, ContainerKilledDuringBootstrap)
+                    if isinstance(last_exc, (ContainerKilledDuringBootstrap, RequestedCapabilityUnavailable))
                     else str(log_text)
                 ),
                 detail=failure_detail,
@@ -10773,20 +10911,41 @@ class DockerService:
                 )
             raise
         except Exception as exc:
-            container_stopped = await self._stop_half_recovered_container(
-                ssh_client, container_name
-            )
+            # read exit code and log tail before the stop: an entrypoint that dies at once makes the
+            # remount's `docker exec` fail, and that error alone does not say why the workload died
+            try:
+                diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name)
+            finally:
+                container_stopped = await self._stop_half_recovered_container(
+                    ssh_client, container_name
+                )
             logger.error(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_START_FAILED",
                     extra=get_extra_info({
                         **log_extra,
+                        **diagnostics.to_log_fields(),
                         "error": str(exc),
                         "container_stopped": container_stopped,
                     }),
                 )
             )
             return False
+
+        # a start that did not stick (pod da05c116, 30 Oct: exit 126, restart loop) is not a
+        # recovery: log it truthfully with the container's exit code and logs
+        diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name)
+        if diagnostics.status is not None and diagnostics.status != "running":
+            logger.error(
+                _m(
+                    "POD_STALE_MOUNT_RECOVERY_NOT_RUNNING",
+                    extra=get_extra_info({**log_extra, **diagnostics.to_log_fields()}),
+                )
+            )
+            # A restarting container still returns True: the caller's `docker ps` re-read counts it as
+            # running, exactly as before this log existed. Whether a crash loop under the renter's own
+            # image is penalised is the penalty owners' call, not this recovery's (lium-io #1534).
+            return diagnostics.status == "restarting"
 
         logger.info(
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
@@ -10892,6 +11051,23 @@ class DockerService:
             )
         ]
         return repaired[0] if repaired else None
+
+    async def _bounded_death_diagnostics(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+    ) -> ContainerDeathDiagnostics:
+        # a hung `docker logs` on the miner's host must not hold back the recovery's verdict or stop;
+        # the state read before the hang is kept, so a dead container is not taken for a recovery
+        diagnostics = ContainerDeathDiagnostics()
+        try:
+            return await asyncio.wait_for(
+                collect_container_death_diagnostics(ssh_client, container_name, diagnostics),
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+        except TimeoutError:
+            diagnostics.capture_error = "diagnostics timed out"
+            return diagnostics
 
     async def _stop_half_recovered_container(
         self,
