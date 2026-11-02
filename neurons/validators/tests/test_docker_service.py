@@ -6863,6 +6863,66 @@ async def test_create_container_encrypted_setup_failure_cleans_up(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("local_volume", "removed"), [(None, True), ("volume_kept", False)], ids=["fresh", "edit"])
+async def test_create_container_a_clock_reset_refusal_runs_the_failed_create_cleanup(
+    docker_service, monkeypatch, local_volume, removed
+):
+    # DAH-4663 (review): refused after the volume was made; the cleanup removes a fresh create's volume only
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "_reset_leftover_clock_locks_before_create",
+        AsyncMock(side_effect=RuntimeError("GPU clocks a previous rental locked could not be reset: GPU-test")),
+    )
+    cleanup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup_spy)
+    docker_run = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
+    pod_id = str(uuid4())
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="custom/with-label:1",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+        local_volume=local_volume,
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    cleanup_spy.assert_awaited_once()
+    assert cleanup_spy.await_args.kwargs["ssh_client"] is ssh_client
+    assert cleanup_spy.await_args.kwargs["remove_volume"] is removed
+    docker_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_container_s3fs_external_volume_keeps_encrypted_local_mount(
     docker_service,
     monkeypatch,

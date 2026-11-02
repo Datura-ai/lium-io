@@ -9485,9 +9485,6 @@ class DockerService:
                     current_step = "cluster_overlay_port"
                     await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
 
-                current_step = "gpu_clock_reset"
-                await self._reset_leftover_clock_locks_before_create(ssh_client, payload, default_extra)
-
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
                 # gpu_power_limits). Fail-closed: apply undoes any partial work on failure, and the
                 # raise records this create FAILED (12h backoff) — never run the miner uncapped.
@@ -9634,6 +9631,10 @@ class DockerService:
 
                 container_id = None
                 try:
+                    # DAH-4663 (review): inside the failed-create cleanup, so a GPU it cannot reset refuses the create
+                    # without leaving its new volume or build artifacts behind
+                    current_step = "gpu_clock_reset"
+                    await self._reset_leftover_clock_locks_before_create(ssh_client, payload, default_extra)
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)

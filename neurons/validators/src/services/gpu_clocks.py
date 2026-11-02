@@ -282,7 +282,14 @@ async def reset_pod_clock_locks(runner: SSHCommandRunner, redis: RedisService, p
     raw_index = await redis.get(_pod_key(pod_id))
     if not raw_index:
         return 0  # the pod locked nothing: one Redis read, no SSH
-    failures = await _reset_gpus(runner, redis, [str(u) for u in json.loads(raw_index)])
+    # only GPUs whose record still names this pod (review): a stale index left by a failed cleanup must not reset
+    # the next renter's lock or drop its record; an unrecorded GPU is reset by the next create's safety net
+    owned = []
+    for uuid in (str(u) for u in json.loads(raw_index)):
+        raw = await redis.get(_lock_key(uuid))
+        if raw and json.loads(raw).get("pod_id") == pod_id:
+            owned.append(uuid)
+    failures = await _reset_gpus(runner, redis, owned)
     await redis.delete(_pod_key(pod_id))  # a GPU whose reset failed keeps its own record for the next create
     return sum(1 for failure in failures.values() if failure is None)
 

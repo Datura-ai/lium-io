@@ -219,6 +219,44 @@ async def test_the_pods_delete_resets_its_locks_and_a_failed_reset_is_caught_by_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("record", "reset"),
+    [(None, False), ({"pod_id": "pod1"}, True), ({"pod_id": "pod2"}, False)],
+    ids=["missing", "own", "foreign"],
+)
+async def test_teardown_resets_only_the_gpus_whose_record_still_names_the_pod(record, reset):
+    host, redis = FakeHost(), FakeRedis()
+    redis.store["gpu_clock_lock_pod:pod1"] = json.dumps([U[0]])
+    if record:
+        redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps(record)
+
+    assert await reset_pod_clock_locks(host, redis, "pod1") == int(reset)
+    assert bool(host.commands) == reset and "gpu_clock_lock_pod:pod1" not in redis.store
+    assert (f"gpu_clock_lock:{U[0]}" in redis.store) == (record is not None and not reset), "another pod's record stays"
+
+
+@pytest.mark.asyncio
+async def test_a_delete_retried_after_its_redis_cleanup_failed_leaves_the_next_renters_lock_alone():
+    host, redis = FakeHost(), FakeRedis()
+    await lock_pod_gpu_clocks(host, redis, container_name=NAME, pod_id="podA", executor_id="ex", pod_gpu_uuids=[U[0]],
+                              gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False)
+    redis.fail_delete_of = {"gpu_clock_lock_pod:podA"}
+    with pytest.raises(Exception):
+        await reset_pod_clock_locks(host, redis, "podA")  # -rgc ran and the record went; then Redis failed
+    assert "gpu_clock_lock_pod:podA" in redis.store and f"gpu_clock_lock:{U[0]}" not in redis.store
+
+    assert await reset_leftover_clock_locks(host, redis, [U[0]]) == []  # B's create
+    await lock_pod_gpu_clocks(host, redis, container_name=NAME, pod_id="podB", executor_id="ex", pod_gpu_uuids=[U[0]],
+                              gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False)
+    host.commands.clear()
+
+    assert await reset_pod_clock_locks(host, redis, "podA") == 0  # A's delete, re-sent
+    assert not any(" -rgc " in c for c in host.commands), "B's clocks stay locked"
+    assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "podB"
+    assert json.loads(redis.store["gpu_clock_lock_pod:podB"]) == [U[0]]
+
+
+@pytest.mark.asyncio
 async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_checks_every_host_gpu():
     host = FakeHost()
     redis = FakeRedis()
