@@ -214,8 +214,11 @@ def sxm_board(name="NVIDIA H100 80GB HBM3", count=8, nvlink=False):
 
 
 @pytest.mark.asyncio
-async def test_a_full_sxm_board_without_nvlink_fails_without_probing(context_factory):
-    result, runner = await run_check(context_factory, sxm_board())
+@pytest.mark.parametrize("p2p_ok_pairs", [None, 0, 27])
+async def test_a_full_sxm_board_without_nvlink_fails_without_probing(context_factory, p2p_ok_pairs):
+    specs = sxm_board()
+    specs["interconnect"].update(gpu_pairs=28, p2p_ok_pairs=p2p_ok_pairs)
+    result, runner = await run_check(context_factory, specs)
 
     assert result.passed is False
     assert result.event.reason_code == "NVLINK_MISSING"
@@ -242,6 +245,11 @@ async def test_a_raw_tesla_h100_name_is_matched_after_normalization(context_fact
         sxm_board(name="NVIDIA H200 NVL"),
         {"gpu": sxm_board()["gpu"]},  # no interconnect scrape: unknown, not a fault
         {**sxm_board(), "interconnect": {"pcie_class": "SYS"}},
+        # SXM modules on PCIe carriers (8c7d58d6): P2P works on all 28 pairs, so a working build, not a fault
+        {
+            **sxm_board(),
+            "interconnect": {**sxm_board()["interconnect"], "gpu_pairs": 28, "p2p_ok_pairs": 28},
+        },
     ],
 )
 async def test_boards_that_may_lack_nvlink_are_skipped(context_factory, specs):

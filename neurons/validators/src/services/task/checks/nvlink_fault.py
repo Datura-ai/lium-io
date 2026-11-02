@@ -18,8 +18,9 @@ PROBE_JSON_MARKER = "NVLINK_MULTICAST_PROBE_JSON:"
 # above the probe's own 45 s budget; only catches a stalled SSH channel (scored UNKNOWN)
 PROBE_TIMEOUT_SECONDS = 75
 MAX_CHARS = 300
-# These GPUs ship only as SXM modules on an NVLink baseboard, so a full 8-GPU board of them with no NVLink
-# at all has its fabric down (fabric manager or NVSwitch), not a PCIe build. Fewer GPUs can be a VM slice.
+# These GPUs ship as SXM modules, so a full 8-GPU board of them with no NVLink and broken P2P has its fabric
+# down (fabric manager or NVSwitch). With P2P working on every pair the modules sit on PCIe carrier boards: a
+# working build the listing shows without the NVLink badge (8c7d58d6, 2 Nov). Fewer GPUs can be a VM slice.
 NVLINK_BASEBOARD_GPUS = frozenset(
     {
         "NVIDIA H100 80GB HBM3",
@@ -112,11 +113,15 @@ def _missing_nvlink_on_sxm_board(specs: dict[str, Any], interconnect: Any) -> di
     names = {normalize_gpu_model(gpu.get("name")) for gpu in details if isinstance(gpu, dict)}
     if len(details) < BASEBOARD_GPU_COUNT or len(names) != 1 or not names <= NVLINK_BASEBOARD_GPUS:
         return None
+    pairs = interconnect.get("gpu_pairs")
+    if isinstance(pairs, int) and pairs > 0 and interconnect.get("p2p_ok_pairs") == pairs:
+        return None
     return {
         "gpu_name": next(iter(names)),
         "gpu_count": len(details),
         "nvlink_active_links": interconnect.get("nvlink_active_links"),
         "pcie_class": interconnect.get("pcie_class"),
+        "p2p_ok_pairs": interconnect.get("p2p_ok_pairs"),
     }
 
 
