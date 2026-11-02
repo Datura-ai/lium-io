@@ -350,3 +350,67 @@ async def test_a_fault_with_every_anchored_card_listed_posts_no_cards(context_fa
     await _run_with_memory_read(context_factory, services, _report("flagged", flags=flags))
 
     assert services.backend.report_rented_gpu_drop.await_args.kwargs["gpu_details"] is None
+
+
+def _at(*isos: str):
+    """Patch the check's clock to return these cycle times in turn."""
+    from datetime import datetime as real
+
+    clock = patch.object(rented_gpu_drop, "datetime")
+    mocked = clock.start()
+    mocked.now.side_effect = [real.fromisoformat(iso) for iso in isos]
+    return clock
+
+
+@pytest.mark.asyncio
+async def test_reports_carry_the_observation_time_and_a_retried_recovery_keeps_it(context_factory):
+    t_fault, t_clean, t_retry = (
+        "2026-11-02T10:00:00+00:00",
+        "2026-11-02T10:05:00+00:00",
+        "2026-11-02T10:10:00+00:00",
+    )
+    services = _services()
+    clock = _at(t_fault, t_clean, t_retry)
+    try:
+        await RentedGpuDropCheck().run(_ctx(context_factory, services, listed=UUIDS[:7], count=7))
+        services.backend.report_rented_gpu_drop.return_value = None  # the recovery goes unanswered
+        await RentedGpuDropCheck().run(_ctx(context_factory, services, listed=UUIDS))
+        services.backend.report_rented_gpu_drop.return_value = NOTIFIED
+        await RentedGpuDropCheck().run(_ctx(context_factory, services, listed=UUIDS))
+    finally:
+        clock.stop()
+
+    calls = services.backend.report_rented_gpu_drop.await_args_list
+    assert [(c.kwargs["state"], c.kwargs["observed_at"]) for c in calls] == [
+        ("fault", t_fault),
+        ("recovered", t_clean),
+        ("recovered", t_clean),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_backend_client_posts_observed_at():
+    from unittest.mock import AsyncMock
+
+    from neurons.validators.src.clients.backend_client import BackendClient
+
+    client = BackendClient.__new__(BackendClient)
+    client.post = AsyncMock(return_value=None)
+    kwargs = dict(
+        state="recovered",
+        executor_id="e",
+        first_seen_at="t0",
+        consecutive_cycles=1,
+        expected_gpu_count=0,
+        visible_gpu_count=0,
+        missing_uuids=[],
+        nvml_error_code=None,
+        faults=[],
+        pod_gpu_count=8,
+        rented_gpu_count=8,
+        nvml_gpu_count=8,
+    )
+    await client.report_rented_gpu_drop(POD_ID, observed_at="t1", **kwargs)
+    assert client.post.await_args.kwargs["json_data"]["observed_at"] == "t1"
+    await client.report_rented_gpu_drop(POD_ID, **kwargs)
+    assert "observed_at" not in client.post.await_args.kwargs["json_data"]

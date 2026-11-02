@@ -235,6 +235,8 @@ class DropMark:
     evidence: list[Any] | None = None
     # the incident named a card with uncorrected ECC, which only the memory read can call healed
     ecc: bool = False
+    # when the clean cycle that owes the recovery was seen: a retried recovery reports this, not its retry time
+    observed_at: str | None = None
 
     @classmethod
     def load(cls, raw: object) -> DropMark | None:
@@ -470,7 +472,7 @@ class RentedGpuDropCheck:
                 # mark alive past the TTL
                 await self._save(ctx, pod.pod_id, mark, redis_ok)
                 return None
-            return await self._recover(ctx, pod, mark, rented_total, nvml_count, redis_ok)
+            return await self._recover(ctx, pod, mark, rented_total, nvml_count, redis_ok, now_iso)
 
         if mark is None:
             mark = DropMark(now_iso)
@@ -487,7 +489,9 @@ class RentedGpuDropCheck:
         evidence = drop.evidence(rented_total, pod.gpu_count)
         due = not mark.reported or mark.evidence != evidence
         if due and not held:
-            answer = await self._post(ctx, pod, STATE_FAULT, mark, drop, rented_total, nvml_count)
+            answer = await self._post(
+                ctx, pod, STATE_FAULT, mark, drop, rented_total, nvml_count, now_iso
+            )
             posted = True
             mark = mark.after_answer(answer, evidence)
         await self._save(ctx, pod.pod_id, mark, redis_ok)
@@ -511,16 +515,24 @@ class RentedGpuDropCheck:
         rented_total: int | None,
         nvml_count: int,
         redis_ok: bool,
+        now_iso: str,
     ) -> dict[str, Any] | None:
         if not mark.needs_recovery:
             await self._forget(ctx, pod.pod_id)
             return None
-        answer = await self._post(ctx, pod, STATE_RECOVERED, mark, None, rented_total, nvml_count)
+        owed = replace(
+            mark,
+            recovering=True,
+            observed_at=(mark.recovering and mark.observed_at) or now_iso,
+        )
+        answer = await self._post(
+            ctx, pod, STATE_RECOVERED, mark, None, rented_total, nvml_count, owed.observed_at
+        )
         done = answer is not None and answer.delivery in _NO_RETRY_DELIVERIES
         if done:
             await self._forget(ctx, pod.pod_id)
-        elif not mark.recovering:
-            await self._save(ctx, pod.pod_id, replace(mark, recovering=True), redis_ok)
+        elif owed != mark:
+            await self._save(ctx, pod.pod_id, owed, redis_ok)
         return {
             "pod_id": pod.pod_id,
             "state": STATE_RECOVERED,
@@ -569,6 +581,7 @@ class RentedGpuDropCheck:
         drop: GpuDrop | None,
         rented_total: int | None,
         nvml_count: int,
+        observed_at: str,
     ) -> RentedGpuDropResponse | None:
         # Never fatal: a backend that is down, older (404) or raising is no answer, and the next cycle asks again.
         try:
@@ -586,6 +599,7 @@ class RentedGpuDropCheck:
                 pod_gpu_count=_gpus(pod.gpu_count),
                 rented_gpu_count=_gpus(rented_total),
                 nvml_gpu_count=_gpus(nvml_count),
+                observed_at=observed_at,
                 # the anchored cards are gone: the cards the node lists now, so the pod can move onto them
                 gpu_details=((ctx.state.specs or {}).get("gpu") or {}).get("details")
                 if drop and FAULT_ANCHORED_MISSING in drop.faults
