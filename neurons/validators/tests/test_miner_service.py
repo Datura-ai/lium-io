@@ -11,6 +11,7 @@ PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
 that a ContainerCreateRequest is delegated to create_container and that
 miner_service no longer makes an early wait_for_port_check_containers call.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
@@ -212,6 +213,55 @@ async def test_a_create_waits_out_a_miner_that_refuses_connections_while_it_rest
     # the miner rejects a signed timestamp older than 10 s, so every attempt must be signed anew
     sent = [c.kwargs["headers"]["X-Timestamp"] for c in miner_service._make_rest_request.await_args_list[:3]]
     assert sent == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_key_submit_fails_the_create_instead_of_skipping_the_miners_rental_hook(
+    mocker, miner_service
+):
+    # review: a timeout may or may not have run the miner's rental hook (it stops other workloads), so neither a
+    # resubmit with the hook nor one without it is safe
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
+    miner_service._make_rest_request.side_effect = [asyncio.TimeoutError(), accepted]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    create_mock.assert_not_awaited()
+    assert miner_service._make_rest_request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_resubmit_after_a_refused_submit_still_runs_the_miners_rental_hook(mocker, miner_service):
+    # a refused submit never reached the miner, so the hook has not run yet
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
+    miner_service._make_rest_request.side_effect = [_refused(), accepted]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    calls = miner_service._make_rest_request.await_args_list
+    assert [c.kwargs["json_data"]["is_rental_request"] for c in calls] == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_a_create_that_keeps_timing_out_names_the_exception_type(mocker, miner_service):
+    # str(asyncio.TimeoutError()) is empty, so the logged error used to be blank
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    miner_service._make_rest_request.side_effect = asyncio.TimeoutError()
+    mocker.patch("services.miner_service.MINER_RESTART_WAIT_S", 0)
+
+    result = await miner_service._handle_container(_make_create_payload(executor_id))
+
+    assert result.msg == "Resulted in an exception"
+    assert "TimeoutError" in result.detail
 
 
 @pytest.mark.asyncio
