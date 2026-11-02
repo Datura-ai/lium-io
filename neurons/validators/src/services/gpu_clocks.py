@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
-# nvidia-smi's exit code for an operation the GPU does not support (a completed answer: nothing was changed)
 
 
 @dataclass
