@@ -752,6 +752,14 @@ async def test_an_empty_or_unknown_fleet_snapshot_removes_nothing_and_warns(rent
             {LIVE_POD, LIVE_FILLER, STRAY_POD},
             id="idle-node-orphans-still-reaped",
         ),
+        pytest.param(
+            # DAH-5510: a moved pod's old container no listed pod names, kept only by the retained list
+            _real_rented_data("another-node", [ELSEWHERE_POD]).model_copy(
+                update={"retained_container_names": [STRAY_POD]}
+            ),
+            {LIVE_POD, LIVE_FILLER},
+            id="retained-old-container-kept",
+        ),
     ],
 )
 async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_listed_one(rented_data, expected_removed):
