@@ -12,6 +12,7 @@ from neurons.validators.src.services.task.checks.rented_pod_network import (
     RentedPodNetworkCheck,
     parse_summary,
     read_command,
+    socket_read_command,
 )
 from neurons.validators.src.services.task.messages import RentedPodNetworkMessages as Msg
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
@@ -133,25 +134,37 @@ def test_read_command_without_table_exits_3(tmp_path):
     assert res.returncode == 3
 
 
-def _ssh(summary="", table_exit=0, inspect="/pod_1 172.17.0.2\n", raise_exc=None):
+def _ssh(
+    summary="",
+    table_exit=0,
+    sockets="",
+    sockets_exit=0,
+    inspect="/pod_1 4242 172.17.0.2\n",
+    raise_exc=None,
+):
     async def run(cmd, *args, **kwargs):
         if raise_exc is not None:
             raise raise_exc
         if cmd.startswith("/usr/bin/docker inspect"):
             return SimpleNamespace(exit_status=0, stdout=inspect, stderr="")
+        if cmd.startswith("e=0;"):  # the socket fallback
+            return SimpleNamespace(exit_status=sockets_exit, stdout=sockets, stderr="")
         return SimpleNamespace(exit_status=table_exit, stdout=summary, stderr="")
 
     return SimpleNamespace(run=run)
 
 
-def _ctx(context_factory, ssh, pods=True, pid_mode="host"):
+def _ctx(context_factory, ssh, pods=True, pid_mode="host", names=("pod_1",)):
     rented = RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
                 miner_hotkey="miner-hotkey",
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="22",
-                pods=[RentedPod(pod_id="1", container_name="pod_1", status="RUNNING")]
+                pods=[
+                    RentedPod(pod_id=str(i), container_name=n, status="RUNNING")
+                    for i, n in enumerate(names, 1)
+                ]
                 if pods
                 else [],
             )
@@ -205,12 +218,19 @@ async def test_many_unreplied_destinations_warn_but_pass(context_factory):
     "ssh",
     [
         _ssh(table_exit=3),
+        _ssh(table_exit=3, sockets_exit=1, sockets="S 4242 1 0 1 0 0\n"),
+        _ssh(table_exit=3, inspect="/pod_1 0 172.17.0.2\n"),
         _ssh(inspect="/pod_1 <no value>\n"),
         _ssh(raise_exc=asyncssh.ConnectionLost("gone")),
+        _ssh(
+            table_exit=3,
+            inspect="/pod_1 4242 172.17.0.2\n/pod_2 4343 172.17.0.3\n",
+            sockets="S 4242 1 0 1 0 0\n",
+        ),
     ],
 )
 async def test_unreadable_never_fails(context_factory, ssh):
-    result = await _run(_ctx(context_factory, ssh))
+    result = await _run(_ctx(context_factory, ssh, names=("pod_1", "pod_2")))
     assert result.passed is True
     assert result.event.reason_code == Msg.UNREAD.reason
 
@@ -227,3 +247,71 @@ async def test_executor_outside_host_pid_namespace_is_unread(context_factory, pi
 async def test_not_rented(context_factory):
     result = await _run(_ctx(context_factory, _ssh(), pods=False))
     assert result.event.reason_code == Msg.NOT_RENTED.reason
+
+
+HDR = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+
+
+def _sock(i, local, remote, st):
+    return f"{i:4d}: {local} {remote} {st} 00000000:00000000 00:00000000 00000000     0        0 {i} 1\n"
+
+
+def _fake_proc(tmp_path, pid=4242):
+    net = tmp_path / str(pid) / "net"
+    net.mkdir(parents=True)
+    tcp = [
+        _sock(0, "00000000:1F90", "00000000:0000", "0A"),  # listening: not a connection
+        _sock(1, "020011AC:9C41", "DF006597:01BB", "01"),  # established to 151.101.0.223:443
+        _sock(2, "020011AC:9C42", "DF006597:01BB", "06"),  # time-wait, same destination
+    ] + [
+        _sock(3 + i, "020011AC:A000", f"{i:02X}00010A:0016", "02") for i in range(12)
+    ]  # SYN_SENT :22
+    (net / "tcp").write_text(HDR + "".join(tcp))
+    (net / "tcp6").write_text(
+        HDR + _sock(0, "0" * 32 + ":A001", "0000000000000000FFFF0000DF006597:01BB", "01")
+    )
+    (net / "udp").write_text(
+        HDR
+        + _sock(0, "020011AC:1388", "00000000:0000", "07")  # unconnected
+        + _sock(1, "020011AC:1389", "0300000A:0035", "01")  # connected to 10.0.0.3:53
+    )
+    (net / "raw").write_text(HDR + _sock(0, "020011AC:0001", "00000000:0000", "07"))
+    return tmp_path
+
+
+def test_socket_read_command_summarises_real_proc_tables(tmp_path):
+    proc = _fake_proc(tmp_path)
+    out = subprocess.run(
+        ["sh", "-c", socket_read_command([4242, 999], proc=str(proc))],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    (pod,) = parse_summary(out, {"4242": "pod_a"})
+    assert pod == {
+        "container": "pod_a",
+        "flows": 16,
+        "unreplied_flows": 12,
+        "destinations": 15,
+        "unreplied_destinations": 12,
+        "top_unreplied_ports": [{"port": "22", "flows": 12}],
+        "raw_sockets": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_connection_table_falls_back_to_pod_sockets(context_factory):
+    ssh = _ssh(table_exit=3, sockets="S 4242 900 800 850 800 2\nP 4242 22 700\n")
+    result = await _run(_ctx(context_factory, ssh))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FANOUT.reason
+    what = result.event.what_we_saw
+    assert what["source"] == "sockets"
+    assert what["pods"][0]["raw_sockets"] == 2
+    assert what["pods"][0]["top_unreplied_ports"] == [{"port": "22", "flows": 700}]
+
+
+@pytest.mark.asyncio
+async def test_no_readable_socket_table_is_unread(context_factory):
+    result = await _run(_ctx(context_factory, _ssh(table_exit=3, sockets="")))
+    assert result.event.reason_code == Msg.UNREAD.reason

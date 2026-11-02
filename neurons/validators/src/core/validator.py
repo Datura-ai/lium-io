@@ -200,6 +200,7 @@ class Validator:
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+            backend_client=self.backend_client,
         )
         task_service = TaskService(
             ssh_service=ssh_service,
