@@ -102,6 +102,8 @@ FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 # DAH-3698: a port verification that failed once inside the window (first-miss grace, as DAH-3597)
 PORT_VERIFY_MISS_PREFIX = "port_verify_miss"
+# DAH-4537: one key per executor while an outside port probe failure is on record (a second one in a row fails it)
+EXTERNAL_PROBE_MISS_PREFIX = "external_probe_miss"
 # ticket-0494: one key per executor while its last DinD probe that reached the container found sysbox.
 SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 # One key per executor: when this validator first found it without its recommended default image
@@ -413,6 +415,20 @@ class RedisService:
             await self.redis.expire(key, ttl_seconds)
             return False
 
+    async def record_external_probe_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        """Record an outside port probe failure; True when none was on record (the first in a row).
+        A repeat restarts the window, so a failure that persists never earns a fresh first reading."""
+        key = f"{EXTERNAL_PROBE_MISS_PREFIX}:{miner_hotkey}:{executor_id}"
+        async with self.lock:
+            if await self.redis.set(key, "1", ex=ttl_seconds, nx=True):
+                return True
+            await self.redis.expire(key, ttl_seconds)
+            return False
+
+    async def clear_external_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
+        """The outside prober reached the node: forget the failure on record."""
+        await self.delete(f"{EXTERNAL_PROBE_MISS_PREFIX}:{miner_hotkey}:{executor_id}")
+
     @staticmethod
     def _sysbox_verified_key(miner_hotkey: str, executor_id: str) -> str:
         return f"{SYSBOX_VERIFIED_PREFIX}:{miner_hotkey}:{executor_id}"
@@ -636,7 +652,8 @@ class RedisService:
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
     ):
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         now = int(time.time())
 
         item: dict = {"time": now, "pod_id": pod_id}
@@ -649,7 +666,7 @@ class RedisService:
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         pending_pods = [item for item in pending_pods if item.get('pod_id', '') != pod_id]
         if pending_pods:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
@@ -723,7 +740,10 @@ class RedisService:
                 await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
         return creates
 
-    async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
+    async def get_pending_pods(
+        self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60
+    ) -> list[dict]:
+        """Pending-pod entries younger than `max_age_seconds` (None: every entry)."""
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
             return []
@@ -739,7 +759,10 @@ class RedisService:
         pending_pods = []
         
         for item in data:
-            if now - item.get('time', 0) >= 30 * 60:  # 30 mins
+            if (
+                max_age_seconds is not None
+                and now - item.get('time', 0) >= max_age_seconds
+            ):
                 continue
             pending_pods.append(item)
         

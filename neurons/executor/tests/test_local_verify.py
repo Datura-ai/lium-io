@@ -238,6 +238,19 @@ def test_an_intent_for_another_miners_executor_is_401_and_not_burnt(client, vali
     assert client.post("/verify", json=_signed(body, validator_keypair)).status_code == 200
 
 
+def test_an_intent_for_the_pool_hotkey_runs(client, validator_keypair, monkeypatch):
+    """DAH-5296: a provider moved to Lium-held payouts is reached by the validator as the Lium
+    pool hotkey; its executor runs that intent too, and still refuses a stranger's."""
+    pool = Keypair.create_from_uri("//Pool").ss58_address
+    monkeypatch.setattr(settings, "LIUM_POOL_HOTKEY", pool)
+    steps = VerifySteps(inspector=True)
+    intent = _signed(_body(miner_hotkey=pool, steps=steps), validator_keypair)
+    assert client.post("/verify", json=intent).status_code == 200
+    stranger = Keypair.create_from_uri("//Stranger").ss58_address
+    refused = client.post("/verify", json=_signed(_body(miner_hotkey=stranger), validator_keypair))
+    assert refused.status_code == 401
+
+
 def test_replayed_nonce_is_refused(client, validator_keypair):
     intent = _signed(_body(steps=VerifySteps(inspector=True)), validator_keypair)
     assert client.post("/verify", json=intent).status_code == 200
