@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from clients.compute_client import CREATE_CUT_OFF_BY_RESTART_STEP, ComputeClient, OutgoingMessages
-from payload_models.payloads import ContainerCreateRequest, FailedContainerRequest, WorkloadKind
+from payload_models.payloads import ContainerCreateRequest, ContainerDeleteRequest, FailedContainerRequest, WorkloadKind
 from services.redis_service import InflightBackendCreate, RedisService
 
 
@@ -257,3 +257,21 @@ async def test_the_resumed_creates_report_goes_first_on_the_first_socket_only() 
     assert (report["message_type"], report["pod_ids"], len(first.sent)) == ("ResumedCreatesReport", [], 2)
     # never again: on a later socket the backend would fail the creates it sent on the first one
     assert second.sent == ["auth"]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_deleted_during_its_create_is_not_resumed_after_a_restart() -> None:
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create(
+        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, request=_create_request().model_dump_json()
+    )
+    client = _client(redis_service)
+    client._drive_miner_job = AsyncMock()
+
+    await client._run_miner_job(
+        ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1")
+    )
+    await client.fail_creates_cut_off_by_restart()
+
+    assert client.miner_drivers.empty()
+    assert client.resumed_creates_report.pod_ids == []

@@ -1096,6 +1096,9 @@ class ComputeClient:
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
         # past it and find nothing to cancel — and the create it raced then orphans its container.
+        if isinstance(job_request, ContainerDeleteRequest):
+            # DAH-5437: the renter deleted this pod; a connector restart must not resume its in-flight create
+            await self._untrack_backend_create_for_restart_report(job_request.pod_id)
         if not isinstance(job_request, ContainerCreateRequest):
             return await self._drive_miner_job(job_request)
         with inflight_creates.track(job_request.pod_id):
