@@ -85,13 +85,16 @@ class PortCountCheck:
         # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
         probed = list((ctx.state.specs or {}).get("verified_ports") or [])
         held = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
-        filler_ports = sorted(set(held) - set(probed))
-        verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
-        port_count = ctx.state.verified_port_count + len(filler_ports)
+        if ctx.state.externally_unreachable:
+            held = []  # its filler ports are firewalled too, so they cannot lift it over the floor
 
         # Check if executor is rented (same pattern as rented_machine.py)
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
+
+        filler_ports = sorted(set(held) - set(probed))
+        verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
+        port_count = ctx.state.verified_port_count + len(filler_ports)
 
         updated_state = replace(
             ctx.state,

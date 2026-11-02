@@ -100,8 +100,6 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     provider_discord_connected_executor_ids: list[str] | None = None
     # executor_ids the backend keeps unlisted until the provider confirms an e-mail address
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters
-    renter_hardware_fault_executor_ids: list[str] = []
     # executor_ids inside a running provider maintenance window: no incentive from either pool, rented or not
     maintenance_executor_ids: list[str] = []
     # executor_id → its maintenance window; the validator fails a node whose cycle started inside it
