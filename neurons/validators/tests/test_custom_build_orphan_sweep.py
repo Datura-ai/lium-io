@@ -75,3 +75,20 @@ async def test_a_build_pending_past_30_minutes_is_still_listed_for_the_sweep():
     assert await service.get_pending_pods("miner", "exec") == []
     assert await service.get_pending_pods("miner", "exec", max_age_seconds=None) == [entry]
     service.hget.assert_awaited_with(PENDING_PODS_PREFIX, "miner:exec")
+
+
+@pytest.mark.asyncio
+async def test_a_later_pending_pod_write_keeps_a_build_past_30_minutes():
+    entry = {"time": int(time.time()) - 40 * 60, "pod_id": "pod-long-build"}
+    service = RedisService.__new__(RedisService)
+    service.hget = AsyncMock(return_value=json.dumps([entry, {"time": 0, "pod_id": "pod-other"}]))
+    service.hset = AsyncMock()
+
+    await service.add_pending_pod("miner", "exec", "pod-new")
+    assert [i["pod_id"] for i in json.loads(service.hset.await_args.args[2])][:2] == [
+        "pod-long-build",
+        "pod-other",
+    ]
+
+    await service.remove_pending_pod("miner", "exec", "pod-other")
+    assert json.loads(service.hset.await_args.args[2]) == [entry]

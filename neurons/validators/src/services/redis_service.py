@@ -652,7 +652,8 @@ class RedisService:
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
     ):
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         now = int(time.time())
 
         item: dict = {"time": now, "pod_id": pod_id}
@@ -665,7 +666,7 @@ class RedisService:
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         pending_pods = [item for item in pending_pods if item.get('pod_id', '') != pod_id]
         if pending_pods:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
