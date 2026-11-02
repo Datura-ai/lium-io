@@ -1546,3 +1546,46 @@ def test_older_backend_sends_no_averages():
     assert data.filler_revenue_by_gpu_config == []
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) is None
     assert data.provider_spot_executor_ids == []
+
+
+def test_a_lone_one_gpu_node_has_an_average_after_two_filler_hours():
+    # a lone 1x node earns from its first 2 Default Job hours, not after a full day
+    data = _rented_data(
+        FillerRevenueByGpuConfig(
+            base_model="RTX 3090", gpu_count=1, usd_per_gpu_hour=0.08, gpu_hours=2.0
+        )
+    )
+
+    floor = settings.FILLER_REVENUE_MIN_GPU_HOURS
+    assert floor == 2.0
+    assert data.get_filler_revenue_per_gpu_hour("RTX 3090", 1, floor) == 0.08
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gpu_hours", [2.0, 23.9])
+async def test_secure_keeps_the_24_gpu_hour_threshold_while_spot_uses_2(
+    context_factory, floor_on, gpu_hours
+):
+    # a sample of 2 to under 24 GPU-hours pays Spot, but gives a secure node no floor average
+    sample = {"filler_revenue_by_gpu_config": [{**_GOOD_ENTRY, "gpu_hours": gpu_hours}]}
+
+    secure = await _handled(context_factory, _spot_reply(spot_executor_ids=[], **sample))
+    spot = await _handled(context_factory, _spot_reply(**sample))
+
+    assert secure.is_spot is False
+    assert secure.filler_revenue_per_gpu_hour is None
+    # diluted by a second 8x node in its bucket, it still gets no floor top-up
+    await _run([secure, _node("secure-2")])
+    assert secure.effective_rate == HOURLY_RATE * 0.5
+    assert secure.floor_top_up_rate is None
+    assert spot.is_spot is True
+    assert spot.filler_revenue_per_gpu_hour == 2.0
+
+
+@pytest.mark.asyncio
+async def test_secure_uses_an_average_taken_over_24_gpu_hours(context_factory):
+    sample = {"filler_revenue_by_gpu_config": [{**_GOOD_ENTRY, "gpu_hours": 24.0}]}
+
+    secure = await _handled(context_factory, _spot_reply(spot_executor_ids=[], **sample))
+
+    assert secure.filler_revenue_per_gpu_hour == 2.0

@@ -675,9 +675,16 @@ class Settings(BaseSettings):
     # its listed rate (1.0 = SECURE_FILLER_REVENUE_FLOOR_FACTOR, set apart from the spot factor).
     # False: dilution applies as before.
     ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
-    # A configuration's filler average is used only when it was taken over at least this many
-    # filler GPU-hours; a thinner sample reads as no average.
-    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
+    # A Spot node's configuration filler average is used only when it was taken over at least this
+    # many filler GPU-hours; a thinner sample reads as no average. 2 = the backend's floor for the
+    # per-card rate the average is built from; 24 left a lone 1-GPU Spot node unpaid for its first
+    # day of Default Job and after every restart.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=2.0)
+    # The same threshold for a secure node (the secure floor above): kept at 24 GPU-hours, since its
+    # top-up is bounded by the remaining burn allocation, not by what the fillers earned.
+    SECURE_FILLER_REVENUE_MIN_GPU_HOURS: float = Field(
+        env="SECURE_FILLER_REVENUE_MIN_GPU_HOURS", default=24.0
+    )
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
     # unrented node) when every pod in the batch-start rented list is stale: not running and its
@@ -798,6 +805,13 @@ class Settings(BaseSettings):
 
     def get_allowed_gpu_hwmodels(self) -> set[str]:
         return {s.strip() for s in self.GPU_ATTESTATION_ALLOWED_HWMODELS.split(",") if s.strip()}
+
+    def get_filler_revenue_min_gpu_hours(self, is_spot: bool) -> float:
+        return (
+            self.FILLER_REVENUE_MIN_GPU_HOURS
+            if is_spot
+            else self.SECURE_FILLER_REVENUE_MIN_GPU_HOURS
+        )
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
