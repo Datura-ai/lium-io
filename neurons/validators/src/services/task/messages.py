@@ -2346,8 +2346,8 @@ class GpuKernelCountMessages:
         category="env",
         impact="Validation failed; score set to 0",
         remediation=(
-            "Every rent on the listed GPU fails. Restart the NVIDIA driver or reboot the host so "
-            "the driver lists all the GPUs the node reports."
+            "Every rent on the listed GPU fails. Restart the executor container, or reboot the host "
+            "if the GPU is still missing."
         ),
     )
     NOT_EVALUATED = MessageTemplate(

@@ -7,8 +7,8 @@ from typing import Any
 from core.config import settings
 from services.nvidia_devices import (
     KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS,
-    _missing_gpu_uuids,
-    _query_gpu_minor_map_from_proc,
+    missing_gpu_uuids,
+    query_gpu_minor_map_from_proc,
     read_kernel_gpu_view,
 )
 
@@ -170,11 +170,11 @@ async def unattachable_gpu_uuids(ctx: Context, reported_uuids: list[str]) -> lis
         return []
     try:
         attachable = await asyncio.wait_for(
-            _query_gpu_minor_map_from_proc(ctx.ssh), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
+            query_gpu_minor_map_from_proc(ctx.ssh), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
         )
     except Exception:
         return []
-    return _missing_gpu_uuids(reported_uuids, attachable) if attachable else []
+    return missing_gpu_uuids(reported_uuids, attachable) if attachable else []
 
 
 class GpuKernelCountCheck:
