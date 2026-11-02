@@ -96,7 +96,7 @@ async def test_published_estimates_follow_the_setting(monkeypatch, enabled):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_rented", [False, True])
-async def test_off_an_on_demand_48gb_estimate_is_answered_like_an_unknown_model(monkeypatch, is_rented):
+async def test_off_an_on_demand_48gb_estimate_is_unavailable(monkeypatch, is_rented):
     # Arrange
     from unittest.mock import AsyncMock
 
@@ -111,4 +111,6 @@ async def test_off_an_on_demand_48gb_estimate_is_answered_like_an_unknown_model(
     unknown = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model="NVIDIA Unknown", is_rented=is_rented))
 
     # Assert
-    assert result.model_dump() == {**unknown.model_dump(), "gpu_model": RTX_4090_48GB, "base_model": RTX_4090_48GB}
+    assert result.usd_per_epoch is None
+    assert result.eligible_for_rental_share is False
+    assert unknown.usd_per_epoch == 0.0  # other unknown models are unchanged
