@@ -582,6 +582,28 @@ async def test_rented_node_probe_that_reached_its_container_without_sysbox_is_a_
 
 
 @pytest.mark.asyncio
+async def test_rented_node_keeps_verified_sysbox_when_the_sysbox_test_timed_out(context_factory):
+    """30 Oct, pod c0877f60: the probe reached its container with sysbox-runc, but hello-world timed out on the busy
+    host. That measured nothing, so the earlier pass stands; before, the node lost Sysbox and the renter's next
+    Docker-in-Docker launches ran without it."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    ctx = _verified_ctx(
+        context_factory,
+        redis_service=redis_service,
+        state=_rented_state(scrape_sysbox=True),
+        dind_ok=True,
+        sysbox_measured=None,
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].sysbox_runtime is True
+    assert result.updates["default_extra"]["sysbox_from_last_verified"] is True
+    assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
+
+
+@pytest.mark.asyncio
 async def test_rented_node_without_a_verified_sysbox_keeps_the_current_behaviour(context_factory):
     """No pass on record: a refused probe on a rented node still records no sysbox."""
     redis_service = DummyRedis()

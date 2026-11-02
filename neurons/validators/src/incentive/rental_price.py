@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
+from services.gpu_spec_table import RTX_4090_48GB
 from services.const import (
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
@@ -167,7 +168,7 @@ class RentalPriceEstimate(BaseModel):
     base_model: str
     gpu_count: int
     is_rented: bool
-    usd_per_epoch: float
+    usd_per_epoch: float | None                         # None = no estimate for this model (unavailable)
     count_bucket: int | None = None                     # gpu_count_bucket the executor was placed into
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
@@ -1488,6 +1489,11 @@ class RentalPriceIncentive(DefaultIncentive):
         gpu_count = params.gpu_count
         is_rented = params.is_rented
 
+        if gpu_model == RTX_4090_48GB and not settings.RTX_4090_48GB_MODEL_ENABLED:
+            # DAH-5508: off, the card is rejected, so no estimate at all (0.0 would read as an available $0)
+            return RentalPriceEstimate(
+                gpu_model=gpu_model, base_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented, usd_per_epoch=None
+            )
         base_model = BASE_GPU_MAP.get(gpu_model)
         cap_spec = self.config.max_unrented_gpus.get(base_model, {}) if base_model else {}
         eligible_for_unrented_estimate = (
@@ -1717,6 +1723,9 @@ async def precompute_all_estimates(
     on-demand request to the validator.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
+    if not settings.RTX_4090_48GB_MODEL_ENABLED:
+        # DAH-5508: the validator rejects this card while off, so publish no estimate for it.
+        gpu_models.remove(RTX_4090_48GB)
     estimates: dict[str, dict] = {}
     for gpu_model in gpu_models:
         estimates[gpu_model] = {
