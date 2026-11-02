@@ -2441,6 +2441,9 @@ def _should_repair_stale_mountpoint(
         and _is_stale_vloopback_mountpoint_error(str(exc))
     )
 
+_JUPYTER_SCRIPT_COPY_TIMEOUT_SEC = 120
+
+
 def _should_encrypt_local_volume(
     local_volume: str | None,
     workload_kind: WorkloadKind,
@@ -6588,10 +6591,16 @@ class DockerService:
         if local_volume and not encrypted_local_volume:
             temp_container_name = f"temp_jupyter_copy_{uuid4()}"
             try:
+                # attached, not -d: a detached copy races the `rm -f` below and a failed cp is
+                # never seen, so the chmod later fails with "No such file or directory".
+                # --remove-destination: the volume is the renter's, so whatever sits at the target
+                # (a FIFO would block the open forever) is unlinked, not opened; the timeout is the
+                # backstop, after which the `rm -fv` below kills the container.
                 command = (
-                    f"/usr/bin/docker run -d --rm -v {local_volume}:/mnt "
+                    f"/usr/bin/docker run --rm -v {local_volume}:/mnt "
                     f"--name {temp_container_name} --entrypoint sh "
-                    f"daturaai/compute-subnet-executor:latest -c 'cp /root/app/run_jupyter.sh /mnt/'"
+                    f"daturaai/compute-subnet-executor:latest -c "
+                    f"'cp --remove-destination /root/app/run_jupyter.sh /mnt/'"
                 )
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -6599,7 +6608,10 @@ class DockerService:
                     log_tag=log_tag,
                     log_text="Creating temporary container for script copy",
                     log_extra=log_extra,
+                    timeout=_JUPYTER_SCRIPT_COPY_TIMEOUT_SEC,
                     raise_exception=True,
+                    # a killed cp can leave an empty script and no stderr; only the status shows it
+                    check_exit_status=True,
                 )
             finally:
                 command = f"/usr/bin/docker rm -fv {temp_container_name}"
