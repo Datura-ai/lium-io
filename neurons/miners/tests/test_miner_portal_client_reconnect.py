@@ -71,3 +71,21 @@ def test_connect_failures_back_off_and_reset_after_a_connection(monkeypatch):
         asyncio.run(client.run_forever())
 
     assert [call.args[0] for call in sleeps.await_args_list] == [2, 4, portal_client.CONNECT_INTERVAL, 2]
+
+
+def test_the_handshake_tells_the_portal_this_miner_takes_an_address_update(monkeypatch):
+    import bittensor
+
+    client = object.__new__(MinerPortalClient)
+    client.logging_extra = {}
+    client.keypair = bittensor.Keypair.create_from_uri("//LiumTestMiner")
+    client.miner_portal_uri = "wss://portal.example/api/miners/hk"
+    connect = Mock()
+    monkeypatch.setattr(portal_client.websockets, "connect", connect)
+
+    async def handshake():  # the connect log reads the running task
+        client.connect()
+
+    asyncio.run(handshake())
+
+    assert connect.call_args.kwargs["additional_headers"]["capabilities"] == "address_update"

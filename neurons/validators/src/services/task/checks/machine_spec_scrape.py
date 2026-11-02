@@ -16,7 +16,7 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
-from services.gpu_spec_table import normalize_gpu_model
+from services.gpu_spec_table import classify_gpu_model
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
@@ -79,7 +79,9 @@ def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, 
     return [
         {
             **detail,
-            "name": normalize_gpu_model(detail.get("name")),
+            "name": classify_gpu_model(
+                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
+            ),
         }
         if detail.get("name")
         else detail
@@ -518,6 +520,8 @@ class MachineSpecScrapeCheck:
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
+            # DAH-3698: PortConnectivityCheck's grace marker is validator-owned; a provider must never report it
+            specs.pop("port_verify_first_miss", None)
 
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0

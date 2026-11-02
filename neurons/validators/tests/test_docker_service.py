@@ -742,28 +742,72 @@ async def test_pod_mapping_reuse_no_duplicate_external_port(docker_service, test
     assert ssh_mapping[2] == 40040
 
 
+def _offered(ports):
+    return [PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in ports]
+
+
 @pytest.mark.asyncio
-async def test_min_port_count_validation(docker_service, test_executor_id, test_miner_hotkey, monkeypatch):
-    """Test that generate_portMappings returns empty when MIN_PORT_COUNT is not met."""
-    # Set MIN_PORT_COUNT to 3
-    monkeypatch.setattr("services.docker_service.MIN_PORT_COUNT", 3)
-
-    # Only 2 available ports (less than MIN_PORT_COUNT)
-    available_ports_raw = [
-        PayloadPortMapping(internal_port=p, external_port=p, docker_port=None)
-        for p in [9000, 9001]
-    ]
-
-    # Act
+async def test_min_port_count_validation(docker_service, test_executor_id, test_miner_hotkey):
+    """DAH-3698: no free port means no pod; a Jupyter pod needs a second one."""
     result, jupyter_map = await docker_service.generate_portMappings(
         test_miner_hotkey, test_executor_id, UUID(test_executor_id), [22, 8080, 8081],
-        available_ports_raw=available_ports_raw, pod_mapping_raw=[]
+        available_ports_raw=[], pod_mapping_raw=[]
     )
+    assert (result, jupyter_map) == ([], None)
 
-    # Assert - should return empty result
-    assert result == []
+    result, jupyter_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        enable_jupyter=True, available_ports_raw=_offered([9000]), pod_mapping_raw=[]
+    )
+    assert (result, jupyter_map) == ([], None)
+
+
+@pytest.mark.asyncio
+async def test_one_port_split_pod_gets_only_ssh(docker_service, test_executor_id, test_miner_hotkey):
+    """DAH-3698: a 1-GPU split offered one port is created with SSH on it, not refused for a 3-port floor."""
+    result, jupyter_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), initial_port_count=None,
+        available_ports_raw=_offered([40001]), pod_mapping_raw=[]
+    )
+    assert result == [(22, 40001, 40001)]
     assert jupyter_map is None
 
+
+@pytest.mark.asyncio
+async def test_two_port_jupyter_pod(docker_service, test_executor_id, test_miner_hotkey):
+    result, jupyter_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), enable_jupyter=True,
+        available_ports_raw=_offered([40001, 40002]), pod_mapping_raw=[]
+    )
+    assert [m[0] for m in result] == [22, 8888]
+    assert {m[2] for m in result} == {40001, 40002}
+    assert jupyter_map == (8888, next(m[2] for m in result if m[0] == 8888))
+
+
+@pytest.mark.asyncio
+async def test_full_node_pod_still_takes_every_preferred_port(docker_service, test_executor_id, test_miner_hotkey):
+    """An older platform offering a full node's ports: unchanged, SSH plus the 10 preferred ports."""
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(),
+        available_ports_raw=_offered(range(20000, 20040)), pod_mapping_raw=[]
+    )
+    assert [m[0] for m in result] == [22, *range(20000, 20010)]
+    assert len({m[2] for m in result}) == 11
+
+
+@pytest.mark.asyncio
+async def test_split_pods_never_share_an_external_port(docker_service, test_executor_id, test_miner_hotkey):
+    """Collisions: each 1-port split pod takes the one port it was offered; a port another pod holds is never offered,
+    and a port the offer lists twice maps once."""
+    taken = set()
+    for port in range(40001, 40009):  # 8x1 node, 8 ports, one per split
+        result, _ = await docker_service.generate_portMappings(
+            test_miner_hotkey, test_executor_id, uuid4(),
+            available_ports_raw=_offered([port, port]), pod_mapping_raw=[]
+        )
+        assert result == [(22, port, port)]
+        taken.add(port)
+    assert len(taken) == 8
 
 @pytest.mark.asyncio
 async def test_reserve_ports_with_backend_data(docker_service, test_executor_id, test_miner_hotkey):
@@ -6370,6 +6414,60 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_withou
 
 
 @pytest.mark.asyncio
+async def test_recreated_sysbox_pod_on_existing_volume_still_caps_var_lib_docker(
+    docker_service,
+    monkeypatch,
+):
+    # restart/edit: the workspace volume is reused, so no create_local_volume returns its driver
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    driver_of = AsyncMock(return_value="vloopback:v2")
+    monkeypatch.setattr(docker_service, "_vloopback_driver_of_volume", driver_of)
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dind:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=80,
+        storage_limit_gb=40,
+        is_sysbox=True,
+        local_volume="volume_existing",
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
+    [dind] = run_spec.driver_volumes
+    assert (dind.target, dind.driver) == ("/var/lib/docker", "vloopback:v2")
+    assert dind.driver_opts["size"] == "20g"
+    assert run_spec.storage_limit_gb == 20
+    assert driver_of.await_args.args[1] == "volume_existing"
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_local_volume_docker_run_flags(
     docker_service,
     monkeypatch,
@@ -6780,6 +6878,8 @@ async def test_create_container_s3fs_external_volume_keeps_encrypted_local_mount
         "create_s3fs_volume",
         AsyncMock(return_value=(True, "ok")),
     )
+    # a single-slice sysbox uid range, so the Volume owner aligns and the pod keeps sysbox
+    monkeypatch.setattr(docker_service, "resolve_sysbox_subuid_base", AsyncMock(return_value=231072))
     monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
     setup_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
@@ -7403,6 +7503,49 @@ async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
 
 
 @pytest.mark.parametrize(
+    "status, expected_recovered",
+    [
+        # restarting keeps True so the caller's `docker ps` re-read decides the verdict as before
+        pytest.param("restarting", True, id="crash_loop_keeps_todays_verdict"),
+        pytest.param("exited", False, id="start_did_not_stick"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_logs_a_start_that_did_not_stick_with_its_exit_code(
+    docker_service, monkeypatch, caplog, status, expected_recovered
+):
+    # pod da05c116 (30 Oct): the repaired container came back restarting with exit 126, yet the
+    # recovery logged POD_STALE_MOUNT_RECOVERED and no exit code anywhere
+    state = {"Status": status, "ExitCode": 126, "OOMKilled": False, "Error": ""}
+    ssh_client = _recovery_ssh_client()
+    plain_run = ssh_client.run.side_effect
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _make_ssh_command_result(stdout=json.dumps(state))
+        if "docker logs" in command:
+            return _make_ssh_command_result(stdout="exec /entrypoint.sh: permission denied\n")
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "start_existing_container", AsyncMock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    events = [str(record.msg) for record in caplog.records]
+    assert "POD_STALE_MOUNT_RECOVERED" not in events
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_NOT_RUNNING"]
+    assert record.msg.extra["container_status"] == status
+    assert record.msg.extra["container_exit_code"] == 126
+    assert "permission denied" in record.msg.extra["container_logs_tail"]
+
+
+@pytest.mark.parametrize(
     "local_volume_path",
     [
         pytest.param(None, id="path_absent"),
@@ -7477,6 +7620,133 @@ async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_
 
     assert recovered is True
     assert start_existing_container.await_args.kwargs["local_volume_path"] == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_keeps_the_exit_code_when_the_encrypted_remount_hits_a_crash_loop(
+    docker_service, monkeypatch, caplog
+):
+    # review on #1973: an encrypted pod whose entrypoint exits 126 at once fails the remount's
+    # `docker exec` (container restarting), and the stop in the failure branch used to run before
+    # anything read the exit code. Drives the real start_existing_container and remount.
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    state = {"Status": "restarting", "ExitCode": 126, "OOMKilled": False, "Error": ""}
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+    plain_run = ssh_client.run.side_effect
+    commands: list[str] = []
+
+    async def run(command, *args, **kwargs):
+        commands.append(command)
+        if "docker exec" in command:
+            return _make_ssh_command_result(
+                exit_status=1,
+                stderr="Error response from daemon: Container abc is restarting, wait until the container is running",
+            )
+        if "{{json .State}}" in command:
+            return _make_ssh_command_result(stdout=json.dumps(state))
+        if "docker logs" in command:
+            return _make_ssh_command_result(stdout="exec /entrypoint.sh: permission denied\n")
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
+    docker_service.rental_docker_client_factory.client.mount_source_for_destination = AsyncMock(
+        return_value="volume_pod-1"
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(
+            docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+        )
+
+    assert recovered is False
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_START_FAILED"]
+    assert record.msg.extra["container_exit_code"] == 126
+    assert record.msg.extra["container_status"] == "restarting"
+    assert "permission denied" in record.msg.extra["container_logs_tail"]
+    assert "is restarting" in record.msg.extra["error"]
+    assert record.msg.extra["container_stopped"] is True
+    state_read = next(i for i, c in enumerate(commands) if "{{json .State}}" in c)
+    stop = next(i for i, c in enumerate(commands) if "docker stop pod_pod-1" in c)
+    assert state_read < stop
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_keeps_the_crash_state_when_the_log_read_hangs(
+    docker_service, monkeypatch, caplog
+):
+    # review F-4 on #1973: inspect answered "exited 126", then `docker logs` hung; the timeout used
+    # to discard the state and the recovery logged POD_STALE_MOUNT_RECOVERED and returned True
+    monkeypatch.setattr(docker_service_module, "_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC", 0.05)
+    state = {"Status": "exited", "ExitCode": 126, "OOMKilled": False, "Error": ""}
+    ssh_client = _recovery_ssh_client()
+    plain_run = ssh_client.run.side_effect
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _make_ssh_command_result(stdout=json.dumps(state))
+        if "docker logs" in command:
+            await asyncio.sleep(10)
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "start_existing_container", AsyncMock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is False
+    assert "POD_STALE_MOUNT_RECOVERED" not in [str(r.msg) for r in caplog.records]
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_NOT_RUNNING"]
+    assert record.msg.extra["container_status"] == "exited"
+    assert record.msg.extra["container_exit_code"] == 126
+    assert record.msg.extra["diagnostics_capture_error"] == "diagnostics timed out"
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_still_stops_the_container_when_diagnostics_hang(
+    docker_service, monkeypatch, caplog
+):
+    monkeypatch.setattr(docker_service_module, "_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC", 0.01)
+    ssh_client = _recovery_ssh_client()
+    plain_run = ssh_client.run.side_effect
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            await asyncio.sleep(10)
+        return await plain_run(command, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    monkeypatch.setattr(
+        docker_service, "start_existing_container", AsyncMock(side_effect=RuntimeError("remount failed"))
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is False
+    assert "docker stop pod_pod-1" in ssh_client.run.await_args.args[0]
+    [record] = [r for r in caplog.records if str(r.msg) == "POD_STALE_MOUNT_RECOVERY_START_FAILED"]
+    assert record.msg.extra["diagnostics_capture_error"] == "diagnostics timed out"
 
 
 @pytest.mark.parametrize(
