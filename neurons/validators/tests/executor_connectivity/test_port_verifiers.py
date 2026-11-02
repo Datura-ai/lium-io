@@ -183,7 +183,7 @@ async def test_batch_late_bind_with_enforced_outside_prober_is_not_externally_bl
 
     result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert result.external_blocked is False
+    assert result.external != "blocked"
     assert sorted(result.successful, key=lambda p: p.internal) == ports
 
 
