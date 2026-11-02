@@ -1,16 +1,32 @@
 # Installing `liumd` in the executor image
 
-Design for the step after this change: lium-io#1494 adds the host files and the validator's shadow but ships no binary.
+## Current: PR artifact
 
-## Why the binary is not committed
+The image vendors the `liumd` binary built from a lium-platform PR artifact:
 
-A committed binary with an adjacent SHA-256 only proves the bytes did not change. It does not show
-which source revision they were built from, and the image build would execute them as root.
+```
+neurons/executor/liumd/liumd-amd64
+neurons/executor/liumd/liumd-arm64
+neurons/executor/liumd/SOURCE.json
+neurons/executor/liumd/provenance-amd64.json
+neurons/executor/liumd/provenance-arm64.json
+```
 
-## Source access
+This is not a signed release. `SOURCE.json` records the source PR, source head and merge commits,
+the workflow run, each target's embedded build sha and its sha256. The Dockerfile installs the
+matching binary at `/usr/local/bin/liumd`, and `verify_liumd.py` checks the target, build sha and
+sha256 during the image build.
 
-The `liumd` source lives in a repository this image build cannot read, so the image cannot be built
-from a pinned source commit in a multi-stage build. The install therefore verifies provenance:
+This lets the executor and validator changes proceed without waiting for a `liumd-v*` tag. A
+signed release replaces it when one exists.
+
+The binary is standalone: it embeds VerifyX, matmul and inspector. Do not install `liumd.sh` over
+`/usr/local/bin/liumd`; the client runs that path directly. No `children.json`, no Python wrapper
+and no `/usr/local/lib/liumd` tree are needed.
+
+## Signed release (later)
+
+The signed release path verifies provenance instead of trusting a PR artifact:
 
 1. The companion's trusted CI builds `liumd` from a full commit hash and publishes the artifact
    with a detached signature made by a release key held in that CI. The signed statement names
@@ -20,14 +36,18 @@ from a pinned source commit in a multi-stage build. The install therefore verifi
    verifies the signature, that the signed statement names that commit, and that the downloaded
    file's SHA-256 equals the one in the statement, before the file is installed or run. A failed
    check fails the build.
-3. Only then does the Dockerfile run the existing install steps: `install` the binary, `liumd.sh`
-   as `/usr/local/bin/liumd`, the `liumd_host_files.py children` manifest and `liumd version`.
+3. Only then does the Dockerfile install the binary at `/usr/local/bin/liumd` and run
+   `liumd version`.
 
-## To do before the install lands
+The binary is not committed to lium-platform. The PR artifact above is the bridge until the first
+signed release.
 
-- Wire the signing step into the companion's CI. The release key exists: the `liumd-release`
-  environment holds it (key_id `ed25519:04d614eaf59dbbb8`), and `liumd-release verify` already
-  checks a signed manifest's binary digest. Its public half lands with lium-platform#1215.
+## To do when the signed release lands
+
+- Replace the vendored binaries and `SOURCE.json` with the artifact download and signature check.
+- Remove the `/etc/liumd` writer from `run.sh`; liumd reads the executor container env through
+  Docker and ignores those files. The old Python path still uses them, so remove this with the
+  liumd cutover, not before.
 - Restore `neurons/validators/tests/test_liumd_exec_e2e.py` from this branch's history
   (`4929da826:neurons/validators/tests/test_liumd_exec_e2e.py`); it runs the real binary and
   skips when it is absent.
