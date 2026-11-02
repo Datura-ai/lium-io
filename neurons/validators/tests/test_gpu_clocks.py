@@ -720,3 +720,38 @@ async def test_a_create_its_delete_cancelled_runs_no_clock_reset(monkeypatch):
 
     reset.assert_not_awaited()  # the GPUs may already be the next renter's
     assert not ds.pod_gpu_operation_locks._locks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rgc_exit, passed, reason", [(0, True, "GPU_CLOCK_LOCK_RESET"), (4, False, "GPU_CLOCK_LOCK_STUCK")])
+async def test_an_idle_nodes_stuck_lock_is_reset_or_unlists_the_node(context_factory, caplog, rgc_exit, passed, reason):
+    from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+    from services.task.checks.gpu_clock_lock import STUCK_LOCK_LOG_MSG, GpuClockLockCheck
+
+    from tests.helpers import build_services
+
+    redis, host = FakeRedis(), FakeHost(rgc_exit=rgc_exit)
+    old = {"pod_id": "gone", "locked_at": 0}
+    redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps(old)
+    redis.store[f"gpu_clock_lock:{U[1]}"] = json.dumps({**old, "locked_at": 9e12})  # too young: maybe a fresh rental
+    rows = [{"uuid": u} for u in U[:3]]
+    ctx = context_factory(state=build_state(gpu_details=rows), services=build_services(redis=redis), runner=host)
+
+    result = await GpuClockLockCheck().run(ctx)
+
+    assert result.passed is passed and result.event.reason_code == reason
+    assert [u for c in host.commands for u in _reset_uuids(c)] == [U[0]]
+    assert (f"gpu_clock_lock:{U[0]}" in redis.store) is not passed and f"gpu_clock_lock:{U[1]}" in redis.store
+    assert (STUCK_LOCK_LOG_MSG in caplog.text) is not passed
+
+    # a record naming a pod the snapshot still rents is that pod's lock, never reset
+    ex = ctx.executor.uuid
+    rented = RentedExecutorsResponse(executors={ex: {
+        "miner_hotkey": "m", "executor_ip_address": "1", "executor_ip_port": "2",
+        "pods": [{"pod_id": "gone", "container_name": "c"}],
+    }})
+    host.commands.clear()
+    live_ctx = context_factory(
+        state=build_state(gpu_details=rows, rented_data=rented), services=build_services(redis=redis), runner=host
+    )
+    assert (await GpuClockLockCheck().run(live_ctx)).passed and host.commands == []
