@@ -4504,7 +4504,8 @@ class DockerService:
                 UUID(pod_id)
             except ValueError:
                 return True
-            if self.backend_client is None:
+            # past the deadline no read starts: an expired timeout only cancels on the next loop turn, after the request began
+            if self.backend_client is None or asyncio.get_running_loop().time() >= deadline:
                 return False
             try:
                 async with asyncio.timeout_at(deadline):
