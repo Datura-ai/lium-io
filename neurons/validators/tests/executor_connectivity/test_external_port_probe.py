@@ -34,27 +34,17 @@ def _verifier(mocker, reached):
     return BatchVerifier(port_tester, runner, external), port_tester
 
 
+@pytest.mark.parametrize("enforce", [True, False])
 @pytest.mark.asyncio
-async def test_batch_flags_ports_that_answer_only_the_validator(mocker):
-    mocker.patch.object(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
+async def test_batch_reports_ports_that_answer_only_the_validator_whatever_the_flag(mocker, enforce):
+    # the verdict is PortConnectivityCheck's; the batch only reports the reading and keeps the validator's ports
+    mocker.patch.object(settings, "EXTERNAL_PORT_PROBE_ENFORCE", enforce)
     verifier, _ = _verifier(mocker, lambda sample: [])
 
     result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert result.external_blocked is True
-
-
-@pytest.mark.asyncio
-async def test_batch_only_logs_ports_that_answer_only_the_validator_until_enforced(mocker, caplog):
-    mocker.patch.object(settings, "EXTERNAL_PORT_PROBE_ENFORCE", False)
-    verifier, _ = _verifier(mocker, lambda sample: [])
-
-    with caplog.at_level("WARNING"):
-        result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
-
-    assert result.external_blocked is False
+    assert result.external == "blocked"
     assert result.successful == PORTS
-    assert "not the outside prober (log-only)" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -63,7 +53,7 @@ async def test_batch_counts_ports_the_outside_prober_reached_without_fetching_th
 
     result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert result.external_blocked is False
+    assert result.external == "passed"
     assert sorted(result.successful, key=lambda p: p.internal) == PORTS
     assert len(port_tester.test_many.call_args.args[2]) == len(PORTS) - 3
 
@@ -84,31 +74,31 @@ async def test_a_failed_prober_never_flags_the_node(mocker):
 
     result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert result.external_blocked is False
+    assert result.external is None
     assert result.successful == PORTS
 
 
 @pytest.mark.asyncio
 async def test_port_probe_does_not_fall_back_to_validator_only_tiers_when_blocked(mocker):
     batch = mocker.Mock()
-    batch.verify = mocker.AsyncMock(return_value=BatchResult(PORTS, [], external_blocked=True))
+    batch.verify = mocker.AsyncMock(return_value=BatchResult(PORTS, [], external="blocked"))
     semi, fallback = mocker.Mock(), mocker.Mock()
 
     result = await PortProbe(batch, semi, fallback).probe(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
-    assert result.tier == "external_blocked"
-    assert result.successful == ()
+    assert (result.tier, result.external) == ("batch", "blocked")
+    assert result.successful == tuple(PORTS)
     semi.verify.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_leaves_an_externally_unreachable_node_no_verified_ports(
+async def test_orchestrator_passes_the_outside_reading_on_for_the_check_to_judge(
     sample_executor_info, mock_ssh_client, mocker
 ):
     selector = mocker.Mock()
     selector.select.return_value = PORTS
     probe = mocker.Mock()
-    probe.probe = mocker.AsyncMock(return_value=PortProbeResult((), tuple(PORTS), "external_blocked"))
+    probe.probe = mocker.AsyncMock(return_value=PortProbeResult(tuple(PORTS), (), "batch", external="blocked"))
     dind = mocker.Mock()
     dind.verify = mocker.AsyncMock(
         return_value=DindProbeResult(success=True, sysbox_runtime=True, port=PORTS[0], log_text="ok")
@@ -122,8 +112,8 @@ async def test_orchestrator_leaves_an_externally_unreachable_node_no_verified_po
         ssh_client=mock_ssh_client,
     )
 
-    assert result.status == "externally_unreachable"
-    assert result.successful_ports == ()
+    assert (result.status, result.external_probe) == ("ok", "blocked")
+    assert sorted(result.successful_ports, key=lambda p: p.internal) == PORTS
     assert result.sysbox_runtime is True
 
 
