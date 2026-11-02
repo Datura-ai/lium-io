@@ -635,6 +635,21 @@ class RedisService:
             return None
         return {"owner_flag": owner_flag, "containers": [{"name": container_name}]}
 
+    async def rented_pod_ids(self) -> frozenset[str]:
+        """pods whose container the rented-machine cache lists, i.e. a create that finished"""
+        pod_ids: set[str] = set()
+        for raw in (await self.hgetall(RENTED_MACHINE_PREFIX)).values():
+            try:
+                containers = json.loads(raw).get("containers") or []
+            except (ValueError, AttributeError):
+                continue
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                if container.get("pod_id") and str(container.get("name", "")).strip():
+                    pod_ids.add(container["pod_id"])
+        return frozenset(pod_ids)
+
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
 

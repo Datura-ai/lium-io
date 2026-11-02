@@ -7963,9 +7963,12 @@ class DockerService:
         The DNS ACCEPTs go by their tag and the DinD IP (`_egress_filter_script`),
         so the teardown never needs to know which resolvers the apply saw.
 
-        Order: the remove helper (bounded on the executor, exit 124 logged as a
-        failure), then `docker rm -f` of both firewall helpers by name, then
-        the DinD itself. The helpers go first because removing the DinD
+        Order: `docker pause` of the DinD, the remove helper (bounded on the
+        executor, exit 124 logged as a failure), then `docker rm -f` of both
+        firewall helpers by name, then the DinD itself. The pause goes first:
+        a build still running in the DinD (one a connector restart cut off)
+        would otherwise run unfiltered once its rules are gone; a paused
+        container keeps its IP. The helpers go before the DinD because removing the DinD
         releases its IP: an apply or remove helper that outlived its bound is
         still editing rules for that IP, and the next build to get the IP
         would inherit them.
@@ -7975,6 +7978,22 @@ class DockerService:
         """
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
+        try:
+            # fails harmlessly on a DinD that is gone, stopped or already paused
+            await ssh_client.run(
+                f"/usr/bin/docker pause {shlex.quote(dind_name)} 2>/dev/null || true",
+                check=False,
+                timeout=setup_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                _m(
+                    "Custom build DinD pause before teardown failed (non-fatal)",
+                    extra=get_extra_info(
+                        {**default_extra, "error": str(exc), "dind_name": dind_name}
+                    ),
+                )
+            )
         if dind_ip:
             try:
                 remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)

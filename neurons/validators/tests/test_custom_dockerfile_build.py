@@ -544,6 +544,28 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
 
 
 @pytest.mark.asyncio
+async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_rules_go(svc):
+    """DAH-5437: a cut-off attempt's build may still run in its DinD; it must never run without the rules."""
+    ssh_client = _make_dind_ssh()
+    await svc._teardown_dind_build(
+        ssh_client=ssh_client,
+        dind_name="dind_x",
+        dind_image="img",
+        dind_ip="172.20.0.2",
+        cidrs=["10.0.0.0/8"],
+        default_extra={},
+    )
+
+    def first(pred):
+        return next(i for i, c in enumerate(ssh_client.calls) if pred(c))
+
+    paused = first(lambda c: c.startswith("/usr/bin/docker pause dind_x "))
+    _, remove_helper = svc._dind_firewall_helper_names("dind_x")
+    assert paused < first(lambda c: f"--name {remove_helper} " in c)
+    assert paused < first(lambda c: c.startswith("/usr/bin/docker rm -fv dind_x "))
+
+
+@pytest.mark.asyncio
 async def test_A6b_a_lost_node_connection_mid_build_says_so(svc, monkeypatch):
     """The SSH connection dropping during the build is not the renter's Dockerfile failing."""
     import asyncssh

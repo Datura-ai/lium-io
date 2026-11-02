@@ -238,6 +238,8 @@ class ComputeClient:
         self.lock = asyncio.Lock()
         # pod id -> resume count of a create the restart sweep runs again, read when that create is tracked
         self.resume_count_by_pod_id: dict[str, int] = {}
+        # pods deleted while a create of theirs runs: that create's late restart record is not written
+        self.deleted_pod_ids: set[str] = set()
         # set by a start sweep that read the in-flight records; sent once, first on the next authenticated socket
         self.resumed_creates_report: ResumedCreatesReport | None = None
 
@@ -1115,6 +1117,8 @@ class ComputeClient:
         # past it and find nothing to cancel — and the create it raced then orphans its container.
         if isinstance(job_request, ContainerDeleteRequest):
             # DAH-5437: the renter deleted this pod; a connector restart must not resume its in-flight create
+            if inflight_creates.is_running(job_request.pod_id):
+                self.deleted_pod_ids.add(job_request.pod_id)
             await self._untrack_backend_create_for_restart_report(job_request.pod_id)
         if not isinstance(job_request, ContainerCreateRequest):
             return await self._drive_miner_job(job_request)
@@ -1124,8 +1128,12 @@ class ComputeClient:
                 return await self._drive_miner_job(job_request)
             finally:
                 await self._untrack_backend_create_for_restart_report(job_request.pod_id)
+                if inflight_creates.is_only_create(job_request.pod_id):
+                    self.deleted_pod_ids.discard(job_request.pod_id)
 
     async def _track_backend_create_for_restart_report(self, job_request: ContainerCreateRequest) -> None:
+        if job_request.pod_id in self.deleted_pod_ids:
+            return  # a delete that landed first already removed the record; writing it now would undo that
         # best-effort: a Redis error loses only the restart report, never the create itself
         try:
             await self.miner_service.redis_service.add_inflight_backend_create(
@@ -1204,10 +1212,14 @@ class ComputeClient:
         already resumed MAX_CREATE_RESUMES times, is reported failed, which frees the node, and its flag is cleared."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
+        rented_pod_ids = await redis_service.rented_pod_ids() if creates else frozenset()
         resumed: list[str] = []
         for pod_id, create in creates.items():
-            if time.time() - create.started_at_unix_seconds > INFLIGHT_CREATE_MAX_AGE_SECONDS:
-                # DAH-5437: its pod may be running now; re-running it would replace the container by name
+            if pod_id in rented_pod_ids or (
+                time.time() - create.started_at_unix_seconds > INFLIGHT_CREATE_MAX_AGE_SECONDS
+            ):
+                # DAH-5437: a create that ended but whose record removal failed; its container runs (or may, past
+                # the longest create), and a re-run would replace it by name
                 await self._untrack_backend_create_for_restart_report(pod_id)
                 continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone

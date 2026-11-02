@@ -48,6 +48,7 @@ def _client(redis_service: RedisService) -> ComputeClient:
     client.miner_service = MagicMock()
     client.miner_service.redis_service = redis_service
     client.resume_count_by_pod_id = {}
+    client.deleted_pod_ids = set()
     client.miner_drivers = asyncio.Queue()
     client.resumed_creates_report = None
     return client
@@ -280,6 +281,43 @@ async def test_a_pod_deleted_during_its_create_is_not_resumed_after_a_restart() 
 
     assert client.miner_drivers.empty()
     assert client.resumed_creates_report.pod_ids == []
+
+
+@pytest.mark.asyncio
+async def test_a_delete_before_the_creates_record_write_is_not_undone_by_it() -> None:
+    from services.docker_service import inflight_creates
+
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client._drive_miner_job = AsyncMock()
+
+    with inflight_creates.track("pod-1"):  # the create is picked up, its record write still to come
+        await client._run_miner_job(
+            ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1")
+        )
+        await client._track_backend_create_for_restart_report(_create_request())
+
+    assert await redis_service.inflight_backend_creates() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_create_whose_container_runs_is_not_resumed_after_a_restart() -> None:
+    # it ended, but its record removal failed; a re-run would replace the running container by name
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create(
+        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, request=_create_request().model_dump_json()
+    )
+    await redis_service.hset(
+        "rented_machines_prefix", "1.2.3.4:22", json.dumps({"containers": [{"name": "pod_pod-1", "pod_id": "pod-1"}]})
+    )
+    client = _client(redis_service)
+
+    await client.fail_creates_cut_off_by_restart()
+
+    assert client.miner_drivers.empty()
+    assert client.message_queue == []
+    assert client.resumed_creates_report.pod_ids == []
+    assert await redis_service.inflight_backend_creates() == {}
 
 
 @pytest.mark.asyncio
