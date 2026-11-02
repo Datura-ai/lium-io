@@ -39,6 +39,7 @@ class PortProbe:
             log_ctx=log_ctx,
             min_ports=min_ports,
         )
+
         def short(ok) -> bool:
             # a split node (min_ports above the floor) keeps probing until it has its ports or every selected port
             # answered; the tier that verified most wins. Otherwise a later tier runs only when the earlier one
