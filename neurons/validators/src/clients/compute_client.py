@@ -72,6 +72,7 @@ from protocol.vc_protocol.validator_requests import (
     RentedMachineRequest,
     ResetVerifiedJobEvidence,
     ResetVerifiedJobRequest,
+    ResumedCreatesReport,
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
@@ -220,6 +221,8 @@ class ComputeClient:
         self.lock = asyncio.Lock()
         # pod id -> resume count of a create the restart sweep runs again, read when that create is tracked
         self.resumed_creates: dict[str, int] = {}
+        # set by a start sweep that read the in-flight records; sent once, first on the next authenticated socket
+        self.resumed_creates_report: ResumedCreatesReport | None = None
 
         self.logging_extra = {
             "validator_hotkey": self.my_hotkey(),
@@ -385,6 +388,13 @@ class ComputeClient:
             ) from exc
         if response.status != "success":
             raise AuthenticationError("auth request received failed response", response.errors)
+
+        if (report := self.resumed_creates_report) is not None:
+            # once, and before any reply: the backend fails a waiting create sent before THIS socket authenticated
+            # that is not listed, so a report re-sent on a later socket would fail the creates sent on this one
+            self.resumed_creates_report = None
+            report.sent_at = time.time()
+            await ws.send(report.model_dump_json())
 
         self.ws = ws
 
@@ -1172,6 +1182,7 @@ class ComputeClient:
         already resumed MAX_CREATE_RESUMES times, is reported failed, which frees the node, and its flag is cleared."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
+        resumed: list[str] = []
         for pod_id, create in creates.items():
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
@@ -1182,6 +1193,7 @@ class ComputeClient:
                     request = None
                 if request is not None and request.pod_id == pod_id:
                     self.resumed_creates[pod_id] = create.resumes + 1
+                    resumed.append(pod_id)
                     await self.miner_drivers.put(asyncio.create_task(self.miner_driver(request)))
                     logger.warning(
                         _m(
@@ -1213,6 +1225,8 @@ class ComputeClient:
                     ),
                 )
             )
+        # DAH-5437: only a sweep that read the records reports; an empty list is the point (Redis lost them)
+        self.resumed_creates_report = ResumedCreatesReport(pod_ids=resumed)
 
     async def _drive_miner_job(
         self,

@@ -27,6 +27,7 @@ class RequestType(enum.Enum):
     GpuEstimatesRequest = "GpuEstimatesRequest"
     EstimateResponse = "EstimateResponse"
     PodStatesReport = "PodStatesReport"
+    ResumedCreatesReport = "ResumedCreatesReport"
 
 
 class BaseValidatorRequest(BaseRequest, DeliveryStamps):
@@ -167,6 +168,15 @@ class PodStatesReport(BaseValidatorRequest):
     chunk_index: int = pydantic.Field(ge=0)
     chunk_total: int = pydantic.Field(ge=1)
     pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
+
+
+class ResumedCreatesReport(BaseValidatorRequest):
+    """DAH-5437 (lium_protocol 1.19.0): the creates this connector's start sweep runs again, sent once, first on
+    its first authenticated socket. The backend fails at once a create it sent before that socket authenticated
+    that still waits and is not listed, e.g. one whose in-flight record Redis lost."""
+
+    message_type: RequestType = RequestType.ResumedCreatesReport
+    pod_ids: list[str] = pydantic.Field(default_factory=list)
 
 
 class ExecutorSpecRequest(BaseValidatorRequest):

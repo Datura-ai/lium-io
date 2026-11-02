@@ -1,5 +1,6 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -43,6 +44,7 @@ def _client(redis_service: RedisService) -> ComputeClient:
     client.miner_service.redis_service = redis_service
     client.resumed_creates = {}
     client.miner_drivers = asyncio.Queue()
+    client.resumed_creates_report = None
     return client
 
 
@@ -184,6 +186,7 @@ async def test_a_create_cut_off_by_a_restart_runs_again_instead_of_failing() -> 
 
     assert client.message_queue == []
     assert ran[0][0] == request
+    assert client.resumed_creates_report.pod_ids == ["pod-1"]
     # tracked again with its resume counted, so a second restart in the re-run reports it failed
     assert (ran[0][1].request, ran[0][1].resumes) == (stored, 1)
     # the re-run claims the command id, so a backend re-send of the same create is a duplicate
@@ -203,6 +206,8 @@ async def test_a_create_already_resumed_once_is_reported_failed() -> None:
 
     assert client.miner_drivers.empty()
     assert [m.failure_step for m in client.message_queue] == [CREATE_CUT_OFF_BY_RESTART_STEP]
+    # not run again, so not listed: the backend fails it at once even if this failure report is lost
+    assert client.resumed_creates_report.pod_ids == []
 
 
 @pytest.mark.asyncio
@@ -215,3 +220,40 @@ async def test_a_create_with_an_unreadable_stored_request_is_reported_failed() -
 
     assert client.miner_drivers.empty()
     assert [m.failure_step for m in client.message_queue] == [CREATE_CUT_OFF_BY_RESTART_STEP]
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(raw)
+
+    async def recv(self) -> str:
+        return json.dumps({"status": "success"})
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_the_resumed_creates_report_goes_first_on_the_first_socket_only() -> None:
+    # Redis lost every in-flight record: the sweep still reports, with an empty list, so the backend fails the cut creates
+    client = _client(_redis_service())
+    client.keypair = None
+    await client.fail_creates_cut_off_by_restart()
+    first, second = _FakeSocket(), _FakeSocket()
+
+    auth = MagicMock(model_dump_json=lambda: "auth")
+    with patch("clients.compute_client.AuthenticateRequest.from_keypair", return_value=auth):
+        await client.handle_connection(first)
+        await client.handle_connection(second)
+
+    assert first.sent[0] == "auth"
+    report = json.loads(first.sent[1])
+    assert (report["message_type"], report["pod_ids"], len(first.sent)) == ("ResumedCreatesReport", [], 2)
+    # never again: on a later socket the backend would fail the creates it sent on the first one
+    assert second.sent == ["auth"]

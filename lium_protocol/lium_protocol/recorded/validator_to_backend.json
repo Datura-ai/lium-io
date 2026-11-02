@@ -642,6 +642,18 @@
         ],
         "detail": null
       }
+    },
+    {
+      "expect": "ResumedCreatesReport",
+      "message": {
+        "message_type": "ResumedCreatesReport",
+        "sent_at": null,
+        "forwarded_at": null,
+        "queue_depth": null,
+        "pod_ids": [
+          "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9"
+        ]
+      }
     }
   ]
 }
