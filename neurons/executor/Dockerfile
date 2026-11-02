@@ -96,6 +96,19 @@ RUN if [ "$INSTALL_GPU_ATTESTATION" = "true" ]; then \
 
 COPY . .
 
+# The liumd PR artifact is vendored under neurons/executor/liumd and installed at the path the
+# validator's SSH client runs. This is an unsigned PR artifact: it carries its source PR, build sha
+# and sha256 in SOURCE.json; a liumd-v* release replaces it when one exists.
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) target=x86_64-unknown-linux-gnu; artifact=liumd-amd64 ;; \
+      arm64) target=aarch64-unknown-linux-gnu; artifact=liumd-arm64 ;; \
+      *) echo "no liumd artifact for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+  && install -m 0755 "/root/app/liumd/$artifact" /usr/local/bin/liumd \
+  && /usr/local/bin/liumd version \
+  && python3 verify_liumd.py "$target"
+
 # arm64 takes the aarch64 builds (lib*-aarch64.so, from celium-gpu-verifier's aarch64 build) once they are
 # vendored; until then the validator refuses ARM hosts with ARM_VERIFIER_NOT_AVAILABLE.
 RUN for f in libdmcompverify libverifyx libinspector; do \

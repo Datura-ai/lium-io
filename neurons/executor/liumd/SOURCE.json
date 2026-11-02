@@ -1,0 +1,22 @@
+{
+  "schema": "liumd.vendored/1",
+  "source_head_sha": "dddedf835593fdaaa123c0e1cd8185dd337794af",
+  "source_merge_sha": "9a4c4b19425e17a3250f42cb48e9d937711f2d18",
+  "source_pr": 2222,
+  "source_repo": "Datura-ai/lium-platform",
+  "source_run": "https://github.com/Datura-ai/lium-platform/actions/runs/41406168661",
+  "targets": {
+    "aarch64-unknown-linux-gnu": {
+      "artifact": "liumd-arm64",
+      "build_sha": "9a4c4b19425e",
+      "provenance": "provenance-arm64.json",
+      "sha256": "46893d90f52aa746b1bbc6c08a65127730ff7873658b65000b8bbddc4f8d74df"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "artifact": "liumd-amd64",
+      "build_sha": "9a4c4b19425e",
+      "provenance": "provenance-amd64.json",
+      "sha256": "89532ab73eb542db9eb839ffaff57cc0d49012f1444f3cfd1be9c1575a518ca4"
+    }
+  }
+}
