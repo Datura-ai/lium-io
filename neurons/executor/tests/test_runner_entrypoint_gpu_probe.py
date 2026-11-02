@@ -27,6 +27,7 @@ DOCKER_STUB = textwrap.dedent(
         "inspect --format") echo "sha256:executorimage" ;;
         "ps --all") echo "${STUB_PROBE_LEFTOVERS:-}" ;;
         "rm --force") exit "${STUB_RM_EXIT:-0}" ;;
+        "image ls") echo "${STUB_EXECUTOR_IMAGES:-}" ;;
         "image rm") exit "${STUB_IMAGE_RM_EXIT:-0}" ;;
         "run --rm")
             [ -n "${STUB_PROBE_HANG:-}" ] && exec "$STUB_PROBE_HANG" 30
@@ -112,18 +113,35 @@ def test_first_install_recreates_without_probe(tmp_path, probe_error):
 
 
 def test_previous_executor_image_is_removed_after_the_update(tmp_path):
-    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123")
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage"
+    )
 
     up = calls.index("compose up --pull always --detach --wait --force-recreate")
-    assert calls.index("image rm sha256:executorimage") > up
-    assert "Removed the previous executor image sha256:executorimage" in result.stdout
+    assert calls.index("image rm sha256:previous") > up
+    assert "image rm sha256:executorimage" not in calls
+    assert "Removed old executor image sha256:previous" in result.stdout
+
+
+def test_every_past_releases_executor_image_goes_but_the_running_one(tmp_path):
+    result, calls = run_entrypoint(
+        tmp_path,
+        STUB_RUNNING_EXECUTOR="abc123",
+        STUB_EXECUTOR_IMAGES="sha256:v163 sha256:v164 sha256:executorimage",
+    )
+
+    assert "image rm sha256:v163" in calls
+    assert "image rm sha256:v164" in calls
+    assert "image rm sha256:executorimage" not in calls
 
 
 def test_previous_image_still_in_use_is_kept_and_the_update_goes_on(tmp_path):
-    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_IMAGE_RM_EXIT="1")
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous", STUB_IMAGE_RM_EXIT="1"
+    )
 
-    assert "image rm sha256:executorimage" in calls
-    assert "Removed the previous" not in result.stdout
+    assert "image rm sha256:previous" in calls
+    assert "Removed old" not in result.stdout
     assert "image prune -f" in calls
 
 
