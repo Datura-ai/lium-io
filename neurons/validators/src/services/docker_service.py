@@ -7570,13 +7570,28 @@ class DockerService:
             )
             if inflight_creates.is_only_create(pod_id):
                 # DAH-5437: a create resumed after a connector restart meets the build container its cut-off
-                # attempt left under this pod's name; no other create of this pod runs, so it is ours to replace
-                await ssh_client.run(
-                    "/usr/bin/docker rm -fv "
-                    + " ".join(shlex.quote(name) for name in (dind_name, *self._dind_firewall_helper_names(dind_name)))
-                    + " 2>/dev/null || true",
-                    check=False,
-                    timeout=setup_timeout_s,
+                # attempt left under this pod's name; no other create of this pod runs, so it is ours to replace.
+                # The full teardown, so the egress rules of the old DinD's IP go with it.
+                old_ip: str | None = None
+                try:
+                    ip_res = await ssh_client.run(
+                        "/usr/bin/docker inspect -f "
+                        "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
+                        f"{shlex.quote(dind_name)}",
+                        check=False,
+                        timeout=setup_timeout_s,
+                    )
+                    if ip_res.exit_status == 0:
+                        old_ip = str(ipaddress.ip_address((ip_res.stdout or "").strip()))
+                except (asyncio.TimeoutError, ValueError):
+                    pass
+                await self._teardown_dind_build(
+                    ssh_client=ssh_client,
+                    dind_name=dind_name,
+                    dind_image=dind_image,
+                    dind_ip=old_ip,
+                    cidrs=cidrs,
+                    default_extra=default_extra,
                 )
             # `timeout(1)` on the executor kills the `docker run` (and so the
             # image pull) when it outlives the bound: asyncssh's own `timeout=`

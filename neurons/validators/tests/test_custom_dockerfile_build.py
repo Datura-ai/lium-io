@@ -537,8 +537,10 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
         inflight_creates._creates_by_pod_id[payload.pod_id].running = 1
 
     run_at = next(i for i, c in enumerate(ssh_client.calls) if "run -d --runtime=sysbox-runc" in c)
-    leftover_rm = f"/usr/bin/docker rm -fv {dind} {dind}-fw-apply {dind}-fw-remove"
-    assert any(c.startswith(leftover_rm) for c in ssh_client.calls[:run_at]) is only_create
+    before = ssh_client.calls[:run_at]
+    # the full teardown: the old DinD's egress rules (by its IP) go too, not only the container
+    assert any("--network=host" in c and "-D DOCKER-USER" in c and "172.20.0.2" in c for c in before) is only_create
+    assert any(c.startswith(f"/usr/bin/docker rm -fv {dind} ") for c in before) is only_create
 
 
 @pytest.mark.asyncio

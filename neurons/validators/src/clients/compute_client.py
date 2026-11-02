@@ -118,6 +118,23 @@ CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 # DAH-5437: a create cut off by a connector restart runs again this many times; past it (say the create itself
 # kills the connector) it is reported failed
 MAX_CREATE_RESUMES = 1
+# a record older than the longest create (the custom-build budget, past the backend's 1 h PENDING limit with the
+# margin) is one whose removal failed: the create ended long ago, so it is dropped, never run again or reported
+INFLIGHT_CREATE_MAX_AGE_SECONDS = settings.CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS + 600
+
+
+def _carries_secret(model: pydantic.BaseModel) -> bool:
+    """a field the model hides from logs (repr=False) is a credential; True when one is set, nested models included"""
+    for name, field in type(model).model_fields.items():
+        value = getattr(model, name, None)
+        if not field.repr and value:
+            return True
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, pydantic.BaseModel) and _carries_secret(item):
+                return True
+    return False
+
+
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
 # pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
 # so the backend loses the validator for seconds, not the whole startup.
@@ -220,7 +237,7 @@ class ComputeClient:
         self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
         # pod id -> resume count of a create the restart sweep runs again, read when that create is tracked
-        self.resumed_creates: dict[str, int] = {}
+        self.resume_count_by_pod_id: dict[str, int] = {}
         # set by a start sweep that read the in-flight records; sent once, first on the next authenticated socket
         self.resumed_creates_report: ResumedCreatesReport | None = None
 
@@ -392,9 +409,9 @@ class ComputeClient:
         if (report := self.resumed_creates_report) is not None:
             # once, and before any reply: the backend fails a waiting create sent before THIS socket authenticated
             # that is not listed, so a report re-sent on a later socket would fail the creates sent on this one
-            self.resumed_creates_report = None
             report.sent_at = time.time()
             await ws.send(report.model_dump_json())
+            self.resumed_creates_report = None
 
         self.ws = ws
 
@@ -1116,8 +1133,10 @@ class ComputeClient:
                 job_request.miner_hotkey,
                 job_request.executor_id,
                 job_request.workload_kind,
-                request=job_request.model_dump_json(),
-                resumes=self.resumed_creates.pop(job_request.pod_id, 0),
+                # a request with a credential (registry password, volume keys, ...) is never stored: Redis is on
+                # disk. Without its request the next connector reports the create failed and the backend retries it.
+                request="" if _carries_secret(job_request) else job_request.model_dump_json(),
+                resumes=self.resume_count_by_pod_id.pop(job_request.pod_id, 0),
             )
         except Exception as exc:
             self._log_backend_create_tracking_error(job_request.pod_id, exc)
@@ -1187,6 +1206,10 @@ class ComputeClient:
         creates = await redis_service.inflight_backend_creates()
         resumed: list[str] = []
         for pod_id, create in creates.items():
+            if time.time() - create.started_at_unix_seconds > INFLIGHT_CREATE_MAX_AGE_SECONDS:
+                # DAH-5437: its pod may be running now; re-running it would replace the container by name
+                await self._untrack_backend_create_for_restart_report(pod_id)
+                continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
             if create.request and create.resumes < MAX_CREATE_RESUMES:
@@ -1195,7 +1218,7 @@ class ComputeClient:
                 except pydantic.ValidationError:
                     request = None
                 if request is not None and request.pod_id == pod_id:
-                    self.resumed_creates[pod_id] = create.resumes + 1
+                    self.resume_count_by_pod_id[pod_id] = create.resumes + 1
                     resumed.append(pod_id)
                     await self.miner_drivers.put(asyncio.create_task(self.miner_driver(request)))
                     logger.warning(
