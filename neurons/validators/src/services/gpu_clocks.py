@@ -42,10 +42,6 @@ if TYPE_CHECKING:
 
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
-# the record written before an -lgc expires after this until the -lgc is confirmed, then it stays for the pod's
-# life: a record left by a failed restore or by an unanswered -lgc whose reset was refused stops refusing creates on
-# its GPU (taiberium), while a live lock never loses the record that keeps the next rental fail-closed (gateway)
-CLOCK_LOCK_TTL_SECONDS = 7 * 24 * 3600
 # one per GPU uuid this validator ever changed; a few thousand at most, never freed
 _GPU_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -295,15 +291,16 @@ async def _record_and_lock(
     # -lgc, so a GPU this request never changes gets no record a create would then refuse on (review F-46)
     record = {"gpu_uuid": uuid, "pod_id": pod_id, "executor_id": executor_id, "locked_at": time.time()}
     previous = await redis.get(_lock_key(uuid))
-    previous_ms = await redis.pttl(_lock_key(uuid)) if previous else -2
-    await redis.set(_lock_key(uuid), json.dumps(record), ex=CLOCK_LOCK_TTL_SECONDS)
+    # no expiry (gateway review): a record goes only once an -rgc succeeded, so a GPU whose reset keeps failing, maybe
+    # still locked, stays refused rather than handed on
+    await redis.set(_lock_key(uuid), json.dumps(record))
     locked = await _run(runner, build_clock_command("lock", uuid, pod_gpu_uuids=pod_gpu_uuids, min_mhz=low, max_mhz=high))
     if locked.exit_code > 0:
         # a completed refusal ("not supported" 3, "insufficient permissions" 4, ...) changed no clocks: the record goes
         # back to what it was, so a GPU without clock control (that refuses -rgc too) never carries a record a create
         # would refuse on (review)
-        if previous:  # with the expiry it had: a confirmed lock stays for good, a provisional one still expires
-            await redis.set(_lock_key(uuid), previous, ex=max(1, previous_ms // 1000) if previous_ms > 0 else None)
+        if previous:
+            await redis.set(_lock_key(uuid), previous)
         else:
             await redis.delete(_lock_key(uuid))
         outcome.detail = _tail(locked.stdout or locked.stderr) or f"nvidia-smi -lgc failed (exit {locked.exit_code})"
@@ -315,10 +312,6 @@ async def _record_and_lock(
         outcome.detail = "nvidia-smi -lgc did not answer"
         outcome.detail += "; clocks reset to default" if reset_failure is None else f"; {reset_failure}"
         return outcome
-    try:
-        await redis.persist(_lock_key(uuid))  # confirmed: the record stays until the pod's delete resets the GPU
-    except Exception:
-        pass  # the lock is applied; a record left provisional only expires early (Redis failed twice in a row)
     readback = await _run(
         runner, f"nvidia-smi -i {shlex.quote(uuid)} --query-gpu=clocks.gr --format=csv,noheader,nounits"
     )
