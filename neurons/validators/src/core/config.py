@@ -286,8 +286,8 @@ class Settings(BaseSettings):
     # validator reaches them, the node gets no verified ports. Unset URL: no outside probe.
     EXTERNAL_PORT_PROBE_URL: str = Field(env="EXTERNAL_PORT_PROBE_URL", default="")
     EXTERNAL_PORT_PROBE_TOKEN: str = Field(env="EXTERNAL_PORT_PROBE_TOKEN", default="")
-    # Off: a node whose ports answer only the validator is logged ("log-only"), not failed, so prod can count
-    # those nodes before enforcing.
+    # Off: an outside failure is logged ("log-only"), never failed, so prod can count the nodes it would fail
+    # (the shadow step). On: a node fails on its second outside failure in a row.
     EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
@@ -453,6 +453,11 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
+    # DAH-5508: an RTX 4090 reporting ~48 GB is scored as its own model "NVIDIA GeForce RTX 4090 48GB" (own VRAM
+    # window, rate, anchor and idle tier) instead of failing the 24 GB window. Off: such a card is rejected as before.
+    # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
+    # preflight classifies it too, and the all-card probe is sized from the classified model.
+    RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
@@ -736,6 +741,13 @@ class Settings(BaseSettings):
     GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED: bool = Field(
         env="GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED", default=False
     )
+    # NVIDIA's minimum VBIOS for CC in R595, per GPU model (Trusted Computing Solutions Release Notes R595,
+    # RN-12817-001_v02, Tables 1 (SPT CC) and 3 (MPT CC) for Blackwell). Dotted hex fields; "XX" matches any value.
+    CC_VBIOS_MINIMUMS: dict[str, str] = Field(
+        env="CC_VBIOS_MINIMUMS", default={"B200": "97.00.E4.00.XX", "B300": "97.10.64.00.XX"}
+    )
+    # On (default) = a CC multi-GPU node below the minimum fails like an identity finding. Off = shadow: only logged.
+    CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED: bool = Field(env="CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED", default=True)
     # Hosted NRAS endpoint (interim verification locus; a local nv-verifier removes
     # this outbound SPOF before fleet enforcement — see remediation plan CD4).
     NVIDIA_NRAS_URL: str = Field(
@@ -843,6 +855,20 @@ class Settings(BaseSettings):
     CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS", default=1200,
         description="Hard timeout for `docker build` of a custom-dockerfile pod (seconds).",
+    )
+    CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND: int = Field(
+        env="CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND", default=10 * 1024 * 1024, gt=0,
+        description=(
+            "Slowest image export (DinD `docker save | docker load` onto the host) the export timeout allows "
+            "for: the timeout is the built image's size at this rate, never below the build timeout."
+        ),
+    )
+    CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS", default=3300, gt=0,
+        description=(
+            "Ceiling for setup + build + export of one custom-dockerfile pod. The backend fails a pod "
+            "still PENDING after 1 h, so a size-scaled export never runs past this."
+        ),
     )
     CUSTOM_DOCKERFILE_MAX_BYTES: int = Field(
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,
