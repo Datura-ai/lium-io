@@ -37,6 +37,20 @@ fi
 
 docker compose up --pull always --detach --wait --force-recreate
 
+# The executor is pulled by digest, so its old images are not dangling and `image prune` keeps them
+# (2-5 GB per release, every past release too). Remove every executor image but the one now running;
+# Docker refuses to remove an image a container still uses.
+current_image=$(docker inspect --format '{{.Image}}' "$(docker compose ps --quiet executor 2>/dev/null)" 2>/dev/null || true)
+for image in $(docker image ls --quiet --no-trunc daturaai/compute-subnet-executor 2>/dev/null || true); do
+    if [ "$image" != "$current_image" ] && docker image rm "$image" >/dev/null 2>&1; then
+        echo "Removed old executor image $image"
+    fi
+done
+# the validator's per-cycle probes run the :latest tag; keep it local so they never wait on the registry
+if [ -n "$current_image" ]; then
+    docker tag "$current_image" daturaai/compute-subnet-executor:latest || true
+fi
+
 # Clean docker images
 docker image prune -f
 
