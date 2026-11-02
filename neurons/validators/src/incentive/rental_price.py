@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
+from services.gpu_spec_table import RTX_4090_48GB
 from services.const import (
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
@@ -1713,6 +1714,9 @@ async def precompute_all_estimates(
     on-demand request to the validator.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
+    if not settings.RTX_4090_48GB_MODEL_ENABLED:
+        # DAH-5508: the validator rejects this card while off, so publish no estimate for it.
+        gpu_models.remove(RTX_4090_48GB)
     estimates: dict[str, dict] = {}
     for gpu_model in gpu_models:
         estimates[gpu_model] = {

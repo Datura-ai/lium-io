@@ -75,3 +75,20 @@ def test_scrape_state_and_published_specs_follow_the_setting(monkeypatch, enable
     assert [d["name"] for d in _normalize_gpu_details(details)] == expected
     published = _canonicalize_published_gpu_names({"gpu": {"details": details}})
     assert [d["name"] for d in published["gpu"]["details"]] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_published_estimates_follow_the_setting(monkeypatch, enabled):
+    from incentive import rental_price
+
+    monkeypatch.setattr(settings, "RTX_4090_48GB_MODEL_ENABLED", enabled)
+
+    async def fake_estimate(config, redis_service, snapshot, params):
+        return {"gpu_model": params.gpu_model}
+
+    monkeypatch.setattr(rental_price, "estimate_executor", fake_estimate)
+    estimates = await rental_price.precompute_all_estimates(None, None, None)
+    assert (RTX_4090_48GB in estimates) is enabled
+    assert RTX_4090 in estimates
+    assert len(estimates) == len(BASE_GPU_MAP) - (0 if enabled else 1)
