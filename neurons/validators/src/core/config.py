@@ -342,10 +342,11 @@ class Settings(BaseSettings):
     # and the matmul (at most 120 s) run one after the other.
     LIUMD_SHADOW_TIMEOUT_SECONDS: int = Field(env="LIUMD_SHADOW_TIMEOUT_SECONDS", default=330)
     # The only executors the shadow runs on: reserved, non-rentable dev executors, as
-    # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries. A pod or filler started
-    # after the cycle's snapshot is not seen, so on a rentable node the shadow could run its
-    # GPU/RAM/disk/network probe next to a workload. Executor UUIDs are miner-chosen, so an entry
-    # matches only that miner's executor at that SSH endpoint. Empty = none.
+    # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries, or `all` for every
+    # executor (staging only). A pod or filler started after the cycle's snapshot is not seen, so on
+    # a rentable node the shadow could run its GPU/RAM/disk/network probe next to a workload.
+    # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
+    # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
     # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
     # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
@@ -753,9 +754,13 @@ class Settings(BaseSettings):
     def get_allowed_advisory_ids(self) -> set[str]:
         return {s.strip() for s in self.TDX_ALLOWED_ADVISORY_IDS.split(",") if s.strip()}
 
-    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]]:
+    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]] | None:
         """`LIUMD_SHADOW_RESERVED_EXECUTORS` as (miner_hotkey, executor_uuid, address, ssh_port).
-        A malformed entry raises ValueError rather than being dropped."""
+
+        `all` means every executor. A malformed entry raises ValueError rather than being dropped.
+        """
+        if self.LIUMD_SHADOW_RESERVED_EXECUTORS.strip().lower() == "all":
+            return None
         reserved = set()
         for entry in self.LIUMD_SHADOW_RESERVED_EXECUTORS.split(","):
             if not entry.strip():

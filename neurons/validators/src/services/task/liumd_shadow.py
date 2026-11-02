@@ -12,8 +12,8 @@ the shadow writes no EMA, state or network-gate tally. The outcome is one `[lium
 log line. Nothing is returned to the caller, stored, or scored.
 
 It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (reserved, non-rentable
-dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default),
-never on an express-lane first pass. VerifyX is not compared on an executor with no stored download
+dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default,
+`all` for every executor), never on an express-lane first pass. VerifyX is not compared on an executor with no stored download
 EMA: today's check may take a second sample there, the shadow takes one
 (`liumd_reason="cold_sample_retry"`).
 
@@ -197,7 +197,8 @@ async def _compare(
     # Executor UUIDs are miner-chosen: an entry matches only its miner's executor at its endpoint.
     executor = ctx.executor
     key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
-    if key not in settings.get_liumd_shadow_reserved_executors():
+    reserved = settings.get_liumd_shadow_reserved_executors()
+    if reserved is not None and key not in reserved:
         return _skipped("not_reserved", steps=steps)
     if _workload_on_node(ctx, today):
         return _skipped("workload", steps=steps)
@@ -398,10 +399,13 @@ def _judged(
             entry["agree"] = entry["liumd_verdict"] == today[name].verdict
             compared.append(entry["agree"])
     complete = len(compared) == len(requested)
+    facts = _facts(ctx, answer)
     return {
         "outcome": "compared",
         "reason": "ok",
         "agree": all(compared) if complete and compared else None,
+        "facts_agree": facts["agree"],
+        "facts": facts["checks"],
         "round_trip_ms": answer.round_trip_ms,
         "executor_elapsed_ms": answer.elapsed_ms,
         "executor_version": answer.executor_version,
@@ -409,3 +413,42 @@ def _judged(
         "first_pass": ctx.config.first_pass,
         "steps": steps,
     }
+
+
+def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
+    """Compare the facts both paths collect. Missing or skipped data is not a mismatch."""
+    specs = ctx.state.specs or {}
+    checks: list[dict[str, Any]] = []
+
+    def check(field: str, liumd: Any, python: Any) -> None:
+        checks.append({"field": field, "liumd": liumd, "python": python, "agree": liumd == python})
+
+    docker = answer.step("docker")
+    data = docker.data if docker.status == "ok" and isinstance(docker.data, dict) else None
+    if data:
+        if "sysbox_runtime" in specs:
+            check("docker.sysbox_runtime", data.get("sysbox_runtime"), specs.get("sysbox_runtime"))
+        if isinstance(data.get("containers"), list) and isinstance(specs.get("docker_containers"), list):
+            liumd_names = sorted(
+                c.get("name") for c in data["containers"] if isinstance(c, dict) and c.get("name")
+            )
+            python_names = sorted(
+                c.get("each_name")
+                for c in specs["docker_containers"]
+                if isinstance(c, dict) and c.get("each_name")
+            )
+            check("docker.container_names", liumd_names, python_names)
+
+    ports = answer.step("ports")
+    data = ports.data if ports.status == "ok" and isinstance(ports.data, dict) else None
+    if data:
+        check("ports.port_range", data.get("port_range"), ctx.executor.port_range)
+        check("ports.port_mappings", data.get("port_mappings"), ctx.executor.port_mappings)
+
+    inspector = answer.step("inspector")
+    data = inspector.data if inspector.status == "ok" and isinstance(inspector.data, dict) else None
+    local_checksum = getattr(getattr(ctx.services, "inspector", None), "local_checksum", None)
+    if data and local_checksum:
+        check("inspector.lib_sha256", data.get("lib_sha256"), local_checksum)
+
+    return {"agree": all(c["agree"] for c in checks) if checks else None, "checks": checks}
