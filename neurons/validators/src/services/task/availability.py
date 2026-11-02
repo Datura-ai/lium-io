@@ -53,15 +53,21 @@ class AvailabilityErrorCode(StrEnum):
     RENTED_EXECUTOR_NOT_LISTED = "RENTED_EXECUTOR_NOT_LISTED"
     # An unrented node the miner lists (known_executor_ids) but could not reach to install our key.
     EXECUTOR_UNREACHABLE_BY_MINER = "EXECUTOR_UNREACHABLE_BY_MINER"
-    # DAH-4457: a GPU dropped out of NVML within the hold window (GpuLossHoldCheck).
+    # DAH-4457: a GPU dropped out of NVML and the node has not yet read clean and passed the load test (GpuLossHoldCheck).
     GPU_LOST = "GPU_LOST"
     # DAH-4683: NVML reports a card's memory broken (GpuMemoryHealthCheck).
     GPU_MEMORY_HEALTH_FAILED = "GPU_MEMORY_HEALTH_FAILED"
+    # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
+    GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
 
 
 # Faults of the node's own cards: never a sign of our own outage, and never silenced with one.
 NODE_GPU_FAULT_CODES = frozenset(
-    {AvailabilityErrorCode.GPU_LOST, AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED}
+    {
+        AvailabilityErrorCode.GPU_LOST,
+        AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
+        AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
+    }
 )
 
 

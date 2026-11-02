@@ -4,16 +4,27 @@ import json
 import logging
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from core.config import settings
 from core.utils import _m
+from protocol.vc_protocol.compute_requests import (
+    LIVE_FILLER_RUN_STATUSES,
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+)
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
 from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
-from ...const import POD_CONTAINER_PREFIX
+from ...const import (
+    EDIT_PARKED_SUFFIX,
+    FILLER_CONTAINER_PREFIX,
+    LEGACY_LIUM_CONTAINER_NAME,
+    LIUM_WORKLOAD_LOOKUPS_PER_CYCLE,
+    POD_CONTAINER_PREFIX,
+)
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -40,8 +51,16 @@ DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS = 60 * 60
 # claim on those slots, the queued ids take turns for the rest (least recently sent first) and never
 # fewer than REAPED_POD_STATES_FLOOR of them, so a node with 256 rented pods still moves its queue.
 REAPED_POD_STATE_RETENTION_SECONDS = 24 * 60 * 60
+# How long after its rental closed a volume is still the delete's to remove, not the low-disk sweep's.
+ENDED_RENTAL_VOLUME_GRACE = timedelta(hours=1)
+# A volume_<uuid> neither a pod nor a filler run is known by is removed only after this long.
+UNKNOWN_VOLUME_MIN_AGE = timedelta(days=7)
 REAPED_POD_STATES_KEY_PREFIX = "reaped_pod_states:"
 REAPED_POD_STATES_FLOOR = 32
+# DAH-5117 review 4373847343: a removed container's GPU processes are dropped once per name. An ended
+# record stays ended, so a provider recreating pod_<old id> each cycle would otherwise be exempt forever.
+# Never expired: see _ReapedPodStateQueue.claim_gpu_exemptions.
+REAPED_GPU_EXEMPT_KEY_PREFIX = "reaped_gpu_exempt:"
 
 
 class StaleContainerCleanupCheck:
@@ -92,6 +111,36 @@ class StaleContainerCleanupCheck:
         queue = _ReapedPodStateQueue(ctx)
         first_sight = await self._first_sight(ctx)
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data)
+        confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
+        lookups = {"made": 0, "skipped": 0}
+        # labelled removals holding a GPU process: each has a lookup slot kept for its exemption
+        reserved: set[str] = set()
+        gpu_container_names = {process.get("container_name") for process in ctx.state.gpu_processes}
+
+        def budget_left() -> bool:
+            return lookups["made"] + len(reserved) < LIUM_WORKLOAD_LOOKUPS_PER_CYCLE
+
+        async def lium_workload_ended(name: str) -> bool:
+            if not budget_left():
+                lookups["skipped"] += 1  # unconfirmed: not removed, its GPU processes still count
+                return False
+            lookups["made"] += 1
+            ended = await _lium_workload_ended_here(ctx, name)
+            if ended:
+                confirmed.add(name)
+            return ended
+
+        def reserve_removal(name: str) -> bool:
+            # a removal with no GPU process needs no exemption lookup; one with a process is removed
+            # only when its lookup fits the budget, so it is never gone yet still counted
+            if name not in gpu_container_names:
+                return True
+            if not budget_left():
+                lookups["skipped"] += 1
+                return False
+            reserved.add(name)
+            return True
+
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
@@ -104,6 +153,8 @@ class StaleContainerCleanupCheck:
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
                 on_before_remove=queue.add,
+                lium_workload_ended=lium_workload_ended,
+                reserve_removal=reserve_removal,
             )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
@@ -112,12 +163,22 @@ class StaleContainerCleanupCheck:
         # BEFORE the reclaim below on purpose: the reclaim measures free disk itself, so garbage
         # freed here can be the difference between keeping the node's ~190 GB cache and losing it.
         swept_download_temporaries: int | None = None
+        removed_orphan_volumes: int | None = None
         now: float = time.monotonic()
         last_sweep_at: float = self._last_sweep_at.get(ctx.executor.uuid, float("-inf"))
         if now - last_sweep_at >= DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS:
             swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
                 ssh_client=ctx.ssh,
                 executor_uuid=ctx.executor.uuid,
+            )
+            # A volume_<uuid> whose container is gone and whose pod or filler run is over is never read
+            # again; same hourly throttle, since each candidate costs backend lookups. Before the
+            # reclaim below, which measures free disk itself: the renter's leftovers go first.
+            removed_orphan_volumes = await ctx.services.container_cleanup.remove_orphan_rental_volumes(
+                ssh_client=ctx.ssh,
+                rented_data=ctx.state.rented_data,
+                executor_uuid=ctx.executor.uuid,
+                is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
             )
             self._last_sweep_at[ctx.executor.uuid] = now
 
@@ -142,9 +203,38 @@ class StaleContainerCleanupCheck:
                 "first_sight_grace": first_sight,
                 "rented_list_unknown": rented_list_unknown,
                 "reclaimed_cache_volumes": reclaimed_cache_volumes,
+                "removed_orphan_volumes": removed_orphan_volumes,
                 "swept_download_temporaries": swept_download_temporaries,
             },
         )
+        # The GPU processes were read before this cleanup; a reaped container's are gone with it, so
+        # neither TenantEnforcementCheck nor GpuUsageCheck may count them against the node. Only when
+        # the backend confirms it was Lium's: a label or a health_check_ name is the host's to forge,
+        # and a forged container recreated between cycles would otherwise pass the GPU gate each cycle.
+        for name in removed_names:
+            if name in confirmed or name not in reserved:
+                continue
+            try:
+                if await _lium_workload_ended_here(ctx, name):  # its slot was reserved before removal
+                    confirmed.add(name)
+            except Exception as e:  # noqa: BLE001 - unconfirmed: its processes still count
+                logger.warning(
+                    _m(
+                        "Pod record check failed; the removed container's GPU processes still count",
+                        extra={"container_name": name, "error": str(e)},
+                    )
+                )
+        if lookups["skipped"]:
+            logger.warning(
+                _m(
+                    "Backend lookup cap reached; the remaining containers wait for a later cycle",
+                    extra={
+                        "executor_uuid": ctx.executor.uuid,
+                        "cap": LIUM_WORKLOAD_LOOKUPS_PER_CYCLE,
+                        "skipped_lookups": lookups["skipped"],
+                    },
+                )
+            )
         # DAH-2991: an orphan that survived removal still holds its ports; PortCountCheck names it
         # instead of reporting a bare count the provider has to diagnose by hand.
         # DAH-3338: a reaped pod_* container is reported to the backend as `reaped`, so the rental
@@ -155,11 +245,18 @@ class StaleContainerCleanupCheck:
             # queued before the attempt (the hook runs first), still on the host: not reaped
             await queue.drop(name)
         reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
-        if not unremovable_names and not reaped:
+        if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
+        # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
+        removed = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
+            gpu_processes=[
+                process
+                for process in ctx.state.gpu_processes
+                if process.get("container_name") not in removed
+            ],
             pod_states=[*ctx.state.pod_states, *reaped],
         )
         return CheckResult(passed=True, event=event, updates={"state": state})
@@ -205,6 +302,57 @@ class StaleContainerCleanupCheck:
                 )
             )
             return True
+
+
+async def _lium_workload_ended_here(ctx: Context, container_name: str) -> bool:
+    """DAH-5117: the backend's record shows a pre-label pod_/filler_<uuid> was this node's Lium
+    workload and has ended: a rental with a close time, or a filler run in a terminal state.
+    Only the canonical lowercase dashed name counts, labelled or not: the backend resolves an
+    uppercase or dashless spelling to the same record, so each spelling would claim its own GPU
+    exemption for one historical run (review 4392604823)."""
+    if LEGACY_LIUM_CONTAINER_NAME.fullmatch(container_name) is None:
+        return False
+    record_id = container_name.removesuffix(EDIT_PARKED_SUFFIX).partition("_")[2]
+    record: PodRentalActiveResponse | FillerRunActiveResponse | None
+    if container_name.startswith(FILLER_CONTAINER_PREFIX):
+        record = await ctx.services.backend.get_filler_run_active(record_id)
+        ended = (
+            record is not None
+            and not record.active
+            and record.status not in (None, *LIVE_FILLER_RUN_STATUSES)
+        )
+    else:
+        record = await ctx.services.backend.get_pod_rental_active(record_id)
+        ended = record is not None and not record.active and record.rental_closed_at is not None
+    # a record with no owner never matches: it cannot prove the workload ran on this node
+    return ended and record.executor_id is not None and record.executor_id == str(ctx.executor.uuid)
+
+
+async def _is_orphan_volume(ctx: Context, volume_id: str, age: timedelta) -> bool:
+    """Whether the backend says the pod or filler run this volume belongs to is over.
+
+    Any doubt keeps the volume: no answer, a live rental or run, or a pod with no closed rental.
+    A uuid neither knows (a pod row long gone, a foreign name) goes only once the volume is
+    UNKNOWN_VOLUME_MIN_AGE old.
+    """
+    backend = ctx.services.backend
+    pod = await backend.get_pod_rental_active(volume_id)
+    if pod is None or pod.active:
+        return False
+    if pod.rental_closed_at is not None:
+        closed_at: datetime = pod.rental_closed_at
+        if closed_at.tzinfo is None:
+            # the backend writes a naive UTC timestamp
+            closed_at = closed_at.replace(tzinfo=UTC)
+        return datetime.now(UTC) - closed_at >= ENDED_RENTAL_VOLUME_GRACE
+    if pod.status is not None:
+        return False
+    filler = await backend.get_filler_run_active(volume_id)
+    if filler is None or filler.active:
+        return False
+    if filler.status is not None:
+        return filler.status not in LIVE_FILLER_RUN_STATUSES
+    return age >= UNKNOWN_VOLUME_MIN_AGE
 
 
 def pod_id_of_container(name: str) -> str | None:
@@ -278,6 +426,35 @@ class _ReapedPodStateQueue:
         self._key = f"{REAPED_POD_STATES_KEY_PREFIX}{ctx.executor.uuid}"
         self._extra = {"executor_uuid": ctx.executor.uuid}
         self._this_cycle: dict[str, _QueuedReap] = {}
+        self._exempt_key = f"{REAPED_GPU_EXEMPT_KEY_PREFIX}{ctx.executor.uuid}"
+
+    async def claim_gpu_exemptions(self, names: set[str]) -> set[str]:
+        """The names whose GPU processes may be dropped: those never exempted on this node. A
+        recreated container is removed again, but its processes now count. The marker has no TTL
+        (review 4374006889): an ended record stays ended, so an expiring marker would re-arm it. Only
+        backend-confirmed removals that held a GPU process are written, so the hash grows slowly.
+        A redis error exempts none (fail closed: the processes count for that cycle)."""
+        if not names or self._redis is None:
+            return set(names)
+        try:
+            stored = await self._redis.hgetall(self._exempt_key) or {}
+            seen = {key.decode() if isinstance(key, bytes) else str(key) for key in stored}
+            fresh = {name for name in names if name.removesuffix(EDIT_PARKED_SUFFIX) not in seen}
+            now = datetime.now(UTC).isoformat()
+            for name in fresh:
+                await self._redis.hset(self._exempt_key, name.removesuffix(EDIT_PARKED_SUFFIX), now)
+        except Exception as e:  # noqa: BLE001 - one-shot unverifiable: the processes still count
+            logger.warning(
+                _m("GPU exemption record unavailable; removed containers' processes still count",
+                   extra={**self._extra, "error": str(e)})
+            )
+            return set()
+        if names - fresh:
+            logger.warning(
+                _m("Removed container was exempted before; its GPU processes count",
+                   extra={**self._extra, "container_names": sorted(names - fresh)})
+            )
+        return fresh
 
     async def add(self, container_name: str) -> None:
         pod_id = pod_id_of_container(container_name)

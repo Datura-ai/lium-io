@@ -1,11 +1,12 @@
 import asyncio
 import json
+import re
 import shlex
 from dataclasses import dataclass
 
 import asyncssh
 
-from services.const import DOCKER_DIND_IMAGE
+from services.const import DOCKER_DIND_IMAGE, LIUM_POD_ID_LABEL
 
 # Bounded so a crash-looping worker can't flood the log line; keep the tail,
 # not the head — a dying entrypoint prints its fatal error last.
@@ -41,7 +42,8 @@ class DockerCommand:
             "&& ssh-keygen -A && service ssh start && tail -f /dev/null'"
         )
         return (
-            f"/usr/bin/docker run -d {runtime} --name {name} --gpus all "
+            f"/usr/bin/docker run -d {runtime} --name {name} --label {LIUM_POD_ID_LABEL}={name} "
+            "--gpus all "
             f"-p {port}:22 {DOCKER_DIND_IMAGE} {ssh_cmd}"
         )
 
@@ -104,10 +106,41 @@ class DockerCommand:
         )
 
     @staticmethod
-    def ps_filter(*name_patterns: str) -> str:
+    def kill_orphaned_task_shim(container_id: str) -> str:
+        """SIGKILL the containerd shim still holding the task of a container dockerd reports exited.
+
+        After a dockerd/containerd restart the old shim can outlive dockerd's view of the container,
+        and every `docker start` then fails with "AlreadyExists: task <id>". Matches only the shim
+        started with `-id <container_id>` (the exact 64-hex id). Its pid and start time are captured
+        first, then the container state is re-read: only while it is still exited/created, and only
+        that same shim generation, is it killed with its children. A replacement shim started by
+        anyone in between has another pid/start time and is never touched. Exit 0 always.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ValueError(f"not a full container id: {container_id!r}")
+        # argv0 must be the shim binary, so this shell (whose own cmdline holds the id) never matches
+        return (
+            "shim=; for d in /proc/[0-9]*; do "
+            "c=$(tr '\\0' ' ' 2>/dev/null < $d/cmdline); "
+            "case \"${c%% *}\" in *containerd-shim*) case \"$c\" in "
+            f"*' -id {container_id} '*) shim=${{d#/proc/}};; esac;; esac; done; "
+            "[ -n \"$shim\" ] || { echo 'no shim'; exit 0; }; "
+            # field 22 of /proc/<pid>/stat = start time: (pid, start time) names one process
+            "gen=$(cut -d' ' -f22 /proc/$shim/stat 2>/dev/null); "
+            f"st=$(/usr/bin/docker inspect --format '{{{{.State.Status}}}}' {container_id} 2>&1); "
+            "case \"$st\" in exited|created) ;; *) echo \"skipped state=$st\"; exit 0;; esac; "
+            "[ -n \"$gen\" ] && [ \"$(cut -d' ' -f22 /proc/$shim/stat 2>/dev/null)\" = \"$gen\" ] "
+            "|| { echo 'skipped shim replaced'; exit 0; }; "
+            "kids=$(awk -v p=$shim '/^PPid:/ && $2 == p {print FILENAME}' /proc/[0-9]*/status "
+            "2>/dev/null | cut -d/ -f3); kill -9 $kids $shim 2>/dev/null; "
+            "echo \"killed shim=$shim init=$kids\"; sleep 3; true"
+        )
+
+    @staticmethod
+    def ps_filter(*name_patterns: str, output_format: str = "{{.Names}}") -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
-        return f'/usr/bin/docker ps -a {filters} --format "{{{{.Names}}}}"'
+        return f"/usr/bin/docker ps -a {filters} --format {shlex.quote(output_format)}"
 
     @staticmethod
     def inspect_status(container_id: str) -> str:
@@ -155,8 +188,13 @@ class DockerCommand:
 
     @staticmethod
     def ps_running(container_name: str) -> str:
-        """Build docker ps command to check if container is running."""
-        return f"/usr/bin/docker ps -q -f name={container_name}"
+        """Build docker ps command to check if container is running.
+
+        Docker's name filter is an unanchored regex: `name=pod_1` also lists `pod_12`. A container
+        name is [a-zA-Z0-9_.-], so `.` is its only regex metacharacter.
+        """
+        pattern = container_name.replace(".", r"\.")
+        return f"/usr/bin/docker ps -q -f {shlex.quote(f'name=^/?{pattern}$')}"
 
     @staticmethod
     def exec_command(container_name: str, command: str) -> str:
@@ -272,6 +310,7 @@ def _reports_missing_container(message: str) -> bool:
 async def collect_container_death_diagnostics(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,
+    diagnostics: ContainerDeathDiagnostics | None = None,
 ) -> ContainerDeathDiagnostics:
     """Read why a container died over an already-open SSH session.
 
@@ -279,9 +318,10 @@ async def collect_container_death_diagnostics(
     (cancellation excepted). At both call sites this runs right before the
     container is force-removed, and the executor host belongs to the miner —
     losing the rest of the evidence to an exception is worse than a partial
-    record.
+    record. A caller that bounds this with a timeout passes its own `diagnostics`
+    so the fields read before the timeout survive it.
     """
-    diagnostics = ContainerDeathDiagnostics()
+    diagnostics = diagnostics if diagnostics is not None else ContainerDeathDiagnostics()
     capture_errors: list[str] = []
     quoted_name = shlex.quote(container_name)
 

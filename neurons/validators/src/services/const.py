@@ -1,3 +1,5 @@
+import re
+
 MIN_JOB_TAKEN_TIME = 20
 
 # the plugin alias new rental volumes are created on; the backend health check is told it
@@ -52,6 +54,8 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
+    "NVIDIA A100-PCIE-40GB": 0.0,  # idle pay only, no mining share (DAH-5088)
+    "NVIDIA A100-SXM4-40GB": 0.0,
     "NVIDIA A800 80GB PCIe": 0.0,
     "NVIDIA CMP 170HX": 0.0,
     "NVIDIA A10 Tensor Core GPU": 0.0,
@@ -137,8 +141,17 @@ GPU_WEDGE_MEMORY_MAX = 1  # percent (periodic check, NVML memory-utilization)
 GPU_WEDGE_SWEEP_MEMORY_MAX_MIB = 16  # teardown sweep, nvidia-smi memory.used
 GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is removed
 
+# DAH-3698: the listing, rent and idle-pay port floor (PortCountCheck, the split-remainder idle pay). Kept at 3
+# until the platform's one-port-per-split rent path (lium-platform DAH-3698) is live, then dropped to 1.
 MIN_PORT_COUNT = 3
+# DAH-3698: a pod needs only its SSH port (plus one for Jupyter); generate_portMappings creates it from that many.
+MIN_POD_PORT_COUNT = 1
+# DAH-4961: the disk floor the renter listing used to apply itself; an idle node past it now fails
+# validation instead of being hidden. The free-space floor is settings.MIN_FREE_DISK_GB (per environment).
+MAX_DISK_UTILIZATION_PERCENT = 90
 BATCH_PORT_VERIFICATION_SIZE = 300
+# DAH-3698: window in which only the first failed port verification is forgiven
+PORT_VERIFY_FIRST_MISS_TTL_SECONDS = 3600
 # Declared ports are tallied per bucket of this width (by external port), so a wide range
 # forwarded only in part shows which part answered; at most 14 tallies over 1-65535
 # per event.
@@ -375,6 +388,21 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   container_*    — validator DinD/port-check probes (hotkey-scoped)
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
 RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
+# DAH-5117: set at create on every container Lium creates (pods, fillers, the validator's DinD probe);
+# the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
+# labelled container whose pod is no longer live, so a provider's container is never touched.
+LIUM_POD_ID_LABEL = "io.lium.pod_id"
+# Backend ownership lookups (one sequential request each) the stale cleanup makes per node per cycle;
+# the rest of a host's pod_/filler_ candidates wait for a later cycle, so a host cannot flood the backend.
+LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
+# A pod or filler container created before the label: reaped only when the backend's record of
+# that pod or filler run confirms it ended.
+LEGACY_LIUM_CONTAINER_NAME = re.compile(
+    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev)?$"
+)
+# The backend's own probe, created over SSH and so never labelled: health_check_{uuid4().hex}, or
+# the int(time.time()) suffix it used before (lium-platform orchestrator/executor_health_check.py).
+LIUM_HEALTH_CHECK_CONTAINER_NAME = re.compile(r"^health_check_(?:[0-9a-f]{32}|[0-9]{10})$")
 
 # DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
 # without importing the probe service: that module reaches services.task.models, which pulls
