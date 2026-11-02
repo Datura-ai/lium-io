@@ -163,8 +163,8 @@ class GpuKernelCountCheck:
     The reported count and UUIDs come from the scrape (NVML); the kernel list is
     /proc/driver/nvidia/gpus as BannedProviderCheck reads it once per cycle. A node whose kernel
     list is present and shorter than its reported GPU count gets GPU_KERNEL_COUNT_MISMATCH. That
-    verdict fails the validation. As with the ban checks, a failure stops the run only when the
-    node has no live rental.
+    verdict fails the validation and zeroes the score. As with the ban checks, a failure stops
+    the run only when the node has no live rental.
 
     The container the check reads in may have been handed only some of the host's cards. So a
     short list is checked once more against the host's own list (host_view_verdict): if that one
@@ -183,7 +183,7 @@ class GpuKernelCountCheck:
             return CheckResult(passed=True, event=event)
         try:
             return await self._evaluate(ctx)
-        except Exception as exc:  # a check that only observes must not break the cycle
+        except Exception as exc:  # an evaluation error must not fail the node
             event = render_message(
                 Msg.NOT_EVALUATED,
                 ctx=ctx,
@@ -232,9 +232,14 @@ class GpuKernelCountCheck:
 
         event = self._render_event(ctx, kernel_check_fields)
         if would_fail:
-            # Like the ban checks: a node with a renter's pod on it keeps being verified, so the
-            # failure stops the run only when there is no live rental.
-            return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx))
+            # A node with a renter's pod on it keeps being verified, so the failure stops the
+            # run only when there is no live rental; the flag zeroes the score in either case.
+            return CheckResult(
+                passed=False,
+                event=event,
+                fatal=not has_live_rental(ctx),
+                updates={"gpu_kernel_count_passed": False},
+            )
         return CheckResult(passed=True, event=event)
 
     def _render_event(self, ctx: Context, kernel_check_fields: dict[str, Any]) -> ValidationEvent:

@@ -47,6 +47,7 @@ from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleted,
+    ContainerStopped,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -124,7 +125,12 @@ from services.prerun_host_probe import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
-from services.loopback_plugin_setup import loopback_plugin_setup_command
+from services.loopback_plugin_setup import (
+    LOOPBACK_PLUGIN_BUILDS,
+    current_loopback_plugin_alias,
+    loopback_plugin_probe_marker_path,
+    loopback_plugin_setup_command,
+)
 from services.nvidia_devices import MissingRentedGpuError, build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
@@ -695,6 +701,10 @@ class VolumeSizingResult:
 # `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
 # whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
 _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
+# the direct-I/O generation also mounts a probe volume (volume create + mkfs, a helper-image run that
+# may pull, a sync) before it writes its marker; on a host whose dockerd starts containers slowly the
+# install budget alone cut the probe short, and every new-volume rental re-ran it until one finished
+_LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS = 150
 # how much longer than the host's `timeout` the validator waits: for a connection that stops answering
 _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS = 10
 _PROBE_OUTPUT_LOG_CAP = 512
@@ -704,23 +714,44 @@ _VOLUME_HOST_PROBE_TIMEOUT_SECONDS = 30
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
 def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
-    return (
+    plugin_state_command = (
         "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
         f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null || echo absent) | tail -n 1"
     )
+    marker_path = loopback_plugin_probe_marker_path(loopback_plugin_alias)
+    if marker_path is None:
+        return plugin_state_command
+    # "true" only once the setup script's probe volume mounted on this installation of this pinned
+    # build (the marker holds its digest and the plugin's ID and settings, printed as the script
+    # prints them); an enabled plugin still being probed, whose probe was cut short, probed as an
+    # earlier build, installed again or set to another data directory reads "unverified" and goes
+    # through setup
+    digest = LOOPBACK_PLUGIN_BUILDS[loopback_plugin_alias].digest
+    installation_command = (
+        "/usr/bin/docker plugin inspect --format '{{.Id}} {{json .Settings.Env}}' "
+        f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null"
+    )
+    return (
+        f'state="$( {plugin_state_command})"; '
+        f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != "{digest} $({installation_command})" ]; '
+        'then echo unverified; else echo "$state"; fi'
+    )
 
 
-_LOOPBACK_PLUGIN_STATE_COMMAND = _loopback_plugin_state_command(LOOPBACK_PLUGIN_ALIAS)
+def _current_loopback_plugin_state_command() -> str:
+    return _loopback_plugin_state_command(current_loopback_plugin_alias())
 
 
 class NoUsableLoopbackPluginError(Exception):
-    """v2 cannot be used and the old plugin is not enabled: the validator never installs or
-    enables the old plugin, so the rent fails naming both."""
+    """The current plugin cannot be used and no fallback plugin can be: the validator never installs
+    or enables the legacy plugin, so the rent fails naming the fallbacks' states."""
 
-    def __init__(self, v2_unusable_reason: str, old_plugin_state: str):
+    def __init__(self, current_plugin_unusable_reason: str, current_alias: str, old_plugin_states: dict[str, str]):
+        # "plugin vloopback" + "disabled" is what the stats classifier files as volume.plugin_disabled
+        states = ", ".join(f"plugin {alias} state {state}" for alias, state in old_plugin_states.items())
+        generation = LOOPBACK_PLUGIN_BUILDS[current_alias].generation
         super().__init__(
-            f"no usable vloopback plugin on host (v2: {v2_unusable_reason}; "
-            f"old plugin {LEGACY_LOOPBACK_PLUGIN_ALIAS} state {old_plugin_state})"
+            f"no usable vloopback plugin on host ({generation}: {current_plugin_unusable_reason}; old {states})"
         )
 
 
@@ -734,7 +765,7 @@ class VolumeHostProbe:
     docker_root_dir: str
     df_avail_bytes: int | None          # None when the probe was asked not to measure df
     vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
-    loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
+    loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true (v3: and its probe marker is there)
     loopback_plugin_installed: bool = False  # said true or false (installed, maybe disabled)
 
 
@@ -855,7 +886,7 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
         "printf 'VOLS\\t%s\\n' \"$?\"; "
         # the space keeps `$( (` from reading as arithmetic `$((`
-        f"printf 'PLUGIN\\t%s\\n' \"$( {_LOOPBACK_PLUGIN_STATE_COMMAND})\""
+        f"printf 'PLUGIN\\t%s\\n' \"$( {_current_loopback_plugin_state_command()})\""
     )
 
 
@@ -1720,6 +1751,7 @@ class _InflightCreate:
     running: int = 0
     cancelled_by_delete: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class _InflightCreateRegistry:
@@ -1764,7 +1796,13 @@ class _InflightCreateRegistry:
         if create is None:
             return False
         create.cancelled_by_delete = True
+        create.cancelled.set()
         return True
+
+    async def wait_cancelled(self, pod_id: str) -> None:
+        """Return once a delete cancels this pod's create; never while no create is tracked for it."""
+        create = self._creates_by_pod_id.get(pod_id)
+        await (create.cancelled if create is not None else asyncio.Event()).wait()
 
     def is_cancelled(self, pod_id: str) -> bool:
         create = self._creates_by_pod_id.get(pod_id)
@@ -4815,9 +4853,10 @@ class DockerService:
         the removal, and the create goes on. Otherwise the create fails at its own step,
         FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours.
 
-        Before failing, the listing is read again until ``cleanup_deadline``: a filler gone from it was removed
-        by dockerd (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still pending, and
-        dockerd removed it about 30 s after the rm, 4 s after the create had already failed)."""
+        Before failing, `docker rm -fv` is sent again with the listing until ``cleanup_deadline``: a filler gone
+        from it is removed (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still
+        pending). dockerd gives up an rm whose kill does not land in time and never retries it: the killed
+        filler stays listed, stopped, until another rm, which then removes it in seconds."""
         error = (
             f"[clean_existing_containers] docker rm -fv of filler {fillers} did not finish in time"
         )
@@ -4879,16 +4918,25 @@ class DockerService:
     async def _listing_once_gone(
         self, ssh_client: asyncssh.SSHClientConnection, targets: list[str], deadline: float
     ) -> ContainerListing | None:
-        """The host listing once none of ``targets`` is on it, read every few seconds until ``deadline``; None if
-        they are still listed (or the host cannot be listed) by then."""
+        """The host listing once none of ``targets`` is on it, `docker rm -fv` of them sent again with each
+        listing every few seconds until ``deadline``; None if they are still listed (or the host cannot be
+        listed) by then."""
         loop = asyncio.get_running_loop()
         while (remaining := deadline - loop.time()) > 0:
             await asyncio.sleep(min(_STUCK_FILLER_RELIST_SECONDS, remaining))
             try:
+                # asyncssh's timeout= bounds only the command, not its channel open
                 async with asyncio.timeout_at(deadline):
-                    listing = await self._list_all_containers(ssh_client)
+                    result = await ssh_client.run(
+                        _remove_and_list_containers_command(targets, []),
+                        check=False,
+                        timeout=max(deadline - loop.time(), 0.001),
+                    )
             except TimeoutError:
                 return None
+            except Exception:
+                continue
+            listing = _parse_remove_and_list_containers(result.stdout or "").listing_after_rm
             if listing is not None and not set(targets) & (set(listing[0]) | set(listing[1].values())):
                 return listing
         return None
@@ -6750,40 +6798,96 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         timeout: int,
         log_extra: dict,
-        v2_unusable_reason: str,
+        current_plugin_unusable_reason: str,
+        docker_root_dir: str | None,
     ) -> str:
-        """The old plugin for one new volume when v2 cannot be used, only if it is already enabled:
-        until it is retired a node without v2 keeps renting. Returns the driver to create on, else
-        raises NoUsableLoopbackPluginError; never installs or enables the old plugin.
-        The only place a plugin command may name the old plugin; it goes away with it."""
-        old_plugin_alias = LEGACY_LOOPBACK_PLUGIN_ALIAS
-        try:
-            state_result = await _run_with_host_timeout(
-                ssh_client, _loopback_plugin_state_command(old_plugin_alias), timeout
-            )
-            state = (state_result.stdout or "").strip() or "unknown"
-        except TimeoutError:
-            state = "unknown"
-        if state != "true":
-            raise NoUsableLoopbackPluginError(v2_unusable_reason, state)
+        """An older plugin for one new volume when the current one cannot be used: the previous
+        version first (its volumes behave as today), set up as the flag off would when it is not
+        enabled yet and the data root is known, then the legacy one only if it is already enabled,
+        so a node the current install does not reach keeps renting. With the flag off only the
+        legacy plugin, the one RentalVerificationCheck then names to the backend's health check.
+        Returns the driver to create on, else raises NoUsableLoopbackPluginError; never installs or
+        enables the legacy plugin. The only place a plugin command may name the old plugins; it goes away with them."""
+        current_alias = current_loopback_plugin_alias()
+        old_plugin_aliases = (
+            (LOOPBACK_PLUGIN_ALIAS, LEGACY_LOOPBACK_PLUGIN_ALIAS)
+            if settings.LOOPBACK_PLUGIN_V2_ENABLED and current_alias != LOOPBACK_PLUGIN_ALIAS
+            else (LEGACY_LOOPBACK_PLUGIN_ALIAS,)
+        )
+        old_plugin_states: dict[str, str] = {}
+        for old_plugin_alias in old_plugin_aliases:
+            try:
+                state_result = await _run_with_host_timeout(
+                    ssh_client, _loopback_plugin_state_command(old_plugin_alias), timeout
+                )
+                old_plugin_states[old_plugin_alias] = (state_result.stdout or "").strip() or "unknown"
+            except TimeoutError:
+                old_plugin_states[old_plugin_alias] = "unknown"
+            if old_plugin_states[old_plugin_alias] == "true":
+                break
+            if old_plugin_alias == LOOPBACK_PLUGIN_ALIAS and docker_root_dir is not None:
+                # a node that joined with v3 on never had v2: without this a host that refuses the
+                # direct-I/O loop lost every size-limited rent (review, 30.10)
+                previous_plugin_unusable_reason = await self._set_up_loopback_plugin(
+                    ssh_client, docker_root_dir, LOOPBACK_PLUGIN_ALIAS
+                )
+                if previous_plugin_unusable_reason is None:
+                    break
+                old_plugin_states[old_plugin_alias] += f" ({previous_plugin_unusable_reason})"
+        else:
+            raise NoUsableLoopbackPluginError(current_plugin_unusable_reason, current_alias, old_plugin_states)
         logger.warning(
             _m(
-                "Loopback plugin v2 unusable; creating this volume on the old plugin",
+                "Loopback plugin unusable; creating this volume on an older plugin",
                 extra=get_extra_info(
-                    {**log_extra, "loopback_plugin": old_plugin_alias, "reason": v2_unusable_reason}
+                    {**log_extra, "loopback_plugin": old_plugin_alias, "reason": current_plugin_unusable_reason}
                 ),
             )
         )
         return old_plugin_alias
 
     @staticmethod
-    async def _get_loopback_v2_state(ssh_client: asyncssh.SSHClientConnection, requested_timeout: int) -> str:
-        # `plugin inspect` output of v2 ("true", "false", empty when absent), "unknown" when the read timed out
+    async def _get_current_loopback_plugin_state(ssh_client: asyncssh.SSHClientConnection, requested_timeout: int) -> str:
+        # `plugin inspect` output of the current plugin ("true", "false", empty when absent), "unknown" when the read timed out
         try:
-            state_result = await _run_with_host_timeout(ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout)
+            state_result = await _run_with_host_timeout(
+                ssh_client, _current_loopback_plugin_state_command(), requested_timeout
+            )
         except TimeoutError:
             return "unknown"
         return (state_result.stdout or "").strip()
+
+    @staticmethod
+    async def _set_up_loopback_plugin(
+        ssh_client: asyncssh.SSHClientConnection, docker_root_dir: str, alias: str
+    ) -> str | None:
+        # the pinned build under this alias, installed, verified and enabled on the host (v3: and
+        # probed); returns why it cannot be used, None once it can
+        generation = LOOPBACK_PLUGIN_BUILDS[alias].generation
+        try:
+            setup_timeout_seconds = (
+                _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
+                if loopback_plugin_probe_marker_path(alias)
+                else _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
+            )
+            setup_execution = await _run_with_host_timeout(
+                ssh_client,
+                loopback_plugin_setup_command(docker_root_dir, alias, setup_timeout_seconds),
+                setup_timeout_seconds,
+            )
+            if setup_execution.exit_status == 0:
+                return None
+            return (
+                f"{generation} setup exit {setup_execution.exit_status}: "
+                f"{(setup_execution.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
+            )
+        except (SshSessionMayStillBeTakenError, asyncssh.Error):
+            raise
+        except TimeoutError:
+            return f"{generation} setup timed out"
+        except Exception as exc:
+            # SSH errors can contain provider banners or credentials. Log only the type.
+            return f"{generation} setup error: {type(exc).__name__}"
 
     async def _pick_loopback_driver_for_new_volume(
         self,
@@ -6794,34 +6898,23 @@ class DockerService:
     ) -> str:
         if not settings.LOOPBACK_PLUGIN_V2_ENABLED:
             return await self._fall_back_to_old_loopback_plugin(
-                ssh_client, timeout, log_extra, "v2 disabled by LOOPBACK_PLUGIN_V2_ENABLED"
+                ssh_client, timeout, log_extra, "v2 disabled by LOOPBACK_PLUGIN_V2_ENABLED", None
             )
+        current_alias = current_loopback_plugin_alias()
         if host_probe is not None and host_probe.loopback_plugin_enabled:
-            return LOOPBACK_PLUGIN_ALIAS
+            return current_alias
         root = host_probe.docker_root_dir if host_probe else await self.get_docker_root_dir(ssh_client)
         if not root.startswith("/"):
-            # An existing enabled v2 remains usable even when DockerRootDir could not be read.
-            if await self._get_loopback_v2_state(ssh_client, timeout) == "true":
-                return LOOPBACK_PLUGIN_ALIAS
-            reason = "Docker data root unknown"
-        else:
-            try:
-                result = await _run_with_host_timeout(
-                    ssh_client,
-                    loopback_plugin_setup_command(root, LOOPBACK_PLUGIN_ALIAS),
-                    _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS,
-                )
-                if result.exit_status == 0:
-                    return LOOPBACK_PLUGIN_ALIAS
-                reason = f"v2 setup exit {result.exit_status}: {(result.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
-            except (SshSessionMayStillBeTakenError, asyncssh.Error):
-                raise
-            except TimeoutError:
-                reason = "v2 setup timed out"
-            except Exception as exc:
-                # SSH errors can contain provider banners or credentials. Log only the type.
-                reason = f"v2 setup error: {type(exc).__name__}"
-        return await self._fall_back_to_old_loopback_plugin(ssh_client, timeout, log_extra, reason)
+            # An existing enabled plugin remains usable even when DockerRootDir could not be read.
+            if await self._get_current_loopback_plugin_state(ssh_client, timeout) == "true":
+                return current_alias
+            return await self._fall_back_to_old_loopback_plugin(
+                ssh_client, timeout, log_extra, "Docker data root unknown", None
+            )
+        reason = await self._set_up_loopback_plugin(ssh_client, root, current_alias)
+        if reason is None:
+            return current_alias
+        return await self._fall_back_to_old_loopback_plugin(ssh_client, timeout, log_extra, reason, root)
 
     async def create_local_volume(
         self,
@@ -7824,17 +7917,24 @@ class DockerService:
                 f"sh -c {shlex.quote(inner_build)}"
             )
             try:
-                ok, err = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=build_cmd,
-                    log_tag=log_tag,
-                    log_text=f"Building custom image {image_tag}",
-                    log_extra={**default_extra, "build_image_tag": image_tag},
-                    timeout=timeout_s,
-                    raise_exception=False,
-                    # an exec killed with its DinD (exit 137, empty stderr) is a failed build
-                    check_exit_status=True,
+                ok, err = await self._unless_cancelled_by_delete(
+                    ssh_client,
+                    payload,
+                    default_extra,
+                    self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=build_cmd,
+                        log_tag=log_tag,
+                        log_text=f"Building custom image {image_tag}",
+                        log_extra={**default_extra, "build_image_tag": image_tag},
+                        timeout=timeout_s,
+                        raise_exception=False,
+                        # an exec killed with its DinD (exit 137, empty stderr) is a failed build
+                        check_exit_status=True,
+                    ),
                 )
+            except _CreateCancelledByDelete:
+                raise
             except Exception as exc:
                 logger.error(
                     _m(
@@ -7909,14 +8009,19 @@ class DockerService:
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"docker save {shlex.quote(image_tag)} | /usr/bin/docker load"
             )
-            ok, err = await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=export_cmd,
-                log_tag=log_tag,
-                log_text=f"Exporting custom image {image_tag}",
-                log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
-                timeout=export_timeout_s,
-                raise_exception=False,
+            ok, err = await self._unless_cancelled_by_delete(
+                ssh_client,
+                payload,
+                default_extra,
+                self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=export_cmd,
+                    log_tag=log_tag,
+                    log_text=f"Exporting custom image {image_tag}",
+                    log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
+                    timeout=export_timeout_s,
+                    raise_exception=False,
+                ),
             )
             if not ok:
                 if stream_timed_out(err):
@@ -8135,6 +8240,42 @@ class DockerService:
         raise _CreateCancelledByDelete(
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
+
+    async def _unless_cancelled_by_delete(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+        step: Awaitable[Any],
+        on_cancel: Callable[[], Awaitable[Any]] | None = None,
+    ) -> Any:
+        """Run a long create step (image pull, custom build, its export), but stop it as soon as this
+        pod's delete cancels the create.
+
+        DAH-5283: the delete only flags the create, and the create looks at the flag after the step. A
+        slow pull therefore kept streaming up to its 1 h deadline after the renter had deleted the pod,
+        and a custom build went on to build and load its image onto the host, competing with the next
+        create on the node (a deleted pod's export filled the disk under the renter's retry). `on_cancel`
+        ends the remote side: closing the Docker client ends a pull's SSH stream; a custom build's
+        DinD container is removed by `_custom_build_image`'s teardown.
+        """
+        step_task = asyncio.ensure_future(step)
+        cancelled = asyncio.ensure_future(inflight_creates.wait_cancelled(payload.pod_id))
+        try:
+            await asyncio.wait({step_task, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            step_task.cancel()
+            raise
+        finally:
+            cancelled.cancel()
+        if not step_task.done():
+            step_task.cancel()
+            if on_cancel is not None:
+                with contextlib.suppress(Exception):
+                    await on_cancel()
+            await asyncio.wait({step_task})
+            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+        return await step_task
 
     def _explain_container_killed_during_bootstrap(
         self,
@@ -8943,12 +9084,20 @@ class DockerService:
                             log_tag,
                         )
                         try:
-                            await run_logged_rental_docker_sdk_operation(
-                                operation="pull",
-                                log_extra=default_extra,
-                                call=lambda: docker_client.pull(image=payload.docker_image),
-                                image=payload.docker_image,
+                            await self._unless_cancelled_by_delete(
+                                ssh_client,
+                                payload,
+                                default_extra,
+                                run_logged_rental_docker_sdk_operation(
+                                    operation="pull",
+                                    log_extra=default_extra,
+                                    call=lambda: docker_client.pull(image=payload.docker_image),
+                                    image=payload.docker_image,
+                                ),
+                                on_cancel=lambda: docker_client.aclose(),
                             )
+                        except _CreateCancelledByDelete:
+                            raise
                         except Exception as exc:
                             if login_error is None:
                                 raise
@@ -10557,6 +10706,8 @@ class DockerService:
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
                 msg=str(log_text),
+                # DAH-5510: Docker's own error ("No such container") lets the backend tell a gone container
+                detail=log_text.to_full_string(),
                 error_type=FailedContainerErrorTypes.ContainerStopFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
@@ -10568,6 +10719,13 @@ class DockerService:
                     {**default_extra, "container_name": payload.container_name}
                 ),
             ),
+        )
+        return ContainerStopped(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            container_name=payload.container_name,
         )
 
     async def start_container(

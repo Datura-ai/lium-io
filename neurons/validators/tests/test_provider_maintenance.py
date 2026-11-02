@@ -1,6 +1,6 @@
-"""DAH-4709: a node whose cycle started inside its provider maintenance window fails PROVIDER_MAINTENANCE.
+"""DAH-4709: a node in a running provider maintenance window at the cycle snapshot fails PROVIDER_MAINTENANCE.
 
-Half-open window [starting_at, expiring_at) against the cycle start (job_batch_id); verification is
+Running = listed in the snapshot's maintenance_executor_ids, not the job_batch_id label; verification is
 kept; a rented node is judged after its pod states are read and a downed pod is not recovered.
 """
 
@@ -44,12 +44,19 @@ def _ctx(
     ssh=None,
     backend=None,
     services=None,
+    running=None,
 ):
     rented_data = build_rented_data(EXECUTOR, rented_machine) or RentedExecutorsResponse(
         executors={}, banned_guids=[]
     )
     rented_data = rented_data.model_copy(
-        update={"maintenance_windows_by_executor": {EXECUTOR: WINDOW}}
+        update={
+            "maintenance_windows_by_executor": {EXECUTOR: WINDOW},
+            # the backend lists a node running at the snapshot; default: running at the cycle start
+            "maintenance_executor_ids": [EXECUTOR]
+            if (START <= cycle_start < END if running is None else running)
+            else [],
+        }
     )
     services = services or build_services(
         score_calculator=DummyScoreCalculator(), backend=backend or DummyBackendClient(active=True)
@@ -65,20 +72,15 @@ def _ctx(
     )
 
 
-@pytest.mark.parametrize(
-    ("cycle_start", "inside"),
-    [
-        (START - timedelta(seconds=1), False),
-        (START, True),
-        (END - timedelta(seconds=1), True),
-        (END, False),
-        (END + timedelta(seconds=1), False),
-    ],
-)
-def test_the_window_is_half_open_on_the_cycle_start(context_factory, cycle_start, inside):
-    assert (
-        maintenance_window_at_cycle_start(_ctx(context_factory, cycle_start)) is not None
-    ) is inside
+@pytest.mark.asyncio
+async def test_a_window_finished_before_the_snapshot_no_longer_fails_a_late_running_cycle(
+    context_factory,
+):
+    # 31 Oct: label 10:19:48 inside the window, but the cycle ran from 10:33 and the provider finished at 10:31
+    ctx = _ctx(context_factory, START + timedelta(minutes=20), running=False)
+
+    assert maintenance_window_at_cycle_start(ctx) is None
+    assert (await ProviderMaintenanceCheck().run(ctx)).passed is True
 
 
 @pytest.mark.asyncio
