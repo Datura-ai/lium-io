@@ -221,6 +221,10 @@ class RentedExecutorsResponse(BaseModel):
     # executor_ids of the nodes of banned pool accounts, listed as soon as a node is added, so a node
     # added after an account ban fails the ban check in its first cycle. An older backend bans none.
     banned_executor_ids: list[str] = []
+    # DAH-5510: old containers of pods moved off a down node, which the backend keeps on that node until their
+    # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
+    # and its volume_<pod_id>. An older backend names none.
+    retained_container_names: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

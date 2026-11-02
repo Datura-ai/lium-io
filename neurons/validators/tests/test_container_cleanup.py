@@ -812,3 +812,11 @@ def test_listed_container_names_protects_the_pod_container_of_an_unnamed_pod():
 
     assert "pod_pod-0" in names and "pod_pod-0__prev" in names
     assert "" not in names and "__prev" not in names
+
+
+def test_listed_container_names_keeps_a_moved_pods_retained_old_container():
+    # DAH-5510: the backend keeps a moved pod's old container on the node it left until its removal time
+    data = RentedExecutorsResponse(executors={}, retained_container_names=["pod_moved"])
+
+    assert "pod_moved" in listed_container_names(data)
+    assert rented_list_unknown_reason(data) is None

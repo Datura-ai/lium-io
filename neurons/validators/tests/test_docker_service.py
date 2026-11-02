@@ -8484,3 +8484,25 @@ def test_no_usable_loopback_plugin_error_preserves_the_disabled_classification()
     message = str(NoUsableLoopbackPluginError("verified v2 plugin remains disabled", "false"))
 
     assert "plugin vloopback" in message and "disabled" in message
+
+
+@pytest.mark.asyncio
+async def test_stop_container_success_replies_container_stopped(docker_service, monkeypatch):
+    # DAH-5510: the backend's stop of a moved pod's old container waits for this reply
+    from payload_models.payloads import ContainerStopped
+
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    payload = ContainerStopRequest(
+        miner_hotkey="miner-hotkey", executor_id=str(uuid4()), pod_id="pod-id", container_name="pod_test"
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()), address="127.0.0.1", port=8001, ssh_username="root", ssh_port=2200,
+        python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.stop_container(payload, executor_info, Mock(ss58_address="v"), "encrypted")
+
+    assert isinstance(result, ContainerStopped) and result.container_name == "pod_test"
+    assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]

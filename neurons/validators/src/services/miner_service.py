@@ -37,6 +37,7 @@ from payload_models.payloads import (
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    ContainerStopRequest,
     AddSshPublicKeyRequest,
     RemoveSshPublicKeysRequest,
     FailedContainerErrorCodes,
@@ -1409,6 +1410,17 @@ class MinerService:
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
             )
+        elif isinstance(payload, ContainerStopRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=headline,
+                detail=detail,
+                error_type=FailedContainerErrorTypes.ContainerStopFailed,
+                error_code=error_code,
+            )
         elif isinstance(payload, AddSshPublicKeyRequest):
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -2398,6 +2410,9 @@ class MinerService:
                         my_key,
                         private_key.decode("utf-8"),
                     )
+                elif isinstance(payload, ContainerStopRequest):
+                    # DAH-5510: the platform stops a moved pod's old container on the node it left
+                    result = await docker_service.stop_container(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, AddSshPublicKeyRequest):
                     logger.info(
                         _m(

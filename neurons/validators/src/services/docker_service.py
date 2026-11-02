@@ -47,6 +47,7 @@ from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleted,
+    ContainerStopped,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -10366,6 +10367,13 @@ class DockerService:
                     {**default_extra, "container_name": payload.container_name}
                 ),
             ),
+        )
+        return ContainerStopped(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            container_name=payload.container_name,
         )
 
     async def start_container(
