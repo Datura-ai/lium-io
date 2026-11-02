@@ -269,6 +269,43 @@ async def test_a_delete_retried_after_its_redis_cleanup_failed_leaves_the_next_r
 
 
 @pytest.mark.asyncio
+async def test_another_pods_lock_during_a_late_teardowns_reset_waits_and_keeps_its_lock_and_record():
+    """Gateway review: A's late delete has read A's record and is in its -rgc when B locks the same GPU."""
+    import asyncio
+
+    host, redis = FakeHost(device_ids=(U[0],)), FakeRedis()
+    await lock_pod_gpu_clocks(host, redis, container_name=NAME, pod_id="podA", executor_id="ex", pod_gpu_uuids=[U[0]],
+                              gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False)
+    in_reset, release = asyncio.Event(), asyncio.Event()
+    answer = host.run
+
+    async def slow_rgc(cmd, **kw):
+        if " -rgc " in cmd and not release.is_set():
+            in_reset.set()
+            await release.wait()
+        return await answer(cmd, **kw)
+
+    host.run = slow_rgc
+    teardown = asyncio.create_task(reset_pod_clock_locks(host, redis, "podA"))
+    await in_reset.wait()
+    lock_b = asyncio.create_task(lock_pod_gpu_clocks(
+        host, redis, container_name=NAME, pod_id="podB", executor_id="ex", pod_gpu_uuids=[U[0]],
+        gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False,
+    ))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "podA", "B waits for A's reset"
+    release.set()
+
+    assert await teardown == 1
+    assert (await lock_b).ok
+    rgc, lgc = (max(i for i, c in enumerate(host.commands) if flag in c) for flag in (" -rgc ", " -lgc "))
+    assert rgc < lgc, "A's -rgc never undoes B's -lgc"
+    assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "podB"
+    assert json.loads(redis.store["gpu_clock_lock_pod:podB"]) == [U[0]]
+
+
+@pytest.mark.asyncio
 async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_checks_every_host_gpu():
     host = FakeHost()
     redis = FakeRedis()
