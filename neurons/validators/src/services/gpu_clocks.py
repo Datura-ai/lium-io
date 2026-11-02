@@ -341,7 +341,11 @@ async def reset_pod_clock_locks(runner: SSHCommandRunner, redis: RedisService, p
 
 
 async def reset_leftover_clock_locks(
-    runner: SSHCommandRunner, redis: RedisService, gpu_uuids: list[str] | None, keep_pod_id: str | None = None
+    runner: SSHCommandRunner,
+    redis: RedisService,
+    gpu_uuids: list[str] | None,
+    keep_pod_id: str | None = None,
+    expected: dict[str, str] | None = None,
 ) -> list[str]:
     """Safety net before a create: `-rgc` every GPU of the new pod (None/empty = every host GPU), with or
     without a lock record, so a lost record never hands a renter another's locked clocks (as
@@ -349,11 +353,19 @@ async def reset_leftover_clock_locks(
     (their records stay): the create must not start on them. A failed reset of a GPU with no record (one that
     does not support -rgc, never locked here) is not counted; while Redis cannot say which GPUs have a record,
     every failed reset counts. A GPU whose record names `keep_pod_id` (the pod's own edit or reboot) keeps its lock and
-    record (review)."""
+    record (review). `expected` (uuid -> the record read before the GPU lock) resets only a GPU whose record is
+    still that one: a new renter's lock taken meanwhile is left alone (review F-83)."""
     if not gpu_uuids:
         host = await _run(runner, HOST_GPUS_COMMAND)
         gpu_uuids = [gpu.uuid for gpu in parse_host_gpus(host.stdout or "")]
     async with _holding(gpu_uuids):
+        if expected is not None:
+            try:
+                gpu_uuids = [uuid for uuid in gpu_uuids if await redis.get(_lock_key(uuid)) == expected.get(uuid)]
+            except Exception:
+                return []  # unknown: touch nothing, the caller judges again next cycle
+            if not gpu_uuids:
+                return []
         return await _reset_leftovers(runner, redis, gpu_uuids, keep_pod_id)
 
 

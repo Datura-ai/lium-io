@@ -755,3 +755,18 @@ async def test_an_idle_nodes_stuck_lock_is_reset_or_unlists_the_node(context_fac
         state=build_state(gpu_details=rows, rented_data=rented), services=build_services(redis=redis), runner=host
     )
     assert (await GpuClockLockCheck().run(live_ctx)).passed and host.commands == []
+
+
+@pytest.mark.asyncio
+async def test_a_stale_lock_replaced_by_a_new_renters_lock_before_its_reset_is_left_alone():
+    # F-83: the check sampled A's old record; B's create reset it and B locked the GPU before the check's reset ran
+    host, redis = FakeHost(), FakeRedis()
+    sampled = json.dumps({"pod_id": "A", "locked_at": 0})
+    redis.store[f"gpu_clock_lock:{U[0]}"] = b_record = json.dumps({"pod_id": "B", "locked_at": 9e12})
+
+    assert await reset_leftover_clock_locks(host, redis, [U[0]], expected={U[0]: sampled}) == []
+    assert host.commands == [] and redis.store[f"gpu_clock_lock:{U[0]}"] == b_record
+
+    redis.store[f"gpu_clock_lock:{U[0]}"] = sampled  # still A's: reset as before
+    assert await reset_leftover_clock_locks(host, redis, [U[0]], expected={U[0]: sampled}) == []
+    assert _reset_uuids(host.commands[0]) == [U[0]] and f"gpu_clock_lock:{U[0]}" not in redis.store

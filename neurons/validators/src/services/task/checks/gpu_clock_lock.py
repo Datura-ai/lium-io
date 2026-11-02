@@ -37,7 +37,7 @@ class GpuClockLockCheck:
         uuids = [d["uuid"] for d in ctx.state.gpu_details or [] if d.get("uuid")]
         rented = ctx.state.rented_data.executors.get(ctx.executor.uuid) if ctx.state.rented_data else None
         live_pods = {pod.pod_id for pod in rented.pods} if rented else set()
-        stale: list[str] = []
+        stale: dict[str, str] = {}
         try:
             for uuid in uuids:
                 raw = await ctx.services.redis.get(f"{CLOCK_LOCK_KEY_PREFIX}{uuid}")
@@ -45,14 +45,15 @@ class GpuClockLockCheck:
                     continue
                 record = json.loads(raw)
                 if record.get("pod_id") not in live_pods and time.time() - record.get("locked_at", 0) >= STALE_LOCK_GRACE_SECONDS:
-                    stale.append(uuid)
+                    stale[uuid] = raw
         except Exception:
-            stale = []  # Redis down: the create path still refuses a recorded GPU; judged next cycle
+            stale = {}  # Redis down: the create path still refuses a recorded GPU; judged next cycle
         if not stale:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id))
 
-        still_locked = await reset_leftover_clock_locks(ctx.runner, ctx.services.redis, stale)
-        what = {"stale_gpu_uuids": stale, "still_locked_gpu_uuids": still_locked}
+        # only a record still the one read here is reset: a renter's lock since then is theirs (review F-83)
+        still_locked = await reset_leftover_clock_locks(ctx.runner, ctx.services.redis, list(stale), expected=stale)
+        what = {"stale_gpu_uuids": list(stale), "still_locked_gpu_uuids": still_locked}
         if not still_locked:
             return CheckResult(passed=True, event=render_message(Msg.RESET, ctx=ctx, check_id=self.check_id, what=what))
         logger.error(_m(STUCK_LOCK_LOG_MSG, extra=get_extra_info({**ctx.default_extra, **what})))
