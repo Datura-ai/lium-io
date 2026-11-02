@@ -37,6 +37,12 @@ fi
 
 docker compose up --pull always --detach --wait --force-recreate
 
+# The executor is pulled by digest, so its old image is not dangling and `image prune` keeps it
+# (2-5 GB per release). Docker refuses to remove an image a container still uses (same image).
+if [ -n "${probe_image:-}" ] && docker image rm "$probe_image" >/dev/null 2>&1; then
+    echo "Removed the previous executor image $probe_image"
+fi
+
 # Clean docker images
 docker image prune -f
 

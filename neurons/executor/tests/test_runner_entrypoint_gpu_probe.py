@@ -27,6 +27,7 @@ DOCKER_STUB = textwrap.dedent(
         "inspect --format") echo "sha256:executorimage" ;;
         "ps --all") echo "${STUB_PROBE_LEFTOVERS:-}" ;;
         "rm --force") exit "${STUB_RM_EXIT:-0}" ;;
+        "image rm") exit "${STUB_IMAGE_RM_EXIT:-0}" ;;
         "run --rm")
             [ -n "${STUB_PROBE_HANG:-}" ] && exec "$STUB_PROBE_HANG" 30
             [ -z "${STUB_PROBE_ERROR:-}" ] && exit 0
@@ -107,6 +108,23 @@ def test_first_install_recreates_without_probe(tmp_path, probe_error):
 
     assert not any(c.startswith("run ") for c in calls)
     assert recreated(calls)
+    assert not any(c.startswith("image rm") for c in calls)
+
+
+def test_previous_executor_image_is_removed_after_the_update(tmp_path):
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123")
+
+    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    assert calls.index("image rm sha256:executorimage") > up
+    assert "Removed the previous executor image sha256:executorimage" in result.stdout
+
+
+def test_previous_image_still_in_use_is_kept_and_the_update_goes_on(tmp_path):
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_IMAGE_RM_EXIT="1")
+
+    assert "image rm sha256:executorimage" in calls
+    assert "Removed the previous" not in result.stdout
+    assert "image prune -f" in calls
 
 
 def test_a_hanging_probe_holds_the_update(tmp_path):
