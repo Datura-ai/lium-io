@@ -2069,7 +2069,7 @@ class PinnedMemoryProbeMessages:
 
 class NvlinkFaultMessages:
     """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED fails
-    the node until a probe passes again."""
+    the node until a probe passes again; MISSING fails a full SXM board that reports no NVLink at all."""
 
     PROBE_OK = MessageTemplate(
         event="NVLink multicast probe passed",
@@ -2097,6 +2097,20 @@ class NvlinkFaultMessages:
             "Stop the workloads, reset the GPUs (`nvidia-smi -r`) and restart nvidia-fabricmanager, or "
             "reboot. Then restart the executor container (`docker restart executor-executor-1`) so it "
             "sees the GPUs again. If the errors come back, service the board."
+        ),
+    )
+    MISSING = MessageTemplate(
+        event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
+        reason="NVLINK_MISSING",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink works again",
+        remediation=(
+            "These GPUs are SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows PCIe paths "
+            "(PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. Start "
+            "nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, same version as the "
+            "driver), check `nvidia-smi nvlink -s`, then restart the executor container "
+            "(`docker restart executor-executor-1`). If the links stay down, service the board."
         ),
     )
     UNKNOWN = MessageTemplate(
