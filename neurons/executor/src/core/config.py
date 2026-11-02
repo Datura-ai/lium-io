@@ -141,8 +141,9 @@ class Settings(BaseSettings):
     )
     # DAH-2977: also keep the top-N official templates warm (the backend lists them with
     # `pre_pull: true` when asked). Pulled one per refresh sweep, only while the node is
-    # idle. Off by default: the loop then behaves exactly as before and never asks.
-    PRE_PULL_TEMPLATES_ENABLED: bool = Field(env="PRE_PULL_TEMPLATES_ENABLED", default=False)
+    # idle. On by default since DAH-3604 (rollout step 3); PRE_PULL_TEMPLATES_ENABLED=false
+    # in .env opts a node out, and the loop then behaves exactly as before and never asks.
+    PRE_PULL_TEMPLATES_ENABLED: bool = Field(env="PRE_PULL_TEMPLATES_ENABLED", default=True)
     # Free space the docker root must keep after a pre-pull; least-recently-used
     # pre-pulled images are evicted first to stay above it.
     PRE_PULL_MIN_FREE_GB: int = Field(env="PRE_PULL_MIN_FREE_GB", default=200)
@@ -151,6 +152,11 @@ class Settings(BaseSettings):
     # Random delay before this node's first pre-pull, so a fleet-wide enable does not
     # send every executor to the registry at once.
     PRE_PULL_START_JITTER_SECONDS: int = Field(env="PRE_PULL_START_JITTER_SECONDS", default=15 * 60)
+    # A pre-pulled image the backend has stopped serving is removed after this long unlisted;
+    # 0 keeps it until the disk floor needs the room.
+    PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS: int = Field(
+        env="PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS", default=24 * 3600
+    )
 
     TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
     SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")

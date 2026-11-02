@@ -107,7 +107,6 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
@@ -172,6 +171,8 @@ class ContextState:
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
     # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause.
     dind_probe_error: DindLogCause | None = None
+    # the outside prober could not reach the ports: our filler's ports are behind the same firewall
+    externally_unreachable: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
@@ -211,7 +212,7 @@ class CheckResult(BaseModel):
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
-    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
@@ -242,12 +243,8 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
-    # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
-    # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
-    # node scores 0 on every later cycle under this executor id and is never re-anchored.
-    gpu_anchor_broken: bool = False
-    # Set by GpuFingerprintCheck (legacy rule) when an idle node's whole GPU set was replaced: the reset drops the
-    # anchor, so the next passing cycle anchors the new cards (whole_set_replaced).
+    # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
+    # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
@@ -279,9 +276,17 @@ class Context(BaseModel):
     # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
     # score gate lives in calculate_scores.
     rented_throughput_passed: bool = True
+    # True when that failure is RENTED_THROUGHPUT_NOT_RUN (no reading ran), not a slow reading.
+    rented_throughput_not_run: bool = False
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
+    # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
+    # rented-pod checks still run; the run still ends as that failure (_ended).
+    gpu_fingerprint_passed: bool = True
+    # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    hardware_identity_passed: bool = True
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True
@@ -523,6 +528,17 @@ def _stops_run(chk: Check, res: CheckResult) -> bool:
     return (not res.passed and fatal) or res.halt
 
 
+def _ended(events: list[ValidationEvent], ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+    """A run that got through. A GPU set change under a live rental ran on through the rented-pod checks for
+    their reports only: the run still ends as that failure (its event last, score 0, not rented), as it did
+    when the check halted it."""
+    if ctx.gpu_fingerprint_passed:
+        return True, events, ctx
+    failure = next(e for e in events if e.check_id == "gpu.validate.fingerprint")
+    events = [e for e in events if e is not failure] + [failure]
+    return False, events, ctx.model_copy(update={"rented": False, "score": 0.0, "job_score": 0.0, "success": False})
+
+
 class Pipeline:
     def __init__(self, checks: List[Check], sink: EventSink):
         self.checks = checks
@@ -641,6 +657,6 @@ class Pipeline:
                     return False, events, current_ctx
 
                 if res.halt:
-                    return True, events, current_ctx
+                    return _ended(events, current_ctx)
 
-        return True, events, current_ctx
+        return _ended(events, current_ctx)
