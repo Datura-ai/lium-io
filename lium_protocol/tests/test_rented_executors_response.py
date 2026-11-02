@@ -65,9 +65,9 @@ def test_maintenance_windows_arrived_in_1_16_and_are_empty_from_an_older_backend
     assert (window.expiring_at - window.starting_at).total_seconds() == 6 * 3600
 
 
-def test_self_rent_arrived_in_1_18_and_is_false_from_an_older_backend() -> None:
+def test_self_rent_arrived_in_1_19_and_is_false_from_an_older_backend() -> None:
     major, minor, _patch = (int(part) for part in PROTOCOL_VERSION.split("."))
-    assert (major, minor) >= (1, 18)
+    assert (major, minor) >= (1, 19)
     executor = "3e2f1a0b-9c8d-4e7f-8a6b-5c4d3e2f1a0b"
     rental = {"miner_hotkey": "5Miner", "executor_ip_address": "10.0.0.1", "executor_ip_port": "22", "pods": []}
     older = RentedExecutorsResponse.model_validate({**OLDER_BACKEND_REPLY, "executors": {executor: rental}})
