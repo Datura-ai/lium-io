@@ -1356,6 +1356,7 @@ def test_reporter_sends_restic_summary_only_on_completed_backup() -> None:
     summary = {
         "message_type": "summary",
         "data_added": 4096,
+        "data_added_packed": 2048,
         "files_new": 2,
         "files_changed": 1,
         "files_unmodified": 7,
@@ -1369,6 +1370,7 @@ def test_reporter_sends_restic_summary_only_on_completed_backup() -> None:
     terminal_payload = session.requests[-1]["json"]
     assert isinstance(terminal_payload, dict)
     assert terminal_payload["data_added_bytes"] == 4096
+    assert terminal_payload["data_added_packed_bytes"] == 2048
     assert (
         terminal_payload["files_new"],
         terminal_payload["files_changed"],

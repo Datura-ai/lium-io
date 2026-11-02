@@ -306,6 +306,7 @@ def _summary_counts(summary: Mapping[str, object]) -> dict[str, int]:
     """restic's final backup summary, under the backup_log column names"""
     counts = {
         "data_added_bytes": _first_integer(summary, "data_added"),
+        "data_added_packed_bytes": _first_integer(summary, "data_added_packed"),
         "files_new": _first_integer(summary, "files_new"),
         "files_changed": _first_integer(summary, "files_changed"),
         "files_unmodified": _first_integer(summary, "files_unmodified"),
