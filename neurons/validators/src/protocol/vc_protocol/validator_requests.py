@@ -171,7 +171,7 @@ class PodStatesReport(BaseValidatorRequest):
 
 
 class ResumedCreatesReport(BaseValidatorRequest):
-    """DAH-5437 (lium_protocol 1.19.0): the creates this connector's start sweep runs again, sent once, first on
+    """DAH-5437 (lium_protocol 2.5.0): the creates this connector's start sweep runs again, sent once, first on
     its first authenticated socket. The backend fails at once a create it sent before that socket authenticated
     that still waits and is not listed, e.g. one whose in-flight record Redis lost."""
 

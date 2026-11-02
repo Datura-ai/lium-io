@@ -5043,14 +5043,6 @@
           "title": "Provider Spot Executor Ids",
           "type": "array"
         },
-        "renter_hardware_fault_executor_ids": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "title": "Renter Hardware Fault Executor Ids",
-          "type": "array"
-        },
         "spot_executor_ids": {
           "default": [],
           "items": {
@@ -5669,7 +5661,7 @@
       "type": "object"
     },
     "ResumedCreatesReport": {
-      "description": "1.19.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.\n`pod_ids` are the creates the previous connector was running that this one runs again; each still gets its\nown reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the\nold connector: the backend fails it at once. An older validator never sends this, and the backend then\nchanges nothing.",
+      "description": "2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.\n`pod_ids` are the creates the previous connector was running that this one runs again; each still gets its\nown reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the\nold connector: the backend fails it at once. An older validator never sends this, and the backend then\nchanges nothing.",
       "properties": {
         "forwarded_at": {
           "anyOf": [
@@ -6254,7 +6246,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.19.0",
+  "protocol_version": "2.5.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

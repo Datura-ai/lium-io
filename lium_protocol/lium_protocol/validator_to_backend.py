@@ -58,7 +58,7 @@ class ValidatorMessageType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
     # 1.16.0: the answer to ResetPodGpuRequest
     PodGpuResetResult = "PodGpuResetResult"
-    # 1.19.0: after its start sweep, the creates a new connector runs again (DAH-5437)
+    # 2.5.0: after its start sweep, the creates a new connector runs again (DAH-5437)
     ResumedCreatesReport = "ResumedCreatesReport"
 
 
@@ -249,7 +249,7 @@ class PodStatesReport(ValidatorMessage):
 
 @VALIDATOR_MESSAGES.register
 class ResumedCreatesReport(ValidatorMessage):
-    """1.19.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.
+    """2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.
     `pod_ids` are the creates the previous connector was running that this one runs again; each still gets its
     own reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the
     old connector: the backend fails it at once. An older validator never sends this, and the backend then
