@@ -1,20 +1,32 @@
 import asyncio
+import fcntl
 import json
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
+from services.docker_service import _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
 from services.loopback_plugin_setup import (
-    LOOPBACK_PLUGIN_DIGEST,
     _SETUP_SCRIPT,
+    LOOPBACK_PLUGIN_BUILDS,
     loopback_plugin_setup_command,
 )
 
 
-_FAKE_DOCKER = r'''
+def _probe_proof(tmp_path: Path, plugin_id: str = "a" * 64, data_dir_suffix: str = "") -> str:
+    # what the setup writes once its probe volume mounted: the pinned digest, the fake plugin's ID and Env
+    env = [
+        "DATA_DIR=/srv" + str(tmp_path) + "/vloopback-v3" + data_dir_suffix,
+        "STATE_DIR=/srv/run/docker-volume-loopback-v3",
+    ]
+    return LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest + " " + plugin_id + " " + json.dumps(env, separators=(",", ":"))
+
+_FAKE_DOCKER = r"""
 import json
 import sys
 import time
@@ -23,15 +35,47 @@ from pathlib import Path
 root = Path(__file__).parent
 state_path = root / "state.json"
 state = json.loads(state_path.read_text())
-action = sys.argv[2]
 state["calls"].append(sys.argv[1:])
+state_path.write_text(json.dumps(state))
+containers = state.setdefault("containers", [])
+if sys.argv[1] == "run":
+    if state.get("run_hang"):
+        # the daemon keeps the container once the client is killed by the script's timeout
+        containers.append(sys.argv[sys.argv.index("--name") + 1])
+        state_path.write_text(json.dumps(state))
+        time.sleep(30)
+    sys.exit(state.get("run_exit", 0))
+if sys.argv[1] == "rm":
+    if sys.argv[-1] not in containers:
+        print("Error: No such container: " + sys.argv[-1], file=sys.stderr)
+        sys.exit(1)
+    if state.get("rm_exit"):
+        print("Error: cannot remove container", file=sys.stderr)
+        sys.exit(1)
+    containers.remove(sys.argv[-1])
+    state_path.write_text(json.dumps(state))
+    sys.exit(0)
+if sys.argv[1] == "volume":
+    if sys.argv[2] == "rm" and containers:
+        print("Error: volume is in use", file=sys.stderr)
+        sys.exit(1)
+    # named volumes the daemon still knows, as {name: driver}: `volume rm` drops one, `ls` lists it
+    volumes = state.setdefault("volumes", {})
+    if sys.argv[2] == "rm" and not state.get("volume_rm_exit"):
+        volumes.pop(sys.argv[-1], None)
+        state_path.write_text(json.dumps(state))
+    if sys.argv[2] == "ls":
+        print("\n".join(state.get("volume_drivers", []) + list(volumes.values())))
+    sys.exit(state.get("volume_" + sys.argv[2] + "_exit", 0))
+action = sys.argv[2]
 plugin_id = "a" * 64
+generation = state["generation"]
 
 def plugin():
-    data_dir = "/srv" + str(root) + "/vloopback-v2"
+    data_dir = "/srv" + str(root) + "/vloopback-" + generation
     if state.get("root_mismatch"):
         data_dir += "-wrong"
-    env = ["DATA_DIR=" + data_dir, "STATE_DIR=/srv/run/docker-volume-loopback-v2"]
+    env = ["DATA_DIR=" + data_dir, "STATE_DIR=/srv/run/docker-volume-loopback-" + generation]
     if state.get("duplicate_env"):
         env.append("DATA_DIR=/wrong")
     identity = "b" * 64 if state.get("enable_switch_id") and state.get("enabled") else plugin_id
@@ -47,38 +91,79 @@ if action == "install":
         "Manifest": state["manifest"], "plugin": {"Id": state.get("saved_id", plugin_id)}}))
 elif action == "enable" and not state.get("enable_exit"):
     state["enabled"] = True
+elif action == "disable" and state.get("disable_hang"):
+    time.sleep(30)
+elif action == "disable" and not state.get("disable_exit"):
+    state["enabled"] = False
+elif action == "rm" and not state.get("plugin_rm_exit"):
+    state["installed"] = False
 state_path.write_text(json.dumps(state))
 if action == "inspect":
     if state.get("inspect_error"):
         print("permission denied", file=sys.stderr)
         sys.exit(1)
     if not state.get("installed"):
-        print("Error response from daemon: No such plugin: vloopback:v2", file=sys.stderr)
+        print("Error response from daemon: No such plugin: " + sys.argv[3], file=sys.stderr)
         sys.exit(1)
+    if sys.argv[3] == "--format":
+        # what `{{.Id}} {{json .Settings.Env}}` prints: Go's json, no spaces
+        print(plugin()["Id"] + " " + json.dumps(plugin()["Settings"]["Env"], separators=(",", ":")))
+        sys.exit(0)
     print(json.dumps([plugin()]))
 sys.exit(state.get(action + "_exit", 0))
-'''
+"""
 
 
-def _setup_arguments(tmp_path: Path, overrides: dict) -> list[str]:
-    state = {"manifest": LOOPBACK_PLUGIN_DIGEST, "calls": [], **overrides}
+def _setup_arguments(
+    tmp_path: Path,
+    overrides: dict[str, str | int | bool],
+    alias: str = "vloopback:v3",
+    deadline_seconds: int = _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS,
+) -> list[str]:
+    # the real setup command's arguments, with the fake docker and tmp_path as the host
+    tag, digest, generation = LOOPBACK_PLUGIN_BUILDS[alias]
+    state = {"manifest": digest, "generation": generation, "calls": [], **overrides}
     (tmp_path / "state.json").write_text(json.dumps(state))
     plugin_dir = tmp_path / "plugins" / ("a" * 64)
     plugin_dir.mkdir(parents=True)
-    (plugin_dir / "config.json").write_text(json.dumps({
-        "Manifest": state["manifest"], "plugin": {"Id": state.get("saved_id", "a" * 64)},
-    }))
+    (plugin_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "Manifest": state.get("installed_manifest", state["manifest"]),
+                "plugin": {"Id": state.get("saved_id", "a" * 64)},
+            }
+        )
+    )
     docker = tmp_path / "docker"
     docker.write_text(f"#!{sys.executable}\n" + _FAKE_DOCKER)
     docker.chmod(0o700)
-    return [
-        sys.executable, "-c", _SETUP_SCRIPT, str(docker), "vloopback:v2",
-        "daturaai/docker-volume-loopback:1.0.0-lium1", LOOPBACK_PLUGIN_DIGEST,
-        str(tmp_path), "", str(tmp_path / "setup.lock"),
-    ]
+    arguments = shlex.split(loopback_plugin_setup_command(str(tmp_path), alias, deadline_seconds))
+    arguments[0] = sys.executable
+    arguments[3] = str(docker)
+    arguments[-3] = ""
+    arguments[-2] = str(tmp_path / "setup.lock")
+    if arguments[-1]:
+        arguments[-1] = str(tmp_path / "probe-ok")
+        marker_content = {
+            "current": _probe_proof(tmp_path).encode(),
+            "another-install": _probe_proof(tmp_path, plugin_id="b" * 64).encode(),
+            "another-data-dir": _probe_proof(tmp_path, data_dir_suffix="-moved").encode(),
+            "old": b"sha256:" + b"0" * 64,
+            "empty": b"",
+            "binary": b"\xff",
+        }
+        if overrides.get("marker_before"):
+            (tmp_path / "probe-ok").write_bytes(marker_content[str(overrides["marker_before"])])
+    return arguments
+
+
+def _plugin_calls(tmp_path: Path) -> list[list[str]]:
+    calls = json.loads((tmp_path / "state.json").read_text())["calls"]
+    return [call for call in calls if call[0] == "plugin"]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["vloopback:v2", "vloopback:v3"])
 @pytest.mark.parametrize(
     "overrides, success, installs, enables",
     [
@@ -87,7 +172,6 @@ def _setup_arguments(tmp_path: Path, overrides: dict) -> list[str]:
         ({"installed": True, "enabled": True}, True, 0, 0),
         ({"installed": True, "enabled": False}, True, 0, 1),
         ({"manifest": "sha256:" + "0" * 64}, False, 1, 0),
-        ({"installed": True, "enabled": True, "manifest": "wrong"}, False, 0, 0),
         ({"root_mismatch": True}, False, 1, 0),
         ({"duplicate_env": True}, False, 1, 0),
         ({"saved_id": "wrong"}, False, 1, 0),
@@ -97,24 +181,34 @@ def _setup_arguments(tmp_path: Path, overrides: dict) -> list[str]:
     ],
 )
 async def test_setup_verifies_download_before_enable_and_preserves_existing_plugins(
-    tmp_path: Path, overrides: dict, success: bool, installs: int, enables: int,
+    tmp_path: Path,
+    alias: str,
+    overrides: dict[str, str | int | bool],
+    success: bool,
+    installs: int,
+    enables: int,
 ) -> None:
     # Arrange: execute the real remote script against a stateful Docker command fixture.
-    arguments = _setup_arguments(tmp_path, overrides)
+    arguments = _setup_arguments(tmp_path, overrides, alias)
 
     # Act
     result = subprocess.run(
         arguments,
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
 
     # Assert: no unverified binary runs and no existing plugin or volume is removed.
-    saved = json.loads((tmp_path / "state.json").read_text())
-    calls = saved["calls"]
+    calls = _plugin_calls(tmp_path)
     assert (result.returncode == 0) is success, result.stderr
     assert sum(call[1] == "install" for call in calls) == installs
     assert sum(call[1] == "enable" for call in calls) == enables
     assert not any(call[1] in ("rm", "disable", "set") for call in calls)
+    all_calls = json.loads((tmp_path / "state.json").read_text())["calls"]
+    if alias == "vloopback:v2":
+        # v2 is set up exactly as before this generation existed: no probe volume, no container
+        assert all(call[0] == "plugin" for call in all_calls)
     for call in calls:
         if call[1] == "install":
             assert "--disable" in call and "@sha256:" not in " ".join(call)
@@ -123,36 +217,434 @@ async def test_setup_verifies_download_before_enable_and_preserves_existing_plug
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides, success, mounts, disables",
+    [
+        ({}, True, 1, 0),
+        ({"installed": True, "enabled": False}, True, 1, 0),
+        ({"installed": True, "enabled": True}, True, 1, 0),
+        ({"installed": True, "enabled": True, "marker_before": "current"}, True, 0, 0),
+        ({"installed": True, "enabled": True, "marker_before": "old"}, True, 1, 0),
+        ({"installed": True, "enabled": True, "marker_before": "another-install"}, True, 1, 0),
+        ({"installed": True, "enabled": True, "marker_before": "another-data-dir"}, True, 1, 0),
+        ({"marker_before": "current"}, True, 1, 0),
+        ({"run_exit": 1}, False, 1, 1),
+        ({"volume_create_exit": 1}, False, 0, 1),
+        ({"run_exit": 1, "disable_exit": 1}, False, 1, 3),
+    ],
+    ids=[
+        "fresh",
+        "disabled",
+        "enabled-unprobed",
+        "enabled-probed",
+        "enabled-probed-as-old-build",
+        "enabled-probed-as-another-install",
+        "enabled-probed-in-another-data-dir",
+        "absent-with-a-current-marker",
+        "mount-refused",
+        "create-refused",
+        "mount-refused-disable-refused",
+    ],
+)
+async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it_when_the_host_refuses(
+    tmp_path: Path,
+    overrides: dict[str, str | int | bool],
+    success: bool,
+    mounts: int,
+    disables: int,
+) -> None:
+    # a host that refuses the direct-I/O loop (kernel, data-root filesystem) fails at Mount, which
+    # install and enable never reach: the plugin must not stay enabled there, or every create and
+    # the backend's health check would pick it (review, 27.10). A plugin found enabled is probed
+    # too unless the marker of a passed probe is there (a probe the validator's deadline cut short
+    # left the plugin enabled; reread, 27.10). The marker holds the pinned digest and the plugin's ID
+    # and Env: one left by an earlier build, by an installation since removed or for another data
+    # directory proves nothing about this one, which is probed and the marker rewritten once it
+    # mounts (review, 30.10)
+    arguments = _setup_arguments(tmp_path, overrides)
+
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    calls = json.loads((tmp_path / "state.json").read_text())["calls"]
+    assert (result.returncode == 0) is success, result.stderr
+    runs = [call for call in calls if call[0] == "run"]
+    assert len(runs) == mounts
+    assert all("lium-loopback-probe-v3:/mnt" in call and "--network" in call for call in runs)
+    creates = [call for call in calls if call[:2] == ["volume", "create"]]
+    removes = [call for call in calls if call[:2] == ["volume", "rm"]]
+    assert len(creates) == (1 if mounts or "volume_create_exit" in overrides else 0)
+    # leftovers of an earlier probe go before the create, the probe's own after it
+    assert len(removes) == 2 * len(creates)
+    assert all(
+        call[3:5] == ["vloopback:v3", "-o"] and call[-1] == "lium-loopback-probe-v3"
+        for call in creates
+    )
+    assert sum(call[:2] == ["plugin", "disable"] for call in calls) == disables
+    assert all("size=1g" in call and "sparse=true" in call for call in creates)
+    assert (tmp_path / "probe-ok").exists() is success
+    if success:
+        assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
+    if not success:
+        assert "probe volume" in result.stderr
+        if overrides.get("disable_exit"):
+            assert "could not be disabled" in result.stderr
+        else:
+            assert json.loads((tmp_path / "state.json").read_text())["enabled"] is False
+
+
+@pytest.mark.parametrize("disable_exit", [0, 1], ids=["disable-ok", "disable-refused"])
+@pytest.mark.parametrize("run_exit", [0, 1], ids=["probe-ok", "probe-failed"])
+@pytest.mark.parametrize("marker_before", ["empty", "old", "binary", "current"])
+def test_setup_removes_a_marker_of_another_build_before_it_can_fail(
+    tmp_path: Path, marker_before: str, run_exit: int, disable_exit: int
+) -> None:
+    # Arrange: the backend's health check tests the marker's existence only. Were a marker of an
+    # earlier build left while this build's probe fails and the plugin cannot be disabled (volumes
+    # keep it busy), the validator would rent on v2 while the backend checks v3 (reread, 29.10)
+    overrides: dict[str, str | int | bool] = {
+        "installed": True, "enabled": True, "marker_before": marker_before,
+        "run_exit": run_exit, "disable_exit": disable_exit,
+    }
+    arguments = _setup_arguments(tmp_path, overrides)
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert
+    probed = marker_before != "current"
+    assert (result.returncode == 0) is (not probed or run_exit == 0), result.stderr
+    marker = tmp_path / "probe-ok"
+    if result.returncode == 0:
+        assert marker.read_text() == _probe_proof(tmp_path)
+    else:
+        assert not marker.exists()
+        assert ("could not be disabled" in result.stderr) is bool(disable_exit)
+
+
+def test_setup_reclaims_a_probe_container_an_earlier_setup_abandoned(tmp_path: Path) -> None:
+    # Arrange: a setup killed before its cleanup left the probe container (`created`, never exits)
+    # holding the probe volume. The next setup must reclaim both before it probes, and never write
+    # the marker while they stay (reread, 29.10)
+    arguments = _setup_arguments(tmp_path, {"containers": ["lium-loopback-probe-v3"]})
+
+    # Act: two setups, as two rents would run them
+    results = [subprocess.run(arguments, capture_output=True, text=True, timeout=10) for _ in range(2)]
+
+    # Assert: the first reclaims and probes, the second finds the marker and skips
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert [result.returncode for result in results] == [0, 0], [result.stderr for result in results]
+    assert state["containers"] == []
+    assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
+    calls = state["calls"]
+    assert sum(call[0] == "run" for call in calls) == 1
+    first_rm = next(i for i, call in enumerate(calls) if call[:2] == ["rm", "-f"])
+    first_create = next(i for i, call in enumerate(calls) if call[:2] == ["volume", "create"])
+    assert first_rm < first_create
+    assert all(call[-1] == "lium-loopback-probe-v3" for call in calls if call[:2] == ["rm", "-f"])
+
+
+def test_setup_fails_without_a_marker_when_an_abandoned_probe_container_cannot_be_removed(
+    tmp_path: Path,
+) -> None:
+    # Arrange: the abandoned container refuses `docker rm -f`, so its volume stays in use
+    arguments = _setup_arguments(tmp_path, {"containers": ["lium-loopback-probe-v3"], "rm_exit": 1})
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert: a leftover is a setup error, not a warning, and no proof is written over it
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert result.returncode == 1
+    assert "an earlier probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3" in result.stderr
+    assert not (tmp_path / "probe-ok").exists()
+    assert not any(call[0] == "run" for call in state["calls"])
+    assert state["enabled"] is False
+
+
+def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(tmp_path: Path) -> None:
+    # Arrange: the probe's `sync` outlives the script's per-command timeout. Python kills the docker
+    # client, the daemon keeps the container with the volume attached: unless the container goes
+    # first, the volume stays in use and the plugin cannot be disabled, and every retry adds a
+    # container (review, 29.10)
+    arguments = _setup_arguments(tmp_path, {"run_hang": True})
+    arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", "PROBE_SECONDS = 1")
+
+    # Act: two attempts, as two rents would retry the setup
+    results = [subprocess.run(arguments, capture_output=True, text=True, timeout=20) for _ in range(2)]
+
+    # Assert
+    state = json.loads((tmp_path / "state.json").read_text())
+    for result in results:
+        assert result.returncode == 1
+        assert "probe volume failed: TimeoutExpired" in result.stderr
+        assert "could not be disabled" not in result.stderr
+    assert state["containers"] == []
+    assert state["enabled"] is False
+    assert not (tmp_path / "probe-ok").exists()
+    calls = state["calls"]
+    runs = [i for i, call in enumerate(calls) if call[0] == "run"]
+    assert len(runs) == 2
+    for run in runs:
+        assert calls[run][calls[run].index("--name") + 1] == "lium-loopback-probe-v3"
+        after = calls[run + 1 :]
+        container_rm = next(i for i, call in enumerate(after) if call[:2] == ["rm", "-f"])
+        volume_rm = next(i for i, call in enumerate(after) if call[:2] == ["volume", "rm"])
+        assert container_rm < volume_rm
+
+
+def test_setup_replaces_an_earlier_v3_build_that_owns_no_volumes(tmp_path: Path) -> None:
+    # Arrange: a staging node probed the earlier pinned v3 build (lium7); lium8 is pinned now
+    old_digest = "sha256:" + "0" * 64
+    arguments = _setup_arguments(
+        tmp_path,
+        {"installed": True, "enabled": True, "installed_manifest": old_digest, "marker_before": "old"},
+    )
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert: the old build goes, the pinned one is installed, verified and probed
+    assert result.returncode == 0, result.stderr
+    plugin_actions = [call[1] for call in _plugin_calls(tmp_path)]
+    assert plugin_actions[plugin_actions.index("disable") :].count("install") == 1
+    assert plugin_actions.index("disable") < plugin_actions.index("rm") < plugin_actions.index("install")
+    assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
+
+
+def test_setup_replaces_an_earlier_v3_build_whose_only_volume_is_an_abandoned_probe(tmp_path: Path) -> None:
+    # Arrange: a setup on the earlier build was killed before its cleanup, so its probe volume is the
+    # only volume left on that build; the cleanup that reclaims it runs only after the replacement
+    arguments = _setup_arguments(
+        tmp_path,
+        {
+            "installed": True, "enabled": True, "installed_manifest": "sha256:" + "0" * 64,
+            "marker_before": "old", "volumes": {"lium-loopback-probe-v3": "vloopback:v3"},
+        },
+    )
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert: the abandoned probe does not pin the host to the earlier build
+    assert result.returncode == 0, result.stderr
+    plugin_actions = [call[1] for call in _plugin_calls(tmp_path)]
+    assert plugin_actions.index("rm") < plugin_actions.index("install")
+    assert json.loads((tmp_path / "state.json").read_text())["volumes"] == {}
+    assert (tmp_path / "probe-ok").read_text() == _probe_proof(tmp_path)
+
+
+def test_setup_keeps_an_earlier_v3_build_that_still_owns_volumes(tmp_path: Path) -> None:
+    # Arrange: a rental volume still lives on the earlier build
+    arguments = _setup_arguments(
+        tmp_path,
+        {
+            "installed": True, "enabled": True, "installed_manifest": "sha256:" + "0" * 64,
+            "marker_before": "old", "volume_drivers": ["local", "vloopback:v3"],
+        },
+    )
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert: nothing is disabled, removed or installed; the host falls back until the volumes drain
+    assert result.returncode == 1
+    assert "still owns volumes" in result.stderr
+    assert [call[1] for call in _plugin_calls(tmp_path)] == ["inspect"]
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_v2_setup_never_replaces_a_plugin_of_another_build(tmp_path: Path) -> None:
+    # Arrange
+    arguments = _setup_arguments(
+        tmp_path, {"installed": True, "enabled": True, "manifest": "wrong"}, "vloopback:v2"
+    )
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+
+    # Assert
+    assert result.returncode == 1
+    assert "does not match the pinned digest" in result.stderr
+    assert [call[1] for call in _plugin_calls(tmp_path)] == ["inspect"]
+
+
+def test_setup_reports_a_disable_that_times_out_after_a_failed_probe(tmp_path: Path) -> None:
+    # Arrange: the probe mount fails, then the daemon hangs on every disable
+    arguments = _setup_arguments(tmp_path, {"run_exit": 1, "disable_hang": True})
+    arguments[2] = _SETUP_SCRIPT.replace("DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1")
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+
+    # Assert: bounded retries, then both reasons reach stderr
+    assert result.returncode == 1
+    assert "probe volume mount failed" in result.stderr
+    assert "could not be disabled" in result.stderr
+    assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 3
+    assert not (tmp_path / "probe-ok").exists()
+
+
+
+def _script_with_one_second_cleanup_and_disable_tries() -> str:
+    return _SETUP_SCRIPT.replace("CLEANUP_SECONDS = 10", "CLEANUP_SECONDS = 1").replace(
+        "DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1"
+    )
+
+
+def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_inside_it(tmp_path: Path) -> None:
+    # Arrange: the install eats into the validator's deadline, the probe never returns and the daemon
+    # hangs on every disable (review, 30.10: the probe's budget started after install and enable, so the
+    # deadline cut the disable tries and stderr only said the setup was cut short). The reserve is 15 s
+    # with 1 s cleanups and disable tries, so 2 s of install leaves the probe about 3 s
+    deadline_seconds = 20
+    arguments = _setup_arguments(
+        tmp_path, {"install_delay": 2, "run_hang": True, "disable_hang": True}, deadline_seconds=deadline_seconds
+    )
+    arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
+    started = time.monotonic()
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
+
+    # Assert: every disable try ran and both reasons reached stderr before the deadline
+    assert time.monotonic() - started < deadline_seconds
+    assert result.returncode == 1
+    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "could not be disabled" in result.stderr
+    assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 3
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_setup_with_no_time_left_to_probe_never_enables_the_plugin(tmp_path: Path) -> None:
+    # Arrange: the install outlasts what the deadline leaves before the 15 s reserve and the daemon would
+    # hang on every disable (review, 30.10: an enable the probe had no time for left a disable to the deadline)
+    deadline_seconds = 20
+    arguments = _setup_arguments(
+        tmp_path, {"install_delay": 6, "disable_hang": True}, deadline_seconds=deadline_seconds
+    )
+    arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
+    started = time.monotonic()
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
+
+    # Assert: the install is cut where the reserve begins and nothing is enabled, so nothing needs disabling
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert time.monotonic() - started < deadline_seconds - 10
+    assert result.returncode == 1
+    assert "too little of the validator's deadline left to probe" in result.stderr
+    assert [call[1] for call in _plugin_calls(tmp_path) if call[1] in ("enable", "disable")] == []
+    assert not any(call[0] == "run" for call in state["calls"])
+    assert state.get("enabled", False) is False
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_setup_whose_lock_wait_ate_the_reserve_stops_hung_disables_before_the_deadline(tmp_path: Path) -> None:
+    # Arrange: an enabled v3 that was never probed, another setup holding the lock for 12 of the 20 s and a
+    # daemon that hangs on every disable: the reserve is gone, the three disable tries no longer fit
+    deadline_seconds = 20
+    arguments = _setup_arguments(
+        tmp_path, {"installed": True, "enabled": True, "disable_hang": True}, deadline_seconds=deadline_seconds
+    )
+    arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
+    with open(tmp_path / "setup.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = time.monotonic()
+        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(12)
+
+    # Act
+    _, stderr = process.communicate(timeout=60)
+
+    # Assert: the disable tries stop before the validator's `timeout` would, and both reasons reach stderr
+    assert time.monotonic() - started < deadline_seconds
+    assert process.returncode == 1
+    assert "too little of the validator's deadline left to probe" in stderr
+    assert "could not be disabled" in stderr
+    assert 0 < sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) < 3
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_setup_reports_a_probe_that_ran_out_of_its_budget_and_a_disable_that_hung(tmp_path: Path) -> None:
+    # Arrange: the probe never returns, then the daemon hangs on every disable
+    arguments = _setup_arguments(tmp_path, {"run_hang": True, "disable_hang": True})
+    arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", "PROBE_SECONDS = 1").replace(
+        "DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1"
+    )
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+
+    # Assert
+    assert result.returncode == 1
+    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "could not be disabled" in result.stderr
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: Path) -> None:
+    # Arrange: the probe is still running when the validator's `timeout` sends SIGTERM
+    arguments = _setup_arguments(tmp_path, {"run_hang": True})
+    process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 10
+    while not any(call[0] == "run" for call in json.loads((tmp_path / "state.json").read_text())["calls"]):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+
+    # Act
+    process.send_signal(signal.SIGTERM)
+    _, stderr = process.communicate(timeout=20)
+
+    # Assert
+    assert process.returncode == 1
+    assert "setup cut short by the validator's deadline" in stderr
+    assert not (tmp_path / "probe-ok").exists()
+
+@pytest.mark.asyncio
 async def test_concurrent_setup_waits_for_the_first_install(tmp_path: Path) -> None:
     # Arrange: two rents reach the same absent plugin while its installation is still running.
     arguments = _setup_arguments(tmp_path, {"install_delay": 0.2})
 
     # Act
-    processes = await asyncio.gather(*(
-        asyncio.create_subprocess_exec(
-            *arguments, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        ) for _ in range(2)
-    ))
-    outputs = await asyncio.wait_for(asyncio.gather(*(p.communicate() for p in processes)), timeout=10)
+    processes = await asyncio.gather(
+        *(
+            asyncio.create_subprocess_exec(
+                *arguments,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            for _ in range(2)
+        )
+    )
+    outputs = await asyncio.wait_for(
+        asyncio.gather(*(p.communicate() for p in processes)), timeout=10
+    )
 
     # Assert: both rents see the verified plugin; the second cannot race another install or enable.
     assert all(p.returncode == 0 for p in processes), outputs
-    calls = json.loads((tmp_path / "state.json").read_text())["calls"]
+    calls = _plugin_calls(tmp_path)
     assert sum(call[1] == "install" for call in calls) == 1
     assert sum(call[1] == "enable" for call in calls) == 1
 
 
+@pytest.mark.parametrize("alias, generation", [("vloopback:v2", "v2"), ("vloopback:v3", "v3")])
 @pytest.mark.asyncio
-async def test_setup_command_quotes_the_root_and_never_installs_a_digest() -> None:
+async def test_setup_command_quotes_the_root_and_never_installs_a_digest(alias, generation) -> None:
     # Arrange
     root = "/data/docker space'$(touch /tmp/unwanted)"
+    tag, digest, _ = LOOPBACK_PLUGIN_BUILDS[alias]
 
     # Act
-    args = shlex.split(loopback_plugin_setup_command(root, "vloopback:v2"))
+    args = shlex.split(loopback_plugin_setup_command(root, alias, 150))
 
-    # Assert: the shell sees one literal path, with the expected digest passed separately.
-    assert args[-3] == root
-    assert args[-2] == "/proc/1/root"
-    assert args[-1] == "/run/lock/lium-loopback-v2.lock"
+    # Assert: the shell sees one literal path, with its generation's tag and digest passed separately.
+    assert args[-4] == root
+    assert args[-5] == "150"
+    assert args[-3] == "/proc/1/root"
+    assert args[-2] == f"/run/lock/lium-loopback-{generation}.lock"
+    # the marker path is read by the backend's health check too (lium-platform#2126) and stays fixed
+    assert args[-1] == ("" if generation == "v2" else f"/run/lock/lium-loopback-{generation}.probe-ok")
     assert args[2] == _SETUP_SCRIPT
-    assert args[-4] == LOOPBACK_PLUGIN_DIGEST
+    assert args[4:8] == [alias, tag, digest, generation]
+    assert args[8] == ("" if generation == "v2" else "docker.io/library/alpine:3.19")
+    assert "sha256" not in tag

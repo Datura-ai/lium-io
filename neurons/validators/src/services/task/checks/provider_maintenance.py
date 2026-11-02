@@ -1,7 +1,9 @@
 """DAH-4709: a node inside its provider maintenance window fails PROVIDER_MAINTENANCE (score 0).
 
-The window is compared with the cycle start (the clock of job_batch_id), half-open
-[starting_at, expiring_at). Verification is kept: the node is not re-verified after the window.
+A node is in its window when the cycle's backend snapshot lists it in maintenance_executor_ids,
+the same gate that zeroes its incentive. The cycle runs about one cycle behind its job_batch_id
+label, so the label is not compared with the window: a window the provider finished before the
+snapshot no longer applies. Verification is kept: the node is not re-verified after the window.
 A rented node is judged inside TenantEnforcementCheck, after its pod states are read; this
 check fails an idle node before any probe runs on a machine the provider is working on.
 """
@@ -32,17 +34,12 @@ def cycle_started_at(job_batch_id: str | None) -> datetime:
 
 
 def maintenance_window_at_cycle_start(ctx: Context) -> MaintenanceWindow | None:
-    """The executor's maintenance window when this cycle started inside it, else None."""
+    """The executor's maintenance window when it was running at the cycle's snapshot, else None."""
     rented_data = ctx.state.rented_data
-    window = (
-        rented_data.maintenance_windows_by_executor.get(str(ctx.executor.uuid))
-        if rented_data
-        else None
-    )
-    if window is None:
+    executor_id = str(ctx.executor.uuid)
+    if not rented_data or executor_id not in rented_data.maintenance_executor_ids:
         return None
-    started = cycle_started_at(ctx.config.job_batch_id)
-    return window if _utc(window.starting_at) <= started < _utc(window.expiring_at) else None
+    return rented_data.maintenance_windows_by_executor.get(executor_id)
 
 
 def maintenance_failure(

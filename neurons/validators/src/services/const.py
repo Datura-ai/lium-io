@@ -2,9 +2,11 @@ import re
 
 MIN_JOB_TAKEN_TIME = 20
 
-# the plugin alias new rental volumes are created on; the backend health check is told it
+# the plugin aliases new rental volumes are created on: v3 with LOOPBACK_PLUGIN_V3_ENABLED, else v2
+# (loopback_plugin_setup.current_loopback_plugin_alias); the backend health check is told the one in use
 LOOPBACK_PLUGIN_ALIAS = "vloopback:v2"
-# the old plugin (`vloopback:latest`): a new volume goes there only when v2 cannot be used
+LOOPBACK_PLUGIN_V3_ALIAS = "vloopback:v3"
+# the old plugin (`vloopback:latest`): a new volume goes there only when the current plugin cannot be used
 LEGACY_LOOPBACK_PLUGIN_ALIAS = "vloopback"
 
 GPU_MODEL_RATES = {
@@ -38,6 +40,9 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce RTX 4060": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
+    # DAH-5508: no rental history yet, so no share, as the RTX 5090 D and the Quadro RTX 8000 it was paid as before.
+    # Only reachable with RTX_4090_48GB_MODEL_ENABLED on (see gpu_spec_table.classify_gpu_model).
+    "NVIDIA GeForce RTX 4090 48GB": 0.0,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
     "NVIDIA RTX PRO 2000 Blackwell": 0.0,
     "NVIDIA RTX PRO 4000 Blackwell": 0.0,

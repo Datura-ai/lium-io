@@ -1424,6 +1424,13 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    VERIFY_DEFERRED = MessageTemplate(
+        event="Port verification deferred: the Docker filesystem is backed up with a tenant's writes",
+        reason="PORT_VERIFY_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
 
 
 class DiskSpaceMessages:
@@ -2069,7 +2076,7 @@ class PinnedMemoryProbeMessages:
 
 class NvlinkFaultMessages:
     """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED fails
-    the node until a probe passes again."""
+    the node until a probe passes again; MISSING fails a full SXM board that reports no NVLink at all."""
 
     PROBE_OK = MessageTemplate(
         event="NVLink multicast probe passed",
@@ -2097,6 +2104,20 @@ class NvlinkFaultMessages:
             "Stop the workloads, reset the GPUs (`nvidia-smi -r`) and restart nvidia-fabricmanager, or "
             "reboot. Then restart the executor container (`docker restart executor-executor-1`) so it "
             "sees the GPUs again. If the errors come back, service the board."
+        ),
+    )
+    MISSING = MessageTemplate(
+        event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
+        reason="NVLINK_MISSING",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink works again",
+        remediation=(
+            "These GPUs are SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows PCIe paths "
+            "(PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. Start "
+            "nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, same version as the "
+            "driver), check `nvidia-smi nvlink -s`, then restart the executor container "
+            "(`docker restart executor-executor-1`). If the links stay down, service the board."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2660,6 +2681,16 @@ class GpuAttestationIdentityMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    # Fails the node only under CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; in shadow it is a log line.
+    CC_VBIOS_BELOW_MINIMUM = MessageTemplate(
+        event="GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing",
+        reason="CC_VBIOS_BELOW_MINIMUM",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 while the finding stands",
+        remediation="Pause new rentals and wait for running ones to end, since the update restarts the host. Then "
+        "update every GPU's VBIOS to at least NVIDIA's minimum for CC in R595 (B200 97.00.E4.00.xx, B300 97.10.64.00.xx).",
     )
     OK = MessageTemplate(
         event="GPU identity verified against NVIDIA's root",
