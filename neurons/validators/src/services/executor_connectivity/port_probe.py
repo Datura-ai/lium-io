@@ -51,8 +51,16 @@ class PortProbe:
             # ports are kept: PortConnectivityCheck decides whether this reading fails the node. A short split
             # node still runs the later tiers; the result keeps the "blocked" reading.
             return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
-        successful, failed = batch.successful, batch.failed
-        tier = "batch"
+        successful, failed = list(batch.successful), list(batch.failed)
+        tier, best = "batch", len(successful)
+
+        def merge(ok, bad, name) -> None:
+            # a port any tier verified counts: tiers can verify different ports of the same node
+            nonlocal successful, failed, tier, best
+            successful = list(dict.fromkeys([*successful, *ok]))
+            failed = [p for p in dict.fromkeys([*failed, *bad]) if p not in set(successful)]
+            if len(ok) >= best:
+                tier, best = name, len(ok)
 
         if short(successful):
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
@@ -66,8 +74,7 @@ class PortProbe:
                 max_ports=max(50, min_ports),
                 log_ctx=log_ctx,
             )
-            if len(semi_ok) >= len(successful):
-                successful, failed, tier = semi_ok, semi_failed, "semi_batch"
+            merge(semi_ok, semi_failed, "semi_batch")
 
         if short(successful):
             logger.debug(
@@ -80,7 +87,6 @@ class PortProbe:
                 max_ports=max(10, min_ports),
                 log_ctx=log_ctx,
             )
-            if len(fb_ok) >= len(successful):
-                successful, failed, tier = fb_ok, fb_failed, "fallback"
+            merge(fb_ok, fb_failed, "fallback")
 
         return PortProbeResult(tuple(successful), tuple(failed), tier, batch.external)

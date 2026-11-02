@@ -205,3 +205,39 @@ async def test_port_probe_blocked_reading_stops_an_unsplit_node(mocker):
 
     assert result.external == "blocked" and result.tier == "batch"
     semi.verify.assert_not_called()
+
+
+def _span(lo, hi):
+    return [PortPair(p, p) for p in range(lo, hi)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "semi_ok, fb_ok, expect_ok, expect_tier",
+    [
+        # busy 40000; tiers verify complementary-overlapping ranges: every distinct success counts
+        (_span(40010, 40030), _span(40001, 40024), _span(40010, 40030) + _span(40001, 40010), "fallback"),
+        # fully overlapping: no double count
+        (_span(40001, 40021), _span(40001, 40011), _span(40001, 40021), "semi_batch"),
+        # complementary halves
+        (_span(40015, 40030), _span(40001, 40015), _span(40015, 40030) + _span(40001, 40015), "semi_batch"),
+        # busy port in the middle stays failed
+        (_span(40000, 40012), _span(40013, 40030), _span(40000, 40012) + _span(40013, 40030), "fallback"),
+    ],
+)
+async def test_port_probe_merges_distinct_successes_across_tiers(mocker, semi_ok, fb_ok, expect_ok, expect_tier):
+    ports = _span(40000, 40030)
+    batch = mocker.Mock()
+    batch.verify = mocker.AsyncMock(return_value=BatchResult([], ports, "blocked"))
+    semi = mocker.Mock()
+    semi.verify = mocker.AsyncMock(return_value=(semi_ok, [p for p in ports if p not in semi_ok]))
+    fallback = mocker.Mock()
+    fallback.verify = mocker.AsyncMock(return_value=(fb_ok, [p for p in ports if p not in fb_ok]))
+
+    result = await PortProbe(batch, semi, fallback).probe(
+        ports, ssh_client=mocker.Mock(), host="127.0.0.1", min_ports=30
+    )
+
+    assert list(result.successful) == expect_ok
+    assert set(result.failed) == set(ports) - set(expect_ok)
+    assert result.tier == expect_tier
