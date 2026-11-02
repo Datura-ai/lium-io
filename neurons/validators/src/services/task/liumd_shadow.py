@@ -426,8 +426,8 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     docker = answer.step("docker")
     data = docker.data if docker.status == "ok" and isinstance(docker.data, dict) else None
     if data:
-        if "sysbox_runtime" in specs:
-            check("docker.sysbox_runtime", data.get("sysbox_runtime"), specs.get("sysbox_runtime"))
+        # `specs["sysbox_runtime"]` is the GPU compatibility probe, not the runtime list that
+        # liumd's docker step reports, so the two are not comparable.
         if isinstance(data.get("containers"), list) and isinstance(specs.get("docker_containers"), list):
             liumd_names = sorted(
                 c.get("name") for c in data["containers"] if isinstance(c, dict) and c.get("name")
