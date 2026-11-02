@@ -46,6 +46,10 @@ for image in $(docker image ls --quiet --no-trunc daturaai/compute-subnet-execut
         echo "Removed old executor image $image"
     fi
 done
+# the validator's per-cycle probes run the :latest tag; keep it local so they never wait on the registry
+if [ -n "$current_image" ]; then
+    docker tag "$current_image" daturaai/compute-subnet-executor:latest || true
+fi
 
 # Clean docker images
 docker image prune -f

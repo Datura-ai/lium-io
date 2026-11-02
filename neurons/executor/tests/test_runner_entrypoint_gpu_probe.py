@@ -170,3 +170,14 @@ def test_a_leftover_probe_that_cannot_be_removed_holds_the_update(tmp_path):
     assert not recreated(calls)
     assert "cannot be removed (dead1)" in result.stdout
     assert "sleep 300" in calls
+
+
+def test_the_running_image_keeps_the_latest_tag_after_the_cleanup(tmp_path):
+    # review 4446885396: the validator's probes run daturaai/compute-subnet-executor:latest; the cleanup must not
+    # leave that tag to the registry
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage"
+    )
+
+    tag = calls.index("tag sha256:executorimage daturaai/compute-subnet-executor:latest")
+    assert tag > calls.index("image rm sha256:previous")
