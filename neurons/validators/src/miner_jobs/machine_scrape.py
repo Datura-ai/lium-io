@@ -904,9 +904,14 @@ def hard_disk_reading(usage):
 
 def report_tighter_store(hard_disk, store_usage):
     # hard_disk is data-root's reading after its filler run volumes are released; a rental also needs room in
-    # the containerd store on its other filesystem, so the tighter of the two is what a renter can get
-    if store_usage and store_usage.free // 1024 < hard_disk.get("hard_disk_free", float("inf")):
+    # the containerd store on its other filesystem, so the tighter of the two is what a renter can get:
+    # the smaller filesystem's size (what the disk gate measures) and the least free room of the two
+    if not store_usage or "hard_disk_total" not in hard_disk:
+        return
+    free_kb = min(store_usage.free // 1024, hard_disk["hard_disk_free"])
+    if store_usage.total // 1024 < hard_disk["hard_disk_total"]:
         hard_disk.update(hard_disk_reading(store_usage))
+    hard_disk["hard_disk_free"] = free_kb
 
 
 def disk_root_dir(info):

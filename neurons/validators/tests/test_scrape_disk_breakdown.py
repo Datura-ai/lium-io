@@ -857,6 +857,9 @@ _BIG = _Usage(14 * 1024 * _GiB, 1024 * _GiB, 13 * 1024 * _GiB)
         (_BIG, _SMALL, False, 400, 150),
         # store with 50 GiB free, data-root on 14 TiB: the store binds, and the run volumes free nothing there
         (_SMALL, _BIG, False, 400, 50),
+        # store undersized but with more free room than data-root: the store's size, data-root's free room
+        (_Usage(400 * _GiB, 50 * _GiB, 350 * _GiB), _Usage(14 * 1024 * _GiB, 14 * 1024 * _GiB - 50 * _GiB, 50 * _GiB),
+         False, 400, 150),
     ],
 )
 def test_a_renter_gets_the_room_both_the_store_and_data_root_have(
