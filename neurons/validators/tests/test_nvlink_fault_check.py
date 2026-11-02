@@ -226,6 +226,14 @@ async def test_a_full_sxm_board_without_nvlink_fails_without_probing(context_fac
 
 
 @pytest.mark.asyncio
+async def test_a_raw_tesla_h100_name_is_matched_after_normalization(context_factory):
+    result, _ = await run_check(context_factory, sxm_board(name="Tesla H100 80GB HBM3"))
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVLINK_MISSING"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "specs",
     [

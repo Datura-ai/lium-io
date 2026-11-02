@@ -5,6 +5,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from services.gpu_spec_table import normalize_gpu_model
+
 from ..messages import NvlinkFaultMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -56,11 +58,13 @@ class NvlinkFaultCheck:
         specs = ctx.state.specs or {}
         interconnect = specs.get("interconnect")
         if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is True):
-            board = _baseboard_without_nvlink(specs, interconnect)
-            if board is not None:
+            missing_nvlink = _missing_nvlink_on_sxm_board(specs, interconnect)
+            if missing_nvlink is not None:
                 return CheckResult(
                     passed=False,
-                    event=render_message(Msg.MISSING, ctx=ctx, check_id=self.check_id, what=board),
+                    event=render_message(
+                        Msg.MISSING, ctx=ctx, check_id=self.check_id, what=missing_nvlink
+                    ),
                 )
             return CheckResult(
                 passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
@@ -99,12 +103,13 @@ class NvlinkFaultCheck:
         )
 
 
-def _baseboard_without_nvlink(specs: dict[str, Any], interconnect: Any) -> dict[str, Any] | None:
+def _missing_nvlink_on_sxm_board(specs: dict[str, Any], interconnect: Any) -> dict[str, Any] | None:
     # only an explicit nvlink False counts; an old executor without the interconnect scrape is skipped
     if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is False):
         return None
     details = (specs.get("gpu") or {}).get("details") or []
-    names = {gpu.get("name") for gpu in details if isinstance(gpu, dict)}
+    # specs keep the raw NVML name (e.g. "Tesla H100 80GB HBM3")
+    names = {normalize_gpu_model(gpu.get("name")) for gpu in details if isinstance(gpu, dict)}
     if len(details) < BASEBOARD_GPU_COUNT or len(names) != 1 or not names <= NVLINK_BASEBOARD_GPUS:
         return None
     return {
