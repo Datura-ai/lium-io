@@ -120,3 +120,18 @@ async def test_a_hung_backend_answer_is_bounded_and_keeps_the_pod(retry_ssh_mock
     ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout=f"pod_{NEWER}\n", stderr=""))
 
     assert await svc.clean_existing_containers(ssh_client=ssh_client, default_extra={}, pod_name="pod_target") == []
+
+
+@pytest.mark.asyncio
+async def test_lookups_per_sweep_are_capped_and_the_rest_kept(retry_ssh_mock, monkeypatch):
+    monkeypatch.setattr(ds_module, "_POD_RENTAL_LOOKUPS_PER_SWEEP", 2)
+    pods = [f"{i:08d}-1111-1111-1111-111111111111" for i in range(5)]
+    backend_client = Mock(get_pod_rental_active=AsyncMock(return_value=CLOSED))
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock(), backend_client=backend_client)
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout="".join(f"pod_{p}\n" for p in pods), stderr=""))
+
+    removed = await svc.clean_existing_containers(ssh_client=ssh_client, default_extra={}, pod_name="pod_target")
+
+    assert backend_client.get_pod_rental_active.await_count == 2
+    assert removed == [f"pod_{p}" for p in pods[:2]]
