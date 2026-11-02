@@ -81,6 +81,7 @@ class ExecutorConnectivityService:
                 dind_error=verification.dind_error,
                 port_ranges=verification.port_ranges,
                 probe_tier=verification.probe_tier,
+                external_probe=verification.external_probe,
                 declared_port_count=verification.declared_port_count,
                 sysbox_measured=verification.sysbox_measured,
             )

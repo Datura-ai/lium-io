@@ -317,9 +317,16 @@ class GpuAttestationIdentityCheck:
                             findings.append("serial_moved")
             previous_host = stored[host_key]
             previous_host = json.loads(previous_host) if previous_host else None
-            if previous_host and slots and previous_host.get("slots") == slots and not set(previous_host.get("uuids") or []) & set(reported):
-                # every UUID new, same models in the same slots: renamed cards. Replacing one failed card keeps the
-                # other UUIDs and does not match; replacing every card in place with the same model would.
+            if (
+                previous_host
+                and slots
+                and previous_host.get("slots") == slots
+                and not set(previous_host.get("uuids") or []) & set(reported)
+                and not all(_serial(hw) for hw in hw_by_uuid.values())
+            ):
+                # every UUID new, same models in the same slots, no serials to tell the cards apart: renamed cards.
+                # With a real serial on every card, a known card under a new UUID is serial_moved; none moved means
+                # a different card set (e.g. a VM moved to new hardware), so it is re-pinned below.
                 findings.append("uuids_changed_same_slots")
             if any(m.startswith("identity_was_under") for m in moved.values()):
                 findings.append("identity_moved")  # the attested card under a new UUID: a swap

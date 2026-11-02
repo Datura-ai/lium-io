@@ -6,7 +6,6 @@ import uuid
 import aiohttp
 from asyncssh import SSHClientConnection
 
-from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -159,16 +158,19 @@ class BatchVerifier:
         if external_blocked:
             logger.warning(
                 _m(
-                    f"ports {[p.external for p in sample]} answer the validator but not the outside prober"
-                    f"{'' if settings.EXTERNAL_PORT_PROBE_ENFORCE else ' (log-only)'}",
+                    f"ports {[p.external for p in sample]} answer the validator but not the outside prober",
                     extra=get_extra_info(log_ctx),
                 )
             )
-        return BatchResult((reached or []) + successful, failed, external_blocked and settings.EXTERNAL_PORT_PROBE_ENFORCE)
+        external = "blocked" if external_blocked else "passed" if reached else None
+        return BatchResult((reached or []) + successful, failed, external)
 
 
 class FallbackVerifier:
     """Verifies ports sequentially using -p publish."""
+
+    # DAH-5419: `docker run` over SSH has no timeout of its own; a stuck daemon held it until the task was dropped
+    START_TIMEOUT_SEC = 30
 
     def __init__(self, port_tester: PortTester, runner: ContainerRunner):
         self.port_tester = port_tester
@@ -201,7 +203,9 @@ class FallbackVerifier:
 
                 started = False
                 try:
-                    start_result = await self.runner.run(ssh_client, name, script, network_flag, 10)
+                    start_result = await asyncio.wait_for(
+                        self.runner.run(ssh_client, name, script, network_flag, 10), self.START_TIMEOUT_SEC
+                    )
                     if not start_result.ok:
                         logger.debug(
                             _m(
@@ -225,6 +229,18 @@ class FallbackVerifier:
                         successful.append(port)
                     else:
                         failed.append(port)
+
+                except TimeoutError:
+                    # the later ports would hang the same way; ending here lets the round report the port check
+                    logger.warning(
+                        _m(
+                            f"fallback: container start timed out after {self.START_TIMEOUT_SEC}s, "
+                            f"{len(ports_to_test) - idx + 1} port(s) left untested",
+                            extra=get_extra_info(log_ctx),
+                        )
+                    )
+                    failed.extend(ports_to_test[idx - 1:])
+                    break
 
                 except Exception as e:
                     logger.error(
