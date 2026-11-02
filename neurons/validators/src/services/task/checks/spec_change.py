@@ -33,6 +33,8 @@ class SpecChangeCheck:
                 passed=False,
                 event=event,
                 updates={"clear_verified_job_info": True},
+                # a live-rental GPU set change already failed GpuFingerprintCheck non-fatally: let the run reach the pod checks
+                fatal=ctx.gpu_fingerprint_passed,
             )
 
         event = render_message(

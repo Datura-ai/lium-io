@@ -13,7 +13,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
-from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
+from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -378,7 +378,8 @@ class ResultHandler:
                 await self.redis_service.set_verified_job_info(
                     miner_hotkey=miner_hotkey,
                     executor_id=executor_id,
-                    prev_info=verified_job_info,
+                    # a full set of other cards: this cycle's set becomes the anchor
+                    prev_info={**verified_job_info, GPU_ANCHOR_KEY: ""} if context.gpu_reanchor else verified_job_info,
                     success=True,
                     spec=gpu_model_count,
                     uuids=gpu_uuids,
@@ -387,12 +388,13 @@ class ResultHandler:
             # On failure, either clear or mark as failed
             if context.clear_verified_job_info:
                 reason = self._resolve_clear_reason(context.clear_verified_job_reason)
-                # DAH-2865: the address this cycle checked, so the backend can drop a reset that arrives after the
-                # provider moved the node to another address under the same id
+                # DAH-2865: the address and cycle this check ran in, so the backend can drop a reset that arrives
+                # after the provider moved the node to another address under the same id, however late it arrives
                 evidence = {
                     **(context.clear_verified_job_evidence or {}),
                     "executor_ip": context.executor.address,
                     "executor_port": context.executor.port,
+                    **({"job_batch_id": context.config.job_batch_id} if context.config.job_batch_id else {}),
                 }
                 await self.redis_service.clear_verified_job_info(
                     miner_hotkey=miner_hotkey,
@@ -400,7 +402,6 @@ class ResultHandler:
                     prev_info=verified_job_info,
                     reason=reason,
                     evidence=evidence,
-                    anchor_broken=context.gpu_anchor_broken,
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                 )
             else:
