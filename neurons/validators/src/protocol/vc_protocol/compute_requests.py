@@ -93,6 +93,9 @@ class RentedExecutor(BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-5244 (protocol 2.1.0): a pod on the node has an open rental contracted as a self-rent. A backend
+    # before 2.1.0 omits it, so every rental reads as a third party's - today's behaviour.
+    self_rent: bool = False
 
     def get_rented_ports(self) -> list[int]:
         """Aggregate rented ports from all pods."""
@@ -196,9 +199,6 @@ class RentedExecutorsResponse(BaseModel):
     # and rentals are untouched. A held new node is also absent from the Discord list above.
     # Additive with an empty default: an older backend names nobody.
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters in the
-    # backend's report window (DAH-4482): each owes a post-rental GPU recheck. Additive with an empty default.
-    renter_hardware_fault_executor_ids: list[str] = []
     # executor_ids inside a running provider maintenance window (DAH-4709): no incentive from either pool,
     # rented or not. Additive with an empty default: an older backend names nobody.
     maintenance_executor_ids: list[str] = []
