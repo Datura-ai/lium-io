@@ -592,7 +592,9 @@ def _filler_revenue_now(rented_data: RentedExecutorsResponse | None, previous: J
     if rented_data is None:
         return previous.filler_revenue_per_gpu_hour
     return rented_data.get_filler_revenue_per_gpu_hour(
-        BASE_GPU_MAP.get(previous.gpu_model or ""), previous.gpu_count, settings.FILLER_REVENUE_MIN_GPU_HOURS
+        BASE_GPU_MAP.get(previous.gpu_model or ""),
+        previous.gpu_count,
+        settings.get_filler_revenue_min_gpu_hours(previous.is_spot),
     )
 
 

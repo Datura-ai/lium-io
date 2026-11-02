@@ -153,6 +153,8 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
     for fillers in rented_data.all_filler_containers_by_executor.values():
         names.update(fillers)
     names.update(name for name in rented_data.filler_containers_by_executor.values() if name)
+    # DAH-5510: a moved pod's old container is kept on the node it left until the backend's removal time
+    names.update(getattr(rented_data, "retained_container_names", None) or [])
     return names
 
 

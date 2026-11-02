@@ -471,6 +471,7 @@ def test_the_cycle_cleanup_protects_the_parked_twin_of_every_rented_pod():
         executors={"exec-1": SimpleNamespace(pods=pods)},
         all_filler_containers_by_executor={},
         filler_containers_by_executor={},
+        retained_container_names=[],
     )
 
     assert listed_container_names(rented) == {"pod_aaaa", "pod_aaaa" + EDIT_PARKED_SUFFIX, "pod_bbbb", "pod_bbbb" + EDIT_PARKED_SUFFIX}
