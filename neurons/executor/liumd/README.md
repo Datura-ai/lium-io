@@ -8,8 +8,6 @@ The image vendors the `liumd` binary built from a lium-platform PR artifact:
 neurons/executor/liumd/liumd-amd64
 neurons/executor/liumd/liumd-arm64
 neurons/executor/liumd/SOURCE.json
-neurons/executor/liumd/provenance-amd64.json
-neurons/executor/liumd/provenance-arm64.json
 ```
 
 This is not a signed release. `SOURCE.json` records the source PR, source head and merge commits,
