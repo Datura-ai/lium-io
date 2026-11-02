@@ -113,8 +113,12 @@ def _missing_nvlink_on_sxm_board(specs: dict[str, Any], interconnect: Any) -> di
     names = {normalize_gpu_model(gpu.get("name")) for gpu in details if isinstance(gpu, dict)}
     if len(details) < BASEBOARD_GPU_COUNT or len(names) != 1 or not names <= NVLINK_BASEBOARD_GPUS:
         return None
-    pairs = interconnect.get("gpu_pairs")
-    if isinstance(pairs, int) and pairs > 0 and interconnect.get("p2p_ok_pairs") == pairs:
+    gpu_pair_count = interconnect.get("gpu_pairs")
+    if (
+        isinstance(gpu_pair_count, int)
+        and gpu_pair_count > 0
+        and interconnect.get("p2p_ok_pairs") == gpu_pair_count
+    ):
         return None
     return {
         "gpu_name": next(iter(names)),

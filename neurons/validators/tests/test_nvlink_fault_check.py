@@ -215,7 +215,9 @@ def sxm_board(name="NVIDIA H100 80GB HBM3", count=8, nvlink=False):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("p2p_ok_pairs", [None, 0, 27])
-async def test_a_full_sxm_board_without_nvlink_fails_without_probing(context_factory, p2p_ok_pairs):
+async def test_a_full_sxm_board_without_nvlink_or_full_p2p_fails_without_probing(
+    context_factory, p2p_ok_pairs
+):
     specs = sxm_board()
     specs["interconnect"].update(gpu_pairs=28, p2p_ok_pairs=p2p_ok_pairs)
     result, runner = await run_check(context_factory, specs)
