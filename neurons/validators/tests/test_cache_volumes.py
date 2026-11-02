@@ -305,31 +305,17 @@ async def test_the_container_storage_counts_toward_what_the_rental_needs(docker_
 
 
 @pytest.mark.asyncio
-async def test_an_unsized_rental_takes_the_listed_engy_cache_but_keeps_the_dolphin_one(docker_service):
-    # no --storage-opt: nothing caps the renter, and the scrape listed the Engy cache as free disk for it.
-    # The Dolphin cache is still listed as used, so it stays.
-    ssh_client = HostSshClient([_KIMI, "dphn_cache_hf_x", "volume_pod"], free_gb=100_000)
-
-    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(None), {}) is True
-    assert _removed_volumes(ssh_client) == [_KIMI]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("held_kb", "removed"), [("0", []), (f"{200 * 1024**2}", [_KIMI])])
-async def test_an_unsized_rental_needs_only_the_free_disk_it_was_listed(docker_service, held_kb, removed):
-    # the listing offered df free plus what the Engy cache holds: an empty cache offered nothing, so it stays
-    ssh_client = DuHostSshClient([_KIMI, "volume_pod"], free_gb=100, du_stdout=f"{held_kb}\t/cache\n")
-
-    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(None), {}) is bool(removed)
-    assert _removed_volumes(ssh_client) == removed
-
-
-@pytest.mark.asyncio
-async def test_an_unsized_rental_on_a_node_without_an_engy_cache_removes_nothing(docker_service):
-    ssh_client = HostSshClient(["dphn_cache_hf_x", "volume_pod"], free_gb=10)
+@pytest.mark.parametrize("free_gb", [100_000, 100, 10])
+@pytest.mark.parametrize("volumes", [[_KIMI, "dphn_cache_hf_x"], [_KIMI], ["dphn_cache_hf_x"]])
+async def test_an_unsized_rental_keeps_every_cache_however_short_the_disk(docker_service, volumes, free_gb):
+    # Rustam 2 Nov: no --storage-opt means the renter did not ask for the disk, so the cache survives the rental.
+    # Evicting up front would re-download up to 1.5 TB after every such rental (the churn DAH-5014 stopped).
+    ssh_client = DuHostSshClient([*volumes, "volume_pod"], free_gb=free_gb, du_stdout=_kb(1560))
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(None), {}) is False
     assert _removed_volumes(ssh_client) == []
+    # decided on the request alone: no df or du read on the create path
+    assert not any("df -P" in command or "du -sk" in command for command in ssh_client.commands)
 
 
 @pytest.mark.asyncio

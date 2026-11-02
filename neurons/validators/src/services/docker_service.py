@@ -5081,7 +5081,9 @@ class DockerService:
         backend sizes the renter's volume and container storage on that listing. So the caches stay while the
         rental fits beside them, and go oldest first until it does; the listing can also be stale (~15 min old,
         an Engy download writes ~1 GB/s until the filler is removed). With no requested size (no --storage-opt)
-        the renter needs the free disk it was listed, so the Engy caches go until df shows that much. Every
+        the renter did not ask for the disk, so every cache stays (Rustam, 2 Nov): evicting up front would
+        re-download up to 1.5 TB after each such rental. Nothing reclaims it mid-rental (the idle backstop
+        `reclaim_dphn_cache_when_disk_is_tight` waits for no live pod). Every
         removal is awaited before this returns; a sized rental that still does not fit (a removal failed or
         timed out) has its volume clamped to the disk actually free, so the pod volume is never sized on
         disk that was not freed (create_container then warns, or refuses a clamp far below the order). A
@@ -5090,36 +5092,24 @@ class DockerService:
         at the volume step instead of short-changing the renter.
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
-        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
             return False
         try:
             # DAH-5014: the Engy checkpoint cache gives way to the renter too.
             cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
                 ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES, host_probe=host_probe
             )
-            if not payload.volume_limit_gb:
-                cache_volumes = [name for name in cache_volumes if name.startswith(ENGY_CACHE_VOLUME_PREFIX)]
             if not cache_volumes:
                 return False
 
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
             free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-            if payload.volume_limit_gb:
-                # a re-create's volume is already preallocated, outside df free: counting it again never fits
-                rental_needs_free_gb: float = (
-                    (0 if payload.local_volume else payload.volume_limit_gb)
-                    + (payload.storage_limit_gb or 0)
-                    + RENTAL_DISK_HEADROOM_GB
-                )
-            else:
-                # unsized (no --storage-opt): the renter needs the free disk it was listed, df free plus the Engy
-                # caches; one that cannot be measured counts as its checkpoint size (inf when unknown: it goes);
-                # all in GiB, the unit df free is read in
-                held_kb = [await self._cache_volume_held_kb(ssh_client, name) for name in cache_volumes]
-                rental_needs_free_gb = free_gb + sum(
-                    kb * 1024 / 1024**3 if kb is not None else _cache_download_gb(name) * 1e9 / 1024**3
-                    for name, kb in zip(cache_volumes, held_kb)
-                )
+            # a re-create's volume is already preallocated, outside df free: counting it again never fits
+            rental_needs_free_gb: float = (
+                (0 if payload.local_volume else payload.volume_limit_gb)
+                + (payload.storage_limit_gb or 0)
+                + RENTAL_DISK_HEADROOM_GB
+            )
             if free_gb >= rental_needs_free_gb:
                 return False
 
@@ -5130,10 +5120,7 @@ class DockerService:
                         **default_extra,
                         "volumes": cache_volumes,
                         "free_gb": round(free_gb, 1),
-                        # json.dumps writes inf as bare Infinity (invalid JSON)
-                        "rental_needs_free_gb": (
-                            round(rental_needs_free_gb, 1) if math.isfinite(rental_needs_free_gb) else None
-                        ),
+                        "rental_needs_free_gb": round(rental_needs_free_gb, 1),
                     }),
                 )
             )
@@ -5163,7 +5150,7 @@ class DockerService:
                     exc_info=True,
                 )
             # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed
-            if payload.volume_limit_gb and not payload.local_volume and not await rental_fits():
+            if not payload.local_volume and not await rental_fits():
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
                 payload.volume_limit_gb = max(
                     int(free_now_gb - (payload.storage_limit_gb or 0) - RENTAL_DISK_HEADROOM_GB), 1
