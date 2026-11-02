@@ -180,7 +180,9 @@ class ResultHandler:
         )
         filler_revenue_per_gpu_hour = (
             rented_data.get_filler_revenue_per_gpu_hour(
-                BASE_GPU_MAP.get(gpu_model or ""), gpu_count, settings.FILLER_REVENUE_MIN_GPU_HOURS
+                BASE_GPU_MAP.get(gpu_model or ""),
+                gpu_count,
+                settings.get_filler_revenue_min_gpu_hours(is_spot),
             )
             if rented_data
             else None
