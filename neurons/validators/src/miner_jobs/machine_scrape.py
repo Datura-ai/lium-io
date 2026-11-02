@@ -728,11 +728,11 @@ def get_executor_pid_mode():
     return pid_mode
 
 
-def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
+def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
     # filler_only: just the volumes a filler create labelled as its own (pass it positionally: the
-    # obfuscator renames arguments, not call keywords).
+    # obfuscator renames arguments, not call keywords). sizes: a dict to fill with bytes per volume.
     volumes = (docker_api_get("/volumes") or {}).get("Volumes") or []
     names = [
         volume.get("Name")
@@ -760,15 +760,79 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
         raise RuntimeError(f"no vloopback plugin data dir under {docker_root_dir} for {len(names)} volumes")
 
     total = 0
+    mount_points = None
     for name in names:
         for data_dir in data_dirs:
             try:
                 # st_blocks, not st_size: a preallocated volume takes its whole declared size on
                 # disk while holding nothing, a sparse one takes only what it wrote.
-                total += os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                size = os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                total += size
+                if sizes is not None:
+                    # the pod's share is what its filesystem holds: a preallocated file is its full
+                    # size from the start, a sparse one keeps the blocks of deleted data
+                    if mount_points is None:
+                        mount_points = host_mount_points()
+                    used = None
+                    for mount in glob.glob(f"/proc/1/root{docker_root_dir}/plugins/*/propagated-mount/{name}"):
+                        used = mounted_fs_used_bytes(mount[len("/proc/1/root"):], mount_points)
+                        if used is not None:
+                            break
+                    sizes[name] = size if used is None else used
                 break
             except OSError:
                 continue
+    return total
+
+
+def host_mount_points():
+    # the host's mount points, from its own mount table: os.path.ismount under /proc/1/root resolves the
+    # parent with realpath into this container's filesystem, so a host mount reads as a plain dir
+    try:
+        with open("/proc/1/mountinfo") as mountinfo:
+            fields = [line.split() for line in mountinfo]
+    except (OSError, ValueError):
+        return set()
+    # the kernel escapes only space, tab, newline and backslash (as \ooo); backslash last. No lambda
+    # or re callback: the obfuscator renames a lambda's body but not its argument (F-5)
+    mount_points = set()
+    for f in fields:
+        if len(f) > 4:
+            mount_points.add(f[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\"))
+    return mount_points
+
+
+def mounted_fs_used_bytes(host_path, mount_points):
+    # bytes in use on the filesystem mounted at host_path; None when nothing is mounted there (a stopped pod)
+    if host_path not in mount_points:
+        return None
+    try:
+        stat = os.statvfs(f"/proc/1/root{host_path}")
+    except OSError:
+        return None
+    return (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+
+
+def get_dmcrypt_volume_bytes(docker_root_dir, sizes):
+    # DAH-5487 dm-crypt pod volumes: `local` volumes of type ext4 over /dev/mapper/lium-<pod id>, which
+    # /system/df skips (a volume with mount options). On disk they hold their loop file under lium-crypt.
+    total = 0
+    mount_points = None
+    for volume in (docker_api_get("/volumes") or {}).get("Volumes") or []:
+        device = str((volume.get("Options") or {}).get("device") or "")
+        match = re.fullmatch(r"/dev/mapper/lium-([0-9a-f-]{36})", device)
+        if volume.get("Driver") != "local" or not match or not volume.get("Name"):
+            continue
+        try:
+            size = os.stat(f"/proc/1/root{docker_root_dir}/lium-crypt/{match.group(1)}.img").st_blocks * 512
+        except OSError:
+            continue
+        total += size
+        mountpoint = volume.get("Mountpoint")
+        if mount_points is None:
+            mount_points = host_mount_points()
+        used = mounted_fs_used_bytes(mountpoint, mount_points) if mountpoint else None
+        sizes[volume["Name"]] = size if used is None else used
     return total
 
 
@@ -828,7 +892,13 @@ def get_docker_disk_usage():
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
     # renters were shown half of an idle node's disk. The model caches stay: rentals keep them.
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
-    volumes += get_vloopback_volume_bytes(docker_root_dir) - filler_run_volumes
+    by_volume = {
+        str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
+        if volume.get("Name")
+    }
+    volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
+    volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
@@ -837,6 +907,20 @@ def get_docker_disk_usage():
         max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
     )
 
+    # DAH-5059: each pod's own share, so the pod page can show used against its limits: the writable
+    # layer per container name, plus the anonymous volumes it mounts (a dind image's VOLUME
+    # /var/lib/docker has no name the backend knows); named volumes stand alone under their name.
+    by_container = {}
+    for container in df.get("Containers") or []:
+        name = str((container.get("Names") or [""])[0]).lstrip("/")
+        if not name:
+            continue
+        by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(
+            by_volume.get(str(mount.get("Name")), 0)
+            for mount in container.get("Mounts") or []
+            if mount.get("Type") == "volume" and re.fullmatch(r"[0-9a-f]{64}", str(mount.get("Name")))
+        )
+
     return {
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
@@ -844,6 +928,8 @@ def get_docker_disk_usage():
         "filler_run_volume_kb": filler_run_volumes // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
+        "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
+        "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
     }
 
 

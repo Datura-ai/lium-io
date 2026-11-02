@@ -48,6 +48,9 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # `NVIDIA GB300` is priced like B300 for now. A different card from the B300, so its own base
 # model and idle tier (it never fills the B300 cap), at the B300 rate and caps.
 RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]  # mirrors B300; revisit when GB300 market data exists
+# DAH-5508: the RTX 4090 48GB, its own model and idle tier; only reachable with RTX_4090_48GB_MODEL_ENABLED on.
+# Anchor = the backend's MACHINE_PRICES: RTX 4090 0.30 x the same-chip Quadro RTX 8000/6000 ratio (0.21/0.13), 0.48.
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.48
 
 # Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
 # price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.
@@ -119,6 +122,13 @@ RENTAL_PRICES_PER_HOUR.update({
     "NVIDIA GeForce GTX 1060": 0.09,
     "NVIDIA Tesla M40": 0.08,
 })
+# A100 40GB (DAH-5088, Fish 30 Oct 2026: "give idle rates once you figure out what they are worth"): no Lium rentals
+# yet, so the anchor is the 30 Oct vast.ai median (listed and rented offers) times 0.668, the median Lium/vast price
+# ratio of the A100 80GB PCIe and SXM4, RTX A6000, L40S and RTX 4090, rounded to the cent. Not an A100 80GB rate.
+RENTAL_PRICES_PER_HOUR.update({
+    "NVIDIA A100-PCIE-40GB": 0.37,  # vast 0.553 x 0.668
+    "NVIDIA A100-SXM4-40GB": 0.48,  # vast 0.715 x 0.668 = 0.477
+})
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -158,6 +168,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "RTX 3090": {1: 10, 8: 64},
     "H800": {1: 10, 8: 64},
     "A800": {1: 10, 8: 64},
+    "A100 40GB": {1: 10, 8: 64},  # own family: no demand data yet, the default caps
     "CMP 170HX": {1: 10, 8: 64},
     "RTX 5090": {1: 10, 8: 64},
     "RTX 5090 D": {1: 10, 8: 64},
@@ -232,6 +243,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "Tesla M40": {1: 10, 8: 64},
 }
 MAX_UNRENTED_GPUS_BY_TYPE["GB300"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B300"])  # mirrors B300; revisit when GB300 market data exists
+MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] = {1: 10, 8: 64}  # DAH-5508: the default tier (DAH-5070)
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
@@ -305,6 +317,8 @@ BASE_GPU_MAP = {
     "NVIDIA RTX 2000 Ada Generation": "RTX 2000 Ada Generation",
     "NVIDIA A100 80GB PCIe": "A100",
     "NVIDIA A100-SXM4-80GB": "A100",
+    "NVIDIA A100-PCIE-40GB": "A100 40GB",
+    "NVIDIA A100-SXM4-40GB": "A100 40GB",
     "NVIDIA A800 80GB PCIe": "A800",
     "NVIDIA CMP 170HX": "CMP 170HX",
     "NVIDIA A10 Tensor Core GPU": "A10",
@@ -353,6 +367,7 @@ BASE_GPU_MAP = {
 }
 BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
 BASE_GPU_MAP["NVIDIA GB300"] = "GB300"  # own family, see RENTAL_PRICES_PER_HOUR
+BASE_GPU_MAP["NVIDIA GeForce RTX 4090 48GB"] = "RTX 4090 48GB"  # own family, never fills the RTX 4090 tier
 
 
 class IncentiveConfig(BaseModel):
