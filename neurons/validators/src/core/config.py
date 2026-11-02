@@ -286,8 +286,8 @@ class Settings(BaseSettings):
     # validator reaches them, the node gets no verified ports. Unset URL: no outside probe.
     EXTERNAL_PORT_PROBE_URL: str = Field(env="EXTERNAL_PORT_PROBE_URL", default="")
     EXTERNAL_PORT_PROBE_TOKEN: str = Field(env="EXTERNAL_PORT_PROBE_TOKEN", default="")
-    # Off: a node whose ports answer only the validator is logged ("log-only"), not failed, so prod can count
-    # those nodes before enforcing.
+    # Off: an outside failure is logged ("log-only"), never failed, so prod can count the nodes it would fail
+    # (the shadow step). On: a node fails on its second outside failure in a row.
     EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
@@ -832,6 +832,20 @@ class Settings(BaseSettings):
     CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS", default=1200,
         description="Hard timeout for `docker build` of a custom-dockerfile pod (seconds).",
+    )
+    CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND: int = Field(
+        env="CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND", default=10 * 1024 * 1024, gt=0,
+        description=(
+            "Slowest image export (DinD `docker save | docker load` onto the host) the export timeout allows "
+            "for: the timeout is the built image's size at this rate, never below the build timeout."
+        ),
+    )
+    CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS", default=3300, gt=0,
+        description=(
+            "Ceiling for setup + build + export of one custom-dockerfile pod. The backend fails a pod "
+            "still PENDING after 1 h, so a size-scaled export never runs past this."
+        ),
     )
     CUSTOM_DOCKERFILE_MAX_BYTES: int = Field(
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,

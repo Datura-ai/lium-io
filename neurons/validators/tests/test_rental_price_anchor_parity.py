@@ -77,6 +77,8 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
         "NVIDIA RTX 5000 Ada Generation",
         "NVIDIA RTX 5880 Ada Generation",
         "NVIDIA A800 80GB PCIe",
+        "NVIDIA A100-PCIE-40GB",  # DAH-5088
+        "NVIDIA A100-SXM4-40GB",
         "NVIDIA A10 Tensor Core GPU",
         "NVIDIA RTX A2000",
         "NVIDIA T4 Tensor Core GPU",

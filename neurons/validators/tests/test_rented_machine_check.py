@@ -10,7 +10,7 @@ import asyncssh
 import pytest
 from helpers import build_context_config, build_services, build_state
 import neurons.validators.src.services.task.checks.rented_machine as rented_machine_module
-from neurons.validators.src.core.docker_utils import _collect_host_context
+from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
@@ -1851,7 +1851,7 @@ async def test_unnamed_pod_never_runs_a_docker_filter_on_an_empty_name(context_f
     await TenantEnforcementCheck().run(ctx)
 
     ps_commands = [c for c in ssh.commands_called if "docker ps" in c]
-    assert ps_commands == ["/usr/bin/docker ps -q -f name=pod_53a68595"]
+    assert ps_commands == ["/usr/bin/docker ps -q -f 'name=^/?pod_53a68595$'"]
     assert not any(c.rstrip().endswith("name=") for c in ssh.commands_called)
 
 
@@ -1893,6 +1893,43 @@ def test_a_fresh_process_imports_the_module(module):
     assert result.returncode == 0, result.stderr[-2000:]
 
 
+REAPED_FILLER = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "processes, passed",
+    [
+        pytest.param([REAPED_FILLER], True, id="reaped-filler-only"),
+        pytest.param(["pod_53a68595", REAPED_FILLER], True, id="tenant-and-reaped-filler"),
+        pytest.param(
+            ["pod_53a68595", REAPED_FILLER, "my_miner"],
+            False,
+            id="a-surviving-foreign-process-still-fails",
+        ),
+    ],
+)
+async def test_a_container_the_cleanup_reaped_this_cycle_is_not_gpu_usage_outside_the_tenant(
+    context_factory, processes, passed
+):
+    """Review 4371171967: TenantEnforcementCheck runs before GpuUsageCheck on the same processes."""
+    from tests.test_gpu_usage_check import _after_the_cleanup_removed
+
+    ctx = _unnamed_pod_ctx(
+        context_factory,
+        DummySSHClient(pod_running=True),
+        [{"container_name": name, "pid": 1000 + i} for i, name in enumerate(processes)],
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [REAPED_FILLER])
+
+    assert all(process["container_name"] != REAPED_FILLER for process in ctx.state.gpu_processes)
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is passed
+    expected = Msg.ALREADY_RENTED.reason if passed else Msg.GPU_OUTSIDE_TENANT.reason
+    assert result.event.reason_code == expected
+
+
 @pytest.mark.asyncio
 async def test_unnamed_pod_whose_create_is_still_running_after_the_grace_is_not_penalised(context_factory):
     # a custom-Dockerfile build keeps the pod PENDING with no container for longer than the grace
@@ -1906,3 +1943,8 @@ async def test_unnamed_pod_whose_create_is_still_running_after_the_grace_is_not_
     assert result.passed
     assert result.event.reason_code == Msg.ALREADY_RENTED.reason
     assert "clear_verified_job_reason" not in result.updates
+
+
+def test_ps_running_matches_the_whole_container_name_only():
+    # Docker's name filter is an unanchored regex: `name=pod_1` also listed a `pod_12` container as this pod
+    assert DockerCommand.ps_running("pod_1.a") == "/usr/bin/docker ps -q -f 'name=^/?pod_1\\.a$'"
