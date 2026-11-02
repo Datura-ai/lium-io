@@ -220,8 +220,8 @@ async def _compare(
     elif fallback_cap:
         steps["verifyx"]["liumd_reason"] = "package_fallback_cap"
     ask_verifyx = today["verifyx"].verdict in RAN and not cold_retry and not fallback_cap
-    if not (ask_matmul or ask_verifyx):
-        return _skipped("no_gpu_step_ran", steps=steps)
+    # The fact steps run even when today's run reached no GPU step: the docker, ports and
+    # inspector data is useful on a node that stopped earlier, and the client asks for no GPU work.
     specs = ctx.state.specs
     if not specs:
         return _skipped("no_specs", steps=steps)
