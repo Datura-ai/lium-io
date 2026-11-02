@@ -1434,14 +1434,18 @@ async def test_an_unreadable_image_list_or_a_create_without_port_22_reaches_no_v
 async def test_no_verified_ports_or_no_key_reaches_no_verdict():
     """Regression: create_container is called with no ports (it fails at port_mapping and the node is blamed)
     or with no executor key (it raises)."""
-    # fewer than MIN_PORT_COUNT pairs: generate_portMappings would refuse the create at port_mapping
-    ctx, docker, _ = make_probe_context(port_pairs=PORT_PAIRS[:2])
+    # no verified pair: generate_portMappings would refuse the create at port_mapping
+    ctx, docker, _ = make_probe_context(port_pairs=[])
     with probe_settings():
         result = await RentalProbeCheck().run(ctx)
     assert result.event.reason_code == Msg.INCONCLUSIVE.reason and docker.create_calls == []
-    assert (
-        result.event.what_we_saw["reason"] == "validator has no 3 verified ports for this executor"
-    )
+    assert result.event.what_we_saw["reason"] == "validator has no verified port for this executor"
+
+    # DAH-3698: one verified pair is enough for the create (the probe runs no Jupyter)
+    ctx, docker, _ = make_probe_context(port_pairs=PORT_PAIRS[:1])
+    with probe_settings(), renter_path():
+        await RentalProbeCheck().run(ctx)
+    assert len(docker.create_calls) == 1
 
     ctx, docker, _ = make_probe_context()
     ctx = ctx.model_copy(update={"executor_ssh_private_key_encrypted": None})
@@ -1495,13 +1499,17 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     pipeline (staging, DRY_RUN=true) starts creating containers on providers' nodes."""
     ids = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_checks()]
     assert ids.index("RentalProbeCheck") == ids.index("RentalVerificationCheck") + 1
-    assert ids.index("RentalProbeCheck") == ids.index("ScoreCheck") - 1
+    # DAH-5320: only the shadow idle disk write sits between the probe and scoring
+    assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
+    assert ids.index("IdleDiskWriteCheck") == ids.index("ScoreCheck") - 1
     assert ids.index("RentalProbeCheck") > ids.index("PortConnectivityCheck")
     assert ids.index("RentalProbeCheck") > ids.index("TenantEnforcementCheck")
     dry = [
         type(check).__name__ for check in pipeline_factory.PipelineFactory.build_dry_run_checks()
     ]
-    assert "RentalProbeCheck" not in dry
+    assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
+    fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
+    assert fast[-4:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck"]
 
 
 @pytest.mark.asyncio

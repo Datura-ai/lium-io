@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
@@ -12,6 +13,10 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
+
+# machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
+# out: a busy host, not a verdict on Sysbox
+SYSBOX_TEST_TIMED_OUT = "Test command timed out."
 
 
 class PortConnectivityCheck:
@@ -44,12 +49,18 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        # 26 Oct: an unrented node's scrape sysbox test timed out under load, so the probe ran without sysbox-runc,
+        # failed, and the node scored 0 with Sysbox working. The timeout is provider-reported, so it is neither a
+        # pass nor a miss: the validator's own probe measures Sysbox with sysbox-runc instead.
+        scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+        probe_sysbox = ctx.state.sysbox_runtime or (rented_executor is None and scrape_error == SYSBOX_TEST_TIMED_OUT)
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
             ctx.miner_hotkey,
             ctx.executor,
-            ctx.state.sysbox_runtime,
+            probe_sysbox,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
             filler_ports=filler_ports,
@@ -61,6 +72,18 @@ class PortConnectivityCheck:
                 "executor_ip": ctx.executor.address,
             },
         )
+        if probe_sysbox and not ctx.state.sysbox_runtime:
+            # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
+            # own in-container measurement may say Sysbox works
+            result = replace(result, sysbox_runtime=result.sysbox_measured is True)
+        if await self._outside_failure_confirmed(ctx, result):
+            # renters cannot reach the host, so no port counts, whatever the validator reached
+            result = replace(
+                result,
+                successful_ports=(),
+                failed_ports=result.failed_ports + result.successful_ports,
+                status="externally_unreachable",
+            )
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
         declared_port_count = result.declared_port_count
@@ -81,7 +104,8 @@ class PortConnectivityCheck:
         updated_state = replace(
             ctx.state,
             specs={
-                **ctx.state.specs,
+                # DAH-3698: the grace marker is the validator's alone; one the provider's specs carry never survives
+                **{key: value for key, value in ctx.state.specs.items() if key != "port_verify_first_miss"},
                 "sysbox_runtime": result.sysbox_runtime,
                 "verified_ports": [p.external for p in result.successful_ports],
             },
@@ -91,6 +115,7 @@ class PortConnectivityCheck:
             declared_port_count=declared_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
+            externally_unreachable=result.status == "externally_unreachable",
         )
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
@@ -105,13 +130,25 @@ class PortConnectivityCheck:
             )
 
         if await self._should_use_last_verified_sysbox(
-            ctx, result, rented=rented_executor is not None, sysbox_now=updated_state.sysbox_runtime
+            ctx,
+            result,
+            rented=rented_executor is not None,
+            sysbox_now=updated_state.sysbox_runtime,
+            sysbox_probed=probe_sysbox,
         ):
             extra_info["sysbox_from_last_verified"] = True
             updated_state = replace(
                 updated_state,
                 specs={**updated_state.specs, "sysbox_runtime": True},
                 sysbox_runtime=True,
+            )
+
+        # status "ok" means at least one port answered; a partial loss is a miss too, or one transient probe
+        # failure would cut a split remainder's idle pay at once
+        if await self._is_first_port_verify_miss(ctx, ok=result.status == "ok" and not result.failed_ports):
+            extra_info["port_verify_first_miss"] = True
+            updated_state = replace(
+                updated_state, specs={**updated_state.specs, "port_verify_first_miss": True}
             )
 
         total = len(result.successful_ports) + len(result.failed_ports)
@@ -213,6 +250,54 @@ class PortConnectivityCheck:
         )
 
     @staticmethod
+    async def _outside_failure_confirmed(ctx: Context, result: PortVerificationResult) -> bool:
+        """DAH-4537: one outside reading is no verdict. A node fails only on its second outside failure in a row
+        (a pass in between clears the first), and only with EXTERNAL_PORT_PROBE_ENFORCE on; off, the second one
+        is logged as the shadow count. Fails open (no failure) on a Redis error."""
+        redis, hotkey, uuid = ctx.services.redis, ctx.miner_hotkey, ctx.executor.uuid
+        try:
+            if result.external_probe == "passed":
+                await redis.clear_external_probe_miss(hotkey, uuid)
+                return False
+            if result.external_probe != "blocked":
+                return False
+            # the port grace's window: it spans more than one validation cycle
+            if await redis.record_external_probe_miss(hotkey, uuid, PORT_VERIFY_FIRST_MISS_TTL_SECONDS):
+                logger.info(_m("outside port probe failed once; not a verdict", extra=get_extra_info(ctx.default_extra)))
+                return False
+        except Exception as e:  # noqa: BLE001 — never fail a node over the probe's own records
+            logger.warning(
+                _m("outside probe record unavailable", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+            )
+            return False
+        enforce = settings.EXTERNAL_PORT_PROBE_ENFORCE
+        logger.warning(
+            _m(
+                f"outside port probe failed twice in a row{'' if enforce else ' (log-only)'}",
+                extra=get_extra_info(ctx.default_extra),
+            )
+        )
+        return enforce
+
+    @staticmethod
+    async def _is_first_port_verify_miss(ctx: Context, *, ok: bool) -> bool:
+        """DAH-3698: the first failed verification inside the window is not a verdict on the
+        node's ports; the split-remainder port gate skips that cycle. A repeat inside the window
+        counts, even with passes in between: a pass never clears the record, or alternating a
+        pass and a failure would earn grace every time. Fails closed (no grace) on a Redis error."""
+        try:
+            if ok:
+                return False
+            return await ctx.services.redis.record_port_verify_miss(
+                ctx.miner_hotkey, ctx.executor.uuid, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
+            )
+        except Exception as e:  # noqa: BLE001 — never fail the port check over the grace
+            logger.warning(
+                _m("port verify miss record unavailable", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+            )
+            return False
+
+    @staticmethod
     async def _should_keep_last_known_sysbox(
         ctx: Context, result: PortVerificationResult, extra_info: dict[str, object]
     ) -> bool:
@@ -251,7 +336,7 @@ class PortConnectivityCheck:
 
     @staticmethod
     async def _should_use_last_verified_sysbox(
-        ctx: Context, result: PortVerificationResult, *, rented: bool, sysbox_now: bool
+        ctx: Context, result: PortVerificationResult, *, rented: bool, sysbox_now: bool, sysbox_probed: bool
     ) -> bool:
         """ticket-0494: keep a rented executor's verified sysbox when this cycle measured nothing.
 
@@ -272,7 +357,15 @@ class PortConnectivityCheck:
                 )
             elif result.sysbox_measured is False:
                 await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            if not rented or sysbox_now or result.dind_ok:
+            if not rented:
+                # a scrape sysbox test that ran and said no supersedes the last pass; an unrented node never reads
+                # it (only a validator probe counts there), but a later rented cycle would
+                scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+                if result.sysbox_measured is None and scrape_error and scrape_error != SYSBOX_TEST_TIMED_OUT:
+                    await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+                return False
+            # a probe that reached its container with sysbox-runc but whose Sysbox test timed out measured nothing too
+            if sysbox_now or (result.dind_ok and not (sysbox_probed and result.sysbox_measured is None)):
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
