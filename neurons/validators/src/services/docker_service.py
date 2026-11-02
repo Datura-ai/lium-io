@@ -563,6 +563,8 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
 # DAH-5392: bounds the backend's rental-active answer for an unlisted pod in a create's sweep; no answer keeps the pod
 _POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
+# the names come from the provider's docker ps: read their rentals this many at a time, never all at once
+_POD_RENTAL_READS_AT_ONCE = 16
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
@@ -4514,7 +4516,9 @@ class DockerService:
                 return False
             return answer is not None and not answer.active
 
-        answers = await asyncio.gather(*(closed(name) for name in names))
+        answers: list[bool] = []
+        for start in range(0, len(names), _POD_RENTAL_READS_AT_ONCE):
+            answers += await asyncio.gather(*(closed(name) for name in names[start : start + _POD_RENTAL_READS_AT_ONCE]))
         kept = [name for name, is_closed in zip(names, answers) if not is_closed]
         if kept:
             logger.info(_m("Keeping unlisted pods whose rental is not confirmed closed", extra=get_extra_info({**default_extra, "container_names": kept})))
