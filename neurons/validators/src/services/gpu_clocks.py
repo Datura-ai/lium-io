@@ -39,7 +39,6 @@ if TYPE_CHECKING:
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
 # nvidia-smi's exit code for an operation the GPU does not support (a completed answer: nothing was changed)
-NVSMI_NOT_SUPPORTED = 3
 
 
 @dataclass
@@ -145,7 +144,7 @@ async def _forget(redis: RedisService, uuids: list[str]) -> None:
             await redis.delete(_pod_key(pod_id))
 
 
-async def _reset_gpus(
+async def _reset_gpu_clocks(
     runner: SSHCommandRunner,
     redis: RedisService,
     uuids: list[str],
@@ -196,7 +195,7 @@ async def lock_pod_gpu_clocks(
     pod_gpu_uuids = set(targets)
 
     if reset:
-        failures = await _reset_gpus(runner, redis, targets, pod_gpu_uuids)
+        failures = await _reset_gpu_clocks(runner, redis, targets, pod_gpu_uuids)
         gpus = [
             GpuClockOutcome(index=index_by_uuid[u], uuid=u, result="failed" if f else "reset", detail=f)
             for u, f in failures.items()
@@ -252,20 +251,21 @@ async def _lock_one_gpu(
     previous = await redis.get(_lock_key(uuid))
     await redis.set(_lock_key(uuid), json.dumps(record))
     locked = await _run(runner, build_clock_command("lock", uuid, pod_gpu_uuids=pod_gpu_uuids, min_mhz=low, max_mhz=high))
-    if locked.exit_code == NVSMI_NOT_SUPPORTED:
-        # a completed "not supported" answer changed no clocks: the GPU's record goes back to what it was, so a GPU
-        # without clock control (that may refuse -rgc too) never carries a record a create would refuse on (review)
+    if locked.exit_code > 0:
+        # a completed refusal ("not supported" 3, "insufficient permissions" 4, ...) changed no clocks: the record goes
+        # back to what it was, so a GPU without clock control (that refuses -rgc too) never carries a record a create
+        # would refuse on (review)
         if previous:
             await redis.set(_lock_key(uuid), previous)
         else:
             await redis.delete(_lock_key(uuid))
-        outcome.detail = _tail(locked.stdout or locked.stderr) or "nvidia-smi -lgc is not supported on this GPU"
+        outcome.detail = _tail(locked.stdout or locked.stderr) or f"nvidia-smi -lgc failed (exit {locked.exit_code})"
         return outcome
     if locked.exit_code != 0:
-        # any other failure: the outcome is unknown (a lost or timed-out answer may hide an applied -lgc): reset the GPU, and its record
+        # -1, the runner's timeout or lost answer: an applied -lgc may hide behind it, so reset the GPU, and its record
         # goes only once that reset succeeded; else it stays, so a later create refuses rather than hand it on locked
-        reset_failure = (await _reset_gpus(runner, redis, [uuid], pod_gpu_uuids))[uuid]
-        outcome.detail = _tail(locked.stdout or locked.stderr) or "nvidia-smi -lgc failed"
+        reset_failure = (await _reset_gpu_clocks(runner, redis, [uuid], pod_gpu_uuids))[uuid]
+        outcome.detail = "nvidia-smi -lgc did not answer"
         outcome.detail += "; clocks reset to default" if reset_failure is None else f"; {reset_failure}"
         return outcome
     readback = await _run(
@@ -289,29 +289,33 @@ async def reset_pod_clock_locks(runner: SSHCommandRunner, redis: RedisService, p
         raw = await redis.get(_lock_key(uuid))
         if raw and json.loads(raw).get("pod_id") == pod_id:
             owned.append(uuid)
-    failures = await _reset_gpus(runner, redis, owned)
+    failures = await _reset_gpu_clocks(runner, redis, owned)
     await redis.delete(_pod_key(pod_id))  # a GPU whose reset failed keeps its own record for the next create
     return sum(1 for failure in failures.values() if failure is None)
 
 
 async def reset_leftover_clock_locks(
-    runner: SSHCommandRunner, redis: RedisService, gpu_uuids: list[str] | None
+    runner: SSHCommandRunner, redis: RedisService, gpu_uuids: list[str] | None, keep_pod_id: str | None = None
 ) -> list[str]:
     """Safety net before a create: `-rgc` every GPU of the new pod (None/empty = every host GPU), with or
     without a lock record, so a lost record never hands a renter another's locked clocks (as
     raise_low_power_limits_to_default does for power). Answers the GPUs with a lock record whose reset failed
     (their records stay): the create must not start on them. A failed reset of a GPU with no record (one that
     does not support -rgc, never locked here) is not counted; while Redis cannot say which GPUs have a record,
-    every failed reset counts."""
+    every failed reset counts. A GPU whose record names `keep_pod_id` (the pod's own edit or reboot) keeps its lock and
+    record (review)."""
     if not gpu_uuids:
         host = await _run(runner, HOST_GPUS_COMMAND)
         gpu_uuids = [gpu.uuid for gpu in parse_host_gpus(host.stdout or "")]
     try:
-        recorded = {uuid for uuid in gpu_uuids if isinstance(await redis.get(_lock_key(uuid)), (str, bytes))}
+        raws = {uuid: await redis.get(_lock_key(uuid)) for uuid in gpu_uuids}
+        recorded = {uuid for uuid, raw in raws.items() if isinstance(raw, (str, bytes))}
+        own = {uuid for uuid in recorded if keep_pod_id and json.loads(raws[uuid]).get("pod_id") == keep_pod_id}
     except Exception:
-        recorded = set(gpu_uuids)  # unknown (review): every failed reset counts, never a silent pass
+        recorded, own = set(gpu_uuids), set()  # unknown (review): every failed reset counts, never a silent pass
+    gpu_uuids = [uuid for uuid in gpu_uuids if uuid not in own]
     try:
-        failures = await _reset_gpus(runner, redis, gpu_uuids, forget=False)
+        failures = await _reset_gpu_clocks(runner, redis, gpu_uuids, forget=False)
     except Exception:
         if not recorded:
             raise

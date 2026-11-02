@@ -137,13 +137,25 @@ async def test_a_backend_subset_of_a_whole_host_container_touches_only_the_backe
 
 
 @pytest.mark.asyncio
-async def test_a_refused_lock_is_reset_and_its_record_goes_only_once_that_reset_succeeded():
-    report, redis = await _lock(FakeHost(lgc_exit=1))
+async def test_an_unanswered_lock_is_reset_and_its_record_goes_only_once_that_reset_succeeded():
+    report, redis = await _lock(FakeHost(lgc_exit=-1))  # the runner's timeout or lost answer
 
     assert not report.ok and report.error_code == GpuResetErrorCode.ClockLockNotSupported
     assert {g.result for g in report.gpus} == {"failed"}
     assert all(g.detail.endswith("clocks reset to default") for g in report.gpus)
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store), "reset: nothing for a create to refuse on"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lgc_exit", [3, 4, 1], ids=["not-supported", "insufficient-permissions", "other"])
+async def test_a_completed_refusal_runs_no_reset_and_never_locks_the_gpu_out(lgc_exit):
+    # review: a passthrough VM refuses -lgc and -rgc alike (exit 4); a kept record would refuse every create for good
+    host = FakeHost(lgc_exit=lgc_exit, rgc_exit=lgc_exit)
+    report, redis = await _lock(host)
+
+    assert not report.ok and not any(" -rgc " in c for c in host.commands)
+    assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [], "rentals on it go on"
 
 
 @pytest.mark.asyncio
@@ -164,7 +176,7 @@ async def test_an_unsupported_lock_runs_no_reset_and_leaves_the_record_it_found(
 @pytest.mark.asyncio
 async def test_a_lock_whose_answer_was_lost_and_whose_reset_failed_keeps_its_record_and_refuses_the_next_create():
     # -lgc may have applied on the host though its answer timed out; the cleanup -rgc fails
-    host = FakeHost(lgc_exit=124, rgc_exit=1)
+    host = FakeHost(lgc_exit=-1, rgc_exit=1)  # -1: what SSHCommandRunner answers for a timeout or a lost answer
     report, redis = await _lock(host)
     assert not report.ok
 
@@ -275,6 +287,22 @@ async def test_a_create_reset_answers_only_the_recorded_gpus_it_could_not_reset_
     # U[1] has no record: a GPU without -rgc support, never locked here, does not count
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0]]
     assert f"gpu_clock_lock:{U[0]}" in redis.store, "kept for the next try"
+
+
+@pytest.mark.asyncio
+async def test_the_pods_own_edit_or_reboot_keeps_its_lock_and_another_pods_create_resets_it():
+    host = FakeHost()
+    _, redis = await _lock(host)
+    host.commands.clear()
+
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1], U[2]], keep_pod_id="pod1") == []
+    assert _reset_uuids(host.commands[0]) == [U[2]], "only the GPU the pod has not locked"
+    assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "pod1"
+
+    host.commands.clear()
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]], keep_pod_id="pod2") == []
+    assert _reset_uuids(host.commands[0]) == [U[0], U[1]]
+    assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
 
 
 @pytest.mark.asyncio
@@ -515,7 +543,7 @@ async def test_a_reboot_waits_for_a_clock_lock_in_flight_so_its_clock_reset_runs
     order: list[str] = []
     service, gates, started = _service_with_gated_steps(order)
     service.redis_service = None
-    monkeypatch.setattr(ds, "reset_leftover_clock_locks", AsyncMock(side_effect=lambda *_a: order.append("rgc")))
+    monkeypatch.setattr(ds, "reset_leftover_clock_locks", AsyncMock(side_effect=lambda *_a, **_k: order.append("rgc")))
 
     gpu = asyncio.create_task(_gpu_operation(service))
     await started["gpu"].wait()
@@ -540,7 +568,7 @@ async def test_a_clock_lock_during_a_reboots_clock_reset_is_declined_and_touches
     service.redis_service = None
     rgc_started, rgc_gate = asyncio.Event(), asyncio.Event()
 
-    async def gated_rgc(*_args):
+    async def gated_rgc(*_args, **_kwargs):
         rgc_started.set()
         await rgc_gate.wait()
         order.append("rgc")
@@ -566,7 +594,7 @@ async def test_a_delete_cancels_a_create_before_taking_the_pod_lock_its_clock_re
     order: list[str] = []
     service, gates, _started = _service_with_gated_steps(order)
     service.redis_service = None
-    monkeypatch.setattr(ds, "reset_leftover_clock_locks", AsyncMock(side_effect=lambda *_a: order.append("rgc")))
+    monkeypatch.setattr(ds, "reset_leftover_clock_locks", AsyncMock(side_effect=lambda *_a, **_k: order.append("rgc")))
     info = type("Info", (), {"address": "h", "port": 8001, "ssh_username": "u", "ssh_port": 22})()
     create_go = asyncio.Event()
 

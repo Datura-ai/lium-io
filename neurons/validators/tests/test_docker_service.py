@@ -4763,6 +4763,27 @@ async def test_failed_create_without_container_id_removes_by_name_only_when_no_o
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("live_creates, removed", [(1, True), (2, False)])
+async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_is_live(
+    docker_service, monkeypatch, live_creates, removed,
+):
+    # F-78: the volume is named by pod; another live create of the pod may have restored into it
+    monkeypatch.setattr(
+        docker_service, "capture_failed_container_diagnostics", AsyncMock(return_value=Mock(container_missing=False))
+    )
+    ssh_commands = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        with registry.track("test"):
+            await docker_service.cleanup_failed_container_creation(
+                ssh_client=Mock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
+                remove_volume=True, container_id="cid", pod_id="test",
+            )
+    assert any("volume rm volume_test" in str(call) for call in ssh_commands.call_args_list) is removed
+
+
+@pytest.mark.asyncio
 async def test_create_container_does_not_repair_vloopback_mountpoint_twice(
     docker_service, monkeypatch,
 ):

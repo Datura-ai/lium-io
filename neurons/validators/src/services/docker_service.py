@@ -5576,7 +5576,8 @@ class DockerService:
                     "cleanup_failed_container_creation",
                 )
 
-            if remove_volume and volume_name:
+            # the pod's volume is shared by name too: another live create of the pod may have restored into it (F-78)
+            if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create(pod_id)):
                 volume = shlex.quote(volume_name)
                 await retry_ssh_command(
                     ssh_client,
@@ -9757,8 +9758,9 @@ class DockerService:
                         pod_id=payload.pod_id,
                     )
                     container_vanished = container_created and container_missing
-                    # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
-                    if is_custom_build:
+                    # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure; named by pod, so
+                    # left to another live create of the same pod (F-78)
+                    if is_custom_build and inflight_creates.is_only_create(payload.pod_id):
                         await self._cleanup_custom_build_artifacts(
                             ssh_client=ssh_client,
                             pod_id=payload.pod_id,
@@ -11567,8 +11569,10 @@ class DockerService:
                 logger.info(_m("Cancelled by its delete: no GPU clock reset", extra=get_extra_info(default_extra)))
                 return
             try:
+                # the pod's own lock survives its edit or reboot (review)
                 still_locked = await reset_leftover_clock_locks(
-                    SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids
+                    SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids,
+                    keep_pod_id=payload.pod_id,
                 )
             except Exception as exc:
                 logger.warning(

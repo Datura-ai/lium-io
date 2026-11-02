@@ -138,10 +138,10 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
-        # DAH-4663: the clock-lock safety net resets the pod's GPUs before the create
-        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
+        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
         host_key,
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
         f"/usr/bin/docker rm -fv id-{name}",
