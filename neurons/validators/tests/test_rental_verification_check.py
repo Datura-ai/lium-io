@@ -766,6 +766,37 @@ async def test_rental_verification_flag_false_when_no_customer_rental():
     assert backend_client.called_with["rental_in_progress"] is False
 
 
+
+@pytest.mark.asyncio
+async def test_rental_verification_flag_false_for_another_miners_rental():
+    """DAH-5548: the rental hint is this miner's node's rental only, as in TenantEnforcementCheck."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="other-miner-hotkey",
+                    executor_ip_address="127.0.0.1",
+                    executor_ip_port="2222",
+                    pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+                )
+            }
+        ),
+    )
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        await RentalVerificationCheck().run(ctx)
+
+    assert backend_client.called_with["rental_in_progress"] is False
+
 # ---------------------------------------------------------------- GPU-split nodes (DAH-2465 bundles)
 
 _BUNDLE_A = "filler_aaaaaaaa-1111-2222-3333-444444444444"
