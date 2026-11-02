@@ -434,9 +434,6 @@ class Settings(BaseSettings):
     )
     # The per-pod incident mark expires this long after the last cycle that saw the fault.
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
-    # DAH-4457: a node whose GPU dropped out stays hidden (GPU_LOST availability entry, no new rentals) until its
-    # cards have read clean this long after the last faulty cycle (GpuLossHoldCheck).
-    GPU_LOSS_HOLD_SECONDS: int = Field(env="GPU_LOSS_HOLD_SECONDS", default=7200, gt=0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
@@ -548,6 +545,7 @@ class Settings(BaseSettings):
     # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
     # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
     # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
+    # So is a failing side the rented pods' own counters show they used while the probe measured it (rented_throughput.DURING_*).
     RENTED_THROUGHPUT_CHECK_ENABLED: bool = Field(env="RENTED_THROUGHPUT_CHECK_ENABLED", default=True)
     RENTED_THROUGHPUT_INTERVAL_HOURS: float = Field(env="RENTED_THROUGHPUT_INTERVAL_HOURS", default=3.0, gt=0)
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
@@ -559,6 +557,11 @@ class Settings(BaseSettings):
     # yet (the follow-up zeroes the score on a slow disk).
     IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
     IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
+    # a node running a filler is busy from this rate of sectors read plus written on the docker root disks: a filler
+    # moving less than DISK_BUSY_MB_PER_S would otherwise share the disk with the probe and lower the reading
+    IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S: float = Field(
+        env="IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S", default=5.0, gt=0
+    )
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and

@@ -241,12 +241,8 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
-    # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
-    # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
-    # node scores 0 on every later cycle under this executor id and is never re-anchored.
-    gpu_anchor_broken: bool = False
-    # Set by GpuFingerprintCheck (legacy rule) when an idle node's whole GPU set was replaced: the reset drops the
-    # anchor, so the next passing cycle anchors the new cards (whole_set_replaced).
+    # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
+    # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
@@ -284,6 +280,9 @@ class Context(BaseModel):
     # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
     # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
     cc_vbios_passed: bool = True
+    # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
+    # rented-pod checks still run; the run still ends as that failure (_ended).
+    gpu_fingerprint_passed: bool = True
     # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     hardware_identity_passed: bool = True
@@ -528,6 +527,17 @@ def _stops_run(chk: Check, res: CheckResult) -> bool:
     return (not res.passed and fatal) or res.halt
 
 
+def _ended(events: list[ValidationEvent], ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+    """A run that got through. A GPU set change under a live rental ran on through the rented-pod checks for
+    their reports only: the run still ends as that failure (its event last, score 0, not rented), as it did
+    when the check halted it."""
+    if ctx.gpu_fingerprint_passed:
+        return True, events, ctx
+    failure = next(e for e in events if e.check_id == "gpu.validate.fingerprint")
+    events = [e for e in events if e is not failure] + [failure]
+    return False, events, ctx.model_copy(update={"rented": False, "score": 0.0, "job_score": 0.0, "success": False})
+
+
 class Pipeline:
     def __init__(self, checks: List[Check], sink: EventSink):
         self.checks = checks
@@ -646,6 +656,6 @@ class Pipeline:
                     return False, events, current_ctx
 
                 if res.halt:
-                    return True, events, current_ctx
+                    return _ended(events, current_ctx)
 
-        return True, events, current_ctx
+        return _ended(events, current_ctx)
