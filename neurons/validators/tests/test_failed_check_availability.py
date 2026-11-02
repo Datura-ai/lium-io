@@ -1,4 +1,4 @@
-"""DAH-5395: a fatal check that means the node cannot serve a rental hides it until a cycle passes."""
+"""DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node until a cycle passes."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +7,7 @@ import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from services.task.availability import (
+    REASONS_THAT_HIDE_AT_ONCE,
     AvailabilityErrorCode,
     ReachSource,
     ReachTarget,
@@ -26,42 +27,85 @@ def _event(check_id: str, reason: str = "SOME_REASON", severity: str = "error"):
 def _errors_the_service_sends(ok: bool, events: list) -> list[dict]:
     # the same composition as TaskService.create_task
     failed = failed_check_event(ok, events)
-    return [e.model_dump(mode="json") for e in availability_errors([*events, failed] if failed else events)]
+    return [
+        e.model_dump(mode="json")
+        for e in availability_errors([*events, failed] if failed else events)
+    ]
 
 
-def test_a_failed_check_that_makes_the_node_unusable_hides_it() -> None:
-    events = [_event("gpu.scrape.machine_spec", "OK", "info"), _event("gpu.validate.verifyx", "VERIFYX_FAILED")]
+HIDES_AT_ONCE = [
+    ("gpu.validate.model", "GPU_DETAILS_MISMATCH"),
+    ("gpu.validate.fingerprint", "GPU_UUID_CHANGED"),
+    ("gpu.validate.nvlink_fault", "NVLINK_FAULT"),
+]
+
+
+def test_the_allowlist_is_exactly_these_reasons() -> None:
+    assert REASONS_THAT_HIDE_AT_ONCE == {reason for _, reason in HIDES_AT_ONCE}
+
+
+@pytest.mark.parametrize(("check_id", "reason"), HIDES_AT_ONCE)
+def test_an_allowlisted_failure_hides_the_node(check_id, reason) -> None:
+    events = [_event("gpu.scrape.machine_spec", "OK", "info"), _event(check_id, reason)]
 
     errors = _errors_the_service_sends(False, events)
 
     assert [e["reason_code"] for e in errors] == [AvailabilityErrorCode.VERIFICATION_FAILED]
     assert errors[0]["reach_source"] == "validator"
     assert errors[0]["reach_target"] == "node"
-    assert errors[0]["what_we_saw"] == {"failed_check": "gpu.validate.verifyx", "failed_reason": "VERIFYX_FAILED"}
+    assert errors[0]["what_we_saw"] == {"failed_check": check_id, "failed_reason": reason}
+
+
+@pytest.mark.parametrize(
+    ("check_id", "reason"),
+    [
+        ("gpu.validate.verifyx", "VERIFYX_FAILED"),
+        ("executor.validate.ports", "INSUFFICIENT_PORTS"),
+        ("gpu.validate.usage", "GPU_USAGE_HIGH"),
+        ("gpu.scrape.machine_spec", "SCRAPE_TIMEOUT"),
+        ("executor.validate.sysbox", "SYSBOX_REQUIRED_MISSING"),
+        ("executor.validate.storage", "STORAGE_LIMIT_REQUIRED"),
+        ("gpu.validate.fingerprint", "GPU_MISSING"),
+        ("executor.validate.duplicate", "SOME_REASON"),
+    ],
+)
+def test_any_other_failure_no_longer_hides_the_node(check_id, reason) -> None:
+    events = [_event("gpu.scrape.machine_spec", "OK", "info"), _event(check_id, reason)]
+
+    assert failed_check_event(False, events) is None
+    assert _errors_the_service_sends(False, events) == []
+
+
+def test_an_allowlisted_reason_earlier_in_the_run_does_not_count() -> None:
+    # only the event that ended the run decides
+    events = [
+        _event("gpu.validate.model", "GPU_DETAILS_MISMATCH", "info"),
+        _event("gpu.validate.verifyx", "VERIFYX_FAILED"),
+    ]
+
+    assert _errors_the_service_sends(False, events) == []
 
 
 def test_a_policy_score_zero_keeps_the_node_listed() -> None:
-    # a run that completes with score 0 (excluded hotkey, idle-only exclusion, a score-zero gate) is ok=True
-    events = [_event("gpu.validate.verifyx", "OK", "info"), _event("score", "SCORING_EXCLUDED", "warning")]
+    # a run that completes with score 0 is ok=True
+    events = [
+        _event("gpu.validate.verifyx", "OK", "info"),
+        _event("score", "SCORING_EXCLUDED", "warning"),
+    ]
 
     assert failed_check_event(True, events) is None
     assert _errors_the_service_sends(True, events) == []
 
 
-def test_failed_checks_that_keep_the_listing_add_nothing() -> None:
-    for check_id in (
-        "executor.validate.duplicate",
-        "executor.validate.image_version",
-        "executor.validate.rented_state",
-        "executor.validate.cached_template",
-    ):
-        assert _errors_the_service_sends(False, [_event(check_id)]) == [], check_id
-
-
 def test_a_check_that_already_reported_an_availability_error_is_not_doubled() -> None:
     lost = build_availability_event(
-        code=AvailabilityErrorCode.GPU_LOST, reach_source=ReachSource.VALIDATOR, reach_target=ReachTarget.GPU,
-        event_text="lost", impact="x", remediation="x", what_we_saw={},
+        code=AvailabilityErrorCode.GPU_LOST,
+        reach_source=ReachSource.VALIDATOR,
+        reach_target=ReachTarget.GPU,
+        event_text="lost",
+        impact="x",
+        remediation="x",
+        what_we_saw={},
     )
 
     errors = _errors_the_service_sends(False, [lost])
@@ -70,7 +114,9 @@ def test_a_check_that_already_reported_an_availability_error_is_not_doubled() ->
 
 
 def test_the_next_pass_clears_it() -> None:
-    assert _errors_the_service_sends(False, [_event("gpu.validate.fingerprint")])
+    assert _errors_the_service_sends(
+        False, [_event("gpu.validate.fingerprint", "GPU_UUID_CHANGED")]
+    )
     # an empty list (not None) is what makes the backend clear the stored entry
     assert _errors_the_service_sends(True, [_event("score", "OK", "info")]) == []
 
@@ -78,16 +124,27 @@ def test_the_next_pass_clears_it() -> None:
 def _result(errors):
     return JobResult(
         executor_info=ExecutorSSHInfo(
-            uuid="node", address="10.0.0.5", port=8080, ssh_username="root", ssh_port=2200,
-            python_path="/usr/bin/python3", root_dir="/root/app",
+            uuid="node",
+            address="10.0.0.5",
+            port=8080,
+            ssh_username="root",
+            ssh_port=2200,
+            python_path="/usr/bin/python3",
+            root_dir="/root/app",
         ),
-        score=0, job_score=0, job_batch_id="b", log_status="info", log_text="", gpu_model=None, gpu_count=0,
+        score=0,
+        job_score=0,
+        job_batch_id="b",
+        log_status="info",
+        log_text="",
+        gpu_model=None,
+        gpu_count=0,
         availability_errors=errors,
     )
 
 
 def test_most_of_a_cycle_failing_is_treated_as_our_own_outage() -> None:
-    failed = _errors_the_service_sends(False, [_event("gpu.validate.verifyx")])
+    failed = _errors_the_service_sends(False, [_event("gpu.validate.nvlink_fault", "NVLINK_FAULT")])
     results = [_result(list(failed)) for _ in range(8)] + [_result([]) for _ in range(2)]
 
     assert silence_availability_errors_on_our_own_outage(results) == 10
@@ -95,6 +152,7 @@ def test_most_of_a_cycle_failing_is_treated_as_our_own_outage() -> None:
 
 
 # --- through TaskService.create_task -------------------------------------------------------------
+
 
 class _Shell:
     async def __aenter__(self):
@@ -112,8 +170,11 @@ def _service(pipeline_run=None, build_context_error=None) -> TaskService:
     service.attestation_service = MagicMock()
     service.attestation_service.prepare_host_policy = AsyncMock(
         return_value=MagicMock(
-            known_hosts=None, attestation_digest=None, tee_type=None,
-            gpu_attestation_passed=None, attestation_passed=False,
+            known_hosts=None,
+            attestation_digest=None,
+            tee_type=None,
+            gpu_attestation_passed=None,
+            attestation_passed=False,
         )
     )
     service.pipeline_factory = MagicMock()
@@ -124,8 +185,12 @@ def _service(pipeline_run=None, build_context_error=None) -> TaskService:
 
 async def _create_task(service: TaskService) -> JobResult:
     miner = MinerJobRequestPayload(
-        job_batch_id="b", miner_hotkey="5Miner", miner_coldkey="5Cold",
-        miner_address="10.0.0.5", miner_port=8080, executors=[],
+        job_batch_id="b",
+        miner_hotkey="5Miner",
+        miner_coldkey="5Cold",
+        miner_address="10.0.0.5",
+        miner_port=8080,
+        executors=[],
     )
     handled = _result([])
     with (
@@ -136,20 +201,40 @@ async def _create_task(service: TaskService) -> JobResult:
     ):
         handler.return_value.handle_result = AsyncMock(return_value=handled)
         return await service.create_task(
-            miner_info=miner, executor_info=handled.executor_info, keypair=MagicMock(ss58_address="5Val"),
-            private_key="key", public_key="pub", encrypted_files=MagicMock(),
-            rented_data=MagicMock(), default_docker_image_digests={},
+            miner_info=miner,
+            executor_info=handled.executor_info,
+            keypair=MagicMock(ss58_address="5Val"),
+            private_key="key",
+            public_key="pub",
+            encrypted_files=MagicMock(),
+            rented_data=MagicMock(),
+            default_docker_image_digests={},
         )
 
 
 @pytest.mark.asyncio
-async def test_create_task_hides_a_node_whose_check_failed() -> None:
-    run = (False, [_event("gpu.validate.verifyx", "VERIFYX_FAILED")], MagicMock(success=False))
+async def test_create_task_hides_a_node_on_an_allowlisted_failure() -> None:
+    run = (
+        False,
+        [_event("gpu.validate.fingerprint", "GPU_UUID_CHANGED")],
+        MagicMock(success=False),
+    )
 
     result = await _create_task(_service(pipeline_run=run))
 
     assert [e["reason_code"] for e in result.availability_errors] == ["VERIFICATION_FAILED"]
-    assert result.availability_errors[0]["what_we_saw"]["failed_check"] == "gpu.validate.verifyx"
+    assert (
+        result.availability_errors[0]["what_we_saw"]["failed_check"] == "gpu.validate.fingerprint"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_keeps_a_node_listed_on_any_other_failure() -> None:
+    run = (False, [_event("gpu.validate.verifyx", "VERIFYX_FAILED")], MagicMock(success=False))
+
+    result = await _create_task(_service(pipeline_run=run))
+
+    assert result.availability_errors == []
 
 
 @pytest.mark.asyncio
@@ -162,16 +247,16 @@ async def test_create_task_keeps_a_policy_score_zero_listed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_task_hides_a_node_whose_shell_died_under_the_run() -> None:
+async def test_create_task_keeps_a_node_listed_when_its_shell_dies_under_the_run() -> None:
     result = await _create_task(_service(build_context_error=asyncssh.ConnectionLost("lost")))
 
-    assert [e["reason_code"] for e in result.availability_errors] == ["VERIFICATION_FAILED"]
-    assert result.availability_errors[0]["what_we_saw"]["failed_check"] == "pipeline.exception.ConnectionLost"
-    # the rollout grace still sees the shell death by its own name
+    assert result.availability_errors == []
     assert result.failure_reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
 
 
-@pytest.mark.parametrize("error", [RuntimeError("redis down"), ConnectionError("backend call"), TimeoutError()])
+@pytest.mark.parametrize(
+    "error", [RuntimeError("redis down"), ConnectionError("backend call"), TimeoutError()]
+)
 @pytest.mark.asyncio
 async def test_create_task_says_nothing_against_the_node_for_our_own_errors(error) -> None:
     result = await _create_task(_service(build_context_error=error))

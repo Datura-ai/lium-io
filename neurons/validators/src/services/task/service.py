@@ -28,7 +28,6 @@ from .availability import (
     availability_errors,
     build_ssh_unreachable_event,
     failed_check_event,
-    verification_failed_event,
 )
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
@@ -252,7 +251,7 @@ class TaskService:
                 result.ssh_host_key_verified = known_hosts_policy is not None
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
-                # DAH-5395: a fatal check that means the node cannot serve a rental hides it too
+                # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
                 failed = failed_check_event(ok, events)
                 result.availability_errors = [
                     error.model_dump(mode="json")
@@ -314,17 +313,10 @@ class TaskService:
                         "error": str(e),
                     })
                 )
-                # A cycle that never opened the shell says nothing, and must not clear what the cycle
-                # before it found. DAH-5395: once it did, an SSH error can only be the node's own shell
-                # dying under the run, so the node is hidden until a cycle passes; any other error
-                # (Redis, DB, a backend call, a bug of ours) says nothing against the node, so the
-                # cycle reports an empty list and re-lists a node an earlier cycle hid.
-                availability_problems = None
-                if has_reached_the_node:
-                    node_side = [
-                        verification_failed_event(f"pipeline.exception.{type(e).__name__}", failure_reason_code)
-                    ] if isinstance(e, asyncssh.Error) else []
-                    availability_problems = [error.model_dump(mode="json") for error in availability_errors(node_side)]
+                # A cycle that opened the shell proves the node is reachable, so it reports an
+                # empty list and re-lists a node an earlier cycle hid. A cycle that never got
+                # there says nothing, and must not clear what the cycle before it found.
+                availability_problems = [] if has_reached_the_node else None
             logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,

@@ -59,7 +59,7 @@ class AvailabilityErrorCode(StrEnum):
     GPU_LOST = "GPU_LOST"
     # DAH-4683: NVML reports a card's memory broken (GpuMemoryHealthCheck).
     GPU_MEMORY_HEALTH_FAILED = "GPU_MEMORY_HEALTH_FAILED"
-    # DAH-5395: a fatal check that means the node cannot serve a rental failed this cycle (failed_check_event).
+    # DAH-5395: a run ended by a failure that hides the node at once (failed_check_event).
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
     GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
@@ -297,38 +297,21 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
     return len(checked_results)
 
 
-# DAH-5395: fatal checks whose failure leaves the node on the market. The backend drops a report that did not score
-# (it only refreshes a node on a pass), so without an availability entry a node that failed stays listed and
-# rentable until the staleness sweep. These are not "the node cannot serve a rental": the duplicate copy's verdict
-# (the kept copy stays listed), the executor image version (the backend acts on it itself), the rented pod's own
-# state (the renter's container, not the node) and an advisory template check.
-CHECKS_THAT_KEEP_THE_LISTING = frozenset(
-    {
-        "executor.validate.duplicate",
-        "executor.validate.image_version",
-        "executor.validate.rented_state",
-        "executor.validate.cached_template",
-    }
-)
+# DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
+REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "NVLINK_FAULT"})
 
 
 def failed_check_event(ok: bool, events: list[ValidationEvent]) -> ValidationEvent | None:
-    """The availability entry for a run a fatal check ended, so the backend hides the node until a cycle passes.
+    """The availability entry for a run ended by a reason in REASONS_THAT_HIDE_AT_ONCE, else None.
 
-    None for a run that did not fail, one that already raised an availability error, and one
-    ended by a check in CHECKS_THAT_KEEP_THE_LISTING. Policy score-zero outcomes never end the run (they zero the
-    score of a run that completes), so they never get one.
+    The backend hides the node on it and lists it again on the next cycle that sends an empty list.
+    A run that already raised an availability error gets none, so nothing is doubled.
     """
     if ok or not events or any(e.is_availability_error for e in events):
         return None
     last_event = events[-1]
-    if last_event.check_id in CHECKS_THAT_KEEP_THE_LISTING:
+    if last_event.reason_code not in REASONS_THAT_HIDE_AT_ONCE:
         return None
-    return verification_failed_event(last_event.check_id, last_event.reason_code)
-
-
-def verification_failed_event(check_id: str, reason: str | None) -> ValidationEvent:
-    """VERIFICATION_FAILED: the node could not finish a verification this cycle (see failed_check_event)."""
     return build_availability_event(
         code=AvailabilityErrorCode.VERIFICATION_FAILED,
         reach_source=ReachSource.VALIDATOR,
@@ -337,5 +320,5 @@ def verification_failed_event(check_id: str, reason: str | None) -> ValidationEv
         impact="Hidden and takes no new rentals until a check passes; a rental already on it is not touched",
         remediation="See the failed check's message for the cause. The node is listed again on the first check "
         "that passes.",
-        what_we_saw={"failed_check": check_id, "failed_reason": reason},
+        what_we_saw={"failed_check": last_event.check_id, "failed_reason": last_event.reason_code},
     )
