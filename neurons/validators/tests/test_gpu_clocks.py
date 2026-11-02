@@ -112,6 +112,20 @@ async def test_a_sysbox_pod_is_locked_like_any_other():
 
 
 @pytest.mark.asyncio
+async def test_a_redis_failure_on_the_second_gpu_still_answers_the_first_gpus_lock():
+    """Gateway review: a record write that raises must not drop the outcomes of the GPUs already locked."""
+    host, redis = FakeHost(), FakeRedis()
+    redis.fail_next_set_of = {f"gpu_clock_lock:{U[0]}"}  # the second target (pod GPU 1)
+
+    report, _ = await _lock(host, redis)
+
+    assert not report.ok and report.error_code == GpuResetErrorCode.ExecutorUnreachable
+    assert [(g.uuid, g.result) for g in report.gpus] == [(U[1], "locked"), (U[0], "failed")]
+    assert f"nvidia-smi -i {U[0]} -lgc 1200,1500" not in host.commands, "never -lgc without its record"
+    assert json.loads(redis.store[f"gpu_clock_lock:{U[1]}"])["pod_id"] == "pod1"  # the delete still resets it
+
+
+@pytest.mark.asyncio
 async def test_the_range_is_clamped_to_the_supported_clocks():
     report, _ = await _lock(FakeHost(), lo=50, hi=9999, indices=[0])
     assert [(g.uuid, g.applied_min_mhz, g.applied_max_mhz) for g in report.gpus] == [(U[1], 210, 1980)]

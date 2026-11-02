@@ -225,13 +225,27 @@ async def lock_pod_gpu_clocks(
     pod_uuids = list(dict.fromkeys([*(json.loads(raw_index) if raw_index else []), *targets]))
     await redis.set(_pod_key(pod_id), json.dumps(pod_uuids))
 
-    gpus = [
-        await _lock_one_gpu(
-            runner, redis, uuid, index_by_uuid[uuid], pod_gpu_uuids, min_mhz, max_mhz, pod_id=pod_id,
-            executor_id=executor_id,
-        )
-        for uuid in targets
-    ]
+    gpus: list[GpuClockOutcome] = []
+    for uuid in targets:
+        try:
+            gpus.append(await _lock_one_gpu(
+                runner, redis, uuid, index_by_uuid[uuid], pod_gpu_uuids, min_mhz, max_mhz, pod_id=pod_id,
+                executor_id=executor_id,
+            ))
+        except Exception:
+            # Redis failed mid-request (review): answer the GPUs already locked, stop before the rest. A GPU whose
+            # record was written keeps it, so the pod's delete still resets it
+            gpus += [
+                GpuClockOutcome(
+                    index=index_by_uuid[u], uuid=u, result="failed",
+                    detail="the validator could not record the lock" if u == uuid else "not attempted",
+                )
+                for u in targets[len(gpus):]
+            ]
+            return GpuClocksReport(
+                ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable,
+                detail="the validator could not record the clock lock", gpus=gpus,
+            )
     # a refused -lgc whose reset failed keeps its record: the pod's delete and the next create reset it again
     ok = all(gpu.result == "locked" for gpu in gpus)
     return GpuClocksReport(ok=ok, error_code=None if ok else GpuResetErrorCode.ClockLockNotSupported, gpus=gpus)
