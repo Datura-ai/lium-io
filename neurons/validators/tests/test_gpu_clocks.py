@@ -103,6 +103,15 @@ async def test_locks_the_pods_gpus_and_records_them():
 
 
 @pytest.mark.asyncio
+async def test_a_sysbox_pod_is_locked_like_any_other():
+    # every renter pod runs under sysbox-runc; -lgc runs on the host with -i <uuid>, whatever the runtime
+    host = FakeHost(runtime="sysbox-runc")
+    report, _ = await _lock(host)
+    assert report.ok and [g.result for g in report.gpus] == ["locked", "locked"]
+    assert f"nvidia-smi -i {U[0]} -lgc 1200,1500" in host.commands
+
+
+@pytest.mark.asyncio
 async def test_the_range_is_clamped_to_the_supported_clocks():
     report, _ = await _lock(FakeHost(), lo=50, hi=9999, indices=[0])
     assert [(g.uuid, g.applied_min_mhz, g.applied_max_mhz) for g in report.gpus] == [(U[1], 210, 1980)]
@@ -113,7 +122,6 @@ async def test_the_range_is_clamped_to_the_supported_clocks():
 @pytest.mark.parametrize(
     ("host", "kwargs", "code"),
     [
-        (FakeHost(runtime="sysbox-runc"), {}, GpuResetErrorCode.ClockLockNotSupported),
         (FakeHost(), {"in_tee": True}, GpuResetErrorCode.ClockLockNotSupported),
         (FakeHost(mig=(0,)), {}, GpuResetErrorCode.MigEnabled),
         (FakeHost(inspect_exit=1), {}, GpuResetErrorCode.ContainerNotFound),

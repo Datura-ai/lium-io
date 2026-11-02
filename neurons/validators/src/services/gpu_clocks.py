@@ -129,9 +129,6 @@ async def _pod_gpus_to_lock(
         host_config = json.loads(inspected.stdout).get("HostConfig") or {}
     except (ValueError, AttributeError) as exc:
         raise GpuResetRefused(GpuResetErrorCode.ContainerNotFound, f"unreadable docker inspect: {exc}") from exc
-    if "sysbox" in str(host_config.get("Runtime") or ""):
-        raise GpuResetRefused(GpuResetErrorCode.ClockLockNotSupported, "clock locking is not supported on sysbox pods")
-
     host = await _run(runner, HOST_GPUS_COMMAND)
     host_gpus = parse_host_gpus(host.stdout or "")
     if host.exit_code != 0 or not host_gpus:
