@@ -57,7 +57,7 @@ Per GPU host (the full list is in the [Node Quickstart](https://docs.lium.io/pro
 - **GPU:** an NVIDIA model on the [supported list](https://docs.lium.io/providers/architecture#supported-gpus) (the validator's source of truth is `GPU_MODEL_RATES` in [`neurons/validators/src/services/const.py`](neurons/validators/src/services/const.py)), with the driver installed (`nvidia-smi` works).
 - **Docker Engine**, installed and running.
 - **Network:** a public IP and at least **100 Mbps download**, as measured by the validator.
-- **Hardware:** at least 8 GB RAM and 140 GB free disk before the first install (100 GB once the node's images are pulled). For idle pay, total disk must be at least **1.5× total GPU VRAM**.
+- **Hardware:** at least 8 GB RAM and 140 GB free disk before the first install (100 GB once the node's images are pulled). For idle pay, total disk must be at least **1.5× total GPU VRAM**. The node removes the volumes of ended rentals by itself, and below 100 GB free or above 90% used also the images no container uses.
 - **A registered hotkey** on Subnet 51 (below). Keep your coldkey off the server.
 
 ### Ports
@@ -144,7 +144,7 @@ The validator code here is open so anyone can read what it checks and how it sco
 flowchart LR
     R["Renters<br/>lium.io · CLI · SDK · API"] --> P["Lium platform"]
     P <-->|"WebSocket<br/>lium_protocol"| V["Validator<br/>neurons/validators"]
-    V <-->|"WebSocket<br/>datura"| M["Provider coordinator<br/>neurons/miners"]
+    V <-->|"REST<br/>datura"| M["Provider coordinator<br/>neurons/miners"]
     M -->|"signed HTTP"| E["Node agent<br/>neurons/executor<br/>on each GPU host"]
     V -->|"SSH: checks<br/>and rental pods"| E
     R -.->|"SSH into the pod"| E
@@ -166,7 +166,7 @@ A provider earns in two ways. The rates move with the market, so the [rewards ca
 1. **Rental fees.** The renter pays per GPU-hour at the price the provider set. The platform pays the provider's share to their coldkey once a day ([Rental fees](https://docs.lium.io/providers/rewards/rental-fees), [Payouts](https://docs.lium.io/providers/rewards/payouts)).
 2. **Subnet emission.** Each cycle the validator scores every node and sets weights on chain, and Bittensor pays alpha to provider hotkeys every tempo. The validator splits the emission three ways:
    - **Rented pool:** nodes that are rented right now, scored by GPU model and count.
-   - **Unrented pool:** idle nodes of an eligible GPU model, paid by what that GPU earns when rented. Among the conditions: the node passes validation, its price is at or below the market soft limit, its disk is at least 1.5× its VRAM, its container can set a GPU power limit, and its GPU count has a priced tier. An 8× H200, B200 or B300 node must also offer GPU splitting, GPU profiling or an attested confidential VM.
+   - **Unrented pool:** idle nodes of an eligible GPU model, paid by what that GPU earns when rented. Among the conditions: the node passes validation, its price is at or below the market soft limit, its disk is at least 1.5× its VRAM, its container can set a GPU power limit, and its GPU count has a priced tier. An 8× H200, B200 or B300 node must also offer GPU splitting, GPU profiling or an attested confidential VM. On a partly rented split node, the free GPUs are paid for one minimum-size split per free open port (at least 3 free ports in all): 8 free 1-GPU splits need 8 free ports.
    - **Burn:** the rest. The validator reads the ceiling for the unrented and burn pools from the platform's shared config (`total_burn_emission` at [lium.io/api/v1/shared-config](https://lium.io/api/v1/shared-config)) at the start of every cycle.
 
 A node that fails validation, or runs the provider's own default job, earns nothing that cycle. Every reason a node can earn 0, with the exact message the provider sees, is listed in [`incentive/miner_incentive_log.py`](neurons/validators/src/incentive/miner_incentive_log.py). The pool logic is in [`incentive/rental_price.py`](neurons/validators/src/incentive/rental_price.py). The full explanation is in [Subnet emission](https://docs.lium.io/providers/rewards/emission) and [Penalties](https://docs.lium.io/providers/rewards/penalties).
@@ -179,7 +179,7 @@ Issues and pull requests are welcome. Open an [issue](https://github.com/Datura-
 cd neurons/validators && pdm install && \
 BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
 SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
-ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
+TDX_VERIFIER_URL=http://localhost:8000/verify \
 pdm run pytest tests/ --tb=short --strict-markers
 ```
 

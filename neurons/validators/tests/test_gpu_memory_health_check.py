@@ -251,3 +251,42 @@ def test_the_read_runs_before_the_rented_short_circuit_in_every_pipeline():
     ):
         ids = [check.check_id for check in build()]
         assert ids.index("gpu.validate.memory_health") < ids.index("executor.validate.rented_state")
+
+
+RESET_REQUIRED = ["gpu 4 (GPU-4): NVML recovery action GPU_RESET required"]
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_action_still_required_cycles_in_a_row_fails_the_rented_node(
+    context_factory,
+):
+    from neurons.validators.src.services.task.checks import gpu_memory_health
+
+    gpu_memory_health._reset_required_streak.clear()
+    stdout = _report("ok", flags=[], warnings=RESET_REQUIRED)
+    check = GpuMemoryHealthCheck()
+
+    def ctx(out=stdout):
+        return make_ctx(context_factory, FakeRunner(out), rented_data=_live_rental())
+
+    limit = gpu_memory_health.RESET_REQUIRED_STREAK_LIMIT
+    for _ in range(limit - 1):
+        assert (await check.run(ctx())).event.reason_code == Msg.RESET_ADVISED.reason
+    # an unread cycle neither counts nor ends the run
+    assert (await check.run(ctx("no marker"))).event.reason_code == Msg.UNKNOWN.reason
+    result = await check.run(ctx())
+
+    assert (result.passed, result.fatal) == (False, False)
+    assert result.updates == {"clear_verified_job_info": True}
+    [entry] = availability_errors([result.event])
+    assert entry.reason_code == AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED
+    assert entry.what_we_saw["flags"] == RESET_REQUIRED
+    assert entry.what_we_saw["reset_required_streak"] == limit
+
+    # a clean read ends the run: the next reset-required read is a warning again
+    assert (await check.run(ctx(_report("ok", flags=[])))).event.reason_code == Msg.OK.reason
+    assert (await check.run(ctx())).event.reason_code == Msg.RESET_ADVISED.reason
+    # a pending remap alone is never escalated
+    remap = _report("ok", flags=[], warnings=["gpu 1 (GPU-1): row remap pending"])
+    for _ in range(limit + 1):
+        assert (await check.run(ctx(remap))).event.reason_code == Msg.RESET_ADVISED.reason

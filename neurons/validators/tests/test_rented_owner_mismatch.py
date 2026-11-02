@@ -5,7 +5,6 @@ rented UUID would halt as rented and keep its score without the matmul ever runn
 """
 
 import logging
-from unittest.mock import patch
 
 import pytest
 
@@ -20,13 +19,14 @@ from helpers import build_context_config, build_services, build_state
 EXECUTOR_UUID = "executor-123"
 
 
-def _rented_by(miner_hotkey: str) -> RentedExecutorsResponse:
+def _rented_by(miner_hotkey: str, port: str = "22") -> RentedExecutorsResponse:
+    # The context's executor is 127.0.0.1:22 (helpers.default_executor).
     return RentedExecutorsResponse(
         executors={
             EXECUTOR_UUID: RentedExecutor(
                 miner_hotkey=miner_hotkey,
                 executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
+                executor_ip_port=port,
                 pods=[RentedPod(pod_id="pod-1", container_name="tenant-1", rented_ports=[])],
             )
         },
@@ -34,7 +34,7 @@ def _rented_by(miner_hotkey: str) -> RentedExecutorsResponse:
     )
 
 
-def _ctx(context_factory, rental_miner_hotkey: str):
+def _ctx(context_factory, rental_miner_hotkey: str, rental_port: str = "22"):
     services = build_services(
         score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
         container_cleanup=MockContainerCleanup(),
@@ -43,7 +43,7 @@ def _ctx(context_factory, rental_miner_hotkey: str):
         gpu_processes=[],
         gpu_details=[],
         gpu_model="NVIDIA RTX 4090",
-        rented_data=_rented_by(rental_miner_hotkey),
+        rented_data=_rented_by(rental_miner_hotkey, rental_port),
     )
     return context_factory(
         services=services,
@@ -73,7 +73,20 @@ async def test_own_rental_logs_no_mismatch(context_factory, caplog):
 
 
 @pytest.mark.asyncio
-async def test_another_miners_rental_is_logged_and_still_rented_by_default(context_factory, caplog):
+async def test_another_miners_rental_is_logged_and_validated_as_not_rented(context_factory, caplog):
+    ctx = _ctx(context_factory, rental_miner_hotkey="other-miner-hotkey", rental_port="2222")
+
+    with caplog.at_level(logging.WARNING, logger=rented_machine.logger.name):
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.NOT_RENTED.reason
+    assert result.updates["rented"] is False
+    assert len(_mismatch_logs(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_another_miners_rental_on_same_endpoint_stays_rented(context_factory, caplog):
+    """Same IP and port: the renter's pod is on this box, so the probes must not run beside it."""
     ctx = _ctx(context_factory, rental_miner_hotkey="other-miner-hotkey")
 
     with caplog.at_level(logging.WARNING, logger=rented_machine.logger.name):
@@ -81,25 +94,3 @@ async def test_another_miners_rental_is_logged_and_still_rented_by_default(conte
 
     assert result.event.reason_code != Msg.NOT_RENTED.reason
     assert len(_mismatch_logs(caplog)) == 1
-
-
-@pytest.mark.asyncio
-async def test_another_miners_rental_is_validated_as_not_rented_under_enforcement(
-    context_factory, caplog
-):
-    ctx = _ctx(context_factory, rental_miner_hotkey="other-miner-hotkey")
-
-    with patch.object(rented_machine.settings, "RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED", True):
-        result = await TenantEnforcementCheck().run(ctx)
-
-    assert result.event.reason_code == Msg.NOT_RENTED.reason
-    assert result.updates["rented"] is False
-
-
-def test_enforcement_is_off_by_default():
-    assert (
-        type(rented_machine.settings)
-        .model_fields["RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED"]
-        .default
-        is False
-    )

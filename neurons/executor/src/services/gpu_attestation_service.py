@@ -1,8 +1,8 @@
 import asyncio
 import json
 import logging
-import os
 import secrets
+from pathlib import Path
 
 from core.config import settings
 
@@ -31,12 +31,11 @@ class GPUAttestationService:
     """
 
     def __init__(self) -> None:
-        self.enabled: bool = bool(settings.ENABLE_TDX_ATTESTATION)
         self.arch: str = settings.GPU_ATTESTATION_ARCH
 
     @staticmethod
     def _in_cvm() -> bool:
-        return os.path.exists(settings.DSTACK_SOCKET_PATH)
+        return Path(settings.DSTACK_SOCKET_PATH).is_socket()  # Docker makes a missing path a dir
 
     @staticmethod
     def _normalise_nonce(nonce: str | None) -> str | None:
@@ -104,12 +103,9 @@ class GPUAttestationService:
         Payload shape matches the private-ml-sdk reference exactly:
         {"nonce": <hex>, "evidence_list": [...], "arch": <arch>}.
         """
-        if not self.enabled:
-            return None
-
         if not self._in_cvm():
             logger.info(
-                "GPU attestation enabled but no dstack guest detected at %s — "
+                "No dstack guest detected at %s — "
                 "host-mode topology, skipping GPU evidence collection",
                 settings.DSTACK_SOCKET_PATH,
             )

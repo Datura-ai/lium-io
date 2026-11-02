@@ -309,8 +309,7 @@ async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(cont
 async def test_machine_spec_scrape_runs_the_uploaded_binary_when_no_source_was_delivered(
     context_factory,
 ):
-    # With ENABLE_SCRAPE_SOURCE_DELIVERY off the config carries no source, so UploadFilesCheck
-    # uploaded the binary and it is what runs.
+    # A config that carries no source: UploadFilesCheck uploaded the binary and it is what runs.
     # Arrange
     runner = DummySSHCommandRunner(
         result=make_command_result(success=True, stdout=FERNET_TOKEN)
@@ -697,6 +696,14 @@ async def test_a_failed_vloopback_test_changes_no_stored_spec(context_factory):
     assert "storage_limit_scrape_error" not in specs
     assert "vloopback_check" not in specs
     assert result.updates["state"].supports_gpu_splitting is True
+
+
+@pytest.mark.asyncio
+async def test_a_provider_reported_port_grace_marker_is_dropped(context_factory):
+    # DAH-3698: the marker is PortConnectivityCheck's; a provider-sent one would bypass the split-remainder port gate
+    result = await _scrape_ok_event_for(context_factory, {"port_verify_first_miss": True})
+
+    assert "port_verify_first_miss" not in result.updates["state"].specs
 
 
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the

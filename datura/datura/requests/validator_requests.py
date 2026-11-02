@@ -37,7 +37,6 @@ class AuthenticationPayload(pydantic.BaseModel):
 
         All callers MUST use this method instead of constructing their own JSON strings.
         See call sites in:
-        - neurons/validators/src/clients/miner_client.py (WebSocket signing)
         - neurons/miners/src/dependencies/auth.py (REST verification)
         - neurons/validators/src/services/miner_service.py (REST signing)
 

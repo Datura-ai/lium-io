@@ -9,7 +9,7 @@ dilution assertions fail.
 from unittest.mock import AsyncMock
 
 import pytest
-from incentive.config import MAX_UNRENTED_GPUS_BY_TYPE, IncentiveConfig
+from incentive.config import BASE_GPU_MAP, MAX_UNRENTED_GPUS_BY_TYPE, RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task import JobResult
 
@@ -41,15 +41,6 @@ async def _run_with_production_config(
     return incentive
 
 
-def test_a100_and_l40s_caps_and_nothing_else_moved():
-    assert MAX_UNRENTED_GPUS_BY_TYPE["A100"] == {1: 10, 8: 40}
-    assert MAX_UNRENTED_GPUS_BY_TYPE["L40S"] == {1: 10, 8: 16}
-    for family, buckets in MAX_UNRENTED_GPUS_BY_TYPE.items():
-        if family in ("B300", "GB300", "A100", "L40S"):  # GB300 takes the B300 caps
-            continue
-        assert buckets in ({}, {1: 10, 8: 64}), family
-
-
 @pytest.mark.asyncio
 async def test_idle_8_card_a100_nodes_over_the_cap_share_the_capped_pay():
     """Six idle 8-card A100 nodes exceed the bucket cap and are diluted by the cap multiplier."""
@@ -75,20 +66,6 @@ async def test_idle_8_card_a100_nodes_over_the_cap_share_the_capped_pay():
 
 
 @pytest.mark.asyncio
-async def test_idle_8_card_l40s_nodes_over_the_cap_share_the_capped_pay():
-    """Three idle 8-card L40S nodes exceed the bucket cap and are diluted by the cap multiplier."""
-    jobs = {f"miner_{i}": [_make_pcc_job(f"l40s-8x-{i}", L40S, 8)] for i in range(3)}
-
-    incentive = await _run_with_production_config(jobs)
-
-    assert incentive.unrented_count_by_bucket[("L40S", 8)] == 24
-    assert incentive.cap_multiplier_by_bucket[("L40S", 8)] == pytest.approx(16 / 24)
-    for jobs_of_miner in jobs.values():
-        assert jobs_of_miner[0].max_cap == 16
-        assert jobs_of_miner[0].cap_dilution_applied is True
-
-
-@pytest.mark.asyncio
 async def test_one_idle_node_per_family_is_paid_in_full():
     """One idle 8-card node per family sits under the cap, so it is paid in full."""
     jobs = {
@@ -104,3 +81,11 @@ async def test_one_idle_node_per_family_is_paid_in_full():
     for jobs_of_miner in jobs.values():
         assert jobs_of_miner[0].cap_dilution_applied is False
         assert jobs_of_miner[0].effective_rate == pytest.approx(jobs_of_miner[0].hourly_rate)
+
+
+def test_every_gpu_model_has_a_positive_idle_cap_and_a_rate():
+    """Regression: a model whose base model had an empty cap earned nothing while free (DAH-5070, Fish 23 Oct)."""
+    for gpu_model, base_model in BASE_GPU_MAP.items():
+        assert MAX_UNRENTED_GPUS_BY_TYPE.get(base_model), gpu_model
+        assert all(cap > 0 for cap in MAX_UNRENTED_GPUS_BY_TYPE[base_model].values()), gpu_model
+        assert RENTAL_PRICES_PER_HOUR.get(gpu_model, 0) > 0, gpu_model

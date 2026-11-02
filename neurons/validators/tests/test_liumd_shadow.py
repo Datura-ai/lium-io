@@ -399,10 +399,10 @@ def _network_ema(download):
         (150.0, {"download_speed": None, "cloudflare_fallback": True}, False, "pass", None, 0),
         # Nothing stored and nothing read: the EMA stays unseeded and the check passes.
         (None, {"download_speed": None, "cloudflare_fallback": True}, False, "pass", None, 0),
-        # Cold retries on, never measured: today re-measures 50 then 150 Mbps and passes, where
+        # Never measured: today re-measures 50 then 150 Mbps and passes, where
         # the shadow's one 50 Mbps sample would fail. Not compared.
         (None, {"download_speed": 50.0}, False, "pass", {"download_speed": 150.0}, 0),
-        # Cold retries on, but a stored EMA: no retry today, so compared as ever.
+        # A stored EMA: no retry today, so compared as ever.
         (100.0, {"download_speed": 50.0}, False, "fail", {"download_speed": 150.0}, 0),
         # Past the package-fallback cap today's check scores the package reading as zero (EMA 150 →
         # 75, fail) while the shadow would read 1,000 Mbps and pass. Not compared.
@@ -444,7 +444,6 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
     retry,
     prior_fallbacks,
 ):
-    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", retry is not None)
     verifyx_check._package_fallback_probes.clear()
     if prior_fallbacks:
         verifyx_check._package_fallback_probes[("5Miner", UUID)] = prior_fallbacks
@@ -480,12 +479,13 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
 
     entry = record["steps"]["verifyx"]
     assert entry["today"] == today
-    if retry and prev_ema is None:
-        assert checked.passed is True
+    if prev_ema is None:
+        # never measured: today's check may re-measure (DAH-2959), so the shadow does not compare
         assert entry.get("agree") is None
         assert entry["liumd_reason"] == "cold_sample_retry"
         assert "liumd_verdict" not in entry
-        assert fake.intents[0]["steps"]["verifyx"] is None
+        # a failed run with no other GPU step to compare sends no intent at all
+        assert not fake.intents or fake.intents[0]["steps"]["verifyx"] is None
     elif prior_fallbacks:
         assert entry.get("agree") is None
         assert entry["liumd_reason"] == "package_fallback_cap"
