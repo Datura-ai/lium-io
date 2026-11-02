@@ -481,6 +481,8 @@ resolve_disk_dir() {
     SNAPSHOTTER_FIX=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
     docker_containerd || return 1
+    # containerd dumps defaults (exit 0) for a config that is gone: a missing generated or custom one is unknown
+    [ "$CTRD_CONFIG" = /etc/containerd/config.toml ] || [ -r "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" ] || return 1
     # the merged config (imports resolved); no dump: its config file itself, unless that imports others, whose
     # root or root_path would be missed: unknown then, as the validator's scrape follows them
     config=$("$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null) || {

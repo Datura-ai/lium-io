@@ -450,17 +450,22 @@ def test_no_visible_daemon_on_dockers_own_address_reads_its_generated_config(tmp
 
 
 @pytest.mark.parametrize(
-    "config_text",
+    "config_text, dumps_defaults",
     [
-        None,  # the managed daemon's generated config cannot be read (and so not dumped)
-        'version = 2\nroot = "/gone/containerd/daemon"\n',  # a root that is not on the host
+        (None, False),  # the managed daemon's generated config cannot be read (and so not dumped)
+        # it is gone, yet containerd dumps its defaults (exit 0), as the real one does for a missing --config
+        (None, True),
+        ('version = 2\nroot = "/gone/containerd/daemon"\n', False),  # a root that is not on the host
     ],
 )
-def test_an_unreadable_managed_root_is_skipped_not_read_as_the_leftover(tmp_path, config_text):
+def test_an_unreadable_managed_root_is_skipped_not_read_as_the_leftover(tmp_path, config_text, dumps_defaults):
     # a leftover /var/lib/containerd on the root disk must not stand in for Docker's containerd
-    _, files = _containerd_fixture(tmp_path, _MANAGED)
+    root, files = _containerd_fixture(tmp_path, _MANAGED)
     files[MANAGED_CONFIG.lstrip("/")] = config_text
-    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    env = {**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    if dumps_defaults:
+        env["STUB_CONTAINERD_ROOT"] = f'"{root}/var/lib/containerd"'
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
     assert rc == 0, out
     assert "SKIP" in out and "root cannot be read" in out
     assert "/var/lib/containerd is below" not in out

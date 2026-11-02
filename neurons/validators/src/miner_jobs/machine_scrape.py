@@ -869,7 +869,7 @@ def get_container_log_bytes(docker_root_dir: str) -> int:
     return total
 
 
-def get_host_disk_usage():
+def get_host_disk_usage(data_root_too=False):
     # total/used/free of the filesystem that holds docker's data root — where rented containers,
     # images and volumes land — read through PID 1's root like the walks above. `/` is this
     # container's own overlay: on a host with /var/lib/docker on its own partition it reported the
@@ -879,10 +879,34 @@ def get_host_disk_usage():
         info = docker_api_get("/info") or {}
     except Exception:
         info = {}
-    host_disk_root = f"/proc/1/root{disk_root_dir(info)}"
-    if os.path.isdir(host_disk_root):
-        return shutil.disk_usage(host_disk_root)
-    return shutil.disk_usage("/")
+    store = disk_root_dir(info)
+    host_disk_root = f"/proc/1/root{store}"
+    if not os.path.isdir(host_disk_root):
+        return (shutil.disk_usage("/"), None) if data_root_too else shutil.disk_usage("/")
+    usage = shutil.disk_usage(host_disk_root)
+    if not data_root_too:
+        return usage
+    # rental volumes stay under data-root whatever store keeps the containers: its own reading when apart
+    data_root = info.get("DockerRootDir") or "/var/lib/docker"
+    if on_one_filesystem(store, data_root) or not os.path.isdir(f"/proc/1/root{data_root}"):
+        return usage, None
+    return usage, shutil.disk_usage(f"/proc/1/root{data_root}")
+
+
+def hard_disk_reading(usage):
+    return {
+        "hard_disk_total": usage.total // 1024,  # in kB
+        "hard_disk_used": usage.used // 1024,
+        "hard_disk_free": usage.free // 1024,
+        "hard_disk_utilization": (usage.used / usage.total) * 100,
+    }
+
+
+def report_tighter_store(hard_disk, store_usage):
+    # hard_disk is data-root's reading after its filler run volumes are released; a rental also needs room in
+    # the containerd store on its other filesystem, so the tighter of the two is what a renter can get
+    if store_usage and store_usage.free // 1024 < hard_disk.get("hard_disk_free", float("inf")):
+        hard_disk.update(hard_disk_reading(store_usage))
 
 
 def disk_root_dir(info):
@@ -987,7 +1011,7 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
     dumped = dump.get("root")
     root_path = ((dump.get("plugins") or {}).get(plugin) or {}).get("root_path")
     # walked even after a dump: a missing literal import can still dump exit 0 with the default root
-    roots, root_paths = [], []
+    roots, sections = [], []
     pending, seen = [config_path], set()
     try:
         while pending:
@@ -996,8 +1020,9 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
                 continue
             seen.add(path)
             try:
-                # /var/run is a symlink to /run: absolute, so through /proc/1/root it would land in this container
-                with open(f"/proc/1/root{re.sub(r'^/var/run/', '/run/', path)}") as config_file:
+                # resolved on the host (/var/run -> /run, an imported file linked elsewhere); path stays the logical
+                # one, which relative imports resolve against
+                with open(f"/proc/1/root{host_realpath(path)}") as config_file:
                     config = tomllib.loads(config_file.read())
             except FileNotFoundError:
                 if path != CONTAINERD_CONFIG_PATH:
@@ -1005,8 +1030,9 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
                 config = {}  # no config at all: containerd runs on its default root
             # containerd keeps an earlier nonempty value over an empty one
             roots += [config["root"]] if isinstance(config.get("root"), str) and config["root"] else []
-            path_value = ((config.get("plugins") or {}).get(plugin) or {}).get("root_path")
-            root_paths += [path_value] if isinstance(path_value, str) and path_value else []
+            # a later file's plugin section replaces an earlier one whole, an empty root_path included
+            if isinstance((config.get("plugins") or {}).get(plugin), dict):
+                sections.append(config["plugins"][plugin].get("root_path"))
             for pattern in config.get("imports") or []:
                 # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
                 pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
@@ -1021,8 +1047,9 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
     root = host_realpath(root or dumped or (roots[-1] if roots else "/var/lib/containerd"))
     if not os.path.isdir(f"/proc/1/root{root}"):
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
-    root_path = root_path or (root_paths[-1] if root_paths else None)
-    if root_path:
+    if not dump:  # a dump that ran is the merged config: its empty root_path is the default, not a gap to fill
+        root_path = sections[-1] if sections else None
+    if isinstance(root_path, str) and root_path:
         root_path = host_realpath(root_path)
         if not os.path.isdir(f"/proc/1/root{root_path}"):
             raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: snapshotter root_path {root_path!r} is not on the host")
@@ -1075,8 +1102,7 @@ def get_docker_disk_usage():
         max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
         for volume in df.get("Volumes") or []
     )
-    info = docker_api_get("/info") or {}
-    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
+    docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     # A filler's own run volume is preallocated to its full size, but any rental removes the filler
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
     # renters were shown half of an idle node's disk. The model caches stay: rentals keep them.
@@ -1088,9 +1114,6 @@ def get_docker_disk_usage():
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
-    # the run volumes sit under data-root: they free disk only when that is the measured filesystem
-    if not on_one_filesystem(docker_root_dir, disk_root_dir(info)):
-        filler_run_volumes = 0
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
@@ -2591,14 +2614,11 @@ def get_machine_specs():
         data["ram_scrape_error"] = repr(exc)
 
     data["data_hard_disk"] = {}
+    store_usage = None
     try:
-        disk_usage = get_host_disk_usage()
-        data["data_hard_disk"] = {
-            "hard_disk_total": disk_usage.total // 1024,  # in kB
-            "hard_disk_used": disk_usage.used // 1024,
-            "hard_disk_free": disk_usage.free // 1024,
-            "hard_disk_utilization": (disk_usage.used / disk_usage.total) * 100
-        }
+        store_usage, data_root_usage = get_host_disk_usage(True)
+        data["data_hard_disk"] = hard_disk_reading(data_root_usage or store_usage)
+        store_usage = store_usage if data_root_usage else None
     except Exception as exc:
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
         data["hard_disk_scrape_error"] = repr(exc)
@@ -2610,6 +2630,7 @@ def get_machine_specs():
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
         # node that loses only the breakdown must keep reporting total/used/free.
         data["hard_disk_docker_scrape_error"] = repr(exc)
+    report_tighter_store(data["data_hard_disk"], store_usage)
 
     try:
         data["data_hard_disk"]["hard_disk_disk_type"] = get_docker_root_disk_type()

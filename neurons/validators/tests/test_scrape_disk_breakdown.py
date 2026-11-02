@@ -58,6 +58,8 @@ DISK_HELPERS = {
     "CONTAINERD_CONFIG_PATH",
     "CONTAINERD_ROOT_UNKNOWN",
     "on_one_filesystem",
+    "hard_disk_reading",
+    "report_tighter_store",
 }
 
 
@@ -802,7 +804,10 @@ def test_the_root_is_read_from_the_containerd_docker_uses(scrape: dict, monkeypa
     files = {CONTAINERD_DEFAULT: _EXTERNAL_TOML, _MANAGED_HOST_FILE: _MANAGED_TOML}
     _stub_containerd_config(scrape, monkeypatch, files, dump)
     dirs = {"/proc/1/root/data/docker/containerd/daemon", "/proc/1/root/data/containerd", "/proc/1/root/data/flag-root", "/proc/1/root/var/lib/containerd"}
-    asked = _stub_filesystem(scrape, monkeypatch, host_dirs=dirs, usage_by_path={f"/proc/1/root{expected_root}": _DOCKER_PARTITION})
+    asked = _stub_filesystem(
+        scrape, monkeypatch, host_dirs=dirs, usage_by_path={f"/proc/1/root{expected_root}": _DOCKER_PARTITION},
+        links={"/proc/1/root/var/run": "/run"},
+    )
 
     assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
     assert asked == [f"/proc/1/root{expected_root}"]
@@ -838,31 +843,42 @@ def test_two_containerd_daemons_without_dockers_address_are_unknown(scrape: dict
     assert asked == []
 
 
-def test_filler_run_volumes_on_another_filesystem_are_not_reported_as_free(scrape: dict, monkeypatch) -> None:
-    # the run volumes sit under data-root on one disk, the containerd store is measured on another:
-    # removing them frees nothing there
-    info = {"DockerRootDir": "/data/docker", "DriverStatus": [["driver-type", "io.containerd.snapshotter.v1"]]}
-    df = {"LayersSize": 0, "Containers": [], "Volumes": []}
-    _stub_docker_api(scrape, {"/info": info, "/system/df": df, "/volumes": {"Volumes": []}})
-    devices = {"/proc/1/root/data/docker": 1, "/proc/1/root/var/lib/containerd": 2}
+_GiB = 1024**3
+_SMALL = _Usage(400 * _GiB, 350 * _GiB, 50 * _GiB)
+_BIG = _Usage(14 * 1024 * _GiB, 1024 * _GiB, 13 * 1024 * _GiB)
+
+
+@pytest.mark.parametrize(
+    "store, data_root, same_device, expected_total_gib, expected_free_gib",
+    [
+        # one filesystem: the filler run volumes under data-root free room there
+        (_SMALL, _SMALL, True, 400, 150),
+        # store on 14 TiB, data-root (rental volumes, filler run volumes) with 50 GiB free: data-root binds
+        (_BIG, _SMALL, False, 400, 150),
+        # store with 50 GiB free, data-root on 14 TiB: the store binds, and the run volumes free nothing there
+        (_SMALL, _BIG, False, 400, 50),
+    ],
+)
+def test_a_renter_gets_the_room_both_the_store_and_data_root_have(
+    scrape: dict, monkeypatch, store, data_root, same_device, expected_total_gib, expected_free_gib
+) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
     scrape["open"] = lambda path: io.StringIO("")  # no root in the containerd config: its default
-    monkeypatch.setitem(
-        scrape,
-        "os",
-        SimpleNamespace(
-            path=SimpleNamespace(isdir=lambda path: path in devices, join=os.path.join),
-            stat=lambda path: SimpleNamespace(st_dev=devices[path]),
-            readlink=lambda path: (_ for _ in ()).throw(OSError(22, "not a link", path)),
-        ),
-    )
-    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
-    scrape["get_vloopback_volume_bytes"] = lambda docker_root_dir, filler_only=False, sizes=None: 100 * 1024**3
-    hard_disk = {"hard_disk_total": 400 * 1024**2, "hard_disk_used": 300 * 1024**2, "hard_disk_free": 100 * 1024**2}
+    paths = {"/proc/1/root/var/lib/containerd": store, "/proc/1/root/data/docker": data_root}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=set(paths), usage_by_path=paths)
+    devices = {"/proc/1/root/var/lib/containerd": 1, "/proc/1/root/data/docker": 1 if same_device else 2}
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=devices[path])
 
-    hard_disk.update(scrape["get_docker_disk_usage"]())
+    store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
+    hard_disk = {**scrape["hard_disk_reading"](data_root_usage or store_usage), "filler_run_volume_kb": 100 * 1024**2}
     scrape["release_filler_cache"](hard_disk)
+    scrape["report_tighter_store"](hard_disk, store_usage if data_root_usage else None)
 
-    assert (hard_disk["hard_disk_used"], hard_disk["hard_disk_free"]) == (300 * 1024**2, 100 * 1024**2)
+    assert (data_root_usage is None) == same_device
+    assert (hard_disk["hard_disk_total"], hard_disk["hard_disk_free"]) == (
+        expected_total_gib * 1024**2,
+        expected_free_gib * 1024**2,
+    )
 
 
 def test_disk_usage_falls_back_to_root_without_a_reachable_docker_root(scrape: dict, monkeypatch) -> None:
@@ -1135,6 +1151,42 @@ def test_a_symlinked_containerd_root_is_followed_on_the_host(scrape: dict, monke
 
     assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
     assert asked == ["/proc/1/root/data/containerd"]
+
+
+def test_a_symlinked_config_file_is_read_on_the_host(scrape: dict, monkeypatch) -> None:
+    # /etc/containerd/storage.toml -> /data/config/storage.toml, which only the host has; its relative import
+    # still resolves against /etc/containerd
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    files = {CONTAINERD_DEFAULT: 'imports = ["/etc/containerd/storage.toml"]\n',
+             "/data/config/storage.toml": 'imports = ["./root.toml"]\n',
+             "/etc/containerd/root.toml": 'root = "/data/containerd"\n'}
+    _stub_containerd_config(scrape, monkeypatch, files, dump='root = "/data/containerd"\n')
+    asked = _stub_filesystem(
+        scrape, monkeypatch, host_dirs={"/proc/1/root/data/containerd"},
+        usage_by_path={"/proc/1/root/data/containerd": _DOCKER_PARTITION},
+        links={"/proc/1/root/etc/containerd/storage.toml": "/data/config/storage.toml"},
+    )
+
+    assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
+    assert asked == ["/proc/1/root/data/containerd"]
+
+
+@pytest.mark.parametrize(
+    "dump",
+    [
+        # the merged dump: the import replaced the whole section, so root_path is empty
+        f'root = "/var/lib/containerd"\n[plugins."{_OVERLAYFS}"]\n  root_path = ""\n  mount_options = ["x"]\n',
+        None,  # no dump: the walk replaces the section as containerd does
+    ],
+)
+def test_an_imported_plugin_section_replaces_the_main_ones_root_path(scrape: dict, monkeypatch, dump) -> None:
+    files = {CONTAINERD_DEFAULT: f'imports = ["/etc/containerd/opts.toml"]\n[plugins."{_OVERLAYFS}"]\n  root_path = "/small/snapshots"\n',
+             "/etc/containerd/opts.toml": f'[plugins."{_OVERLAYFS}"]\n  mount_options = ["x"]\n'}
+    _stub_containerd_config(scrape, monkeypatch, files, dump)
+    dirs = {"/proc/1/root/var/lib/containerd", f"/proc/1/root/var/lib/containerd/{_OVERLAYFS}", "/proc/1/root/small/snapshots"}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=dirs, usage_by_path={})
+
+    assert scrape["containerd_root"]() == f"/var/lib/containerd/{_OVERLAYFS}"
 
 
 @pytest.mark.parametrize(
