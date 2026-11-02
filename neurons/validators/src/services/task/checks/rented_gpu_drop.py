@@ -21,8 +21,8 @@ and reads the NVML error code out of `gpu_scrape_error`. A GPU-loss code (NVML_G
 on its own; any other NVML code only rides along with a count fault, and a scrape error with no NVML code
 adds no `nvml_error` label. A card NVML still lists but reports its memory broken (uncorrected ECC, a
 failed row remap: GpuMemoryHealthCheck's NVML read, done here first on a rented node) is
-`ecc_uncorrected`, even when every card is listed; its UUID goes into `missing_uuids` only when the
-rental holds every card, since the rental does not say which cards each pod holds.
+`ecc_uncorrected`, even when every card is listed; its UUID goes into `missing_uuids` on a part-rented
+node too: the backend knows which cards each pod holds, and a fault naming no card is refused there.
 
 The counts are executor-wide, and a fault is posted for every RUNNING pod on the executor; each post
 carries that pod's own `gpu_count` next to the executor totals so the backend can tell which renters of
@@ -181,15 +181,9 @@ def judge_rented_gpus(
     rented = rented_gpu_count or 1
     code = nvml_error_code(scrape_error)
     missing = sorted(anchor - listed)[:MAX_MISSING_UUIDS] if listed or not listed_count else []
-    # The rental names no card per pod: a broken card is named only when the rental holds every card,
-    # else it may be one no pod rents (it still raises the fault).
-    # anchor too: a card off the bus lowers both counts, so a 7-of-8 rental would read as the whole node
-    whole_node = rented_gpu_count is None or rented_gpu_count >= max(
-        nvml_count, listed_count, len(anchor)
-    )
     broken_set = set(broken_uuids or ())
-    broken = [uuid for uuid in sorted(broken_set) if uuid not in missing]
-    named_broken = broken if whole_node else []
+    # named on a part rental too: the backend maps each UUID to the pod renting it (or to none)
+    named_broken = [uuid for uuid in sorted(broken_set) if uuid not in missing]
 
     faults: list[str] = []
     if visible < rented:

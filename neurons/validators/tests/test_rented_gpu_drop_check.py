@@ -226,8 +226,8 @@ ECC_FLAGS = [f"gpu 3 ({UUIDS[3]}): 1 uncorrected ECC error(s) since the driver l
 
 
 @pytest.mark.asyncio
-async def test_a_broken_card_on_a_partly_rented_node_is_not_named(context_factory):
-    # the rental does not say which cards the pod holds: the broken card may be one no pod rents
+async def test_a_broken_card_on_a_partly_rented_node_is_named(context_factory):
+    # counts intact: a report naming no card is refused by the backend, which maps the UUID to its renter
     services = _services()
     ctx = _ctx(context_factory, services, listed=UUIDS, gpu_count=1).model_copy(
         update={"runner": FakeRunner(_report("flagged", flags=ECC_FLAGS))}
@@ -238,10 +238,11 @@ async def test_a_broken_card_on_a_partly_rented_node_is_not_named(context_factor
     assert result.event.what_we_saw["faults"] == [FAULT_ECC_UNCORRECTED]
     call = services.backend.report_rented_gpu_drop.await_args
     assert call.kwargs["faults"] == [FAULT_ECC_UNCORRECTED]
-    assert call.kwargs["missing_uuids"] == []
+    assert call.kwargs["missing_uuids"] == [UUIDS[3]]
+    assert call.kwargs["expected_gpu_count"] == call.kwargs["visible_gpu_count"] == 8
 
 
-def test_a_card_off_the_bus_does_not_make_a_part_rental_look_like_the_whole_node():
+def test_a_card_off_the_bus_and_a_broken_card_are_both_named_on_a_part_rental():
     # 8 anchored cards, one fell off the bus so NVML and the scrape list 7, and the rental holds 7
     drop = judge_rented_gpus(
         rented_gpu_count=7,
@@ -253,9 +254,7 @@ def test_a_card_off_the_bus_does_not_make_a_part_rental_look_like_the_whole_node
         broken_uuids=[UUIDS[3]],
     )
 
-    assert (
-        len(drop.missing_uuids) == 1
-    )  # the card off the bus; the broken card may be one no pod rents
+    assert drop.missing_uuids == [UUIDS[7], UUIDS[3]]
 
 
 UNREAD_MEMORY = [
