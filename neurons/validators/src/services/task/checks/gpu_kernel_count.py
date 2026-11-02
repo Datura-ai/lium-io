@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from core.config import settings
-from services.nvidia_devices import read_kernel_gpu_view
+from services.nvidia_devices import (
+    KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS,
+    _missing_gpu_uuids,
+    _query_gpu_minor_map_from_proc,
+    read_kernel_gpu_view,
+)
 
 from ..messages import GpuKernelCountMessages as Msg
 from ..messages import MessageTemplate, render_message
@@ -157,6 +163,20 @@ async def host_view_verdict(
     )
 
 
+async def unattachable_gpu_uuids(ctx: Context, reported_uuids: list[str]) -> list[str]:
+    """DAH-5519: the reported cards the create step's own kernel lookup cannot find, so it refuses every
+    container on them (failure_step gpu_flags). An unreadable or empty lookup finds none: not evaluated, as before."""
+    if ctx.ssh is None or not reported_uuids:
+        return []
+    try:
+        attachable = await asyncio.wait_for(
+            _query_gpu_minor_map_from_proc(ctx.ssh), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return []
+    return _missing_gpu_uuids(reported_uuids, attachable) if attachable else []
+
+
 class GpuKernelCountCheck:
     """Cross-check the reported GPU list against the kernel's view of the cards.
 
@@ -171,7 +191,9 @@ class GpuKernelCountCheck:
     covers the reported cards the verdict is match_host_view and nothing fails.
 
     A kernel list that is missing (unreadable, empty, read failed, withheld behind a foreign
-    mount) is never a failure: the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED.
+    mount) is never a failure: the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED. One exception
+    (DAH-5519): behind a foreign mount, a reported card the create step cannot attach fails like a
+    short list (verdict unattachable), since no renter can start a container on it.
     """
 
     check_id = "gpu.validate.kernel_count"
@@ -220,7 +242,13 @@ class GpuKernelCountCheck:
             kernel_check_fields["not_evaluated_reason"] = (
                 "kernel_list_behind_foreign_mount" if foreign_mounts else "kernel_list_unavailable"
             )
-        would_fail = verdict == "count_lower"
+            unattachable = (
+                await unattachable_gpu_uuids(ctx, reported_uuids) if foreign_mounts else []
+            )
+            if unattachable:
+                verdict = kernel_check_fields["kernel_verdict"] = "unattachable"
+                kernel_check_fields["unattachable_uuids"] = unattachable
+        would_fail = verdict in ("count_lower", "unattachable")
         kernel_check_fields.update(
             {
                 "reported_uuids": reported_uuids,
@@ -239,11 +267,12 @@ class GpuKernelCountCheck:
 
     def _render_event(self, ctx: Context, kernel_check_fields: dict[str, Any]) -> ValidationEvent:
         """The event for a finished evaluation."""
-        template = (
-            Msg.COUNT_MISMATCH
-            if kernel_check_fields["would_fail"]
-            else self._template_for(kernel_check_fields)
-        )
+        if kernel_check_fields["kernel_verdict"] == "unattachable":
+            template = Msg.UNATTACHABLE
+        elif kernel_check_fields["would_fail"]:
+            template = Msg.COUNT_MISMATCH
+        else:
+            template = self._template_for(kernel_check_fields)
         return render_message(template, ctx=ctx, check_id=self.check_id, what=kernel_check_fields)
 
     @staticmethod

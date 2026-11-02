@@ -22,6 +22,7 @@ from services.nvidia_devices import (
     KERNEL_GPU_FS_SEPARATOR,
     KERNEL_GPU_VIEW_CMD,
     KERNEL_GPU_VIEW_SEPARATOR,
+    PROC_GPU_INFO_CMD,
 )
 
 from neurons.validators.src.services.task.checks.gpu_kernel_count import (
@@ -77,11 +78,16 @@ def _ctx(
     read_attempted=True,
     count=None,
     host=NO_HOST_VIEW,
+    attachable=None,
 ):
-    """`host` is the stdout of the host-view read, or an exception that read raises."""
+    """`host` is the stdout of the host-view read, or an exception that read raises. `attachable` lists the
+    cards the create step's kernel lookup finds (None: the test expects no such read)."""
     specs = {"gpu": {"count": len(reported) if count is None else count}}
 
     async def run(command, *args, **kwargs):
+        if command == PROC_GPU_INFO_CMD and attachable is not None:
+            rows = "\n".join(f"{gpu_uuid}, {i}" for i, gpu_uuid in enumerate(attachable))
+            return SimpleNamespace(exit_status=0, stdout=rows, stderr="")
         if command != HOST_KERNEL_GPU_VIEW_CMD:
             raise AssertionError("the kernel list is read once per cycle")
         if isinstance(host, BaseException):
@@ -489,6 +495,74 @@ async def test_kernel_list_withheld_behind_a_foreign_mount_is_not_evaluated(
     assert result.event.reason_code == Msg.NOT_EVALUATED.reason
     assert result.event.what_we_saw["not_evaluated_reason"] == "kernel_list_behind_foreign_mount"
     assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == mounts
+
+
+def _behind_a_foreign_mount(ctx):
+    mounts = [
+        "/proc/driver/nvidia/gpus/0000:03:00.0 proc:/driver/nvidia/gpus/0000:03:00.0//deleted"
+    ]
+    return ctx.model_copy(update={"state": replace(ctx.state, kernel_gpu_foreign_mounts=mounts)})
+
+
+@pytest.mark.asyncio
+async def test_a_card_the_create_step_cannot_attach_fails_behind_a_foreign_mount(
+    context_factory, check_enabled
+):
+    # DAH-5519, node fe08c607: 4 reported, the create step's lookup finds 3, every rent on the 4th failed
+    reported = REAL[:4]
+    ctx = _behind_a_foreign_mount(
+        _ctx(context_factory, reported=reported, kernel=None, attachable=[REAL[0], *REAL[2:4]])
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is True
+    assert result.event.reason_code == Msg.UNATTACHABLE.reason
+    assert result.event.what_we_saw["unattachable_uuids"] == [REAL[1]]
+    assert result.event.what_we_saw["would_fail"] is True
+
+
+@pytest.mark.asyncio
+async def test_an_unattachable_card_on_a_rented_node_fails_but_does_not_stop_the_run(
+    context_factory, check_enabled
+):
+    ctx = _behind_a_foreign_mount(
+        _ctx(context_factory, reported=REAL[:4], kernel=None, attachable=REAL[:3])
+    )
+    rented = RentedExecutorsResponse(
+        executors={
+            ctx.executor.uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address=ctx.executor.address,
+                executor_ip_port=str(ctx.executor.port),
+                pods=[RentedPod(pod_id="pod-1", container_name="pod_p1")],
+            )
+        }
+    )
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented)})
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is False
+    assert result.event.reason_code == Msg.UNATTACHABLE.reason
+
+
+@pytest.mark.parametrize("attachable", [REAL[:4], []], ids=["all-attachable", "lookup-empty"])
+@pytest.mark.asyncio
+async def test_behind_a_foreign_mount_an_attachable_or_unread_set_stays_not_evaluated(
+    context_factory, check_enabled, attachable
+):
+    ctx = _behind_a_foreign_mount(
+        _ctx(context_factory, reported=REAL[:4], kernel=None, attachable=attachable)
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_EVALUATED.reason
+    assert result.event.what_we_saw["not_evaluated_reason"] == "kernel_list_behind_foreign_mount"
 
 
 @pytest.mark.asyncio
