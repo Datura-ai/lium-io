@@ -5,6 +5,7 @@ cleanup on delete and on a failed create, disk accounting."""
 from __future__ import annotations
 
 import ast
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -14,6 +15,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
+    ContainerStartRequest,
+    ContainerStopRequest,
     FailedContainerRequest,
     PayloadPortMapping,
     VolumeEncryptionStatus,
@@ -57,6 +60,7 @@ def test_commands_never_carry_the_key_and_run_in_the_host_mount_namespace():
     for command in (
         dm.dmcrypt_create_command(pod, 20, sparse=False),
         dm.dmcrypt_open_command(pod),
+        dm.dmcrypt_close_command(pod),
         dm.dmcrypt_delete_command(pod),
     ):
         assert key not in command
@@ -506,3 +510,115 @@ async def test_delete_dmcrypt_volume_skips_a_non_uuid_pod(docker_service):
     ssh_client = Mock(run=AsyncMock())
     await docker_service.delete_dmcrypt_volume(ssh_client, "filler-1", {})
     ssh_client.run.assert_not_awaited()
+
+
+def test_close_keeps_the_file_and_a_second_close_is_a_no_op(tmp_path):
+    """The host script's close against stub tools: the first closes the mapping and detaches the loop
+    device, the second finds nothing to do and still succeeds; the backing file stays."""
+    pod = str(uuid4())
+    bin_dir, state, crypt = tmp_path / "bin", tmp_path / "state", tmp_path / "lium-crypt"
+    bin_dir.mkdir(), state.mkdir(), crypt.mkdir()
+    (crypt / f"{pod}.img").write_bytes(b"")
+    (state / "mapped").touch()
+    (state / "loop").touch()
+    stubs = {
+        "dmsetup": '[ -e "$S/mapped" ]',
+        "cryptsetup": 'echo "$*" >> "$S/calls"; [ "$1" = close ] && rm "$S/mapped"',
+        "losetup": 'echo "losetup $*" >> "$S/calls"; case $1 in -j) [ ! -e "$S/loop" ] || echo "/dev/loop7: x";; -d) rm "$S/loop";; esac',
+    }
+    for name, body in stubs.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    script = dm._SCRIPT.replace(dm._PATH, f"export PATH={bin_dir}:/usr/bin:/bin S={state}")
+
+    for _ in range(2):
+        done = subprocess.run(["sh", "-c", script, "lium-dmcrypt", "close", str(crypt), pod], capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+
+    assert (state / "calls").read_text().splitlines().count(f"close lium-{pod}") == 1
+    assert "losetup -d /dev/loop7" in (state / "calls").read_text()
+    assert (crypt / f"{pod}.img").exists()
+
+
+def _lifecycle(cls, pod):
+    return cls(miner_hotkey="miner", miner_address="127.0.0.1", miner_port=8000, executor_id=str(uuid4()),
+               pod_id=pod, container_name="pod_x", **({"local_volume_path": "/root"} if cls is ContainerStartRequest else {}))
+
+
+def _wire_lifecycle(docker_service, monkeypatch, pod, events, *, close_exit=0):
+    """Stub host: tracks whether the pod's mapping is open; a start with it closed is refused at the mount."""
+    host = {"open": True}
+
+    async def run(command, **kwargs):
+        if command == dm.mounted_volume_devices_command("pod_x"):
+            events.append("list")
+            return _make_ssh_command_result(stdout=f"<no value>\n/dev/mapper/lium-{pod}\n")
+        if command == dm.dmcrypt_close_command(pod):
+            events.append("close")
+            host["open"] = host["open"] and close_exit != 0
+            return _make_ssh_command_result(exit_status=close_exit, stderr="Device is still in use.")
+        if command == dm.dmcrypt_open_command(pod):
+            events.append("open")
+            host["open"] = True
+        return _make_ssh_command_result()
+
+    async def start(*, container_name, network=None):
+        events.append("start")
+        if not host["open"]:
+            raise RuntimeError(_CLOSED_MAPPING_ERROR.format(pod=pod))
+
+    async def stop(*, container_name, stop_grace_seconds=None):
+        events.append("stop")
+
+    client = docker_service.rental_docker_client_factory.client
+    monkeypatch.setattr(client, "start", start)
+    monkeypatch.setattr(client, "stop", stop)
+    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", _MASTER)
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(side_effect=lambda **kw: DummySSHConnectionManager(Mock(run=AsyncMock(side_effect=run)))),
+    )
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    monkeypatch.setattr(docker_service, "_restore_mount_and_sshd_after_start", AsyncMock())
+    return host
+
+
+_EXECUTOR = ExecutorSSHInfo(
+    uuid=str(uuid4()), address="127.0.0.1", port=8001, ssh_username="root", ssh_port=2200,
+    python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=FAKE_SSH_HOST_KEY,
+)
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_the_mapping_and_the_next_start_reopens_it(docker_service, monkeypatch):
+    pod = str(uuid4())
+    events: list[str] = []
+    host = _wire_lifecycle(docker_service, monkeypatch, pod, events)
+    keypair = Mock(ss58_address="validator")
+
+    assert await docker_service.stop_container(_lifecycle(ContainerStopRequest, pod), _EXECUTOR, keypair, "k") is None
+    assert events == ["stop", "close"]
+    assert host["open"] is False  # a stopped dm-crypt pod is not decrypted on the host
+
+    events.clear()
+    assert await docker_service.start_container(_lifecycle(ContainerStartRequest, pod), _EXECUTOR, keypair, "k") is None
+    # the start is refused at the mount until the mapping is reopened: nothing runs on the closed volume
+    assert events == ["start", "list", "open", "start"]
+    assert host["open"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_close_fails_the_stop(docker_service, monkeypatch):
+    pod = str(uuid4())
+    events: list[str] = []
+    _wire_lifecycle(docker_service, monkeypatch, pod, events, close_exit=5)
+
+    result = await docker_service.stop_container(
+        _lifecycle(ContainerStopRequest, pod), _EXECUTOR, Mock(ss58_address="validator"), "k"
+    )
+
+    # the container is down, but the volume would stay decrypted: report the stop failed
+    assert isinstance(result, FailedContainerRequest)
+    assert events == ["stop", "close"]

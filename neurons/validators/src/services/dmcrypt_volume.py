@@ -48,11 +48,11 @@ loop_of() {{ losetup -j "$f" | cut -d: -f1 | head -n1; }}
 mapped() {{ dmsetup info "$n" >/dev/null 2>&1; }}
 # dockerd resolves the device in the host /dev, which udev fills asynchronously: wait before any start
 settle() {{ udevadm settle --timeout=10 || true; test -b "/dev/mapper/$n"; }}
-teardown() {{
+close() {{
   if mapped; then cryptsetup close "$n"; fi
   l=$(loop_of); [ -z "$l" ] || losetup -d "$l"
-  rm -f "$f"
 }}
+teardown() {{ close; rm -f "$f"; }}
 case $op in
 create)
   size=$4 sparse=$5
@@ -80,6 +80,8 @@ open)
     printf %s "$k" | cryptsetup open --key-file - "$l" "$n"
   fi
   settle ;;
+close)
+  close ;;
 delete)
   teardown ;;
 *) exit 2 ;;
@@ -117,6 +119,12 @@ def dmcrypt_create_command(pod_id: str, size_gb: int, *, sparse: bool) -> str:
 def dmcrypt_open_command(pod_id: str) -> str:
     """Open the volume unless it is open (after a host reboot it is not); the key is the stdin line."""
     return _host_command("open", pod_id)
+
+
+def dmcrypt_close_command(pod_id: str) -> str:
+    """Close the mapping and detach the loop device, keeping the file (a stopped pod); nothing to do is
+    success. A mapping still mounted refuses the close."""
+    return _host_command("close", pod_id)
 
 
 def dmcrypt_delete_command(pod_id: str) -> str:

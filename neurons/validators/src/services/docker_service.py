@@ -195,6 +195,7 @@ from services.dmcrypt_volume import (
     GOCRYPTFS_METHOD,
     dmcrypt_backing_bytes_command,
     dmcrypt_capability_command,
+    dmcrypt_close_command,
     dmcrypt_create_command,
     dmcrypt_delete_command,
     dmcrypt_device,
@@ -5901,6 +5902,17 @@ class DockerService:
             logger.info(_m("dm-crypt volume open", extra=get_extra_info({**log_extra, "dmcrypt_pod_id": pod_id})))
         return pod_ids
 
+    async def close_dmcrypt_volume(self, ssh_client: asyncssh.SSHClientConnection, pod_id: str, log_extra: dict) -> None:
+        """Close the stopped pod's mapping and detach its loop device; the file stays. A pod without one
+        (or already closed) costs one command that finds nothing. A failed close raises: the stop is
+        reported failed rather than leaving the volume decrypted on the host unnoticed."""
+        result = await ssh_client.run(dmcrypt_close_command(pod_id), check=False, timeout=_DMCRYPT_OPEN_TIMEOUT_SEC)
+        if result.exit_status != 0:
+            raise RuntimeError(
+                f"dm-crypt volume close failed for pod {pod_id} (exit_status={result.exit_status}): "
+                f"{(result.stderr or '').strip()[-500:]}"
+            )
+
     async def delete_dmcrypt_volume(self, ssh_client: asyncssh.SSHClientConnection, pod_id: str, log_extra: dict) -> None:
         """Best effort: close, detach and remove the pod's backing file; a pod without one costs one
         command that finds nothing. Run after its Docker volume is removed (a mounted mapping refuses)."""
@@ -10550,10 +10562,10 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        asyncssh.import_private_key(private_key)  # validates the key, raises on a bad payload
+        pkey = asyncssh.import_private_key(private_key)  # validates the key, raises on a bad payload
 
         try:
-            await self._prepare_known_hosts_policy(
+            known_hosts_policy = await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -10600,6 +10612,19 @@ class DockerService:
                     call=lambda: docker_client.stop(container_name=payload.container_name),
                     container_name=payload.container_name,
                 )
+            # a stopped dm-crypt pod stays encrypted at rest: its mapping is closed here and reopened
+            # by the next start (the start fails closed at the mount, opens it, starts again). Only a
+            # UUID pod id names a dm-crypt volume; the mapping is named by the pod id, never the container.
+            if is_dmcrypt_pod_id(payload.pod_id):
+                async with asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                ) as ssh_client:
+                    await self.close_dmcrypt_volume(ssh_client, payload.pod_id, default_extra)
         except Exception as exc:
             log_text = _m(
                 "Failed stop_container",

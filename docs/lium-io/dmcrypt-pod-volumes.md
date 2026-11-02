@@ -22,10 +22,11 @@ On Ubuntu: `apt-get install cryptsetup-bin`.
 ## Lifecycle
 
 - **Create:** the loop file, LUKS2, open, `udevadm settle`, a check that the host device node exists, mkfs, then the Docker volume. If the create fails at any point, the validator removes the Docker volume, the mapping and the file.
-- **Start after a host reboot:** a reboot closes every mapping. dockerd's own restart then fails at the mount ("failed to mount local volume … /dev/mapper/lium-…"), so the pod never runs on an empty directory. When the validator sees that error on a start, it opens the mapping and starts the pod again. This covers backend start, GPU reset, edit undo and reboot recovery in the rented-machine check.
+- **Stop:** after the container stops, the validator closes the mapping and detaches the loop device; the file stays. A stopped pod is not decrypted on the host. Closing an already closed mapping does nothing. If the close fails, the stop is reported failed.
+- **Start after a stop or a host reboot:** a stop closes the pod's mapping and a reboot closes every mapping. dockerd's own restart then fails at the mount ("failed to mount local volume … /dev/mapper/lium-…"), so the pod never runs on an empty directory. When the validator sees that error on a start, it opens the mapping and starts the pod again. This covers backend start, GPU reset, edit undo and reboot recovery in the rented-machine check.
 - **Edit/reboot from the backend:** the backend sends the pod's stored method. The validator opens the existing volume before `docker run`.
 - **Delete:** after the Docker volume is removed, the validator closes the mapping, detaches the loop device and removes the file. A mapping that is still mounted refuses to close and keeps its file.
-- **Backup/restore:** the backend sends `volume_encrypted=false` for a dm-crypt pod, so the plain-volume path reads it. The mapping must be open, which it is while the pod runs.
+- **Backup/restore:** the backend sends `volume_encrypted=false` for a dm-crypt pod, so the plain-volume path reads it. The mapping must be open, which it is only while the pod runs.
 - **Disk accounting:** the fresh sizing adds the backing files' apparent size to the declared vloopback sizes.
 
 ## Check a node
