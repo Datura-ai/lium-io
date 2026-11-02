@@ -307,3 +307,51 @@ def test_delete_removes_the_named_node_not_another_at_its_address(executor_servi
     assert isinstance(result, ExecutorDeleted)
     dao.delete_by_uuid.assert_called_once_with(payload.uuid)
     dao.delete_by_address_port.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "messages, expected",
+    [
+        # an address edit after the provider changed price here, before the portal synced it
+        ([{"address": "10.0.0.9", "port": 2222}], ("10.0.0.9", 2222, "5MinerValidator", 3.0)),
+        # a portal price edit, then an address edit: the address edit undoes neither
+        (
+            [
+                {"validator": "5PortalValidator", "address": "10.0.0.1", "port": 22, "price_per_gpu": 3.5},
+                {"address": "10.0.0.9", "port": 2222},
+            ],
+            ("10.0.0.9", 2222, "5PortalValidator", 3.5),
+        ),
+        # a full update still writes every field it carries
+        (
+            [{"validator": "5PortalValidator", "address": "10.0.0.9", "port": 2222, "price_per_gpu": 2.5}],
+            ("10.0.0.9", 2222, "5PortalValidator", 2.5),
+        ),
+    ],
+    ids=["address_only", "price_edit_then_address_edit", "full_update"],
+)
+def test_an_update_writes_only_the_fields_the_portal_sent(tmp_path, messages, expected):
+    from sqlmodel import Session, SQLModel, create_engine
+
+    from daos.executor import ExecutorDao
+    from protocol.miner_portal_request import ExecutorUpdated, UpdateExecutorRequest
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'update.db'}")
+    SQLModel.metadata.create_all(engine)
+    node_id = uuid4()
+    with Session(engine) as session:
+        session.add(Executor(uuid=node_id, address="10.0.0.1", port=22, validator="5MinerValidator", price_per_gpu=3.0))
+        session.commit()
+    with Session(engine) as session:
+        service = ExecutorService.__new__(ExecutorService)
+        service.executor_dao = ExecutorDao(session)
+
+        for fields in messages:
+            sent = UpdateExecutorRequest.model_validate_json(
+                json.dumps({"executor": {"uuid": str(node_id), **fields}})
+            )
+            assert isinstance(service.update(sent), ExecutorUpdated)
+
+    with Session(engine) as session:
+        node = session.get(Executor, node_id)
+        assert (node.address, node.port, node.validator, node.price_per_gpu) == expected
