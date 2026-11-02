@@ -1012,6 +1012,13 @@ def test_command_reads_the_disk_pressure_only_with_the_reading_on():
     assert "sync -f" not in without and "lium_dp" not in without and "/usr/bin/docker run" in without
 
 
+def test_command_reads_the_disk_pressure_before_the_counter_snapshots():
+    cmd = throughput_command(True, [], skip_under_pressure=True)
+    busy_window = cmd.index("snap; sleep")
+    assert cmd.index("lium_tp_device") < cmd.index("sync -f") < cmd.index("lium_dp_sync") < busy_window
+    assert busy_window < cmd.index('if [ "$dp" = 1 ]')
+
+
 async def test_reading_off_sends_the_command_without_the_sync_and_judges_as_before():
     with flags(read_pressure=False, enforce_pressure=True):
         ctx, runner = make_ctx(SLOW_DISK)

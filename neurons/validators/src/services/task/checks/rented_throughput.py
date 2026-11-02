@@ -73,7 +73,7 @@ _UNSAVED: dict[str, _State] = {}
 # received and sent on the physical NICs and sectors
 # moved (and requests completed) per whole disk (/proc/diskstats is not namespaced), twice BUSY_WINDOW_SECONDS apart
 # before the probe, then again after the disk container and after the fetch container (throughput_command).
-_SNAPSHOT = DOCKER_ROOT_DEVICES + (
+_COUNTER_SNAPSHOTS = (
     # Only physical NICs (a sysfs `device` link) are counted: disjoint, so a bond, bridge, VLAN or OVS port can neither
     # repeat nor hide an uplink. Without a host sysfs (this shell's own is the container's), names and bond members.
     'ph=$(for i in /proc/1/root/sys/class/net/*; do [ -e $i/device ] && [ "${i##*/}" != lo ] && '
@@ -117,6 +117,7 @@ _SNAPSHOT = DOCKER_ROOT_DEVICES + (
     '/proc/diskstats) pod=$(pods)"; }; '
     f"snap; sleep {BUSY_WINDOW_SECONDS}; snap; "
 )
+_SNAPSHOT = DOCKER_ROOT_DEVICES + _COUNTER_SNAPSHOTS
 # In the probe container, whose writable layer sits on the disk a renter's container writes to. O_DIRECT where the
 # filesystem takes it, else buffered with the fsync timed in; a timed-out write is the slow reading itself.
 _DISK_SCRIPT = (
@@ -133,8 +134,9 @@ _DISK_SCRIPT = (
 def throughput_command(
     sysbox: bool, containers: list[str], *, read_pressure: bool = True, skip_under_pressure: bool = False
 ) -> str:
-    """The busy snapshot, the disk-pressure reading (read_pressure), then one probe container per side with the
-    counters after each: what the renter's pods moved while that side was measured. With skip_under_pressure both
+    """The disk-pressure reading (read_pressure), the busy snapshot, then one probe container per side with the
+    counters after each: what the renter's pods moved while that side was measured. The reading goes first so its
+    seconds stay out of the disk side's interval and do not dilute the renter's rate there. With skip_under_pressure both
     containers are left out when the reading shows pressure (the shell's `dp`), since their start would stall."""
     names = " ".join(shlex.quote(c) for c in containers)
     pod_pids = (
@@ -150,7 +152,7 @@ def throughput_command(
         return pod_pids + _SNAPSHOT + probe
     if skip_under_pressure:
         probe = f'if [ "$dp" = 1 ]; then echo "{PROBE_SKIPPED_MARKER}"; else {probe}; fi'
-    return pod_pids + _SNAPSHOT + disk_pressure_probe() + probe
+    return pod_pids + DOCKER_ROOT_DEVICES + disk_pressure_probe() + _COUNTER_SNAPSHOTS + probe
 
 
 @dataclass(frozen=True)
