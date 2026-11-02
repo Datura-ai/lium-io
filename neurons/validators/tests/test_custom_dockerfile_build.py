@@ -35,7 +35,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     PayloadPortMapping,
 )
-from services.docker_service import DockerService
+from services.docker_service import DockerService, custom_build_export_timeout
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -488,6 +488,53 @@ async def test_A12_sysbox_unavailable_aborts_before_build(svc, monkeypatch):
     assert not any("docker build" in c for c in esl.seen)
 
 
+@pytest.mark.asyncio
+async def test_A6_build_timeout_carries_the_step_that_was_running(svc, monkeypatch):
+    """A timed-out build ships no tail itself; the renter still gets the last lines from the build
+    log in the DinD container, then the timeout line."""
+    ssh_client = _make_dind_ssh()
+    base_run = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if "tail -n" in cmd and "/tmp/lium-build.log" in cmd:
+            ssh_client.calls.append(cmd)
+            return _ssh_result(stdout="#5 [2/3] RUN pip install flash-attn\n#5 12.3 Building wheel\n")
+        return await base_run(cmd, **kw)
+
+    ssh_client.run = _run
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN pip install flash-attn\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert ok is False
+    assert step == "build_timeout"
+    assert tail.startswith("#5 [2/3] RUN pip install flash-attn")
+    assert tail.endswith("docker build exceeded 1200 s")
+
+
+@pytest.mark.asyncio
+async def test_A6b_a_lost_node_connection_mid_build_says_so(svc, monkeypatch):
+    """The SSH connection dropping during the build is not the renter's Dockerfile failing."""
+    import asyncssh
+
+    async def _esl(**kwargs):
+        if "docker build" in kwargs.get("command", ""):
+            raise asyncssh.ConnectionLost("Connection lost")
+        return (True, "")
+
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=_make_dind_ssh(), payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert (ok, step, tail) == (False, "build_ssh_lost", "the connection to the node was lost during the build; please retry")
+
+
 # ------------------------------------------------------------------
 # A.13 — egress firewall failure → build_egress_setup, NO build attempted
 # ------------------------------------------------------------------
@@ -653,3 +700,55 @@ def test_A17e_a_stack_trace_longer_than_the_tail_still_reaches_the_renter_with_i
         "#5 [2/3] RUN pip install nope",
         "ERROR: failed to solve: pip install nope did not complete",
     ]
+
+
+# ------------------------------------------------------------------
+# A.20 — the image export's timeout follows the built image's size
+# ------------------------------------------------------------------
+
+
+def test_A20_export_timeout_scales_with_image_size_within_the_pending_budget():
+    gib = 1024**3
+    # unknown or small image: the build timeout, as before
+    assert custom_build_export_timeout(None, 1200, 950, 10 * 1024**2, 3300) == 1200
+    assert custom_build_export_timeout(2 * gib, 1200, 950, 10 * 1024**2, 3300) == 1200
+    # a 20 GiB image at 10 MiB/s needs 2048 s, more than the build timeout
+    assert custom_build_export_timeout(20 * gib, 1200, 950, 10 * 1024**2, 3300) == 2048
+    # never past what is left of the budget, even when that is below the build timeout
+    assert custom_build_export_timeout(40 * gib, 1200, 950, 10 * 1024**2, 3300) == 2350
+    assert custom_build_export_timeout(40 * gib, 1200, 3000, 10 * 1024**2, 3300) == 300
+    assert custom_build_export_timeout(None, 1200, 3000, 10 * 1024**2, 3300) == 300
+    # budget spent: 1 s, never 0 (the streamer reads 0 as no timeout)
+    assert custom_build_export_timeout(None, 1200, 3400, 10 * 1024**2, 3300) == 1
+
+
+@pytest.mark.asyncio
+async def test_A20b_a_large_image_gets_a_size_scaled_export_timeout(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    inner_run = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if "docker image inspect -f" in cmd:
+            ssh_client.calls.append(cmd)
+            return _ssh_result(stdout=str(20 * 1024**3))
+        return await inner_run(cmd, **kw)
+
+    ssh_client.run = _run
+    timeouts = {}
+    esl = _make_esl()
+
+    async def _esl(**kwargs):
+        if "docker save" in kwargs["command"]:
+            timeouts["export"] = kwargs["timeout"]
+        return await esl(**kwargs)
+
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step, _tail = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert ok is True and step is None
+    assert any("docker image inspect -f" in c for c in ssh_client.calls)
+    assert timeouts["export"] == 2048  # 20 GiB at the default 10 MiB/s, not the 1200 s build timeout

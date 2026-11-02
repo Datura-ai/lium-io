@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 
-from core.config import settings
+from services.nvidia_devices import read_kernel_gpu_view
 
 from ..messages import HardwareIdentityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -75,8 +75,8 @@ def dmi_overlay_findings(mountinfo: str, file_fs: str) -> list[str]:
 
 
 def gpu_sources_disagree(reported: list[str], kernel: list[str] | None) -> bool:
-    """NVML (the scrape) and the kernel's procfs list name different cards; unknown when the kernel list is unreadable."""
-    return kernel is not None and set(reported) != set(kernel)
+    """NVML (the scrape) names a card the kernel's procfs list does not; unknown when the kernel list is unreadable."""
+    return kernel is not None and not set(reported) <= set(kernel)
 
 
 def digest(values: list[str]) -> str:
@@ -99,14 +99,12 @@ class HardwareIdentityCheck:
 
     DMI (`/sys/class/dmi/id`) is text a script can overlay (provider 5E5GpE1b's dmi-cloak); the GPU
     UUID the kernel driver reads from the card is not. The node is flagged when DMI files are not
-    served by sysfs, when NVML and the kernel name different GPUs, or when DMI identity
+    served by sysfs, when NVML names a GPU the kernel does not list, or when DMI identity
     (product_uuid, board_serial) changes between checks while the GPU set stays the same. The
     fingerprint (a hash of the kernel's GPU UUIDs, NVML's when the kernel list is unreadable) and
     the DMI hash are logged on every event.
 
-    Shadow by default: a finding is a warning event and the node passes. Under
-    HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED it fails the node. An unreadable host, SSH error or
-    Redis outage decides nothing.
+    A finding fails the node. An unreadable host, SSH error or Redis outage decides nothing.
     """
 
     check_id = "host.validate.hardware_identity"
@@ -142,10 +140,16 @@ class HardwareIdentityCheck:
         except Exception:
             logger.warning("hardware identity record unavailable", exc_info=True, extra=ctx.default_extra)
 
+        host_kernel = None
+        if gpu_sources_disagree(reported, kernel) and ctx.ssh is not None:
+            # a container handed some of the host's cards lists only those; the host's own list is the full one
+            host_uuids, _ = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+            host_kernel = sorted(set(host_uuids)) if host_uuids else None
+
         findings = []
         if overlays:
             findings.append("dmi_overlaid")
-        if gpu_sources_disagree(reported, kernel):
+        if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
         if dmi_identity_drifted(previous, gpus, dmi_identity):
             findings.append("dmi_changed_under_same_gpus")
@@ -157,21 +161,20 @@ class HardwareIdentityCheck:
             if previous and previous.get("dmi")
             else None,
             "kernel_gpu_uuids": kernel,
+            "host_kernel_gpu_uuids": host_kernel,
             "reported_gpu_uuids": reported,
             "dmi_overlays": overlays,
             "findings": findings,
-            "enforced": settings.HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED,
         }
         if not findings:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
 
-        enforce = settings.HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED
-        event = render_message(
-            Msg.SPOOFED,
-            ctx=ctx,
-            check_id=self.check_id,
-            impact=None if enforce else "Shadow observation only: score was NOT changed",
-            what=what,
+        event = render_message(Msg.SPOOFED, ctx=ctx, check_id=self.check_id, what=what)
+        # like the ban checks: a node with a live pod keeps being verified (TenantEnforcementCheck still runs);
+        # the flag zeroes its score in calculate_scores
+        return CheckResult(
+            passed=False,
+            event=event,
+            fatal=not has_live_rental(ctx),
+            updates={"hardware_identity_passed": False},
         )
-        # like the ban checks: a node with a live pod keeps being verified (TenantEnforcementCheck still runs)
-        return CheckResult(passed=not enforce, event=event, fatal=not has_live_rental(ctx))

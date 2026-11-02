@@ -324,3 +324,30 @@ async def test_the_pipeline_check_with_default_settings_reports_the_drop(context
 # --- an incident replayed ----------------------------------------------------------------------------------------------
 
 
+# --- a whole set of other cards: the post carries them, so the backend can move the pod at once -----------------------
+
+
+@pytest.mark.asyncio
+async def test_a_whole_set_of_other_cards_is_posted_with_the_new_cards(context_factory):
+    services = _services()
+    new = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(8)]
+    ctx = _ctx(context_factory, services, listed=new).model_copy(
+        update={"runner": FakeRunner(_report("ok"))}
+    )
+
+    await RentedGpuDropCheck().run(ctx)
+
+    call = services.backend.report_rented_gpu_drop.await_args
+    assert FAULT_ANCHORED_MISSING in call.kwargs["faults"]
+    assert call.kwargs["missing_uuids"] == sorted(UUIDS)
+    assert call.kwargs["gpu_details"] == _details(new)
+
+
+@pytest.mark.asyncio
+async def test_a_fault_with_every_anchored_card_listed_posts_no_cards(context_factory):
+    services = _services()
+    flags = [f"gpu 3 ({UUIDS[3]}): 1 uncorrected ECC error(s) since the driver loaded"]
+
+    await _run_with_memory_read(context_factory, services, _report("flagged", flags=flags))
+
+    assert services.backend.report_rented_gpu_drop.await_args.kwargs["gpu_details"] is None

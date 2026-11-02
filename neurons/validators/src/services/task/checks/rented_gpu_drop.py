@@ -14,6 +14,8 @@ fails the cycle. For a rented executor it compares what the scrape listed with:
   MachineSpecScrapeCheck, which runs this check on it before the cycle halts),
 - the driver's own count (`gpu.count`),
 - the anchored UUID set of the verified-job record (`missing_uuids` is the anchor minus the listed set),
+  so a rented node that came back with a full set of other cards posts `anchored_gpu_missing` on that cycle:
+  the renter's incident for the swap, while the node itself is re-anchored and stays listed (GpuFingerprintCheck),
 
 and reads the NVML error code out of `gpu_scrape_error`. A GPU-loss code (NVML_GPU_LOSS_CODES) is a fault
 on its own; any other NVML code only rides along with a count fault, and a scrape error with no NVML code
@@ -590,6 +592,10 @@ class RentedGpuDropCheck:
                 pod_gpu_count=_gpus(pod.gpu_count),
                 rented_gpu_count=_gpus(rented_total),
                 nvml_gpu_count=_gpus(nvml_count),
+                # the anchored cards are gone: the cards the node lists now, so the pod can move onto them
+                gpu_details=((ctx.state.specs or {}).get("gpu") or {}).get("details")
+                if drop and FAULT_ANCHORED_MISSING in drop.faults
+                else None,
             )
         except Exception:
             logger.warning(
