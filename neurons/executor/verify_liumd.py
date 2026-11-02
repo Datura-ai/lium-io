@@ -24,7 +24,9 @@ def main(target: str) -> None:
     if version["target"] != target:
         raise SystemExit(f"liumd target {version['target']!r}, SOURCE says {target!r}")
     if version["build_sha"] != entry["build_sha"]:
-        raise SystemExit(f"liumd build_sha {version['build_sha']!r}, SOURCE says {entry['build_sha']!r}")
+        raise SystemExit(
+            f"liumd build_sha {version['build_sha']!r}, SOURCE says {entry['build_sha']!r}"
+        )
     digest = hashlib.sha256((LIUMD / entry["artifact"]).read_bytes()).hexdigest()
     if digest != entry["sha256"]:
         raise SystemExit(f"liumd sha256 {digest}, SOURCE says {entry['sha256']}")
