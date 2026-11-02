@@ -336,7 +336,7 @@ class Settings(BaseSettings):
     # GPU steps again through `liumd run` on an SSH exec channel of the same session and log one
     # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
     # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
-    VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
+    VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=True)
     # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the
     # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
     # and the matmul (at most 120 s) run one after the other.
@@ -347,7 +347,7 @@ class Settings(BaseSettings):
     # a rentable node the shadow could run its GPU/RAM/disk/network probe next to a workload.
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
-    LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="all")
     # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
     # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
     # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
