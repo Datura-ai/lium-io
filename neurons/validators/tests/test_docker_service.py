@@ -4783,6 +4783,20 @@ async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_i
     assert any("volume rm volume_test" in str(call) for call in ssh_commands.call_args_list) is removed
 
 
+def test_every_failed_create_cleanup_that_may_remove_a_volume_names_its_pod():
+    # F-78 (review): without pod_id the cleanup cannot see another live create of the pod and removes its volume
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(docker_service_module))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "cleanup_failed_container_creation"
+    ]
+    removing = [call for call in calls if any(k.arg == "remove_volume" for k in call.keywords)]
+    assert removing and all(any(k.arg == "pod_id" for k in call.keywords) for call in removing)
+
+
 @pytest.mark.asyncio
 async def test_create_container_does_not_repair_vloopback_mountpoint_twice(
     docker_service, monkeypatch,

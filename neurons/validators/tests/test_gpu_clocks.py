@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 from payload_models.payloads import GpuResetErrorCode
 from services.gpu_clocks import (
+    CLOCK_LOCK_TTL_SECONDS,
     build_clock_command,
     clamp_range,
     clock_locked_gpu_uuids,
@@ -97,6 +98,8 @@ async def test_locks_the_pods_gpus_and_records_them():
     assert host.commands.index(f"nvidia-smi -i {U[0]} -pm 1") < host.commands.index(f"nvidia-smi -i {U[0]} -lgc 1200,1500")
     assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "pod1"
     assert set(json.loads(redis.store["gpu_clock_lock_pod:pod1"])) == {U[0], U[1]}
+    # review: a record no -rgc could clear never refuses creates on its GPU for good
+    assert redis.ttl[f"gpu_clock_lock:{U[0]}"] == CLOCK_LOCK_TTL_SECONDS
 
 
 @pytest.mark.asyncio

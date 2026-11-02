@@ -42,12 +42,16 @@ if TYPE_CHECKING:
 
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
+# a record a refused -rgc could not clear stops refusing creates on its GPU after this (review); a live lock that
+# outlasts it only loses the thermal check's low-clock pass (a warning, never a fail) and the delete's -rgc, which
+# the next create's safety net runs on every GPU anyway
+CLOCK_LOCK_TTL_SECONDS = 7 * 24 * 3600
 # one per GPU uuid this validator ever changed; a few thousand at most, never freed
 _GPU_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 @asynccontextmanager
-async def _holding(uuids):
+async def _holding(uuids: list[str]):
     """Hold the clock lock of each GPU (in uuid order, so two holders never deadlock). The per-pod lock does not cover
     this: a delete of pod A and a lock of pod B on the same GPU are different pods (review)."""
     async with AsyncExitStack() as stack:
@@ -280,14 +284,14 @@ async def _record_and_lock(
     # -lgc, so a GPU this request never changes gets no record a create would then refuse on (review F-46)
     record = {"gpu_uuid": uuid, "pod_id": pod_id, "executor_id": executor_id, "locked_at": time.time()}
     previous = await redis.get(_lock_key(uuid))
-    await redis.set(_lock_key(uuid), json.dumps(record))
+    await redis.set(_lock_key(uuid), json.dumps(record), ex=CLOCK_LOCK_TTL_SECONDS)
     locked = await _run(runner, build_clock_command("lock", uuid, pod_gpu_uuids=pod_gpu_uuids, min_mhz=low, max_mhz=high))
     if locked.exit_code > 0:
         # a completed refusal ("not supported" 3, "insufficient permissions" 4, ...) changed no clocks: the record goes
         # back to what it was, so a GPU without clock control (that refuses -rgc too) never carries a record a create
         # would refuse on (review)
         if previous:
-            await redis.set(_lock_key(uuid), previous)
+            await redis.set(_lock_key(uuid), previous, ex=CLOCK_LOCK_TTL_SECONDS)
         else:
             await redis.delete(_lock_key(uuid))
         outcome.detail = _tail(locked.stdout or locked.stderr) or f"nvidia-smi -lgc failed (exit {locked.exit_code})"
