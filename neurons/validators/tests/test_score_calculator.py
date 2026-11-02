@@ -140,6 +140,15 @@ def test_rented_throughput_flag_zeroes_a_rented_score():
     assert "network or disk throughput" in warning
 
 
+def test_rented_throughput_not_run_is_not_called_slow():
+    ctx = _ctx(500.0).model_copy(
+        update={"rented_throughput_passed": False, "rented_throughput_not_run": True}
+    )
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "could not run" in warning and "far too little" not in warning
+
+
 def test_gpu_identity_flag_zeroes_a_rented_score():
     """GpuAttestationIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
     ctx = _ctx(500.0).model_copy(update={"gpu_attestation_identity_passed": False})

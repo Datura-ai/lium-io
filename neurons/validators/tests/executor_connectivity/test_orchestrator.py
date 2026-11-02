@@ -218,3 +218,32 @@ async def test_orchestrator_reports_the_probes_own_sysbox_reading(
     )
 
     assert result.sysbox_measured is measured
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_a_timed_out_sysbox_test_measured_nothing(sample_executor_info, mock_ssh_client, mocker):
+    """30 Oct, pod c0877f60: the probe reached its container with sysbox-runc, hello-world timed out."""
+    selected_ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = selected_ports
+    port_probe = mocker.Mock(spec=PortProbe)
+    port_probe.probe = mocker.AsyncMock(
+        return_value=PortProbeResult(successful=tuple(selected_ports), failed=tuple())
+    )
+    dind_probe = mocker.Mock(spec=DindProbe)
+    dind_probe.verify = mocker.AsyncMock(
+        return_value=DindProbeResult(
+            success=True, sysbox_runtime=False, port=selected_ports[0], sysbox_timed_out=True
+        )
+    )
+
+    result = await ConnectivityOrchestrator(port_selector, port_probe, dind_probe).verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=True,
+        unavailable_ports=[],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert result.dind_ok is True
+    assert result.sysbox_measured is None
