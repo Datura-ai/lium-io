@@ -754,6 +754,41 @@ async def test_a_split_node_declaring_exactly_its_split_target_counts_the_stale_
     assert len(published.verified_port_pairs) == published.verified_port_count == declared
 
 
+class OutsideBlockedAfterFirstProbe(Firewalled):
+    """Every port answers the validator; once `blocked_outside` is set the outside prober reaches none."""
+
+    blocked_outside = False
+
+    async def verify(self, ports, *, max_ports=None, **kw):
+        result = await super().verify(ports, max_ports=max_ports, **kw)
+        if max_ports is None and self.blocked_outside:
+            return BatchResult(result.successful, result.failed, external="blocked")
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [True, False])
+async def test_a_stale_split_nodes_reprobe_honours_a_confirmed_outside_block(context_factory, monkeypatch, enforce):
+    """F-81: the re-probe reaches all 24 ports from the validator but the outside prober reaches none, a second
+    outside failure in a row. Enforced, no port (filler's included) counts and the node stays short; off, as before."""
+    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", enforce)
+    probe = OutsideBlockedAfterFirstProbe(blocked=set())
+    ctx = stale_split_ctx(context_factory, probe, 40023)
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    probe.blocked_outside = True
+    ctx.services.redis.record_external_probe_miss.return_value = False  # a miss already on record
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is not enforce
+    if enforce:
+        assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+        published = tenant_result.updates["state"]
+        assert published.specs["verified_ports"] == [] and tenant_result.updates["port_count"] == 0
+        assert published.externally_unreachable is True
+
+
 @pytest.mark.asyncio
 async def test_a_stale_split_nodes_freed_ports_that_no_longer_answer_are_not_credited(context_factory):
     """Reviewer's case: 40000-40023 declared, the closed rental's 40000-40002 now firewalled. The other 21

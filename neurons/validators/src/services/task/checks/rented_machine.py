@@ -29,6 +29,7 @@ from services.gpu_reset import renter_gpu_reset_in_progress
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .port_connectivity import PortConnectivityCheck
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .port_count import (
     hidden_from_renters_text,
@@ -847,17 +848,21 @@ async def _reprobe_split_shortfall(
     except Exception:
         logger.warning(_m("SPLIT_PORT_REPROBE_FAILED", extra=get_extra_info(ctx.default_extra)), exc_info=True)
         return split_short, {}
-    probed = [pair.external for pair in result.successful_ports]
+    # DAH-4537: the outside confirmation PortConnectivityCheck applies; a confirmed block credits no port, filler too
+    unreachable = await PortConnectivityCheck._outside_failure_confirmed(ctx, result)
+    probed = [] if unreachable else [pair.external for pair in result.successful_ports]
 
     def published(fillers: list[int]) -> tuple[tuple[int, tuple[int, int]] | None, dict[str, Any]]:
         # the probe skips our idle filler's ports; they count as in PortCountCheck, which a rental frees
+        fillers = [] if unreachable else fillers
         verified_ports = probed + sorted(set(fillers) - set(probed))
         state = replace(
             ctx.state,
             specs={**ctx.state.specs, "verified_ports": verified_ports, "available_port_count": len(verified_ports)},
             verified_port_count=len(probed),
             probed_port_count=len(result.selected_ports),
-            verified_port_pairs=[(pair.internal, pair.external) for pair in result.successful_ports],
+            verified_port_pairs=[] if unreachable else [(p.internal, p.external) for p in result.successful_ports],
+            externally_unreachable=ctx.state.externally_unreachable or unreachable,
         )
         return split_port_shortfall(ctx.state, len(verified_ports)), {"state": state, "port_count": len(verified_ports)}
 
