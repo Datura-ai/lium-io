@@ -16,6 +16,8 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
     "NVIDIA A10 Tensor Core GPU": (0.2, (24,)),
     "NVIDIA A100 80GB PCIe": (0.45, (80,)),
     "NVIDIA A100-SXM4-80GB": (0.7, (80,)),
+    "NVIDIA A100-PCIE-40GB": (0.37, (40,)),
+    "NVIDIA A100-SXM4-40GB": (0.48, (40,)),
     "NVIDIA A800 80GB PCIe": (0.31, (80,)),
     "NVIDIA B200": (5.6, (192,)),
     "NVIDIA B300 SXM6 AC": (8.0, (288,)),

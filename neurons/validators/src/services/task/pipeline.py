@@ -171,6 +171,8 @@ class ContextState:
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
     # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause.
     dind_probe_error: DindLogCause | None = None
+    # the outside prober could not reach the ports: our filler's ports are behind the same firewall
+    externally_unreachable: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
@@ -274,9 +276,14 @@ class Context(BaseModel):
     # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
     # score gate lives in calculate_scores.
     rented_throughput_passed: bool = True
+    # True when that failure is RENTED_THROUGHPUT_NOT_RUN (no reading ran), not a slow reading.
+    rented_throughput_not_run: bool = False
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
+    # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
+    # rented-pod checks still run; the run still ends as that failure (_ended).
+    gpu_fingerprint_passed: bool = True
     # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     hardware_identity_passed: bool = True
@@ -521,6 +528,17 @@ def _stops_run(chk: Check, res: CheckResult) -> bool:
     return (not res.passed and fatal) or res.halt
 
 
+def _ended(events: list[ValidationEvent], ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+    """A run that got through. A GPU set change under a live rental ran on through the rented-pod checks for
+    their reports only: the run still ends as that failure (its event last, score 0, not rented), as it did
+    when the check halted it."""
+    if ctx.gpu_fingerprint_passed:
+        return True, events, ctx
+    failure = next(e for e in events if e.check_id == "gpu.validate.fingerprint")
+    events = [e for e in events if e is not failure] + [failure]
+    return False, events, ctx.model_copy(update={"rented": False, "score": 0.0, "job_score": 0.0, "success": False})
+
+
 class Pipeline:
     def __init__(self, checks: List[Check], sink: EventSink):
         self.checks = checks
@@ -639,6 +657,6 @@ class Pipeline:
                     return False, events, current_ctx
 
                 if res.halt:
-                    return True, events, current_ctx
+                    return _ended(events, current_ctx)
 
-        return True, events, current_ctx
+        return _ended(events, current_ctx)

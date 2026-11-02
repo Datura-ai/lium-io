@@ -133,7 +133,31 @@ async def test_gpu_usage_orphaned_container(context_factory):
     assert result.event.what_we_saw.get("orphaned_container") == container_name
     assert result.event.what_we_saw.get("rental_status") == "Lium has no rental for it"
     assert result.event.what_we_saw.get("container_status") == "still running"
-    assert "Provider Portal must show no active rental" in result.event.remediation
+    # DAH-5117: no record of the rental ending, so the stale cleanup keeps it: no removal promise
+    remediation = result.event.remediation
+    assert "within about 30 minutes" not in remediation
+    assert "the node passes again" not in remediation
+    assert "Lium cannot confirm a rental of it on this node" in remediation
+    assert "contact Lium support" in remediation
+    assert "docker rm" not in remediation
+
+
+@pytest.mark.asyncio
+async def test_a_pod_named_container_lium_never_issued_is_left_to_the_provider(context_factory):
+    container_name = f"{POD_CONTAINER_PREFIX}mine"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": container_name}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
+    assert "never removes" not in result.event.remediation
+    assert "stop" not in result.event.remediation.lower()
 
 
 # --- A rental that ends while the run is inside it is teardown, not an orphan ---
@@ -307,9 +331,43 @@ async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(contex
         f"{TEARDOWN_POD} is named like a Lium pod container (pod {TEARDOWN_POD_ID}), and no live "
         "rental on this node uses it: its rental ended 20 minutes ago."
     )
-    assert "Provider Portal must show no active rental" in remediation
+    assert "removes a leftover pod container by itself" in remediation
+    assert "Do not remove pod containers yourself" in remediation
     assert "docker stop" not in remediation
-    assert f"Only then remove it: docker rm -f {TEARDOWN_POD}" in remediation
+    assert "docker rm" not in remediation
+
+
+@pytest.mark.asyncio
+async def test_an_ended_rental_with_no_owning_node_gets_no_removal_promise(context_factory):
+    # the stale cleanup keeps it: a record naming no node cannot prove the pod ran here
+    pod_rental = PodRentalActiveResponse(
+        active=False, executor_id=None, rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=20)
+    )
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "removes a leftover pod container by itself" not in result.event.remediation
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
+
+
+@pytest.mark.parametrize("owner", ["this", "none", "other"])
+@pytest.mark.asyncio
+async def test_the_orphan_remediation_promises_removal_only_when_the_rental_is_placed_here(context_factory, owner):
+    # cleanup removes an unlabelled leftover only with this node's record; a label it may follow is not visible
+    # here, so without that record the text promises neither removal nor retention
+    executor_id = {"this": default_executor().uuid, "none": None, "other": "00000000-0000-4000-8000-000000000001"}[owner]
+    pod_rental = PodRentalActiveResponse(
+        active=False, executor_id=executor_id, rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=20)
+    )
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
+
+    remediation = (await GpuUsageCheck().run(ctx)).event.remediation
+
+    assert ("removes a leftover pod container by itself" in remediation) is (owner == "this")
+    assert "keeps" not in remediation
+    assert "do not wait" not in remediation.lower()
 
 
 @pytest.mark.parametrize(
@@ -328,6 +386,8 @@ async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, p
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert result.event.what_we_saw["rental_status"] == rental_status
+    assert "within about 30 minutes" not in result.event.remediation
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
 
 
 @pytest.mark.asyncio
@@ -648,6 +708,120 @@ async def test_ghost_still_latched_after_cure_fails_the_check(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_WEDGED.reason
     assert result.event.what_we_saw["still_wedged"] == [WEDGED_UUID]
+
+
+async def _after_the_cleanup_removed(ctx, removed: list[str], confirmed: bool = True):
+    """Run the stale cleanup check, its service reporting `removed`, and apply its state update.
+
+    `confirmed`: the backend's record shows each removed workload ended on this node."""
+    from neurons.validators.src.services.task.checks.stale_container_cleanup import (
+        StaleContainerCleanupCheck,
+    )
+
+    cleanup = AsyncMock()
+
+    async def remove(**kwargs):  # as the real cleanup: a labelled removal asks for its lookup slot first
+        gone = [name for name in removed if kwargs["reserve_removal"](name)]
+        return len(gone), gone, []
+
+    cleanup.cleanup.side_effect = remove
+    cleanup.sweep_abandoned_download_temporaries.return_value = 0
+    cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
+    redis = AsyncMock()
+    redis.sadd.return_value = 0
+    redis.hgetall.return_value = {}
+    cleanup_services = build_services(container_cleanup=cleanup, redis=redis)
+    if confirmed:
+        owner = str(ctx.executor.uuid)
+        cleanup_services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+            active=False, status="STOPPED", executor_id=owner
+        )
+        cleanup_services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+            active=False, rental_closed_at=datetime.now(timezone.utc), executor_id=owner
+        )
+    services = ctx.services
+    ctx = ctx.model_copy(update={"services": cleanup_services})
+    result = await StaleContainerCleanupCheck().run(ctx)
+    return ctx.model_copy(update={**result.updates, "services": services})
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_gpu_still_fails_after_the_cleanup_removed_an_unrelated_container(
+    context_factory,
+):
+    """Review 4371171963: a removal this cycle must not skip the wedge cure."""
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 100, 0\n")
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
+    ctx = await _after_the_cleanup_removed(ctx, ["health_check_1777040800"])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_WEDGED.reason
+    assert any(cmd.startswith(CURE_PREFIX) for cmd in _commands(runner))
+
+
+@pytest.mark.asyncio
+async def test_a_reaped_containers_process_no_longer_counts_but_a_surviving_one_does(
+    context_factory,
+):
+    reaped = f"{FILLER_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    survivor = f"{POD_CONTAINER_PREFIX}mine"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[
+            {"pid": 1, "info": "0::/x/init.scope", "container_name": reaped},
+            {"pid": 2, "info": "0::/x/init.scope", "container_name": survivor},
+        ],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw.get("orphaned_container") == survivor
+
+
+@pytest.mark.asyncio
+async def test_a_node_whose_only_gpu_load_was_a_reaped_container_passes(context_factory):
+    reaped = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 10, "memory_utilization": 10}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": reaped}],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_removal_the_backend_does_not_confirm_still_counts_its_gpu_load(context_factory):
+    """Review 5644590326: a container removed by its label alone does not exempt its GPU load."""
+    reaped = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": reaped}],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped], confirmed=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
 
 
 @pytest.mark.asyncio
