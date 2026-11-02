@@ -281,6 +281,9 @@ class Context(BaseModel):
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
+    # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
+    # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
+    cc_vbios_passed: bool = True
     # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
     # rented-pod checks still run; the run still ends as that failure (_ended).
     gpu_fingerprint_passed: bool = True
@@ -290,6 +293,9 @@ class Context(BaseModel):
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True
+    # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_kernel_count_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
