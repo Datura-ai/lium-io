@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel
 from services.const import DEFAULT_JOB_OWNER_LIUM
+from services.redis_service import RedisWrites
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     RENTAL_START_RATIO_TTL_SECONDS,
@@ -15,8 +16,10 @@ from services.gpu_power_limit import (
     GpuPowerRestoreRecord,
     read_gpu_power_restore_records,
     rental_legacy_pod_key,
+    SCORED_TIER_RATIO_TTL_SECONDS,
     rental_start_ratio_key,
     restore_tracked_gpu_power_limits,
+    scored_tier_ratio_key,
 )
 
 from ..messages import GpuPowerLimitMessages as Msg
@@ -159,6 +162,8 @@ class GpuPowerLimitCheck:
                 },
             )
 
+        if self.restore_stale_caps:  # the dry-run pipeline writes nothing
+            await self._remember_tier_ratios(ctx, measurements)
         event = render_message(
             Msg.LIMIT_OK,
             ctx=ctx,
@@ -169,6 +174,23 @@ class GpuPowerLimitCheck:
             },
         )
         return CheckResult(passed=True, event=event)
+
+    async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> None:
+        """Keep each GPU's passing reading in the 80 % tier (and clear it at stock) for a rental-start
+        read that misses the GPU: it then starts at what the renter's badge showed, not at stock (F-36)."""
+        writes = RedisWrites()
+        for m in measurements:
+            if not m.uuid or m.power_limit_ratio is None:
+                continue
+            key = scored_tier_ratio_key(ctx.executor.uuid, m.uuid)
+            if m.power_limit_ratio < RENTED_MIN_POWER_LIMIT_RATIO:
+                writes.set(key, str(m.power_limit_ratio), ex=SCORED_TIER_RATIO_TTL_SECONDS)
+            else:
+                writes.delete(key)
+        try:
+            await ctx.services.redis.write_atomically(writes)
+        except Exception:
+            pass  # without it a missed GPU starts at stock, the safe side
 
     async def _rented_floors(self, ctx: Context) -> dict[str, float]:
         """Per-GPU floor while the node is rented, by GPU uuid; "" is the floor for any other GPU.

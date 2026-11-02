@@ -13,6 +13,7 @@ from services.gpu_power_limit import (
     GpuPowerRestoreRecord,
     rental_legacy_pod_key,
     rental_start_ratio_key,
+    scored_tier_ratio_key,
 )
 from services.task.checks import gpu_power_limit as check_module
 from services.task.checks.gpu_power_limit import GpuPowerLimitCheck
@@ -144,6 +145,25 @@ async def test_power_limit_80_percent_tier_passes_on_an_unrented_node(context_fa
     result = await GpuPowerLimitCheck().run(ctx)
     assert result.passed is True
     assert result.event.reason_code == "GPU_POWER_LIMIT_OK"
+
+
+@pytest.mark.asyncio
+async def test_a_passing_80_percent_tier_reading_is_kept_for_the_rental_start_and_cleared_at_stock(
+    context_factory, read_records_mock
+) -> None:
+    # F-36: a GPU the rental-start read misses starts at the tier the renter's badge showed
+    redis = FakeRedis()
+    key = scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")
+
+    def ctx(watts: int):
+        return context_factory(state=_state(current_limit=watts, default_limit=350), services=build_services(redis=redis))
+
+    await GpuPowerLimitCheck().run(ctx(280))
+    assert redis.store[key] == "0.8"
+    await GpuPowerLimitCheck(restore_stale_caps=False).run(ctx(350))  # the dry run writes nothing
+    assert key in redis.store
+    await GpuPowerLimitCheck().run(ctx(350))
+    assert key not in redis.store
 
 
 @pytest.mark.asyncio

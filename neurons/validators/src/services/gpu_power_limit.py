@@ -96,6 +96,10 @@ MIN_POWER_LIMIT_RATIO = 0.8
 RENTED_MIN_POWER_LIMIT_RATIO = 0.9
 _RENTAL_START_RATIO_KEY_PREFIX = "gpu_power_rental_start_ratio:"
 _RENTAL_LEGACY_POD_KEY_PREFIX = "gpu_power_rental_legacy_pod:"
+# The check's last passing reading of a GPU in the 80 % tier, as the renter's badge showed it: a GPU the
+# rental-start read misses takes this, not a later reading the host controls (F-36).
+_SCORED_TIER_RATIO_KEY_PREFIX = "gpu_power_scored_tier_ratio:"
+SCORED_TIER_RATIO_TTL_SECONDS = 2 * 3600
 # Outlives any rental; a record counts only while the pod it names is rented.
 RENTAL_START_RATIO_TTL_SECONDS = 365 * 24 * 3600
 # GPUs restored (or raised) at the same time. One verified set is three nvidia-smi round trips
@@ -188,6 +192,10 @@ def _restore_key(gpu_uuid: str) -> str:
 
 def rental_start_ratio_key(executor_id: str, gpu_uuid: str) -> str:
     return f"{_RENTAL_START_RATIO_KEY_PREFIX}{executor_id}:{gpu_uuid}"
+
+
+def scored_tier_ratio_key(executor_id: str, gpu_uuid: str) -> str:
+    return f"{_SCORED_TIER_RATIO_KEY_PREFIX}{executor_id}:{gpu_uuid}"
 
 
 def rental_legacy_pod_key(pod_id: str) -> str:
@@ -762,21 +770,23 @@ async def _record_rental_start_ratios(
 ) -> None:
     uuids = list(gpu_uuids or state_by_uuid)
     keys = [rental_start_ratio_key(executor_id, gpu_uuid) for gpu_uuid in uuids]
+    scored_keys = [scored_tier_ratio_key(executor_id, gpu_uuid) for gpu_uuid in uuids]
     try:
-        *existing, legacy = await redis.mget([*keys, rental_legacy_pod_key(pod_id)])
+        *existing, legacy = await redis.mget([*keys, *scored_keys, rental_legacy_pod_key(pod_id)])
     except Exception as exc:
         # without the old records a reboot could replace its rental's start with today's limit
         raise GpuPowerRestoreStateError("GPU power rental-start records could not be read") from exc
+    existing, scored = existing[: len(keys)], existing[len(keys) :]
     writes = RedisWrites()
     unreadable: list[str] = []
-    for gpu_uuid, key, old in zip(uuids, keys, existing):
+    for gpu_uuid, key, old, scored_raw in zip(uuids, keys, existing, scored):
         if rental_record_pod_id(old) == pod_id:
             continue  # a reboot or edit of the same rental keeps the limit it started on
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None or state.default_watts <= 0:
-            # held at 90 %; the GPUs read now keep this start too, so a retry cannot re-read them lower
+            # the tier the renter saw, else held at 90 %; a retry keeps this start, so a later read cannot lower it
             unreadable.append(gpu_uuid)
-            ratio = 1.0
+            ratio = _scored_tier_ratio(scored_raw)
         else:
             ratio = state.current_watts / state.default_watts
         if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
@@ -790,6 +800,14 @@ async def _record_rental_start_ratios(
         raise GpuPowerRestoreStateError(f"GPU power rental-start ratios not recorded: {exc}") from exc
     if unreadable:
         raise RuntimeError(f"GPU power state of {', '.join(unreadable)} unreadable; recorded at stock, create retried")
+
+
+def _scored_tier_ratio(raw: str | bytes | None) -> float:
+    try:
+        ratio = float(raw) if raw else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+    return ratio if MIN_POWER_LIMIT_RATIO <= ratio < 1.0 else 1.0
 
 
 async def _raise_below_floor(

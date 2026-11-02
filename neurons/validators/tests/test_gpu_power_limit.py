@@ -428,23 +428,29 @@ async def test_the_synced_marker_is_read_before_the_list(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("first_query", "retry_watts", "after_first", "kept"),
+    ("first_query", "retry_watts", "scored", "after_first", "kept"),
     [
         # nvidia-smi timed out: nothing was read, nothing recorded; the retry records the 80 % tier
-        (AsyncMock(side_effect=asyncio.TimeoutError()), (280, 280), None, [0.8, 0.8]),
-        # partial output: GPU-0 read in the tier, GPU-1 missing and held at stock; the retry keeps both
-        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), [0.8, 1.0], [0.8, 1.0]),
+        (AsyncMock(side_effect=asyncio.TimeoutError()), (280, 280), None, None, [0.8, 0.8]),
+        # partial output: GPU-0 read in the tier, GPU-1 missing and never scored in it: stock; the retry keeps both
+        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), None, [0.8, 1.0], [0.8, 1.0]),
+        # F-36: GPU-1 missing but scored in the 80 % tier before the rental: it starts at what the renter saw
+        (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), "0.8", [0.8, 0.8], [0.8, 0.8]),
         # GPU-0 read at stock, GPU-1 missing; the host cuts GPU-0 to 80 % before the retry: it keeps 1.0
-        (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (280, 280), [1.0, 1.0], [1.0, 1.0]),
+        (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (280, 280), None, [1.0, 1.0], [1.0, 1.0]),
+        # a scored value outside the tier proves nothing: stock
+        (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (280, 280), "0.5", [1.0, 1.0], [1.0, 1.0]),
     ],
 )
 @pytest.mark.asyncio
 async def test_an_unreadable_rental_start_fails_the_create_and_a_retry_cannot_lower_it(
-    monkeypatch, first_query, retry_watts, after_first, kept
+    monkeypatch, first_query, retry_watts, scored, after_first, kept
 ) -> None:
     monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
     monkeypatch.setattr(gpl, "_query_power_state", first_query)
     redis = SharedFakeRedis()
+    if scored:
+        await redis.set(gpl.scored_tier_ratio_key("ex-1", "GPU-1"), scored)
     with pytest.raises(RuntimeError):
         await gpl.raise_low_power_limits_to_default(AsyncMock(), "ex-1", ["GPU-0", "GPU-1"], redis=redis, pod_id="pod-1")
     recorded = any(k.startswith("gpu_power_rental_start_ratio:") for k in redis.store)
