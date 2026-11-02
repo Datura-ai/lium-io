@@ -165,6 +165,9 @@ class ContextState:
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
+    # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
+    # not measured; a consumer that keeps "last good ports" must not store them as fresh.
+    port_check_deferred: bool = False
     # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
     # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.
@@ -278,9 +281,14 @@ class Context(BaseModel):
     # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
     # score gate lives in calculate_scores.
     rented_throughput_passed: bool = True
+    # True when that failure is RENTED_THROUGHPUT_NOT_RUN (no reading ran), not a slow reading.
+    rented_throughput_not_run: bool = False
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
+    # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
+    # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
+    cc_vbios_passed: bool = True
     # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
     # rented-pod checks still run; the run still ends as that failure (_ended).
     gpu_fingerprint_passed: bool = True
@@ -290,6 +298,9 @@ class Context(BaseModel):
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True
+    # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_kernel_count_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None

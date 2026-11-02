@@ -1,8 +1,12 @@
+import re
+
 MIN_JOB_TAKEN_TIME = 20
 
-# the plugin alias new rental volumes are created on; the backend health check is told it
+# the plugin aliases new rental volumes are created on: v3 with LOOPBACK_PLUGIN_V3_ENABLED, else v2
+# (loopback_plugin_setup.current_loopback_plugin_alias); the backend health check is told the one in use
 LOOPBACK_PLUGIN_ALIAS = "vloopback:v2"
-# the old plugin (`vloopback:latest`): a new volume goes there only when v2 cannot be used
+LOOPBACK_PLUGIN_V3_ALIAS = "vloopback:v3"
+# the old plugin (`vloopback:latest`): a new volume goes there only when the current plugin cannot be used
 LEGACY_LOOPBACK_PLUGIN_ALIAS = "vloopback"
 
 GPU_MODEL_RATES = {
@@ -36,6 +40,9 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce RTX 4060": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
+    # DAH-5508: no rental history yet, so no share, as the RTX 5090 D and the Quadro RTX 8000 it was paid as before.
+    # Only reachable with RTX_4090_48GB_MODEL_ENABLED on (see gpu_spec_table.classify_gpu_model).
+    "NVIDIA GeForce RTX 4090 48GB": 0.0,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
     "NVIDIA RTX PRO 2000 Blackwell": 0.0,
     "NVIDIA RTX PRO 4000 Blackwell": 0.0,
@@ -386,6 +393,21 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   container_*    — validator DinD/port-check probes (hotkey-scoped)
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
 RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
+# DAH-5117: set at create on every container Lium creates (pods, fillers, the validator's DinD probe);
+# the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
+# labelled container whose pod is no longer live, so a provider's container is never touched.
+LIUM_POD_ID_LABEL = "io.lium.pod_id"
+# Backend ownership lookups (one sequential request each) the stale cleanup makes per node per cycle;
+# the rest of a host's pod_/filler_ candidates wait for a later cycle, so a host cannot flood the backend.
+LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
+# A pod or filler container created before the label: reaped only when the backend's record of
+# that pod or filler run confirms it ended.
+LEGACY_LIUM_CONTAINER_NAME = re.compile(
+    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev)?$"
+)
+# The backend's own probe, created over SSH and so never labelled: health_check_{uuid4().hex}, or
+# the int(time.time()) suffix it used before (lium-platform orchestrator/executor_health_check.py).
+LIUM_HEALTH_CHECK_CONTAINER_NAME = re.compile(r"^health_check_(?:[0-9a-f]{32}|[0-9]{10})$")
 
 # DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
 # without importing the probe service: that module reaches services.task.models, which pulls

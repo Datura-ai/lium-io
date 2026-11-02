@@ -273,6 +273,9 @@ class Settings(BaseSettings):
     )
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
+    # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
+    # the volume image); off = vloopback:v2 as before. Volumes already created keep their plugin.
+    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=False)
     # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
     # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
     POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
@@ -453,6 +456,11 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
+    # DAH-5508: an RTX 4090 reporting ~48 GB is scored as its own model "NVIDIA GeForce RTX 4090 48GB" (own VRAM
+    # window, rate, anchor and idle tier) instead of failing the 24 GB window. Off: such a card is rejected as before.
+    # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
+    # preflight classifies it too, and the all-card probe is sized from the classified model.
+    RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
@@ -551,6 +559,17 @@ class Settings(BaseSettings):
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5244: before its port-check container (and the rented-throughput probe) the validator times `sync -f` on
+    # the host's Docker root - the wait every `docker run` pays while a tenant's dirty pages sit on that filesystem
+    # - and reads the Docker-root disk and host Dirty around it (services/task/host_disk.py). CHECK_ENABLED takes
+    # the reading, logs it and sends it to the backend (specs.disk_pressure). ENFORCEMENT additionally lets a node
+    # rented by someone else, or running our filler, keep its last verified ports and sysbox instead of a port
+    # check into the stall (DISK_PRESSURE_MAX_DEFERRALS cycles in a row at most; the rental probe rents nothing on
+    # such a cycle), and leaves out the rented-throughput probe container under pressure (a probe that runs under
+    # it judges no disk side). Shadow by default: a week of readings decides the flip.
+    DISK_PRESSURE_CHECK_ENABLED: bool = Field(env="DISK_PRESSURE_CHECK_ENABLED", default=True)
+    DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED: bool = Field(env="DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", default=False)
+
     # DAH-5320: IdleDiskWriteCheck, last in the pipeline, writes the same 256 MiB with fsync on idle and filler nodes
     # once a day per node (skipped while the docker root disk already moves DISK_BUSY_MB_PER_S) and logs
     # IDLE_DISK_WRITE with a shadow verdict against DISK_MIN_MB_PER_S. Logged only; ENFORCE_ENABLED is read by nothing
@@ -725,6 +744,13 @@ class Settings(BaseSettings):
     GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED: bool = Field(
         env="GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED", default=False
     )
+    # NVIDIA's minimum VBIOS for CC in R595, per GPU model (Trusted Computing Solutions Release Notes R595,
+    # RN-12817-001_v02, Tables 1 (SPT CC) and 3 (MPT CC) for Blackwell). Dotted hex fields; "XX" matches any value.
+    CC_VBIOS_MINIMUMS: dict[str, str] = Field(
+        env="CC_VBIOS_MINIMUMS", default={"B200": "97.00.E4.00.XX", "B300": "97.10.64.00.XX"}
+    )
+    # On (default) = a CC multi-GPU node below the minimum fails like an identity finding. Off = shadow: only logged.
+    CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED: bool = Field(env="CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED", default=True)
     # Hosted NRAS endpoint (interim verification locus; a local nv-verifier removes
     # this outbound SPOF before fleet enforcement — see remediation plan CD4).
     NVIDIA_NRAS_URL: str = Field(
@@ -832,6 +858,20 @@ class Settings(BaseSettings):
     CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS", default=1200,
         description="Hard timeout for `docker build` of a custom-dockerfile pod (seconds).",
+    )
+    CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND: int = Field(
+        env="CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND", default=10 * 1024 * 1024, gt=0,
+        description=(
+            "Slowest image export (DinD `docker save | docker load` onto the host) the export timeout allows "
+            "for: the timeout is the built image's size at this rate, never below the build timeout."
+        ),
+    )
+    CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS", default=3300, gt=0,
+        description=(
+            "Ceiling for setup + build + export of one custom-dockerfile pod. The backend fails a pod "
+            "still PENDING after 1 h, so a size-scaled export never runs past this."
+        ),
     )
     CUSTOM_DOCKERFILE_MAX_BYTES: int = Field(
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,

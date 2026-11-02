@@ -11,8 +11,10 @@ test_scrape_encryption_key_order.py parses rather than imports.
 import ast
 import glob
 import http.client
+import io
 import json
 import os
+import re
 import shutil
 import socket
 from collections import namedtuple
@@ -28,10 +30,13 @@ DISK_HELPERS = {
     "DOCKER_SOCKET_PATH",
     "DOCKER_API_TIMEOUT_SECONDS",
     "VLOOPBACK_DRIVER_PREFIX",
-    "VLOOPBACK_V2_DATA_DIR_NAME",
+    "VLOOPBACK_HOST_DATA_DIR_NAMES",
     "UnixSocketHTTPConnection",
     "docker_api_get",
     "get_vloopback_volume_bytes",
+    "mounted_fs_used_bytes",
+    "host_mount_points",
+    "get_dmcrypt_volume_bytes",
     "get_container_log_bytes",
     "get_host_disk_usage",
     "get_docker_disk_usage",
@@ -49,7 +54,7 @@ def scrape() -> dict:
     return build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HELPERS,
-        {"glob": glob, "http": http, "json": json, "os": os, "shutil": shutil, "socket": socket},
+        {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket},
     )
 
 
@@ -84,7 +89,153 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_volumes": 5454000000 // 1024,
         "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
+        "hard_disk_by_container": {},
+        "hard_disk_by_volume": {},
     }
+
+
+def test_docker_disk_usage_reports_each_pods_share(scrape: dict, monkeypatch) -> None:
+    # Arrange — DAH-5059: a pod with a named vloopback workspace, a dind pod whose anonymous
+    # /var/lib/docker volume has no name the backend knows, and a stopped container with no size.
+    dind_volume = "ab" * 32
+    blocks_by_path = {"/proc/1/root/var/lib/docker/vloopback-v2/volume_pod1": 2048}
+    monkeypatch.setitem(scrape, "glob", type("_Glob", (), {"glob": staticmethod(lambda pattern: [])}))
+    monkeypatch.setitem(
+        scrape,
+        "os",
+        type(
+            "_Os",
+            (),
+            {
+                "path": type("_Path", (), {"join": staticmethod(os.path.join), "isdir": staticmethod(lambda path: True)}),
+                "stat": staticmethod(lambda path: type("_Stat", (), {"st_blocks": blocks_by_path[path]})),
+            },
+        ),
+    )
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {
+                "LayersSize": 0,
+                "Containers": [
+                    {
+                        "Names": ["/container_pod1"],
+                        "SizeRw": 4096,
+                        "Mounts": [{"Type": "volume", "Name": "volume_pod1", "Destination": "/root"}],
+                    },
+                    {
+                        "Names": ["/container_dind"],
+                        "SizeRw": 1024,
+                        "Mounts": [
+                            {"Type": "volume", "Name": dind_volume, "Destination": "/var/lib/docker"},
+                            {"Type": "bind", "Source": "/tmp", "Destination": "/tmp"},
+                        ],
+                    },
+                    {"Names": ["/stopped"]},
+                ],
+                "Volumes": [
+                    {"Name": "volume_pod1", "UsageData": {"Size": -1}},
+                    {"Name": dind_volume, "UsageData": {"Size": 10240}},
+                ],
+            },
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": [{"Name": "volume_pod1", "Driver": "vloopback-v2"}]},
+        },
+    )
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert — kB; the vloopback volume by its real blocks, the dind volume under its container
+    assert usage["hard_disk_by_container"] == {"container_pod1": 4, "container_dind": 11, "stopped": 0}
+    assert usage["hard_disk_by_volume"] == {"volume_pod1": 2048 * 512 // 1024, dind_volume: 10}
+    assert usage["hard_disk_containers"] == 5
+    assert usage["hard_disk_volumes"] == (10240 + 2048 * 512) // 1024
+
+
+GIB = 1024**3
+POD_ID = "0f5e6a3c-1b2d-4e5f-8a9b-0c1d2e3f4a5b"
+DMCRYPT = {"Driver": "local", "Options": {"type": "ext4", "device": f"/dev/mapper/lium-{POD_ID}"}}
+
+
+@pytest.mark.parametrize(
+    "volume, df_size, backing_bytes, mounted_used, by_volume, total",
+    [
+        # plain local volume: /system/df walks its files, nothing else to read
+        ({"Driver": "local"}, 3 * GIB, None, None, 3 * GIB, 3 * GIB),
+        # preallocated vloopback (partial rental): the file holds 600 GiB, its filesystem 1 GiB
+        ({"Driver": "vloopback:v2"}, -1, 600 * GIB, 1 * GIB, 1 * GIB, 600 * GIB),
+        # sparse vloopback after writing 50 GiB and deleting 48: the file keeps the blocks
+        ({"Driver": "vloopback:v2"}, -1, 50 * GIB, 2 * GIB, 2 * GIB, 50 * GIB),
+        # a stopped pod's volume is not mounted: its file is all there is to read
+        ({"Driver": "vloopback:v2"}, -1, 600 * GIB, None, 600 * GIB, 600 * GIB),
+        # dm-crypt (lium-io#1986), preallocated, sparse and unmounted: /system/df leaves it out
+        (DMCRYPT, None, 600 * GIB, 1 * GIB, 1 * GIB, 600 * GIB),
+        (DMCRYPT, None, 50 * GIB, 2 * GIB, 2 * GIB, 50 * GIB),
+        (DMCRYPT, None, 600 * GIB, None, 600 * GIB, 600 * GIB),
+    ],
+    ids=[
+        "local",
+        "vloopback-prealloc-parent-absent",
+        "vloopback-sparse-deleted",
+        "vloopback-unmounted",
+        "dmcrypt-prealloc-parent-absent",
+        "dmcrypt-sparse",
+        "dmcrypt-unmounted",
+    ],
+)
+def test_by_volume_reports_what_the_pods_filesystem_holds(
+    scrape: dict, monkeypatch, volume, df_size, backing_bytes, mounted_used, by_volume, total
+) -> None:
+    # Arrange — review on #1989: a pod's share is its mounted filesystem's used bytes; the disk
+    # total stays what the backing file takes
+    root = "/proc/1/root/var/lib/docker"
+    dmcrypt = "Options" in volume
+    mountpoint = "/var/lib/docker/volumes/volume_pod/_data" if dmcrypt else "/mnt/volume_pod"
+    host_mount = mountpoint if dmcrypt else "/var/lib/docker/plugins/abc/propagated-mount/volume_pod"
+    backing = f"{root}/lium-crypt/{POD_ID}.img" if dmcrypt else f"{root}/vloopback-v2/volume_pod"
+
+    def stat(path):
+        if path != backing or backing_bytes is None:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_blocks=backing_bytes // 512)
+
+    def statvfs(path):
+        assert path == f"/proc/1/root{host_mount}"
+        return SimpleNamespace(f_blocks=1000 * GIB // 4096, f_bfree=(1000 * GIB - mounted_used) // 4096, f_frsize=4096)
+
+    path = SimpleNamespace(
+        join=os.path.join,
+        isdir=lambda candidate: candidate == f"{root}/vloopback-v2",
+        # F-2: the host-side parent is absent in the executor container, so py3.11's ismount (realpath
+        # of the parent through /proc/1/root) says False for every mount; the host's mountinfo decides
+        ismount=lambda candidate: False,
+    )
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat, statvfs=statvfs))
+    glob_hit = [f"/proc/1/root{host_mount}"]
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: glob_hit if "propagated-mount" in pattern else []))
+    mountinfo = [
+        "22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n",
+        # an escaped neighbour (a space in its path) must not hide or fake the pod's mount
+        "30 22 7:3 / /mnt/my\\040disk rw shared:9 - ext4 /dev/loop3 rw\n",
+    ] + ([f"31 22 7:4 / {host_mount} rw,relatime shared:10 - ext4 /dev/loop4 rw\n"] if mounted_used is not None else [])
+    monkeypatch.setitem(scrape, "open", lambda path: io.StringIO("".join(mountinfo)) if path == "/proc/1/mountinfo" else None)
+    df_volumes = [] if df_size is None else [{"Name": "volume_pod", "UsageData": {"Size": df_size}}]
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {"LayersSize": 0, "Containers": [], "Volumes": df_volumes},
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": [{"Name": "volume_pod", "Mountpoint": mountpoint, **volume}]},
+        },
+    )
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert
+    assert usage["hard_disk_by_volume"] == {"volume_pod": by_volume // 1024}
+    assert usage["hard_disk_volumes"] == total // 1024
 
 
 def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
@@ -112,6 +263,8 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_volumes": 0,
         "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
+        "hard_disk_by_container": {},
+        "hard_disk_by_volume": {},
     }
 
 
@@ -207,14 +360,17 @@ def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, 
 
 
 @pytest.mark.parametrize("old_blocks, total_blocks", [(1953136, 1953136 + 7488), (None, 7488)])
-def test_vloopback_volume_bytes_counts_the_v2_host_data_dir_beside_the_old_plugin_rootfs(
+def test_vloopback_volume_bytes_counts_the_v2_and_v3_host_data_dirs_beside_the_old_plugin_rootfs(
     scrape: dict, monkeypatch, old_blocks, total_blocks
 ) -> None:
     # the old plugin's files sit in its rootfs (found by the glob), v2's in a host dir under DockerRootDir;
     # a node with v2 only is a fresh one, not a structural miss
     old_dir = "/proc/1/root/var/lib/docker/plugins/abc/rootfs/var/lib/docker/loopback"
     v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
-    blocks = {f"{v2_dir}/volume_v2": 7488} | ({f"{old_dir}/volume_old": old_blocks} if old_blocks else {})
+    v3_dir = "/proc/1/root/var/lib/docker/vloopback-v3"
+    blocks = {f"{v2_dir}/volume_v2": 7488, f"{v3_dir}/volume_v3": 96} | (
+        {f"{old_dir}/volume_old": old_blocks} if old_blocks else {}
+    )
 
     def stat(path):
         if path not in blocks:
@@ -222,12 +378,16 @@ def test_vloopback_volume_bytes_counts_the_v2_host_data_dir_beside_the_old_plugi
         return SimpleNamespace(st_blocks=blocks[path])
 
     monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [old_dir] if old_blocks else []))
-    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate in (v2_dir, v3_dir))
     monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
-    volumes = [{"Name": "volume_old", "Driver": "vloopback:latest"}, {"Name": "volume_v2", "Driver": "vloopback:v2"}]
+    volumes = [
+        {"Name": "volume_old", "Driver": "vloopback:latest"},
+        {"Name": "volume_v2", "Driver": "vloopback:v2"},
+        {"Name": "volume_v3", "Driver": "vloopback:v3"},
+    ]
     _stub_docker_api(scrape, {"/volumes": {"Volumes": volumes}})
 
-    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == total_blocks * 512
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == (total_blocks + 96) * 512
 
 
 def _obfuscation_tables() -> tuple[set[str], set[str]]:
@@ -484,6 +644,12 @@ def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
         "hard_disk_volumes": 1550 * 1024**2,
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
+        "hard_disk_by_container": {},
+        "hard_disk_by_volume": {
+            "engy_cache_hf_kimi-k3-0123abcd": 1500 * 1024**2,
+            "dphn_cache_hf_x": 40 * 1024**2,
+            "volume_renter": 10 * 1024**2,
+        },
     }
 
 
@@ -560,4 +726,47 @@ def test_a_capability_check_is_named_and_removed_even_when_it_times_out() -> Non
     command = raised.value.args[0]
     name = command[command.index("--name") + 1]
     assert command[:3] == ["docker", "run", "--rm"] and name.startswith("lium_capability_check_")
+    # the exact name the stale cleanup removes by, and nothing looser
+    from services.container_cleanup import never_started_check_containers
+
+    assert never_started_check_containers(f"a1 {name}") == ["a1"]
     assert removed == [["docker", "rm", "-f", name]]
+
+
+def test_host_mount_points_decodes_mountinfo_escapes(scrape: dict, monkeypatch) -> None:
+    mountinfo = "22 1 259:2 / / rw - ext4 /dev/root rw\n30 22 7:3 / /mnt/my\\040disk rw - ext4 /dev/loop3 rw\n"
+    monkeypatch.setitem(scrape, "open", lambda path: io.StringIO(mountinfo))
+
+    assert scrape["host_mount_points"]() == {"/", "/mnt/my disk"}
+
+
+@pytest.mark.parametrize(
+    "line, mount_point",
+    [
+        ("31 22 7:4 / /var/lib/docker/volumes/v/_data rw - ext4 /dev/loop4 rw", "/var/lib/docker/volumes/v/_data"),
+        ("30 22 7:3 / /mnt/my\\040disk rw - ext4 /dev/loop3 rw", "/mnt/my disk"),
+        ("32 22 7:5 / /mnt/tab\\011and\\134slash rw - ext4 /dev/loop5 rw", "/mnt/tab\tand\\slash"),
+        ("garbage", None),
+    ],
+    ids=["plain", "escaped-space", "escaped-tab-backslash", "short-line"],
+)
+def test_packaged_scrape_reads_escaped_mount_points(monkeypatch, line, mount_point) -> None:
+    # F-5: run host_mount_points as it ships, out of obfuscator.py's output. A lambda there kept its
+    # argument name while its body was renamed, so an escaped path raised NameError and the whole
+    # docker disk breakdown fell into the error key.
+    from miner_jobs.obfuscator import obfuscate_code
+
+    tree = ast.parse(obfuscate_code((SRC / "miner_jobs" / "machine_scrape.py").read_text()))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(isinstance(child, ast.Constant) and child.value == "/proc/1/mountinfo" for child in ast.walk(node))
+    )
+    mountinfo = f"22 1 259:2 / / rw - ext4 /dev/root rw\n{line}\n"
+    namespace = {"re": re, "open": lambda path: io.StringIO(mountinfo)}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "obfuscated", "exec"), namespace)
+
+    mount_points = namespace[function.name]()
+
+    assert mount_points == {"/"} | ({mount_point} if mount_point else set())
