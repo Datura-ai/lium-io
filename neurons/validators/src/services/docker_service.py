@@ -567,9 +567,6 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
 # DAH-5392: bounds the backend's rental-active answer for an unlisted pod in a create's sweep; no answer keeps the pod
 _POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
-# at most this many rental lookups per sweep, run as one concurrent wave (one timeout at most); the rest are kept
-# until a later sweep, so a host with many unlisted pods cannot fan a create out into many backend calls
-_POD_RENTAL_LOOKUPS_PER_SWEEP = 8
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
@@ -4490,20 +4487,16 @@ class DockerService:
     async def _pods_with_closed_rental(self, names: list[str], default_extra: dict) -> set[str]:
         """The ``names`` whose rental the backend confirms closed, plus names that are not `pod_<uuid>` (the
         backend names every pod it creates after the pod's uuid, so such a name is no newer create's pod).
-        No backend client, no answer, an error, a timeout or a lookup past the per-sweep cap keeps the pod:
-        a removal cannot be undone."""
-        lookups_left = _POD_RENTAL_LOOKUPS_PER_SWEEP
+        No backend client, no answer, an error or a timeout keeps the pod: a removal cannot be undone."""
 
         async def closed(name: str) -> bool:
-            nonlocal lookups_left
             pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
             try:
                 UUID(pod_id)
             except ValueError:
                 return True
-            if self.backend_client is None or lookups_left <= 0:
+            if self.backend_client is None:
                 return False
-            lookups_left -= 1
             try:
                 async with asyncio.timeout(_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS):
                     answer = await self.backend_client.get_pod_rental_active(pod_id)
