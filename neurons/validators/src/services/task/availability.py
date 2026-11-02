@@ -65,12 +65,14 @@ class AvailabilityErrorCode(StrEnum):
     GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
 
 
-# Faults of the node's own cards: never a sign of our own outage, and never silenced with one.
+# Faults the node itself proved: never a sign of our own outage, and never silenced with one.
 NODE_GPU_FAULT_CODES = frozenset(
     {
         AvailabilityErrorCode.GPU_LOST,
         AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
         AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
+        # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
+        AvailabilityErrorCode.VERIFICATION_FAILED,
     }
 )
 

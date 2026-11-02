@@ -143,9 +143,28 @@ def _result(errors):
     )
 
 
-def test_most_of_a_cycle_failing_is_treated_as_our_own_outage() -> None:
-    failed = _errors_the_service_sends(False, [_event("gpu.validate.nvlink_fault", "NVLINK_FAULT")])
+@pytest.mark.parametrize("reason", sorted(REASONS_THAT_HIDE_AT_ONCE))
+def test_most_of_a_cycle_failing_a_listed_reason_is_not_silenced(reason: str) -> None:
+    failed = _errors_the_service_sends(False, [_event("gpu.validate.x", reason)])
     results = [_result(list(failed)) for _ in range(8)] + [_result([]) for _ in range(2)]
+
+    assert silence_availability_errors_on_our_own_outage(results) == 0
+    assert all(r.availability_errors == failed for r in results[:8])
+
+
+def test_most_of_a_cycle_failing_the_connect_is_still_treated_as_our_own_outage() -> None:
+    unreachable = build_availability_event(
+        code=AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE,
+        reach_source=ReachSource.VALIDATOR,
+        reach_target=ReachTarget.EXECUTOR_SSH,
+        event_text="x",
+        impact="x",
+        remediation="x",
+        what_we_saw={},
+    )
+    unreachable_errors = _errors_the_service_sends(False, [unreachable])
+    results = [_result(list(unreachable_errors)) for _ in range(8)]
+    results += [_result([]) for _ in range(2)]
 
     assert silence_availability_errors_on_our_own_outage(results) == 10
     assert all(r.availability_errors is None for r in results)
