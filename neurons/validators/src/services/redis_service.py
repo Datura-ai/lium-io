@@ -652,7 +652,8 @@ class RedisService:
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
     ):
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         now = int(time.time())
 
         item: dict = {"time": now, "pod_id": pod_id}
@@ -666,7 +667,7 @@ class RedisService:
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str, kind: str | None = None):
         """Every pending mark of the pod, or only its marks of `kind` when given."""
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         pending_pods = [
             item
             for item in pending_pods
@@ -744,7 +745,10 @@ class RedisService:
                 await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
         return creates
 
-    async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
+    async def get_pending_pods(
+        self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60
+    ) -> list[dict]:
+        """Pending-pod entries younger than `max_age_seconds` (None: every entry)."""
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
             return []
@@ -760,7 +764,10 @@ class RedisService:
         pending_pods = []
         
         for item in data:
-            if now - item.get('time', 0) >= 30 * 60:  # 30 mins
+            if (
+                max_age_seconds is not None
+                and now - item.get('time', 0) >= max_age_seconds
+            ):
                 continue
             pending_pods.append(item)
         
