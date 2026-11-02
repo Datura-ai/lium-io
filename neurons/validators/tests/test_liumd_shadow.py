@@ -106,13 +106,21 @@ class FakeLiumd:
     """`LiumdExecClient` answering as the binary does, per step as told."""
 
     def __init__(
-        self, *, verifyx_ok=True, lib_sha="lib-sha", result=None, matmul=None, deadline_hit=False
+        self,
+        *,
+        verifyx_ok=True,
+        lib_sha="lib-sha",
+        result=None,
+        matmul=None,
+        deadline_hit=False,
+        facts=None,
     ):
         self.matmul = matmul  # a dict replacing the matmul step's reply
         self.deadline_hit = deadline_hit  # the document-wide flag: any step reached the deadline
         self.verifyx_ok = verifyx_ok
         self.lib_sha = lib_sha
         self.result = result
+        self.facts = facts or {}
         self.intents: list[dict] = []
         self.timeouts: list[float] = []
 
@@ -149,7 +157,7 @@ class FakeLiumd:
         if self.matmul is not None:
             steps["matmul"] = self.matmul
         for name in ("docker", "ports", "inspector"):
-            steps[name] = {"status": "ok", "ms": 3}
+            steps[name] = {"status": "ok", "ms": 3, **self.facts.get(name, {})}
         raw = {
             "schema": SCHEMA,
             "nonce": intent["nonce"],
@@ -246,6 +254,42 @@ async def test_agreeing_verdicts_are_logged_as_one_structured_line(
     [line] = [r for r in caplog.records if r.getMessage() == LIUMD_SHADOW_EVENT]
     assert line.msg.extra["transport"] == "liumd_shadow"
     assert line.msg.extra["agree"] is True and line.msg.extra["steps"] == record["steps"]
+
+
+@pytest.mark.asyncio
+async def test_all_reserved_runs_on_any_executor(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "LIUMD_SHADOW_RESERVED_EXECUTORS", "all")
+    fake = FakeLiumd()
+
+    record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
+
+    assert record["outcome"] == "compared"
+    assert fake.intents
+
+
+@pytest.mark.asyncio
+async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch, verifyx_service):
+    specs = {**SPECS, "sysbox_runtime": True, "docker_containers": [{"each_name": "filler"}]}
+    state = build_state(specs=specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+    fake = FakeLiumd(
+        facts={
+            "docker": {
+                "data": {"sysbox_runtime": True, "containers": [{"name": "filler"}]},
+            },
+            "ports": {"data": {"port_range": None, "port_mappings": None}},
+        }
+    )
+
+    record = await _shadow(ctx, fake)
+
+    assert record["facts_agree"] is True
+    assert {c["field"] for c in record["facts"]} == {
+        "docker.sysbox_runtime",
+        "docker.container_names",
+        "ports.port_range",
+        "ports.port_mappings",
+    }
 
 
 @pytest.mark.asyncio
