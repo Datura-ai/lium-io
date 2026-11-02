@@ -1561,6 +1561,43 @@ async def test_unnamed_pod_still_not_up_after_the_grace_is_not_running(context_f
     assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
 
 
+REAPED_FILLER = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "processes, passed",
+    [
+        pytest.param([REAPED_FILLER], True, id="reaped-filler-only"),
+        pytest.param(["pod_53a68595", REAPED_FILLER], True, id="tenant-and-reaped-filler"),
+        pytest.param(
+            ["pod_53a68595", REAPED_FILLER, "my_miner"],
+            False,
+            id="a-surviving-foreign-process-still-fails",
+        ),
+    ],
+)
+async def test_a_container_the_cleanup_reaped_this_cycle_is_not_gpu_usage_outside_the_tenant(
+    context_factory, processes, passed
+):
+    """Review 4371171967: TenantEnforcementCheck runs before GpuUsageCheck on the same processes."""
+    from tests.test_gpu_usage_check import _after_the_cleanup_removed
+
+    ctx = _unnamed_pod_ctx(
+        context_factory,
+        DummySSHClient(pod_running=True),
+        [{"container_name": name, "pid": 1000 + i} for i, name in enumerate(processes)],
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [REAPED_FILLER])
+
+    assert all(process["container_name"] != REAPED_FILLER for process in ctx.state.gpu_processes)
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is passed
+    expected = Msg.ALREADY_RENTED.reason if passed else Msg.GPU_OUTSIDE_TENANT.reason
+    assert result.event.reason_code == expected
+
+
 @pytest.mark.asyncio
 async def test_unnamed_pod_whose_create_is_still_running_after_the_grace_is_not_penalised(context_factory):
     # a custom-Dockerfile build keeps the pod PENDING with no container for longer than the grace

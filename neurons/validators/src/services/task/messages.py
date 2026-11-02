@@ -1321,12 +1321,19 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation=(
             "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
-            "node uses it: {rental_status}. Lium stops a pod's container when its rental ends and the "
-            "validator removes leftovers, so this one should not be holding the GPU. Before you touch "
-            "it, confirm it is not a live rental: the node's page in the Provider Portal must show no "
-            "active rental. Only then remove it: docker rm -f {orphaned_container}. If the portal "
-            "still shows a rental on the node, leave the container running and contact Lium support."
+            "node uses it: {rental_status}. The validator removes a leftover pod container by itself "
+            "within about 30 minutes and the node passes again. Do not remove pod containers yourself, "
+            "by hand or by script: a mistake deletes a live rental. If it is still there after an hour, "
+            "contact Lium support with the container name."
         ),
+    )
+    # DAH-5117: no pod id Lium issued, or no backend record placing the ended rental on this node. Whether the
+    # stale cleanup removes it depends on its label, which this check does not see: promise neither way
+    ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION = (
+        "{orphaned_container} is named like a Lium pod container{pod}, but Lium cannot confirm a rental "
+        "of it on this node: {rental_status}. If it is your own workload, run it without Lium's pod_ "
+        "name and io.lium.pod_id label, or free the GPU; otherwise leave it running and contact Lium "
+        "support with the container name."
     )
     ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
         "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
