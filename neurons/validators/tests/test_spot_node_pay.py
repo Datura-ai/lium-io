@@ -1,12 +1,11 @@
-"""Spot-node pay and the secure floor (ENABLE_SECURE_FILLER_REVENUE_FLOOR).
+"""Spot-node pay and the secure floor.
 
 Spot: an idle spot node running Lium fillers is paid min(1.0 x its GPU configuration's average
 filler revenue per GPU-hour, its secure rate before cap dilution), outside the buckets, and a GPU
 model's spot nodes together at most what its fillers earn per hour (DAH-5128).
 Secure floor: an idle secure node's cap-diluted rate is raised to 1.0 x that average, even
 above its listed rate. The two factors are separate constants. No cap (owner rule): spot pay and floor top-ups are paid on top of the
-burn-capped rental share, up to the whole incentive pool. Both flags off reproduce the old
-numbers exactly.
+burn-capped rental share, up to the whole incentive pool.
 """
 
 import json
@@ -199,15 +198,9 @@ def spot_rental_on(monkeypatch):
     monkeypatch.setattr(settings, "ENABLE_SPOT_RENTAL_INCENTIVE", True)
 
 
-@pytest.fixture
-def floor_on(monkeypatch):
-    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
-
-
 @pytest.fixture(autouse=True)
 def flags_default_off(monkeypatch):
     monkeypatch.setattr(settings, "SPOT_IDLE_PAY_SECURE_DECISION_ENABLED", False)
-    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", False)
     monkeypatch.setattr(settings, "ENABLE_SPOT_RENTAL_INCENTIVE", False)
 
 
@@ -630,15 +623,7 @@ def _over_cap_cycle(filler_revenue: float | None) -> list[JobResult]:
 
 
 @pytest.mark.asyncio
-async def test_floor_off_keeps_the_diluted_rate():
-    incentive = await _run(_over_cap_cycle(8.0))
-
-    for node in incentive.job_results["hk"]:
-        assert node.effective_rate == HOURLY_RATE * 0.5
-
-
-@pytest.mark.asyncio
-async def test_floor_lifts_a_diluted_rate_after_dilution(floor_on):
+async def test_floor_lifts_a_diluted_rate_after_dilution():
     incentive = await _run(_over_cap_cycle(8.0))
 
     for node in incentive.job_results["hk"]:
@@ -653,7 +638,7 @@ async def test_floor_lifts_a_diluted_rate_after_dilution(floor_on):
 
 
 @pytest.mark.asyncio
-async def test_floor_lifts_above_the_listed_rate(floor_on):
+async def test_floor_lifts_above_the_listed_rate():
     incentive = await _run(_over_cap_cycle(4 * HOURLY_RATE))
 
     for node in incentive.job_results["hk"]:
@@ -664,7 +649,7 @@ async def test_floor_lifts_above_the_listed_rate(floor_on):
 
 
 @pytest.mark.asyncio
-async def test_floor_leaves_a_bucket_with_no_capacity_at_zero(floor_on):
+async def test_floor_leaves_a_bucket_with_no_capacity_at_zero():
     config = IncentiveConfig(
         rental_incentive_gpu_types=["H100"],
         max_unrented_gpus={"H100": {8: BUCKET_CAP, 1: 0}},
@@ -682,7 +667,7 @@ async def test_floor_leaves_a_bucket_with_no_capacity_at_zero(floor_on):
 
 
 @pytest.mark.asyncio
-async def test_floor_below_the_diluted_rate_changes_nothing(floor_on):
+async def test_floor_below_the_diluted_rate_changes_nothing():
     incentive = await _run(_over_cap_cycle(2.0))
 
     for node in incentive.job_results["hk"]:
@@ -693,7 +678,7 @@ async def test_floor_below_the_diluted_rate_changes_nothing(floor_on):
 
 
 @pytest.mark.asyncio
-async def test_floor_without_an_average_changes_nothing(floor_on):
+async def test_floor_without_an_average_changes_nothing():
     incentive = await _run(_over_cap_cycle(None))
 
     for node in incentive.job_results["hk"]:
@@ -701,7 +686,7 @@ async def test_floor_without_an_average_changes_nothing(floor_on):
 
 
 @pytest.mark.asyncio
-async def test_floor_keeps_the_nodes_own_penalties(floor_on, monkeypatch):
+async def test_floor_keeps_the_nodes_own_penalties(monkeypatch):
     monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 0.5)
     incentive = await _run(
         [
@@ -718,7 +703,7 @@ async def test_floor_keeps_the_nodes_own_penalties(floor_on, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_floored_node_below_the_minimum_driver_adds_no_floor_cost(floor_on):
+async def test_a_floored_node_below_the_minimum_driver_adds_no_floor_cost():
     incentive = await _run(
         [
             _node("old-driver", filler_revenue_per_gpu_hour=8.0, nvidia_driver_version="535.104.05"),
@@ -736,7 +721,7 @@ async def test_a_floored_node_below_the_minimum_driver_adds_no_floor_cost(floor_
 
 @pytest.mark.asyncio
 async def test_floor_skips_the_free_remainder_of_a_partially_rented_split_node(
-    floor_on, monkeypatch
+    monkeypatch
 ):
     config = IncentiveConfig(
         rental_incentive_gpu_types=["H100"],
@@ -768,17 +753,8 @@ async def test_floor_skips_the_free_remainder_of_a_partially_rented_split_node(
 
 
 @pytest.mark.asyncio
-async def test_the_two_flags_are_independent(monkeypatch):
-    def cycle() -> list[JobResult]:
-        return [*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)]
-
-    spot_only = await _run(cycle())
-    assert [n.effective_rate for n in spot_only.job_results["hk"]] == pytest.approx(
-        [HOURLY_RATE * 0.5, HOURLY_RATE * 0.5, SPOT_FACTOR * 2.0]
-    )
-
-    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
-    both = await _run(cycle())
+async def test_spot_pay_and_the_floor_apply_together():
+    both = await _run([*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)])
     assert [_paid_rate(n) for n in both.job_results["hk"]] == pytest.approx(
         [FLOOR_FACTOR * 8.0, FLOOR_FACTOR * 8.0, SPOT_FACTOR * 2.0]
     )
@@ -794,7 +770,7 @@ def _messages(result: JobResult, marker: str) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_the_spot_factor_moves_spot_pay_alone(floor_on, monkeypatch):
+async def test_the_spot_factor_moves_spot_pay_alone(monkeypatch):
     monkeypatch.setattr(rental_price, "FILLER_REVENUE_PAY_FACTOR", 0.5)
 
     incentive = await _run([*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)])
@@ -809,7 +785,7 @@ async def test_the_spot_factor_moves_spot_pay_alone(floor_on, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_floor_factor_moves_the_floor_alone(floor_on, monkeypatch):
+async def test_the_floor_factor_moves_the_floor_alone(monkeypatch):
     monkeypatch.setattr(rental_price, "SECURE_FILLER_REVENUE_FLOOR_FACTOR", 0.8)
 
     incentive = await _run([*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)])
@@ -849,12 +825,12 @@ def _mixed_config() -> IncentiveConfig:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tao_price", [TAO_PRICE, AT_CAP_TAO_PRICE], ids=["below-cap", "at-cap"])
-@pytest.mark.parametrize("flag", ["ENABLE_SECURE_FILLER_REVENUE_FLOOR", "ENABLE_SPOT_RENTAL_INCENTIVE"])
-async def test_non_spot_idle_pay_is_identical_with_either_flag_on_or_off(
-    monkeypatch, flag, tao_price
+@pytest.mark.parametrize("spot_rental_incentive", [False, True], ids=["spot-rental-off", "spot-rental-on"])
+async def test_non_spot_idle_pay_is_identical_with_or_without_spot_pay_and_the_floor(
+    monkeypatch, spot_rental_incentive, tao_price
 ):
+    monkeypatch.setattr(settings, "ENABLE_SPOT_RENTAL_INCENTIVE", spot_rental_incentive)
     off = await _run(_without_filler_averages(_mixed_cycle()), _mixed_config(), tao_price=tao_price)
-    monkeypatch.setattr(settings, flag, True)
     on = await _run(_mixed_cycle(), _mixed_config(), tao_price=tao_price)
 
     assert on.total_rental_cost == off.total_rental_cost
@@ -883,7 +859,6 @@ async def test_non_spot_idle_pay_is_identical_with_either_flag_on_or_off(
 @pytest.mark.asyncio
 async def test_the_paid_share_rises_by_exactly_spot_pay_and_floor_top_ups(monkeypatch):
     off = await _run(_without_filler_averages(_mixed_cycle()), _mixed_config())
-    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
     on = await _run(_mixed_cycle(), _mixed_config())
 
     spot_pay = 8 * SPOT_FACTOR * 2.0
@@ -906,7 +881,6 @@ async def test_extras_past_the_whole_pool_are_clamped_and_only_they_shrink(monke
     tao_price = _half_clamp_tao_price()
 
     off = await _run(_without_filler_averages(cycle()), tao_price=tao_price)
-    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
     with caplog.at_level(logging.WARNING):
         on = await _run(cycle(), tao_price=tao_price)
 
@@ -933,7 +907,6 @@ async def test_at_the_burn_cap_the_pool_has_no_room_left_for_extras(monkeypatch,
     if burn_emission is not None:
         monkeypatch.setattr("incentive.rental_price.get_total_burn_emission", lambda: burn_emission)
         monkeypatch.setattr("incentive.default.get_total_burn_emission", lambda: burn_emission)
-    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
 
     with caplog.at_level(logging.WARNING):
         on = await _run(_mixed_cycle(), _mixed_config(), tao_price=AT_CAP_TAO_PRICE)
@@ -997,7 +970,7 @@ async def test_a_zero_rate_spot_node_at_the_cap_keeps_only_its_own_reason(
 
 
 @pytest.mark.asyncio
-async def test_a_price_outage_reports_no_burn_cap_reason_or_note(floor_on, caplog):
+async def test_a_price_outage_reports_no_burn_cap_reason_or_note(caplog):
     with caplog.at_level(logging.WARNING):
         incentive = await _run(
             [*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)], tao_price=None
@@ -1016,7 +989,7 @@ async def test_a_price_outage_reports_no_burn_cap_reason_or_note(floor_on, caplo
 
 
 @pytest.mark.asyncio
-async def test_spot_and_floored_nodes_publish_both_terms_of_the_formula(floor_on):
+async def test_spot_and_floored_nodes_publish_both_terms_of_the_formula():
     incentive = await _run(
         [*_over_cap_cycle(8.0), _node("plain-1x", gpu_count=1), _spot(filler_revenue_per_gpu_hour=2.0)],
         _mixed_config(),
@@ -1058,7 +1031,7 @@ async def test_spot_and_floored_nodes_publish_both_terms_of_the_formula(floor_on
 @pytest.mark.parametrize(
     "tao_price", [TAO_PRICE, "half-clamp", AT_CAP_TAO_PRICE], ids=["below-clamp", "clamped", "at-cap"]
 )
-async def test_the_logged_formulas_reproduce_the_paid_incentive(floor_on, tao_price):
+async def test_the_logged_formulas_reproduce_the_paid_incentive(tao_price):
     if tao_price == "half-clamp":
         tao_price = _half_clamp_tao_price()
     incentive = await _run([*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)], tao_price=tao_price)
@@ -1082,7 +1055,7 @@ async def test_the_logged_formulas_reproduce_the_paid_incentive(floor_on, tao_pr
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tao_price", [TAO_PRICE, AT_CAP_TAO_PRICE], ids=["below-cap", "at-cap"])
-async def test_monitoring_splits_the_rental_pool_by_the_bucket_rate(floor_on, caplog, tao_price):
+async def test_monitoring_splits_the_rental_pool_by_the_bucket_rate(caplog, tao_price):
     with caplog.at_level(logging.INFO):
         incentive = await _run(_over_cap_cycle(8.0), tao_price=tao_price)
 
@@ -1117,7 +1090,7 @@ async def test_monitoring_defaults_to_no_unbucketed_share(caplog):
 
 
 @pytest.mark.asyncio
-async def test_an_unpriced_capped_model_gets_no_floor(floor_on):
+async def test_an_unpriced_capped_model_gets_no_floor():
     config = IncentiveConfig(
         rental_incentive_gpu_types=["H100", "H200"],
         max_unrented_gpus={"H100": {8: BUCKET_CAP}, "H200": {8: BUCKET_CAP}},
@@ -1440,7 +1413,7 @@ def test_a_field_that_is_not_a_list_reads_as_no_averages(value, caplog):
 
 
 @pytest.mark.asyncio
-async def test_a_malformed_field_does_not_change_a_flags_off_cycle(context_factory):
+async def test_a_malformed_field_scores_like_an_absent_one(context_factory):
     executor_id = str(default_executor().uuid)
     fillers = {"all_filler_containers_by_executor": {executor_id: ["filler_run-1"]}}
     malformed = RentedExecutorsResponse.model_validate(
@@ -1483,7 +1456,7 @@ def test_a_lone_one_gpu_node_has_an_average_after_two_filler_hours():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("gpu_hours", [2.0, 23.9])
 async def test_secure_keeps_the_24_gpu_hour_threshold_while_spot_uses_2(
-    context_factory, floor_on, gpu_hours
+    context_factory, gpu_hours
 ):
     # a sample of 2 to under 24 GPU-hours pays Spot, but gives a secure node no floor average
     sample = {"filler_revenue_by_gpu_config": [{**_GOOD_ENTRY, "gpu_hours": gpu_hours}]}

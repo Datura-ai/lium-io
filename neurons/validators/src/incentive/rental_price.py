@@ -63,7 +63,7 @@ CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
 
 # The share of a GPU configuration's average filler revenue per GPU-hour that a node is paid:
-# spot-node pay and the secure floor (ENABLE_SECURE_FILLER_REVENUE_FLOOR).
+# spot-node pay and the secure floor.
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
 FILLER_REVENUE_PAY_FACTOR = 1.0
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
@@ -785,7 +785,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     * result.sysbox_multiplier
                     * result.driver_multiplier
                 )
-                if settings.ENABLE_SECURE_FILLER_REVENUE_FLOOR and result.filler_revenue_per_gpu_hour is not None:
+                if result.filler_revenue_per_gpu_hour is not None:
                     self._secure_floor_candidates.append((base_model, result))
 
                 # DAH-2528: a split-capable node pinned to its gpu_count bucket may
@@ -1221,8 +1221,7 @@ class RentalPriceIncentive(DefaultIncentive):
         and a node with no listed rate stay at 0: they are not in `_secure_floor_candidates`, so
         the unbucketed cost carries no top-up for them."""
         if (
-            not settings.ENABLE_SECURE_FILLER_REVENUE_FLOOR
-            or result.filler_revenue_per_gpu_hour is None
+            result.filler_revenue_per_gpu_hour is None
             or not result.max_cap
             or not result.hourly_rate
         ):
