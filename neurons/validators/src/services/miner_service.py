@@ -4,7 +4,7 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Container, Iterator
 from typing import Annotated
 from uuid import UUID
 
@@ -363,6 +363,10 @@ class MinerService:
         # wave's list of the node's miner, or the wave could verify and publish the node again
         # under the same id once the lane let go of it.
         self.miners_awaiting_wave_list: dict[str, str] = {}
+        # The express lane's queue (its live _pending map): new executors it will verify within
+        # minutes. The wave leaves them to it too, not only the ones it is running: in the wave a
+        # new node waits its turn and runs the full check, 7-15 min to listed (DAH-5601).
+        self.express_queued: Container[str] = frozenset()
         # per miner hotkey, the rented executor uuids it left out of its previous answer (one-cycle grace: a
         # single miss is mostly a key upload that missed the miner's 10 s window, so the row starts at the second).
         # shortcut: in memory, so a restart costs one extra cycle before a real outage is reported.
@@ -387,7 +391,7 @@ class MinerService:
         default_extra: dict,
     ) -> list[ExecutorSSHInfo]:
         """The wave takes every executor the miner returned, minus those the express lane is
-        verifying at this moment, so a new node's hardware tests never run twice concurrently
+        verifying or has queued, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched.
 
@@ -399,7 +403,10 @@ class MinerService:
         executors = self._first_entry_per_uuid(executors, default_extra)
         claimed: list[ExecutorSSHInfo] = []
         for executor in executors:
-            if self.in_flight.get(executor.uuid) == EXPRESS_LANE:
+            if (
+                self.in_flight.get(executor.uuid) == EXPRESS_LANE
+                or executor.uuid in self.express_queued
+            ):
                 logger.info(
                     _m(
                         "Executor left to the express lane this cycle",
