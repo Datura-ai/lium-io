@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
+from services.gpu_spec_table import RTX_4090_48GB
 from services.const import (
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
@@ -67,7 +68,7 @@ CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
 
 # The share of a GPU configuration's average filler revenue per GPU-hour that a node is paid:
-# spot-node pay (ENABLE_SPOT_NODE_PAY) and the secure floor (ENABLE_SECURE_FILLER_REVENUE_FLOOR).
+# spot-node pay and the secure floor.
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
 FILLER_REVENUE_PAY_FACTOR = 1.0
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
@@ -191,7 +192,7 @@ class RentalPriceEstimate(BaseModel):
     base_model: str
     gpu_count: int
     is_rented: bool
-    usd_per_epoch: float
+    usd_per_epoch: float | None                         # None = no estimate for this model (unavailable)
     count_bucket: int | None = None                     # gpu_count_bucket the executor was placed into
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
@@ -849,7 +850,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     * result.sysbox_multiplier
                     * result.driver_multiplier
                 )
-                if settings.ENABLE_SECURE_FILLER_REVENUE_FLOOR and result.filler_revenue_per_gpu_hour is not None:
+                if result.filler_revenue_per_gpu_hour is not None:
                     self._secure_floor_candidates.append((base_model, result))
 
                 # DAH-2528: a split-capable node pinned to its gpu_count bucket may
@@ -1169,8 +1170,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # this path (earns_spot_rental_incentive decides its pay), and neither is the free remainder of
         # a partially rented one: it has no configuration average of its own (spot_tier, not "no average")
         return (
-            settings.ENABLE_SPOT_NODE_PAY
-            and result.is_spot
+            result.is_spot
             and result.is_on_spot_pay_list
             and not result.is_rented
             and not result.is_split_remainder
@@ -1286,8 +1286,7 @@ class RentalPriceIncentive(DefaultIncentive):
         and a node with no listed rate stay at 0: they are not in `_secure_floor_candidates`, so
         the unbucketed cost carries no top-up for them."""
         if (
-            not settings.ENABLE_SECURE_FILLER_REVENUE_FLOOR
-            or result.filler_revenue_per_gpu_hour is None
+            result.filler_revenue_per_gpu_hour is None
             or not result.max_cap
             or not result.hourly_rate
         ):
@@ -1570,6 +1569,11 @@ class RentalPriceIncentive(DefaultIncentive):
         gpu_count = params.gpu_count
         is_rented = params.is_rented
 
+        if gpu_model == RTX_4090_48GB and not settings.RTX_4090_48GB_MODEL_ENABLED:
+            # DAH-5508: off, the card is rejected, so no estimate at all (0.0 would read as an available $0)
+            return RentalPriceEstimate(
+                gpu_model=gpu_model, base_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented, usd_per_epoch=None
+            )
         base_model = BASE_GPU_MAP.get(gpu_model)
         cap_spec = self.config.max_unrented_gpus.get(base_model, {}) if base_model else {}
         eligible_for_unrented_estimate = (
@@ -1799,6 +1803,9 @@ async def precompute_all_estimates(
     on-demand request to the validator.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
+    if not settings.RTX_4090_48GB_MODEL_ENABLED:
+        # DAH-5508: the validator rejects this card while off, so publish no estimate for it.
+        gpu_models.remove(RTX_4090_48GB)
     estimates: dict[str, dict] = {}
     for gpu_model in gpu_models:
         estimates[gpu_model] = {
