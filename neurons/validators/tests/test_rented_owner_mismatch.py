@@ -195,3 +195,38 @@ def test_banned_provider_live_rental_gate_ignores_another_miners_rental(context_
 
     assert has_live_rental(_ctx(context_factory, rental_miner_hotkey="miner-hotkey")) is True
     assert has_live_rental(_ctx(context_factory, **OTHER)) is False
+
+
+# DAH-4263 review round 3 on #1834: a filler listed under this UUID for another miner is not this node's.
+def _filler_owned_by(owner_hotkey: str) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={},
+        all_filler_containers_by_executor={EXECUTOR_UUID: ["filler_1"]},
+        filler_ports_by_executor={EXECUTOR_UUID: [2001, 2002]},
+        executor_owner_hotkeys={EXECUTOR_UUID: owner_hotkey},
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_re_read_ignores_another_miners_filler(context_factory):
+    from unittest.mock import AsyncMock
+
+    from neurons.validators.src.services.task.checks.capability import lium_workload_live_now
+
+    ctx = _ctx(context_factory, **OTHER)
+    ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_filler_owned_by("other-miner-hotkey"))
+    assert await lium_workload_live_now(ctx) is None
+    ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_filler_owned_by("miner-hotkey"))
+    assert (await lium_workload_live_now(ctx)).kind == "filler"
+
+
+@pytest.mark.asyncio
+async def test_port_count_ignores_another_miners_filler_ports(context_factory):
+    def run(owner_hotkey: str):
+        state = build_state(
+            verified_port_count=0, specs={"verified_ports": []}, rented_data=_filler_owned_by(owner_hotkey)
+        )
+        return PortCountCheck().run(context_factory(state=state))
+
+    assert (await run("other-miner-hotkey")).updates["port_count"] == 0
+    assert (await run("miner-hotkey")).updates["port_count"] == 2
