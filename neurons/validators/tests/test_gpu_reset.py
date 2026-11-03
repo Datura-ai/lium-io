@@ -592,20 +592,22 @@ def test_the_host_unit_waits_for_an_exporter_whose_stop_failed_before_starting_i
 
 
 @pytest.mark.parametrize(
-    "inspect_err, waits_to_exit, expected",
+    "inspect_err, waits_to_exit, expected, handoff_rc",
     [
-        ("", 2, "0 0"),
+        ("", 2, "0 0", 0),
         # a transient daemon error is no proof the container is gone: keep waiting for its exit
-        ("Cannot connect to the Docker daemon", 2, "0 0"),
+        ("Cannot connect to the Docker daemon", 2, "0 0", 0),
         # a removed container ends the wait; its failed start is the validator's restoration failure
-        ("Error: No such object: e1", 99, "1 1"),
-        # an exporter that outlives its kill (stuck in the kernel) no longer holds the unit: it ends and names it
-        # (it still reads running, so the validator's restore check cannot)
-        ("", 99, "1 1"),
+        ("Error: No such object: e1", 99, "1 1", 0),
+        # an exporter that outlives its kill (stuck in the kernel) no longer holds the unit: it ends, hands the
+        # start to a host unit that outlives it and names it (it still reads running, so the restore check cannot)
+        ("", 99, "1 1", 0),
+        # the hand-off itself failed: the unit says nothing will start it
+        ("", 99, "1 1", 1),
     ],
 )
 def test_the_host_unit_keeps_waiting_for_an_exporter_whose_exit_outlasts_one_wait(
-    tmp_path, inspect_err, waits_to_exit, expected
+    tmp_path, inspect_err, waits_to_exit, expected, handoff_rc
 ):
     # the first wait times out with the exit still pending: a start then would be a no-op and nothing restarts it
     script = shlex.split(build_fabric_reset_command([], "true", ["e1"]))[-1]
@@ -627,11 +629,21 @@ timeout() { shift; "$@"; }
 sleep() { :; }
 trap 'echo "$pending $noops"' EXIT
 """
-    done = subprocess.run(["/bin/sh", "-c", stubs + script], capture_output=True, text=True, timeout=30)
+    # `systemd-run` is no valid sh function name: a PATH stub records the hand-off
+    (tmp_path / "systemd-run").write_text(f'#!/bin/sh\necho "$@" > "{tmp_path}/handoff"\nexit {handoff_rc}\n')
+    (tmp_path / "systemd-run").chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    done = subprocess.run(["/bin/sh", "-c", stubs + script], capture_output=True, text=True, timeout=30, env=env)
     assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
     assert done.stdout.strip() == expected
     stuck = not inspect_err and waits_to_exit == 99
-    assert ("could not start e1: it did not exit after a kill" in done.stderr) == stuck
+    handoff = tmp_path / "handoff"
+    assert handoff.exists() == stuck
+    if stuck:
+        assert f"--unit={gpu_reset.EXPORTER_RESTART_UNIT}" in handoff.read_text()
+        assert handoff.read_text().strip().endswith("e1")
+    assert ("e1 did not exit after a kill: restart pending" in done.stderr) == (stuck and handoff_rc == 0)
+    assert ("could not start e1: it did not exit after a kill" in done.stderr) == (stuck and handoff_rc != 0)
 
 
 AGENT = "some-gpu-agent.service"

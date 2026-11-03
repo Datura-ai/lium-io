@@ -95,6 +95,8 @@ GPU_HOLDER_UNITS_SCRIPT = (
 # named, so a reset that outlives its SSH timeout can be stopped (one per host: it owns every host GPU)
 FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
+# starts an exporter that outlived its kill once it exits, after the reset unit has ended
+EXPORTER_RESTART_UNIT = "lium-gpu-reset-exporter-restart"
 # "no-systemd" only when the host proves it has no systemd (not booted with it, no systemd-run): any other answer,
 # a failed probe included, keeps the reset in the host unit
 HOST_SYSTEMD_PROBE = "nsenter -t 1 -m -- sh -c " + shlex.quote(
@@ -476,13 +478,17 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: wait for
         # the exit (a removed container ends the wait), then kill one still there and wait once more. Bounded, so
         # the unit always ends inside the validator's wait and the renter pod starts. One that outlives its kill
-        # (stuck in the kernel) still reads running, so the restore check cannot see it: the unit names it
+        # (stuck in the kernel) still reads running, so the restore check cannot see it: its start goes to a host
+        # unit that outlives this one and starts it once it exits, and the report names it (restart pending)
+        restart = shlex.quote('docker wait "$0" >/dev/null; docker start "$0"')
         script += (
             f'[ -z "$dying" ] || until timeout {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
             '! docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; '
             'echo "$dying did not exit, killing it" >&2; docker kill "$dying" >/dev/null 2>&1; '
-            f'timeout {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1 || '
-            'echo "could not start $dying: it did not exit after a kill" >&2; break; done; '
+            f'timeout {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1 || {{ '
+            f'systemd-run --quiet --collect --unit={EXPORTER_RESTART_UNIT} /bin/sh -c {restart} "$dying" '
+            '>/dev/null 2>&1 && echo "$dying did not exit after a kill: restart pending, it starts once it exits" >&2 '
+            '|| echo "could not start $dying: it did not exit after a kill" >&2; }; break; done; '
         )
         ids = " ".join(shlex.quote(c) for c in reversed(containers))
         script += f'for u in {ids}; do docker start "$u" >/dev/null; done; '
