@@ -2023,3 +2023,22 @@ def test_backup_reruns_once_after_an_s3_upload_timeout(
         assert len(calls) == runs
         # the reported cause is the last run's own fatal error, not the first run's timeout
         assert first_runs[-1].split('"message":"')[1][:30] in runner._events._reporter._restic_failure_detail
+
+
+def test_backup_picks_its_parent_by_host_not_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # an encrypted pod's /proc/<pid>/root path changes on restart; a host+paths match would miss the parent
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    (tmp_path / "file").write_text("x")
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    commands: list[list[str]] = []
+
+    def stream(command, **_kwargs):
+        commands.append(command)
+        return 0, {"message_type": "summary", "snapshot_id": "abc123"}
+
+    monkeypatch.setattr(runner, "_stream", stream)
+
+    runner._backup()
+
+    command = commands[0]
+    assert command[command.index("--group-by") + 1] == "host"

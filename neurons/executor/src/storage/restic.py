@@ -443,6 +443,10 @@ class ResticStorageRunner:
             "--json",
             "--host",
             f"lium-pod-{self._operation.pod_id}",
+            # encrypted pods back up /proc/<pid>/root/..., a path that changes on every container restart;
+            # restic's default host+paths parent match then misses and rescans every file
+            "--group-by",
+            "host",
             "--tag",
             f"lium-operation:{self._operation.operation_id}",
             *(f"--exclude={pattern}" for pattern in self._operation.workspace.exclude_patterns),
