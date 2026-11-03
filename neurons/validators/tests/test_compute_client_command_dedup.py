@@ -245,3 +245,20 @@ async def test_ssh_key_add_answer_echoes_the_request_command_id(client, answer):
     await client.miner_driver(add)
 
     assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["restore:1"]
+
+
+@pytest.mark.asyncio
+async def test_a_create_failure_echoes_the_create_command_id(client):
+    """DAH-5592: the backend fences a creation failure on the create it answers (a late failure of a reboot the
+    backend already gave up on must not fail or exempt the reboot that replaced it)."""
+    client.miner_service.handle_container.return_value = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+        msg="failed",
+    )
+
+    await client.miner_driver(request("create-a"))
+
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["create-a"]
