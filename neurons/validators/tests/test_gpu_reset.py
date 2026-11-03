@@ -591,16 +591,30 @@ def test_the_host_unit_waits_for_an_exporter_whose_stop_failed_before_starting_i
     assert log == ["docker stop -t 10 e1", "docker wait e1", "docker start e1"]
 
 
-def test_the_host_unit_keeps_waiting_for_an_exporter_whose_exit_outlasts_one_wait(tmp_path):
+@pytest.mark.parametrize(
+    "inspect_err, waits_to_exit, expected",
+    [
+        ("", 2, "0 0"),
+        # a transient daemon error is no proof the container is gone: keep waiting for its exit
+        ("Cannot connect to the Docker daemon", 2, "0 0"),
+        # a removed container ends the wait; its failed start is the validator's restoration failure
+        ("Error: No such object: e1", 99, "1 1"),
+    ],
+)
+def test_the_host_unit_keeps_waiting_for_an_exporter_whose_exit_outlasts_one_wait(
+    tmp_path, inspect_err, waits_to_exit, expected
+):
     # the first wait times out with the exit still pending: a start then would be a no-op and nothing restarts it
     script = shlex.split(build_fabric_reset_command([], "true", ["e1"]))[-1]
-    stubs = """
-running=1; pending=0; waits=0; noops=0
+    stubs = f"""
+running=1; pending=0; waits=0; noops=0; inspect_err='{inspect_err}'; exit_at={waits_to_exit}
+""" + """
 docker() {
   case "$1" in
     stop) pending=1; return 1;;
+    inspect) [ -z "$inspect_err" ] || { echo "$inspect_err" >&2; return 1; };;
     wait) waits=$((waits+1))
-          [ "$waits" -gt 1 ] || return 124
+          [ "$waits" -ge "$exit_at" ] || return 124
           running=0; pending=0;;
     start) if [ "$running" = 1 ]; then noops=$((noops+1)); else running=1; fi;;
   esac
@@ -610,9 +624,9 @@ timeout() { shift; "$@"; }
 sleep() { :; }
 trap 'echo "$pending $noops"' EXIT
 """
-    done = subprocess.run(["/bin/sh", "-c", stubs + script], capture_output=True, text=True)
+    done = subprocess.run(["/bin/sh", "-c", stubs + script], capture_output=True, text=True, timeout=30)
     assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
-    assert done.stdout.strip() == "0 0"
+    assert done.stdout.strip() == expected
 
 
 AGENT = "some-gpu-agent.service"

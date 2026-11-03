@@ -472,10 +472,11 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         script += f'for u in {start}; do systemctl start "$u"; done; '
     if containers:
         # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: this unit
-        # owns its start until the exit is seen (a removed container ends the wait; the validator reports it)
+        # owns its start until the exit is seen (only a removed container ends the wait, which the validator
+        # reports; a transient inspect failure keeps waiting)
         script += (
             f'[ -z "$dying" ] || until timeout {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
-            'docker inspect "$dying" >/dev/null 2>&1 || break; sleep 5; done; '
+            '! docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; sleep 5; done; '
         )
         ids = " ".join(shlex.quote(c) for c in reversed(containers))
         script += f'for u in {ids}; do docker start "$u" >/dev/null; done; '
