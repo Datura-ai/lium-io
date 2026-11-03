@@ -4114,7 +4114,7 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
     "workload_kind, answers, outcome",
     [
         (WorkloadKind.CUSTOMER_RENTAL, True, "created"),
-        (WorkloadKind.CUSTOMER_RENTAL, False, "failed at ssh_reachable"),  # F-1679: a reboot said success
+        (WorkloadKind.CUSTOMER_RENTAL, False, "failed at ssh_ready"),  # F-1679: a reboot said success
         (WorkloadKind.FILLER, False, "created, not checked"),
         # an image our bootstrap cannot give sshd: the renter may run it without SSH (never turned away)
         (WorkloadKind.CUSTOMER_RENTAL, False, "created, no sshd, not checked"),
@@ -4153,9 +4153,9 @@ async def test_a_create_succeeds_only_once_the_pods_ssh_port_answers(
         private_key="encrypted",
     )
 
-    if outcome == "failed at ssh_reachable":
+    if outcome == "failed at ssh_ready":
         assert isinstance(result, FailedContainerRequest)
-        assert result.failure_step == "ssh_reachable" and "did not answer" in result.detail
+        assert result.failure_step == "ssh_ready" and "did not answer" in result.detail
     else:
         assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     if "not checked" in outcome:
@@ -4163,6 +4163,44 @@ async def test_a_create_succeeds_only_once_the_pods_ssh_port_answers(
     else:
         pod_ssh_answers_on_create_path.assert_awaited_once()
         assert pod_ssh_answers_on_create_path.await_args.args == ("127.0.0.1", 20001)
+
+
+@pytest.mark.asyncio
+async def test_the_ssh_check_probes_the_port_a_collision_retry_moved_22_to(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """DAH-5618: a port collision on create remaps 22 in place; the check reads the port the pod got."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    real_run = docker_service._run_rental_docker_create_with_port_retry
+
+    async def run_and_remap(**kwargs):
+        container_id = await real_run(**kwargs)
+        kwargs["port_maps"][0] = (22, 20002, 20002)
+        return container_id
+
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_and_remap)
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert pod_ssh_answers_on_create_path.await_args.args == ("127.0.0.1", 20002)
 
 
 @pytest.mark.asyncio

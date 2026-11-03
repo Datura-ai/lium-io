@@ -10281,10 +10281,13 @@ class DockerService:
                     # SSH is expected only when our bootstrap left sshd listening or the template starts its own:
                     # an image our bootstrap cannot give sshd still rents (soft failure), and a filler has no renter
                     ssh_expected = soft_failed_step is None
-                    if ssh_port_map and ssh_expected and payload.workload_kind != WorkloadKind.FILLER:
-                        current_step = "ssh_reachable"
+                    # a port collision may have moved port 22 since ssh_port_map was read: probe the port the pod got
+                    ssh_mapping = self._find_mapping_by_docker_port(port_maps, 22)
+                    if ssh_mapping and ssh_expected and payload.workload_kind != WorkloadKind.FILLER:
+                        # the backend's creation-failure classifier knows this gate as ssh_ready
+                        current_step = "ssh_ready"
                         await _raise_unless_pod_ssh_answers(
-                            executor_info.address, ssh_port_map[2], log_extra=default_extra
+                            executor_info.address, ssh_mapping[2], log_extra=default_extra
                         )
                         current_step = "finalize"
 
