@@ -9,16 +9,16 @@ the answer with the same two functions those checks use on SSH output (`evaluate
 `evaluate_verifyx_capture`). A judged, passing step is left in `ctx.state.local_verify`;
 `CapabilityCheck` and `VerifyXCheck` consume it and skip their SSH run.
 
-Everything else — flag off, capability or port absent, refusal, a tunnel nobody answers, timeout, a
+Everything else — capability or port absent, refusal, a tunnel nobody answers, timeout, a
 mismatched answer, a step that did not run, a step that ran and FAILED the judgement, or a pass
 that arrived later than the SSH
 path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the validator's clock) — leaves
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
-matmul path and a consumed local pass must not skip it), nor when VerifyX runs full size and in
-series with it (`ctx.config.first_pass` off): the round trip then measures both steps
-and is no bound on the matmul alone, see `_matmul_ssh_reason`. Every outcome is one
+matmul path and a consumed local pass must not skip it). Nothing is sent outside the first pass
+(`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's budget and then run again
+over SSH, past `JOB_TIME_OUT`; both steps stay on SSH (`scored_ssh`). Every outcome is one
 `[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
 """
 
@@ -92,19 +92,9 @@ def _matmul_ssh_reason(ctx: Context) -> str | None:
     pinned run per card) lives inside the SSH matmul path only. While that check is on, the matmul
     stays on SSH so a consumed local pass can never skip the probe or its enforcement; phase 2
     carries `devices` in the intent and judges the per-card output here.
-
-    `scored_ssh`: with `ctx.config.first_pass` off (a scored cycle, or any cycle while
-    FIRST_PASS_FAST_PATH_ENABLED is off) VerifyX is full size and the two GPU steps run one after
-    the other (`parallel_gpu` off). The round trip is the only clock the validator holds, and it
-    then holds the whole VerifyX run (80 s p50, 149 s p90 in SWEEP_provider_verify) on top of the
-    matmul, so `ROUND_TRIP_CAP_MS_BY_STEP["matmul"]` (120 s) fails a passing matmul on a large
-    share of hosts and measures it on none. The matmul is not asked for; the executor does not run
-    it twice.
     """
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         return "allcards_ssh"
-    if not ctx.config.first_pass:
-        return "scored_ssh"
     return None
 
 
@@ -146,6 +136,9 @@ class LocalVerifyCheck:
         if get_filler_only_container(ctx):
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
+        if not ctx.config.first_pass:
+            # a full-size VerifyX can time out on /verify and then run again over SSH, past JOB_TIME_OUT
+            return self._fallback(ctx, "call", "scored_ssh", "not the first pass: both steps run over SSH")
         if ctx.config.validator_keypair is None:
             return self._fallback(
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"

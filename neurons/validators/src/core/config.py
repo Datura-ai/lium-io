@@ -368,8 +368,8 @@ class Settings(BaseSettings):
     # channel of the pipeline's SSH session to the executor's loopback port (`/version` names it);
     # the executor refuses any other peer. Any refusal, timeout, mismatch or local failure falls
     # back to the SSH path for that step (logged per outcome, `[local_verify]`).
-    # Whole-call budget for `POST /verify` (seconds). Sized for the first pass; a full-size VerifyX
-    # may take longer and then falls back, so keep this above VERIFYX first-pass p90 (90 s) + matmul.
+    # Whole-call budget for `POST /verify` (seconds). Only the first pass calls it (a full-size VerifyX
+    # stays on SSH), so keep this above VERIFYX first-pass p90 (90 s) + matmul.
     # The executor is told to stop 30 s earlier (`deadline_s` = this − 30, min 5) so a cut answer
     # with finished steps inside still arrives inside the budget.
     LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)
