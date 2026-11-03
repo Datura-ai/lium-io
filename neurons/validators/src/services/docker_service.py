@@ -8131,7 +8131,8 @@ class DockerService:
         firewall helpers by name, then the DinD itself. The pause goes first:
         a build still running in the DinD (one a connector restart cut off)
         would otherwise run unfiltered once its rules are gone; a paused
-        container keeps its IP. The helpers go before the DinD because removing the DinD
+        container keeps its IP. A DinD that is still not paused after it
+        (`{{.State.Paused}}`) is killed instead. The helpers go before the DinD because removing the DinD
         releases its IP: an apply or remove helper that outlived its bound is
         still editing rules for that IP, and the next build to get the IP
         would inherit them.
@@ -8142,9 +8143,13 @@ class DockerService:
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
         try:
-            # fails harmlessly on a DinD that is gone, stopped or already paused
+            # A DinD the pause did not freeze is killed, so no build runs once the
+            # rules go; harmless on a DinD that is gone, stopped or already paused.
+            dind_q = shlex.quote(dind_name)
             await ssh_client.run(
-                f"/usr/bin/docker pause {shlex.quote(dind_name)} 2>/dev/null || true",
+                f"/usr/bin/docker pause {dind_q} 2>/dev/null; "
+                f"[ \"$(/usr/bin/docker inspect -f '{{{{.State.Paused}}}}' {dind_q} 2>/dev/null)\" = true ] "
+                f"|| /usr/bin/docker kill {dind_q} >/dev/null 2>&1 || true",
                 check=False,
                 timeout=setup_timeout_s,
             )

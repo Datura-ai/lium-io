@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import subprocess
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -563,6 +564,28 @@ async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_r
     _, remove_helper = svc._dind_firewall_helper_names("dind_x")
     assert paused < first(lambda c: f"--name {remove_helper} " in c)
     assert paused < first(lambda c: c.startswith("/usr/bin/docker rm -fv dind_x "))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paused, killed", [("true", False), ("false", True), ("", True)])
+async def test_A27c_a_build_container_the_pause_did_not_freeze_is_killed_before_its_rules_go(
+    svc, tmp_path, paused, killed
+):
+    """DAH-5437: the pause command, run by a shell against a fake docker, kills a DinD it left running."""
+    ssh_client = _make_dind_ssh()
+    await svc._teardown_dind_build(
+        ssh_client=ssh_client, dind_name="dind_x", dind_image="img", dind_ip=None, cidrs=[], default_extra={}
+    )
+    cmd = next(c for c in ssh_client.calls if c.startswith("/usr/bin/docker pause dind_x "))
+    log = tmp_path / "log"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f'#!/bin/sh\necho "$@" >> {log}\n[ "$1" = pause ] && exit 1\n[ "$1" = inspect ] && printf {paused}\nexit 0\n'
+    )
+    docker.chmod(0o755)
+    res = subprocess.run(["sh", "-c", cmd.replace("/usr/bin/docker", str(docker))], capture_output=True)
+    assert res.returncode == 0
+    assert ("kill dind_x" in log.read_text()) is killed
 
 
 @pytest.mark.asyncio
