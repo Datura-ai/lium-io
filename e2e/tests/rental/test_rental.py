@@ -189,14 +189,17 @@ def test_a_re_sent_create_replaces_its_own_leftover_container(services):
     rc, out = lib.executor_sh(f"docker run -d --name {name} --entrypoint sleep {lib.ENV['E2E_POD_IMAGE']} infinity")
     assert rc == 0, out
     leftover_id = out.strip()
-    created = _create_ok(services, pod_id, renter_pub)
     try:
-        assert created.container_name == name, created
-        now = _container_id(name)
-        assert now and now != leftover_id, "the leftover container is still the pod"
-        _renter_can_ssh(created, renter_priv)
+        created = _create_ok(services, pod_id, renter_pub)
+        try:
+            assert created.container_name == name, created
+            replacement_container_id = _container_id(name)
+            assert replacement_container_id and replacement_container_id != leftover_id, "the leftover container is still the pod"
+            _renter_can_ssh(created, renter_priv)
+        finally:
+            _release_and_delete(services, pod_id, created)
     finally:
-        _release_and_delete(services, pod_id, created)
+        lib.executor_sh(f"docker rm -f {name} >/dev/null 2>&1; true")
 
 
 def test_a_customer_create_on_a_node_running_a_filler_removes_the_filler(services):

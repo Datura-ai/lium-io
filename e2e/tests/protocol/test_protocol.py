@@ -57,6 +57,7 @@ def _submit(headers: dict, body: dict | None = None):
         "message_type": "SSHPubKeySubmitRequest",
         "public_key": pub,
         "validator_signature": lib.sign(vk, pub),
+        "validator_miner_signature": lib.sign(vk, lib.ssh_pubkey_signing_blob(pub, None, lib.MINER_HOTKEY)),
         "miner_hotkey": lib.MINER_HOTKEY,
     }
     return lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-submit", json=body, headers=headers, timeout=60), priv, pub
@@ -175,11 +176,11 @@ def test_executor_refuses_a_substituted_public_key():
 # --------------------------------------------------- executor: key bound to a miner, dated nonce ------------------------
 
 
-def _upload(body: dict):
+def _upload_ssh_key_to_executor(body: dict):
     return lib.http("POST", f"{lib.EXECUTOR_URL}/upload_ssh_key", json=body)
 
 
-def _remove(body: dict) -> None:
+def _remove_ssh_key_from_executor(body: dict) -> None:
     lib.http("POST", f"{lib.EXECUTOR_URL}/remove_ssh_key", json=body)
 
 
@@ -188,26 +189,26 @@ def test_executor_accepts_a_key_bound_to_the_pool_hotkey():
     like one bound to the executor's own miner (lium-io#1923)."""
     priv, pub = lib.ssh_keypair()
     body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, bound_to=lib.POOL_HOTKEY)
-    r = _upload(body)
+    r = _upload_ssh_key_to_executor(body)
     assert r.status_code == 200, r.text
     try:
         rc, _ = lib.run(lib.ssh_run(lib.EXECUTOR_IP, r.json()["ssh_port"], r.json()["ssh_username"], priv, "true"))
         assert rc == 0
     finally:
-        _remove(body)
+        _remove_ssh_key_from_executor(body)
 
 
 def test_executor_refuses_a_key_bound_to_another_miner_403():
     _, pub = lib.ssh_keypair()
     body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, bound_to=lib.stranger_keypair().ss58_address)
-    r = _upload(body)
+    r = _upload_ssh_key_to_executor(body)
     assert r.status_code == 403, r.text
 
 
 def test_executor_refuses_a_key_without_a_miner_binding_403():
     """The stack's executor enforces the binding (REQUIRE_MINER_BOUND_SSH_KEY): a legacy upload without one is refused."""
     _, pub = lib.ssh_keypair()
-    r = _upload(lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, bound_to=None))
+    r = _upload_ssh_key_to_executor(lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, bound_to=None))
     assert r.status_code == 403, r.text
 
 
@@ -215,7 +216,7 @@ def test_executor_refuses_a_binding_signed_by_a_stranger_403():
     _, pub = lib.ssh_keypair()
     body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub)
     body["validator_miner_signature"] = lib.sign(lib.stranger_keypair(), lib.ssh_pubkey_signing_blob(pub, None, lib.MINER_HOTKEY))
-    r = _upload(body)
+    r = _upload_ssh_key_to_executor(body)
     assert r.status_code == 403, r.text
 
 
@@ -233,19 +234,19 @@ def test_executor_accepts_a_fresh_dated_nonce():
 
     priv, pub = lib.ssh_keypair()
     body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, nonce=fresh_upload_nonce())
-    r = _upload(body)
+    r = _upload_ssh_key_to_executor(body)
     assert r.status_code == 200, r.text
     try:
         rc, _ = lib.run(lib.ssh_run(lib.EXECUTOR_IP, r.json()["ssh_port"], r.json()["ssh_username"], priv, "true"))
         assert rc == 0
     finally:
-        _remove(body)
+        _remove_ssh_key_from_executor(body)
 
 
 def test_executor_refuses_a_stale_nonce_401():
     """A captured upload is worth at most UPLOAD_NONCE_MAX_AGE_SECONDS (600 s): one minted an hour ago is refused."""
     _, pub = lib.ssh_keypair()
-    r = _upload(lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, nonce=_dated_nonce(int(time.time()) - 3600)))
+    r = _upload_ssh_key_to_executor(lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, nonce=_dated_nonce(int(time.time()) - 3600)))
     assert r.status_code == 401 and "nonce" in r.text.lower(), r.text
 
 
@@ -256,7 +257,7 @@ def test_executor_refuses_a_stripped_or_swapped_nonce_401():
     _, pub = lib.ssh_keypair()
     signed = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, nonce=fresh_upload_nonce())
     stripped = {k: v for k, v in signed.items() if k != "nonce"}
-    r = _upload(stripped)
+    r = _upload_ssh_key_to_executor(stripped)
     assert r.status_code == 401, r.text
-    r = _upload({**signed, "nonce": fresh_upload_nonce()})
+    r = _upload_ssh_key_to_executor({**signed, "nonce": fresh_upload_nonce()})
     assert r.status_code == 401, r.text
