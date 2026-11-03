@@ -7734,6 +7734,31 @@ class DockerService:
             await self.stream_log(
                 f"Starting isolated build container {dind_name}", "success", log_tag
             )
+            if inflight_creates.is_only_create(pod_id):
+                # DAH-5437: a create resumed after a connector restart meets the build container its cut-off
+                # attempt left under this pod's name; no other create of this pod runs, so it is ours to replace.
+                # The full teardown, so the egress rules of the old DinD's IP go with it.
+                old_ip: str | None = None
+                try:
+                    ip_res = await ssh_client.run(
+                        "/usr/bin/docker inspect -f "
+                        "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
+                        f"{shlex.quote(dind_name)}",
+                        check=False,
+                        timeout=setup_timeout_s,
+                    )
+                    if ip_res.exit_status == 0:
+                        old_ip = str(ipaddress.ip_address((ip_res.stdout or "").strip()))
+                except (asyncio.TimeoutError, ValueError):
+                    pass
+                await self._teardown_dind_build(
+                    ssh_client=ssh_client,
+                    dind_name=dind_name,
+                    dind_image=dind_image,
+                    dind_ip=old_ip,
+                    cidrs=cidrs,
+                    default_extra=default_extra,
+                )
             # `timeout(1)` on the executor kills the `docker run` (and so the
             # image pull) when it outlives the bound: asyncssh's own `timeout=`
             # only stops waiting, the remote command would run on. The
@@ -8116,9 +8141,13 @@ class DockerService:
         The DNS ACCEPTs go by their tag and the DinD IP (`_egress_filter_script`),
         so the teardown never needs to know which resolvers the apply saw.
 
-        Order: the remove helper (bounded on the executor, exit 124 logged as a
-        failure), then `docker rm -f` of both firewall helpers by name, then
-        the DinD itself. The helpers go first because removing the DinD
+        Order: `docker pause` of the DinD, the remove helper (bounded on the
+        executor, exit 124 logged as a failure), then `docker rm -f` of both
+        firewall helpers by name, then the DinD itself. The pause goes first:
+        a build still running in the DinD (one a connector restart cut off)
+        would otherwise run unfiltered once its rules are gone; a paused
+        container keeps its IP. A DinD that is still not paused after it
+        (`{{.State.Paused}}`) is killed instead. The helpers go before the DinD because removing the DinD
         releases its IP: an apply or remove helper that outlived its bound is
         still editing rules for that IP, and the next build to get the IP
         would inherit them.
@@ -8128,6 +8157,26 @@ class DockerService:
         """
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
+        try:
+            # A DinD the pause did not freeze is killed, so no build runs once the
+            # rules go; harmless on a DinD that is gone, stopped or already paused.
+            dind_q = shlex.quote(dind_name)
+            await ssh_client.run(
+                f"/usr/bin/docker pause {dind_q} 2>/dev/null; "
+                f"[ \"$(/usr/bin/docker inspect -f '{{{{.State.Paused}}}}' {dind_q} 2>/dev/null)\" = true ] "
+                f"|| /usr/bin/docker kill {dind_q} >/dev/null 2>&1 || true",
+                check=False,
+                timeout=setup_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                _m(
+                    "Custom build DinD pause before teardown failed (non-fatal)",
+                    extra=get_extra_info(
+                        {**default_extra, "error": str(exc), "dind_name": dind_name}
+                    ),
+                )
+            )
         if dind_ip:
             try:
                 remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
