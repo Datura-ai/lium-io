@@ -259,6 +259,7 @@ def make_probe_context(
     images=(IMAGE,),
     rented_now=None,
     first_pass: bool = False,
+    port_check_deferred: bool = False,
 ):
     docker = docker or FakeDocker()
     redis = redis or FakeRedis()
@@ -289,6 +290,7 @@ def make_probe_context(
         sysbox_runtime=True,
         verified_port_pairs=list(port_pairs),
         rented_data=rented if rented is not None else rented_data(),
+        port_check_deferred=port_check_deferred,
     )
     ctx = make_context(
         services=services,
@@ -551,6 +553,10 @@ async def test_a_failed_probe_clears_an_earlier_pass_stamp_and_records_the_faile
         (
             lambda redis: make_probe_context(redis=redis, image_present=False),
             "skipped: default renter image is not pulled on the node",
+        ),
+        (
+            lambda redis: make_probe_context(redis=redis, port_check_deferred=True),
+            "skipped: port check deferred for disk pressure",
         ),
         (
             lambda redis: make_probe_context(redis=redis, rented_now=[None]),
@@ -1712,6 +1718,21 @@ async def test_a_filler_node_is_probed_beside_its_filler():
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
     assert docker.create_options == [{"beside_fillers": True}]
     assert redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_whose_port_check_was_deferred_for_disk_pressure_rents_nothing():
+    """Regression (DAH-5244 review): the port check kept its memory instead of a container on a Docker root
+    whose sync stalls, and the probe then started one on the same root: its create waited in that sync and
+    failed the filler node at container_start."""
+    fillers = rented_data(fillers=1)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers, port_check_deferred=True)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+    assert result.event.what_we_saw["reason"] == "port check deferred for disk pressure"
+    assert docker.create_calls == [] and not redis.stamped()
 
 
 @pytest.mark.asyncio

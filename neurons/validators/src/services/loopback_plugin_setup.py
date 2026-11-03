@@ -1,9 +1,50 @@
-"""Prepare v2 without triggering old dockerd's digest-download panic."""
+"""Prepare the pinned loopback plugin without triggering old dockerd's digest-download panic."""
 
 import shlex
+from typing import NamedTuple
 
-LOOPBACK_PLUGIN_TAG = "daturaai/docker-volume-loopback:1.0.0-lium1"
-LOOPBACK_PLUGIN_DIGEST = "sha256:99eacc306478ae5d03188474d07973078b66109077caa49618c57da211a71309"
+from core.config import settings
+from core.docker_utils import ALPINE_HELPER_IMAGE
+from services.const import LOOPBACK_PLUGIN_ALIAS, LOOPBACK_PLUGIN_V3_ALIAS
+
+
+class LoopbackPluginBuild(NamedTuple):
+    tag: str
+    digest: str
+    # names the plugin's DATA_DIR / STATE_DIR / lock on the host, so two generations never share a directory
+    generation: str
+
+
+LOOPBACK_PLUGIN_BUILDS = {
+    LOOPBACK_PLUGIN_ALIAS: LoopbackPluginBuild(
+        "daturaai/docker-volume-loopback:1.0.0-lium1",
+        "sha256:99eacc306478ae5d03188474d07973078b66109077caa49618c57da211a71309",
+        "v2",
+    ),
+    # DAH-5101: losetup --direct-io=on --sector-size 4096 --nooverlap, data files in whole sectors
+    LOOPBACK_PLUGIN_V3_ALIAS: LoopbackPluginBuild(
+        "daturaai/docker-volume-loopback:1.0.0-lium10",
+        "sha256:8a780afe833dee55f60da5a5380dfcbc19c26a51688e7d7cd5353c0c8657897e",
+        "v3",
+    ),
+}
+
+
+def current_loopback_plugin_alias() -> str:
+    return LOOPBACK_PLUGIN_V3_ALIAS if settings.LOOPBACK_PLUGIN_V3_ENABLED else LOOPBACK_PLUGIN_ALIAS
+
+
+def loopback_plugin_probe_marker_path(alias: str) -> str | None:
+    # the setup script writes it once a probe volume mounted on this plugin; an enabled plugin
+    # without it is not handed out (the probe may have been cut short, or the plugin enabled by
+    # hand). None for v2 and the legacy plugin, which run no probe. Lives beside the lock, so an
+    # executor restart costs one probe. The path is read by the backend's health check too, so it
+    # stays fixed; the file holds the pinned digest and the plugin's ID and settings, so a newly
+    # pinned build, a reinstalled plugin or one moved to another data directory is probed again.
+    if alias != LOOPBACK_PLUGIN_V3_ALIAS:
+        return None
+    return f"/run/lock/lium-loopback-{LOOPBACK_PLUGIN_BUILDS[alias].generation}.probe-ok"
+
 
 # Executed by the executor's Python, not the validator's filesystem. Docker's plugin metadata
 # is on the host; the privileged executor has host PID access and can read it via /proc/1/root.
@@ -12,16 +53,160 @@ _SETUP_SCRIPT = r'''
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 
-docker, alias, tag, digest, root, host_root, lock_path = sys.argv[1:]
-data_dir = "/srv" + root + "/vloopback-v2"
-state_dir = "/srv/run/docker-volume-loopback-v2"
+(docker, alias, tag, digest, generation, probe_image, deadline_seconds, root, host_root, lock_path,
+ marker_path) = sys.argv[1:]
+validator_deadline = time.monotonic() + float(deadline_seconds)
+PROBE_SECONDS = 60
+CLEANUP_SECONDS = 10
+DISABLE_TRY_SECONDS = 10
+DISABLE_TRIES = 3
+# the shell and Python start before the clock above, so the validator's `timeout` may fire this much
+# sooner; it also covers the 1 s timeout floors
+START_SECONDS = 5
+# the probe ends this long before the validator's deadline, however long the lock, install and enable
+# took: the removals before and after it, every disable try with its pause, and START_SECONDS
+PROBE_RESERVE_SECONDS = 4 * CLEANUP_SECONDS + DISABLE_TRIES * (DISABLE_TRY_SECONDS + 1) + START_SECONDS
+TOO_LITTLE_TIME_TO_PROBE = "too little of the validator's deadline left to probe"
+# the validator's state check prints the same: the ID changes with every install, DATA_DIR with `plugin set`
+INSTALLATION_FORMAT = "{{.Id}} {{json .Settings.Env}}"
+
+def end_on_validator_deadline(*_):
+    # the validator ends this script with `timeout -k 5`: the reason goes out before the cleanup
+    # below runs, so its SIGKILL cannot leave stderr empty
+    print("setup cut short by the validator's deadline", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+signal.signal(signal.SIGTERM, end_on_validator_deadline)
+data_dir = "/srv" + root + "/vloopback-" + generation
+state_dir = "/srv/run/docker-volume-loopback-" + generation
 plugins_dir = host_root + root + "/plugins"
 
+def seconds_before_probe_reserve():
+    return validator_deadline - PROBE_RESERVE_SECONDS - time.monotonic()
+
+def run_docker(*args, timeout=None):
+    if timeout is None and probe_image:
+        # a probed setup's calls before the probe end where its reserve begins: however long the lock
+        # and they took, a failed probe still has the time to clean up and disable the plugin
+        try:
+            return subprocess.run([docker, *args], capture_output=True, text=True, check=False,
+                                  timeout=max(1, seconds_before_probe_reserve()))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE) from None
+    return subprocess.run([docker, *args], capture_output=True, text=True, check=False,
+                          timeout=120 if timeout is None else timeout)
+
 def call(*args):
-    return subprocess.run([docker, "plugin", *args], capture_output=True, text=True, check=False)
+    return run_docker("plugin", *args)
+
+def read_probe_marker():
+    try:
+        with open(marker_path) as marker:
+            return marker.read().strip()
+    except (OSError, UnicodeError):
+        # a marker the host cannot even decode is as stale as one of another build: drop it
+        return ""
+
+def remove_probe_marker():
+    if os.path.exists(marker_path):
+        os.remove(marker_path)
+
+# one volume and one container per generation: the lock serialises setups, so a stable name lets
+# the next setup reclaim what a killed one left (a `created` container never exits, `--rm` or not)
+probe_volume = "lium-loopback-probe-" + generation
+probe_container = probe_volume
+
+def remove_probe_leftovers():
+    # the container first: a `docker run` cut off by its timeout leaves it running with the volume
+    # attached. Returns what stayed behind
+    leftovers = []
+    removed = run_docker("rm", "-f", probe_container, timeout=CLEANUP_SECONDS)
+    if removed.returncode and "no such container" not in removed.stderr.lower():
+        leftovers.append("container " + probe_container)
+    if run_docker("volume", "rm", "-f", probe_volume, timeout=CLEANUP_SECONDS).returncode:
+        leftovers.append("volume " + probe_volume)
+    return leftovers
+
+def mount_probe_volume():
+    # install and enable mount nothing, and a host may refuse what the plugin asks of its loop
+    # device (direct I/O, 4096-byte sectors): one probe volume is mounted before the plugin is
+    # handed out, else it stays installed but disabled and the older plugin keeps renting.
+    # 1g: the plugin's mkfs.xfs refuses anything under 300 MB; sparse, so a host with little
+    # free disk is not refused by the reservation instead of by its loop device
+    deadline = min(time.monotonic() + PROBE_SECONDS, validator_deadline - PROBE_RESERVE_SECONDS)
+    if deadline <= time.monotonic():
+        raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE)
+    leftovers = remove_probe_leftovers()
+    if leftovers:
+        raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
+    try:
+        created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", probe_volume,
+                             timeout=max(1, deadline - time.monotonic()))
+        if created.returncode:
+            raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
+        mounted = run_docker("run", "--rm", "--name", probe_container, "--network", "none",
+                             "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync /mnt/probe",
+                             timeout=max(1, deadline - time.monotonic()))
+        if mounted.returncode:
+            raise RuntimeError("probe volume mount failed: " + mounted.stderr.strip()[-300:])
+    except BaseException:
+        remove_probe_leftovers()
+        raise
+    leftovers = remove_probe_leftovers()
+    if leftovers:
+        # a volume still in use means the mount did not end cleanly: not a proof
+        raise RuntimeError("probe cleanup left " + ", ".join(leftovers))
+
+def disable_plugin(plugin_id):
+    # the backend's health check may hold a volume on the plugin for a moment: retry. Short tries that
+    # stop before the validator's deadline, so a hung daemon still leaves this reason on stderr even
+    # when the lock wait ate the probe's reserve
+    for _ in range(DISABLE_TRIES):
+        try_seconds = min(DISABLE_TRY_SECONDS, validator_deadline - START_SECONDS - time.monotonic())
+        if try_seconds < 1:
+            break
+        try:
+            if run_docker("plugin", "disable", plugin_id, timeout=try_seconds).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(1)
+    raise RuntimeError("the plugin could not be disabled")
+
+def read_saved_config(plugin_id):
+    if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
+        raise RuntimeError("invalid plugin ID")
+    with open(plugins_dir + "/" + plugin_id + "/config.json") as source:
+        return json.load(source)
+
+def remove_plugin_of_another_build(plugin):
+    # Docker refuses to disable or remove a plugin its volumes still use; the listing only makes
+    # that refusal readable. A probe a killed setup left on that build is reclaimed first: its
+    # cleanup otherwise runs only after this replacement, and the host would never move on
+    leftovers = remove_probe_leftovers()
+    if leftovers:
+        raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
+    listed = run_docker("volume", "ls", "--format", "{{.Driver}}")
+    if listed.returncode:
+        raise RuntimeError("cannot list the volumes of an earlier build")
+    if alias in listed.stdout.split():
+        raise RuntimeError("an earlier build of the plugin still owns volumes")
+    if plugin["Enabled"]:
+        disable_plugin(plugin["Id"])
+    if call("rm", plugin["Id"]).returncode:
+        raise RuntimeError("the earlier build of the plugin could not be removed")
+
+def probe_proof():
+    # what a passed probe proved: this build, this installation of it, mounting in this data directory
+    result = call("inspect", "--format", INSTALLATION_FORMAT, alias)
+    if result.returncode:
+        raise RuntimeError("plugin inspect failed")
+    return digest + " " + result.stdout.strip()
 
 def inspect():
     result = call("inspect", alias)
@@ -40,7 +225,20 @@ try:
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # the backend's health check compares the marker with the plugin's ID and settings but not with
+        # the pinned digest, which it does not know: a marker of another build goes before anything
+        # below can fail, so both sides see the same fallback, and one of another installation (the
+        # plugin absent, removed and installed again, or set to another data directory) once inspect shows it
+        if probe_image and read_probe_marker().split(" ")[0] != digest:
+            remove_probe_marker()
         plugin = inspect()
+        if probe_image and os.path.exists(marker_path) and (plugin is None or read_probe_marker() != probe_proof()):
+            os.remove(marker_path)
+        if plugin is not None and probe_image and read_saved_config(plugin["Id"]).get("Manifest") != digest:
+            # an earlier pinned build under this alias (lium7 once lium8 is pinned) is replaced once
+            # no volume uses it, else every setup refuses its manifest and the host never moves on
+            remove_plugin_of_another_build(plugin)
+            plugin = None
         if plugin is None:
             # The daemon may complete an install even if its client reports failure. Inspect
             # the actual result under the lock before deciding whether setup succeeded.
@@ -48,38 +246,57 @@ try:
                  "DATA_DIR=" + data_dir, "STATE_DIR=" + state_dir)
             plugin = inspect()
         if plugin is None:
-            raise RuntimeError("v2 installation did not produce a plugin")
+            raise RuntimeError("installation did not produce a plugin")
         plugin_id = plugin["Id"]
-        if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
-            raise RuntimeError("invalid plugin ID")
-        with open(plugins_dir + "/" + plugin_id + "/config.json") as source:
-            saved = json.load(source)
+        saved = read_saved_config(plugin_id)
         if saved.get("Manifest") != digest or saved.get("plugin", {}).get("Id") != plugin_id:
-            raise RuntimeError("v2 downloaded manifest does not match the pinned digest")
+            raise RuntimeError("downloaded manifest does not match the pinned digest")
         env = plugin.get("Settings", {}).get("Env", [])
         for name, value in (("DATA_DIR", data_dir), ("STATE_DIR", state_dir)):
             if [entry for entry in env if entry.startswith(name + "=")] != [name + "=" + value]:
-                raise RuntimeError("v2 data/state directories do not match this Docker data root")
+                raise RuntimeError("data/state directories do not match this Docker data root")
         if not plugin["Enabled"]:
+            if probe_image and seconds_before_probe_reserve() <= 0:
+                # enabled now, the plugin would have no time left to be probed or disabled again
+                raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE)
             call("enable", plugin_id)
             plugin = inspect()
         if not plugin or plugin["Id"] != plugin_id or plugin["Enabled"] is not True:
-            raise RuntimeError("verified v2 plugin remains disabled")
-        print("verified v2 ready")
+            raise RuntimeError("verified plugin remains disabled")
+        verified_probe_proof = probe_proof() if probe_image else None
+        if verified_probe_proof is not None and read_probe_marker() != verified_probe_proof:
+            # also for a plugin found enabled: an enabled plugin without the marker was never proven
+            # to mount (a probe cut short by the validator's deadline, one enabled by hand)
+            try:
+                mount_probe_volume()
+            except BaseException as error:
+                reason = str(error) if isinstance(error, RuntimeError) else "probe volume failed: " + type(error).__name__
+                try:
+                    disable_plugin(plugin_id)
+                except RuntimeError as disable_error:
+                    reason += "; " + str(disable_error)
+                raise RuntimeError(reason) from None
+            with open(marker_path, "w") as marker:
+                marker.write(verified_probe_proof)
+        print("verified plugin ready")
 except Exception as error:
     # Do not echo a remote banner, registry credentials, or arbitrary filesystem contents.
     if isinstance(error, RuntimeError):
         print(str(error), file=sys.stderr)
     else:
-        print("v2 verification failed: " + type(error).__name__, file=sys.stderr)
+        print("plugin verification failed: " + type(error).__name__, file=sys.stderr)
     sys.exit(1)
 '''
 
 
-def loopback_plugin_setup_command(docker_root_dir: str, alias: str) -> str:
+def loopback_plugin_setup_command(docker_root_dir: str, alias: str, deadline_seconds: int) -> str:
+    tag, digest, generation = LOOPBACK_PLUGIN_BUILDS[alias]
+    # v2 is set up exactly as before; only the direct-I/O generation mounts a probe volume
+    probe_image = "" if alias == LOOPBACK_PLUGIN_ALIAS else ALPINE_HELPER_IMAGE
     arguments = (
         "python3", "-c", _SETUP_SCRIPT, "/usr/bin/docker", alias,
-        LOOPBACK_PLUGIN_TAG, LOOPBACK_PLUGIN_DIGEST, docker_root_dir.rstrip("/"),
-        "/proc/1/root", "/run/lock/lium-loopback-v2.lock",
+        tag, digest, generation, probe_image, str(deadline_seconds), docker_root_dir.rstrip("/"),
+        "/proc/1/root", f"/run/lock/lium-loopback-{generation}.lock",
+        loopback_plugin_probe_marker_path(alias) or "",
     )
     return shlex.join(arguments)
