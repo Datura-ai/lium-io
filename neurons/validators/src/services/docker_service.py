@@ -8732,7 +8732,9 @@ class DockerService:
 
             # add executor in pending status dict
             current_step = "pending_pod"
-            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            await self.redis_service.add_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
+            )
 
             current_step = "ssh_key_import"
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -10396,6 +10398,7 @@ class DockerService:
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
+                    command_id=payload.command_id,
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.

@@ -710,6 +710,8 @@ class ContainerCreated(ContainerBaseResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # protocol 2.6.0: the ContainerCreateRequest's command_id, so the backend can tell which dispatch this completes
+    command_id: str = ""
 
 
 class ContainerStarted(ContainerBaseResponse):

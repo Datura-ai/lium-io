@@ -1077,6 +1077,11 @@
           "default": null,
           "title": "Backup Log Id"
         },
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "container_name": {
           "title": "Container Name",
           "type": "string"
@@ -6558,7 +6563,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.5.0",
+  "protocol_version": "2.6.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
