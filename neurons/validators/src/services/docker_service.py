@@ -199,6 +199,8 @@ from services.storage_operations import (
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
+from services.task.checks.rented_pod_ssh import tcp_connect_fault
+from protocol.vc_protocol.validator_requests import PodSshResult
 from tenacity import RetryError
 
 from core.config import settings
@@ -1281,6 +1283,29 @@ async def _raise_if_killed_after_exec(
 
 FINAL_STATE_INSPECT_ATTEMPTS = 3
 FINAL_STATE_INSPECT_RETRY_DELAY_S = 1.0
+# DAH-5618: how long a new or rebooted pod gets to answer on its mapped SSH port before the create fails
+POD_SSH_ANSWER_DEADLINE_S = 60.0
+POD_SSH_ANSWER_ATTEMPT_TIMEOUT_S = 5.0
+POD_SSH_ANSWER_RETRY_DELAY_S = 3.0
+
+
+async def _raise_unless_pod_ssh_answers(host: str, port: int) -> None:
+    """DAH-5618: the renter's SSH reaches the pod at host:port, so the create succeeds only once that port sends an
+    SSH identification line (the per-cycle pod SSH probe's check). A host that drops SSH sessions or does not
+    forward the port fails the create, and a reboot then ends REBOOT_FAILED instead of RUNNING. Retried for a
+    while, since an image that starts its own sshd may not be listening yet."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + POD_SSH_ANSWER_DEADLINE_S
+    while True:
+        outcome = await tcp_connect_fault(host, port, POD_SSH_ANSWER_ATTEMPT_TIMEOUT_S)
+        if outcome.result == PodSshResult.BANNER:
+            return
+        if loop.time() + POD_SSH_ANSWER_RETRY_DELAY_S >= deadline:
+            raise RuntimeError(
+                f"the pod's SSH port {port} did not answer on {host} ({outcome.result.value}); "
+                "the host may be dropping SSH connections or not forwarding the port"
+            )
+        await asyncio.sleep(POD_SSH_ANSWER_RETRY_DELAY_S)
 
 
 async def _raise_unless_running_before_created(
@@ -10235,6 +10260,11 @@ class DockerService:
                     await _raise_unless_running_before_created(
                         docker_client, container_name=container_name, container_id=container_id
                     )
+                    # a soft-failed sshd bootstrap keeps its own step; a filler has no renter to reach it
+                    if ssh_port_map and soft_failed_step is None and payload.workload_kind != WorkloadKind.FILLER:
+                        current_step = "ssh_reachable"
+                        await _raise_unless_pod_ssh_answers(executor_info.address, ssh_port_map[2])
+                        current_step = "finalize"
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.
