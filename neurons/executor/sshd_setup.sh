@@ -19,7 +19,10 @@
 # locked out; after a silent hour the backend fires EXECUTOR_INACTIVE_MID_RENTAL
 # (DAH-3236, ticket-0287, ticket-0302). Such hosts turn both per-source limits off:
 # `start` puts the off drop-in in place when EXECUTOR_SSH_SOURCE_LIMITS=false or the executor
-# runs in a CVM (the dstack socket is there; QEMU slirp shows sshd 10.0.2.2 for everyone).
+# runs in a CVM (the dstack socket is there; QEMU slirp shows sshd 10.0.2.2 for everyone), and
+# sshd_log_receiver.py puts it in place (and reloads sshd) on the first login from a private
+# address, which is what such a host shows for every client. Until then private ranges and the
+# validator's own addresses are on PerSourcePenaltyExemptList, so they are never penalised.
 #
 # The directive is unknown to OpenSSH < 9.8, where sshd refuses to start on it, so it is
 # written only when this sshd accepts it. It goes into a drop-in that sshd_config's
@@ -91,7 +94,29 @@ expect() { # expect <sshd -T line>...: each line must be in the rendered config
     done
 }
 if [ "$supported" = yes ]; then
-    printf 'PerSourceMaxStartups 10\nPerSourcePenalties yes\n' >>"$DROP_IN"
+    # never penalised: the validator's own addresses (a slow or early login must not lock it out) and the
+    # private, CGNAT and loopback ranges a NAT, Docker gateway or tunnel shows for every client
+    exempt="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,127.0.0.0/8,::1/128,fc00::/7"
+    sources="$(python3 - "$(dirname "$0")/src/core" <<'PY'
+import ast, pathlib, sys
+
+core = pathlib.Path(sys.argv[1])  # same choice as core.config._resolve_validator_ssh_sources
+
+
+def literal(path, name):
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
+            return ast.literal_eval(node.value)
+
+
+override = core / "config_override.py"
+if override.exists():
+    print(literal(override, "_VALIDATOR_SSH_SOURCES") or "")
+else:
+    print(literal(core / "config.py", "_BUILTIN_VALIDATOR_SSH_SOURCES") or "")
+PY
+)"
+    printf 'PerSourceMaxStartups 10\nPerSourcePenalties yes\nPerSourcePenaltyExemptList %s\n' "$exempt${sources:+,$sources}" >>"$DROP_IN"
     expect 'persourcemaxstartups 10'
     if sshd_test | grep -qx 'persourcepenalties no'; then
         echo "sshd_setup: PerSourcePenalties yes from $DROP_IN is not in effect" >&2

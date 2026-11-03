@@ -82,6 +82,9 @@ def test_modern_sshd_gets_per_source_limits_and_short_grace(tmp_path):
     for line in ["LogLevel VERBOSE", "LoginGraceTime 20", "MaxStartups 60:30:200",
                  "PerSourceMaxStartups 10", "PerSourcePenalties yes"]:
         assert line in lines
+    # private ranges and the image's validator SSH sources are never penalised
+    exempt = next(x for x in lines if x.startswith("PerSourcePenaltyExemptList ")).split()[1].split(",")
+    assert {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "54.163.250.18", "13.223.237.157"} <= set(exempt)
     # the build proved the off drop-in wins over lium.conf, then took it out again
     assert "PerSourcePenalties no" in (tmp_path / "lium-source-limits-off.conf").read_text()
     assert not (tmp_path / "sshd_config.d" / "00-lium-source-limits-off.conf").exists()
