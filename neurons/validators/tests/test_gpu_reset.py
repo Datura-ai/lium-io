@@ -84,6 +84,7 @@ class FakeHost:
         self.reset_hangs = False
         self.reset_unit_stuck = False
         self.reset_unit_state, self.reset_unit_procs = "inactive", 0
+        self.hung_units: list[str] = []
         self.active_during_cure: dict[str, bool] | None = None
         self.fm_log: list[tuple[str, str]] = []
 
@@ -122,6 +123,7 @@ class FakeHost:
             self.active_during_reset = dict(self.active)
             if self.reset_hangs:
                 # the SSH timeout fires while the host unit still holds the fabric down
+                self.hung_units = units
                 return make_command_result(False, stderr="timed out", exit_code=-1)
             for unit in reversed(units):
                 self.active[unit] = unit != "nvidia-fabricmanager" or self.fm_start_ok
@@ -137,6 +139,12 @@ class FakeHost:
             verb, unit = cmd.split()[-2:]
             self.fm_log.append((verb, unit))
             if unit == gpu_reset.FABRIC_RESET_UNIT:
+                if self.hung_units and not self.reset_unit_stuck and self.reset_unit_procs == 0:
+                    # the unit finished late: its own loop started the fabric again before it was gone
+                    for u in reversed(self.hung_units):
+                        self.active[u] = u != "nvidia-fabricmanager" or self.fm_start_ok
+                        self.fm_log.append(("unit start", u))
+                    self.hung_units = []
                 if verb == "is-active":
                     state = "deactivating" if self.reset_unit_stuck else self.reset_unit_state
                     return make_command_result(False, state, exit_code=0 if self.reset_unit_stuck else 3)
@@ -333,7 +341,7 @@ async def test_fabric_manager_is_started_again_when_the_reset_fails():
 
 
 @pytest.mark.asyncio
-async def test_a_hung_reset_starts_the_fabric_again_before_the_fallback_and_the_container():
+async def test_a_hung_reset_waits_for_its_unit_to_restore_the_fabric_before_the_fallback_and_the_container():
     host = FakeHost(device_ids=(), count=-1, fabric_manager=True, nvlsm=True)
     host.reset_hangs = True
     active_at_start = {}
@@ -341,15 +349,13 @@ async def test_a_hung_reset_starts_the_fabric_again_before_the_fallback_and_the_
     report, _ = await _reset(host, backend=U, start=start)
     up = {FM: True, NVLSM: True}
     assert host.active_during_cure == up and active_at_start == up
-    i = host.fm_log.index(("stop", gpu_reset.FABRIC_RESET_UNIT))
+    # never stopped: the unit started the fabric itself, so the validator only checks it
+    i = host.fm_log.index(("is-active", gpu_reset.FABRIC_RESET_UNIT))
     assert host.fm_log[i:] == [
-        ("stop", gpu_reset.FABRIC_RESET_UNIT),
         ("is-active", gpu_reset.FABRIC_RESET_UNIT),
+        ("unit start", NVLSM),
+        ("unit start", FM),
         ("is-active", NVLSM),
-        ("start", NVLSM),
-        ("is-active", NVLSM),
-        ("is-active", FM),
-        ("start", FM),
         ("is-active", FM),
     ]
     assert report.container_restarted
@@ -373,8 +379,10 @@ async def test_a_hung_reset_whose_unit_will_not_stop_skips_the_fallback_and_the_
     report, start = await _reset(host, backend=U)
     assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
     assert "still running on the host" in report.detail and not report.container_restarted
-    # the fabric is left to the still-running unit, never started under it
-    assert ("start", FM) not in host.fm_log and host.active_during_cure is None
+    # the unit is never stopped (its own loop starts the fabric when the reset ends) and no validator start
+    # runs while it is active
+    assert ("stop", gpu_reset.FABRIC_RESET_UNIT) not in host.fm_log and ("start", FM) not in host.fm_log
+    assert host.active[FM] is False and host.active_during_cure is None
     start.assert_not_awaited()
 
 

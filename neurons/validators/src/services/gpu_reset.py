@@ -10,8 +10,9 @@ Nothing is ever read from inside the pod (no `docker exec`): the renter controls
 On an NVSwitch node whose Fabric Manager runs (many HGX nodes show no /dev/nvidia-nvswitch*), the driver
 refuses `-r` while Fabric Manager holds the GPUs: a pod that owns every host GPU gets Fabric Manager (and
 the NVLink subnet manager on HGX Blackwell, when it runs) stopped around the reset and always started
-again, all in one host systemd unit that outlives the SSH session (a reset that hangs past its timeout has
-that unit stopped and the fabric started by the validator, before the latch cure and the container start);
+again, all in one host systemd unit that outlives the SSH session (a reset that hangs past its timeout is left
+to that unit, which starts the fabric when the reset ends; the latch cure and the container start wait until the
+unit is proven gone);
 any other pod is refused (the provider resets).
 
 Safety invariants, each pinned by a test:
@@ -381,14 +382,15 @@ def build_fabric_reset_command(units: list[str], reset_command: str) -> str:
     return f"{HOST_SYSTEMD_RUN} /bin/sh -c {shlex.quote(script)}"
 
 
-async def _stop_hung_reset_unit(runner: SSHCommandRunner) -> bool:
-    """Stops the host unit of a reset that did not return (which kills the reset); True once it is proven gone."""
+async def _reset_unit_gone(runner: SSHCommandRunner) -> bool:
+    """True once the host unit of a reset that did not return is proven gone.
+
+    Never stopped: a stop kills the unit's shell, so nothing would start the fabric when the reset ends."""
     try:
-        await _run(runner, f"{HOST_SYSTEMCTL} stop {FABRIC_RESET_UNIT}", timeout=_QUERY_TIMEOUT_SECONDS + 60)
         state = await _run(runner, f"{HOST_SYSTEMCTL} is-active {FABRIC_RESET_UNIT}")
         procs = await _run(runner, FABRIC_RESET_UNIT_PROCS)
     except Exception as exc:
-        logger.error("could not stop the hung GPU reset unit: %s", exc)
+        logger.error("could not read the hung GPU reset unit: %s", exc)
         return False
     # a collected unit reads "inactive"; anything else (running, stopping, no answer) may still be resetting.
     # "failed" alone is no proof: systemd also fails a unit whose processes survive its final SIGKILL (a reset in
@@ -534,7 +536,7 @@ async def reset_pod_gpus(
                 )
             finally:
                 # a reset that did not return (timeout, dropped session) may still hold the GPUs and the fabric
-                if (reset is None or reset.exit_code < 0) and not await _stop_hung_reset_unit(runner):
+                if (reset is None or reset.exit_code < 0) and not await _reset_unit_gone(runner):
                     reset_still_running = True
                     fabric_manager_problem = "the GPU reset is still running on the host"
                 else:
