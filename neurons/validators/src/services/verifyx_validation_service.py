@@ -1,3 +1,4 @@
+import asyncio
 import ctypes
 import json
 import math
@@ -39,6 +40,8 @@ STDERR_TAIL_BYTES = 2048
 # minutes, so this is generous — it only cuts true hangs (same silent-hang class as the
 # matrix check, DAH-2365) instead of blocking until the outer JOB_TIME_OUT cancellation.
 VERIFYX_COMMAND_TIMEOUT_SECONDS = 600
+# AsyncSSH applies run(timeout=) only once the channel is open, so the cleanup is bounded from outside too
+VERIFYX_KILL_TIMEOUT_SECONDS = 10
 
 # LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
 LIB_PATH = "/usr/lib/libverifyx.so"
@@ -633,9 +636,17 @@ class VerifyXValidationService:
         kill could hit a renter's process) and removes the scratch dir with any half-written
         disk-test file, which a SIGKILL leaves behind."""
         d = shlex.quote(run_dir)
-        capture = await self._run_ssh_command(
-            shell, f'[ -f {d}/pid ] && kill -9 "$(cat {d}/pid)"; rm -rf {d}', timeout=10
-        )
+        try:
+            capture = await asyncio.wait_for(
+                self._run_ssh_command(
+                    shell,
+                    f'[ -f {d}/pid ] && kill -9 "$(cat {d}/pid)"; rm -rf {d}',
+                    timeout=VERIFYX_KILL_TIMEOUT_SECONDS,
+                ),
+                timeout=VERIFYX_KILL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            capture = SSHCapture(transport_error="TimeoutError: cleanup SSH did not finish")
         if capture.transport_error is not None:
             logger.warning(
                 _m(

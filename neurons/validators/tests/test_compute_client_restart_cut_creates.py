@@ -15,8 +15,31 @@ from payload_models.payloads import ContainerCreateRequest, ContainerDeleteReque
 from services.redis_service import InflightBackendCreate, RedisService
 
 
+class _FakePipeline:
+    """MULTI/EXEC for write_atomically: queues the writes, applies them at execute"""
+
+    def __init__(self, redis) -> None:
+        self.redis, self.ops = redis, []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: self.ops.append((getattr(self.redis, name), args, kwargs))
+
+    async def execute(self) -> None:
+        for method, args, kwargs in self.ops:
+            await method(*args, **kwargs)
+
+
 class _FakeRedis:
     """the hash commands (and SET) RedisService uses, in memory"""
+
+    def pipeline(self, transaction: bool = True) -> _FakePipeline:
+        return _FakePipeline(self)
 
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}

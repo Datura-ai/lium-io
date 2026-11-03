@@ -758,9 +758,11 @@ class RedisService:
         if gpu_uuids:
             item["gpu_uuids"] = list(gpu_uuids)
         pending_pods.append(item)
-        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
-        await self.set(
-            create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
+        # one step: a marker written without its stamp would abort the caller before its cleanup and leave the marker behind
+        await self.write_atomically(
+            RedisWrites()
+            .hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+            .set(create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS)
         )
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):

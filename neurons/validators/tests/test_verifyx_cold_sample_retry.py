@@ -10,13 +10,20 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from neurons.validators.src.services.task.checks import verifyx as verifyx_check
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck, VerifyXColdRetryCheck
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from neurons.validators.src.services.task.pipeline import ParallelStage
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
-from neurons.validators.src.services.redis_service import CREATE_STARTED_AT_TTL_SECONDS, RedisService
+from neurons.validators.src.services.redis_service import (
+    CREATE_STARTED_AT_TTL_SECONDS,
+    PENDING_PODS_PREFIX,
+    RedisService,
+    create_started_at_key,
+)
+from neurons.validators.src.services import verifyx_validation_service
 from neurons.validators.src.services.verifyx_validation_service import (
     VERIFYX_COMMAND_TIMEOUT_SECONDS,
     VerifyXValidationService,
@@ -365,6 +372,23 @@ async def test_killing_a_cut_off_retry_during_the_disk_test_spares_other_process
     await decoy.wait()
 
 
+class _StalledChannelShell:
+    """An SSH channel that never opens: run() ignores its own timeout, as AsyncSSH does before create_process returns."""
+
+    def __init__(self):
+        self.ssh_client = self
+
+    async def run(self, command, timeout=None):
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_the_cleanup_of_a_cut_off_retry_is_bounded_when_the_channel_stalls(monkeypatch):
+    monkeypatch.setattr(verifyx_validation_service, "VERIFYX_KILL_TIMEOUT_SECONDS", 0.05)
+
+    await asyncio.wait_for(VerifyXValidationService().kill_remote_verifyx(_StalledChannelShell(), ".vx-run", {}), 2)
+
+
 @pytest.mark.parametrize("fast_path", [False, True])
 def test_the_cold_retry_runs_after_every_other_check_right_before_scoring(fast_path):
     checks = PipelineFactory.build_checks(fast_path=fast_path)
@@ -519,6 +543,19 @@ class _PendingRedis(FakeRedis):
     add_pending_pod = RedisService.add_pending_pod
     remove_pending_pod = RedisService.remove_pending_pod
     renting_in_progress = RedisService.renting_in_progress
+
+
+@pytest.mark.asyncio
+async def test_a_failed_create_stamp_write_leaves_no_pending_pod_marker():
+    # PR review, 3 Nov: the marker and its stamp were two writes; the stamp failing left a gpu_reset marker behind
+    redis = _PendingRedis()
+    redis.fail_next_set_of.add(create_started_at_key("miner", EXECUTOR))
+
+    with pytest.raises(RedisTimeoutError):
+        await redis.add_pending_pod("miner", EXECUTOR, "pod-1", kind="gpu_reset")
+
+    assert redis.hashes.get(PENDING_PODS_PREFIX, {}) == {}
+    assert await redis.get_pending_pods("miner", EXECUTOR) == []
 
 
 class _CreateDuringRetry(_TimedProbeSequence):
