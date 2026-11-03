@@ -1,5 +1,6 @@
 import asyncio
 import getpass
+import ipaddress
 import logging
 import os
 import stat
@@ -7,8 +8,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+
+import requests
 
 from core.config import VALIDATOR_SSH_SOURCES, settings
+from dependencies.auth import match_validator_hotkey
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +73,69 @@ def _in_cvm() -> bool:
         return False
 
 
+# The pinned addresses come from `<COMPUTE_REST_API_URL>/watchtower/ssh-sources`, signed by the validator like
+# `/watchtower/digest`, so a NAT change or turning the pin off fleet-wide needs no executor release.
+SSH_SOURCES_CACHE_SECONDS = 300
+SSH_SOURCES_TIMEOUT_SECONDS = 5.0
+SSH_SOURCES_MAX_SKEW_SECONDS = 10 * 60
+
+
+def verify_signed_ssh_sources(payload: dict[str, Any], now: int | None = None) -> str:
+    """The `ip,ip` list of a `/watchtower/ssh-sources` answer after checking its signature; "" = no pin."""
+    sources, timestamp, signature = payload.get("sources"), payload.get("timestamp"), payload.get("signature")
+    if not isinstance(sources, str) or not isinstance(timestamp, int) or not isinstance(signature, str):
+        raise ValueError("ssh-sources answer has no sources, timestamp or signature")
+    if now is None:
+        now = int(datetime.now(UTC).timestamp())
+    if abs(timestamp - now) > SSH_SOURCES_MAX_SKEW_SECONDS:
+        raise ValueError(f"ssh-sources answer timestamp out of range (now={now}, ts={timestamp})")
+    if match_validator_hotkey(f"{sources}:{timestamp}", signature) is None:
+        raise ValueError("ssh-sources answer is not signed by a configured validator hotkey")
+    # a malformed from= makes sshd refuse the key: keep the last good list instead
+    for source in filter(None, sources.split(",")):
+        ipaddress.ip_network(source)
+    return sources
+
+
+class SignedSshSources:
+    """The signed source list, refreshed at most every SSH_SOURCES_CACHE_SECONDS; a failed refresh keeps the last
+    good list, and a node that never got one does not pin."""
+
+    def __init__(self):
+        self._sources = ""
+        self._fetched_at: float | None = None
+        self._lock = threading.Lock()
+
+    def get(self, now: float | None = None) -> str:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._fetched_at is not None and now - self._fetched_at < SSH_SOURCES_CACHE_SECONDS:
+                return self._sources
+            self._fetched_at = now
+            if not settings.COMPUTE_REST_API_URL:
+                return self._sources
+            url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/ssh-sources"
+            try:
+                response = requests.get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
+                response.raise_for_status()
+                self._sources = verify_signed_ssh_sources(response.json())
+            except Exception as exc:  # never fail an upload over this
+                logger.warning("Validator ssh sources not refreshed from %s: %s: %s", url, type(exc).__name__, exc)
+            return self._sources
+
+
+_signed_ssh_sources = SignedSshSources()
+
+
 def _validator_source_pin_option() -> bytes:
-    """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin."""
+    """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin.
+
+    A build without a source list (non-prod, e2e) never pins; a prod build pins to the signed list.
+    """
     if not VALIDATOR_SSH_SOURCES or not settings.EXECUTOR_SSH_SOURCE_PIN or _in_cvm():
         return b""
-    return b'from="' + VALIDATOR_SSH_SOURCES.encode() + b'" '
+    sources = _signed_ssh_sources.get()
+    return b'from="' + sources.encode() + b'" ' if sources else b""
 
 
 def _key_without_marker_and_source_pin(line: bytes) -> bytes:
