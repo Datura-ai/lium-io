@@ -25,7 +25,7 @@ unloads once the GPU goes idle and silently reverts ``-pl`` — nvidia-smi still
 So each set first enables persistence mode (``-pm 1``, best-effort: keeps the driver loaded so the
 limit survives) and then READS BACK ``power.limit``; a mismatch counts as a failed set. The readback
 is the hard gate — a cap that cannot be observed on the GPU does not exist.
-**Apply is fail-closed for the filler**: ``apply_filler_gpu_power_limits`` returns ``False`` if the
+**Apply is fail-closed for the filler**: ``apply_filler_gpu_power_limits`` returns anything but ``APPLIED`` if the
 cap could not be fully applied, after undoing whatever it already capped or stored; the caller then
 REFUSES to start the PEARL filler (running the miner uncapped defeats the whole point).
 **Restore stays best-effort**: teardown must never be blocked by a power-limit hiccup; a record
@@ -45,6 +45,7 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, TypeVar
 
 import asyncssh
@@ -158,6 +159,18 @@ class PowerLimitSetOutcome:
 
     failure: str | None
     persistence_enabled: bool | None
+    # The host's nvidia-smi ran and refused the limit, or the limit did not stick: the node's fault, not ours.
+    host_refused: bool = False
+
+
+class GpuPowerCapResult(StrEnum):
+    """What ``apply_filler_gpu_power_limits`` did; anything but APPLIED means do not start the filler."""
+
+    APPLIED = "applied"
+    # The host refused the cap (``PowerLimitSetOutcome.host_refused``).
+    HOST_REFUSED = "host_refused"
+    # Our own side failed (Redis, SSH, the state query, a GPU missing from it): not the node's fault.
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -322,6 +335,7 @@ async def _set_power_limit(
         return PowerLimitSetOutcome(
             failure=f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}",
             persistence_enabled=None,
+            host_refused=True,
         )
     readback = await _read_back_power_state(ssh, uuid)
     if readback.watts is None:
@@ -336,6 +350,7 @@ async def _set_power_limit(
                 f"readback {readback.watts}W != target {watts}W (persistence mode unavailable?)"
             ),
             persistence_enabled=readback.persistence_enabled,
+            host_refused=True,
         )
     return PowerLimitSetOutcome(failure=None, persistence_enabled=readback.persistence_enabled)
 
@@ -349,6 +364,19 @@ async def _set_and_log_power_limit(
     watts_after: int,
     log_extra: dict[str, object] | None,
 ) -> bool:
+    outcome = await _set_and_log_outcome(ssh, action, executor_id, gpu_uuid, watts_before, watts_after, log_extra)
+    return outcome.failure is None
+
+
+async def _set_and_log_outcome(
+    ssh: asyncssh.SSHClientConnection,
+    action: Literal["cap", "restore", "raise"],
+    executor_id: str,
+    gpu_uuid: str,
+    watts_before: int | None,
+    watts_after: int,
+    log_extra: dict[str, object] | None,
+) -> PowerLimitSetOutcome:
     # Reviewer contract (PR #1115): every PL change is logged with executor, GPU, before/after, status.
     # Raises only asyncssh.ChannelOpenError, from -pl or the readback: the host refused the session,
     # so the set may or may not have applied and nothing is logged here; _set_side_by_side retries the GPU alone,
@@ -388,7 +416,7 @@ async def _set_and_log_power_limit(
         },
         log_extra,
     )
-    return failure is None
+    return set_outcome
 
 
 async def _set_alone(
@@ -403,10 +431,21 @@ async def _set_alone(
     """``_set_and_log_power_limit`` for a caller with no other set in flight: a refused session here
     is the host's, not our concurrency's, so it is logged as a failed set (the #1115 fields) and
     returned as False. Never raises."""
+    outcome = await _set_alone_outcome(ssh, action, executor_id, gpu_uuid, watts_before, watts_after, log_extra)
+    return outcome.failure is None
+
+
+async def _set_alone_outcome(
+    ssh: asyncssh.SSHClientConnection,
+    action: Literal["cap", "restore", "raise"],
+    executor_id: str,
+    gpu_uuid: str,
+    watts_before: int | None,
+    watts_after: int,
+    log_extra: dict[str, object] | None,
+) -> PowerLimitSetOutcome:
     try:
-        return await _set_and_log_power_limit(
-            ssh, action, executor_id, gpu_uuid, watts_before, watts_after, log_extra
-        )
+        return await _set_and_log_outcome(ssh, action, executor_id, gpu_uuid, watts_before, watts_after, log_extra)
     except asyncssh.ChannelOpenError as exc:
         _log(
             logging.ERROR,
@@ -423,7 +462,7 @@ async def _set_alone(
             },
             log_extra,
         )
-        return False
+        return PowerLimitSetOutcome(failure=f"the host refused the SSH session: {exc}", persistence_enabled=None)
 
 
 async def _set_side_by_side(
@@ -804,18 +843,18 @@ async def apply_filler_gpu_power_limits(
     pod_id: str,
     executor_id: str,
     log_extra: dict[str, object] | None = None,
-) -> bool:
+) -> GpuPowerCapResult:
     """Record each GPU's pre-cap limit (frozen), then cap it at the target watts (clamped to hw [min, max]).
 
-    Fail-closed: returns True only when EVERY requested GPU was capped; on failure any partial work
-    (records, pod index, already-capped GPUs) is undone first. False means the caller must NOT start
-    the filler. Every failure path logs an error so it is diagnosable/alertable — no silent skips.
+    Fail-closed: returns APPLIED only when EVERY requested GPU was capped; on failure any partial work
+    (records, pod index, already-capped GPUs) is undone first. Anything else means the caller must NOT
+    start the filler: HOST_REFUSED when the host refused a GPU's cap, FAILED when our own side failed. Every failure path logs an error so it is diagnosable/alertable — no silent skips.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: state query failed: {exc}; refusing to start filler uncapped", {}, log_extra)
-        return False
+        return GpuPowerCapResult.FAILED
     missing = [target.gpu_uuid for target in gpu_power_limits if target.gpu_uuid not in state_by_uuid]
     if missing:
         _log(
@@ -825,29 +864,33 @@ async def apply_filler_gpu_power_limits(
             {},
             log_extra,
         )
-        return False
+        return GpuPowerCapResult.FAILED
     target_uuids = [target.gpu_uuid for target in gpu_power_limits]
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
     for target in gpu_power_limits:
         pre_cap_watts = state_by_uuid[target.gpu_uuid].current_watts
         if not await _ensure_restore_record(redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra):
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
-            return False
+            return GpuPowerCapResult.FAILED
     try:
         await redis.set(_pod_index_key(pod_id), json.dumps(target_uuids))
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: could not persist pod index for {pod_id}: {exc}", {}, log_extra)
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
-        return False
-    all_set = True
+        return GpuPowerCapResult.FAILED
+    outcomes: list[PowerLimitSetOutcome] = []
     for target in gpu_power_limits:
         state = state_by_uuid[target.gpu_uuid]
         target_watts = _clamp_watts(target.watts, state)
         # one at a time and nothing else in flight: a refused session is a failed cap (fail-closed)
-        if not await _set_alone(
-            ssh, "cap", executor_id, target.gpu_uuid, state.current_watts, target_watts, log_extra
-        ):
-            all_set = False
-    if not all_set:
-        await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
-    return all_set
+        outcomes.append(
+            await _set_alone_outcome(
+                ssh, "cap", executor_id, target.gpu_uuid, state.current_watts, target_watts, log_extra
+            )
+        )
+    if all(outcome.failure is None for outcome in outcomes):
+        return GpuPowerCapResult.APPLIED
+    await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
+    if any(outcome.host_refused for outcome in outcomes):
+        return GpuPowerCapResult.HOST_REFUSED
+    return GpuPowerCapResult.FAILED
