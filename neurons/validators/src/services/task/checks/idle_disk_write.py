@@ -21,6 +21,7 @@ from .rented_throughput import (
     phase_offset_seconds,
 )
 from .task_time import task_seconds_left
+from .rental_owner import fillers_of_this_node, rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,7 @@ class IdleDiskWriteCheck:
         # a filler started since the cycle-start snapshot (capability.py's race): its download is not the disk's speed
         if filler_busy and _has_filler(fresh, ctx):
             return busy
-        rented_now = fresh.executors.get(ctx.executor.uuid)
+        rented_now = rental_of_this_node(ctx, rented_data=fresh)
         if rented_now is not None and rented_now.pods:
             return "rented"
         if await redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
@@ -206,4 +207,4 @@ def _node_fraction_of_day(ctx: Context) -> float:
 
 
 def _has_filler(rented_data: RentedExecutorsResponse | None, ctx: Context) -> bool:
-    return bool(rented_data and rented_data.get_filler_containers(ctx.executor.uuid))
+    return bool(fillers_of_this_node(ctx, rented_data))

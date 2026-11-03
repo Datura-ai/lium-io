@@ -33,7 +33,7 @@ from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
-from .rental_owner import rental_of_this_node
+from .rental_owner import fillers_of_this_node, rental_of_this_node
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 from .task_time import task_seconds_left
 
@@ -590,7 +590,7 @@ async def _busy_now(ctx: Context) -> _BusyNow:
     rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return _BusyNow(_RENTED_SINCE_CYCLE_START)
-    fillers = frozenset(rented.get_filler_containers(ctx.executor.uuid))
+    fillers = frozenset(fillers_of_this_node(ctx, rented))
     try:
         if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
             return _BusyNow(_RENT_IN_PROGRESS)
@@ -832,7 +832,7 @@ async def _rented_meanwhile(ctx: Context, fillers_beside: frozenset[str]) -> str
     rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return "rented"
-    if set(rented.get_filler_containers(ctx.executor.uuid)) - fillers_beside:
+    if set(fillers_of_this_node(ctx, rented)) - fillers_beside:
         return "given a filler"
     try:
         if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):

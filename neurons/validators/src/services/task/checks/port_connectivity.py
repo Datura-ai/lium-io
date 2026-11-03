@@ -24,7 +24,7 @@ from ..host_disk import (
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import rental_of_this_node
+from .rental_owner import filler_ports_of_this_node, rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ class PortConnectivityCheck:
         rented_pod_names = [p.container_name for p in rented_executor.pods] if rented_executor else []
         # DAH-2527: an idle filler holds ports without creating a pod, so an executor running only
         # fillers has no rented_executor entry at all — hence the separate lookup.
-        filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
+        filler_ports = filler_ports_of_this_node(ctx, rented_data)
 
         gate = await self._disk_pressure_gate(ctx, rented_data, rented_executor, filler_ports)
         if gate.deferred:

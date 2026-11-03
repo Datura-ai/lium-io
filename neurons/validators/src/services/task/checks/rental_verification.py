@@ -28,6 +28,7 @@ from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
+from .rental_owner import fillers_of_this_node
 
 
 @dataclass(frozen=True)
@@ -122,7 +123,7 @@ class RentalVerificationCheck:
         # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
         # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
-        filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        filler_containers: list[str] = fillers_of_this_node(ctx, rented_data)
         # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
         # `docker run` leaves no RUNNING run and no container, so the liveness probe below never
         # sees it and the node collects unrented incentive while never running a default job. The

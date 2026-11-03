@@ -54,3 +54,18 @@ def filler_of_another_miner(ctx: Context, rented_data: RentedExecutorsResponse |
     lists under that UUID is not on this node. An older backend sends no owners: no change."""
     owner = rented_data.executor_owner_hotkeys.get(str(ctx.executor.uuid)) if rented_data else None
     return bool(owner) and owner != ctx.miner_hotkey
+
+
+def fillers_of_this_node(ctx: Context, rented_data: RentedExecutorsResponse | None) -> list[str]:
+    """Every filler `rented_data` lists under this executor UUID, or none when the UUID is listed
+    under another miner's hotkey: those fillers run on that miner's node, not this one."""
+    if not rented_data or filler_of_another_miner(ctx, rented_data):
+        return []
+    return rented_data.get_filler_containers(ctx.executor.uuid)
+
+
+def filler_ports_of_this_node(ctx: Context, rented_data: RentedExecutorsResponse | None) -> list[int]:
+    """The ports this node's fillers hold, with the same owner check as fillers_of_this_node."""
+    if not rented_data or filler_of_another_miner(ctx, rented_data):
+        return []
+    return rented_data.get_filler_ports(ctx.executor.uuid)

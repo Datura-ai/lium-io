@@ -40,6 +40,7 @@ from ..pipeline import CheckResult, Context
 from .capability import get_filler_only_container
 from .gpu_fault_probe import GpuFaultProbeCheck
 from .sshd_bootstrap import remove_lium_fillers
+from .rental_owner import fillers_of_this_node
 
 if TYPE_CHECKING:
     from services.matrix_validation_service import AllCardsProbe
@@ -208,7 +209,7 @@ class PostRentalGpuRecheckCheck:
             or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
         ):
             return []
-        return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
+        return await remove_lium_fillers(ctx, fillers_of_this_node(ctx, rented_data))
 
     @staticmethod
     async def _read_marker(ctx: Context, key: str) -> RecheckMarker | None:

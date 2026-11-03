@@ -15,7 +15,7 @@ from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from .matmul_speed_log import log_matmul_speed
-from .rental_owner import filler_of_another_miner, rental_of_this_node
+from .rental_owner import filler_of_another_miner, fillers_of_this_node, rental_of_this_node
 
 if TYPE_CHECKING:
     from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -380,7 +380,7 @@ def get_filler_only_container(ctx: Context) -> str | None:
     if not rented_data:
         return None
 
-    filler_container = rented_data.get_filler_container(ctx.executor.uuid)
-    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    filler_container = next(iter(fillers_of_this_node(ctx, rented_data)), None)
+    rented_executor = rental_of_this_node(ctx)
     has_customer_rental = bool(rented_executor and rented_executor.pods)
     return filler_container if filler_container and not has_customer_rental else None

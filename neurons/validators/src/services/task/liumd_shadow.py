@@ -58,6 +58,7 @@ from .checks.verifyx import (
     verifyx_verdict,
 )
 from .pipeline import Context
+from .checks.rental_owner import fillers_of_this_node, rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +128,9 @@ def _workload_on_node(ctx: Context, today: dict[str, TodayStep]) -> bool:
     rented = ctx.state.rented_data
     if rented is None:
         return False
-    if rented.get_filler_containers(ctx.executor.uuid):
+    if fillers_of_this_node(ctx, rented):
         return True
-    executor = rented.executors.get(ctx.executor.uuid)
+    executor = rental_of_this_node(ctx, rented_data=rented)
     return bool(executor and executor.pods)
 
 

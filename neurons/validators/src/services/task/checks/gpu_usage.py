@@ -40,7 +40,7 @@ from services.gpu_wedge import (
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import rental_of_this_node
+from .rental_owner import fillers_of_this_node, rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +229,7 @@ class GpuUsageCheck:
         rented_data = ctx.state.rented_data
         # A GPU-split node runs one filler per VRAM bundle (DAH-2465): the GPU is "clean" as long as
         # every process belongs to ONE OF the node's fillers, not a single expected container.
-        filler_containers = set(rented_data.get_filler_containers(ctx.executor.uuid)) if rented_data else set()
+        filler_containers = set(fillers_of_this_node(ctx, rented_data))
         process_names = {process.get("container_name") for process in gpu_processes}
         fillers_only = bool(filler_containers) and all(name in filler_containers for name in process_names)
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
@@ -459,8 +459,7 @@ def lium_workload_containers(ctx: Context) -> set[str]:
     Public because both gates that judge a foreign workload share it: this one for the card,
     the provider-side load one for CPU. They must never disagree about whose container it is.
     """
-    rented_data = ctx.state.rented_data
-    containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
+    containers: set[str] = set(fillers_of_this_node(ctx, ctx.state.rented_data))
     rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(pod.docker_container_name for pod in rented_executor.pods)

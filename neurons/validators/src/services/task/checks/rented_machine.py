@@ -30,7 +30,7 @@ from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
-from .rental_owner import rental_of_this_node
+from .rental_owner import fillers_of_this_node, rental_of_this_node
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)
@@ -158,7 +158,7 @@ class TenantEnforcementCheck:
         # EVERY filler on the node: a partially rented split node keeps one filler per free VRAM
         # bundle running beside the renter (DAH-2465/DAH-2467), and allowlisting only the first
         # makes its siblings' GPU processes read as usage outside the tenant.
-        filler_containers = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        filler_containers = fillers_of_this_node(ctx, rented_data)
         filler_container = filler_containers[0] if filler_containers else None
 
         if not rented_executor or not rented_executor.pods:

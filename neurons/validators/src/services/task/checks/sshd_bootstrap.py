@@ -20,7 +20,7 @@ from ...const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
 from ..messages import SshdBootstrapMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import rental_of_this_node
+from .rental_owner import fillers_of_this_node, rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ class SshdBootstrapCheck:
             and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM
         ):
             what["removed_fillers"] = await remove_lium_fillers(
-                ctx, rented_data.get_filler_containers(ctx.executor.uuid)
+                ctx, fillers_of_this_node(ctx, rented_data)
             )
         return CheckResult(
             passed=False,
@@ -142,7 +142,7 @@ class SshdBootstrapCheck:
             or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
         ):
             return False
-        for name in rented_data.get_filler_containers(ctx.executor.uuid):
+        for name in fillers_of_this_node(ctx, rented_data):
             task_seconds_left = (
                 settings.JOB_TIME_OUT
                 - _TASK_TIMEOUT_MARGIN_SECONDS

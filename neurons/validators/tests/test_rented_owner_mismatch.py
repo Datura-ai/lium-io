@@ -230,3 +230,29 @@ async def test_port_count_ignores_another_miners_filler_ports(context_factory):
 
     assert (await run("other-miner-hotkey")).updates["port_count"] == 0
     assert (await run("miner-hotkey")).updates["port_count"] == 2
+
+
+# DAH-5581: every filler reader goes through fillers_of_this_node / filler_ports_of_this_node.
+def test_filler_helpers_drop_another_miners_fillers(context_factory):
+    ctx = _ctx(context_factory, **OTHER)
+    other, own = _filler_owned_by("other-miner-hotkey"), _filler_owned_by("miner-hotkey")
+    no_owners = own.model_copy(update={"executor_owner_hotkeys": {}})  # an older backend: no change
+
+    assert rental_owner.fillers_of_this_node(ctx, other) == []
+    assert rental_owner.filler_ports_of_this_node(ctx, other) == []
+    assert rental_owner.fillers_of_this_node(ctx, own) == ["filler_1"]
+    assert rental_owner.fillers_of_this_node(ctx, no_owners) == ["filler_1"]
+    assert rental_owner.filler_ports_of_this_node(ctx, own) == [2001, 2002]
+    assert rental_owner.fillers_of_this_node(ctx, None) == []
+
+
+def test_filler_only_container_and_idle_disk_filler_ignore_another_miners_filler(context_factory):
+    from neurons.validators.src.services.task.checks import idle_disk_write
+    from neurons.validators.src.services.task.checks.capability import get_filler_only_container
+
+    ctx = _ctx(context_factory, **OTHER)
+    other, own = _filler_owned_by("other-miner-hotkey"), _filler_owned_by("miner-hotkey")
+    assert idle_disk_write._has_filler(other, ctx) is False
+    assert idle_disk_write._has_filler(own, ctx) is True
+    assert get_filler_only_container(context_factory(state=build_state(rented_data=other))) is None
+    assert get_filler_only_container(context_factory(state=build_state(rented_data=own))) == "filler_1"

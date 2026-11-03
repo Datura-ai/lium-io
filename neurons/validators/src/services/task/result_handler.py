@@ -22,6 +22,7 @@ from incentive.config import BASE_GPU_MAP
 from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
 from .models import JobResult
 from .pipeline import Context
+from .checks.rental_owner import fillers_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +182,7 @@ class ResultHandler:
         provider_discord_connected = self._get_provider_discord_connected(context)
         rented_data = context.state.rented_data
         has_lium_filler = bool(
-            rented_data and rented_data.get_filler_containers(executor_info.uuid)
+            fillers_of_this_node(context, rented_data)
         )
         filler_revenue_per_gpu_hour = (
             rented_data.get_filler_revenue_per_gpu_hour(

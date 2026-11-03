@@ -19,7 +19,7 @@ from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 from ..messages import ContainerDownloadSpeedMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import rental_of_this_node
+from .rental_owner import fillers_of_this_node, rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +230,7 @@ class ContainerDownloadSpeedCheck:
         rented_executor = rental_of_this_node(ctx)
         if rented_executor is not None and rented_executor.pods:
             return self._skipped(ctx, "rented")
-        if rented_data is not None and rented_data.get_filler_containers(ctx.executor.uuid):
+        if fillers_of_this_node(ctx, rented_data):
             return self._skipped(ctx, "filler running")
 
         # with the hotkey: a node copying another miner's UUID cannot write a slow streak onto the owner's
