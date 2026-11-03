@@ -60,6 +60,12 @@ RENTAL_WATCH_INTERVAL_SECONDS = 5
 # the pre-retry rental lookup shares one backend read among all executors (single flight), reused
 # this long: N cold executors in a cycle cost one fleet-wide read, not N
 RENTED_NOW_TTL_SECONDS = 30
+# cut-off runs whose cleanup failed: saving one is capped so the first result still returns in time,
+# and reaping them before the next run is bounded in count and time
+STALE_RUN_SAVE_TIMEOUT_SECONDS = 10
+STALE_RUNS_KEPT = 4
+STALE_RUNS_REAPED_PER_CYCLE = 2
+STALE_RUNS_REAP_BUDGET_SECONDS = 25
 _rented_now: tuple[Any, float, float, asyncio.Future] | None = None  # (backend, monotonic, epoch, read)
 
 
@@ -769,32 +775,51 @@ async def _remember_stale_run(ctx: Context, run_dir: str) -> None:
     """Keep a cut-off run whose cleanup failed, so the next VerifyX run on the node reaps it."""
     key = verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
     try:
-        await ctx.services.redis.hset(key, run_dir, str(time.time()))
-        await ctx.services.redis.expire(key, VERIFYX_STALE_RUNS_TTL_SECONDS)
+        # a busy Redis lock must not eat the margin the first result still needs
+        async with asyncio.timeout(STALE_RUN_SAVE_TIMEOUT_SECONDS):
+            await ctx.services.redis.hset(key, run_dir, str(time.time()))
+            await ctx.services.redis.expire(key, VERIFYX_STALE_RUNS_TTL_SECONDS)
     except Exception as e:
         logger.warning(
             _m(
                 "Failed to record a stale VerifyX run",
-                extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
+                extra=get_extra_info({**ctx.default_extra, "error": repr(e)}),
             )
         )
 
 
 async def _reap_stale_runs(ctx: Context) -> None:
-    """Kill and remove the runs earlier cycles cut off but could not clean up."""
+    """Kill and remove the runs earlier cycles cut off but could not clean up.
+
+    Bounded per cycle: entries past the TTL or beyond STALE_RUNS_KEPT (oldest first) are dropped
+    unreaped (the run's remote deadline ends it), at most STALE_RUNS_REAPED_PER_CYCLE are tried,
+    within STALE_RUNS_REAP_BUDGET_SECONDS, so a node that stalls every cleanup cannot grow the work."""
     key = verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
     try:
-        for raw in await ctx.services.redis.hgetall(key) or {}:
-            run_dir = raw.decode() if isinstance(raw, bytes) else raw
-            if await ctx.services.verifyx.kill_remote_verifyx(
-                ctx.services.shell, run_dir, ctx.default_extra
-            ):
-                await ctx.services.redis.hdel(key, run_dir)
+        async with asyncio.timeout(STALE_RUNS_REAP_BUDGET_SECONDS):
+            runs = {}
+            for raw_dir, raw_at in (await ctx.services.redis.hgetall(key) or {}).items():
+                run_dir = raw_dir.decode() if isinstance(raw_dir, bytes) else raw_dir
+                try:
+                    runs[run_dir] = float(raw_at)
+                except (TypeError, ValueError):
+                    runs[run_dir] = 0.0
+            newest = sorted(runs, key=runs.get, reverse=True)
+            cutoff = time.time() - VERIFYX_STALE_RUNS_TTL_SECONDS
+            keep = [d for d in newest[:STALE_RUNS_KEPT] if runs[d] >= cutoff]
+            dropped = [d for d in newest if d not in keep]
+            if dropped:
+                await ctx.services.redis.hdel(key, *dropped)
+            for run_dir in keep[:STALE_RUNS_REAPED_PER_CYCLE]:
+                if await ctx.services.verifyx.kill_remote_verifyx(
+                    ctx.services.shell, run_dir, ctx.default_extra
+                ):
+                    await ctx.services.redis.hdel(key, run_dir)
     except Exception as e:
         logger.warning(
             _m(
                 "Failed to reap stale VerifyX runs",
-                extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
+                extra=get_extra_info({**ctx.default_extra, "error": repr(e)}),
             )
         )
 

@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import os
 import stat
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,6 +21,7 @@ from neurons.validators.src.services.task.pipeline_factory import PipelineFactor
 from neurons.validators.src.services.redis_service import (
     CREATE_STARTED_AT_TTL_SECONDS,
     PENDING_PODS_PREFIX,
+    VERIFYX_STALE_RUNS_TTL_SECONDS,
     RedisService,
     create_started_at_key,
     verifyx_stale_runs_key,
@@ -487,6 +489,47 @@ async def test_a_cut_off_retry_whose_cleanup_timed_out_is_reaped_on_the_next_run
     assert await ctx.services.redis.hgetall(
         verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
     ) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_stale_run_save_does_not_cost_the_first_result(context_factory, monkeypatch):
+    # PR review, 3 Nov: HSET/EXPIRE behind a busy Redis lock ran past the cycle margin
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 60.05)
+    monkeypatch.setattr(verifyx_check, "MIN_COLD_RETRY_SECONDS", 0)
+    monkeypatch.setattr(verifyx_check, "STALE_RUN_SAVE_TIMEOUT_SECONDS", 0.01)
+    service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=5.0)
+    service.kill_remote_verifyx = AsyncMock(return_value=False)
+    ctx = _ctx(context_factory, service, _never_measured())
+
+    async def blocked_write(*_args):
+        await asyncio.Event().wait()
+
+    ctx.services.redis.hset = AsyncMock(side_effect=blocked_write)
+
+    result = await asyncio.wait_for(_run(ctx), 1.0)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["cold_sample_retry"]["used"] == "first"
+
+
+@pytest.mark.asyncio
+async def test_reaping_stale_runs_is_bounded_per_cycle(context_factory, monkeypatch):
+    # PR review, 3 Nov: a node stalling every cleanup must not grow the next cycle's reaping work
+    service = _ProbeSequence(_probe(900.0))
+    service.kill_remote_verifyx = AsyncMock(return_value=False)
+    ctx = _ctx(context_factory, service, _known(900.0))
+    key = verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
+    now = time.time()
+    for i in range(10):
+        await ctx.services.redis.hset(key, f".verifyx-retry-{i}", str(now - i))
+    await ctx.services.redis.hset(key, ".verifyx-retry-old", str(now - VERIFYX_STALE_RUNS_TTL_SECONDS - 1))
+
+    await VerifyXCheck().run(ctx)
+
+    tried = [c.args[1] for c in service.kill_remote_verifyx.await_args_list]
+    assert tried == [".verifyx-retry-0", ".verifyx-retry-1"]  # newest first, capped
+    left = {k.decode() for k in await ctx.services.redis.hgetall(key)}
+    assert left == {f".verifyx-retry-{i}" for i in range(verifyx_check.STALE_RUNS_KEPT)}
 
 
 @pytest.mark.parametrize("fast_path", [False, True])
