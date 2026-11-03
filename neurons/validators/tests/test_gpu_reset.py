@@ -135,7 +135,7 @@ class FakeHost:
             script = shlex.split(cmd)[-1]
             found = re.search(r"\|\| for u in ([^;$]*); do systemctl stop", script)
             units = found.group(1).split() if found else []
-            containers = re.search(r"for u in ([^;]*); do timeout -k 5 \d+ docker stop", script)
+            containers = re.search(r"for u in ([^;]*); do timeout -k 2 \d+ docker stop", script)
             containers = containers.group(1).split() if containers else []
             for cid in containers:
                 self.active[cid] = False
@@ -665,6 +665,8 @@ trap 'echo "$pending $noops"' EXIT
         (1, "Cannot connect to the Docker daemon", 0, "true false", 1, False),
         # a removed container ends the unit: nothing is left to start
         (1, "Error: No such container: e1", 0, "true false", 0, False),
+        # a wait that hit its deadline (a stalled dockerd) is no exit either
+        (124, "", 0, "true false", 1, False),
     ],
 )
 def test_the_exporter_restart_unit_fails_until_it_has_started_the_exporter(
@@ -672,6 +674,7 @@ def test_the_exporter_restart_unit_fails_until_it_has_started_the_exporter(
 ):
     stubs = f"""
 sleep() {{ :; }}
+timeout() {{ [ "$1" = -k ] && shift 2; shift; "$@"; }}
 docker() {{
   case "$1" in
     wait) return {wait_rc};;
@@ -718,11 +721,11 @@ def test_two_stuck_exporters_each_get_their_own_restart_unit(tmp_path):
     assert sorted(p.name for p in units.iterdir()) == [f"{gpu_reset.EXPORTER_RESTART_UNIT}-{c}" for c in ("e1", "e2")]
 
 
-def test_a_hanging_docker_stop_and_kill_hit_their_deadline_and_still_hand_off(tmp_path, monkeypatch):
+def test_hanging_docker_calls_hit_their_deadline_and_still_hand_off(tmp_path, monkeypatch):
     # dockerd accepted the calls but never answers: the deadlines end them and the recovery path still runs
     monkeypatch.setattr(gpu_reset, "STOP_GRACE_SECONDS", 0)
     monkeypatch.setattr(gpu_reset, "_DOCKER_CALL_SECONDS", 1)
-    env, units = _stuck_exporter_bin(tmp_path, "stop|kill) exec sleep 60;; wait) exit 124;;")
+    env, units = _stuck_exporter_bin(tmp_path, "stop|kill|inspect|start) exec sleep 60;; wait) exit 124;;")
     script = shlex.split(build_fabric_reset_command([], "true", ["e1"]))[-1]
     done = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=30, env=env)
     assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT and "could not stop e1" in done.stderr

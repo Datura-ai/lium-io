@@ -101,9 +101,11 @@ HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --coll
 # One unit per container ID (the unit name ends in it), so two exporters each get their own
 EXPORTER_RESTART_UNIT = "lium-gpu-reset-exporter-restart"
 EXPORTER_RESTART_SCRIPT = (
-    'docker wait "$0" >/dev/null || { docker inspect "$0" 2>&1 >/dev/null | grep -q "No such" && exit 0; exit 1; }; '
-    'docker start "$0" >/dev/null && sleep 5 && '
-    "[ \"$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' \"$0\")\" = 'true false' ]"
+    # every docker call has a deadline (a stalled dockerd): a timeout fails the unit, so systemd runs it again
+    'timeout -k 5 300 docker wait "$0" >/dev/null || '
+    '{ timeout -k 5 30 docker inspect "$0" 2>&1 >/dev/null | grep -q "No such" && exit 0; exit 1; }; '
+    'timeout -k 5 30 docker start "$0" >/dev/null && sleep 5 && '
+    "[ \"$(timeout -k 5 30 docker inspect -f '{{.State.Running}} {{.State.Restarting}}' \"$0\")\" = 'true false' ]"
 )
 EXPORTER_RESTART_RUN = (
     f'systemd-run --quiet --collect --unit={EXPORTER_RESTART_UNIT}-"$dying" -p Restart=on-failure -p RestartSec=10 '
@@ -130,8 +132,10 @@ _FABRIC_STOP_FAILED_EXIT = 97
 # a host GPU holder the unit stopped is not active again after the reset
 _FABRIC_START_FAILED_EXIT = 98
 STOP_GRACE_SECONDS = 10
-# process deadline on a docker CLI call beyond its own grace: a stalled dockerd cannot hold the host unit forever
-_DOCKER_CALL_SECONDS = 15
+# process deadline (plus a 2s kill) on each docker CLI call of the host unit beyond its own grace or wait: a
+# stalled dockerd cannot hold the unit forever. Worst case of the unit's docker calls with one holder container:
+# stop 22 + wait 92 + inspect 12 + kill 12 + wait 32 + start 12 = 182s; each further holder container adds 34s
+_DOCKER_CALL_SECONDS = 10
 # "<running> <restarting>" of a holder container: only "true false" is up
 CONTAINER_STATE_COMMAND = f"{DOCKER} inspect -f '{{{{.State.Running}}}} {{{{.State.Restarting}}}}'"
 # a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
@@ -473,7 +477,7 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     if containers:
         ids = " ".join(shlex.quote(c) for c in containers)
         script += (
-            f'for u in {ids}; do timeout -k 5 {STOP_GRACE_SECONDS + _DOCKER_CALL_SECONDS} '
+            f'for u in {ids}; do timeout -k 2 {STOP_GRACE_SECONDS + _DOCKER_CALL_SECONDS} '
             f'docker stop -t {STOP_GRACE_SECONDS} "$u" >/dev/null || '
             f'{{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; dying="$u"; break; }}; done; '
         )
@@ -502,17 +506,18 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         # (stuck in the kernel) still reads running, so the restore check cannot see it: its start goes to a host
         # unit that outlives this one and starts it once it exits, and the report names it (restart pending)
         script += (
-            f'[ -z "$dying" ] || until timeout {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
-            '! docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; '
+            f'[ -z "$dying" ] || until timeout -k 2 {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
+            f'! timeout -k 2 {_DOCKER_CALL_SECONDS} docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; '
             'echo "$dying did not exit, killing it" >&2; '
-            f'timeout -k 5 {_DOCKER_CALL_SECONDS} docker kill "$dying" >/dev/null 2>&1; '
-            f'timeout {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1 || {{ '
+            f'timeout -k 2 {_DOCKER_CALL_SECONDS} docker kill "$dying" >/dev/null 2>&1; '
+            f'timeout -k 2 {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1 || {{ '
             f"{{ {EXPORTER_RESTART_RUN}; }} "
             '>/dev/null 2>&1 && echo "$dying did not exit after a kill: restart pending, it starts once it exits" >&2 '
             '|| echo "could not start $dying: it did not exit after a kill" >&2; }; break; done; '
         )
         ids = " ".join(shlex.quote(c) for c in reversed(containers))
-        script += f'for u in {ids}; do docker start "$u" >/dev/null; done; '
+        # a start that times out reads as not running again in the validator's restore check
+        script += f'for u in {ids}; do timeout -k 2 {_DOCKER_CALL_SECONDS} docker start "$u" >/dev/null; done; '
     script += "exit $rc"
     return f"{HOST_SYSTEMD_RUN} /bin/sh -c {shlex.quote(script)}"
 
