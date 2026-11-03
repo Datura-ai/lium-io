@@ -64,6 +64,7 @@ class FakeHost:
         fm_start_ok=True,
         holders=None,
         ps="",
+        systemd=True,
     ):
         self.commands: list[str] = []
         self.stopped = False
@@ -81,6 +82,7 @@ class FakeHost:
         self.own_cgroup = own_cgroup
         self.active = {"nvidia-fabricmanager": fabric_manager, "nvidia-nvlsm": nvlsm, **(holders or {})}
         self.ps = ps
+        self.systemd = systemd
         self.fm_start_ok = fm_start_ok
         self.active_during_reset: dict[str, bool] | None = None
         self.reset_raises = False
@@ -150,6 +152,8 @@ class FakeHost:
             if self.reset_raises:
                 raise RuntimeError("ssh dropped")
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
+        if cmd == gpu_reset.HOST_SYSTEMD_PROBE:
+            return make_command_result(True, "" if self.systemd else "no-systemd\n")
         if cmd == gpu_reset.FABRIC_RESET_UNIT_PROCS:
             if not self.hung_units and not self.reset_unit_stuck:
                 if isinstance(self.prior_unit_procs, int):
@@ -662,23 +666,28 @@ async def test_every_host_gpu_holder_comes_back_when_the_reset_raises():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "backend,holders,uses_unit",
+    "backend,holders,uses_unit,systemd",
     [
-        (U, {DCGM: True}, True),
+        (U, {DCGM: True}, True, True),
         # only a holder the validator does not list: the host unit still finds and stops it
-        (U, {"some-gpu-agent": True}, True),
+        (U, {"some-gpu-agent": True}, True, True),
         # a `--gpus all` container the backend gave only half of the host GPUs does not own the host
-        (U[:2], {DCGM: True}, False),
+        (U[:2], {DCGM: True}, False, True),
+        # a host proven without systemd, with nothing to stop: the direct reset, as before the host unit
+        (U, {}, False, False),
     ],
 )
-async def test_only_a_pod_owning_the_host_by_container_and_backend_uses_the_host_unit(backend, holders, uses_unit):
-    host = FakeHost(device_ids=(), count=-1, holders=holders)
+async def test_only_a_pod_owning_the_host_by_container_and_backend_uses_the_host_unit(
+    backend, holders, uses_unit, systemd
+):
+    host = FakeHost(device_ids=(), count=-1, holders=holders, systemd=systemd)
     report, _ = await _reset(host, backend=backend)
     assert report.ok and {g.result for g in report.gpus} == {"reset"}
-    assert any("systemd-run" in cmd for cmd in host.commands) == uses_unit
+    assert any(cmd.startswith("nsenter -t 1 -m -- systemd-run") for cmd in host.commands) == uses_unit
+    assert any(cmd.startswith("nvidia-smi -r") for cmd in host.commands)
     if not uses_unit:
         assert not any(entry[0] in ("stop", "docker stop") for entry in host.fm_log)
-        assert gpu_reset.DOCKER_PS_COMMAND not in host.commands
+        assert (gpu_reset.DOCKER_PS_COMMAND in host.commands) == (backend == U)
 
 
 @pytest.mark.asyncio

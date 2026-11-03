@@ -95,6 +95,11 @@ GPU_HOLDER_UNITS_SCRIPT = (
 # named, so a reset that outlives its SSH timeout can be stopped (one per host: it owns every host GPU)
 FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
+# "no-systemd" only when the host proves it has no systemd (not booted with it, no systemd-run): any other answer,
+# a failed probe included, keeps the reset in the host unit
+HOST_SYSTEMD_PROBE = "nsenter -t 1 -m -- sh -c " + shlex.quote(
+    "[ -d /run/systemd/system ] || command -v systemd-run >/dev/null 2>&1 || echo no-systemd"
+)
 # processes left in the reset unit's cgroup (v2, or v1's systemd hierarchy); 0 only for an unloaded unit or an
 # existing, readable, empty cgroup.procs, or a host without systemctl (no unit can have run there). Neither file
 # there, or a failed read, exits 1: unknown, never 0
@@ -378,6 +383,10 @@ async def _precheck(
                 and re.fullmatch(r"[0-9a-f]{12,64}", cid)
             ):
                 holder_containers.append(cid)
+        if not host_services and not holder_containers:
+            # a host proven without systemd and with nothing to stop resets directly, as before the host unit
+            probe = await _run(runner, HOST_SYSTEMD_PROBE)
+            owns_host = not (probe.exit_code == 0 and (probe.stdout or "").strip() == "no-systemd")
     return _Plan(
         container_id,
         ordered,
