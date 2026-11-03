@@ -13,13 +13,23 @@ set -eu
 running_executor=$(docker compose ps --quiet executor 2>/dev/null || true)
 if [ -n "$running_executor" ]; then
     # A backup or restore runs as storage_runner.py inside the executor; recreating the container kills it and
-    # the renter's backup fails as "stopped reporting progress" (26 backups at executor-v1.167, 2 Nov 21Z).
+    # the renter's backup fails as "stopped reporting progress" (26 backups at executor-v1.167, 2 Nov 21Z). Hold the
+    # update while one runs, but at most RUNNER_STORAGE_HOLD_MAX_SECONDS (backup p95 32 min), so a host with
+    # back-to-back backups still updates; the killed backup is retried by its schedule.
+    hold_file="${RUNNER_STORAGE_HOLD_FILE:-/tmp/lium-storage-hold-since}"
     case "$(docker top "$running_executor" -o args 2>/dev/null || true)" in
         *storage_runner.py*)
-            echo "Update held, running executor kept: a backup or restore is running in it. Retrying in ${RUNNER_STORAGE_RETRY_SECONDS:-120}s."
-            sleep "${RUNNER_STORAGE_RETRY_SECONDS:-120}"
-            exit 1 ;;
+            now=$(date +%s)
+            [ -s "$hold_file" ] || echo "$now" > "$hold_file"
+            held=$(( now - $(cat "$hold_file") ))
+            if [ "$held" -lt "${RUNNER_STORAGE_HOLD_MAX_SECONDS:-1800}" ]; then
+                echo "Update held, running executor kept: a backup or restore is running in it (held $((held / 60)) min of $((${RUNNER_STORAGE_HOLD_MAX_SECONDS:-1800} / 60))). Retrying in ${RUNNER_STORAGE_RETRY_SECONDS:-120}s."
+                sleep "${RUNNER_STORAGE_RETRY_SECONDS:-120}"
+                exit 1
+            fi
+            echo "Update hold expired after $((held / 60)) min: updating with a backup or restore still running." ;;
     esac
+    rm -f "$hold_file"
     # `timeout` stops only the docker client: a hung probe container outlives it, and every retry would add one.
     leftovers=$(docker ps --all --quiet --filter label=io.lium.executor-runner.probe=nvidia-runtime 2>/dev/null || true)
     if [ -n "$leftovers" ] && ! docker rm --force $leftovers >/dev/null 2>&1; then

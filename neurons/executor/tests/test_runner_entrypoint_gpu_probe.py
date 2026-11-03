@@ -54,13 +54,13 @@ def run_entrypoint(tmp_path, **env):
     # the log-follow loop never ends; a `sleep` that fails ends the script after one round
     (bin_dir / "sleep").write_text('#!/bin/sh\necho "sleep $*" >> "$STUB_CALLS"\nexit 7\n')
     (bin_dir / "sleep").chmod(0o755)
-    for tool in ("sh", "tail", "cat", "timeout"):
+    for tool in ("sh", "tail", "cat", "timeout", "date", "rm"):
         os.symlink(shutil.which(tool), bin_dir / tool)
     calls = tmp_path / "calls"
     calls.touch()
     result = subprocess.run(
         ["sh", SCRIPT],
-        env={"PATH": str(bin_dir), "STUB_CALLS": str(calls), **env},
+        env={"PATH": str(bin_dir), "STUB_CALLS": str(calls), "RUNNER_STORAGE_HOLD_FILE": str(tmp_path / "hold"), **env},
         capture_output=True,
         text=True,
         timeout=30,
@@ -199,19 +199,32 @@ def test_old_images_are_kept_when_the_running_image_cannot_be_tagged(tmp_path):
     assert any(c.startswith("compose logs") for c in calls)
 
 
+STORAGE_TOP = "COMMAND\n/usr/bin/python3 /root/app/src/storage_runner.py --spec -"
+
+
 def test_running_backup_holds_the_update(tmp_path):
-    result, calls = run_entrypoint(
-        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP="COMMAND\n/usr/bin/python3 /root/app/src/storage_runner.py --spec -"
-    )
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP=STORAGE_TOP)
 
     assert not recreated(calls)
     assert not any(c.startswith("run ") for c in calls)
-    assert "a backup or restore is running in it" in result.stdout
+    assert "a backup or restore is running in it (held 0 min of 30)" in result.stdout
     assert "sleep 120" in calls
+    assert (tmp_path / "hold").read_text().strip().isdigit()
 
 
-def test_no_storage_operation_updates(tmp_path):
+def test_hold_expires_and_updates(tmp_path):
+    (tmp_path / "hold").write_text("1\n")  # held since 1970: far past the 30 min cap
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP=STORAGE_TOP)
+
+    assert "Update hold expired" in result.stdout
+    assert recreated(calls)
+    assert not (tmp_path / "hold").exists()
+
+
+def test_no_storage_operation_updates_and_clears_hold(tmp_path):
+    (tmp_path / "hold").write_text("1\n")
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP="COMMAND\npython3 /root/app/src/executor.py")
 
     assert "top abc123 -o args" in calls
     assert recreated(calls)
+    assert not (tmp_path / "hold").exists()
