@@ -23,7 +23,12 @@ DOCKER_STUB = textwrap.dedent(
     echo "$*" >> "$STUB_CALLS"
     case "$1 $2" in
         "compose ps") echo "${STUB_RUNNING_EXECUTOR:-}" ;;
-        "top abc123") echo "${STUB_TOP:-}" ;;
+        "top abc123")
+            [ "$3 $4" = "-o pid,args" ] || { echo "Error response from daemon: ps: unknown column" >&2; exit 1; }
+            case "$(cat "$STUB_CALLS")" in
+                *"compose pull"*) [ -n "${STUB_TOP_AFTER_PULL:-}" ] && { printf 'PID COMMAND\n%s\n' "$STUB_TOP_AFTER_PULL"; exit 0; } ;;
+            esac
+            printf 'PID COMMAND\n%s\n' "${STUB_TOP:-}" ;;
         "compose logs") exit 0 ;;
         "compose up") exit 0 ;;
         "inspect --format") echo "sha256:executorimage" ;;
@@ -102,7 +107,7 @@ def test_probe_ok_recreates(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123")
 
     probe = calls.index("run --rm --gpus all --label io.lium.executor-runner.probe=nvidia-runtime --entrypoint true sha256:executorimage")
-    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    up = calls.index("compose up --pull never --detach --wait --force-recreate")
     assert probe < up
     assert "Update held" not in result.stdout
 
@@ -121,7 +126,7 @@ def test_previous_executor_image_is_removed_after_the_update(tmp_path):
         tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage"
     )
 
-    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    up = calls.index("compose up --pull never --detach --wait --force-recreate")
     assert calls.index("image rm sha256:previous") > up
     assert "image rm sha256:executorimage" not in calls
     assert "Removed old executor image sha256:previous" in result.stdout
@@ -201,7 +206,7 @@ def test_old_images_are_kept_when_the_running_image_cannot_be_tagged(tmp_path):
     assert any(c.startswith("compose logs") for c in calls)
 
 
-STORAGE_TOP = "COMMAND\n/usr/bin/python3 /root/app/src/storage_runner.py --spec -"
+STORAGE_TOP = "4242 /usr/bin/python3 /root/app/src/storage_runner.py --spec -"
 
 
 def test_running_backup_holds_the_update(tmp_path):
@@ -225,9 +230,9 @@ def test_hold_expires_and_updates(tmp_path):
 
 def test_no_storage_operation_updates_and_clears_hold(tmp_path):
     (tmp_path / "hold").write_text("1\n")
-    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP="COMMAND\npython3 /root/app/src/executor.py")
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP="17 python3 /root/app/src/executor.py")
 
-    assert "top abc123 -o args" in calls
+    assert "top abc123 -o pid,args" in calls
     assert recreated(calls)
     assert not (tmp_path / "hold").exists()
 
@@ -253,3 +258,11 @@ def test_restore_hold_expires_after_two_hours(tmp_path):
 
     assert "Update hold expired after 121 min: updating with a restore still running." in result.stdout
     assert recreated(calls)
+
+
+def test_backup_started_during_the_pull_holds_the_recreate(tmp_path):
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP_AFTER_PULL=STORAGE_TOP)
+
+    assert "compose pull" in calls
+    assert not recreated(calls)
+    assert "a backup is running in it" in result.stdout

@@ -10,15 +10,16 @@ set -eu
 # If that fails, keep the running executor and exit; the restart policy brings the runner back to try
 # again; a probe that hangs past RUNNER_PROBE_TIMEOUT_SECONDS counts as failed. A first install (no executor
 # running) has nothing to break and skips the probe.
-running_executor=$(docker compose ps --quiet executor 2>/dev/null || true)
-if [ -n "$running_executor" ]; then
-    # A backup or restore runs as storage_runner.py inside the executor; recreating the container kills it and
-    # the renter's backup fails as "stopped reporting progress" (26 backups at executor-v1.167, 2 Nov 21Z). Hold the
-    # update while one runs, but at most 30 min for a backup (p95 32 min; the killed one is retried by its schedule)
-    # and 2 h for a restore (max 1.9 h; a renter is waiting on it), so a busy host still updates. The validator's
-    # machine scrape reads the last of these lines from this container's log and reports it with an outdated image.
-    hold_file="${RUNNER_STORAGE_HOLD_FILE:-/tmp/lium-storage-hold-since}"
-    case "$(docker top "$running_executor" -o args 2>/dev/null || true)" in
+# A backup or restore runs as storage_runner.py inside the executor; recreating the container kills it and the
+# renter's backup fails as "stopped reporting progress" (26 backups at executor-v1.167, 2 Nov 21Z). Hold the update
+# while one runs, but at most 30 min for a backup (p95 32 min; the killed one is retried by its schedule) and 2 h for
+# a restore (max 1.9 h; a renter is waiting on it), so a busy host still updates. Checked before the pull and again
+# right before the recreate, since a backup can start during the pull. The validator's machine scrape reads the last
+# of these lines from this container's log and reports it with an outdated image.
+hold_file="${RUNNER_STORAGE_HOLD_FILE:-/tmp/lium-storage-hold-since}"
+hold_while_storage_runs() {
+    # dockerd's top needs the pid column; with `-o args` alone it errors and every check read as idle.
+    case "$(docker top "$1" -o pid,args 2>/dev/null || true)" in
         *storage_runner.py*)
             case "$(docker ps --no-trunc --filter name=lium-storage- --format '{{.Command}}' 2>/dev/null || true)" in
                 *" restore "*) operation=restore; hold_max="${RUNNER_RESTORE_HOLD_MAX_SECONDS:-7200}" ;;
@@ -33,8 +34,13 @@ if [ -n "$running_executor" ]; then
                 exit 1
             fi
             echo "Update hold expired after $((held / 60)) min: updating with a $operation still running." ;;
+        *) rm -f "$hold_file" ;;
     esac
-    rm -f "$hold_file"
+}
+
+running_executor=$(docker compose ps --quiet executor 2>/dev/null || true)
+if [ -n "$running_executor" ]; then
+    hold_while_storage_runs "$running_executor"
     # `timeout` stops only the docker client: a hung probe container outlives it, and every retry would add one.
     leftovers=$(docker ps --all --quiet --filter label=io.lium.executor-runner.probe=nvidia-runtime 2>/dev/null || true)
     if [ -n "$leftovers" ] && ! docker rm --force $leftovers >/dev/null 2>&1; then
@@ -58,7 +64,12 @@ if [ -n "$running_executor" ]; then
     fi
 fi
 
-docker compose up --pull always --detach --wait --force-recreate
+docker compose pull
+if [ -n "$running_executor" ]; then
+    hold_while_storage_runs "$running_executor"
+fi
+docker compose up --pull never --detach --wait --force-recreate
+rm -f "$hold_file"
 
 # The executor is pulled by digest, so its old images are not dangling and `image prune` keeps them
 # (2-5 GB per release, every past release too). Remove every executor image but the one now running;
