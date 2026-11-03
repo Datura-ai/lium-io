@@ -20,7 +20,7 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, NamedTuple
+from typing import Annotated, Any, NamedTuple, TypeVar
 from uuid import UUID, uuid4
 
 import asyncssh
@@ -47,6 +47,7 @@ from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleted,
+    ContainerStopped,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -60,7 +61,9 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
     JupyterServerInstalled,
+    LockPodGpuClocksRequest,
     PayloadPortMapping,
+    PodGpuClocksResult,
     PodGpuResetResult,
     ProfilerStep,
     ProfilerStepName,
@@ -122,6 +125,12 @@ from services.prerun_host_probe import (
     port_check_containers_command,
     prerun_host_probe_command,
 )
+from services.gpu_clocks import (
+    GpuClocksReport,
+    lock_pod_gpu_clocks,
+    reset_leftover_clock_locks,
+    reset_pod_clock_locks,
+)
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.loopback_plugin_setup import (
@@ -133,6 +142,7 @@ from services.loopback_plugin_setup import (
 from services.nvidia_devices import MissingRentedGpuError, build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
+    GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
@@ -198,6 +208,8 @@ from services.pod_ssh_host_key import derive_pod_ssh_host_key
 from services.volume_keys import VolumeKeyDeriver
 
 logger = logging.getLogger(__name__)
+# the report a pod GPU operation (reset or clock lock) returns; each caller gets its own type back
+_PodGpuReport = TypeVar("_PodGpuReport", GpuResetReport, GpuClocksReport)
 
 REPOSITORIES = [
     "daturaai/compute-subnet-executor:latest",
@@ -1750,6 +1762,7 @@ class _InflightCreate:
     running: int = 0
     cancelled_by_delete: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class _InflightCreateRegistry:
@@ -1794,7 +1807,13 @@ class _InflightCreateRegistry:
         if create is None:
             return False
         create.cancelled_by_delete = True
+        create.cancelled.set()
         return True
+
+    async def wait_cancelled(self, pod_id: str) -> None:
+        """Return once a delete cancels this pod's create; never while no create is tracked for it."""
+        create = self._creates_by_pod_id.get(pod_id)
+        await (create.cancelled if create is not None else asyncio.Event()).wait()
 
     def is_cancelled(self, pod_id: str) -> bool:
         create = self._creates_by_pod_id.get(pod_id)
@@ -2164,6 +2183,52 @@ class _PendingDeletionRegistry:
         self._evict_expired()
         return len(self._marked_at)
 
+
+# DAH-4663 (review): how long a delete waits for a renter's GPU operation on the same pod before it answers
+# DeletionInProgress (the backend re-asks); the operation itself ends by its deadline, so a delete always gets through
+POD_GPU_OPERATION_DELETE_WAIT_SECONDS = 120
+# the longest a renter's clock lock holds the pod; a GPU reset has none, so its container restart is never cut off
+POD_GPU_OPERATION_DEADLINE_SECONDS = 600
+
+
+class _PodGpuOperationLocks:
+    """One lock per pod shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
+    reset before its (re)create.
+
+    The pending-pod check and its mark are separate steps, and a delete takes no mark, so a clock lock and a
+    delete could both run: a -lgc finishing after the delete's clock reset left the GPUs locked with no record
+    to undo it. A GPU operation now declines while the lock is held; a delete waits for it, so its clock reset
+    runs after any -lgc. In-process like inflight_creates: one validator process owns the executor.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._holders: dict[str, int] = {}
+
+    @contextlib.asynccontextmanager
+    async def hold(self, pod_id: str, wait: float):
+        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between."""
+        lock = self._locks.setdefault(pod_id, asyncio.Lock())
+        self._holders[pod_id] = self._holders.get(pod_id, 0) + 1
+        acquired = False
+        try:
+            if wait == 0:
+                acquired = not lock.locked() and await lock.acquire()
+            else:
+                try:
+                    acquired = await asyncio.wait_for(lock.acquire(), wait)
+                except TimeoutError:
+                    acquired = False
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
+            self._holders[pod_id] -= 1
+            if not self._holders[pod_id]:
+                del self._holders[pod_id], self._locks[pod_id]
+
+
+pod_gpu_operation_locks = _PodGpuOperationLocks()
 
 # In-process like inflight_creates: the backend re-asks the validator that owns the executor. A
 # validator restart forgets the marker, and the re-ask then runs the plain best-effort volume remove.
@@ -4845,9 +4910,10 @@ class DockerService:
         the removal, and the create goes on. Otherwise the create fails at its own step,
         FILLER_REMOVAL_STUCK_STEP, not at `container_cleanup`: the stuck container is ours.
 
-        Before failing, the listing is read again until ``cleanup_deadline``: a filler gone from it was removed
-        by dockerd (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still pending, and
-        dockerd removed it about 30 s after the rm, 4 s after the create had already failed)."""
+        Before failing, `docker rm -fv` is sent again with the listing until ``cleanup_deadline``: a filler gone
+        from it is removed (28 Oct, 8x B300: its processes sat in D state on a FUSE lookup, SIGKILL still
+        pending). dockerd gives up an rm whose kill does not land in time and never retries it: the killed
+        filler stays listed, stopped, until another rm, which then removes it in seconds."""
         error = (
             f"[clean_existing_containers] docker rm -fv of filler {fillers} did not finish in time"
         )
@@ -4909,16 +4975,25 @@ class DockerService:
     async def _listing_once_gone(
         self, ssh_client: asyncssh.SSHClientConnection, targets: list[str], deadline: float
     ) -> ContainerListing | None:
-        """The host listing once none of ``targets`` is on it, read every few seconds until ``deadline``; None if
-        they are still listed (or the host cannot be listed) by then."""
+        """The host listing once none of ``targets`` is on it, `docker rm -fv` of them sent again with each
+        listing every few seconds until ``deadline``; None if they are still listed (or the host cannot be
+        listed) by then."""
         loop = asyncio.get_running_loop()
         while (remaining := deadline - loop.time()) > 0:
             await asyncio.sleep(min(_STUCK_FILLER_RELIST_SECONDS, remaining))
             try:
+                # asyncssh's timeout= bounds only the command, not its channel open
                 async with asyncio.timeout_at(deadline):
-                    listing = await self._list_all_containers(ssh_client)
+                    result = await ssh_client.run(
+                        _remove_and_list_containers_command(targets, []),
+                        check=False,
+                        timeout=max(deadline - loop.time(), 0.001),
+                    )
             except TimeoutError:
                 return None
+            except Exception:
+                continue
+            listing = _parse_remove_and_list_containers(result.stdout or "").listing_after_rm
             if listing is not None and not set(targets) & (set(listing[0]) | set(listing[1].values())):
                 return listing
         return None
@@ -5549,7 +5624,8 @@ class DockerService:
                     "cleanup_failed_container_creation",
                 )
 
-            if remove_volume and volume_name:
+            # the pod's volume is shared by name too: another live create of the pod may have restored into it (F-78)
+            if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create(pod_id)):
                 volume = shlex.quote(volume_name)
                 await retry_ssh_command(
                     ssh_client,
@@ -7874,17 +7950,24 @@ class DockerService:
                 f"sh -c {shlex.quote(inner_build)}"
             )
             try:
-                ok, err = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=build_cmd,
-                    log_tag=log_tag,
-                    log_text=f"Building custom image {image_tag}",
-                    log_extra={**default_extra, "build_image_tag": image_tag},
-                    timeout=timeout_s,
-                    raise_exception=False,
-                    # an exec killed with its DinD (exit 137, empty stderr) is a failed build
-                    check_exit_status=True,
+                ok, err = await self._unless_cancelled_by_delete(
+                    ssh_client,
+                    payload,
+                    default_extra,
+                    self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=build_cmd,
+                        log_tag=log_tag,
+                        log_text=f"Building custom image {image_tag}",
+                        log_extra={**default_extra, "build_image_tag": image_tag},
+                        timeout=timeout_s,
+                        raise_exception=False,
+                        # an exec killed with its DinD (exit 137, empty stderr) is a failed build
+                        check_exit_status=True,
+                    ),
                 )
+            except _CreateCancelledByDelete:
+                raise
             except Exception as exc:
                 logger.error(
                     _m(
@@ -7959,14 +8042,19 @@ class DockerService:
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"docker save {shlex.quote(image_tag)} | /usr/bin/docker load"
             )
-            ok, err = await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=export_cmd,
-                log_tag=log_tag,
-                log_text=f"Exporting custom image {image_tag}",
-                log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
-                timeout=export_timeout_s,
-                raise_exception=False,
+            ok, err = await self._unless_cancelled_by_delete(
+                ssh_client,
+                payload,
+                default_extra,
+                self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=export_cmd,
+                    log_tag=log_tag,
+                    log_text=f"Exporting custom image {image_tag}",
+                    log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
+                    timeout=export_timeout_s,
+                    raise_exception=False,
+                ),
             )
             if not ok:
                 if stream_timed_out(err):
@@ -8166,6 +8254,42 @@ class DockerService:
         raise _CreateCancelledByDelete(
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
+
+    async def _unless_cancelled_by_delete(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+        step: Awaitable[Any],
+        on_cancel: Callable[[], Awaitable[Any]] | None = None,
+    ) -> Any:
+        """Run a long create step (image pull, custom build, its export), but stop it as soon as this
+        pod's delete cancels the create.
+
+        DAH-5283: the delete only flags the create, and the create looks at the flag after the step. A
+        slow pull therefore kept streaming up to its 1 h deadline after the renter had deleted the pod,
+        and a custom build went on to build and load its image onto the host, competing with the next
+        create on the node (a deleted pod's export filled the disk under the renter's retry). `on_cancel`
+        ends the remote side: closing the Docker client ends a pull's SSH stream; a custom build's
+        DinD container is removed by `_custom_build_image`'s teardown.
+        """
+        step_task = asyncio.ensure_future(step)
+        cancelled = asyncio.ensure_future(inflight_creates.wait_cancelled(payload.pod_id))
+        try:
+            await asyncio.wait({step_task, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            step_task.cancel()
+            raise
+        finally:
+            cancelled.cancel()
+        if not step_task.done():
+            step_task.cancel()
+            if on_cancel is not None:
+                with contextlib.suppress(Exception):
+                    await on_cancel()
+            await asyncio.wait({step_task})
+            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+        return await step_task
 
     def _explain_container_killed_during_bootstrap(
         self,
@@ -8974,12 +9098,20 @@ class DockerService:
                             log_tag,
                         )
                         try:
-                            await run_logged_rental_docker_sdk_operation(
-                                operation="pull",
-                                log_extra=default_extra,
-                                call=lambda: docker_client.pull(image=payload.docker_image),
-                                image=payload.docker_image,
+                            await self._unless_cancelled_by_delete(
+                                ssh_client,
+                                payload,
+                                default_extra,
+                                run_logged_rental_docker_sdk_operation(
+                                    operation="pull",
+                                    log_extra=default_extra,
+                                    call=lambda: docker_client.pull(image=payload.docker_image),
+                                    image=payload.docker_image,
+                                ),
+                                on_cancel=lambda: docker_client.aclose(),
                             )
+                        except _CreateCancelledByDelete:
+                            raise
                         except Exception as exc:
                             if login_error is None:
                                 raise
@@ -9656,6 +9788,10 @@ class DockerService:
 
                 container_id = None
                 try:
+                    # DAH-4663 (review): inside the failed-create cleanup, so a GPU it cannot reset refuses the create
+                    # without leaving its new volume or build artifacts behind
+                    current_step = "gpu_clock_reset"
+                    await self._reset_leftover_clock_locks_before_create(ssh_client, payload, default_extra)
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
@@ -9778,8 +9914,9 @@ class DockerService:
                         pod_id=payload.pod_id,
                     )
                     container_vanished = container_created and container_missing
-                    # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
-                    if is_custom_build:
+                    # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure; named by pod, so
+                    # left to another live create of the same pod (F-78)
+                    if is_custom_build and inflight_creates.is_only_create(payload.pod_id):
                         await self._cleanup_custom_build_artifacts(
                             ssh_client=ssh_client,
                             pod_id=payload.pod_id,
@@ -10064,6 +10201,7 @@ class DockerService:
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                         container_id=container_id,
+                        pod_id=payload.pod_id,
                     )
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on post-run failure.
@@ -10588,6 +10726,8 @@ class DockerService:
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
                 msg=str(log_text),
+                # DAH-5510: Docker's own error ("No such container") lets the backend tell a gone container
+                detail=log_text.to_full_string(),
                 error_type=FailedContainerErrorTypes.ContainerStopFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
@@ -10599,6 +10739,13 @@ class DockerService:
                     {**default_extra, "container_name": payload.container_name}
                 ),
             ),
+        )
+        return ContainerStopped(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            container_name=payload.container_name,
         )
 
     async def start_container(
@@ -11570,6 +11717,38 @@ class DockerService:
         log.info("Killed the container's processes", result=(killed.stdout or "").strip())
         return await self._force_remove_container(docker_client, payload, log)
 
+    async def _reset_leftover_clock_locks_before_create(
+        self, ssh_client, payload: ContainerCreateRequest, default_extra: dict
+    ) -> None:
+        """DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed) is reset before anyone starts
+        on it. A GPU with a lock record that still cannot be reset fails the create (its record stays for the next
+        try); anything else here is best-effort and never blocks the rental."""
+        # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
+        # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
+        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+            if not held:
+                logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
+            # DAH-4663 (review): a create its delete cancelled during a long pull or build runs no -rgc on GPUs the
+            # backend may have rented again (it would undo the next renter's lock and drop its records). It does not
+            # raise here: its next cancel check, inside the block that removes its volume and build image, ends it.
+            if inflight_creates.is_cancelled(payload.pod_id):
+                logger.info(_m("Cancelled by its delete: no GPU clock reset", extra=get_extra_info(default_extra)))
+                return
+            try:
+                # the pod's own lock survives its edit or reboot (review)
+                still_locked = await reset_leftover_clock_locks(
+                    SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids,
+                    keep_pod_id=payload.pod_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m("GPU clock lock safety net failed", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+                return
+        if still_locked:
+            # never hand a renter the previous renter's locked clocks
+            raise RuntimeError(f"GPU clocks a previous rental locked could not be reset: {', '.join(still_locked)}")
+
     async def delete_container(
         self,
         payload: ContainerDeleteRequest,
@@ -11577,8 +11756,25 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        default_extra = _delete_container_log_extra(payload, executor_info)
-        log = _BoundLog(default_extra)
+        refused = await self._stop_create_before_delete(payload, executor_info)
+        if refused is not None:
+            return refused
+        # DAH-4663 (review): after a renter's GPU operation on the pod, so the clock reset below runs after any -lgc.
+        # Taken only once the cancelled create is done: its own clock reset waits on this lock.
+        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DELETE_WAIT_SECONDS) as held:
+            if not held:
+                logger.warning(
+                    _m(
+                        "A GPU operation on the pod is still running; the backend re-asks the delete",
+                        extra=get_extra_info(_delete_container_log_extra(payload, executor_info)),
+                    )
+                )
+                return self._deletion_in_progress(payload, msg="A GPU operation is still running; retry deletion")
+            return await self._delete_container(payload, executor_info, keypair, private_key)
+
+    async def _stop_create_before_delete(self, payload: ContainerDeleteRequest, executor_info: ExecutorSSHInfo):
+        """The delete's steps before its teardown: the refusal to answer, or None."""
+        log = _BoundLog(_delete_container_log_extra(payload, executor_info))
 
         # DAH-2728: a delete that races an in-flight create can arrive before any container name
         # exists. The create built its name from the pod id, so the same rule reconstructs it here
@@ -11615,6 +11811,18 @@ class DockerService:
             payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
         ):
             log.warning("Cancelled the create's steps after its reply; deleting without them")
+
+        return None
+
+    async def _delete_container(
+        self,
+        payload: ContainerDeleteRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        default_extra = _delete_container_log_extra(payload, executor_info)
+        log = _BoundLog(default_extra)
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
@@ -11698,6 +11906,11 @@ class DockerService:
                     # outlives the teardown and never reaches the next renter.
                     with _best_effort_delete_step(log, "sweep_wedged_gpus"):
                         await _sweep_wedged_gpus_after_teardown(ssh_client, log)
+                # DAH-4663: give the GPUs a renter locked back their clocks (one Redis read when none)
+                with _best_effort_delete_step(log, "reset_gpu_clock_locks"):
+                    await reset_pod_clock_locks(
+                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id
+                    )
 
                 with _best_effort_delete_step(log, "prune_images"):
                     await run_logged_rental_docker_sdk_operation(
@@ -11895,17 +12108,24 @@ class DockerService:
                 msg=str(log_text),
             )
 
-    async def reset_pod_gpus(
+    async def _pod_gpu_operation(
         self,
-        payload: ResetPodGpuRequest,
+        payload: ResetPodGpuRequest | LockPodGpuClocksRequest,
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
-    ) -> PodGpuResetResult:
-        """DAH-4658: a renter's reset of their pod's GPUs (services/gpu_reset.py does the work). The
-        pending-pod mark (kind gpu_reset) is held throughout, so the rented GPU checks skip the node
-        and no verified-job reset is sent for it: a renter's reset is never a provider fault. A short
-        recent-reset mark then covers the scrape that ends just after it."""
+        *,
+        label: str,
+        kind: str,
+        operate: Callable[[SSHCommandRunner, str, Any, dict], Awaitable[_PodGpuReport]],
+        failed: Callable[[str], _PodGpuReport],
+        gpu_uuids: list[str] | None = None,
+        after: Callable[[_PodGpuReport | None, dict], Awaitable[None]] | None = None,
+    ) -> _PodGpuReport:
+        """The trust, SSH and pending-mark steps a renter's GPU reset and clock lock share. `operate(runner,
+        private_key, known_hosts_policy, default_extra)` does the work while the pending-pod mark of `kind` is held;
+        `failed(detail)` is the report for an executor that is not trusted or not reached; `after(report,
+        default_extra)` runs before the pending mark is dropped (report None: cancelled mid-operation)."""
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
@@ -11915,22 +12135,43 @@ class DockerService:
             "executor_ip_address": executor_info.address,
             "executor_ssh_port": executor_info.ssh_port,
         }
-        logger.info(_m("Reset pod GPUs", extra=get_extra_info({**default_extra, "payload": str(payload)})))
+        logger.info(_m(label, extra=get_extra_info({**default_extra, "payload": str(payload)})))
+        # DAH-4663 (review): never alongside the pod's delete or another GPU operation
+        async with pod_gpu_operation_locks.hold(payload.pod_id, 0) as held:
+            if not held:
+                logger.info(_m(f"{label}: another operation on the pod is running", extra=get_extra_info(default_extra)))
+                return dataclasses.replace(
+                    failed("Another operation on this pod is running"),
+                    error_code=GpuResetErrorCode.OperationInProgress,
+                )
+            # DAH-4663 (review): a reset is never cancelled, since cancelling it could stop its container restart
+            deadline = POD_GPU_OPERATION_DEADLINE_SECONDS if kind == GPU_CLOCKS_PENDING_KIND else None
+            try:
+                return await asyncio.wait_for(
+                    self._pod_gpu_operation_held(
+                        payload, executor_info, keypair, private_key, label, kind, operate, failed, gpu_uuids, after,
+                        default_extra,
+                    ),
+                    deadline,
+                )
+            except TimeoutError:
+                logger.error(_m(f"{label}: past its deadline, cancelled", extra=get_extra_info(default_extra)))
+                return failed(f"The GPU operation did not finish in {POD_GPU_OPERATION_DEADLINE_SECONDS} s")
 
-        def result(report: GpuResetReport) -> PodGpuResetResult:
-            return PodGpuResetResult(
-                miner_hotkey=payload.miner_hotkey,
-                executor_id=payload.executor_id,
-                pod_id=payload.pod_id,
-                workload_kind=payload.workload_kind,
-                request_id=payload.request_id,
-                ok=report.ok,
-                error_code=report.error_code,
-                container_restarted=report.container_restarted,
-                gpus=report.gpus,
-                detail=report.detail,
-            )
-
+    async def _pod_gpu_operation_held(
+        self,
+        payload: ResetPodGpuRequest | LockPodGpuClocksRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+        label: str,
+        kind: str,
+        operate: Callable[[SSHCommandRunner, str, Any, dict], Awaitable[_PodGpuReport]],
+        failed: Callable[[str], _PodGpuReport],
+        gpu_uuids: list[str] | None,
+        after: Callable[[_PodGpuReport | None, dict], Awaitable[None]] | None,
+        default_extra: dict,
+    ) -> _PodGpuReport:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
         try:
@@ -11939,28 +12180,13 @@ class DockerService:
             )
             require_rental_docker_ssh_host_key(executor_info)
         except (AttestationError, RentalDockerConnectionError) as exc:
-            logger.error(_m("Reset pod GPUs: executor not trusted", extra=get_extra_info({**default_extra, "error": str(exc)})))
-            return result(GpuResetReport(ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=str(exc)))
-
-        async def start_container() -> None:
-            await self.start_existing_container(
-                executor_info=executor_info,
-                private_key=private_key,
-                known_hosts_policy=known_hosts_policy,
-                container_name=payload.container_name,
-                local_volume_path=payload.local_volume_path,
-                pod_id=payload.pod_id,
-                default_extra=default_extra,
-            )
+            logger.error(_m(f"{label}: executor not trusted", extra=get_extra_info({**default_extra, "error": str(exc)})))
+            return failed(str(exc))
 
         await self.redis_service.add_pending_pod(
-            payload.miner_hotkey,
-            payload.executor_id,
-            payload.pod_id,
-            kind=GPU_RESET_PENDING_KIND,
-            gpu_uuids=payload.gpu_uuids,
+            payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=kind, gpu_uuids=gpu_uuids
         )
-        report: GpuResetReport | None = None
+        report: _PodGpuReport | None = None
         try:
             async with asyncssh.connect(
                 host=executor_info.address,
@@ -11970,20 +12196,50 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
-                report = await reset_pod_gpus(
-                    SSHCommandRunner(ssh_client, max_retries=0),
-                    container_name=payload.container_name,
-                    pod_gpu_uuids=payload.gpu_uuids,
-                    gpu_indices=payload.gpu_indices,
-                    start_container=start_container,
-                    in_tee=bool(executor_info.tdx_quote),
-                    encrypted_volume_mount=_LIUM_CIPHER_MOUNT,
-                    local_volume_path=payload.local_volume_path,
+                report = await operate(
+                    SSHCommandRunner(ssh_client, max_retries=0), private_key, known_hosts_policy, default_extra
                 )
         except Exception as exc:
-            logger.error(_m("Reset pod GPUs failed", extra=get_extra_info({**default_extra, "error": str(exc)})), exc_info=True)
-            report = GpuResetReport(ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=str(exc))
+            logger.error(_m(f"{label} failed", extra=get_extra_info({**default_extra, "error": str(exc)})), exc_info=True)
+            report = failed(str(exc))
         finally:
+            if after is not None:
+                await after(report, default_extra)
+            try:
+                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            except Exception as exc:
+                logger.warning(
+                    _m(f"{label}: pending mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+
+        logger.info(
+            _m(
+                f"{label} done",
+                extra=get_extra_info({
+                    **default_extra,
+                    "ok": report.ok,
+                    "error_code": report.error_code.value if report.error_code else None,
+                    "container_restarted": getattr(report, "container_restarted", None),
+                    "gpus": [gpu.model_dump() for gpu in report.gpus],
+                    "detail": report.detail,
+                }),
+            )
+        )
+        return report
+
+    async def reset_pod_gpus(
+        self,
+        payload: ResetPodGpuRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ) -> PodGpuResetResult:
+        """DAH-4658: a renter's reset of their pod's GPUs (services/gpu_reset.py does the work). The
+        pending-pod mark (kind gpu_reset) is held throughout, so the rented GPU checks skip the pod
+        and no verified-job reset it can cause is sent: a renter's reset is never a provider fault. A short
+        recent-reset mark then covers the scrape that ends just after it."""
+
+        async def mark_recent(report: GpuResetReport | None, default_extra: dict) -> None:
             # a scrape that ends just after the reset can still miss cards: keep a short mark past the pending one;
             # a reset refused before the pod stopped never took the cards out (None: cancelled mid-reset)
             try:
@@ -11999,27 +12255,105 @@ class DockerService:
                 logger.warning(
                     _m("Reset pod GPUs: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
                 )
-            try:
-                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            except Exception as exc:
-                logger.warning(
-                    _m("Reset pod GPUs: pending reset mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))
+
+        async def operate(runner: SSHCommandRunner, private_key: str, known_hosts_policy, default_extra: dict):
+            async def start_container() -> None:
+                await self.start_existing_container(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                    known_hosts_policy=known_hosts_policy,
+                    container_name=payload.container_name,
+                    local_volume_path=payload.local_volume_path,
+                    pod_id=payload.pod_id,
+                    default_extra=default_extra,
                 )
 
-        logger.info(
-            _m(
-                "Reset pod GPUs done",
-                extra=get_extra_info({
-                    **default_extra,
-                    "ok": report.ok,
-                    "error_code": report.error_code.value if report.error_code else None,
-                    "container_restarted": report.container_restarted,
-                    "gpus": [gpu.model_dump() for gpu in report.gpus],
-                    "detail": report.detail,
-                }),
+            return await reset_pod_gpus(
+                runner,
+                container_name=payload.container_name,
+                pod_gpu_uuids=payload.gpu_uuids,
+                gpu_indices=payload.gpu_indices,
+                start_container=start_container,
+                in_tee=bool(executor_info.tdx_quote),
+                encrypted_volume_mount=_LIUM_CIPHER_MOUNT,
+                local_volume_path=payload.local_volume_path,
             )
+
+        report: GpuResetReport = await self._pod_gpu_operation(
+            payload,
+            executor_info,
+            keypair,
+            private_key,
+            label="Reset pod GPUs",
+            kind=GPU_RESET_PENDING_KIND,
+            operate=operate,
+            after=mark_recent,
+            failed=lambda detail: GpuResetReport(
+                ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=detail
+            ),
+            gpu_uuids=payload.gpu_uuids,
         )
-        return result(report)
+        return PodGpuResetResult(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            request_id=payload.request_id,
+            ok=report.ok,
+            error_code=report.error_code,
+            container_restarted=report.container_restarted,
+            gpus=report.gpus,
+            detail=report.detail,
+        )
+
+    async def lock_pod_gpu_clocks(
+        self,
+        payload: LockPodGpuClocksRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ) -> PodGpuClocksResult:
+        """DAH-4663: a renter's lock (or reset) of their pod's GPU clocks (services/gpu_clocks.py does the
+        work). The pending-pod mark (kind gpu_clocks) is held throughout, so a second operation is declined."""
+
+        async def operate(runner: SSHCommandRunner, _private_key: str, _known_hosts_policy, _default_extra: dict):
+            return await lock_pod_gpu_clocks(
+                runner,
+                self.redis_service,
+                container_name=payload.container_name,
+                pod_id=payload.pod_id,
+                executor_id=payload.executor_id,
+                pod_gpu_uuids=payload.gpu_uuids,
+                gpu_indices=payload.gpu_indices,
+                min_mhz=payload.min_mhz,
+                max_mhz=payload.max_mhz,
+                reset=payload.reset,
+                in_tee=bool(executor_info.tdx_quote),
+            )
+
+        report: GpuClocksReport = await self._pod_gpu_operation(
+            payload,
+            executor_info,
+            keypair,
+            private_key,
+            label="Lock pod GPU clocks",
+            kind=GPU_CLOCKS_PENDING_KIND,
+            operate=operate,
+            failed=lambda detail: GpuClocksReport(
+                ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=detail
+            ),
+        )
+        return PodGpuClocksResult(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            request_id=payload.request_id,
+            ok=report.ok,
+            error_code=report.error_code,
+            gpus=report.gpus,
+            detail=report.detail,
+        )
 
     async def remove_ssh_keys(
         self,
