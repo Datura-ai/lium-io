@@ -87,6 +87,9 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Ada consumer
     "NVIDIA GeForce RTX 4090": [24576],  # 24 GB; observed: 24564 (99.6%), 23028 (0.4%)
     "NVIDIA GeForce RTX 4090 D": [24576],  # 24 GB
+    # DAH-5508: a 48 GB RTX 4090 reports the plain 4090 name; classify_gpu_model names it this, only
+    # while RTX_4090_48GB_MODEL_ENABLED is on. Not launched.
+    "NVIDIA GeForce RTX 4090 48GB": [49152],  # 48 GB
     "NVIDIA GeForce RTX 4080 SUPER": [16384],  # 16 GB
     "NVIDIA GeForce RTX 4080": [16384],  # 16 GB
     "NVIDIA GeForce RTX 4070 Ti SUPER": [16384],  # 16 GB
@@ -117,6 +120,8 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Ampere data-center
     "NVIDIA A100 80GB PCIe": [81920],  # 80 GB; observed: 81920
     "NVIDIA A100-SXM4-80GB": [81920],  # 80 GB; observed: 81920
+    "NVIDIA A100-PCIE-40GB": [40960],  # 40 GB
+    "NVIDIA A100-SXM4-40GB": [40960],  # 40 GB; observed: 40960
     "NVIDIA A800 80GB PCIe": [81920],  # 80 GB
     "NVIDIA A10 Tensor Core GPU": [24576],  # 24 GB
     # Only 8 GB is a factory SKU; 40/64 GB come from the community driver unlock.
@@ -220,6 +225,27 @@ def normalize_gpu_model(name: str | None) -> str:
         return ""
     stripped = name.strip()
     return NORMALIZATION_MAP.get(stripped, stripped)
+
+
+RTX_4090 = "NVIDIA GeForce RTX 4090"
+RTX_4090_48GB = "NVIDIA GeForce RTX 4090 48GB"
+
+
+def classify_gpu_model(name: str | None, capacity_mb: int | float | None, rtx_4090_48gb_enabled: bool) -> str:
+    """normalize_gpu_model, plus the RTX 4090 48GB split (DAH-5508).
+
+    With the setting on, an RTX 4090 whose VRAM is in the 48 GB window is its own model. No driver
+    reports the 48GB name itself, so a card that does is treated as a plain RTX 4090: only its VRAM,
+    and only with the setting on, makes it the 48 GB model. Every other card is normalize_gpu_model.
+    """
+    canonical = normalize_gpu_model(name)
+    if canonical == RTX_4090_48GB:
+        canonical = RTX_4090
+    if rtx_4090_48gb_enabled and canonical == RTX_4090 and isinstance(capacity_mb, (int, float)):
+        low, high = vram_window_for_size(GPU_VRAM_SIZES_MB[RTX_4090_48GB][0])
+        if low <= capacity_mb <= high:
+            return RTX_4090_48GB
+    return canonical
 
 
 def vram_window_for_size(nominal_mb: int) -> tuple[int, int]:

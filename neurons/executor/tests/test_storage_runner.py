@@ -1341,6 +1341,43 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
     )
 
 
+def test_reporter_sends_restic_summary_only_on_completed_backup() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+        ),
+        session=session,
+    )
+    summary = {
+        "message_type": "summary",
+        "data_added": 4096,
+        "data_added_packed": 2048,
+        "files_new": 2,
+        "files_changed": 1,
+        "files_unmodified": 7,
+        "snapshot_id": "a" * 64,
+    }
+
+    reporter.send({"event": "restic", "payload": summary})
+    assert "data_added_bytes" not in session.requests[-1]["json"]
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "FULL"})
+
+    terminal_payload = session.requests[-1]["json"]
+    assert isinstance(terminal_payload, dict)
+    assert terminal_payload["data_added_bytes"] == 4096
+    assert terminal_payload["data_added_packed_bytes"] == 2048
+    assert (
+        terminal_payload["files_new"],
+        terminal_payload["files_changed"],
+        terminal_payload["files_unmodified"],
+    ) == (2, 1, 7)
+
+
 class _FailingReporterSession:
     def put(self, *args: object, **kwargs: object) -> None:
         raise requests.ConnectionError("backend unavailable")

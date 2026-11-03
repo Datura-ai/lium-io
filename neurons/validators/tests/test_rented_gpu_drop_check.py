@@ -226,8 +226,8 @@ ECC_FLAGS = [f"gpu 3 ({UUIDS[3]}): 1 uncorrected ECC error(s) since the driver l
 
 
 @pytest.mark.asyncio
-async def test_a_broken_card_on_a_partly_rented_node_is_not_named(context_factory):
-    # the rental does not say which cards the pod holds: the broken card may be one no pod rents
+async def test_a_broken_card_on_a_partly_rented_node_is_named(context_factory):
+    # counts intact: a report naming no card is refused by the backend, which maps the UUID to its renter
     services = _services()
     ctx = _ctx(context_factory, services, listed=UUIDS, gpu_count=1).model_copy(
         update={"runner": FakeRunner(_report("flagged", flags=ECC_FLAGS))}
@@ -238,10 +238,11 @@ async def test_a_broken_card_on_a_partly_rented_node_is_not_named(context_factor
     assert result.event.what_we_saw["faults"] == [FAULT_ECC_UNCORRECTED]
     call = services.backend.report_rented_gpu_drop.await_args
     assert call.kwargs["faults"] == [FAULT_ECC_UNCORRECTED]
-    assert call.kwargs["missing_uuids"] == []
+    assert call.kwargs["missing_uuids"] == [UUIDS[3]]
+    assert call.kwargs["expected_gpu_count"] == call.kwargs["visible_gpu_count"] == 8
 
 
-def test_a_card_off_the_bus_does_not_make_a_part_rental_look_like_the_whole_node():
+def test_a_card_off_the_bus_and_a_broken_card_are_both_named_on_a_part_rental():
     # 8 anchored cards, one fell off the bus so NVML and the scrape list 7, and the rental holds 7
     drop = judge_rented_gpus(
         rented_gpu_count=7,
@@ -253,9 +254,7 @@ def test_a_card_off_the_bus_does_not_make_a_part_rental_look_like_the_whole_node
         broken_uuids=[UUIDS[3]],
     )
 
-    assert (
-        len(drop.missing_uuids) == 1
-    )  # the card off the bus; the broken card may be one no pod rents
+    assert drop.missing_uuids == [UUIDS[7], UUIDS[3]]
 
 
 UNREAD_MEMORY = [
@@ -344,6 +343,22 @@ async def test_a_whole_set_of_other_cards_is_posted_with_the_new_cards(context_f
 
 
 @pytest.mark.asyncio
+async def test_a_pod_whose_reboot_failed_still_posts_the_new_cards(context_factory):
+    services = _services()
+    new = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(8)]
+    ctx = _ctx(context_factory, services, listed=new, status="REBOOT_FAILED").model_copy(
+        update={"runner": FakeRunner(_report("ok"))}
+    )
+
+    await RentedGpuDropCheck().run(ctx)
+
+    call = services.backend.report_rented_gpu_drop.await_args
+    assert FAULT_ANCHORED_MISSING in call.kwargs["faults"]
+    assert call.kwargs["missing_uuids"] == sorted(UUIDS)
+    assert call.kwargs["gpu_details"] == _details(new)
+
+
+@pytest.mark.asyncio
 async def test_a_fault_with_every_anchored_card_listed_posts_no_cards(context_factory):
     services = _services()
     flags = [f"gpu 3 ({UUIDS[3]}): 1 uncorrected ECC error(s) since the driver loaded"]
@@ -351,3 +366,67 @@ async def test_a_fault_with_every_anchored_card_listed_posts_no_cards(context_fa
     await _run_with_memory_read(context_factory, services, _report("flagged", flags=flags))
 
     assert services.backend.report_rented_gpu_drop.await_args.kwargs["gpu_details"] is None
+
+
+def _at(*isos: str):
+    """Patch the check's clock to return these cycle times in turn."""
+    from datetime import datetime as real
+
+    clock = patch.object(rented_gpu_drop, "datetime")
+    mocked = clock.start()
+    mocked.now.side_effect = [real.fromisoformat(iso) for iso in isos]
+    return clock
+
+
+@pytest.mark.asyncio
+async def test_reports_carry_the_observation_time_and_a_retried_recovery_keeps_it(context_factory):
+    t_fault, t_clean, t_retry = (
+        "2026-11-02T10:00:00+00:00",
+        "2026-11-02T10:05:00+00:00",
+        "2026-11-02T10:10:00+00:00",
+    )
+    services = _services()
+    clock = _at(t_fault, t_clean, t_retry)
+    try:
+        await RentedGpuDropCheck().run(_ctx(context_factory, services, listed=UUIDS[:7], count=7))
+        services.backend.report_rented_gpu_drop.return_value = None  # the recovery goes unanswered
+        await RentedGpuDropCheck().run(_ctx(context_factory, services, listed=UUIDS))
+        services.backend.report_rented_gpu_drop.return_value = NOTIFIED
+        await RentedGpuDropCheck().run(_ctx(context_factory, services, listed=UUIDS))
+    finally:
+        clock.stop()
+
+    calls = services.backend.report_rented_gpu_drop.await_args_list
+    assert [(c.kwargs["state"], c.kwargs["observed_at"]) for c in calls] == [
+        ("fault", t_fault),
+        ("recovered", t_clean),
+        ("recovered", t_clean),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_backend_client_posts_observed_at():
+    from unittest.mock import AsyncMock
+
+    from neurons.validators.src.clients.backend_client import BackendClient
+
+    client = BackendClient.__new__(BackendClient)
+    client.post = AsyncMock(return_value=None)
+    kwargs = dict(
+        state="recovered",
+        executor_id="e",
+        first_seen_at="t0",
+        consecutive_cycles=1,
+        expected_gpu_count=0,
+        visible_gpu_count=0,
+        missing_uuids=[],
+        nvml_error_code=None,
+        faults=[],
+        pod_gpu_count=8,
+        rented_gpu_count=8,
+        nvml_gpu_count=8,
+    )
+    await client.report_rented_gpu_drop(POD_ID, observed_at="t1", **kwargs)
+    assert client.post.await_args.kwargs["json_data"]["observed_at"] == "t1"
+    await client.report_rented_gpu_drop(POD_ID, **kwargs)
+    assert "observed_at" not in client.post.await_args.kwargs["json_data"]

@@ -49,6 +49,7 @@ from .checks import (
     GpuKernelCountCheck,
     GpuLossHoldCheck,
     GpuModelValidCheck,
+    GpuClockLockCheck,
     GpuPowerLimitCheck,
     GpuThermalThrottleCheck,
     GpuUsageCheck,
@@ -407,6 +408,8 @@ class PipelineFactory:
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
+                # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
+                GpuClockLockCheck(),
                 GpuUsageCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
@@ -535,6 +538,8 @@ class PipelineFactory:
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
+                # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
+                GpuClockLockCheck(),
                 GpuUsageCheck(),
                 LocalVerifyCheck(),
                 VerifyXCheck(),
