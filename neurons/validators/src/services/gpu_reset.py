@@ -118,6 +118,8 @@ STOP_GRACE_SECONDS = 10
 CONTAINER_STATE_COMMAND = f"{DOCKER} inspect -f '{{{{.State.Running}}}} {{{{.State.Restarting}}}}'"
 # a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
 EXIT_WAIT_SECONDS = 90
+# after the kill of a container that outlasted EXIT_WAIT_SECONDS
+KILL_WAIT_SECONDS = 30
 _QUERY_TIMEOUT_SECONDS = 30
 _RESET_TIMEOUT_SECONDS = 120
 _DETAIL_TAIL_CHARS = 300
@@ -471,12 +473,15 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         start = " ".join(shlex.quote(u) for u in reversed(units))
         script += f'for u in {start}; do systemctl start "$u"; done; '
     if containers:
-        # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: this unit
-        # owns its start until the exit is seen (only a removed container ends the wait, which the validator
-        # reports; a transient inspect failure keeps waiting)
+        # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: wait for
+        # the exit (a removed container ends the wait), then kill one still there and wait once more. Bounded, so
+        # the unit always ends inside the validator's wait and the renter pod starts; a holder still down is
+        # reported by the validator's restore check
         script += (
             f'[ -z "$dying" ] || until timeout {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
-            '! docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; sleep 5; done; '
+            '! docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; '
+            'echo "$dying did not exit, killing it" >&2; docker kill "$dying" >/dev/null 2>&1; '
+            f'timeout {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1; break; done; '
         )
         ids = " ".join(shlex.quote(c) for c in reversed(containers))
         script += f'for u in {ids}; do docker start "$u" >/dev/null; done; '

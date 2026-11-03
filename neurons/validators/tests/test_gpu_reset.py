@@ -599,6 +599,9 @@ def test_the_host_unit_waits_for_an_exporter_whose_stop_failed_before_starting_i
         ("Cannot connect to the Docker daemon", 2, "0 0"),
         # a removed container ends the wait; its failed start is the validator's restoration failure
         ("Error: No such object: e1", 99, "1 1"),
+        # an exporter that outlives its kill (stuck in the kernel) no longer holds the unit: it ends, and the
+        # validator's restore check reports the exporter down
+        ("", 99, "1 1"),
     ],
 )
 def test_the_host_unit_keeps_waiting_for_an_exporter_whose_exit_outlasts_one_wait(
