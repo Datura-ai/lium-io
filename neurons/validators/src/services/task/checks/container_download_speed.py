@@ -19,6 +19,7 @@ from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 from ..messages import ContainerDownloadSpeedMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,7 @@ class ContainerDownloadSpeedCheck:
         if not settings.CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED:
             return self._skipped(ctx, "CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED is off")
         rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
         if rented_executor is not None and rented_executor.pods:
             return self._skipped(ctx, "rented")
         if rented_data is not None and rented_data.get_filler_containers(ctx.executor.uuid):

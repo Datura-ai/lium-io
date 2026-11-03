@@ -38,13 +38,13 @@ def policy() -> ExpectedImageSnapshot:
     )
 
 
-def rented_data() -> RentedExecutorsResponse:
+def rented_data(miner_hotkey: str = "test-miner", port: str = "22") -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
-                miner_hotkey="test-miner",
+                miner_hotkey=miner_hotkey,
                 executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
+                executor_ip_port=port,
                 pods=[RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[8080, 8081])],
             )
         },
@@ -128,3 +128,17 @@ def test_score_calculator_zeroes_outdated_executor(
     assert "Required executor image is outdated" in warning
 
 
+@pytest.mark.asyncio
+async def test_outdated_executor_under_another_miners_rental_on_a_different_endpoint_fails(enforce):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(
+            specs=specs(executor_digest=STALE_DIGEST),
+            rented_data=rented_data(miner_hotkey="other-miner-hotkey", port="2222"),
+        ),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is False

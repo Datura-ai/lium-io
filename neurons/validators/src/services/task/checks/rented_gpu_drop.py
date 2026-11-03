@@ -84,6 +84,8 @@ RENTED_GPU_DROP_KEY_PREFIX = "rented_gpu_drop"
 
 # The one pod status that holds a renter's cards; a backend that predates the field sends none.
 POD_STATUS_RUNNING = "RUNNING"
+# A pod whose reboot is pending or failed still holds the renter's cards, so a drop under it is reported too.
+_RENTED_POD_STATUSES = (None, POD_STATUS_RUNNING, "REBOOT_PENDING", "REBOOT_FAILED")
 # What a failing Redis raises through RedisService: the client's errors and the socket errors under them.
 GPU_DROP_REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
 
@@ -360,7 +362,7 @@ class RentedGpuDropCheck:
         if rented_executor is not None and rented_executor.miner_hotkey != ctx.miner_hotkey:
             rented_executor = None
         all_pods = list(rented_executor.pods) if rented_executor else []
-        pods = [pod for pod in all_pods if pod.status in (None, POD_STATUS_RUNNING)]
+        pods = [pod for pod in all_pods if pod.status in _RENTED_POD_STATUSES]
         if not pods:
             event = render_message(
                 Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id, what={"listed_pods": len(all_pods)}
