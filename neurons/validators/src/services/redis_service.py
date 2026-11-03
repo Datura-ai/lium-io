@@ -794,14 +794,7 @@ class RedisService:
             saved_command_id = ""  # unreadable: never resent anyway
         if keep(saved_command_id):
             return
-        async with self.lock:
-            await self.redis.eval(
-                "if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then return redis.call('HDEL', KEYS[1], ARGV[1]) end return 0",
-                1,
-                UNACKED_CONTAINER_CREATED_KEY,
-                pod_id,
-                saved,
-            )
+        await self.remove_unacked_container_created(pod_id, saved)
 
     async def claim_backend_command(self, command_id: str, claim: str) -> BackendCommand | None:
         key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
@@ -865,8 +858,17 @@ class RedisService:
     async def add_unacked_container_created(self, pod_id: str, message_json: str) -> None:
         await self.hset(UNACKED_CONTAINER_CREATED_KEY, pod_id, message_json)
 
-    async def remove_unacked_container_created(self, pod_id: str) -> None:
-        await self.hdel(UNACKED_CONTAINER_CREATED_KEY, pod_id)
+    async def remove_unacked_container_created(self, pod_id: str, saved: str | bytes) -> None:
+        """Deletes the pod's saved report only while it is still `saved`, the one the caller read: a newer
+        dispatch's report saved meanwhile stays (lium-io#1952)."""
+        async with self.lock:
+            await self.redis.eval(
+                "if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then return redis.call('HDEL', KEYS[1], ARGV[1]) end return 0",
+                1,
+                UNACKED_CONTAINER_CREATED_KEY,
+                pod_id,
+                saved,
+            )
 
     async def unacked_container_created(self) -> dict[str, str]:
         """pod id -> the ContainerCreated JSON the backend has not answered yet"""

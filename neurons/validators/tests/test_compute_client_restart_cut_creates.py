@@ -730,3 +730,26 @@ async def test_a_late_receipt_never_deletes_a_success_saved_after_its_check() ->
     await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")
 
     assert (await redis_service.unacked_container_created())["pod-1"] == new
+
+
+@pytest.mark.asyncio
+async def test_the_replays_expiry_never_deletes_a_success_a_new_dispatch_saved_after_the_read() -> None:
+    # A is read with no pending flag; reboot B writes its flag and success before the flag check returns
+    redis_service = _redis_service()
+    client = await _create_and_send_container_created(redis_service, "cmd-a")
+    await redis_service.hdel("pending_pods_prefix", "miner-hk:exec-1")
+    reboot = ContainerCreated(
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1",
+        container_name="c-1", volume_name="v-1", port_maps=[(22, 40023)], command_id="cmd-b",
+    ).model_dump_json()
+    flag_check = redis_service.renting_in_progress
+
+    async def flag_check_while_the_reboot_saves(*args) -> bool:
+        pending = await flag_check(*args)
+        await redis_service.add_unacked_container_created("pod-1", reboot)
+        return pending
+
+    redis_service.renting_in_progress = flag_check_while_the_reboot_saves
+    await client.resend_unacked_container_created()
+
+    assert (await redis_service.unacked_container_created())["pod-1"] == reboot

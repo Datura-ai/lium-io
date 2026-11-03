@@ -1205,7 +1205,7 @@ class ComputeClient:
             try:
                 if not await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id):
                     # the pending flag expired or was wiped: the backend no longer waits on this create
-                    await redis_service.remove_unacked_container_created(pod_id)
+                    await redis_service.remove_unacked_container_created(pod_id, message_json)
                     continue
             except Exception as exc:
                 self._log_unacked_container_created_error(pod_id, exc)
