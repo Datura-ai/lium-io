@@ -5,6 +5,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from services.gpu_spec_table import normalize_gpu_model
+
 from ..messages import NvlinkFaultMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -16,6 +18,20 @@ PROBE_JSON_MARKER = "NVLINK_MULTICAST_PROBE_JSON:"
 # above the probe's own 45 s budget; only catches a stalled SSH channel (scored UNKNOWN)
 PROBE_TIMEOUT_SECONDS = 75
 MAX_CHARS = 300
+# These GPUs ship only as SXM modules on an NVLink baseboard, so a full 8-GPU board of them with no NVLink
+# at all has its fabric down (fabric manager or NVSwitch), not a PCIe build. Fewer GPUs can be a VM slice.
+NVLINK_BASEBOARD_GPUS = frozenset(
+    {
+        "NVIDIA H100 80GB HBM3",
+        "NVIDIA H800 80GB HBM3",
+        "NVIDIA H200",
+        "NVIDIA B200",
+        "NVIDIA B300 SXM6 AC",
+        "NVIDIA B300 SXM6 PC",
+        "NVIDIA A100-SXM4-80GB",
+    }
+)
+BASEBOARD_GPU_COUNT = 8
 
 
 class NvlinkFaultCheck:
@@ -30,14 +46,26 @@ class NvlinkFaultCheck:
     It runs beside an active filler: on 8x H100 and 8x B300 (28 Oct) the probe passed beside an NVLS
     all-reduce filler, which kept exact results with one slower second per probe. A filler holding
     nearly all GPU memory can leave no room for the probe's context: NVLINK_UNKNOWN, the node passes.
+
+    A full 8x board of SXM-only GPUs that reports no NVLink at all fails with NVLINK_MISSING: an 8x H100
+    HBM3 (1 Nov) was listed with PCIe-only topology (fabric down) and a renter found no NVLink.
     """
 
     check_id = "gpu.validate.nvlink_fault"
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        interconnect = (ctx.state.specs or {}).get("interconnect")
+        specs = ctx.state.specs or {}
+        interconnect = specs.get("interconnect")
         if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is True):
+            missing_nvlink = _missing_nvlink_on_sxm_board(specs, interconnect)
+            if missing_nvlink is not None:
+                return CheckResult(
+                    passed=False,
+                    event=render_message(
+                        Msg.MISSING, ctx=ctx, check_id=self.check_id, what=missing_nvlink
+                    ),
+                )
             return CheckResult(
                 passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             )
@@ -73,6 +101,23 @@ class NvlinkFaultCheck:
         return CheckResult(
             passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         )
+
+
+def _missing_nvlink_on_sxm_board(specs: dict[str, Any], interconnect: Any) -> dict[str, Any] | None:
+    # only an explicit nvlink False counts; an old executor without the interconnect scrape is skipped
+    if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is False):
+        return None
+    details = (specs.get("gpu") or {}).get("details") or []
+    # specs keep the raw NVML name (e.g. "Tesla H100 80GB HBM3")
+    names = {normalize_gpu_model(gpu.get("name")) for gpu in details if isinstance(gpu, dict)}
+    if len(details) < BASEBOARD_GPU_COUNT or len(names) != 1 or not names <= NVLINK_BASEBOARD_GPUS:
+        return None
+    return {
+        "gpu_name": next(iter(names)),
+        "gpu_count": len(details),
+        "nvlink_active_links": interconnect.get("nvlink_active_links"),
+        "pcie_class": interconnect.get("pcie_class"),
+    }
 
 
 def _parse_report(stdout: str) -> dict[str, Any] | None:

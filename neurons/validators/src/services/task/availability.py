@@ -33,6 +33,8 @@ class ReachTarget(StrEnum):
     EXECUTOR_API = "executor_api"
     # A card on the node (GpuLossHoldCheck): the validator cannot reach it through NVML.
     GPU = "gpu"
+    # The node as a whole: a fatal check failed (failed_check_event).
+    NODE = "node"
 
 
 # The longest peer-supplied text a reading may keep: the node writes it, the portal shows it.
@@ -53,15 +55,25 @@ class AvailabilityErrorCode(StrEnum):
     RENTED_EXECUTOR_NOT_LISTED = "RENTED_EXECUTOR_NOT_LISTED"
     # An unrented node the miner lists (known_executor_ids) but could not reach to install our key.
     EXECUTOR_UNREACHABLE_BY_MINER = "EXECUTOR_UNREACHABLE_BY_MINER"
-    # DAH-4457: a GPU dropped out of NVML within the hold window (GpuLossHoldCheck).
+    # DAH-4457: a GPU dropped out of NVML and the node has not yet read clean and passed the load test (GpuLossHoldCheck).
     GPU_LOST = "GPU_LOST"
     # DAH-4683: NVML reports a card's memory broken (GpuMemoryHealthCheck).
     GPU_MEMORY_HEALTH_FAILED = "GPU_MEMORY_HEALTH_FAILED"
+    # DAH-5395: a run ended by a failure that hides the node at once (failed_check_event).
+    VERIFICATION_FAILED = "VERIFICATION_FAILED"
+    # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
+    GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
 
 
-# Faults of the node's own cards: never a sign of our own outage, and never silenced with one.
+# Faults the node itself proved: never a sign of our own outage, and never silenced with one.
 NODE_GPU_FAULT_CODES = frozenset(
-    {AvailabilityErrorCode.GPU_LOST, AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED}
+    {
+        AvailabilityErrorCode.GPU_LOST,
+        AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
+        AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
+        # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
+        AvailabilityErrorCode.VERIFICATION_FAILED,
+    }
 )
 
 
@@ -285,3 +297,30 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
         ]
         result.availability_errors = node_gpu_fault_entries or None
     return len(checked_results)
+
+
+# DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
+REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "NVLINK_FAULT"})
+
+
+def failed_check_event(ok: bool, events: list[ValidationEvent]) -> ValidationEvent | None:
+    """The availability entry for a run ended by a reason in REASONS_THAT_HIDE_AT_ONCE, else None.
+
+    The backend hides the node on it and lists it again on the next cycle that sends an empty list.
+    A run that already raised an availability error gets none, so nothing is doubled.
+    """
+    if ok or not events or any(e.is_availability_error for e in events):
+        return None
+    last_event = events[-1]
+    if last_event.reason_code not in REASONS_THAT_HIDE_AT_ONCE:
+        return None
+    return build_availability_event(
+        code=AvailabilityErrorCode.VERIFICATION_FAILED,
+        reach_source=ReachSource.VALIDATOR,
+        reach_target=ReachTarget.NODE,
+        event_text="The node failed a verification check",
+        impact="Hidden and takes no new rentals until a check passes; a rental already on it is not touched",
+        remediation="See the failed check's message for the cause. The node is listed again on the first check "
+        "that passes.",
+        what_we_saw={"failed_check": last_event.check_id, "failed_reason": last_event.reason_code},
+    )

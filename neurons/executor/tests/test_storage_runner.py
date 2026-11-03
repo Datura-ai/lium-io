@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,8 @@ from storage.restic import (
     ResticStorageRunner,
     RestoreStats,
     StorageOperationCancelled,
+    kernel_kill_lines,
+    kernel_kill_note,
     restic_restore_helper_memory,
 )
 from storage.workspace import (
@@ -224,6 +227,59 @@ def test_backup_repository_probe_retries_transient_access_denied(
         "init",
     ]
     assert clock.now == 2.0
+    assert '"event":"heartbeat"' in event_output.getvalue()
+
+
+def test_backup_repository_probe_retries_closed_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    clock = _RetryClock()
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error='Stat: Head "https://bucket/restic/config": Connection closed by foreign host',
+            ),
+            _repository_command_result(0, standard_output="[]"),
+        ]
+    )
+
+    def slow_restic(*args: object, **kwargs: object) -> object:
+        clock.now += 900.0  # restic's own retries outlast the readiness window
+        return repository_command_sequence(*args, **kwargs)
+
+    monkeypatch.setattr("storage.restic.subprocess.run", slow_restic)
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    runner._ensure_repository_for_backup()
+
+    assert [command[2] for command in repository_command_sequence.commands] == [
+        "snapshots",
+        "snapshots",
+    ]
+
+
+def test_slow_repository_probe_keeps_heartbeating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    event_output = io.StringIO()
+    event_writer = JsonEventWriter(
+        str(OPERATION_ID), 0, heartbeat_interval_seconds=0.0, output=event_output
+    )
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path), event_writer=event_writer)
+
+    def slow_probe(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        time.sleep(1.5)
+        return _repository_command_result(0, standard_output="[]")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", slow_probe)
+    runner._ensure_repository_for_backup()
+
     assert '"event":"heartbeat"' in event_output.getvalue()
 
 
@@ -742,6 +798,15 @@ def test_exit_code_three_with_snapshot_is_completed_partial(
     assert '"result_quality":"PARTIAL"' in output.getvalue()
 
 
+HELPER_ID = "4f2a" + "0" * 60
+OOM_KILL_DMESG = f"""[1000.1] restic invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=1000
+[1000.2] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=docker-{HELPER_ID}.scope,mems_allowed=0,\
+oom_memcg=/system.slice/docker-{HELPER_ID}.scope,task_memcg=/system.slice/docker-{HELPER_ID}.scope,task=restic,pid=4242,uid=0
+[1000.3] Memory cgroup out of memory: Killed process 4242 (restic) total-vm:9000000kB, anon-rss:4100000kB, file-rss:0kB
+[1000.4] oom_reaper: reaped process 4242 (restic), now anon-rss:0kB
+"""
+
+
 class _KilledPopen(_FakePopen):
     def wait(self) -> int:
         return 137
@@ -749,29 +814,40 @@ class _KilledPopen(_FakePopen):
 
 @pytest.mark.parametrize("action", ["backup", "restore"])
 @pytest.mark.parametrize(
-    ("oom_killed", "message"),
+    ("oom_killed", "kernel_log", "message"),
     [
-        (True, " ran out of memory"),
-        (False, " helper was killed (Docker recorded no out-of-memory kill)"),
-        (None, " helper was killed (often out of memory)"),  # docker inspect failed
-        ("", " helper was killed (often out of memory)"),  # docker inspect printed nothing
+        (True, "", " ran out of memory"),
+        (False, "", " helper was killed (Docker recorded no out-of-memory kill)"),
+        (False, OOM_KILL_DMESG, " ran out of memory"),  # the kernel's OOM kill that Docker's flag missed
+        (None, OOM_KILL_DMESG, " helper container was removed while running"),  # container gone
+        ("removing", "", " helper container was removed while running"),  # docker mid-removal
+        ("", OOM_KILL_DMESG, " helper was killed (helper state unknown)"),  # docker inspect printed nothing
+        ("error", OOM_KILL_DMESG, " helper was killed (helper state unknown)"),  # inspect failed otherwise
     ],
 )
-def test_killed_helper_reports_oom_only_when_docker_says_so(
+def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
     monkeypatch: pytest.MonkeyPatch,
     oom_killed: bool | str | None,
+    kernel_log: str,
     message: str,
     action: str,
 ) -> None:
     calls: list[list[str]] = []
     state = {"Status": "exited", "OOMKilled": oom_killed, "ExitCode": 137}
+    if oom_killed == "removing":
+        state = {"Status": "removing", "OOMKilled": False, "ExitCode": 137}
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
         if "inspect" in command:
             if oom_killed is None:
-                return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
-            return SimpleNamespace(returncode=0, stdout=json.dumps(state) if oom_killed != "" else "", stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="Error: No such container: x")
+            if oom_killed == "error":
+                return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+            inspection = json.dumps({"Id": HELPER_ID, "State": state})
+            return SimpleNamespace(returncode=0, stdout=inspection if oom_killed != "" else "", stderr="")
+        if command[0] == "dmesg":
+            return SimpleNamespace(returncode=0, stdout=kernel_log, stderr="")
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"id": SNAPSHOT_ID}]), stderr="")
 
     monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)  # restore's empty-target check
@@ -797,12 +873,41 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
 
     assert str(raised.value) == f"{action}{message}"
     assert session.puts[-1]["json"]["error_message"] == f"{action}{message}"
-    assert calls[-1][1:3] == ["rm", "--force"]
+    assert [c for c in calls if c[0] != "dmesg"][-1][1:3] == ["rm", "--force"]
     # detached runs delete stderr, so the state line must reach the reported operation logs
     log = "\n".join(session.puts[-1]["json"]["logs"] or [])
     assert ("docker state" in log) is (oom_killed is not True)
-    if oom_killed is False:
+    if oom_killed in (False, "removing"):
         assert '"ExitCode": 137' in log
+        kernel_line = "kernel: " + " | ".join(OOM_KILL_DMESG.splitlines()[1:3])
+        assert (kernel_line in log) is bool(kernel_log)
+    elif oom_killed is True:
+        assert not any(c[0] == "dmesg" for c in calls)
+    else:
+        # no ID: the host's OOM lines are never read, they would show other pods' data in the renter's logs
+        assert "kernel: no helper ID to match" in log
+        assert OOM_KILL_DMESG.splitlines()[1] not in log
+
+
+
+
+def test_kernel_kill_lines_match_the_helper_container_only() -> None:
+    assert kernel_kill_lines(OOM_KILL_DMESG, HELPER_ID) == OOM_KILL_DMESG.splitlines()[1:3]
+    assert kernel_kill_lines(OOM_KILL_DMESG.replace(HELPER_ID, "9" * 64), HELPER_ID) == []
+    assert kernel_kill_lines("", HELPER_ID) == []
+
+
+def test_kernel_kill_note_names_a_missing_kill_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_dmesg(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("dmesg")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", no_dmesg)
+    assert kernel_kill_note(HELPER_ID) == "kernel: dmesg unreadable (FileNotFoundError)"
+    monkeypatch.setattr(
+        "storage.restic.subprocess.run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="[1.0] unrelated\n", stderr=""),
+    )
+    assert kernel_kill_note(HELPER_ID) == "kernel: no kernel kill line for the helper"
 
 
 class _TerminatedRunnerPopen(_FakePopen):
@@ -1242,6 +1347,43 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
     assert terminal_payload["error_message"] == (
         "failed to save model.bin: no space left on device"
     )
+
+
+def test_reporter_sends_restic_summary_only_on_completed_backup() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+        ),
+        session=session,
+    )
+    summary = {
+        "message_type": "summary",
+        "data_added": 4096,
+        "data_added_packed": 2048,
+        "files_new": 2,
+        "files_changed": 1,
+        "files_unmodified": 7,
+        "snapshot_id": "a" * 64,
+    }
+
+    reporter.send({"event": "restic", "payload": summary})
+    assert "data_added_bytes" not in session.requests[-1]["json"]
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "FULL"})
+
+    terminal_payload = session.requests[-1]["json"]
+    assert isinstance(terminal_payload, dict)
+    assert terminal_payload["data_added_bytes"] == 4096
+    assert terminal_payload["data_added_packed_bytes"] == 2048
+    assert (
+        terminal_payload["files_new"],
+        terminal_payload["files_changed"],
+        terminal_payload["files_unmodified"],
+    ) == (2, 1, 7)
 
 
 class _FailingReporterSession:

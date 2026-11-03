@@ -26,14 +26,16 @@ from services.redis_service import (
     RENTAL_PROBE_OK_PREFIX,
 )
 
-from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
+from ...const import MIN_POD_PORT_COUNT, POD_CONTAINER_PREFIX
 from ...node_host import open_public_connection, public_host_sock
 from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
+from .rental_owner import rental_of_this_node
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +128,6 @@ _MIN_TASK_SECONDS_LEFT_STANDING = 270
 # the gate's reads can eat into the create's share; below this the probe would fail on our own budget
 # and renew the hold, so the cycle reaches no verdict instead (review)
 _MIN_CREATE_DEADLINE_SECONDS = 60
-_TASK_TIMEOUT_MARGIN_SECONDS = 120
 # the outer cap on delete_container (DAH-3467, review): a stop with its 30 s grace, a `rm -f` that
 # outlives the Docker SDK's 60 s read timeout, the 60 s inspect window plus one 15 s inspect past
 # it and six "volume is in use" retries 5 s apart come to about 190 s on the inspect-confirmed
@@ -233,6 +234,12 @@ class RentalProbeCheck:
     removes no `filler_*`, lifts no GPU power cap and reclaims no filler cache. The validator cannot
     stop a filler run in the backend, so removing the container would read as the provider killing
     it, and lifting a PEARL filler's cap is DAH-2356's hard-ban case.
+
+    DAH-5244: a cycle whose port check was deferred for disk pressure (`ContextState.port_check_deferred`:
+    the Docker root's sync stalls under a tenant's writes, so the port check republished its memory rather
+    than start a container) is skipped here too, standing failure applied as for any other skip: the
+    probe's create would wait in the same sync. The port check's bounded deferral streak ends in a real
+    check, and the probe runs with it.
     """
 
     check_id = "executor.validate.rental_probe"
@@ -323,8 +330,8 @@ class RentalProbeCheck:
     async def _may_probe(self, ctx: Context) -> _ProbeGate | CheckResult:
         """May the probe run on this node now? The gate, or the verdict-less result that stops the cycle.
 
-        In order: the standing failure, the cycle's skip reasons (rented, filler,
-        interval), the validator's inputs, the default renter image and its presence on the node, the
+        In order: the standing failure, the cycle's skip reasons (rented, the port check deferred for
+        disk pressure, interval), the validator's inputs, the default renter image and its presence on the node, the
         per-executor create lock, and the node's idleness re-read under that lock. A gate is returned
         with the lock held; every refusal after the lock was taken releases it first.
         """
@@ -516,23 +523,23 @@ class RentalProbeCheck:
         return CheckResult(passed=True, event=event)
 
 
-def _task_seconds_left(ctx: Context) -> float:
-    return settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
-
-
 def _create_deadline_seconds(ctx: Context) -> float:
     """The create's deadline: the full one, or what is left after a usual teardown when the cycle is late."""
-    return min(_CREATE_DEADLINE_SECONDS, _task_seconds_left(ctx) - _USUAL_TEARDOWN_SECONDS)
+    return min(_CREATE_DEADLINE_SECONDS, task_seconds_left(ctx) - _USUAL_TEARDOWN_SECONDS)
 
 
 async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[str | None, dict[str, Any]]:
-    rented_data = ctx.state.rented_data
-    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor and rented_executor.pods:
         return "rented", {"pods": [pod.pod_id for pod in rented_executor.pods]}
-    task_seconds_left = _task_seconds_left(ctx)
-    if task_seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
-        return "too little cycle time left", {"task_seconds_left": int(task_seconds_left)}
+    if ctx.state.port_check_deferred:
+        # DAH-5244: the port check republished its memory instead of starting a container on a Docker root
+        # whose sync stalls; the probe's create would wait in that same sync and fail the filler node at
+        # container_start. Bounded by the port check's own deferral streak, which ends in a real check.
+        return "port check deferred for disk pressure", {}
+    seconds_left = task_seconds_left(ctx)
+    if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
+        return "too little cycle time left", {"task_seconds_left": int(seconds_left)}
 
     try:
         last_ok = await _last_ok_at(ctx)
@@ -580,7 +587,7 @@ async def _busy_now(ctx: Context) -> _BusyNow:
         return _BusyNow(None)
     if rented is None:
         return _BusyNow(None)
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return _BusyNow(_RENTED_SINCE_CYCLE_START)
     fillers = frozenset(rented.get_filler_containers(ctx.executor.uuid))
@@ -594,10 +601,10 @@ async def _busy_now(ctx: Context) -> _BusyNow:
 
 
 def _missing_inputs(ctx: Context) -> str | None:
-    # generate_portMappings refuses fewer than MIN_PORT_COUNT free ports, so a create with fewer would
-    # fail at port_mapping every cycle
-    if len(ctx.state.verified_port_pairs) < MIN_PORT_COUNT:
-        return f"{MIN_PORT_COUNT} verified ports"
+    # generate_portMappings refuses fewer than MIN_POD_PORT_COUNT free ports (the probe runs no Jupyter), so a
+    # create with fewer would fail at port_mapping every cycle
+    if len(ctx.state.verified_port_pairs) < MIN_POD_PORT_COUNT:
+        return "verified port"
     if not _gpu_uuids(ctx):
         return "GPU UUIDs"
     if not ctx.executor_ssh_private_key_encrypted or ctx.config.validator_keypair is None:
@@ -822,7 +829,7 @@ async def _rented_meanwhile(ctx: Context, fillers_beside: frozenset[str]) -> str
         return None
     if rented is None:
         return None
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return "rented"
     if set(rented.get_filler_containers(ctx.executor.uuid)) - fillers_beside:

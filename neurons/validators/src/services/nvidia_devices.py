@@ -207,6 +207,7 @@ async def build_gpu_docker_config_for_executor(
     executor_id: str | None = None,
     default_extra: dict | None = None,
     host_probe: PrerunHostProbe | None = None,
+    whole_host: bool | None = None,
 ) -> GpuDockerConfig:
     """Resolve structured GPU Docker options for SDK container creation.
 
@@ -227,6 +228,9 @@ async def build_gpu_docker_config_for_executor(
         else:
             per_gpu = await _query_all_gpu_nodes(ssh_client, host_probe=host_probe)
             is_partial_rental = False
+        # The live count alone can be fooled by GPUs that are off the bus at this create. The backend's
+        # whole_host=False (protocol 1.18.0) also makes the rental partial, so neither side can grant the devices alone.
+        is_partial_rental = is_partial_rental or whole_host is False
 
         # On partial rentals (some-but-not-all GPUs on the host), withhold every host-wide node:
         # /dev/nvidia-caps/* are per-GPU/per-MIG control nodes that would let a tenant peek at or
@@ -297,7 +301,7 @@ async def _query_gpu_nodes_for_uuids(
     """
     errors: list[str] = []
     try:
-        uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh, host_probe=host_probe)
+        uuid_to_minor = await query_gpu_minor_map_from_proc(ssh, host_probe=host_probe)
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
@@ -307,7 +311,7 @@ async def _query_gpu_nodes_for_uuids(
     proc_unreadable = not uuid_to_minor
     refused_xml_overwrite = False
 
-    if not uuid_to_minor or _missing_gpu_uuids(gpu_uuids, uuid_to_minor):
+    if not uuid_to_minor or missing_gpu_uuids(gpu_uuids, uuid_to_minor):
         # The kernel (procfs) map cannot satisfy the request; today we consult the NVML-backed
         # nvidia-smi XML, which the shim can spoof, and let it replace the kernel truth. 1b: treat a
         # kernel-vs-XML disagreement (XML supplies a UUID the kernel lacks) as the finding: refuse
@@ -353,7 +357,7 @@ async def _query_gpu_nodes_for_uuids(
         details = f": {'; '.join(errors)}" if errors else ""
         raise RuntimeError(f"GPU minor discovery returned no UUID/minor rows{details}")
 
-    missing = _missing_gpu_uuids(gpu_uuids, uuid_to_minor)
+    missing = missing_gpu_uuids(gpu_uuids, uuid_to_minor)
     if missing:
         raise MissingRentedGpuError(
             requested_uuids=gpu_uuids,
@@ -368,7 +372,7 @@ async def _query_gpu_nodes_for_uuids(
     return per_gpu, len(uuid_to_minor)
 
 
-def _missing_gpu_uuids(gpu_uuids: Sequence[str], uuid_to_minor: dict[str, int]) -> list[str]:
+def missing_gpu_uuids(gpu_uuids: Sequence[str], uuid_to_minor: dict[str, int]) -> list[str]:
     return [uuid for uuid in gpu_uuids if uuid not in uuid_to_minor]
 
 
@@ -560,7 +564,7 @@ async def read_kernel_gpu_view(
     return KernelGpuView(uuids=uuids or None, foreign_mounts=[])
 
 
-async def _query_gpu_minor_map_from_proc(
+async def query_gpu_minor_map_from_proc(
     ssh: asyncssh.SSHClientConnection,
     *,
     host_probe: PrerunHostProbe | None = None,
