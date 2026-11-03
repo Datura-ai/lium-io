@@ -16,7 +16,7 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
-from services.gpu_spec_table import normalize_gpu_model
+from services.gpu_spec_table import classify_gpu_model
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
@@ -79,7 +79,9 @@ def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, 
     return [
         {
             **detail,
-            "name": normalize_gpu_model(detail.get("name")),
+            "name": classify_gpu_model(
+                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
+            ),
         }
         if detail.get("name")
         else detail

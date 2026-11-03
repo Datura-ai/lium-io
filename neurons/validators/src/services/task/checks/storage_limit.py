@@ -32,6 +32,7 @@ from ..messages import AVAILABILITY_CATEGORY
 from ..messages import StorageLimitMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,7 @@ class StorageLimitCheck:
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
 
-        rented_executor = (
-            ctx.state.rented_data.executors.get(ctx.executor.uuid)
-            if ctx.state.rented_data
-            else None
-        )
+        rented_executor = rental_of_this_node(ctx)
         rented = bool(rented_executor and rented_executor.pods)
         # DAH-1997: a host without room for setup's image file keeps the warning; None (an older scrape, a failed
         # reading) neither adds a consequence nor clears one

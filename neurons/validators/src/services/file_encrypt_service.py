@@ -121,6 +121,9 @@ ORIGINAL_KEYS = {
     'hard_disk_disk_type': "disk_type",
     # DAH-5045: used size of the engy_cache_* volumes, in GB
     'hard_disk_engy_cache_used_gb': "engy_cache_used_gb",
+    # DAH-5059: kB per container name (writable layer + its anonymous volumes) and per volume name
+    'hard_disk_by_container': "by_container",
+    'hard_disk_by_volume': "by_volume",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
@@ -333,6 +336,8 @@ class FileEncryptService:
             'hard_disk_docker_scrape_error': "",
             'hard_disk_disk_type': "",
             'hard_disk_engy_cache_used_gb': "",
+            'hard_disk_by_container': "",
+            'hard_disk_by_volume': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",

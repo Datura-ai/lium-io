@@ -20,12 +20,12 @@ from services.task.messages import StorageLimitMessages as Msg
 from services.task.pipeline_factory import PipelineFactory
 
 
-async def run(context_factory, specs: dict, *, rented: bool = False):
+async def run(context_factory, specs: dict, *, rented: bool = False, rental_hotkey: str = "miner-hotkey"):
     rented_data = None
     if rented:
         executor = RentedExecutor.model_validate(
             {
-                "miner_hotkey": "hk",
+                "miner_hotkey": rental_hotkey,
                 "executor_ip_address": "1.2.3.4",
                 "executor_ip_port": "8080",
                 "pods": [{"pod_id": "pod-1", "container_name": "c", "gpu_count": 1}],
@@ -318,3 +318,19 @@ async def test_every_hold_survives_an_outage_cycle(context_factory, enforced, cy
     codes = [error.reason_code for error in availability_errors([result.event])]
     assert codes
     assert set(codes) <= NODE_GPU_FAULT_CODES
+
+
+@pytest.mark.asyncio
+async def test_enforced_another_miners_rental_on_a_different_endpoint_does_not_exempt_the_node(
+    context_factory, enforced
+):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    result = await run(
+        context_factory,
+        {**NO_LIMIT, "storage_limit_capable": True},
+        rented=True,
+        rental_hotkey="other-miner-hotkey",
+    )
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.REQUIRED.reason

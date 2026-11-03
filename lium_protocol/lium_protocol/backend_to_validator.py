@@ -41,6 +41,8 @@ class BackendMessageType(enum.Enum):
     GetEstimateRequest = "GetEstimateRequest"
     # 1.16.0: reset a running pod's GPUs; the validator answers with PodGpuResetResult
     ResetPodGpuRequest = "ResetPodGpuRequest"
+    # 2.4.0: lock or reset a running pod's GPU clocks; the validator answers with PodGpuClocksResult
+    LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -175,6 +177,9 @@ class ContainerCreateRequest(ContainerRequest):
     ships_sshd: bool | None = None
     gpu_power_limits: list[GpuPowerLimit] | None = None
     cache_volumes: list[CacheVolume] | None = None
+    # 1.18.0: False when the backend rents the pod part of its host; the validator then withholds the host-wide
+    # devices whatever GPUs the host shows. None from an older backend: the validator's own count decides.
+    whole_host: bool | None = None
 
 
 @BACKEND_MESSAGES.register
@@ -312,6 +317,23 @@ class ResetPodGpuRequest(ContainerRequest):
 
 
 @BACKEND_MESSAGES.register
+class LockPodGpuClocksRequest(ContainerRequest):
+    """2.4.0: the renter asked to lock the graphics clocks of their running pod's GPUs to
+    `[min_mhz, max_mhz]` (None = the GPU's own bound; clamped to its supported clocks), or with `reset`
+    to give them back to the driver. `gpu_uuids` and `gpu_indices` as in `ResetPodGpuRequest`. Answered
+    by `validator_to_backend.PodGpuClocksResult` with the same `request_id`."""
+
+    message_type: BackendMessageType = BackendMessageType.LockPodGpuClocksRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    min_mhz: int | None = None
+    max_mhz: int | None = None
+    reset: bool = False
+    request_id: str
+
+
+@BACKEND_MESSAGES.register
 class GetEstimateRequest(BackendMessage):
     """Ask the validator for the exact incentive estimate of a node shape; answered by
     `validator_to_backend.EstimateResponse` with the same `request_id`. The validator's copy has no
@@ -367,6 +389,7 @@ class RentedMachine(pydantic.BaseModel):
     executor_ip_port: str
     containers: list[RentedContainer]
     owner_flag: bool = False
+    self_rent: bool = False  # DAH-5244, as http.RentedExecutor.self_rent
     rented_ports: list[int] = []  # as above
 
 

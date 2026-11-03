@@ -57,7 +57,7 @@ Per GPU host (the full list is in the [Node Quickstart](https://docs.lium.io/pro
 - **GPU:** an NVIDIA model on the [supported list](https://docs.lium.io/providers/architecture#supported-gpus) (the validator's source of truth is `GPU_MODEL_RATES` in [`neurons/validators/src/services/const.py`](neurons/validators/src/services/const.py)), with the driver installed (`nvidia-smi` works).
 - **Docker Engine**, installed and running.
 - **Network:** a public IP and at least **100 Mbps download**, as measured by the validator.
-- **Hardware:** at least 8 GB RAM and 140 GB free disk before the first install (100 GB once the node's images are pulled). For idle pay, total disk must be at least **1.5× total GPU VRAM**. The node removes the volumes of ended rentals by itself, and below 100 GB free or above 90% used also the images no container uses.
+- **Hardware:** at least 8 GB RAM and 140 GB free disk before the first install (100 GB once the node's images are pulled). For idle pay, total disk must be at least **1.5× total GPU VRAM**. The node removes the volumes of ended rentals by itself, and below 100 GB free or above 90% used also the images no container uses. An idle node may keep a background workload's model checkpoint; it is listed as free disk and removed when a rental's ordered disk does not fit beside it.
 - **A registered hotkey** on Subnet 51 (below). Keep your coldkey off the server.
 
 ### Ports
@@ -119,7 +119,7 @@ To set every value by hand, use the [manual setup](neurons/executor/README.md#ma
 | `PORT_VERIFY_FAILED` | A port the validator mapped is closed, or NAT forwards a different external port | Behind NAT, list the pairs in `RENTING_PORT_MAPPINGS` (internal, external) and leave `RENTING_PORT_RANGE` unset |
 | SSH errors or `UPLOAD_FAILED` | The node SSH port (`2200`) is not reachable from outside | Open it, or set `SSH_PUBLIC_PORT` to the port your NAT forwards |
 | Job Logs mention `sysbox-runc` | Sysbox is missing or not working | Rerun step 3; see [Sysbox](https://docs.lium.io/providers/nodes/sysbox) |
-| `VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW` | Download speed below 100 Mbps | Reproduce it with the [VerifyX benchmark](https://docs.lium.io/providers/troubleshooting#2-run-the-verifyx-benchmark-to-reproduce-validator-checks), then fix the uplink |
+| `VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW` | Download speed below 100 Mbps or upload speed below 10 Mbps | Reproduce it with the [VerifyX benchmark](https://docs.lium.io/providers/troubleshooting#2-run-the-verifyx-benchmark-to-reproduce-validator-checks), then fix the uplink |
 | No idle pay, and the reason mentions disk | Total disk is below 1.5× total GPU VRAM | Add disk; see [Docker storage](https://docs.lium.io/providers/nodes/docker-storage) |
 
 Every reason code and its fix: [Troubleshooting → Validator reason codes](https://docs.lium.io/providers/troubleshooting#6-validator-reason-codes). Still stuck? Open a ticket in [`#tickets`](https://discord.com/channels/1350984082733142026/1547193098969284650). Never share a seed phrase, private key or coldkey with anyone who offers help ([how support scams work](https://docs.lium.io/security/official-support-and-scams)).
