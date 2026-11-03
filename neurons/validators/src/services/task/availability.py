@@ -314,8 +314,10 @@ class RunningOutageTally:
     our own outage. A result from another job_batch_id is ignored. The cycle starts a fresh one.
     """
 
-    def __init__(self, job_batch_id: str):
+    def __init__(self, job_batch_id: str, rented_executor_ids: frozenset[str] = frozenset()):
         self.job_batch_id = job_batch_id
+        # the backend's rented list at cycle start: a failure is built before the result knows its rentals
+        self.rented_executor_ids = rented_executor_ids
         self.checked_count = 0
         self.unreachable_count = 0
         # executor uuids published early this cycle
@@ -336,17 +338,29 @@ class RunningOutageTally:
         return [
             result
             for result in checked
-            if result.availability_errors and not result.is_rented and not result.is_successful
+            if result.availability_errors
+            and not result.is_successful
+            and not result.is_rented
+            and str(result.executor_info.uuid).lower() not in self.rented_executor_ids
         ]
 
-    def relist_published_early(self, job_results: list[JobResult]) -> None:
-        """After the cycle-end silencer fired: [] re-lists a node hidden early, where None would keep it hidden.
-
-        The silencer has already left only the node's GPU-fault entries (or None); those stay.
+    def restore_published_early(
+        self, job_results: list[JobResult], published_before: dict[str, list[dict]]
+    ) -> None:
+        """After the cycle-end silencer fired: a node published early gets back the list the last cycle
+        published for it (published_before), so a node hidden before this cycle stays hidden and one
+        listed is listed again. None (stored errors left alone, the early ones included) when this
+        process has not published it yet. The silencer's GPU-fault entries stay on top.
         """
         for result in job_results:
-            if str(result.executor_info.uuid) in self.published_early:
-                result.availability_errors = result.availability_errors or []
+            uuid = str(result.executor_info.uuid)
+            if uuid not in self.published_early:
+                continue
+            before = published_before.get(uuid.lower())
+            if before is None:
+                continue
+            kept = result.availability_errors or []
+            result.availability_errors = kept + [error for error in before if error not in kept]
 
 
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.

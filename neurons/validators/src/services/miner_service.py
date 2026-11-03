@@ -376,6 +376,8 @@ class MinerService:
         self.published_gpu_uuids: dict[str, set[str]] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
+        # DAH-5635: executor uuid -> the availability errors this process's last cycle publish sent for it
+        self.cycle_published_availability: dict[str, list[dict]] = {}
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -1281,6 +1283,12 @@ class MinerService:
             ),
         )
         batch_total = len(results) if is_whole_miner_batch else None
+        if is_whole_miner_batch:
+            for result in results:
+                if result.availability_errors is not None:
+                    self.cycle_published_availability[str(result.executor_info.uuid).lower()] = list(
+                        result.availability_errors
+                    )
         for result in results:
             try:
                 await self.redis_service.publish(

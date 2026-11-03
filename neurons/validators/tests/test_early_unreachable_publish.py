@@ -52,20 +52,24 @@ def _healthy(count: int) -> list[JobResult]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("candidate", "published"),
+    ("candidate", "on_the_rented_list", "published"),
     [
-        (_result([SSH]), True),
-        (_result([GPU_LOST]), True),
-        (_result([SSH], rented=True), False),
-        (_result([], passed=True), False),
-        (_result([BY_MINER]), False),
-        (_result(None), False),
-        (_result([SSH], batch="2026-11-03 13:00:00"), False),
+        (_result([SSH]), False, True),
+        (_result([GPU_LOST]), False, True),
+        # the failure is built before the result knows its rentals (is_rented False): the cycle's rented list decides
+        (_result([SSH]), True, False),
+        (_result([], passed=True), False, False),
+        (_result([BY_MINER]), False, False),
+        (_result(None), False, False),
+        (_result([SSH], batch="2026-11-03 13:00:00"), False, False),
     ],
     ids=["ssh-unreachable", "gpu-lost", "rented", "success", "miner-only", "never-checked", "other-batch"],
 )
-async def test_only_an_unrented_validator_reading_that_failed_is_published_early(candidate, published):
-    service = _service(RunningOutageTally(BATCH))
+async def test_only_an_unrented_validator_reading_that_failed_is_published_early(
+    candidate, on_the_rented_list, published
+):
+    rented = frozenset({str(candidate.executor_info.uuid).upper()}) if on_the_rented_list else frozenset()
+    service = _service(RunningOutageTally(BATCH, frozenset(uuid.lower() for uuid in rented)))
 
     await service.publish_unreachable_early(_job(_healthy(9) + [candidate]))
 
@@ -114,18 +118,42 @@ async def test_no_tally_publishes_nothing_and_a_failing_publish_never_fails_the_
     await failing.publish_unreachable_early(_job(_healthy(9) + [_result([SSH])]))
 
 
-def test_the_cycle_end_silencer_relists_the_nodes_hidden_early_and_leaves_the_others_alone():
-    """Nodes hidden early, then the cycle turns out to be our outage: [] lists them again (a GPU-fault
-    entry stays); the rest keep None, so the backend leaves their stored errors alone."""
+def test_the_cycle_end_silencer_gives_nodes_published_early_their_state_from_before_the_cycle():
+    """Nodes published early, then the cycle turns out to be our outage: each gets back what the last cycle
+    published for it (a GPU-fault entry found now stays on top). One this process never published keeps None,
+    as does every node not published early: the backend leaves their stored errors alone."""
     tally = RunningOutageTally(BATCH)
-    early_ssh, early_gpu = _result([SSH]), _result([SSH, GPU_LOST])
-    tally.published_early = {early_ssh.executor_info.uuid, early_gpu.executor_info.uuid}
-    later = [_result([SSH]) for _ in range(8)]
-    cycle = [early_ssh, early_gpu, *later]
+    listed, hidden, gpu, unknown = _result([SSH]), _result([SSH]), _result([SSH, GPU_LOST]), _result([SSH])
+    tally.published_early = {r.executor_info.uuid for r in (listed, hidden, gpu, unknown)}
+    before = {
+        str(listed.executor_info.uuid).lower(): [],
+        str(hidden.executor_info.uuid).lower(): [BY_MINER],
+        str(gpu.executor_info.uuid).lower(): [],
+    }
+    later = [_result([SSH]) for _ in range(6)]
+    cycle = [listed, hidden, gpu, unknown, *later]
 
     assert silence_availability_errors_on_our_own_outage(cycle) == 10
-    tally.relist_published_early(cycle)
+    tally.restore_published_early(cycle, before)
 
-    assert early_ssh.availability_errors == []
-    assert early_gpu.availability_errors == [GPU_LOST]
+    assert listed.availability_errors == []
+    assert hidden.availability_errors == [BY_MINER]
+    assert gpu.availability_errors == [GPU_LOST]
+    assert unknown.availability_errors is None
     assert all(result.availability_errors is None for result in later)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("whole_batch", "recorded"), [(True, True), (False, False)])
+async def test_only_the_cycle_publish_records_what_it_sent(monkeypatch, whole_batch, recorded):
+    service = MinerService.__new__(MinerService)
+    service.cycle_published_availability = {}
+    service.redis_service = AsyncMock()
+    service._pod_states_capped_for_spec = lambda result, extra: None
+    monkeypatch.setattr("services.miner_service.settings.DRY_RUN", False)
+    node, unchecked = _result([SSH]), _result(None)
+
+    await service.publish_machine_specs([node, unchecked], "hk", "ck", is_whole_miner_batch=whole_batch)
+
+    expected = {str(node.executor_info.uuid).lower(): [SSH]} if recorded else {}
+    assert service.cycle_published_availability == expected

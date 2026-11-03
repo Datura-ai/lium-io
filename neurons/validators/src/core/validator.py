@@ -495,7 +495,15 @@ class Validator:
                 # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
                 # where the cycle withholds an unreachable verdict that an early publish would leak.
                 self.miner_service.outage_tally = (
-                    None if rollout_window.covers(job_block) else RunningOutageTally(job_batch_id)
+                    None
+                    if rollout_window.covers(job_block)
+                    else RunningOutageTally(
+                        job_batch_id,
+                        frozenset(
+                            str(executor_id).lower()
+                            for executor_id in (rented_executors.executors if rented_executors else {})
+                        ),
+                    )
                 )
                 # every listed rented pod's SSH (any status), probed once while the miners work
                 pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
@@ -769,9 +777,11 @@ class Validator:
                                 extra={"silenced_results": silenced_count},
                             )
                         )
-                        # DAH-5635: a node hidden early this cycle is listed again; None would keep it hidden
+                        # DAH-5635: a node published early gets back what the last cycle published for it
                         if self.miner_service.outage_tally is not None:
-                            self.miner_service.outage_tally.relist_published_early(cycle_results)
+                            self.miner_service.outage_tally.restore_published_early(
+                                cycle_results, self.miner_service.cycle_published_availability
+                            )
 
                     # each node's pod SSH observations ride on its result; a probed rented
                     # node the cycle has no result for gets one carrying only them. A withheld
