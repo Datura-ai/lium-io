@@ -97,6 +97,33 @@ async def test_outside_prober_fetches_ports_published_through_docker_not_the_hos
     assert [c.args[1] for c in runner.cleanup.await_args_list] == [out_name, host_name]
 
 
+@pytest.mark.parametrize("outside", ["passed", "blocked"])
+@pytest.mark.asyncio
+async def test_a_host_that_answers_only_published_ports_still_reaches_the_semi_batch_tier(mocker, outside):
+    # DAH-5597: INPUT dropped, published ports forwarded: the host batch verifies nothing, the published sample answers
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(return_value=ContainerStartResult(ok=True, container_id="c", status="Up"))
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(
+        side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []) if tested == PORTS[:3] else ([], tested)
+    )
+    external = mocker.Mock(spec=ExternalPortProbe)
+    external.reached = mocker.AsyncMock(side_effect=lambda host, sample, token: sample if outside == "passed" else [])
+    mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
+    mocker.patch("services.executor_connectivity.port_verifiers.asyncio.sleep", mocker.AsyncMock())
+    semi, fallback = mocker.Mock(), mocker.Mock()
+    semi.verify = mocker.AsyncMock(return_value=(PORTS, []))
+
+    result = await PortProbe(BatchVerifier(port_tester, runner, external), semi, fallback).probe(
+        PORTS, ssh_client=mocker.Mock(), host="1.2.3.4"
+    )
+
+    semi.verify.assert_awaited_once()
+    assert semi.verify.await_args.args[0] == PORTS  # the sample is published again with every other port
+    assert (result.tier, result.external, result.successful) == ("semi_batch", outside, tuple(PORTS))
+
+
 @pytest.mark.asyncio
 async def test_a_failed_prober_never_flags_the_node(mocker):
     verifier, _ = _verifier(mocker, lambda sample: None)

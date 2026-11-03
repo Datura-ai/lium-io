@@ -50,6 +50,7 @@ class BatchVerifier:
         timeout_sec = 60
         max_attempts = 2
 
+        external = None  # the last attempt's outside reading, kept when no attempt verified a port
         for attempt in range(1, max_attempts + 1):
             token = uuid.uuid4().hex
             container_name = f"port_test_{token[:8]}"
@@ -66,6 +67,7 @@ class BatchVerifier:
                     self._attempt(ports, token, container_name, ssh_client, host, log_ctx),
                     timeout=timeout_sec
                 )
+                external = attempt_result.external
                 if attempt_result.successful:
                     logger.info(
                         _m(
@@ -102,7 +104,7 @@ class BatchVerifier:
         # attempts and tiers on the way there are DEBUG. An exception inside an attempt keeps
         # ERROR above: that is the validator's own failure, not the node's ports.
         logger.debug(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
-        return BatchResult([], ports)
+        return BatchResult([], ports, external)
 
     async def _attempt(
         self,
@@ -140,7 +142,7 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-            return BatchResult(sampled_ok, ports_left, external)
+            return BatchResult([], ports, external)
 
         try:
             async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
@@ -162,6 +164,10 @@ class BatchVerifier:
         finally:
             await self.runner.cleanup(ssh_client, name)
 
+        if not successful:
+            # DAH-5597: only the host listener decides this tier; a host that drops INPUT but forwards published
+            # ports answers the published sample, and must still reach the semi-batch tier
+            return BatchResult([], ports, external)
         answered = set(sampled_ok + successful)
         return BatchResult([p for p in ports if p in answered], failed, external)
 
