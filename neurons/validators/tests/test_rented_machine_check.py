@@ -1336,23 +1336,36 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
         docker.recover_parked_pod_container.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "state", ["both_gone", "parked", "stopped_canonical", "lock_busy", "create_in_flight", "delete_fails"]
+)
 @pytest.mark.asyncio
-async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_container_is_gone(context_factory, monkeypatch):
-    # a pod the validator stopped passes only while its container exists: once it is removed, the mark is dropped and
-    # POD_NOT_RUNNING resets the node, or the renter is billed for a pod that no longer exists (lio#1827 review)
+async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_container_is_gone(
+    context_factory, monkeypatch, state
+):
+    # a pod the validator stopped passes until, under the create lock, neither <name> nor its parked <name>__prev
+    # exists: only then is the mark dropped and POD_NOT_RUNNING reported, or the renter is billed for a pod that no
+    # longer exists; a parked original (failed recovery) or an unconfirmed check keeps the pass (lio#1827 review)
     ssh = DummySSHClient(pod_running=False)
     real_run = ssh.run
+    present = {"parked": "pod_pod-1__prev", "stopped_canonical": "pod_pod-1"}.get(state)
 
     async def run(command):
         if "{{.State.Running}}" not in command:
             return await real_run(command)
-        return Mock(stdout="", stderr="Error: No such object: pod_pod-1", exit_status=1)
+        if present and command.endswith(f" {present}"):
+            return Mock(stdout="false\n", stderr="", exit_status=0)
+        return Mock(stdout="", stderr="Error: No such object", exit_status=1)
 
     ssh.run = run
     marks = {"stopped_by_recovery:pod-1": "stopped"}
-    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    lock = Mock(acquire=AsyncMock(return_value=state != "lock_busy"), release=AsyncMock())
+    redis = _recovery_redis(lock, marks)
+    redis.backend_create_inflight = AsyncMock(return_value=state == "create_in_flight")
+    if state == "delete_fails":
+        redis.delete = AsyncMock(side_effect=ConnectionError("redis down"))
     docker = AsyncMock()
-    docker.recover_parked_pod_container.return_value = False  # neither <name> nor <name>__prev is listed
+    docker.recover_parked_pod_container.return_value = False  # a failed recovery: nothing renamed back
     docker.recover_pod_after_stale_vloopback_mount.return_value = False
     docker.encrypted_volume_mount_missing.return_value = False
 
@@ -1360,13 +1373,18 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
         return {"container_missing": True}
 
     monkeypatch.setattr(rented_machine_module, "_collect_pod_diagnostics", missing)
-    ctx = build_recovery_context(context_factory, ssh, docker, redis=_recovery_redis(lock, marks))
+    ctx = build_recovery_context(context_factory, ssh, docker, redis=redis)
     result = await TenantEnforcementCheck().run(ctx)
 
-    assert not result.passed
-    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
-    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
-    assert not marks
+    if state in ("both_gone", "delete_fails"):
+        assert not result.passed
+        assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+        assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+        assert marks == ({} if state == "both_gone" else {"stopped_by_recovery:pod-1": "stopped"})
+    else:
+        assert result.passed
+        assert "clear_verified_job_reason" not in result.updates
+        assert marks == {"stopped_by_recovery:pod-1": "stopped"}
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from protocol.vc_protocol.validator_requests import (
 )
 
 from ...const import (
+    EDIT_PARKED_SUFFIX,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     POD_CONTAINER_NAME_GRACE_MINUTES,
@@ -509,9 +510,11 @@ class TenantEnforcementCheck:
             stopped_by_validator = (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED
         if stopped_by_validator and diagnostics.get("container_missing") is True:
             # the container we stopped is gone (provider rm, reinstall): passing it would keep billing a pod that no
-            # longer exists, since only the POD_NOT_RUNNING reset stops billing. Drop the mark and report it down.
-            await _clear_leftover_recovery_mark(ctx, container_name, pod_id, pod_status, container_gone=True)
-            stopped_by_validator = False
+            # longer exists, since only the POD_NOT_RUNNING reset stops billing. Report it down only once neither
+            # <name> nor its parked <name>__prev exists under the create lock; anything unconfirmed keeps the pass.
+            stopped_by_validator = not await _clear_leftover_recovery_mark(
+                ctx, container_name, pod_id, pod_status, container_gone=True
+            )
         if stopped_by_validator:
             extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
             return _DownedPodOutcome(failure=None, ssh_pub_keys=[], container_state=container_state)
@@ -892,30 +895,43 @@ async def _recover_parked_pod_container(
 
 async def _clear_leftover_recovery_mark(
     ctx: Context, container_name: str, pod_id: str, pod_status: str | None, *, container_gone: bool = False
-) -> None:
+) -> bool:
     # the mark means something only while the pod is stopped: one a lost delete left on a running pod would restart a
     # later provider stop, and one left on a removed container would pass a billed pod forever (container_gone).
-    # Bounded and best-effort; the next cycle retries.
+    # Bounded and best-effort; the next cycle retries. Returns True only for container_gone once neither <name> nor
+    # <name>__prev exists under the create lock, whether or not the mark's delete then lands.
     key = f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"
 
-    async def clear() -> None:
-        if await ctx.services.redis.get(key) is None:
-            return
+    async def inspect(name: str):
+        return await ctx.ssh.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(name)}")
+
+    def absent(result) -> bool:
+        return result.exit_status != 0 and "No such" in str(result.stderr)
+
+    async def clear() -> bool:
+        if not container_gone and await ctx.services.redis.get(key) is None:
+            return False
         # under the create lock every mark write and its stop run under: never between a recovery's mark and its stop
         async with _no_create_in_flight(ctx, pod_id, pod_status) as clear_to_delete:
             if not clear_to_delete:
-                return
+                return False
             # re-read under the lock: a recovery may have marked and stopped the pod since this cycle saw it running
-            inspect_result = await ctx.ssh.run(
-                f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(container_name)}"
-            )
-            if (inspect_result.stdout or "").strip() == "true" or (
-                container_gone and inspect_result.exit_status != 0 and "No such" in str(inspect_result.stderr)
-            ):
+            inspect_result = await inspect(container_name)
+            if not container_gone:
+                if (inspect_result.stdout or "").strip() == "true":
+                    await ctx.services.redis.delete(key)
+                return False
+            # a failed recovery can leave the stopped original parked as <name>__prev: still the renter's pod
+            if not (absent(inspect_result) and absent(await inspect(f"{container_name}{EDIT_PARKED_SUFFIX}"))):
+                return False
+            with contextlib.suppress(Exception):
                 await ctx.services.redis.delete(key)
+            return True
 
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(clear(), timeout=_RECOVERY_MARK_CLEAR_TIMEOUT_SEC)
+    try:
+        return await asyncio.wait_for(clear(), timeout=_RECOVERY_MARK_CLEAR_TIMEOUT_SEC)
+    except Exception:
+        return False
 
 
 def _log_recovery_failed(event: str, ctx: Context, container_name: str, pod_id: str, exc: Exception) -> None:
