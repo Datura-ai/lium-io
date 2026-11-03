@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -181,7 +182,8 @@ class StorageEventReporter:
     def _partial_restore_warning(self, result_quality: str | None) -> str | None:
         if result_quality != "PARTIAL" or self._spec.resource is ReporterResource.BACKUP:
             return None
-        detail = self._restic_failure_detail
+        # The restore writes through /proc/<pid>/root of the live container; the renter knows only the path inside it.
+        detail = re.sub(r"/proc/\d+/root(?=/)", "", self._restic_failure_detail or "")
         return f"Restored with errors; some files were not restored: {detail}"[:2000] if detail else (
             "Restored with errors; some files were not restored"
         )

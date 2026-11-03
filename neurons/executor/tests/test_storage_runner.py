@@ -2056,7 +2056,7 @@ def test_partial_restore_result_keeps_first_restic_error_as_warning() -> None:
         ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
         session=session,
     )
-    first = "open /root/restored/model.safetensors: no such file or directory"
+    first = "open /proc/88100/root/root/restored/model.safetensors: no such file or directory"
     reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": first}}})
     reporter.send({"event": "restic", "payload": {"message_type": "exit_error", "message": "Fatal: 1 errors"}})
     reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
@@ -2064,4 +2064,6 @@ def test_partial_restore_result_keeps_first_restic_error_as_warning() -> None:
     final = session.requests[-1]["json"]
     assert final["status"] == "COMPLETED"
     assert final["result_quality"] == "PARTIAL"
-    assert first in final["error_message"]
+    assert final["error_message"] == (
+        "Restored with errors; some files were not restored: open /root/restored/model.safetensors: no such file or directory"
+    )
