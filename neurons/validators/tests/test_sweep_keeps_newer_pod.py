@@ -8,6 +8,7 @@ create exclusion) and create B runs first, B's pod is not on A's list. The sweep
 from __future__ import annotations
 
 import asyncio
+import uuid
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -120,3 +121,72 @@ async def test_a_hung_backend_answer_is_bounded_and_keeps_the_pod(retry_ssh_mock
     ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout=f"pod_{NEWER}\n", stderr=""))
 
     assert await svc.clean_existing_containers(ssh_client=ssh_client, default_extra={}, pod_name="pod_target") == []
+
+
+@pytest.mark.asyncio
+async def test_many_listed_pods_are_read_a_bounded_number_at_a_time():
+    # a provider's docker ps can list thousands of pod_<uuid> names; one backend read per name, never all at once
+    running = peak = 0
+
+    async def rental_active(_pod_id):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0)
+        running -= 1
+        return CLOSED
+
+    backend_client = Mock(get_pod_rental_active=AsyncMock(side_effect=rental_active))
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock(), backend_client=backend_client)
+    names = [f"pod_{uuid.uuid4()}" for _ in range(500)]
+
+    closed = await svc._pods_with_closed_rental(names, {})
+
+    assert closed == set(names)
+    assert backend_client.get_pod_rental_active.await_count == 500
+    assert peak == ds_module._POD_RENTAL_READS_AT_ONCE
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_backend_holds_a_long_sweep_one_timeout_window_not_one_per_batch(monkeypatch):
+    monkeypatch.setattr(ds_module, "_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS", 0.05)
+
+    calls = 0
+
+    async def hang(_pod_id):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(3600)
+
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock(), backend_client=Mock(get_pod_rental_active=hang))
+    names = [f"pod_{uuid.uuid4()}" for _ in range(500)]
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    closed = await svc._pods_with_closed_rental(names, {})
+
+    assert closed == set()
+    # 32 batches of 16 would wait 32 windows, and no read starts once the deadline has passed
+    assert loop.time() - started < 0.05 * 4
+    assert calls == ds_module._POD_RENTAL_READS_AT_ONCE
+
+
+@pytest.mark.asyncio
+async def test_a_long_list_runs_a_bounded_number_of_tasks():
+    tasks_seen = 0
+
+    async def rental_active(_pod_id):
+        nonlocal tasks_seen
+        tasks_seen = max(tasks_seen, len(asyncio.all_tasks()))
+        await asyncio.sleep(0)
+        return CLOSED
+
+    svc = DockerService(
+        ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock(),
+        backend_client=Mock(get_pod_rental_active=AsyncMock(side_effect=rental_active)),
+    )
+
+    await svc._pods_with_closed_rental([f"pod_{uuid.uuid4()}" for _ in range(500)], {})
+
+    # the test's own task plus one per worker, never one per name
+    assert tasks_seen <= ds_module._POD_RENTAL_READS_AT_ONCE + 1

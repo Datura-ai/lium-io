@@ -28,21 +28,31 @@ def _probe_proof(tmp_path: Path, plugin_id: str = "a" * 64, data_dir_suffix: str
 
 _FAKE_DOCKER = r"""
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 root = Path(__file__).parent
 state_path = root / "state.json"
+
+
+def save_state():
+    # a test polls state.json while this runs: a plain write_text shows it an empty file for a moment
+    temporary_path = state_path.with_name(f"state.{os.getpid()}.json")
+    temporary_path.write_text(json.dumps(state))
+    os.replace(temporary_path, state_path)
+
+
 state = json.loads(state_path.read_text())
 state["calls"].append(sys.argv[1:])
-state_path.write_text(json.dumps(state))
+save_state()
 containers = state.setdefault("containers", [])
 if sys.argv[1] == "run":
     if state.get("run_hang"):
         # the daemon keeps the container once the client is killed by the script's timeout
         containers.append(sys.argv[sys.argv.index("--name") + 1])
-        state_path.write_text(json.dumps(state))
+        save_state()
         time.sleep(30)
     sys.exit(state.get("run_exit", 0))
 if sys.argv[1] == "rm":
@@ -53,7 +63,7 @@ if sys.argv[1] == "rm":
         print("Error: cannot remove container", file=sys.stderr)
         sys.exit(1)
     containers.remove(sys.argv[-1])
-    state_path.write_text(json.dumps(state))
+    save_state()
     sys.exit(0)
 if sys.argv[1] == "volume":
     if sys.argv[2] == "rm" and containers:
@@ -63,7 +73,7 @@ if sys.argv[1] == "volume":
     volumes = state.setdefault("volumes", {})
     if sys.argv[2] == "rm" and not state.get("volume_rm_exit"):
         volumes.pop(sys.argv[-1], None)
-        state_path.write_text(json.dumps(state))
+        save_state()
     if sys.argv[2] == "ls":
         print("\n".join(state.get("volume_drivers", []) + list(volumes.values())))
     sys.exit(state.get("volume_" + sys.argv[2] + "_exit", 0))
@@ -97,7 +107,7 @@ elif action == "disable" and not state.get("disable_exit"):
     state["enabled"] = False
 elif action == "rm" and not state.get("plugin_rm_exit"):
     state["installed"] = False
-state_path.write_text(json.dumps(state))
+save_state()
 if action == "inspect":
     if state.get("inspect_error"):
         print("permission denied", file=sys.stderr)

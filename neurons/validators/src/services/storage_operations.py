@@ -138,6 +138,10 @@ async def start_storage_operation(
                     break
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
             return files
+        if await _helper_owned_by_live_runner(ssh_client, operation_id, files):
+            # an earlier dispatch's helper is still working; removing it would kill that run.
+            # A helper whose runner died is an orphan: it is removed below and the run relaunched.
+            return files
         if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
             ssh_client, files.spec
         ):
@@ -319,6 +323,22 @@ async def _remote_file_exists(
     path: PurePosixPath,
 ) -> bool:
     result = await ssh_client.run(f"test -e {shlex.quote(str(path))}", check=False)
+    return result.exit_status == 0
+
+
+async def _helper_owned_by_live_runner(
+    ssh_client: asyncssh.SSHClientConnection,
+    operation_id: UUID,
+    files: StorageOperationFiles,
+) -> bool:
+    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    # "[-]-spec" keeps pgrep from matching this command's own shell
+    runner_pattern = f"[-]-spec {files.spec}"
+    result = await ssh_client.run(
+        f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running"
+        f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
+        check=False,
+    )
     return result.exit_status == 0
 
 

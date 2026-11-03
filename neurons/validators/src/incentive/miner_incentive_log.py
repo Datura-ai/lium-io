@@ -35,7 +35,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
        marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
-   Spot-node pay (ENABLE_SPOT_NODE_PAY on) — an idle spot node earns only while it runs
+   Spot-node pay — an idle spot node earns only while it runs
      Lium fillers and its GPU configuration has an average filler revenue:
      spot node without a Lium filler, no filler revenue average for the GPU configuration,
      no room left in the incentive pool because the rental share is at the burn cap
@@ -115,7 +115,7 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
-    # Spot-node pay (ENABLE_SPOT_NODE_PAY): an idle spot node that is not paid
+    # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
     SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
     SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
