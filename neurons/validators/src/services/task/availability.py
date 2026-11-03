@@ -268,13 +268,8 @@ def _is_the_validators_own_reading(job_result: JobResult) -> bool:
     return not errors or any(error.get("reach_source") != ReachSource.MINER for error in errors)
 
 
-def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) -> int:
-    """Report nothing about reachability when the cycle looks like our own outage.
-
-    Returns how many results were silenced, so the caller can log it; 0 means the cycle is
-    trusted and every result keeps what it found. Only the validator's own readings count and
-    are silenced (``_is_the_validators_own_reading``).
-    """
+def _checked_and_unreachable(job_results: list[JobResult]) -> tuple[list[JobResult], list[JobResult]]:
+    """The two sides of the outage share: the validator's own readings, and those that failed at the connect."""
     checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
     # a lost or broken GPU is the node's own fault, never our outage: not counted in the share
     unreachable_results = [
@@ -285,6 +280,17 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
             for error in result.availability_errors or []
         )
     ]
+    return checked_results, unreachable_results
+
+
+def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) -> int:
+    """Report nothing about reachability when the cycle looks like our own outage.
+
+    Returns how many results were silenced, so the caller can log it; 0 means the cycle is
+    trusted and every result keeps what it found. Only the validator's own readings count and
+    are silenced (``_is_the_validators_own_reading``).
+    """
+    checked_results, unreachable_results = _checked_and_unreachable(job_results)
     if not is_our_own_outage(len(unreachable_results), len(checked_results)):
         return 0
     for result in checked_results:
@@ -297,6 +303,50 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
         ]
         result.availability_errors = node_gpu_fault_entries or None
     return len(checked_results)
+
+
+class RunningOutageTally:
+    """DAH-5635: one cycle's outage share so far, fed each miner's results as its job returns.
+
+    An unrented node that failed is published at once, not after the slowest miner in the fleet,
+    but only while the share so far is trusted: at least SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
+    checked results, and not what ``silence_availability_errors_on_our_own_outage`` would call
+    our own outage. A result from another job_batch_id is ignored. The cycle starts a fresh one.
+    """
+
+    def __init__(self, job_batch_id: str):
+        self.job_batch_id = job_batch_id
+        self.checked_count = 0
+        self.unreachable_count = 0
+        # executor uuids published early this cycle
+        self.published_early: set[str] = set()
+
+    def add(self, job_results: list[JobResult]) -> list[JobResult]:
+        """Count one miner's results; return those that may be published now (none while the share is untrusted)."""
+        checked, unreachable = _checked_and_unreachable(
+            [result for result in job_results if result.job_batch_id == self.job_batch_id]
+        )
+        self.checked_count += len(checked)
+        self.unreachable_count += len(unreachable)
+        if self.checked_count < SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE or is_our_own_outage(
+            self.unreachable_count, self.checked_count
+        ):
+            return []
+        # DAH-5635: a rented node waits for the cycle, so its pod's reboot streak counts once
+        return [
+            result
+            for result in checked
+            if result.availability_errors and not result.is_rented and not result.is_successful
+        ]
+
+    def relist_published_early(self, job_results: list[JobResult]) -> None:
+        """After the cycle-end silencer fired: [] re-lists a node hidden early, where None would keep it hidden.
+
+        The silencer has already left only the node's GPU-fault entries (or None); those stay.
+        """
+        for result in job_results:
+            if str(result.executor_info.uuid) in self.published_early:
+                result.availability_errors = result.availability_errors or []
 
 
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
