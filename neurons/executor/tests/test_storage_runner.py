@@ -2145,20 +2145,31 @@ def test_partial_restore_counts_files_left_on_the_pod() -> None:
     assert final["processed_files"] == 398
 
 
-def test_backup_picks_its_parent_by_host_not_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # an encrypted pod's /proc/<pid>/root path changes on restart; a host+paths match would miss the parent
-    operation = StorageOperationSpec.from_mapping(_operation_payload())
-    (tmp_path / "file").write_text("x")
-    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
-    commands: list[list[str]] = []
-
-    def stream(command, **_kwargs):
-        commands.append(command)
-        return 0, {"message_type": "summary", "snapshot_id": "abc123"}
-
-    monkeypatch.setattr(runner, "_stream", stream)
-
+def test_real_restic_finds_the_parent_when_the_backup_path_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restic_binary: str
+) -> None:
+    """An encrypted pod's /proc/<pid>/root path changes on restart: the second backup must still find its parent."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for index in range(20):
+        (workspace / f"file{index}").write_text(str(index))
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(workspace))
+    commands = []
+    monkeypatch.setattr(runner, "_stream", lambda command, **kwargs: commands.append(command) or (0, {"snapshot_id": SNAPSHOT_ID}))
     runner._backup()
+    env = {**os.environ, "RESTIC_REPOSITORY": str(tmp_path / "repo"), "RESTIC_PASSWORD": "test"}
+    subprocess.run([restic_binary, "init"], env=env, check=True, capture_output=True)
 
-    command = commands[0]
-    assert command[command.index("--group-by") + 1] == "host"
+    summaries = []
+    for name in ("before-restart", "after-restart"):
+        path = tmp_path / name
+        path.symlink_to(workspace)
+        # restic reads the backup path from PWD, as the shell's cd leaves it
+        result = subprocess.run(
+            [restic_binary, *commands[0]], cwd=path, env={**env, "PWD": str(path)}, check=True, capture_output=True, text=True
+        )
+        summaries.append(next(m for m in map(json.loads, result.stdout.splitlines()) if m.get("message_type") == "summary"))
+
+    assert summaries[0]["files_new"] == 20
+    assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
+
