@@ -525,9 +525,15 @@ class ResticStorageRunner:
             raise ResticOperationError(self._killed_helper_message("restore"))
         # restic exits 1 when some files failed (e.g. the live workload removed a dir mid-restore), but also on
         # disk-full and repository errors: only vanished-file errors count as PARTIAL, however many
-        files_restored = (summary or {}).get("files_restored")
-        if exit_code == 1 and isinstance(files_restored, int) and files_restored > 0 and _only_vanished_files(
-            self._restore_errors
+        # restic counts files it wrote, even ones removed afterwards: the files left are the total less the distinct
+        # failed items, and a restore whose whole target vanished has none left
+        total_files = (summary or {}).get("total_files")
+        failed_items = len({item for item, text in self._restore_errors if not _ERRORS_SUMMARY.match(text.strip())})
+        if (
+            exit_code == 1
+            and isinstance(total_files, int)
+            and total_files > failed_items
+            and _only_vanished_files(self._restore_errors)
         ):
             self._events.stage("FINALIZING")
             return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)

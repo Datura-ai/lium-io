@@ -120,6 +120,8 @@ class StorageEventReporter:
                 if result_quality == "FULL":
                     self._state.processed_files = self._state.total_files
                     self._state.processed_bytes = self._state.total_bytes
+            if self._spec.resource is not ReporterResource.BACKUP and self._restore_counts is not None:
+                self._state.processed_files = self._present_counts()[0]
             payload = self._progress_payload(
                 status=status,
                 result_quality=result_quality,
@@ -200,7 +202,7 @@ class StorageEventReporter:
         detail = _renter_paths(self._restic_failure_detail or self._diagnostic_detail)
         if self._restore_counts is None:
             return detail
-        restored = "restored {} of {} files".format(*self._restore_counts)
+        restored = "restored {} of {} files".format(*self._present_counts())
         return f"{detail}; {restored}"[:2000] if detail else restored.capitalize()
 
     def _partial_restore_warning(self, result_quality: str | None) -> str | None:
@@ -208,12 +210,18 @@ class StorageEventReporter:
             return None
         if self._restore_counts is None or not self._failed_items:
             return "Restored with errors; some files were not restored"
-        restored, total = self._restore_counts
+        restored, total = self._present_counts()
         first = _renter_paths(next(iter(self._failed_items)))
         return (
             f"Restored {restored} of {total} files; {len(self._failed_items)} were removed on the pod "
             f"during the restore, first: {first}"
         )[:2000]
+
+    def _present_counts(self) -> tuple[int, int]:
+        """(files left on the pod, snapshot files): restic's files_restored counts writes, including files that
+        failed or were removed afterwards, so the distinct failed items come off the total"""
+        restored, total = self._restore_counts or (0, 0)
+        return max(0, min(restored, total - len(self._failed_items))), total
 
     def _restore_has_started(self) -> bool:
         return bool(
