@@ -1346,6 +1346,7 @@ class MinerService:
                             if result.pod_ssh is not None
                             else None
                         ),
+                        "host_runtime_fault": result.host_runtime_fault,
                     },
                 )
             except Exception as e:

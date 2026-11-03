@@ -176,6 +176,9 @@ class ContextState:
     dind_probe_error: DindLogCause | None = None
     # the outside prober could not reach the ports: our filler's ports are behind the same firewall
     externally_unreachable: bool = False
+    # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
+    # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
+    host_runtime_fault: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.

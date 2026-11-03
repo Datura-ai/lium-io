@@ -1692,3 +1692,30 @@ async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
     assert await service.redis.ttl("disk_pressure_deferrals:hk:ex") > 3000
     await service.clear_disk_pressure_deferrals("hk", "ex", shadow=False)
     assert await service.disk_pressure_deferrals("hk", "ex", shadow=False) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dind_ok", "verified_port_count", "fault"),
+    [(False, 100, True), (True, 100, False), (False, 0, False)],
+    ids=["dind_refused", "dind_answered", "no_probe_ran"],
+)
+async def test_host_runtime_fault_is_a_dind_probe_that_ran_and_failed(
+    context_factory, dind_ok, verified_port_count, fault
+):
+    """DAH-5651: the state says the host's container runtime failed only when the DinD test container was
+    started on a port and never answered; no port to probe is no reading."""
+    services = build_services(
+        redis=DummyRedis(),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=False, verified_port_count=verified_port_count, dind_ok=dind_ok
+        ),
+    )
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=_rented_state()
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].host_runtime_fault is fault
