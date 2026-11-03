@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 # DAH-4537: ports fetched from outside first; each netcat listener answers once, so these are not
-# fetched again by the validator unless the outside fetch missed them
+# fetched again by the validator unless the outside fetch missed them. DAH-5597: they are published
+# with -p in their own container, so the outside fetch takes a renter pod's path
 EXTERNAL_PROBE_SAMPLE = 3
 
 
@@ -114,7 +115,23 @@ class BatchVerifier:
     ) -> BatchResult:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
-        script = NetcatScript.batch(ports, token, 0)
+        sample = random.sample(ports, min(EXTERNAL_PROBE_SAMPLE, len(ports))) if self.external_probe else []
+        reached, first_round = await self._outside_reading(sample, token, ssh_client, host, log_ctx)
+        sampled_ok = [p for p in sample if p in (reached or []) or p in first_round]
+        ports_left = [p for p in ports if p not in sampled_ok]
+        external_blocked = reached == [] and all(p in first_round for p in sample)
+        if external_blocked:
+            logger.warning(
+                _m(
+                    f"ports {[p.external for p in sample]} answer the validator but not the outside prober",
+                    extra=get_extra_info(log_ctx),
+                )
+            )
+        external = "blocked" if external_blocked else "passed" if reached else None
+        if not ports_left:
+            return BatchResult(sampled_ok, [], external)
+
+        script = NetcatScript.batch(ports_left, token, 0)
         start_result = await self.runner.run(ssh_client, name, script, "host", 60)
         if not start_result.ok:
             logger.debug(
@@ -123,21 +140,15 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-            return BatchResult([], ports)
+            return BatchResult(sampled_ok, ports_left, external)
 
         try:
-            sample = random.sample(ports, min(EXTERNAL_PROBE_SAMPLE, len(ports))) if self.external_probe else []
-            reached = await self.external_probe.reached(host, sample, token) if sample else None
             async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
-                remaining = [p for p in ports if p not in (reached or [])]
-                successful, failed = (
-                    await self.port_tester.test_many(session, host, remaining, token, log_ctx) if remaining else ([], [])
-                )
-                first_round = successful
+                successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
                 # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
                 # re-probe the refused ports while the count is below PortCountCheck's floor (the failure condition)
                 for round_no in range(1, self.REPROBE_ROUNDS + 1):
-                    if not failed or len(reached or []) + len(successful) >= MIN_PORT_COUNT:
+                    if not failed or len(sampled_ok) + len(successful) >= MIN_PORT_COUNT:
                         break
                     await asyncio.sleep(self.REPROBE_DELAY_SEC)
                     late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
@@ -151,17 +162,36 @@ class BatchVerifier:
         finally:
             await self.runner.cleanup(ssh_client, name)
 
-        # only first-round answers count against the outside prober: it ran before them, so a late bind refuses it too
-        external_blocked = reached == [] and all(p in first_round for p in sample)
-        if external_blocked:
-            logger.warning(
-                _m(
-                    f"ports {[p.external for p in sample]} answer the validator but not the outside prober",
-                    extra=get_extra_info(log_ctx),
+        answered = set(sampled_ok + successful)
+        return BatchResult([p for p in ports if p in answered], failed, external)
+
+    async def _outside_reading(
+        self, sample: list[PortPair], token: str, ssh_client, host: str, log_ctx: dict
+    ) -> tuple[list[PortPair] | None, list[PortPair]]:
+        """DAH-5597: the outside prober fetches ports published with `-p`, as a renter's pod publishes them, so it
+        goes through the docker DNAT/FORWARD path; a --network=host listener would test the host INPUT chain
+        instead. Returns the outside reading (None: no reading) and the sampled ports the validator then reached
+        on the same listener, first try only: the prober ran before them, so a late bind refuses it too."""
+        if not sample:
+            return None, []
+        name = f"port_test_out_{token[:8]}"
+        publish_flags = " ".join(f"-p {p.internal}:{p.internal}" for p in sample)
+        start = await self.runner.run(ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30)
+        try:
+            if not start.ok:
+                logger.debug(
+                    _m(f"outside probe start failed: status={start.status}", extra=get_extra_info(log_ctx))
                 )
-            )
-        external = "blocked" if external_blocked else "passed" if reached else None
-        return BatchResult((reached or []) + successful, failed, external)
+                return None, []
+            reached = await self.external_probe.reached(host, sample, token)
+            remaining = [p for p in sample if p not in (reached or [])]
+            if not remaining:
+                return reached, []
+            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+                first_round, _ = await self.port_tester.test_many(session, host, remaining, token, log_ctx)
+            return reached, first_round
+        finally:
+            await self.runner.cleanup(ssh_client, name)
 
 
 class FallbackVerifier:
