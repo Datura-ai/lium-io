@@ -5317,10 +5317,19 @@ class DockerService:
             # Still short after every removal worked: the cache was not what was missing, so the size stays as ordered.
             if not payload.local_volume and not await rental_fits():
                 if not removal_failed:
-                    left: list[str] = await self._find_cache_volumes_to_sweep(
-                        ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES
-                    )
-                    removal_failed = bool(set(left) & set(cache_volumes))
+                    # a listing that fails cannot show the removals worked, so it counts as a failed removal
+                    try:
+                        listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+                        cache_volumes_still_listed = (
+                            set((listed.stdout or "").split()) & set(cache_volumes)
+                            if listed.exit_status == 0
+                            else None
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        cache_volumes_still_listed = None
+                    removal_failed = cache_volumes_still_listed is None or bool(cache_volumes_still_listed)
                 if removal_failed:
                     await self._clamp_rental_volume_to_free_disk(ssh_client, payload, docker_root_dir, fit)
             return True
