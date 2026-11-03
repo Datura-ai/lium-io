@@ -202,12 +202,12 @@ async def test_the_split_requirement_sees_the_rental_the_tenant_check_judges(min
     from dataclasses import replace
 
     from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
-    from neurons.validators.src.services.task.checks.rented_machine import _rental_of_validated_miner
+    from neurons.validators.src.services.task.checks.rental_owner import rental_of_validated_miner
 
     ctx = _ctx(MIN_PORT_COUNT)
     ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=_rented_by(miner_hotkey, address))})
     rental = ctx.state.rented_data.executors["executor-123"]
-    assert (_rental_of_validated_miner(ctx, rental) is not None) is rented
+    assert (rental_of_validated_miner(ctx, rental) is not None) is rented
 
     result = await PortCountCheck().run(ctx)
     assert result.passed is rented

@@ -24,6 +24,7 @@ from ..host_disk import (
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -130,21 +131,17 @@ class PortConnectivityCheck:
 
         # Extract rented ports and pod names from context
         rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
+        rented_ports = rented_executor.get_rented_ports() if rented_executor else []
+        rented_pod_names = [p.container_name for p in rented_executor.pods] if rented_executor else []
         # DAH-2527: an idle filler holds ports without creating a pod, so an executor running only
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
         # imported here: port_count also imports from this module, so a top-level import is circular
         from .port_count import split_port_requirement
-        from .rented_machine import _rental_of_validated_miner
 
         split_need = split_port_requirement(ctx.state)
-        # probe to the split target unless PortCountCheck will find this node rented (same rental identity)
-        validated_rental = _rental_of_validated_miner(ctx, rented_executor)
-        # another miner's rental advertised under this UUID never makes this node's ports skipped
-        rented_ports = validated_rental.get_rented_ports() if validated_rental else []
-        rented_pod_names = [p.container_name for p in validated_rental.pods] if validated_rental else []
 
         gate = await self._disk_pressure_gate(ctx, rented_data, rented_executor, filler_ports)
         if gate.deferred:
@@ -174,7 +171,7 @@ class PortConnectivityCheck:
             },
             # a rented node is exempt from the split requirement (PortCountCheck), so only the floor applies;
             # one whose every listed pod is stale is re-probed to its split target by TenantEnforcementCheck
-            min_ports=split_need[1] if split_need and not (validated_rental and validated_rental.pods)
+            min_ports=split_need[1] if split_need and not (rented_executor and rented_executor.pods)
             else MIN_PORT_COUNT,
         )
         if probe_sysbox and not ctx.state.sysbox_runtime:

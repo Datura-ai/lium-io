@@ -11,6 +11,7 @@ from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 from ..availability import AVAILABILITY_CATEGORY, ReachSource, ReachTarget
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
+from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -156,22 +157,24 @@ class PortCountCheck:
         # The probe skips our idle filler's ports, but a rental removes the filler (create-time
         # cleanup) and frees them, so they join both the count and verified_ports, the set the
         # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
-        probed = list((ctx.state.specs or {}).get("verified_ports") or [])
-        held = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
+        # a deferred cycle's ports are the last completed check's, not this cycle's: never listed or paid
+        # from (a rental keeps its exemption below)
+        deferred = ctx.state.port_check_deferred
+        probed = [] if deferred else list((ctx.state.specs or {}).get("verified_ports") or [])
+        held = (
+            rented_data.get_filler_ports(ctx.executor.uuid)
+            if rented_data and not uuid_listed_under_another_miner(ctx, rented_data)
+            else []
+        )
         if ctx.state.externally_unreachable:
             held = []  # its filler ports are firewalled too, so they cannot lift it over the floor
 
-        # the rental TenantEnforcementCheck judges: another miner's on another endpoint is not this node's
-        from .rented_machine import _rental_of_validated_miner  # rented_machine imports this module
-
-        rented_executor = _rental_of_validated_miner(
-            ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        )
+        rented_executor = rental_of_this_node(ctx, rented_data=rented_data)
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         filler_ports = sorted(set(held) - set(probed))
         verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
-        port_count = ctx.state.verified_port_count + len(filler_ports)
+        port_count = (0 if deferred else ctx.state.verified_port_count) + len(filler_ports)
 
         updated_state = replace(
             ctx.state,

@@ -33,6 +33,7 @@ from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
+from .rental_owner import rental_of_this_node
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 from .task_time import task_seconds_left
 
@@ -528,8 +529,7 @@ def _create_deadline_seconds(ctx: Context) -> float:
 
 
 async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[str | None, dict[str, Any]]:
-    rented_data = ctx.state.rented_data
-    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor and rented_executor.pods:
         return "rented", {"pods": [pod.pod_id for pod in rented_executor.pods]}
     if ctx.state.port_check_deferred:
@@ -587,7 +587,7 @@ async def _busy_now(ctx: Context) -> _BusyNow:
         return _BusyNow(None)
     if rented is None:
         return _BusyNow(None)
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return _BusyNow(_RENTED_SINCE_CYCLE_START)
     fillers = frozenset(rented.get_filler_containers(ctx.executor.uuid))
@@ -829,7 +829,7 @@ async def _rented_meanwhile(ctx: Context, fillers_beside: frozenset[str]) -> str
         return None
     if rented is None:
         return None
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return "rented"
     if set(rented.get_filler_containers(ctx.executor.uuid)) - fillers_beside:

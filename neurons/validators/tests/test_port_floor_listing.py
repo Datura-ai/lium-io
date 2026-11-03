@@ -1060,6 +1060,9 @@ async def test_a_stale_split_nodes_reprobe_is_the_measurement_published_and_paid
     _, ctx = await apply(ctx, PortConnectivityCheck())
     _, ctx = await apply(ctx, PortCountCheck())
     assert ctx.state.specs["available_port_count"] == 21
+    from neurons.validators.src.services.task.checks import port_connectivity
+
+    assert (ctx.miner_hotkey, EXECUTOR_UUID) in port_connectivity._COMPLETED_CHECK_SAVED_AT
     probe.blocked = set(range(40000, 40024 - answering))  # only the top `answering` ports answer the re-probe
     ctx.services.connectivity.orchestrator.dind_probe = FirewalledDind(probe)  # a container's port is firewalled too
     if replacement:
@@ -1070,6 +1073,8 @@ async def test_a_stale_split_nodes_reprobe_is_the_measurement_published_and_paid
     assert final.state.specs["available_port_count"] == final.port_count == answering
     assert len(final.state.specs["verified_ports"]) == answering
     assert tenant_result.passed is replacement  # idle and short of its 24 ports: hidden, nothing paid
+    # the re-probe supersedes the first check, so the next pressured cycle checks before it defers again
+    assert (ctx.miner_hotkey, EXECUTOR_UUID) not in port_connectivity._COMPLETED_CHECK_SAVED_AT
     if replacement:
         assert final.rented is True
         incentive = _build_incentive(

@@ -1771,3 +1771,19 @@ async def test_a_filler_given_during_a_probe_beside_another_is_no_verdict():
     assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert result.event.what_we_saw["reason"] == "node was given a filler during the probe"
     assert redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_another_miners_rental_neither_skips_the_probe_nor_excuses_its_failure():
+    """DAH-4263 review round 2: the re-reads under the create lock and after the probe go through
+    rental_of_this_node, so a rental the backend lists under this UUID for another miner on another
+    endpoint is not this node's."""
+    theirs = rented_data(pods=1)
+    theirs.executors[EXECUTOR.uuid] = theirs.executors[EXECUTOR.uuid].model_copy(
+        update={"miner_hotkey": "other-miner-hotkey", "executor_ip_port": "2222"}
+    )
+    ctx, docker, _ = make_probe_context(rented_now=[theirs, theirs])
+    with probe_settings(deadline=1), renter_path(sshd_listens=False):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert len(docker.create_calls) == 1
