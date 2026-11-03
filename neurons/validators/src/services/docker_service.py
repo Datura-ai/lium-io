@@ -578,8 +578,10 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
-# DAH-5392: bounds the backend's rental-active answer for an unlisted pod in a create's sweep; no answer keeps the pod
+# DAH-5392: bounds the backend's rental-active answers for a create's whole sweep of unlisted pods; no answer keeps the pod
 _POD_RENTAL_ACTIVE_TIMEOUT_SECONDS = 15
+# the names come from the provider's docker ps: read their rentals this many at a time, never all at once
+_POD_RENTAL_READS_AT_ONCE = 16
 # DAH-5012: after that rm times out on fillers only, one host command kills their processes directly and
 # reads whether each is exiting; bounded on its own, since the rm's deadline is spent by then
 _STUCK_FILLER_PROBE_TIMEOUT_SECONDS = 15
@@ -4588,16 +4590,20 @@ class DockerService:
         backend names every pod it creates after the pod's uuid, so such a name is no newer create's pod).
         No backend client, no answer, an error or a timeout keeps the pod: a removal cannot be undone."""
 
+        # one deadline for the whole sweep, so a long list never multiplies a stalled backend's wait on the create
+        deadline = asyncio.get_running_loop().time() + _POD_RENTAL_ACTIVE_TIMEOUT_SECONDS
+
         async def closed(name: str) -> bool:
             pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
             try:
                 UUID(pod_id)
             except ValueError:
                 return True
-            if self.backend_client is None:
+            # past the deadline no read starts: an expired timeout only cancels on the next loop turn, after the request began
+            if self.backend_client is None or asyncio.get_running_loop().time() >= deadline:
                 return False
             try:
-                async with asyncio.timeout(_POD_RENTAL_ACTIVE_TIMEOUT_SECONDS):
+                async with asyncio.timeout_at(deadline):
                     answer = await self.backend_client.get_pod_rental_active(pod_id)
             except Exception as exc:
                 logger.warning(
@@ -4609,7 +4615,16 @@ class DockerService:
                 return False
             return answer is not None and not answer.active
 
-        answers = await asyncio.gather(*(closed(name) for name in names))
+        # a fixed number of workers share the list, so tasks and timers stay bounded however many names it holds
+        pending = iter(names)
+        answer_by_name: dict[str, bool] = {}
+
+        async def read_some() -> None:
+            for name in pending:
+                answer_by_name[name] = await closed(name)
+
+        await asyncio.gather(*(read_some() for _ in range(min(_POD_RENTAL_READS_AT_ONCE, len(names)))))
+        answers = [answer_by_name[name] for name in names]
         kept = [name for name, is_closed in zip(names, answers) if not is_closed]
         if kept:
             logger.info(_m("Keeping unlisted pods whose rental is not confirmed closed", extra=get_extra_info({**default_extra, "container_names": kept})))
