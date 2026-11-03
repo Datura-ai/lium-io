@@ -40,6 +40,7 @@ from services.gpu_wedge import (
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -460,7 +461,7 @@ def lium_workload_containers(ctx: Context) -> set[str]:
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
-    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(pod.docker_container_name for pod in rented_executor.pods)
     containers.discard("")
@@ -651,7 +652,7 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
 
-    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid) if ctx.state.rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     rented_at_run_start: bool = rented_executor is not None and any(
         pod.pod_id == pod_id for pod in rented_executor.pods
     )
@@ -726,9 +727,12 @@ def _the_answer_is_about_this_node(ctx: Context, owning_executor_id: str | None)
     nodes could name a squatter container after a live run of their honest one. A backend that
     predates the field sends nothing, and then the fleet snapshot is the only owner test we have.
     """
-    if owning_executor_id is None:
-        return True
-    return str(owning_executor_id) == str(ctx.executor.uuid)
+    if owning_executor_id is not None and str(owning_executor_id) != str(ctx.executor.uuid):
+        return False
+    # the UUID is the miner's word: a snapshot that lists it as another miner's rental elsewhere wins
+    rented_data = ctx.state.rented_data
+    listed = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    return listed is None or rental_of_this_node(ctx) is not None
 
 
 def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:
