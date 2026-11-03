@@ -347,6 +347,28 @@ async def test_a_retry_run_cleans_its_scratch_dir_and_keeps_its_exit_status(tmp_
 
 
 @pytest.mark.asyncio
+async def test_a_retry_run_still_starts_on_a_host_whose_timeout_lacks_k(tmp_path, monkeypatch):
+    # busybox `timeout` has no -k: the run goes ahead without the remote deadline
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "timeout"
+    stub.write_text("#!/bin/sh\necho 'timeout: unrecognized option: k' >&2\nexit 1\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    executor = _fake_python(tmp_path, "touch temp_1.dat; echo answer; exit 3")
+    service = VerifyXValidationService()
+    command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="c"), "lib", ".vx-run")
+
+    capture = await asyncio.create_subprocess_exec(
+        "/bin/sh", "-c", command, cwd=tmp_path, stdout=asyncio.subprocess.PIPE
+    )
+    out, _ = await asyncio.wait_for(capture.communicate(), 10)
+
+    assert (out.decode().strip(), capture.returncode) == ("answer", 3)
+    assert not (tmp_path / ".vx-run").exists()
+
+
+@pytest.mark.asyncio
 async def test_killing_a_cut_off_retry_during_the_disk_test_spares_other_processes(tmp_path):
     # the disk test writes ./temp_<ts>.dat and removes it only when it finishes; SIGKILL skips that
     executor = _fake_python(tmp_path, "touch temp_1.dat; exec sleep 60")

@@ -626,8 +626,10 @@ class VerifyXValidationService:
         d = shlex.quote(run_dir)
         return (
             f"mkdir {d} && cd {d} || exit 1; "
-            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
-            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
+            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
+            # a host whose `timeout` lacks -k (busybox) runs it without one rather than not at all
+            f'if timeout -k 1 1 true 2>/dev/null; then T="timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS}"; '
+            f"else T=; fi; $T {command} & echo $! > pid; wait $!; rc=$?; "
             f"cd .. && rm -rf {d}; exit $rc"
         )
 
