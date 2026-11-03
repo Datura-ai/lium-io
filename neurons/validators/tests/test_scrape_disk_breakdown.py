@@ -884,6 +884,25 @@ def test_a_renter_gets_the_room_both_the_store_and_data_root_have(
     )
 
 
+@pytest.mark.parametrize(
+    "store, data_root",
+    [
+        # only the containerd store (the bigger filesystem) is over 90% used
+        (_Usage(14 * 1024 * _GiB, 13 * 1024 * _GiB, 1024 * _GiB), _Usage(400 * _GiB, 40 * _GiB, 360 * _GiB)),
+        # only data-root (the bigger filesystem) is over 90% used
+        (_Usage(400 * _GiB, 40 * _GiB, 360 * _GiB), _Usage(14 * 1024 * _GiB, 13 * 1024 * _GiB, 1024 * _GiB)),
+    ],
+)
+def test_the_fuller_of_the_store_and_data_root_is_the_reported_utilization(scrape: dict, store, data_root) -> None:
+    # F-48: an idle node must not pass the 90% utilization limit while either filesystem a rental needs is over it
+    hard_disk = scrape["hard_disk_reading"](data_root)
+
+    scrape["report_tighter_store"](hard_disk, store)
+
+    assert hard_disk["hard_disk_utilization"] == pytest.approx(13 / 14 * 100)
+    assert hard_disk["hard_disk_total"] == 400 * 1024**2
+
+
 def test_disk_usage_falls_back_to_root_without_a_reachable_docker_root(scrape: dict, monkeypatch) -> None:
     # outside the executor container (no pid: host) the host path does not exist; `/` is what there is
     _stub_docker_api(scrape, {"/info": {"DockerRootDir": "/var/lib/docker"}})
