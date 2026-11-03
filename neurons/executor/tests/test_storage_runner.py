@@ -884,8 +884,9 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
     elif oom_killed is True:
         assert not any(c[0] == "dmesg" for c in calls)
     else:
-        # no ID: recent OOM kills are still listed, but never claimed as the helper's
-        assert "kernel (no helper ID, any container): " + OOM_KILL_DMESG.splitlines()[1] in log
+        # no ID: the host's OOM lines are never read, they would show other pods' data in the renter's logs
+        assert "kernel: no helper ID to match" in log
+        assert OOM_KILL_DMESG.splitlines()[1] not in log
 
 
 

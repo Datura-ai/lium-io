@@ -1038,6 +1038,9 @@ def kernel_kill_lines(dmesg: str, container_id: str) -> list[str]:
 
 def kernel_kill_note(container_id: str) -> str:
     """One log line naming the kernel's kill of the helper, or saying there was none; never raises."""
+    if not container_id:
+        # without an ID every host OOM line matches, and these lines reach the renter's logs: other pods' data
+        return "kernel: no helper ID to match"
     try:
         dmesg = subprocess.run(["dmesg", "--kernel", "--nopager"], capture_output=True, text=True, timeout=5)
     except Exception as error:  # noqa: BLE001 - diagnostics only
@@ -1045,12 +1048,10 @@ def kernel_kill_note(container_id: str) -> str:
     if dmesg.returncode != 0:
         return f"kernel: dmesg unreadable (exit {dmesg.returncode})"
     # the kill happened seconds ago; a bounded tail keeps a long-running host's ring buffer cheap
-    # no ID ("" matches every line): list any recent OOM kill as a diagnostic, not as the helper's
     found = kernel_kill_lines("\n".join(dmesg.stdout.splitlines()[-2000:]), container_id)
-    prefix = "kernel: " if container_id else "kernel (no helper ID, any container): "
     if not found:
-        return prefix + "no kernel kill line for the helper"
-    return prefix + " | ".join(found)
+        return "kernel: no kernel kill line for the helper"
+    return "kernel: " + " | ".join(found)
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:
