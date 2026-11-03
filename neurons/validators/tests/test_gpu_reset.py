@@ -648,25 +648,30 @@ trap 'echo "$pending $noops"' EXIT
 
 
 @pytest.mark.parametrize(
-    "wait_rc, wait_err, start_rc, rc, started",
+    "wait_rc, wait_err, start_rc, state, rc, started",
     [
-        (0, "", 0, 0, True),
+        (0, "", 0, "true false", 0, True),
         # a failed start (Docker restarting) fails the unit, so systemd runs it again
-        (0, "", 1, 1, True),
+        (0, "", 1, "true false", 1, True),
+        # a start that exits at once, or keeps restarting, fails the unit, so systemd runs it again
+        (0, "", 0, "false false", 1, True),
+        (0, "", 0, "true true", 1, True),
         # a failed wait (daemon restart) is no exit: fail without a no-op start, so systemd runs it again
-        (1, "Cannot connect to the Docker daemon", 0, 1, False),
+        (1, "Cannot connect to the Docker daemon", 0, "true false", 1, False),
         # a removed container ends the unit: nothing is left to start
-        (1, "Error: No such container: e1", 0, 0, False),
+        (1, "Error: No such container: e1", 0, "true false", 0, False),
     ],
 )
 def test_the_exporter_restart_unit_fails_until_it_has_started_the_exporter(
-    wait_rc, wait_err, start_rc, rc, started
+    wait_rc, wait_err, start_rc, state, rc, started
 ):
     stubs = f"""
+sleep() {{ :; }}
 docker() {{
   case "$1" in
     wait) return {wait_rc};;
-    inspect) [ -z '{wait_err}' ] || {{ echo '{wait_err}' >&2; return 1; }};;
+    inspect) [ "$2" = -f ] && {{ echo '{state}'; return 0; }}
+      [ -z '{wait_err}' ] || {{ echo '{wait_err}' >&2; return 1; }};;
     start) echo started >&2; return {start_rc};;
   esac
 }}

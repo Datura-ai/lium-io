@@ -97,11 +97,12 @@ FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
 # starts an exporter that outlived its kill once it exits, after the reset unit has ended. systemd owns the
 # retries: any failed wait or start (a Docker daemon restart included) fails the unit and it runs again; only an
-# observed exit plus a start, or a removed container, ends it
+# observed exit plus a start that is still up ("true false") a few seconds later, or a removed container, ends it
 EXPORTER_RESTART_UNIT = "lium-gpu-reset-exporter-restart"
 EXPORTER_RESTART_SCRIPT = (
     'docker wait "$0" >/dev/null || { docker inspect "$0" 2>&1 >/dev/null | grep -q "No such" && exit 0; exit 1; }; '
-    'docker start "$0" >/dev/null'
+    'docker start "$0" >/dev/null && sleep 5 && '
+    "[ \"$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' \"$0\")\" = 'true false' ]"
 )
 EXPORTER_RESTART_RUN = (
     f"systemd-run --quiet --collect --unit={EXPORTER_RESTART_UNIT} -p Restart=on-failure -p RestartSec=10 "
