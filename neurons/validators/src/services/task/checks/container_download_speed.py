@@ -109,7 +109,7 @@ def _error_kind(stderr: str) -> str:
     if "refused" in text or "unreachable" in text or "no route" in text:
         return "unreachable"
     # the connection opened but was cut mid-handshake or mid-transfer, while DNS and routing still work
-    if "reset by peer" in text or "eof" in text or "handshake" in text:
+    if "reset by peer" in text or "eof" in text or "handshake" in text or "closed prematurely" in text:
         return "connection_reset"
     return "other"
 

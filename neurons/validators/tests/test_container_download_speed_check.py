@@ -254,6 +254,7 @@ async def test_endpoint_unreachable_counts_only_when_the_validator_reaches_it():
         "wget: error getting response: Connection reset by peer",
         "ssl_client: SSL_connect: unexpected eof while reading",
         "net/http: TLS handshake timeout",
+        "wget: connection closed prematurely",
     ],
 )
 async def test_connection_reset_counts_only_when_the_validator_reaches_it(stderr):
