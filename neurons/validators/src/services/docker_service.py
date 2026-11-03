@@ -511,8 +511,8 @@ _OWN_SSH_CONNECTION_MARGIN_SEC = 5
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
 _ANONYMOUS_VOLUME_NAME_RE = re.compile(r"[0-9a-f]{64}")
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-# a clamp within 5% is df/listing drift (a ~15 min old scrape, GB vs GiB); below it the renter is short-changed,
-# so the create fails and the backend's rent retry moves the pod to another node
+# a clamp within 5% is listing drift (the scrape is ~15 min old and a filler download may still be writing);
+# below it the renter is short-changed, so the create fails and the backend's rent retry moves the pod to another node
 RENTAL_VOLUME_CLAMP_MIN_SHARE = 0.95
 RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
@@ -5242,7 +5242,7 @@ class DockerService:
         `reclaim_dphn_cache_when_disk_is_tight` waits for no live pod). Every
         removal is awaited before this returns; a sized rental that still does not fit (a removal failed or
         timed out) has its volume clamped to the disk actually free, so the pod volume is never sized on
-        disk that was not freed (create_container then warns, or refuses a clamp far below the order). A
+        disk that was not freed (create_container refuses a clamp far below the order). A
         re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
         there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
         at the volume step instead of short-changing the renter.
@@ -5313,16 +5313,8 @@ class DockerService:
                 )
             # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed
             if not payload.local_volume and not await rental_fits():
-                free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                rental_gets_gb = (free_now_gb + existing_gb) * disk_share
-                payload.volume_limit_gb = max(
-                    int(
-                        # fresh sizing splits the slice between volume and storage in the order's proportion
-                        rental_gets_gb * payload.volume_limit_gb / rental_own_gb
-                        if fresh_sizing
-                        else rental_gets_gb - (payload.storage_limit_gb or 0)
-                    ),
-                    1,
+                await self._clamp_rental_volume_to_free_disk(
+                    ssh_client, payload, docker_root_dir, rental_own_gb, existing_gb, disk_share, fresh_sizing
                 )
             return True
         except asyncio.CancelledError:
@@ -5336,6 +5328,29 @@ class DockerService:
                 exc_info=True,
             )
             return True  # the removal may have run before the failure
+
+    async def _clamp_rental_volume_to_free_disk(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        docker_root_dir: str,
+        rental_own_gb: float,
+        existing_gb: float,
+        disk_share: float,
+        fresh_sizing: bool,
+    ) -> None:
+        """Clamp a rental's volume to the disk actually free after the cache eviction (DAH-5260)."""
+        free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+        rental_gets_gb = (free_now_gb + existing_gb) * disk_share
+        payload.volume_limit_gb = max(
+            int(
+                # fresh sizing splits the slice between volume and storage in the order's proportion
+                rental_gets_gb * payload.volume_limit_gb / rental_own_gb
+                if fresh_sizing
+                else rental_gets_gb - (payload.storage_limit_gb or 0)
+            ),
+            1,
+        )
 
     async def select_affordable_cache_volumes(
         self,
@@ -9422,15 +9437,13 @@ class DockerService:
                         host_probe=docker_listing_probe,
                     )
                 )
-                if ordered_volume_gb and payload.volume_limit_gb < ordered_volume_gb:
-                    # the reclaim clamped the volume to the disk actually free
-                    if payload.volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_CLAMP_MIN_SHARE:
-                        current_step = RENTAL_DISK_SHORT_STEP
-                        raise RuntimeError(
-                            f"Not enough free disk for the ordered volume: {payload.volume_limit_gb} GB free "
-                            f"of {ordered_volume_gb} GB ordered"
-                        )
-                    warnings.append(ContainerWarningCode.VolumeSmallerThanRequested)
+                # the reclaim clamped the volume to the disk actually free; within 5% the pod is created
+                if ordered_volume_gb and payload.volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_CLAMP_MIN_SHARE:
+                    current_step = RENTAL_DISK_SHORT_STEP
+                    raise RuntimeError(
+                        f"Not enough free disk for the ordered volume: {payload.volume_limit_gb} GB free "
+                        f"of {ordered_volume_gb} GB ordered"
+                    )
                 cleanup_changed_host = bool(
                     removal_at_ssh_connect_lost_its_channel
                     or removed_containers

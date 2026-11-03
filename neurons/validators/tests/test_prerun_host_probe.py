@@ -36,7 +36,7 @@ from unittest.mock import AsyncMock, Mock
 
 import asyncssh
 import pytest
-from payload_models.payloads import ContainerWarningCode, WorkloadKind
+from payload_models.payloads import WorkloadKind
 from services.docker_service import (
     DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD,
     DockerService,
@@ -980,12 +980,12 @@ async def test_a_customer_create_waits_for_the_engy_cache_removal_before_it_size
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("clamped_gb", "created"), [(2500, True), (1059, False)])
-async def test_a_rental_volume_clamped_below_the_order_warns_the_backend_or_fails_the_create(
+async def test_a_rental_volume_clamped_far_below_the_order_fails_the_create(
     svc_fixture, monkeypatch, clamped_gb, created
 ):
     """DAH-5260: a removal that failed leaves less disk than the listing; the reclaim clamps the volume. Within 5% of the
-    2620 GB order the pod is created and the backend is told; 1059 GB is a short-change, so the create fails and the
-    backend's rent retry moves the pod to another node."""
+    2620 GB order the pod is created; 1059 GB is a short-change, so the create fails and the backend's rent retry moves
+    the pod to another node."""
     svc = svc_fixture
     _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
 
@@ -1002,7 +1002,6 @@ async def test_a_rental_volume_clamped_below_the_order_warns_the_backend_or_fail
 
     if created:
         assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-        assert ContainerWarningCode.VolumeSmallerThanRequested in result.warnings
     else:
         assert type(result).__name__ == "FailedContainerRequest"
         assert result.failure_step == ds_module.RENTAL_DISK_SHORT_STEP
