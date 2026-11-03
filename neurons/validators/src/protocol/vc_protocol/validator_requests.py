@@ -296,6 +296,8 @@ class ResetVerifiedJobEvidence(_AbsentWhenNone):
     pod_id: str | None = None
     container_name: str | None = None
     container: ResetVerifiedJobContainerEvidence | None = None
+    # DAH-4658: GpuFingerprintCheck in warn mode: the hard verdict (GPU_MISSING tells a missing card from a swap)
+    anchor_hard_would_be: str | None = None
 
 
 class ResetVerifiedJobRequest(BaseValidatorRequest):

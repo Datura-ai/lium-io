@@ -54,6 +54,10 @@ services:
         datura: ../datura
     image: lium-e2e/executor
     network_mode: service:dind
+    # Match a provider executor: it can inspect the daemon host's saved plugin manifest
+    # through /proc/1/root. Here that host is dind, not the outer CI runner.
+    pid: service:dind
+    privileged: true
     depends_on:
       dind:
         condition: service_healthy

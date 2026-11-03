@@ -13,7 +13,6 @@ import logging
 
 import pytest
 from core import validator as validator_module
-from core.config import settings
 from core.validator import settle_cycle_results, specs_to_publish
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine
@@ -70,11 +69,6 @@ def _result(
     )
 
 
-@pytest.fixture
-def enforce(monkeypatch):
-    monkeypatch.setattr(settings, "DUPLICATE_EXECUTOR_DRY_RUN", False)
-
-
 def _assert_zeroed(result: JobResult, kept_by: str) -> None:
     assert (result.score, result.job_score) == (0, 0)
     assert not result.is_successful
@@ -95,7 +89,7 @@ def _across_miner_logs(caplog) -> list:
 
 
 @pytest.mark.parametrize("order", [(BOB, ALICE), (ALICE, BOB)], ids=["keeper-first", "keeper-last"])
-def test_one_executor_under_two_hotkeys_is_scored_once_under_the_first_hotkey(enforce, order):
+def test_one_executor_under_two_hotkeys_is_scored_once_under_the_first_hotkey(order):
     copies = {BOB: _result("0ec12c01-5f62"), ALICE: _result("0EC12C01-5f62")}
 
     duplicates = keep_one_miner_per_executor({hotkey: [copies[hotkey]] for hotkey in order})
@@ -108,7 +102,7 @@ def test_one_executor_under_two_hotkeys_is_scored_once_under_the_first_hotkey(en
     ]
 
 
-def test_two_executor_uuids_on_one_ssh_endpoint_are_one_machine(enforce):
+def test_two_executor_uuids_on_one_ssh_endpoint_are_one_machine():
     kept, dropped = _result("uuid-a"), _result("uuid-b")
 
     keep_one_miner_per_executor({ALICE: [dropped], BOB: [kept]})
@@ -118,7 +112,7 @@ def test_two_executor_uuids_on_one_ssh_endpoint_are_one_machine(enforce):
     assert not dropped.duplicate_shares_kept_row
 
 
-def test_a_rented_copy_keeps_the_score(enforce):
+def test_a_rented_copy_keeps_the_score():
     idle, rented = _result("uuid-a"), _result("uuid-b", is_rented=True)
 
     keep_one_miner_per_executor({BOB: [idle], ALICE: [rented]})
@@ -127,7 +121,7 @@ def test_a_rented_copy_keeps_the_score(enforce):
     _assert_zeroed(idle, kept_by=ALICE)
 
 
-def test_the_hotkey_the_rental_names_keeps_a_shared_rented_executor(enforce):
+def test_the_hotkey_the_rental_names_keeps_a_shared_rented_executor():
     # both copies read as rented: the rented list is keyed by executor UUID alone
     holder, other = _result("uuid-a", is_rented=True), _result("uuid-a", is_rented=True)
     rented = RentedExecutorsResponse(
@@ -144,7 +138,7 @@ def test_the_hotkey_the_rental_names_keeps_a_shared_rented_executor(enforce):
     _assert_zeroed(other, kept_by=ALICE)
 
 
-def test_a_forced_pass_the_validator_did_not_log_in_for_proves_no_endpoint(enforce):
+def test_a_forced_pass_the_validator_did_not_log_in_for_proves_no_endpoint():
     first = _result("uuid-a", ssh_port=0, is_rented=True)
     second = _result("uuid-b", ssh_port=0, is_rented=True)
 
@@ -154,7 +148,7 @@ def test_a_forced_pass_the_validator_did_not_log_in_for_proves_no_endpoint(enfor
     _assert_untouched(second)
 
 
-def test_every_other_hotkey_on_the_endpoint_loses_its_copy(enforce):
+def test_every_other_hotkey_on_the_endpoint_loses_its_copy():
     a, b, c = _result("uuid-a"), _result("uuid-b"), _result("uuid-c")
 
     duplicates = keep_one_miner_per_executor({ALICE: [a], BOB: [b], CHARLIE: [c]})
@@ -178,7 +172,7 @@ def test_every_other_hotkey_on_the_endpoint_loses_its_copy(enforce):
     ],
     ids=["executor-uuid", "listed-ip-port", "gpu-uuid"],
 )
-def test_a_node_reported_match_on_another_endpoint_is_logged_and_never_zeroed(enforce, caplog, first, second, matched_on):
+def test_a_node_reported_match_on_another_endpoint_is_logged_and_never_zeroed(caplog, first, second, matched_on):
     with caplog.at_level(logging.WARNING):
         duplicates = keep_one_miner_per_executor({BOB: [first], ALICE: [second]})
 
@@ -190,7 +184,7 @@ def test_a_node_reported_match_on_another_endpoint_is_logged_and_never_zeroed(en
     assert {log.extra["miner_hotkey"] for log in _across_miner_logs(caplog)} == {BOB, ALICE}
 
 
-def test_a_single_hotkey_is_unaffected(enforce):
+def test_a_single_hotkey_is_unaffected():
     own_repeat = [_result("uuid-a"), _result("uuid-b")]
     other = [_result("uuid-x", address="203.0.113.9", gpu_uuids=("GPU-7",))]
 
@@ -199,32 +193,14 @@ def test_a_single_hotkey_is_unaffected(enforce):
         _assert_untouched(result)
 
 
-def test_an_unscored_copy_takes_no_part(enforce):
+def test_an_unscored_copy_takes_no_part():
     scored, failed = _result("uuid-a"), _result("uuid-a", score=0)
 
     assert keep_one_miner_per_executor({BOB: [failed], ALICE: [scored]}) == []
     _assert_untouched(scored)
 
 
-def test_dry_run_logs_both_hotkeys_and_changes_nothing(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "DUPLICATE_EXECUTOR_DRY_RUN", True)
-    first, second = _result("uuid-a"), _result("uuid-a")
-
-    with caplog.at_level(logging.WARNING):
-        duplicates = keep_one_miner_per_executor({BOB: [first], ALICE: [second]})
-
-    _assert_untouched(first)
-    _assert_untouched(second)
-    assert not second.duplicate_shares_kept_row
-    assert [(d.hotkey, d.kept_by, d.enforced) for d in duplicates] == [(ALICE, BOB, False)]
-    logged = _across_miner_logs(caplog)
-    assert [(log.extra["miner_hotkey"], log.extra["kept_by_hotkey"], log.extra["enforced"]) for log in logged] == [
-        (ALICE, BOB, False)
-    ]
-    assert "observe mode" in logged[0].message
-
-
-def test_enforce_logs_both_hotkeys(enforce, caplog):
+def test_enforce_logs_both_hotkeys(caplog):
     with caplog.at_level(logging.WARNING):
         keep_one_miner_per_executor({BOB: [_result("uuid-a")], ALICE: [_result("uuid-a")]})
 
@@ -234,12 +210,10 @@ def test_enforce_logs_both_hotkeys(enforce, caplog):
     ]
 
 
-@pytest.mark.parametrize("dry_run, gpus", [(True, 16), (False, 8)], ids=["dry-run", "enforce"])
-def test_the_tier_counts_a_shared_machine_once_only_when_enforced(monkeypatch, dry_run, gpus):
-    monkeypatch.setattr(settings, "DUPLICATE_EXECUTOR_DRY_RUN", dry_run)
+def test_the_tier_counts_a_shared_machine_once():
     results = {BOB: [_result("uuid-a")], ALICE: [_result("uuid-a")]}
 
-    assert settle_cycle_results(results, {}) == {H200: gpus}
+    assert settle_cycle_results(results, {}) == {H200: 8}
 
 
 def test_a_failing_duplicate_pass_leaves_the_cycle_scoring(monkeypatch):
@@ -252,7 +226,7 @@ def test_a_failing_duplicate_pass_leaves_the_cycle_scoring(monkeypatch):
     assert settle_cycle_results(results, {}) == {H200: 16}
 
 
-def test_only_a_zeroed_copy_of_the_keepers_own_row_is_not_published(enforce):
+def test_only_a_zeroed_copy_of_the_keepers_own_row_is_not_published():
     same_row = {BOB: [_result("uuid-a")], ALICE: [_result("uuid-a")]}
     own_row = {BOB: [_result("uuid-a")], ALICE: [_result("uuid-b")]}
     keep_one_miner_per_executor(same_row)
@@ -276,7 +250,7 @@ def _host_key_matches(duplicates) -> list[tuple[str, str]]:
     return sorted((d.hotkey, d.executor_uuid) for d in duplicates if d.matched_on == MATCH_SSH_HOST_KEY)
 
 
-def test_one_host_key_on_two_endpoints_under_two_hotkeys_is_logged_and_never_zeroed(enforce):
+def test_one_host_key_on_two_endpoints_under_two_hotkeys_is_logged_and_never_zeroed():
     direct = _verified(_result("uuid-a", address="198.51.100.7"))
     relayed = _verified(_result("uuid-b", address="203.0.113.9", port=8002))
 
@@ -288,7 +262,7 @@ def test_one_host_key_on_two_endpoints_under_two_hotkeys_is_logged_and_never_zer
     assert all(d.kept_by is None and not d.enforced for d in duplicates)
 
 
-def test_one_host_key_on_two_ports_under_one_hotkey_is_logged(enforce):
+def test_one_host_key_on_two_ports_under_one_hotkey_is_logged():
     first = _verified(_result("uuid-a", ssh_port=2200))
     second = _verified(_result("uuid-b", port=8002, ssh_port=2201))
 
@@ -299,7 +273,7 @@ def test_one_host_key_on_two_ports_under_one_hotkey_is_logged(enforce):
     assert _host_key_matches(duplicates) == [(BOB, "uuid-a"), (BOB, "uuid-b")]
 
 
-def test_a_host_key_the_validator_did_not_verify_matches_nothing(enforce):
+def test_a_host_key_the_validator_did_not_verify_matches_nothing():
     first = _verified(_result("uuid-a", ssh_port=2200))
     unverified = _result("uuid-b", port=8002, ssh_port=2201)
     unverified.executor_info.ssh_host_key = HOST_KEY
@@ -307,7 +281,7 @@ def test_a_host_key_the_validator_did_not_verify_matches_nothing(enforce):
     assert _host_key_matches(keep_one_miner_per_executor({BOB: [first, unverified]})) == []
 
 
-def test_two_nodes_with_their_own_host_keys_match_nothing(enforce):
+def test_two_nodes_with_their_own_host_keys_match_nothing():
     first = _verified(_result("uuid-a", ssh_port=2200))
     second = _verified(_result("uuid-b", port=8002, ssh_port=2201), host_key=HOST_KEY + "2")
 
@@ -317,9 +291,7 @@ def test_two_nodes_with_their_own_host_keys_match_nothing(enforce):
 GPU_ALIAS_REASON = "EXECUTOR_GPU_ALIAS"
 
 
-@pytest.mark.parametrize("enforced", [False, True])
-def test_one_miners_executors_sharing_a_gpu_uuid_score_once(monkeypatch, enforced):
-    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", enforced)
+def test_one_miners_executors_sharing_a_gpu_uuid_score_once():
     kept = _result("uuid-a", gpu_uuids=("GPU-1", "GPU-2"))
     alias = _result("uuid-b", address="203.0.113.9", gpu_uuids=("GPU-2", "GPU-3"))
     other = _result("uuid-c", gpu_uuids=("GPU-9",))
@@ -329,16 +301,12 @@ def test_one_miners_executors_sharing_a_gpu_uuid_score_once(monkeypatch, enforce
     assert aliases == [(BOB, alias)]
     _assert_untouched(kept)
     _assert_untouched(other)
-    if enforced:
-        assert (alias.score, alias.job_score) == (0, 0)
-        assert alias.failure_reason_code == GPU_ALIAS_REASON
-        assert alias.validation_event.reason_code == GPU_ALIAS_REASON
-    else:
-        _assert_untouched(alias)
+    assert (alias.score, alias.job_score) == (0, 0)
+    assert alias.failure_reason_code == GPU_ALIAS_REASON
+    assert alias.validation_event.reason_code == GPU_ALIAS_REASON
 
 
-def test_gpu_alias_keeps_the_rented_copy_and_ignores_other_miners(monkeypatch):
-    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", True)
+def test_gpu_alias_keeps_the_rented_copy_and_ignores_other_miners():
     idle = _result("uuid-a", gpu_uuids=("GPU-1",))
     rented = _result("uuid-b", gpu_uuids=("GPU-1",), is_rented=True)
     # another miner reporting the same card is not this pass's business
@@ -352,8 +320,7 @@ def test_gpu_alias_keeps_the_rented_copy_and_ignores_other_miners(monkeypatch):
     _assert_untouched(foreign)
 
 
-def test_gpu_alias_ignores_one_executors_repeat_and_unscored_copies(monkeypatch):
-    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", True)
+def test_gpu_alias_ignores_one_executors_repeat_and_unscored_copies():
     first = _result("uuid-a", gpu_uuids=("GPU-1",))
     repeat = _result("UUID-A", gpu_uuids=("GPU-1",))
     failed = _result("uuid-b", gpu_uuids=("GPU-1",), score=0.0)

@@ -18,8 +18,11 @@ decision: state failures are swallowed inside ``cache_prefetch_state``.
 """
 
 import asyncio
+import glob
+import os
 import random
 import time
+import tomllib
 
 import aiohttp
 import docker
@@ -29,7 +32,7 @@ import pynvml
 from core.config import settings
 from core.logger import get_logger
 from services.cache_prefetch_state import STATE_PATH, CachePrefetchState, Outcome
-from services.pre_pull_service import STREAM_READ_TIMEOUT_SECONDS, PrePuller
+from services.pre_pull_service import STREAM_READ_TIMEOUT_SECONDS, PrePuller, _remove_ref, rental_activity
 from services.pull_lock import cache_pull_lock
 
 logger = get_logger(__name__)
@@ -53,6 +56,11 @@ FIRST_SWEEP_FAST_RETRIES = 4
 SWEEP_DEADLINE_MARGIN_SECONDS = STREAM_READ_TIMEOUT_SECONDS + 30
 
 DEFAULT_DOCKER_IMAGE_PATH = "/executors/default-docker-image"
+
+# The rental listing hides a node with less free disk than this or more used than the percent
+# below; keep in step with the backend. Under either, unused images are removed (see below).
+LISTING_MIN_FREE_GB = 100
+LISTING_MAX_DISK_USED_PERCENT = 90
 
 
 def _get_gpu_info() -> tuple[str, str, str | None]:
@@ -286,6 +294,95 @@ async def _ensure_template(
     state.note_cleanup_error(image_ref, cleanup_error)
 
 
+HOST_ROOT = "/proc/1/root"
+
+
+def _containerd_roots() -> list[str]:
+    """containerd's default root plus every top-level ``root`` in the host's config.toml and its imports.
+
+    Imports resolve as containerd does: relative to the importing file, a pattern with glob
+    characters is a glob. Measuring more paths only makes the prune start sooner, so the default
+    stays measured too.
+    """
+    roots = ["/var/lib/containerd"]
+    prefix = next((p for p in (HOST_ROOT, "") if os.path.isfile(p + "/etc/containerd/config.toml")), None)
+    if prefix is None:
+        return roots
+    todo, seen = [prefix + "/etc/containerd/config.toml"], set()
+    while todo:
+        config = todo.pop(0)
+        if config in seen:
+            continue
+        seen.add(config)
+        try:
+            with open(config, "rb") as config_file:
+                top = tomllib.load(config_file)  # a real parser: comments, multi-line arrays, escapes
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if isinstance(top.get("root"), str):
+            roots.append(top["root"])
+        for pattern in top.get("imports") or []:
+            if not isinstance(pattern, str):
+                continue
+            path = prefix + pattern if pattern.startswith("/") else os.path.join(os.path.dirname(config), pattern)
+            todo += sorted(glob.glob(path)) if glob.has_magic(pattern) else [path]
+    return roots
+
+
+def _prune_unused_images_when_disk_low(client: "docker.DockerClient", keep_refs: set[str]) -> int:
+    """Remove every image no container uses, once the disk is under the listing floor.
+
+    Blocking; run in a thread. Kept: an image any container uses, running or stopped (this
+    executor's own image included), and the templates this loop keeps warm (``keep_refs``).
+    Only while the node is idle, as the pre-pull is: a rental being created pulls its image
+    before its container exists. Removal is never forced, so docker itself refuses an image a
+    container still holds. Returns how many images were removed.
+    """
+    # "/" is what the listing reads; Docker's data root can be a separate filesystem. That root
+    # is a host path: in the executor container (pid: host) the host's filesystem is /proc/1/root
+    paths = ["/"]
+    info = client.info()
+    roots = [info.get("DockerRootDir")]
+    if any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        # Docker's containerd image store keeps images under containerd's root, whatever data-root says
+        roots += _containerd_roots()
+    for root in roots:
+        if isinstance(root, str) and root.startswith("/"):
+            seen = next((p for p in (HOST_ROOT + root, root) if os.path.isdir(p)), None)
+            if seen and seen not in paths:
+                paths.append(seen)
+    low = [
+        path
+        for path in paths
+        if (u := psutil.disk_usage(path)).free < LISTING_MIN_FREE_GB * 1024**3
+        or u.percent > LISTING_MAX_DISK_USED_PERCENT
+    ]
+    if not low:
+        return 0
+    in_use = {container.attrs.get("Image") for container in client.containers.list(all=True)}
+    removed = 0
+    for image in client.images.list():
+        if image.id in in_use or keep_refs.intersection(image.tags):
+            continue
+        # by tag, so an image with several tags goes; an untagged one only has its id
+        ok = True
+        for ref in image.tags or [image.id]:
+            # rechecked before every removal: a rental that starts mid-sweep may already
+            # have found this image locally and skipped its pull
+            busy = rental_activity(client)
+            if busy:
+                logger.info(f"Disk low but node busy ({busy}); unused images kept this cycle")
+                return removed
+            ok = _remove_ref(client, ref) and ok
+        if ok:
+            removed += 1
+            logger.info(f"Disk low: removed unused image {image.tags or image.id}")
+    if not removed:
+        # nothing this prune may remove: the space is held by images in use, kept templates or other files
+        logger.warning(f"Disk low on {low}; no unused image could be removed, the disk stays full")
+    return removed
+
+
 def _first_sweep_retry_delay(attempt: int, error_interval: float) -> float | None:
     """Delay before fast retry number ``attempt`` (0-based), or None once they are used up."""
     if attempt >= FIRST_SWEEP_FAST_RETRIES:
@@ -342,7 +439,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
 
     logger.info(f"Cache template pre-pull starting (refresh every {refresh_interval}s)")
 
-    # DAH-2977: off by default. When on, the backend is asked for the top-N official
+    # DAH-2977 (on by default since DAH-3604). When on, the backend is asked for the top-N official
     # templates too (`pre_pull: true` entries) and PrePuller warms one per sweep while idle.
     pre_puller = PrePuller(client) if settings.PRE_PULL_TEMPLATES_ENABLED else None
     # The sweep in flight, if any. The loop starts it and never awaits it (review, DAH-2977):
@@ -442,6 +539,16 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                         pre_puller.protected = frozenset(
                             f"{repo}:{tag}" for repo, tag in mandatory_refs if repo and tag
                         )
+                    try:
+                        await asyncio.to_thread(
+                            _prune_unused_images_when_disk_low,
+                            client,
+                            {f"{d.get('docker_image')}:{d.get('docker_image_tag')}" for d in templates},
+                        )
+                    except Exception as e:
+                        # best-effort: a failed prune must not hold the default image's refresh.
+                        # Runs before the pull: a full Docker disk fails that pull every time.
+                        logger.warning(f"Unused image prune failed: {e}")
                     for data in templates:
                         if not data.get("pre_pull"):
                             await _ensure_template(client, data, state, keep_tags)

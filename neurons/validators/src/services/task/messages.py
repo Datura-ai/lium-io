@@ -191,6 +191,14 @@ class MachineSpecMessages:
             " reboot or reinstall the driver."
         ),
     )
+    # DAH-4658: the renter's own reset takes the cards out of NVML; the cycle withholds the verdict
+    SCRAPE_GPU_RESET_IN_PROGRESS = MessageTemplate(
+        event="Machine specs scrape found no GPU: the renter is resetting the pod's GPUs",
+        reason="SCRAPE_GPU_RESET_IN_PROGRESS",
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
+    )
     SCRAPE_FAILED_ON_HOST = MessageTemplate(
         event="Machine specs scrape failed on the executor",
         reason="SCRAPE_FAILED_ON_HOST",
@@ -407,12 +415,14 @@ class GpuThermalThrottleMessages:
         event="GPU clock collapsed by thermal throttling",
         reason="GPU_THERMAL_COLLAPSE",
         severity="error",
-        category="env",
-        impact="Job skipped; score set to 0 until a busy GPU holds at least half its max clock",
+        # an availability error: the backend hides the node and refuses new rentals at once
+        category=AVAILABILITY_CATEGORY,
+        impact="Node hidden, job skipped and score set to 0 until the hold ends (see remediation)",
         remediation="A busy GPU runs below half its max clock with a thermal or hardware slowdown set (see "
-        "gpus[]: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the cooling (fans, "
-        "airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`); the node passes again "
-        "on the next validation once the clock recovers.",
+        "gpus[], held_gpu_uuids: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the "
+        "cooling (fans, airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`). The hold "
+        "ends when the card runs busy at half its max clock or more with no thermal slowdown (for example under "
+        "the Lium filler or the host's own load), or after 7 days, or when the card is replaced.",
     )
     OK = MessageTemplate(
         event="GPU clocks not thermally throttled",
@@ -489,9 +499,9 @@ class RentedGpuDropMessages:
         category="env",
         impact="Proceed",
     )
-    DISABLED = MessageTemplate(
-        event="Rented GPU drop check disabled",
-        reason="RENTED_GPU_DROP_DISABLED",
+    GPU_RESET_IN_PROGRESS = MessageTemplate(
+        event="Rented GPU drop check skipped: the renter is resetting the pod's GPUs",
+        reason="RENTED_GPU_DROP_GPU_RESET_IN_PROGRESS",
         severity="info",
         category="env",
         impact="Proceed",
@@ -505,12 +515,30 @@ class GpuLossHoldMessages:
         severity="error",
         # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
         category=AVAILABILITY_CATEGORY,
-        impact="The node is hidden and takes no new rentals until its GPUs read clean for the hold window "
-        "(see hold_until); an idle node scores 0 meanwhile, a rental already on it is not touched",
+        impact="The node is hidden and takes no new rentals until every GPU reads clean again and passes a load "
+        "test on every card; an idle node scores 0 meanwhile, a rental already on it is not touched",
         remediation="A card fell out of NVML (see faults, missing_uuids, nvml_error_code). Run `nvidia-smi` and "
         "`dmesg | grep -i xid` on the host; 'Unknown Error' or Xid 79 ('fallen off the bus') means the card must "
-        "be reseated, reset or replaced. The node is listed again once every card has read clean for the hold "
-        "window.",
+        "be reseated, reset or replaced. On the first check that sees every GPU again while the node is not "
+        "rented, every card is load-tested, and the node is listed again when they pass.",
+    )
+    # DAH-5393: same code as LOST (an availability error that is never silenced as our own outage)
+    POD_GPUS_GONE = MessageTemplate(
+        event="A rented pod on this node was made for GPUs the node no longer has",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="The node is hidden, takes no new rentals and scores 0 while the pod has none of its GPUs",
+        remediation="The node came back with other GPUs while a pod made for the old ones was running (see "
+        "missing_uuids). The pod cannot use the new cards until it is recreated; the node is verified on its new "
+        "cards on the first check after that, or after the rental ends.",
+    )
+    CLEAN_AGAIN = MessageTemplate(
+        event="Every GPU is listed again; each card is load-tested before the node is listed",
+        reason="GPU_LOST_CLEAN_AGAIN",
+        severity="info",
+        category="env",
+        impact="Proceed; the node is listed if every card passes the load test in this check",
     )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
@@ -526,11 +554,25 @@ class GpuLossHoldMessages:
         category="env",
         impact="Proceed",
     )
+    GPU_RESET_IN_PROGRESS = MessageTemplate(
+        event="GPU loss hold skipped: the renter is resetting the pod's GPUs",
+        reason="GPU_LOST_GPU_RESET_IN_PROGRESS",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    # DAH-4658: the reason of the zero-GPU scrape hold, so the cycle carries the last score the same way
+    MISSING_GPUS_UNDER_RESET = MessageTemplate(
+        event="GPUs missing from the scrape: the renter is resetting them",
+        reason=MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
+    )
 
 
 class PostRentalGpuRecheckMessages:
-    """DAH-4482 — the recheck a node owes after the rented GPU health read flagged it. Shadow while
-    POST_RENTAL_GPU_RECHECK_ENABLED is off: WOULD_REQUIRE is logged and the cycle goes on."""
+    """DAH-4482 — the recheck a node owes after the rented GPU health read flagged it."""
 
     NO_MARKER = MessageTemplate(
         event="Post-rental GPU recheck not needed",
@@ -538,13 +580,6 @@ class PostRentalGpuRecheckMessages:
         severity="info",
         category="env",
         impact="Proceed",
-    )
-    WOULD_REQUIRE = MessageTemplate(
-        event="Post-rental GPU recheck would be required (shadow)",
-        reason="POST_RENTAL_GPU_RECHECK_WOULD_REQUIRE",
-        severity="warning",
-        category="env",
-        impact="Shadow observation only: score was NOT changed",
     )
     FILLER_SKIPPED = MessageTemplate(
         event="Post-rental GPU recheck waits: active filler",
@@ -560,6 +595,16 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Proceed; the recheck runs again next cycle.",
     )
+    # a node back from a GPU dropout: no listing until the every-card test has passed. GPU_LOST, an availability
+    # error: a failed cycle alone does not hide a node the backend still holds active, this entry does.
+    WAITING_AFTER_GPU_LOSS = MessageTemplate(
+        event="GPUs back; waiting for the load test on every card",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Not listed until every card has passed the load test; it runs again on the next check",
+        remediation="Nothing to do while every GPU stays visible; the test runs again on the next check.",
+    )
     PASSED = MessageTemplate(
         event="Post-rental GPU recheck passed",
         reason="POST_RENTAL_GPU_RECHECK_PASSED",
@@ -574,11 +619,36 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Score set to 0",
         remediation=(
-            "A GPU showed a fault during the last rental, and after it at least one card failed the "
+            "A GPU showed a fault (during a rental, or it dropped out), and after it at least one card failed the "
             "all-cards matmul or the kernel-fault probe. Check `nvidia-smi -q` and the host `dmesg` for NVRM "
             "Xid lines; reset the card (`nvidia-smi -r`) or reboot the host, replace a card that still fails, "
             "and wait one cycle."
         ),
+    )
+
+
+class GpuClockLockMessages:
+    OK = MessageTemplate(
+        event="No stuck GPU clock lock",
+        reason="GPU_CLOCK_LOCK_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    RESET = MessageTemplate(
+        event="A GPU clock lock left by an ended rental was reset",
+        reason="GPU_CLOCK_LOCK_RESET",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    STUCK = MessageTemplate(
+        event="GPU clocks an ended rental locked could not be reset",
+        reason="GPU_CLOCK_LOCK_STUCK",
+        severity="warning",
+        category="env",
+        impact="Job skipped; score set to 0 until the clock reset succeeds",
+        remediation="Make sure nvidia-smi -i <uuid> -rgc succeeds on every GPU of the host.",
     )
 
 
@@ -686,15 +756,16 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
-    # Warn mode (GPU_ANCHOR_HARD_ENABLED off): the legacy verdict. Its what_we_saw carries `anchor_hard_would_be`
-    # (GPU_MISSING or ANCHOR_BROKEN) so the hard rule can be read from a week of rows before it is switched on.
+    # A set that lost or gained cards (a full set of other cards is re-anchored, not this). Its what_we_saw carries
+    # `anchor_hard_would_be`: GPU_MISSING (only anchored cards missing) or ANCHOR_BROKEN (other cards among them).
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
         severity="warning",
         category="env",
         impact="Verification reset; score set to 0",
-        remediation="Ensure the same physical GPUs remain attached and stable.",
+        remediation="Ensure every GPU of the node stays attached and visible. A node that comes back with the same "
+        "number of GPUs, all of them other cards, is verified again on its own.",
     )
     # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
@@ -707,19 +778,6 @@ class GpuFingerprintMessages:
         remediation=(
             "One or more GPUs this node listed are not visible. Check `nvidia-smi -L` and `dmesg` on the host. "
             "The node scores again when the full set is back."
-        ),
-    )
-    # Hard mode: the scrape shows a GPU that is not in the anchored set (swap, added card, or a set
-    # replaced by a different one). Permanent for this executor id; re-registering the node is the only way out.
-    ANCHOR_BROKEN = MessageTemplate(
-        event="GPU set differs from the listed set",
-        reason="GPU_UUID_CHANGED",
-        severity="error",
-        category="env",
-        impact="Score 0 on every cycle for this node id; verification does not restart",
-        remediation=(
-            "A listed node keeps one fixed set of GPUs. To list a different set, re-register the node. "
-            "Uptime starts over; penalties stay."
         ),
     )
     UUID_OK = MessageTemplate(
@@ -786,7 +844,6 @@ class BannedProviderMessages:
 
 
 class HardwareIdentityMessages:
-    # DAH-4547: emitted as a warning in shadow; fails the node under HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED.
     SPOOFED = MessageTemplate(
         event="Host hardware identity does not match the hardware",
         reason="HARDWARE_IDENTITY_SPOOFED",
@@ -794,7 +851,7 @@ class HardwareIdentityMessages:
         category="policy",
         impact="Score set to 0 while the finding stands",
         remediation="Remove any mount or script over /sys/class/dmi/id on the host and in the executor "
-        "container, and make sure NVML reports the same GPUs as /proc/driver/nvidia/gpus.",
+        "container, and make sure every GPU NVML reports is listed in /proc/driver/nvidia/gpus.",
     )
     OK = MessageTemplate(
         event="Host hardware identity ok",
@@ -882,6 +939,42 @@ class SysboxRequiredMessages:
     )
 
 
+class PidHostRequiredMessages:
+    MISSING = MessageTemplate(
+        event="Executor not in the host PID namespace",
+        reason="EXECUTOR_PID_HOST_MISSING",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+        ),
+    )
+    RENTED_WARNING = MessageTemplate(
+        event="Executor not in the host PID namespace",
+        reason="EXECUTOR_PID_HOST_MISSING",
+        severity="warning",
+        category="policy",
+        impact="Warning only while the node is rented: score and incentive unchanged",
+        remediation=(
+            "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+        ),
+    )
+    OK = MessageTemplate(
+        event="Executor PID namespace check passed",
+        reason="EXECUTOR_PID_HOST_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class DuplicateExecutorMessages:
     DUPLICATE = MessageTemplate(
         event="Duplicate executor registration",
@@ -889,14 +982,6 @@ class DuplicateExecutorMessages:
         severity="warning",
         category="policy",
         impact="Score set to 0; verification cleared",
-        remediation="Ensure every executor has a unique UUID and deregister duplicates before retrying.",
-    )
-    DUPLICATE_OBSERVED = MessageTemplate(
-        event="Duplicate executor registration (observe mode)",
-        reason="EXECUTOR_DUPLICATE_OBSERVED",
-        severity="warning",
-        category="policy",
-        impact="Detected; no score impact (observe mode)",
         remediation="Ensure every executor has a unique UUID and deregister duplicates before retrying.",
     )
     UNIQUE = MessageTemplate(
@@ -922,6 +1007,24 @@ class DuplicateExecutorMessages:
         impact="Score set to 0 for this cycle; the other executor keeps it",
         remediation="Each physical GPU earns under one executor. Register every machine once.",
     )
+
+class ProviderMaintenanceMessages:
+    IN_WINDOW = MessageTemplate(
+        event="Node in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation="The provider scheduled maintenance on this node; it is validated as usual once the window ends.",
+    )
+    NONE = MessageTemplate(
+        event="Node not in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE_NONE",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
 
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(
@@ -993,13 +1096,6 @@ class InspectorMessages:
         severity="info",
         category="runtime",
         impact="No active customer rental on this executor",
-    )
-    DISABLED = MessageTemplate(
-        event="Inspector validation disabled",
-        reason="INSPECTOR_SKIPPED_DISABLED",
-        severity="info",
-        category="runtime",
-        impact="Inspector checks are disabled",
     )
     CLEAN = MessageTemplate(
         event="Inspector validation clean",
@@ -1222,6 +1318,13 @@ class GpuUsageMessages:
         category="runtime",
         impact="Proceed",
     )
+    GPU_RESET_IN_PROGRESS = MessageTemplate(
+        event="GPU usage check skipped: the renter is resetting the pod's GPUs",
+        reason="GPU_USAGE_GPU_RESET_IN_PROGRESS",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     USAGE_HIGH = MessageTemplate(
         event="GPU busy outside validator",
         reason="GPU_USAGE_HIGH",
@@ -1243,12 +1346,19 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation=(
             "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
-            "node uses it: {rental_status}. Lium stops a pod's container when its rental ends and the "
-            "validator removes leftovers, so this one should not be holding the GPU. Before you touch "
-            "it, confirm it is not a live rental: the node's page in the Provider Portal must show no "
-            "active rental. Only then remove it: docker rm -f {orphaned_container}. If the portal "
-            "still shows a rental on the node, leave the container running and contact Lium support."
+            "node uses it: {rental_status}. The validator removes a leftover pod container by itself "
+            "within about 30 minutes and the node passes again. Do not remove pod containers yourself, "
+            "by hand or by script: a mistake deletes a live rental. If it is still there after an hour, "
+            "contact Lium support with the container name."
         ),
+    )
+    # DAH-5117: no pod id Lium issued, or no backend record placing the ended rental on this node. Whether the
+    # stale cleanup removes it depends on its label, which this check does not see: promise neither way
+    ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION = (
+        "{orphaned_container} is named like a Lium pod container{pod}, but Lium cannot confirm a rental "
+        "of it on this node: {rental_status}. If it is your own workload, run it without Lium's pod_ "
+        "name and io.lium.pod_id label, or free the GPU; otherwise leave it running and contact Lium "
+        "support with the container name."
     )
     ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
         "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
@@ -1339,6 +1449,49 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    VERIFY_DEFERRED = MessageTemplate(
+        event="Port verification deferred: the Docker filesystem is backed up with a tenant's writes",
+        reason="PORT_VERIFY_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class DiskSpaceMessages:
+    OK = MessageTemplate(
+        event="Disk space inspected",
+        reason="DISK_SPACE_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    NOT_REPORTED = MessageTemplate(
+        event="No disk usage reported",
+        reason="DISK_NOT_REPORTED",
+        severity="warning",
+        category="env",
+        impact="Score set to 0",
+        remediation="Make sure the executor can read its data disk (`df -h` on the host), then wait for the next validation.",
+    )
+    TOO_FULL = MessageTemplate(
+        event="Disk too full",
+        reason="DISK_TOO_FULL",
+        severity="warning",
+        category="env",
+        impact="Score set to 0",
+        remediation="Free disk space on the node: check `docker system df` and `df -h`, delete what you no longer "
+        "need, or grow the disk. The next validation reads the disk again.",
+    )
+    FREE_TOO_LOW = MessageTemplate(
+        event="Too little free disk space",
+        reason="DISK_FREE_TOO_LOW",
+        severity="warning",
+        category="env",
+        impact="Score set to 0",
+        remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
+        "longer need, or grow the disk. The next validation reads the disk again.",
+    )
 
 
 class PortCountMessages:
@@ -1393,15 +1546,6 @@ class RegistryPullMessages:
         impact="Score set to 0",
         remediation=REGISTRY_PULL_REMEDIATION,
     )
-    # the same finding while REGISTRY_PULL_ENFORCEMENT_ENABLED is off: logged, score unchanged
-    REGISTRY_PULL_FAILED_OBSERVED = MessageTemplate(
-        event="Docker Hub image pull fails through this node's registry path (not enforced)",
-        reason="REGISTRY_PULL_FAILED_OBSERVED",
-        severity="warning",
-        category="runtime",
-        impact="None: REGISTRY_PULL_ENFORCEMENT_ENABLED is off",
-        remediation=REGISTRY_PULL_REMEDIATION,
-    )
     # one failed pull: a finding only once the next pull fails too
     REGISTRY_PULL_FAILED_ONCE = MessageTemplate(
         event="Docker Hub image pull failed once; the next pull decides",
@@ -1445,10 +1589,13 @@ class RegistryPullMessages:
 
 
 CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
-    "a container on this node downloads from PyPI or Hugging Face far slower than the host does, so a renter's "
-    "`pip install` or model download crawls; check the docker bridge MTU against the uplink (`ip link`; set "
-    '"mtu" in /etc/docker/daemon.json to the uplink\'s and restart docker), NAT/firewall rules and any traffic '
-    "shaping on docker traffic, then `docker run --rm alpine:3.19 wget -O /dev/null "
+    "a container on this node downloads from PyPI or Hugging Face too slowly or cannot connect, so a renter's "
+    "`pip install` or model download crawls; remove any traffic shaping or extra firewall rules added on docker "
+    "traffic (keep docker's own NAT rules); "
+    "if the uplink MTU (`ip link`) is below 1500, recreate the rentals network with it while no pod container exists, running or stopped: "
+    "`docker network rm lium-rentals` then `docker network create -d bridge -o "
+    "com.docker.network.bridge.enable_icc=false -o com.docker.network.driver.mtu=<MTU> lium-rentals`; then "
+    "`docker run --rm --network lium-rentals alpine:3.19 wget -O /dev/null "
     "https://files.pythonhosted.org/packages/9b/b4/e3c7e6fab0f77fff6194afa173d1f2342073d91b1d3b4b30b17c3fb4407a/"
     "numpy-2.1.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl` on the host must finish in seconds"
 )
@@ -1463,13 +1610,13 @@ class ContainerDownloadSpeedMessages:
         impact="Score set to 0",
         remediation=CONTAINER_DOWNLOAD_SLOW_REMEDIATION,
     )
-    # the same finding while CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED is off: logged, score unchanged
+    # the same finding when a failing reading in the streak was not on the rentals network: logged, score unchanged
     SLOW_OBSERVED = MessageTemplate(
         event="Downloads from inside a container on this node are too slow (not enforced)",
         reason="CONTAINER_DOWNLOAD_SLOW_OBSERVED",
         severity="warning",
         category="runtime",
-        impact="None: CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED is off",
+        impact="None: a failing reading was not taken on the rentals network",
         remediation=CONTAINER_DOWNLOAD_SLOW_REMEDIATION,
     )
     SLOW_ONCE = MessageTemplate(
@@ -1498,6 +1645,81 @@ class ContainerDownloadSpeedMessages:
     SKIPPED = MessageTemplate(
         event="Container download speed check skipped",
         reason="CONTAINER_DOWNLOAD_SPEED_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class RentedThroughputMessages:
+    """A renter on a node listed at ~3 Gbps downloaded at 0.7-2 MB/s and the disk crawled."""
+
+    SLOW = MessageTemplate(
+        event="A rented pod on this node gets far too little network or disk throughput",
+        reason="RENTED_THROUGHPUT_SLOW",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=(
+            "repeated readings found a container on this rented node downloading from PyPI or Hugging Face below "
+            "10 Mbps, or writing to its disk below 50 MB/s, while the node's own traffic on that resource stayed "
+            "under its busy threshold (200 Mbps on the network cards, 200 MB/s on the docker disk). Remove any "
+            "traffic shaping or I/O "
+            "throttling on docker traffic and containers, check the docker bridge MTU against the uplink "
+            "(`ip link`), and check the disk under the docker root (`docker info -f '{{.DockerRootDir}}'`) "
+            "for a failing or full drive"
+        ),
+    )
+    # DAH-5453: the reading was due but the earlier checks left too little cycle time, several cycles in a row
+    NOT_RUN = MessageTemplate(
+        event="The rented throughput reading could not run in several validation cycles in a row",
+        reason="RENTED_THROUGHPUT_NOT_RUN",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=(
+            "the earlier checks on this rented node used up most of each validation cycle, so the network and "
+            "disk throughput reading never ran. Check that the node answers SSH and docker commands promptly "
+            "(load, a slow or full disk under the docker root, a slow uplink). The score returns once a reading "
+            "completes"
+        ),
+    )
+    SLOW_ONCE = MessageTemplate(
+        event="A rented pod's network or disk throughput was slow once; the next reading decides",
+        reason="RENTED_THROUGHPUT_SLOW_ONCE",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Rented pod network and disk throughput verified",
+        reason="RENTED_THROUGHPUT_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    # the renter kept the link or the disk busy, an endpoint the validator cannot reach either, or no container
+    UNMEASURED = MessageTemplate(
+        event="Rented pod throughput reached no verdict",
+        reason="RENTED_THROUGHPUT_UNMEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Rented pod throughput check skipped",
+        reason="RENTED_THROUGHPUT_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class IdleDiskWriteMessages:
+    # DAH-5320: shadow only; the reading itself is the IDLE_DISK_WRITE log line
+    LOGGED = MessageTemplate(
+        event="Idle node disk write speed logged (not enforced)",
+        reason="IDLE_DISK_WRITE_LOGGED",
         severity="info",
         category="runtime",
         impact="Proceed",
@@ -1593,7 +1815,8 @@ class VerifyXMessages:
         label="network speed too slow",
         reason_suffix="NETWORK_SPEED_TOO_SLOW",
         remediation=(
-            "EMA download speed is below the minimum threshold. "
+            "EMA download speed (100 Mbps) or upload speed (10 Mbps) is below the minimum "
+            "threshold. "
             "Improve the executor's network connection or wait for the EMA to recover "
             "once speeds improve."
         ),
@@ -1772,17 +1995,9 @@ class GpuMemoryHealthMessages:
 
 
 class GpuFaultProbeMessages:
-    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (GPU_FAULT_PROBE_CHECK_ENABLED
-    without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
+    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
 
-    DISABLED = MessageTemplate(
-        event="GPU kernel-fault probe disabled",
-        reason="GPU_FAULT_PROBE_DISABLED",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
     FILLER_SKIPPED = MessageTemplate(
         event="GPU kernel-fault probe skipped for active filler",
         reason="GPU_FAULT_PROBE_SKIPPED_ACTIVE_FILLER",
@@ -1826,8 +2041,7 @@ class GpuFaultProbeMessages:
 
 
 class PinnedMemoryProbeMessages:
-    """F-1599 — the pinned-host-memory H2D/D2H round trip on every GPU. On by default in shadow mode:
-    PROBE_FAILED is a logged warning with passed=True; with PINNED_MEMORY_PROBE_ENFORCEMENT_ENABLED it fails
+    """F-1599 — the pinned-host-memory H2D/D2H round trip on every GPU. On by default: PROBE_FAILED fails
     the fatal check and keeps the node unrentable."""
 
     DISABLED = MessageTemplate(
@@ -1867,6 +2081,78 @@ class PinnedMemoryProbeMessages:
         category="env",
         impact="Proceed without penalty",
     )
+    FILLER_SKIPPED = MessageTemplate(
+        event="Pinned-memory copy probe skipped for active filler",
+        reason="PINNED_MEMORY_PROBE_SKIPPED_ACTIVE_FILLER",
+        severity="info",
+        category="policy",
+        impact="Active filler runtime preserved; the probe would compete with it for the GPUs.",
+    )
+    WORKLOAD_SKIPPED = MessageTemplate(
+        event="Pinned-memory copy probe not scored: a Lium workload took the cards during this cycle",
+        reason="PINNED_MEMORY_PROBE_SKIPPED_RENTED",
+        severity="info",
+        category="policy",
+        impact=(
+            "Score unchanged; a copy hung beside a Lium pod or default job that started after this "
+            "cycle's rental snapshot. The next cycle probes again."
+        ),
+    )
+
+
+class NvlinkFaultMessages:
+    """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED fails
+    the node until a probe passes again; MISSING fails a full SXM board that reports no NVLink at all."""
+
+    PROBE_OK = MessageTemplate(
+        event="NVLink multicast probe passed",
+        reason="NVLINK_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="NVLink multicast probe not run: not an all-NVLink board",
+        reason="NVLINK_SKIPPED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    PROBE_FAILED = MessageTemplate(
+        event="NVLink is faulted: multicast memory cannot be bound across the GPUs",
+        reason="NVLINK_FAULT",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink works again",
+        remediation=(
+            "The GPUs report an uncorrectable NVLink error state: NCCL NVLink SHARP (NVLS) and other "
+            "multi-GPU jobs fail. Check the host `dmesg` for NVRM Xid lines and `nvidia-smi nvlink -e`. "
+            "Stop the workloads, reset the GPUs (`nvidia-smi -r`) and restart nvidia-fabricmanager, or "
+            "reboot. Then restart the executor container (`docker restart executor-executor-1`) so it "
+            "sees the GPUs again. If the errors come back, service the board."
+        ),
+    )
+    MISSING = MessageTemplate(
+        event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
+        reason="NVLINK_MISSING",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink works again",
+        remediation=(
+            "These GPUs are SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows PCIe paths "
+            "(PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. Start "
+            "nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, same version as the "
+            "driver), check `nvidia-smi nvlink -s`, then restart the executor container "
+            "(`docker restart executor-executor-1`). If the links stay down, service the board."
+        ),
+    )
+    UNKNOWN = MessageTemplate(
+        event="NVLink multicast probe could not run",
+        reason="NVLINK_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed without penalty",
+    )
 
 
 class ScoreMessages:
@@ -1880,13 +2166,6 @@ class ScoreMessages:
 
 
 class RentalVerificationMessages:
-    SKIPPED = MessageTemplate(
-        event="Rental verification skipped",
-        reason="RENTAL_CHECK_DISABLED",
-        severity="info",
-        category="policy",
-        impact="Proceed without backend rental verification",
-    )
     VERIFIED = MessageTemplate(
         event="Rental verification successful",
         reason="RENTAL_VERIFIED",
@@ -1901,6 +2180,19 @@ class RentalVerificationMessages:
         category="policy",
         impact="Validation halted",
         remediation="Check executor health with backend or review rental status",
+    )
+    # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
+    GPU_LIST_EMPTY = MessageTemplate(
+        event="Rental verification failed",
+        reason="RENTAL_NOT_VERIFIED",
+        severity="error",
+        category="policy",
+        impact="Validation halted",
+        remediation=(
+            "The executor container sees no GPU in /proc/driver/nvidia/gpus, usually after a GPU reset "
+            "(`nvidia-smi -r`) or an NVIDIA driver reload while it kept running. Restart it "
+            "(`docker restart executor-executor-1`) or reboot the host."
+        ),
     )
     GPU_RUNTIME_NVML_MISMATCH = MessageTemplate(
         event="GPU runtime health check failed",
@@ -2014,9 +2306,9 @@ class RentalVerificationMessages:
     FILLER_TRANSPORT_UNREACHABLE = MessageTemplate(
         event="SSH transport lost while verifying Lium default job",
         reason="FILLER_TRANSPORT_UNREACHABLE",
-        severity="warning",
+        severity="error",
         category="runtime",
-        impact="Filler state unknown for this cycle",
+        impact="Unrented incentive withheld: SSH was lost while checking the Lium default job",
         remediation="Ensure the executor is reachable over SSH and stays online",
     )
 
@@ -2025,13 +2317,6 @@ class RentalProbeMessages:
     """DAH-3436: the synthetic rental probe. A failed step zeroes the score and clears the verified job
     (RENTAL_PROBE_FAILED) until a probe passes; an idle node with the image pulled is probed again next cycle."""
 
-    DISABLED = MessageTemplate(
-        event="Rental probe disabled",
-        reason="RENTAL_PROBE_DISABLED",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
     SKIPPED = MessageTemplate(
         event="Rental probe skipped",
         reason="RENTAL_PROBE_SKIPPED",
@@ -2053,14 +2338,6 @@ class RentalProbeMessages:
         category="runtime",
         impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
     )
-    # the same verdict while RENTAL_PROBE_ENFORCEMENT_ENABLED is off: logged, score unchanged
-    PROBE_FAILED_OBSERVED = MessageTemplate(
-        event="Rental probe failed: a renter could not use this node (not enforced)",
-        reason="RENTAL_PROBE_FAILED_OBSERVED",
-        severity="warning",
-        category="runtime",
-        impact="None: RENTAL_PROBE_ENFORCEMENT_ENABLED is off; the node is probed again after the interval",
-    )
     INCONCLUSIVE = MessageTemplate(
         event="Rental probe could not reach a verdict",
         reason="RENTAL_PROBE_INCONCLUSIVE",
@@ -2072,8 +2349,7 @@ class RentalProbeMessages:
 
 class CpuTruthMessages:
     """DAH-2671 item 2a — corroborate advertised CPU(s) against sources the lscpu wrapper does not
-    author. Shadow (CPU_TRUTH_CHECK_ENABLED without enforcement) emits CPU_MISMATCH as a warning and
-    keeps passed=True; only CPU_TRUTH_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+    author. CPU_MISMATCH is an error that zeroes the score."""
 
     CPU_OK = MessageTemplate(
         event="CPU core count corroborated",
@@ -2100,20 +2376,11 @@ class CpuTruthMessages:
         category="env",
         impact="Proceed without penalty",
     )
-    SKIPPED = MessageTemplate(
-        event="CPU truth check disabled",
-        reason="CPU_TRUTH_DISABLED",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
 
 
 class GpuKernelCountMessages:
-    """Reported GPU list against the kernel's list (/proc/driver/nvidia/gpus). Shadow
-    (GPU_KERNEL_COUNT_CHECK_ENABLED without enforcement) renders COUNT_MISMATCH as a warning and
-    keeps passed=True; only GPU_KERNEL_COUNT_ENFORCEMENT_ENABLED makes it fail the validation.
-    UUID_MISMATCH is logged only, under either flag."""
+    """Reported GPU list against the kernel's list (/proc/driver/nvidia/gpus). COUNT_MISMATCH
+    fails the validation; UUID_MISMATCH is logged only."""
 
     COUNT_OK = MessageTemplate(
         event="Reported GPUs match the kernel's GPU list",
@@ -2140,6 +2407,17 @@ class GpuKernelCountMessages:
         category="env",
         impact="Shadow observation only: the validation result was NOT changed",
     )
+    UNATTACHABLE = MessageTemplate(
+        event="A reported GPU cannot be attached to a container",
+        reason="GPU_KERNEL_UNATTACHABLE",
+        severity="error",
+        category="env",
+        impact="Validation failed; score set to 0",
+        remediation=(
+            "Every rent on the listed GPU fails. Restart the executor container, or reboot the host "
+            "if the GPU is still missing."
+        ),
+    )
     NOT_EVALUATED = MessageTemplate(
         event="Kernel GPU list not available; reported GPU count not evaluated",
         reason="GPU_KERNEL_COUNT_NOT_EVALUATED",
@@ -2159,7 +2437,7 @@ class GpuKernelCountMessages:
 class ProviderSideLoadMessages:
     """DAH-2734 — the CPU/disk twin of the foreign-GPU gate: a provider who runs another
     subnet's miner on a listed machine sells capacity he already uses himself. Shadow
-    (PROVIDER_SIDE_LOAD_CHECK_ENABLED without enforcement) renders LOAD_ABOVE_LIMIT as a
+    (without enforcement) renders LOAD_ABOVE_LIMIT as a
     warning and keeps passed=True; only PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED zeroes the
     score, and only for the CPU half — a disk figure above the limit is reported, never
     scored, because it is read once and carries every docker category nobody enumerated."""
@@ -2189,13 +2467,6 @@ class ProviderSideLoadMessages:
         severity="info",
         category="policy",
         impact="Proceed without penalty",
-    )
-    SKIPPED = MessageTemplate(
-        event="Provider-side load check disabled",
-        reason="PROVIDER_SIDE_LOAD_DISABLED",
-        severity="info",
-        category="policy",
-        impact="Proceed",
     )
 
 
@@ -2334,9 +2605,7 @@ class LocalVerifyMessages:
 
 class RentedPodResourcesMessages:
     """DAH-4564 — a host script `docker update --cpuset-cpus`-pins a rented pod, or cuts its CPU quota,
-    below 95% of the cores rented. Shadow (RENTED_POD_RESOURCES_CHECK_ENABLED without enforcement)
-    renders RESOURCES_REDUCED as a warning and keeps passed=True; only
-    RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED zeroes the score. A raised oom_score_adj is recorded
+    below 95% of the cores rented: RESOURCES_REDUCED zeroes the score. A raised oom_score_adj is recorded
     in the event and never scored: a renter running as root can raise it himself."""
 
     RESOURCES_OK = MessageTemplate(
@@ -2381,6 +2650,37 @@ class RentedPodResourcesMessages:
     )
 
 
+class RentedPodNetworkMessages:
+    SUMMARY = MessageTemplate(
+        event="Rented pod network summary",
+        reason="RENTED_POD_NETWORK_SUMMARY",
+        severity="info",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+    FANOUT = MessageTemplate(
+        event="Rented pod network summary needs review",
+        reason="RENTED_POD_OUTBOUND_FANOUT",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+    UNREAD = MessageTemplate(
+        event="Rented pod network summary not read",
+        reason="RENTED_POD_NETWORK_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented pod network summary skipped: no running rental",
+        reason="RENTED_POD_NETWORK_NOT_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 class GpuAttestationIdentityMessages:
     # DAH-4551: warning in shadow; fails the node under GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED.
     MISMATCH = MessageTemplate(
@@ -2394,7 +2694,8 @@ class GpuAttestationIdentityMessages:
     )
     # The fallback for cards that cannot attest: the same card under a new UUID (serial or slots kept).
     SWAPPED = MessageTemplate(
-        event="GPU UUIDs were swapped: the same cards are reported under new UUIDs",
+        # Neutral on purpose: "every UUID new in the same slots" is also what replacing every card looks like.
+        event="GPU UUIDs changed: new UUIDs in the same slots, or a known card under a new UUID",
         reason="GPU_UUID_SWAPPED",
         severity="warning",
         category="policy",
@@ -2417,6 +2718,16 @@ class GpuAttestationIdentityMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    # Fails the node only under CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; in shadow it is a log line.
+    CC_VBIOS_BELOW_MINIMUM = MessageTemplate(
+        event="GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing",
+        reason="CC_VBIOS_BELOW_MINIMUM",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 while the finding stands",
+        remediation="Pause new rentals and wait for running ones to end, since the update restarts the host. Then "
+        "update every GPU's VBIOS to at least NVIDIA's minimum for CC in R595 (B200 97.00.E4.00.xx, B300 97.10.64.00.xx).",
     )
     OK = MessageTemplate(
         event="GPU identity verified against NVIDIA's root",

@@ -1,5 +1,9 @@
+import asyncio
+import json
 import logging
+import random
 import re
+from datetime import UTC, datetime, timedelta
 import shlex
 from typing import Awaitable, Callable, Optional
 
@@ -10,12 +14,14 @@ from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_b
 from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
-    DPHN_CACHE_VOLUME_PREFIX,
     CACHE_SWEEP_CONTAINER_NAME,
     EDIT_PARKED_SUFFIX,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
+    LEGACY_LIUM_CONTAINER_NAME,
+    LIUM_HEALTH_CHECK_CONTAINER_NAME,
+    LIUM_POD_ID_LABEL,
     POD_CONTAINER_PREFIX,
     RENTAL_CONTAINER_PREFIXES,
 )
@@ -34,6 +40,13 @@ DPHN_CACHE_RECLAIM_FREE_FLOOR_GB = DPHN_CACHE_LISTING_FLOOR_GB
 # Remove at most this many per pass; GC runs each cycle, so a backlog drains
 # over a few passes without a huge `docker volume rm` command.
 VOLUME_RM_MAX_PER_PASS = 200
+
+# A rental's own volume is created as volume_<pod uuid>; nothing else on the host is named so.
+POD_VOLUME_NAME_PATTERN = re.compile(r"^volume_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+# Backend lookups go per candidate volume; a backlog drains over a few passes.
+ORPHAN_VOLUME_LOOKUPS_PER_PASS = 50
+# Wall-clock budget for those lookups, well inside the executor task timeout; the rest wait a pass.
+ORPHAN_VOLUME_LOOKUP_BUDGET_SECONDS = 30
 
 
 # DAH-2805: how long an abandoned download temporary may sit before the sweep removes it. The window
@@ -54,6 +67,57 @@ DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 # The whole helper run is bounded: the walk itself takes hundreds of ms on a real cache, so anything
 # near a minute means a wedged docker daemon rather than work in progress.
 DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
+
+# The sweep helper mounts every cache volume. `--rm` only fires once the container has run, so a
+# `docker run` whose client is killed (timeout, dropped SSH) between create and start leaves it in
+# Created for good, and dockerd then refuses `volume rm` on the cache it mounts ("volume is in use").
+REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1"
+
+# The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
+# `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
+FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
+REMOVE_IDLE_FILLER_IMAGES = (
+    "/usr/bin/docker image ls "
+    + " ".join(f"--filter reference={repository}" for repository in FILLER_IMAGE_REPOSITORIES)
+    + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
+)
+
+
+async def evict_cache_volumes_oldest_first(
+    ssh_client: asyncssh.SSHClientConnection,
+    volume_names: list[str],
+    run_removal: Callable[[str], Awaitable[object]],
+    has_room: Callable[[], Awaitable[bool]],
+) -> None:
+    """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
+
+    DAH-5014: an Engy checkpoint is up to ~1.6 TB and buys a fast restart, so a rental or the listing
+    floor takes only what it needs. The caller has already found there is not enough room, so the
+    idle filler images go first without a re-check. An order docker cannot report falls back to name order.
+    """
+    created_at: dict[str, str] = {}
+    try:
+        inspected = await ssh_client.run(
+            "/usr/bin/docker volume inspect --format '{{.Name}} {{.CreatedAt}}' "
+            + " ".join(shlex.quote(name) for name in volume_names)
+        )
+        for line in (inspected.stdout or "").splitlines():
+            name, _, created = line.strip().partition(" ")
+            created_at[name] = created
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    # the image first: a pull brings it back far faster than a checkpoint download
+    await run_removal(REMOVE_IDLE_FILLER_IMAGES)
+    if await has_room():
+        return
+    ordered: list[str] = sorted(volume_names, key=lambda name: (created_at.get(name, "~"), name))
+    for index, name in enumerate(ordered):
+        await run_removal(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(name)}")
+        if index + 1 < len(ordered) and await has_room():
+            return
+
 
 RENTED_LIST_UNAVAILABLE = "rented_list_unavailable"
 RENTED_LIST_EMPTY = "rented_list_empty"
@@ -80,7 +144,24 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
     for fillers in rented_data.all_filler_containers_by_executor.values():
         names.update(fillers)
     names.update(name for name in rented_data.filler_containers_by_executor.values() if name)
+    # DAH-5510: a moved pod's old container is kept on the node it left until the backend's removal time
+    names.update(getattr(rented_data, "retained_container_names", None) or [])
     return names
+
+
+def live_pod_ids(rented_data: Optional[RentedExecutorsResponse]) -> set[str]:
+    """The pod ids (and filler run ids) the fleet snapshot lists: a container labelled with one is live."""
+    if not rented_data:
+        return set()
+    ids: set[str] = {
+        pod.pod_id for executor in rented_data.executors.values() for pod in executor.pods
+    }
+    ids.update(
+        name.removeprefix(FILLER_CONTAINER_PREFIX)
+        for name in listed_container_names(rented_data)
+        if name.startswith(FILLER_CONTAINER_PREFIX)
+    )
+    return ids
 
 
 def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -> Optional[str]:
@@ -98,12 +179,42 @@ def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -
     return None
 
 
+def _bound_pod_id_label(container_name: str, label: str) -> str:
+    """The LIUM_POD_ID_LABEL value when it is bound to the name Lium gave, else "" (unlabelled).
+
+    A renter's image can carry an inherited label naming another live pod, so the label counts only
+    when it matches the name: the id after pod_/filler_ (ignoring __prev), or a probe's own name.
+    """
+    base = container_name.removesuffix(EDIT_PARKED_SUFFIX)
+    if base.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
+        return label if label == base.partition("_")[2] else ""
+    return label if label == container_name else ""
+
+
+# The machine scrape's two capability checks (machine_scrape.run_capability_check), named since DAH-5192.
+# Only the exact name it gives counts: a provider's lookalike name, or an unnamed executor-image
+# diagnostic of theirs, is never removed. Only never-started (Created) ones go: a running one is a check
+# in progress.
+CAPABILITY_CHECK_NAME = re.compile(r"^lium_capability_check_[0-9]+_[0-9a-f]{6}$")
+LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
+
+
+def never_started_check_containers(listing: str) -> list[str]:
+    return [
+        fields[0]
+        for fields in (line.split() for line in listing.splitlines())
+        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1])
+    ]
+
+
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
 
     def __init__(self, stale_threshold_minutes: int = FILLER_CONTAINER_GRACE_MINUTES, dry_run: bool = False):
         self.stale_threshold_minutes = stale_threshold_minutes
         self.dry_run = dry_run
+        # per executor: the last orphan-volume candidate examined, so a capped pass resumes after it
+        self._orphan_volume_cursor: dict[str, str] = {}
 
     def _get_rented_containers(
         self, rented_data: Optional[RentedExecutorsResponse], executor_uuid: str
@@ -117,12 +228,22 @@ class ContainerCleanup:
         rented_data: Optional[RentedExecutorsResponse],
         executor_uuid: str,
         on_before_remove: Callable[[str], Awaitable[None]] | None = None,
+        lium_workload_ended: Callable[[str], Awaitable[bool]] | None = None,
+        reserve_removal: Callable[[str], bool] | None = None,
     ) -> tuple[int, list[str], list[str]]:
-        """Remove containers that are not in rented data and are older than threshold.
+        """Remove Lium's containers whose pod is no longer live and that are older than threshold.
+
+        DAH-5117: only a container labelled LIUM_POD_ID_LABEL at create, or one of the names Lium gave
+        before the label: the backend's health_check_ probe, and a pod_/filler_<uuid> for which
+        ``lium_workload_ended(container_name)`` confirms the backend's record ended (no callback:
+        never). Anything else is a provider's container and is never touched, whatever it is called.
 
         ``on_before_remove(container_name)`` is awaited right before each removal (DAH-3338: the
         check queues the reap for the backend first, so a crash between the removal and the report
         does not lose it). It must not raise; an error inside it is the caller's to swallow.
+
+        ``reserve_removal(container_name)`` is asked before removing a labelled pod_/filler_
+        container; False defers it to a later cycle (the caller's per-cycle lookup budget is spent).
 
         Returns:
             Tuple of (number_removed, removed container names, orphaned containers that survived
@@ -149,20 +270,37 @@ class ContainerCleanup:
         try:
             # Get all containers with rental prefixes.
             all_containers = await self._get_all_rental_containers(ssh_client)
+            # backend lookups are capped per cycle: a fresh order each cycle stops a host's forged
+            # pod_/filler_ names from using up the cap ahead of a real leftover every time
+            random.shuffle(all_containers)
             extra["total_containers"] = len(all_containers)
 
             # Get currently rented containers for this executor
             rented_containers = listed_container_names(rented_data)
+            live_ids = live_pod_ids(rented_data)
             extra["rented_container_count"] = len(rented_containers)
 
             # Check each container
-            for container_name in all_containers:
-                stripped_name = container_name.strip()
-                if stripped_name in rented_containers:
+            for stripped_name, label in all_containers:
+                pod_id = _bound_pod_id_label(stripped_name, label)
+                if stripped_name in rented_containers or (pod_id and pod_id in live_ids):
+                    continue
+                legacy = not pod_id and LEGACY_LIUM_CONTAINER_NAME.match(stripped_name) is not None
+                health_check = LIUM_HEALTH_CHECK_CONTAINER_NAME.match(stripped_name) is not None
+                if not pod_id and not legacy and not health_check:
                     continue
 
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
                 if age_minutes and age_minutes > self.stale_threshold_minutes:
+                    if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
+                        continue
+                    if (
+                        not legacy
+                        and reserve_removal is not None
+                        and stripped_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+                        and not reserve_removal(stripped_name)
+                    ):
+                        continue
                     if self.dry_run:
                         logger.info(
                             _m(
@@ -217,8 +355,26 @@ class ContainerCleanup:
         # DAH-2375: reap anonymous volumes orphaned by historical `docker rm`
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
+        await self.remove_never_started_check_containers(ssh_client, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    async def remove_never_started_check_containers(self, ssh_client, executor_uuid: str) -> int:
+        # best-effort like the volume prune above: never raises
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            listed = await ssh_client.run(LIST_CREATED_CONTAINERS)
+            if getattr(listed, "exit_status", 0) != 0:
+                return 0
+            ids: list[str] = never_started_check_containers(listed.stdout or "")
+            if not ids or self.dry_run:
+                return 0
+            await ssh_client.run(f"/usr/bin/docker rm -f {' '.join(ids)} >/dev/null 2>&1 || true")
+            logger.info(_m(f"Removed {len(ids)} never-started capability check container(s)", extra=extra))
+            return len(ids)
+        except Exception as e:
+            logger.warning(_m("Never-started check container removal failed", extra=extra | {"error": str(e)}))
+            return 0
 
     async def prune_dangling_anonymous_volumes(
         self,
@@ -281,6 +437,8 @@ class ContainerCleanup:
 
         Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
         remove it anyway), and a node still filling bundles is not the node this is meant to rescue.
+        Nor a live customer pod (Fish 26 Oct): the cache is kept across rentals and listed as used, so
+        a renter who took the listed free disk leaves the node under the floor by design.
         Returns how many volumes were removed.
         """
         extra = {"executor_uuid": executor_uuid}
@@ -289,13 +447,14 @@ class ContainerCleanup:
             # nodes, miner-assigned nodes, nodes that never ran Dolphin — and this check runs on every
             # node every cycle. Measuring the disk before knowing there is anything to reclaim made all
             # of them start a throwaway container just to learn there was nothing to do.
-            cache_volumes = await self._get_cache_volumes(ssh_client, (DPHN_CACHE_VOLUME_PREFIX,))
+            # DAH-5014: the Engy checkpoint cache is reclaimed here too, oldest first.
+            cache_volumes = await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES)
             if not cache_volumes:
                 return 0
 
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
-            if await self._has_running_filler_container(ssh_client):
+            if await self._has_running_filler_or_pod(ssh_client):
                 return 0
 
             free_gb = await self._get_free_disk_gb(ssh_client)
@@ -311,12 +470,16 @@ class ContainerCleanup:
                 )
                 return 0
 
-            await ssh_client.run(DockerCommand.volume_remove(*cache_volumes))
+            async def above_floor() -> bool:
+                free_now: float | None = await self._get_free_disk_gb(ssh_client)
+                return free_now is not None and free_now >= DPHN_CACHE_RECLAIM_FREE_FLOOR_GB
+
+            await evict_cache_volumes_oldest_first(ssh_client, cache_volumes, ssh_client.run, above_floor)
             # `volume_remove` ends in `|| true`, so its exit status cannot tell a removal from a
             # refusal — and dockerd refuses any volume a container still references, in ANY state.
             # Re-list instead: reporting a rescue that did not happen leaves the node delisted while
             # the check event says it was saved.
-            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, (DPHN_CACHE_VOLUME_PREFIX,)))
+            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES))
             reclaimed: list[str] = [name for name in cache_volumes if name not in surviving]
             if not reclaimed:
                 logger.warning(
@@ -328,7 +491,7 @@ class ContainerCleanup:
                 return 0
             logger.info(
                 _m(
-                    f"Reclaimed {len(reclaimed)} DPHN cache volume(s) to get the node back over "
+                    f"Reclaimed {len(reclaimed)} filler cache volume(s) to get the node back over "
                     "the rental listing floor",
                     extra=extra | {"volumes": reclaimed, "kept_volumes": sorted(surviving), "free_gb": free_gb},
                 )
@@ -338,10 +501,121 @@ class ContainerCleanup:
             logger.warning(_m("DPHN cache reclaim failed", extra=extra | {"error": str(e)}))
             return 0
 
-    async def _has_running_filler_container(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
-        # A cache a live filler still mounts is in use; docker refuses to remove it anyway.
+    async def remove_orphan_rental_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        rented_data: Optional[RentedExecutorsResponse],
+        executor_uuid: str,
+        is_orphan: Callable[[str, timedelta], Awaitable[bool]],
+    ) -> int:
+        """Remove `volume_<uuid>` volumes whose pod or filler run is over and whose container is gone.
+
+        The orphan reaper removes a `volume_<id>` only together with its container, and the dangling
+        prune only matches anonymous (64-hex) names, so a named volume whose container was already
+        gone (a delete whose volume removal failed, a filler stopped without it) stayed for good.
+        A candidate must be a `volume_<uuid>` no container (running or stopped) mounts, and not a pod
+        or filler the fleet snapshot lists: the snapshot carries every pod status but BROKEN and
+        DELETING, so a stopped or failed-reboot pod keeps its volume. ``is_orphan(uuid, age)`` then
+        decides from the backend, ``age`` being the time since the volume was created. Returns how
+        many volumes were removed.
+        """
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            if rented_list_unknown_reason(rented_data) is not None:
+                return 0
+            dangling: Optional[list[str]] = await self._get_dangling_volumes(ssh_client)
+            listed_names: set[str] = listed_container_names(rented_data)
+            listed_pod_ids: set[str] = {
+                pod.pod_id for executor in rented_data.executors.values() for pod in executor.pods
+            }
+            candidates: list[str] = sorted(
+                name
+                for name in dangling or []
+                if (match := POD_VOLUME_NAME_PATTERN.match(name))
+                and match[1] not in listed_pod_ids
+                and f"{POD_CONTAINER_PREFIX}{match[1]}" not in listed_names
+                and f"{FILLER_CONTAINER_PREFIX}{match[1]}" not in listed_names
+            )
+            # resume after the last pass's batch, wrapping around, so volumes that are kept or cannot
+            # be dated never starve the ones behind them
+            after: str = self._orphan_volume_cursor.get(executor_uuid, "")
+            candidates = ([n for n in candidates if n > after] + [n for n in candidates if n <= after])[
+                :ORPHAN_VOLUME_LOOKUPS_PER_PASS
+            ]
+            if not candidates:
+                return 0
+            self._orphan_volume_cursor[executor_uuid] = candidates[-1]
+
+            ages: dict[str, timedelta] = await self._volume_ages(ssh_client, candidates)
+            orphans: list[str] = []
+            # a pass cut off by the budget resumes AT the in-flight candidate, so a slow one is not
+            # skipped behind faster ones; only a first candidate that eats the whole budget is passed
+            self._orphan_volume_cursor[executor_uuid] = candidates[0]
+            try:
+                async with asyncio.timeout(ORPHAN_VOLUME_LOOKUP_BUDGET_SECONDS):
+                    for name in candidates:
+                        if name in ages and await is_orphan(name.removeprefix("volume_"), ages[name]):
+                            orphans.append(name)
+                        self._orphan_volume_cursor[executor_uuid] = name
+            except TimeoutError:
+                logger.info(
+                    _m("Orphan volume lookups hit the pass budget; resuming next pass", extra=extra)
+                )
+            if not orphans:
+                return 0
+            if self.dry_run:
+                logger.info(
+                    _m(
+                        f"[DRY RUN] Would remove {len(orphans)} orphan rental volume(s)",
+                        extra=extra | {"volumes": orphans, "dry_run": True},
+                    )
+                )
+                return 0
+
+            await ssh_client.run(DockerCommand.volume_remove(*orphans))
+            # `volume_remove` ends in `|| true`: re-list to report only what is really gone
+            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, ("volume_",)))
+            removed: list[str] = [name for name in orphans if name not in surviving]
+            if removed:
+                logger.info(
+                    _m(f"Removed {len(removed)} orphan rental volume(s)", extra=extra | {"volumes": removed})
+                )
+            return len(removed)
+        except Exception as e:
+            logger.warning(_m("Orphan rental volume removal failed", extra=extra | {"error": str(e)}))
+            return 0
+
+    async def _volume_ages(self, ssh_client: asyncssh.SSHClientConnection, names: list[str]) -> dict[str, timedelta]:
+        # time since each volume was created, by the host's clock; a volume it cannot date is left out
+        quoted = " ".join(shlex.quote(name) for name in names)
         result = await ssh_client.run(
-            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --format "{{{{.Names}}}}"'
+            f"date +%s; /usr/bin/docker volume inspect --format '{{{{.Name}}}} {{{{.CreatedAt}}}}' {quoted}"
+        )
+        lines = (result.stdout or "").splitlines()
+        if not lines or not lines[0].strip().isdigit():
+            return {}
+        now = datetime.fromtimestamp(int(lines[0].strip()), UTC)
+        ages: dict[str, timedelta] = {}
+        for line in lines[1:]:
+            name, _, created = line.strip().partition(" ")
+            try:
+                ages[name] = now - datetime.fromisoformat(created.strip())
+            except ValueError:
+                continue
+        return ages
+
+    async def _get_dangling_volumes(self, ssh_client) -> Optional[list[str]]:
+        # every volume no container (in any state) references; None if listing failed
+        result = await ssh_client.run(DockerCommand.volume_ls_dangling())
+        if result.exit_status != 0:
+            return None
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+    async def _has_running_filler_or_pod(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
+        # A cache a live filler still mounts is in use; a live rental keeps it (two name filters OR).
+        result = await ssh_client.run(
+            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --filter "name={POD_CONTAINER_PREFIX}" '
+            '--format "{{.Names}}"'
         )
         if getattr(result, "exit_status", 0) != 0:
             return True  # cannot prove the node is idle -> do not reclaim
@@ -444,29 +718,30 @@ class ContainerCleanup:
             f"-v {shlex.quote(name)}:/cache{index}" for index, name in enumerate(volume_names)
         )
         search_roots: str = " ".join(f"/cache{index}" for index in range(len(volume_names)))
-        # The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
+        # The `rm -f` after: a run killed before its container started leaves it Created, pinning the
+        # volumes (see REMOVE_CACHE_SWEEP_CONTAINER). The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
         # container would hold the name for good — the sweep would then fail silently on that node
         # forever. Worst case it interrupts a sweep another validator started, which simply runs again.
         # `timeout` bounds a wedged dockerd the same way machine_scrape does for `docker stats`: this
         # call sits in the per-executor pipeline ahead of the fatal port checks, so a hang here would
         # cost the node its whole cycle. A killed sweep simply removes nothing and runs again later.
         result = await ssh_client.run(
-            f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1; "
+            f"{REMOVE_CACHE_SWEEP_CONTAINER}; "
             f"timeout {DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS} "
             f"/usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} {mount_flags} {ALPINE_HELPER_IMAGE} "
             f"find {search_roots} -maxdepth {DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH} "
             "-type d \\( -name xet -o -name runtimes \\) -prune -o "
             f"-name '*.incomplete' -type f -mmin +{DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES} "
-            "-print -exec rm -f {} + 2>/dev/null || true"
+            "-print -exec rm -f {} + 2>/dev/null; "
+            f"{REMOVE_CACHE_SWEEP_CONTAINER} || true"
         )
         return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
     async def get_dangling_anonymous_volumes(self, ssh_client) -> Optional[list[str]]:
         # anonymous (64-hex) volumes referenced by no container; None if listing failed
-        result = await ssh_client.run(DockerCommand.volume_ls_dangling())
-        if result.exit_status != 0:
+        names = await self._get_dangling_volumes(ssh_client)
+        if names is None:
             return None
-        names = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
         return [name for name in names if ANON_VOLUME_NAME_PATTERN.match(name)]
 
     async def force_remove_health_checks(
@@ -489,7 +764,9 @@ class ContainerCleanup:
         """
         try:
             result = await ssh_client.run(
-                "docker ps -q --filter 'name=^health_check_' | xargs -r docker rm -fv"
+                # only the backend's own probe names: a provider's health_check_mine is not ours
+                "docker ps --format '{{.Names}}' --filter 'name=^health_check_' "
+                "| grep -xE 'health_check_([0-9a-f]{32}|[0-9]{10})' | xargs -r docker rm -fv"
             )
             removed = [
                 line for line in (result.stdout or "").strip().split("\n")
@@ -516,7 +793,25 @@ class ContainerCleanup:
             )
             return 0
 
-    async def _get_all_rental_containers(self, ssh_client) -> list[str]:
+    @staticmethod
+    async def _legacy_ended(
+        lium_workload_ended: Callable[[str], Awaitable[bool]] | None, container_name: str
+    ) -> bool:
+        """A pre-label pod_/filler_<uuid> goes only when the backend's record says it ended."""
+        if lium_workload_ended is None:
+            return False
+        try:
+            return await lium_workload_ended(container_name)
+        except Exception as e:
+            logger.warning(
+                _m(
+                    "Pod record check failed; keeping the container",
+                    extra={"container_name": container_name, "error": str(e)},
+                )
+            )
+            return False
+
+    async def _get_all_rental_containers(self, ssh_client) -> list[tuple[str, str]]:
         """Get all containers with rental-related prefixes.
 
         Iterates RENTAL_CONTAINER_PREFIXES (services/const.py) so any short-lived
@@ -526,13 +821,25 @@ class ContainerCleanup:
         """
         try:
             patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
-            result = await ssh_client.run(DockerCommand.ps_filter(*patterns))
-            if result.stdout and result.stdout.strip():
-                return result.stdout.strip().split('\n')
+            # one JSON array per container: a label with a newline cannot forge a second record
+            output_format = f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}}]'
+            result = await ssh_client.run(
+                DockerCommand.ps_filter(*patterns, output_format=output_format)
+            )
+            # (name, pod id label or ""); the name filter is a substring regex that lists "podman" too
+            containers = []
+            for line in (result.stdout or "").splitlines():
+                try:
+                    name, pod_id = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(name, str) and isinstance(pod_id, str) and name:
+                    containers.append((name, pod_id.strip()))
+            return containers
         except Exception as e:
             logger.warning(
                 _m(
-                    f"Error getting rental containers",
+                    "Error getting rental containers",
                     extra={
                         "error": str(e)
                     }

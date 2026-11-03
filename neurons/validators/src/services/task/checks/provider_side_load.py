@@ -13,6 +13,7 @@ from services.const import LIUM_INFRA_CONTAINER_PREFIXES
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
+from .rental_owner import rental_of_this_node
 from .gpu_usage import (
     carries_a_rental_prefix,
     lium_workload_containers,
@@ -246,7 +247,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     # A custom image builds in `lium-dind-build-<pod_id>`, which is on no rental list and burns
     # cores. The pod id keeps the name rename-proof: it has to match a pod the BACKEND reports
     # here, the same rule the orphan sweep removes such a container by.
-    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
@@ -513,10 +514,6 @@ class ProviderSideLoadCheck:
         )
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.PROVIDER_SIDE_LOAD_CHECK_ENABLED:
-            event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
-            return CheckResult(passed=True, event=event)
-
         lium_container_keys = await lium_containers(ctx)
         provider_side_load = await self.measure_provider_side_load(ctx, lium_container_keys)
         if not provider_side_load.is_measured:

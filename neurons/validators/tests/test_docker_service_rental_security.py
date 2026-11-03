@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -22,7 +23,8 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
-from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
+import services.docker_service as docker_service_module
+from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -476,27 +478,64 @@ async def test_create_container_keeps_sysbox_runtime_for_s3fs_external_volume(
     )
 
 
+def _s3fs_volume_info() -> ExternalVolumeInfo:
+    return ExternalVolumeInfo(
+        name="celium-volume-safe",
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
+    )
+
+
 @pytest.mark.asyncio
-async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
+async def test_fresh_create_fails_when_sysbox_cannot_align_the_volume_owner(
     docker_service,
     executor_info,
     keypair,
     monkeypatch,
 ):
     # A range wider than one slice means sysbox picks a different base per
-    # container, so the mount owner cannot be aligned — the volume stays usable
-    # only under runc.
+    # container, so the mount owner cannot be aligned. A fresh rental fails
+    # before the container exists instead of starting on runc.
+    ssh_client = RecordingSSHClient(stdout="sysbox:231072:1048576")
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    plugin_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "remove_s3fs_volume_plugin", plugin_spy)
+    payload = _base_create_payload(is_sysbox=True, external_volume_info=_s3fs_volume_info())
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "external_volume_sysbox_owner"
+    assert "rent another node" in result.msg
+    assert docker_service.rental_docker_client_factory.client.run_specs == []
+    assert "/usr/bin/docker volume rm volume_00000000-0000-0000-0000-0000000000aa 2>/dev/null || true" in ssh_client.commands
+    plugin_spy.assert_awaited_once_with(ssh_client, "celium-volume-safe")
+
+
+@pytest.mark.asyncio
+async def test_edit_create_still_drops_sysbox_when_subuid_base_is_unusable(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    # An existing pod (its local volume given) keeps today's behaviour: the Volume
+    # stays usable only under runc, so sysbox is dropped and the pod comes back.
     ssh_client = RecordingSSHClient(stdout="sysbox:231072:1048576")
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
     payload = _base_create_payload(
         is_sysbox=True,
-        external_volume_info=ExternalVolumeInfo(
-            name="celium-volume-safe",
-            plugin="s3fs",
-            iam_user_access_key="access-key",
-            iam_user_secret_key="secret-key",
-        ),
+        local_volume="volume_existing",
+        external_volume_info=_s3fs_volume_info(),
     )
+    # an edit parks the pod's current container first; this node has none
+    monkeypatch.setattr("services.docker_service._EditSwap.park", AsyncMock(return_value=None))
 
     result = await docker_service.create_container(
         payload=payload,
@@ -513,6 +552,65 @@ async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
         call.args[0] for call in docker_service.stream_log.await_args_list
     ]
     assert any("Sysbox disabled" in message for message in streamed_messages)
+
+
+@pytest.mark.asyncio
+async def test_fresh_create_fails_when_the_volume_does_not_mount(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient(stdout="sysbox:231072:65536")
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    monkeypatch.setattr(docker_service, "create_s3fs_volume", AsyncMock(return_value=(False, "mount error")))
+    plugin_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "remove_s3fs_volume_plugin", plugin_spy)
+    payload = _base_create_payload(is_sysbox=True, external_volume_info=_s3fs_volume_info())
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "external_volume_creation"
+    assert "mount error" not in result.msg
+    assert "Volume could not be mounted" in result.msg
+    # the plugin holding the Volume's keys does not outlive the refused create
+    plugin_spy.assert_awaited_once_with(ssh_client, "celium-volume-safe")
+    assert docker_service.rental_docker_client_factory.client.run_specs == []
+
+
+@pytest.mark.asyncio
+async def test_edit_create_still_starts_with_a_warning_when_the_volume_does_not_mount(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient(stdout="sysbox:231072:65536")
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    monkeypatch.setattr(docker_service, "create_s3fs_volume", AsyncMock(return_value=(False, "mount error")))
+    payload = _base_create_payload(
+        is_sysbox=True,
+        local_volume="volume_existing",
+        external_volume_info=_s3fs_volume_info(),
+    )
+    # an edit parks the pod's current container first; this node has none
+    monkeypatch.setattr("services.docker_service._EditSwap.park", AsyncMock(return_value=None))
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert not isinstance(result, FailedContainerRequest)
+    assert ContainerWarningCode.ExternalVolumeFailed in (result.warnings or [])
 
 
 @pytest.mark.asyncio
@@ -633,6 +731,27 @@ async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
         "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
         "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
     ]
+
+
+def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_removed_or_reconfigured():
+    # disable, rm, set or upgrade on a loopback plugin loses every volume whose backing file is in its rootfs
+    source = open(docker_service_module.__file__).read()
+
+    targets = re.findall(r"""docker plugin (?:disable|rm|remove|set|upgrade|push|create) ([^\s"']+)""", source)
+
+    assert set(targets) == {"{plugin_alias}"}
+    installed_or_enabled = re.findall(r"""docker plugin (?:install|enable) ([^\s"']+)""", source)
+    assert set(installed_or_enabled) == {
+        "{S3FS_PLUGIN_IMAGE}",
+        "{plugin_alias}",
+        "{LEGACY_S3FS_PLUGIN_ALIAS}",
+    }
+    assert set(re.findall(r"\bplugin_alias(?:: str)? = (\w+)", source)) == {"_s3fs_plugin_alias"}
+
+
+@pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc"])
+def test_s3fs_plugin_alias_never_names_a_loopback_plugin(volume_name):
+    assert not _is_vloopback_driver(_s3fs_plugin_alias(volume_name))
 
 
 @pytest.mark.asyncio
@@ -1109,8 +1228,8 @@ async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
     assert docker_client.created_volumes == []
 
 
-def _pod_host_key_specs(docker_client):
-    return [spec for spec in docker_client.exec_specs if "pod_ssh_host_key" in spec.argv]
+def _pod_host_key_commands(ssh_client):
+    return [shlex.split(cmd) for cmd in ssh_client.commands if "pod_ssh_host_key" in cmd]
 
 
 @pytest.mark.asyncio
@@ -1121,6 +1240,7 @@ async def test_create_container_installs_the_same_ssh_host_key_each_time_a_pod_i
     monkeypatch,
 ):
     ssh_client = RecordingSSHClient()
+    ssh_client.run = AsyncMock(wraps=ssh_client.run)
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
 
     for _ in range(2):
@@ -1131,13 +1251,14 @@ async def test_create_container_installs_the_same_ssh_host_key_each_time_a_pod_i
             private_key="encrypted-private-key",
         )
 
-    specs = _pod_host_key_specs(docker_service.rental_docker_client_factory.client)
+    specs = _pod_host_key_commands(ssh_client)
     assert len(specs) == 2
-    public_keys = {spec.argv[-1] for spec in specs}
+    public_keys = {spec[-1] for spec in specs}
     assert len(public_keys) == 1
     assert next(iter(public_keys)).startswith("ssh-ed25519 ")
-    assert all("OPENSSH PRIVATE KEY" in spec.stdin for spec in specs)
-    assert all("OPENSSH PRIVATE KEY" not in " ".join(spec.argv) for spec in specs)
+    calls = [c for c in ssh_client.run.call_args_list if "pod_ssh_host_key" in c.args[0]]
+    assert all("OPENSSH PRIVATE KEY" in c.kwargs["input"] for c in calls)
+    assert all("OPENSSH PRIVATE KEY" not in " ".join(spec) for spec in specs)
 
 
 @pytest.mark.asyncio
@@ -1158,4 +1279,18 @@ async def test_create_container_skips_the_pod_ssh_host_key_without_a_master_secr
         private_key="encrypted-private-key",
     )
 
-    assert _pod_host_key_specs(docker_service.rental_docker_client_factory.client) == []
+    assert _pod_host_key_commands(ssh_client) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rm_exit, plugin_removed", [(0, True), (1, False)])
+async def test_a_refused_create_drops_the_s3fs_plugin_only_once_its_volume_is_gone(
+    docker_service, rm_exit, plugin_removed
+):
+    # A volume still in use (rm fails) keeps its plugin, so a pod mounting it keeps its mount (jam_bot, lio#1579).
+    ssh_client = RecordingSSHClient(exit_status=rm_exit)
+
+    await docker_service._remove_host_volumes_of_refused_create(ssh_client, {}, None, "celium-volume-safe")
+
+    assert any("docker volume rm celium-volume-safe" in c for c in ssh_client.commands)
+    assert any("docker plugin rm s3fs-celium-volume-safe" in c for c in ssh_client.commands) is plugin_removed
