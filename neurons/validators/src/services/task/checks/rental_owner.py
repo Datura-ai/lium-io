@@ -49,7 +49,7 @@ def rental_of_this_node(
     )
 
 
-def filler_of_another_miner(ctx: Context, rented_data: RentedExecutorsResponse | None) -> bool:
+def uuid_listed_under_another_miner(ctx: Context, rented_data: RentedExecutorsResponse | None) -> bool:
     """True when the backend lists this executor UUID under another miner's hotkey, so the filler it
     lists under that UUID is not on this node. An older backend sends no owners: no change."""
     owner = rented_data.executor_owner_hotkeys.get(str(ctx.executor.uuid)) if rented_data else None
