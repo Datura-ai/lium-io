@@ -97,7 +97,8 @@ FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
 # starts an exporter that outlived its kill once it exits, after the reset unit has ended. systemd owns the
 # retries: any failed wait or start (a Docker daemon restart included) fails the unit and it runs again; only an
-# observed exit plus a start that is still up ("true false") a few seconds later, or a removed container, ends it
+# observed exit plus a start that is still up ("true false") a few seconds later, or a removed container, ends it.
+# One unit per container ID (the unit name ends in it), so two exporters each get their own
 EXPORTER_RESTART_UNIT = "lium-gpu-reset-exporter-restart"
 EXPORTER_RESTART_SCRIPT = (
     'docker wait "$0" >/dev/null || { docker inspect "$0" 2>&1 >/dev/null | grep -q "No such" && exit 0; exit 1; }; '
@@ -105,8 +106,10 @@ EXPORTER_RESTART_SCRIPT = (
     "[ \"$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' \"$0\")\" = 'true false' ]"
 )
 EXPORTER_RESTART_RUN = (
-    f"systemd-run --quiet --collect --unit={EXPORTER_RESTART_UNIT} -p Restart=on-failure -p RestartSec=10 "
-    f"/bin/sh -c {shlex.quote(EXPORTER_RESTART_SCRIPT)}"
+    f'systemd-run --quiet --collect --unit={EXPORTER_RESTART_UNIT}-"$dying" -p Restart=on-failure -p RestartSec=10 '
+    f'/bin/sh -c {shlex.quote(EXPORTER_RESTART_SCRIPT)} "$dying" '
+    # a unit already there for this container (an earlier reset's) starts it already
+    f'|| [ "$(systemctl show -p LoadState --value {EXPORTER_RESTART_UNIT}-"$dying")" = loaded ]'
 )
 # "no-systemd" only when the host proves it has no systemd (not booted with it, no systemd-run): any other answer,
 # a failed probe included, keeps the reset in the host unit
@@ -127,6 +130,8 @@ _FABRIC_STOP_FAILED_EXIT = 97
 # a host GPU holder the unit stopped is not active again after the reset
 _FABRIC_START_FAILED_EXIT = 98
 STOP_GRACE_SECONDS = 10
+# process deadline on a docker CLI call beyond its own grace: a stalled dockerd cannot hold the host unit forever
+_DOCKER_CALL_SECONDS = 15
 # "<running> <restarting>" of a holder container: only "true false" is up
 CONTAINER_STATE_COMMAND = f"{DOCKER} inspect -f '{{{{.State.Running}}}} {{{{.State.Restarting}}}}'"
 # a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
@@ -458,7 +463,8 @@ async def _widen_targets_to_nvlink_peers(
 
 def build_fabric_reset_command(units: list[str], reset_command: str, containers: list[str] = ()) -> str:
     """Stop the GPU holders (containers, the given services, then any other host service still holding a GPU
-    device), reset, start them all again (last stopped first) as one host systemd unit. A refused reset prints
+    device), reset, start them all again (the given services last stopped first, then the discovered ones, then the
+    containers) as one host systemd unit. A refused reset prints
     the processes still holding a GPU.
 
     The unit outlives the SSH session, and SIGPIPE is ignored so a closed pipe cannot kill it before the start."""
@@ -467,7 +473,8 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     if containers:
         ids = " ".join(shlex.quote(c) for c in containers)
         script += (
-            f'for u in {ids}; do docker stop -t {STOP_GRACE_SECONDS} "$u" >/dev/null || '
+            f'for u in {ids}; do timeout -k 5 {STOP_GRACE_SECONDS + _DOCKER_CALL_SECONDS} '
+            f'docker stop -t {STOP_GRACE_SECONDS} "$u" >/dev/null || '
             f'{{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; dying="$u"; break; }}; done; '
         )
     if units:
@@ -478,13 +485,16 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         f'echo "stopping GPU holder $u"; up="$u $up"; systemctl stop "$u" {fail}; done; '
         f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; "
         f'[ $rc -eq 0 ] || echo "GPU holders left: $({GPU_HOLDERS_SCRIPT})"; }}; '
+    )
+    if units:
+        # first: a discovered holder may need them (Fabric Manager, nvidia-persistenced) to start
+        start = " ".join(shlex.quote(u) for u in reversed(units))
+        script += f'for u in {start}; do systemctl start "$u"; done; '
+    script += (
         # a discovered holder is checked here (the validator knows only the listed ones); the rest still start
         'for u in $up; do { systemctl start "$u" && systemctl is-active "$u" >/dev/null; } '
         f'|| {{ echo "could not start $u" >&2; rc={_FABRIC_START_FAILED_EXIT}; }}; done; '
     )
-    if units:
-        start = " ".join(shlex.quote(u) for u in reversed(units))
-        script += f'for u in {start}; do systemctl start "$u"; done; '
     if containers:
         # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: wait for
         # the exit (a removed container ends the wait), then kill one still there and wait once more. Bounded, so
@@ -494,9 +504,10 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         script += (
             f'[ -z "$dying" ] || until timeout {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
             '! docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; '
-            'echo "$dying did not exit, killing it" >&2; docker kill "$dying" >/dev/null 2>&1; '
+            'echo "$dying did not exit, killing it" >&2; '
+            f'timeout -k 5 {_DOCKER_CALL_SECONDS} docker kill "$dying" >/dev/null 2>&1; '
             f'timeout {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1 || {{ '
-            f'{EXPORTER_RESTART_RUN} "$dying" '
+            f"{{ {EXPORTER_RESTART_RUN}; }} "
             '>/dev/null 2>&1 && echo "$dying did not exit after a kill: restart pending, it starts once it exits" >&2 '
             '|| echo "could not start $dying: it did not exit after a kill" >&2; }; break; done; '
         )

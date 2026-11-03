@@ -135,7 +135,7 @@ class FakeHost:
             script = shlex.split(cmd)[-1]
             found = re.search(r"\|\| for u in ([^;$]*); do systemctl stop", script)
             units = found.group(1).split() if found else []
-            containers = re.search(r"for u in ([^;]*); do docker stop", script)
+            containers = re.search(r"for u in ([^;]*); do timeout -k 5 \d+ docker stop", script)
             containers = containers.group(1).split() if containers else []
             for cid in containers:
                 self.active[cid] = False
@@ -512,11 +512,12 @@ async def test_an_unreadable_reset_unit_cgroup_skips_the_fallback_and_the_contai
 
 
 def _run_fabric_script(
-    tmp_path, *, stop_fails="", start_fails="", reset_exit=0, units=(FM, NVLSM), containers=(), procs=None
+    tmp_path, *, stop_fails="", start_fails="", reset_exit=0, units=(FM, NVLSM), containers=(), procs=None, needs=""
 ):
     """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl, docker, fuser and
     nvidia-smi; procs is the host's /proc: {pid: (comm, cgroup)}, all of them holding a GPU device. stop_fails and
-    start_fails name the one unit whose systemctl stop or start exits 1."""
+    start_fails name the one unit whose systemctl stop or start exits 1; a start of any unit fails while the unit
+    needs has not been started yet."""
     log = tmp_path / "log"
     proc = tmp_path / "proc"
     for pid, (comm, cgroup) in (procs or {}).items():
@@ -528,7 +529,9 @@ def _run_fabric_script(
         (
             "systemctl",
             f'echo "$1 $2" >> {log}; [ "$1" = stop ] && [ "$2" = "$STOP_FAILS" ] && exit 1; '
-            '[ "$1" = start ] && [ "$2" = "$START_FAILS" ] && exit 1; exit 0',
+            '[ "$1" = start ] && [ "$2" = "$START_FAILS" ] && exit 1; '
+            f'[ "$1" = start ] && [ -n "$NEEDS" ] && [ "$2" != "$NEEDS" ] && ! grep -qx "start $NEEDS" {log} && exit 1; '
+            "exit 0",
         ),
         ("docker", f'echo "docker $*" >> {log}; [ "$1" = stop ] && [ "$4" = "$STOP_FAILS" ] && exit 1; exit 0'),
         ("fuser", f'echo "$*" | grep -q "/dev/nvidia" && echo " {fuser_out}"; exit 0'),
@@ -539,7 +542,7 @@ def _run_fabric_script(
     cmd = build_fabric_reset_command(list(units), f"nvidia-smi -r -i {U[0]}", list(containers))
     assert cmd.startswith("nsenter -t 1 -m -- systemd-run ")
     script = shlex.split(cmd)[-1].replace("/proc/", f"{proc}/")
-    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": stop_fails, "START_FAILS": start_fails}
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": stop_fails, "START_FAILS": start_fails, "NEEDS": needs}
     done = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True)
     return done, log.read_text().splitlines()
 
@@ -567,11 +570,11 @@ def test_the_host_unit_stops_every_gpu_holder_and_starts_them_again_in_reverse(t
         "stop nvidia-persistenced",
         "stop some-gpu-agent.service",
         f"reset -r -i {U[0]}",
-        "start some-gpu-agent.service",
-        "is-active some-gpu-agent.service",
         "start nvidia-persistenced",
         f"start {FM}",
         "start nvidia-dcgm",
+        "start some-gpu-agent.service",
+        "is-active some-gpu-agent.service",
         "docker start e1",
     ]
     # a refused reset names the processes still holding a GPU
@@ -625,13 +628,15 @@ docker() {
   esac
   return 0
 }
-timeout() { shift; "$@"; }
+timeout() { [ "$1" = -k ] && shift 2; shift; "$@"; }
 sleep() { :; }
 trap 'echo "$pending $noops"' EXIT
 """
     # `systemd-run` is no valid sh function name: a PATH stub records the hand-off
     (tmp_path / "systemd-run").write_text(f'#!/bin/sh\necho "$@" > "{tmp_path}/handoff"\nexit {handoff_rc}\n')
     (tmp_path / "systemd-run").chmod(0o755)
+    (tmp_path / "systemctl").write_text("#!/bin/sh\necho not-found\n")
+    (tmp_path / "systemctl").chmod(0o755)
     env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
     done = subprocess.run(["/bin/sh", "-c", stubs + script], capture_output=True, text=True, timeout=30, env=env)
     assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
@@ -640,7 +645,7 @@ trap 'echo "$pending $noops"' EXIT
     handoff = tmp_path / "handoff"
     assert handoff.exists() == stuck
     if stuck:
-        assert f"--unit={gpu_reset.EXPORTER_RESTART_UNIT}" in handoff.read_text()
+        assert f"--unit={gpu_reset.EXPORTER_RESTART_UNIT}-e1 " in handoff.read_text()
         assert handoff.read_text().strip().endswith("e1")
         assert "-p Restart=on-failure" in handoff.read_text()
     assert ("e1 did not exit after a kill: restart pending" in done.stderr) == (stuck and handoff_rc == 0)
@@ -681,6 +686,57 @@ docker() {{
     )
     assert done.returncode == rc
     assert ("started" in done.stderr) == started
+
+
+def _stuck_exporter_bin(tmp_path, docker_body):
+    """PATH stand-ins for an exporter that outlives its kill: docker (the given case arms), and systemd-run plus
+    systemctl keeping a registry of the transient units like systemd (a second unit of one name is rejected)."""
+    units = tmp_path / "units"
+    units.mkdir()
+    for name, body in (
+        ("docker", f'echo "docker $*" >> {tmp_path}/log; case "$1" in {docker_body} esac; exit 0'),
+        (
+            "systemd-run",
+            'for a; do case "$a" in --unit=*) u="${a#--unit=}";; esac; done; '
+            f'[ -e "{units}/$u" ] && exit 1; touch "{units}/$u"',
+        ),
+        ("systemctl", f'[ -e "{units}/$5" ] && echo loaded || echo not-found'),
+    ):
+        (tmp_path / name).write_text(f"#!/bin/sh\n{body}\n")
+        (tmp_path / name).chmod(0o755)
+    return {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}, units
+
+
+def test_two_stuck_exporters_each_get_their_own_restart_unit(tmp_path):
+    env, units = _stuck_exporter_bin(tmp_path, "stop) exit 1;; wait) exit 124;;")
+    # e1 still has its recovery unit when e2 (and later e1 again) outlives its kill
+    for cid in ("e1", "e2", "e1"):
+        script = shlex.split(build_fabric_reset_command([], "true", [cid]))[-1]
+        done = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=30, env=env)
+        assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
+        assert f"{cid} did not exit after a kill: restart pending" in done.stderr, done.stderr
+    assert sorted(p.name for p in units.iterdir()) == [f"{gpu_reset.EXPORTER_RESTART_UNIT}-{c}" for c in ("e1", "e2")]
+
+
+def test_a_hanging_docker_stop_and_kill_hit_their_deadline_and_still_hand_off(tmp_path, monkeypatch):
+    # dockerd accepted the calls but never answers: the deadlines end them and the recovery path still runs
+    monkeypatch.setattr(gpu_reset, "STOP_GRACE_SECONDS", 0)
+    monkeypatch.setattr(gpu_reset, "_DOCKER_CALL_SECONDS", 1)
+    env, units = _stuck_exporter_bin(tmp_path, "stop|kill) exec sleep 60;; wait) exit 124;;")
+    script = shlex.split(build_fabric_reset_command([], "true", ["e1"]))[-1]
+    done = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=30, env=env)
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT and "could not stop e1" in done.stderr
+    assert "e1 did not exit after a kill: restart pending" in done.stderr
+    assert [p.name for p in units.iterdir()] == [f"{gpu_reset.EXPORTER_RESTART_UNIT}-e1"]
+    assert (tmp_path / "log").read_text().splitlines()[-1] == "docker start e1"
+
+
+def test_the_host_unit_starts_the_listed_prerequisites_before_a_discovered_holder(tmp_path):
+    # a monitor that fails to start without Fabric Manager comes back, since Fabric Manager starts first
+    procs = {4242: ("agent", f"0::/system.slice/{AGENT}")}
+    done, log = _run_fabric_script(tmp_path, units=(FM, PERSISTENCED), procs=procs, needs=FM)
+    assert done.returncode == 0 and "could not start" not in done.stderr
+    assert log[-3:] == [f"start {FM}", f"start {AGENT}", f"is-active {AGENT}"]
 
 
 AGENT = "some-gpu-agent.service"
