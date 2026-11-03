@@ -12,8 +12,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
-from services.gpu_spec_table import normalize_gpu_model
-from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
+from services.gpu_spec_table import classify_gpu_model, reference_gpu_model
+from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -36,7 +36,12 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
         return specs
 
     canonical_details = [
-        {**detail, "name": normalize_gpu_model(detail.get("name"))}
+        {
+            **detail,
+            "name": classify_gpu_model(
+                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
+            ),
+        }
         if isinstance(detail, dict) and detail.get("name")
         else detail
         for detail in details
@@ -142,6 +147,11 @@ class ResultHandler:
             parts = gpu_model_count.split(":")
             gpu_model = parts[0]
             gpu_count = int(parts[1])
+        # DAH-5088: the result is scored under its reference model's key (rate, base, caps, price
+        # anchor, per-type pool); the card's own name stays in the published specs.
+        gpu_details = context.state.gpu_details or []
+        capacity_mb = gpu_details[0].get("capacity") if gpu_details else None
+        gpu_model = reference_gpu_model(gpu_model, capacity_mb) or gpu_model
 
         is_spot = bool(
             context.state.rented_data
@@ -154,6 +164,10 @@ class ResultHandler:
         is_new_rentals_paused = bool(
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
+        )
+        is_in_maintenance = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.maintenance_executor_ids
         )
         is_provider_email_held = bool(
             context.state.rented_data
@@ -171,7 +185,9 @@ class ResultHandler:
         )
         filler_revenue_per_gpu_hour = (
             rented_data.get_filler_revenue_per_gpu_hour(
-                BASE_GPU_MAP.get(gpu_model or ""), gpu_count, settings.FILLER_REVENUE_MIN_GPU_HOURS
+                BASE_GPU_MAP.get(gpu_model or ""),
+                gpu_count,
+                settings.get_filler_revenue_min_gpu_hours(is_spot),
             )
             if rented_data
             else None
@@ -260,6 +276,7 @@ class ResultHandler:
             is_spot=is_spot,
             is_on_spot_pay_list=is_on_spot_pay_list,
             is_new_rentals_paused=is_new_rentals_paused,
+            is_in_maintenance=is_in_maintenance,
             is_provider_banned=context.is_provider_banned,
             provider_discord_connected=provider_discord_connected,
             is_provider_email_held=is_provider_email_held,
@@ -368,7 +385,8 @@ class ResultHandler:
                 await self.redis_service.set_verified_job_info(
                     miner_hotkey=miner_hotkey,
                     executor_id=executor_id,
-                    prev_info=verified_job_info,
+                    # a full set of other cards: this cycle's set becomes the anchor
+                    prev_info={**verified_job_info, GPU_ANCHOR_KEY: ""} if context.gpu_reanchor else verified_job_info,
                     success=True,
                     spec=gpu_model_count,
                     uuids=gpu_uuids,
@@ -377,12 +395,13 @@ class ResultHandler:
             # On failure, either clear or mark as failed
             if context.clear_verified_job_info:
                 reason = self._resolve_clear_reason(context.clear_verified_job_reason)
-                # DAH-2865: the address this cycle checked, so the backend can drop a reset that arrives after the
-                # provider moved the node to another address under the same id
+                # DAH-2865: the address and cycle this check ran in, so the backend can drop a reset that arrives
+                # after the provider moved the node to another address under the same id, however late it arrives
                 evidence = {
                     **(context.clear_verified_job_evidence or {}),
                     "executor_ip": context.executor.address,
                     "executor_port": context.executor.port,
+                    **({"job_batch_id": context.config.job_batch_id} if context.config.job_batch_id else {}),
                 }
                 await self.redis_service.clear_verified_job_info(
                     miner_hotkey=miner_hotkey,
@@ -390,8 +409,7 @@ class ResultHandler:
                     prev_info=verified_job_info,
                     reason=reason,
                     evidence=evidence,
-                    anchor_broken=context.gpu_anchor_broken,
-                    reanchor=context.gpu_reanchor,
+                    reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                 )
             else:
                 await self.redis_service.set_verified_job_info(

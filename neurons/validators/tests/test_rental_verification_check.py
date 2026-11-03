@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import asyncssh
 import pytest
+from core.config import settings
 from neurons.validators.src.core.docker_utils import ContainerDeathDiagnostics
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
@@ -68,17 +69,23 @@ class DummyBackendClient:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enabled, alias", [(True, "vloopback:v2"), (False, "vloopback")])
-async def test_rental_verification_selects_loopback_alias_from_v2_switch(context_factory, enabled, alias):
+@pytest.mark.parametrize(
+    "v2_enabled, v3_enabled, alias",
+    [(True, False, "vloopback:v2"), (True, True, "vloopback:v3"), (False, True, "vloopback")],
+    ids=["v2", "v3", "legacy-when-v2-switch-off"],
+)
+async def test_rental_verification_selects_loopback_alias_from_the_switches(
+    context_factory, monkeypatch, v2_enabled, v3_enabled, alias
+):
     # Arrange
     backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
     services = build_services(backend=backend, container_cleanup=ContainerCleanup())
     ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V2_ENABLED", v2_enabled)
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", v3_enabled)
 
     # Act
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as config:
-        config.LOOPBACK_PLUGIN_V2_ENABLED = enabled
-        result = await RentalVerificationCheck().run(ctx)
+    result = await RentalVerificationCheck().run(ctx)
 
     # Assert: the backend probes the plugin selected for new rental volumes by this validator.
     assert result.passed is True
@@ -191,6 +198,28 @@ async def test_rental_verification_failed():
     assert result.event.what_we_saw["details"]["timeout"] is True
     assert "clear_verified_job_info" not in result.updates
     assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_empty_kernel_gpu_list_says_restart_the_executor():
+    """An empty kernel GPU list is a stale executor container, so the remediation must say restart it."""
+    error = "GPU 'GPU-4edea549-e08e-fdc6-09f2-b3c7880cc708' requested by tenant not present on executor; visible: []"
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=False, error=error, details={"docker_stderr": error})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FAILED.reason
+    assert "docker restart executor-executor-1" in result.event.remediation
+    assert result.event.what_we_saw["error"] == error
 
 
 @pytest.mark.asyncio

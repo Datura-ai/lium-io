@@ -29,6 +29,7 @@ def svc():
     service = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    service._read_host_ram_kib = AsyncMock(return_value=None)
     return service
 
 
@@ -110,9 +111,14 @@ async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_
 
 @pytest.mark.asyncio
 async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
+    from services import gpu_clocks
+
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
+    # the real clock-lock safety net (conftest stubs it): its -rgc is one of the host commands
+    monkeypatch.setattr("services.docker_service.reset_leftover_clock_locks", gpu_clocks.reset_leftover_clock_locks)
+    monkeypatch.setattr(svc.redis_service, "get", AsyncMock(return_value=None), raising=False)  # no lock records
 
     name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
 
@@ -134,6 +140,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         " --format=csv,noheader,nounits",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
+        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
         host_key,
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
         f"/usr/bin/docker rm -fv id-{name}",
@@ -147,7 +155,6 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
 
     async def inspector_start_that_hangs(**kwargs) -> None:
         await asyncio.Event().wait()
@@ -177,7 +184,6 @@ async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     inspector_may_start = asyncio.Event()
 
     async def inspector_start_held(**kwargs) -> None:
@@ -212,7 +218,6 @@ async def test_a_second_edit_cancelled_by_a_delete_while_it_waits_never_parks(sv
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     inspector_may_start = asyncio.Event()
 
     async def inspector_start_held(**kwargs) -> None:
@@ -269,6 +274,42 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
     kwargs = bring_up.await_args.kwargs
     assert kwargs["container_name"] == name and kwargs["pod_id"] == payload.pod_id
     assert kwargs["local_volume_path"] == "/root" and kwargs["ssh_client"] is ssh
+
+
+@pytest.mark.parametrize(
+    ("visible", "starts"),
+    [(["GPU-new"], False), (["GPU-old-2", "GPU-new"], True), ([], True)],
+    ids=["card_set_swapped", "one_card_missing", "procfs_unreadable"],
+)
+@pytest.mark.asyncio
+async def test_a_failed_edit_skips_the_restore_start_only_when_all_pod_gpus_left_the_node(svc, monkeypatch, caplog, visible, starts):
+    # after a VM move swapped the whole card set, the old container's device request names cards the
+    # node no longer has, so it cannot start; it gets its name back, stopped
+    from services.nvidia_devices import MissingRentedGpuError
+
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    requested = ["GPU-old-1", "GPU-old-2"]
+    missing = [u for u in requested if u not in visible]
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(side_effect=MissingRentedGpuError(requested_uuids=requested, visible_uuids=visible, missing_uuids=missing)),
+    )
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert ssh.commands.count(f"/usr/bin/docker rename {parked} {name}") == 1
+    assert f"/usr/bin/docker start {name}" not in ssh.commands
+    if starts:
+        svc._bring_up_existing_container.assert_awaited_once()
+    else:
+        svc._bring_up_existing_container.assert_not_awaited()
+        assert "restore skipped: pod GPUs no longer on node" in caplog.text
+        assert "unknown device" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -437,6 +478,7 @@ def test_the_cycle_cleanup_protects_the_parked_twin_of_every_rented_pod():
         executors={"exec-1": SimpleNamespace(pods=pods)},
         all_filler_containers_by_executor={},
         filler_containers_by_executor={},
+        retained_container_names=[],
     )
 
     assert listed_container_names(rented) == {"pod_aaaa", "pod_aaaa" + EDIT_PARKED_SUFFIX, "pod_bbbb", "pod_bbbb" + EDIT_PARKED_SUFFIX}

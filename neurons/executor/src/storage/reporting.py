@@ -30,6 +30,7 @@ class ProgressState:
     total_bytes: int | None = None
     processed_bytes: int | None = None
     stage: str | None = None
+    summary: dict[str, int] | None = None
 
 
 class StorageEventReporter:
@@ -74,18 +75,29 @@ class StorageEventReporter:
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
-            if self._state.stage == "PREPARING" and self._restore_has_started():
+            if (
+                payload.get("message_type") == "summary"
+                and self._spec.resource is ReporterResource.BACKUP
+            ):
+                self._state.summary = _summary_counts(payload)
+            if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
+            elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
+                # restic is running and scanning the snapshot; no file restored yet.
+                self._state.stage = "SCANNING"
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
+            return
+        if event_type == "rerun":
+            self._restic_failure_detail = self._diagnostic_detail = None
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
-        if event_type == "diagnostic":
+        if event_type in ("diagnostic", "log"):
             message = event.get("message")
             if isinstance(message, str) and message:
-                if self._diagnostic_detail is None:
+                if event_type == "diagnostic" and self._diagnostic_detail is None:
                     self._diagnostic_detail = message[:2000]
                 # Kept until a PUT succeeds, so throttled or failed updates do not drop them.
                 self._pending_logs = _newest_within_bytes(
@@ -103,19 +115,19 @@ class StorageEventReporter:
                 if result_quality == "FULL":
                     self._state.processed_files = self._state.total_files
                     self._state.processed_bytes = self._state.total_bytes
-            self._put(
-                self._progress_payload(
-                    status=status,
-                    result_quality=result_quality,
-                    snapshot_id=_optional_string(event.get("snapshot_id")),
-                    exit_code=_optional_integer(event.get("exit_code")),
-                    error_code=_optional_string(event.get("error_code")),
-                    error_message=(self._restic_failure_detail or self._diagnostic_detail)
-                    if status != "COMPLETED"
-                    else None,
-                ),
-                terminal=True,
+            payload = self._progress_payload(
+                status=status,
+                result_quality=result_quality,
+                snapshot_id=_optional_string(event.get("snapshot_id")),
+                exit_code=_optional_integer(event.get("exit_code")),
+                error_code=_optional_string(event.get("error_code")),
+                error_message=(self._restic_failure_detail or self._diagnostic_detail)
+                if status != "COMPLETED"
+                else None,
             )
+            if status == "COMPLETED" and self._state.summary:
+                payload.update(self._state.summary)
+            self._put(payload, terminal=True)
 
     def _apply_progress(self, event: Mapping[str, object]) -> None:
         percent_done = event.get("percent_done")
@@ -288,6 +300,18 @@ def _first_integer(value: Mapping[str, object], *keys: str) -> int | None:
         if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
             return item
     return None
+
+
+def _summary_counts(summary: Mapping[str, object]) -> dict[str, int]:
+    """restic's final backup summary, under the backup_log column names"""
+    counts = {
+        "data_added_bytes": _first_integer(summary, "data_added"),
+        "data_added_packed_bytes": _first_integer(summary, "data_added_packed"),
+        "files_new": _first_integer(summary, "files_new"),
+        "files_changed": _first_integer(summary, "files_changed"),
+        "files_unmodified": _first_integer(summary, "files_unmodified"),
+    }
+    return {field: value for field, value in counts.items() if value is not None}
 
 
 def _updated_integer(value: Mapping[str, object], current: int | None, *keys: str) -> int | None:

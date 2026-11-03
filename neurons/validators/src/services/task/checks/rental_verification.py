@@ -22,8 +22,8 @@ from ...const import (
     FILLER_CONTAINER_PREFIX,
     FILLER_LIVENESS_GRACE_MINUTES,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
-    LOOPBACK_PLUGIN_ALIAS,
 )
+from ...loopback_plugin_setup import current_loopback_plugin_alias
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
@@ -210,7 +210,9 @@ class RentalVerificationCheck:
                 rental_in_progress=has_customer_rental,
                 gpu_uuids=gpu_uuids,
                 cpu_count=cpu_count,
-                loopback_plugin=LOOPBACK_PLUGIN_ALIAS if settings.LOOPBACK_PLUGIN_V2_ENABLED else LEGACY_LOOPBACK_PLUGIN_ALIAS,
+                loopback_plugin=current_loopback_plugin_alias()
+                if settings.LOOPBACK_PLUGIN_V2_ENABLED
+                else LEGACY_LOOPBACK_PLUGIN_ALIAS,
             )
 
             # Handle API failure (None response) - fail this executor
@@ -276,6 +278,24 @@ class RentalVerificationCheck:
                         "score_warning": quarantine.score_warning,
                         "clear_verified_job_info": True,
                     },
+                )
+            elif (response.error or "").endswith("visible: []"):
+                # an empty kernel list means the container's /proc view is stale, not that the cards changed
+                event = render_message(
+                    Msg.GPU_LIST_EMPTY,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "verified": False,
+                        "executor_uuid": executor.uuid,
+                        "error": response.error,
+                        "details": response.details or {},
+                    },
+                )
+                return CheckResult(
+                    passed=False,  # Fatal check - halt validation
+                    event=event,
+                    updates={},
                 )
             else:
                 # Verification failed - this is fatal

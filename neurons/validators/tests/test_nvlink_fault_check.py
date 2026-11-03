@@ -1,12 +1,10 @@
 import json
 from datetime import UTC, datetime
-from unittest.mock import patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX
 from neurons.validators.src.services.task import pipeline_factory
-from neurons.validators.src.services.task.checks import nvlink_fault
 from neurons.validators.src.services.task.checks.nvlink_fault import (
     PROBE_JSON_MARKER,
     PROBE_SOURCE,
@@ -72,31 +70,14 @@ FAULT = report(status="fault", error="gpu 0: cuMulticastBindMem -> CUresult 401"
 
 
 @pytest.mark.asyncio
-async def test_a_board_whose_nvlink_multicast_cannot_bind_fails_when_enforced(context_factory):
-    with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", True):
-        result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
+async def test_a_board_whose_nvlink_multicast_cannot_bind_fails(context_factory):
+    result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
 
     assert result.passed is False
     assert NvlinkFaultCheck.fatal is True
     assert result.event.reason_code == "NVLINK_FAULT"
     assert result.event.severity == "error"
     assert "401" in result.event.what_we_saw["probe"]["error"]
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_logs_the_fault_and_the_node_passes(context_factory):
-    # shadow first (taiberium, 23 Oct): ~100 all-NVLink nodes, false-fail count unknown until the logs show it
-    assert (
-        type(nvlink_fault.settings).model_fields["NVLINK_FAULT_ENFORCEMENT_ENABLED"].default
-        is False
-    )
-    with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", False):
-        result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
-
-    assert result.passed is True
-    assert result.event.reason_code == "NVLINK_FAULT"
-    assert result.event.severity == "warning"
-    assert "NOT changed" in result.event.impact
 
 
 @pytest.mark.asyncio
@@ -211,7 +192,7 @@ def test_probe_reports_any_other_error_as_could_not_measure():
 
 
 @pytest.mark.asyncio
-async def test_active_filler_skips_the_probe(context_factory):
+async def test_the_probe_runs_beside_an_active_filler_and_a_fault_fails(context_factory):
     rented_data = RentedExecutorsResponse(
         executors={},
         banned_guids=[],
@@ -220,6 +201,52 @@ async def test_active_filler_skips_the_probe(context_factory):
 
     result, runner = await run_check(context_factory, NVLINK_BOARD, FAULT, rented_data=rented_data)
 
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert runner.calls[0]["stdin_text"] == PROBE_SOURCE
+
+
+def sxm_board(name="NVIDIA H100 80GB HBM3", count=8, nvlink=False):
+    return {
+        "gpu": {"count": count, "details": [{"name": name} for _ in range(count)]},
+        "interconnect": {"nvlink": nvlink, "nvlink_active_links": 0, "pcie_class": "SYS"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_full_sxm_board_without_nvlink_fails_without_probing(context_factory):
+    result, runner = await run_check(context_factory, sxm_board())
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVLINK_MISSING"
+    assert result.event.severity == "error"
+    assert result.event.what_we_saw["gpu_name"] == "NVIDIA H100 80GB HBM3"
+    assert result.event.what_we_saw["gpu_count"] == 8
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_raw_tesla_h100_name_is_matched_after_normalization(context_factory):
+    result, _ = await run_check(context_factory, sxm_board(name="Tesla H100 80GB HBM3"))
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVLINK_MISSING"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "specs",
+    [
+        sxm_board(count=4),  # a VM slice of a baseboard can lack NVLink
+        sxm_board(name="NVIDIA H100 PCIe"),
+        sxm_board(name="NVIDIA H200 NVL"),
+        {"gpu": sxm_board()["gpu"]},  # no interconnect scrape: unknown, not a fault
+        {**sxm_board(), "interconnect": {"pcie_class": "SYS"}},
+    ],
+)
+async def test_boards_that_may_lack_nvlink_are_skipped(context_factory, specs):
+    result, runner = await run_check(context_factory, specs)
+
     assert result.passed is True
-    assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert result.event.reason_code == Msg.SKIPPED.reason
     assert runner.calls == []
