@@ -518,9 +518,14 @@ class ResticStorageRunner:
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
         command, cwd = self._restore_execution_command(snapshot_id)
-        exit_code, _ = self._stream_command(command, cwd)
+        exit_code, summary = self._stream_command(command, cwd)
         if exit_code == SIGKILL_EXIT:
             raise ResticOperationError(self._killed_helper_message("restore"))
+        # restic exits 1 when some files failed (e.g. the live workload removed a dir mid-restore)
+        files_restored = (summary or {}).get("files_restored")
+        if exit_code == 1 and isinstance(files_restored, int) and files_restored > 0:
+            self._events.stage("FINALIZING")
+            return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
         self._events.stage("FINALIZING")

@@ -123,7 +123,7 @@ class StorageEventReporter:
                 error_code=_optional_string(event.get("error_code")),
                 error_message=(self._restic_failure_detail or self._diagnostic_detail)
                 if status != "COMPLETED"
-                else None,
+                else self._partial_restore_warning(result_quality),
             )
             if status == "COMPLETED" and self._state.summary:
                 payload.update(self._state.summary)
@@ -177,6 +177,14 @@ class StorageEventReporter:
         message = _optional_string(event.get("message"))
         if message:
             self._restic_failure_detail = message[:2000]
+
+    def _partial_restore_warning(self, result_quality: str | None) -> str | None:
+        if result_quality != "PARTIAL" or self._spec.resource is ReporterResource.BACKUP:
+            return None
+        detail = self._restic_failure_detail
+        return f"Restored with errors; some files were not restored: {detail}"[:2000] if detail else (
+            "Restored with errors; some files were not restored"
+        )
 
     def _restore_has_started(self) -> bool:
         return bool(

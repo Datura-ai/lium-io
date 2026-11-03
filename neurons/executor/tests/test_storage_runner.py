@@ -2015,3 +2015,53 @@ def test_backup_reruns_once_after_an_s3_upload_timeout(
         assert len(calls) == runs
         # the reported cause is the last run's own fatal error, not the first run's timeout
         assert first_runs[-1].split('"message":"')[1][:30] in runner._events._reporter._restic_failure_detail
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "summary", "expected"),
+    [
+        (1, {"message_type": "summary", "files_restored": 38373}, "PARTIAL"),
+        (1, {"message_type": "summary", "files_restored": 0}, None),
+        (1, None, None),
+        (2, {"message_type": "summary", "files_restored": 5}, None),
+    ],
+)
+def test_restore_with_file_errors_completes_partial_only_on_exit_1_with_files(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, expected: str | None
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace/restored"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+    monkeypatch.setattr(runner, "_stream_command", lambda *_a, **_k: (exit_code, summary))
+
+    if expected is None:
+        with pytest.raises(ResticOperationError):
+            runner._restore()
+        return
+    result = runner._restore()
+    assert result.status == "COMPLETED"
+    assert result.result_quality is OperationResultQuality.PARTIAL
+
+
+def test_partial_restore_result_keeps_first_restic_error_as_warning() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    first = "open /root/restored/model.safetensors: no such file or directory"
+    reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": first}}})
+    reporter.send({"event": "restic", "payload": {"message_type": "exit_error", "message": "Fatal: 1 errors"}})
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["status"] == "COMPLETED"
+    assert final["result_quality"] == "PARTIAL"
+    assert first in final["error_message"]
