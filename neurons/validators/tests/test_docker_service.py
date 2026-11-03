@@ -8933,7 +8933,7 @@ async def test_a_key_write_that_fails_in_a_running_container_keeps_the_exec_erro
     assert _failure_error_field(result).startswith("Failed to add SSH public keys inside container")
 
 
-@pytest.mark.parametrize("exit_status", [90, 91, 92, 1])
+@pytest.mark.parametrize("exit_status", [90, 91, 92])
 @pytest.mark.asyncio
 async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
     docker_service, monkeypatch, exit_status
@@ -8945,6 +8945,43 @@ async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
     assert result.failure_step == "encrypted_volume_setup"
     assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
     inspect.assert_not_awaited()
+
+
+# prod 3 Nov: a renter image exiting at start ("workspace mount required") failed the setup exec itself
+# with "OCI runtime exec failed" (exit 127/128), and the renter read only "Failed create_container".
+@pytest.mark.parametrize("exit_status", [1, 127, 128])
+@pytest.mark.asyncio
+async def test_a_setup_exec_docker_could_not_run_in_a_running_container_fails_the_encryption(
+    docker_service, monkeypatch, exit_status
+):
+    result, inspect = await _create_with_volume_setup_exit(
+        docker_service, monkeypatch, exit_status=exit_status, state=_state()
+    )
+
+    assert result.failure_step == "encrypted_volume_setup"
+    assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
+    inspect.assert_awaited()
+
+
+@pytest.mark.parametrize("exit_status", [127, 128])
+@pytest.mark.asyncio
+async def test_a_setup_exec_that_fails_on_an_exiting_image_names_the_image(
+    docker_service, monkeypatch, exit_status
+):
+    result, _ = await _create_with_volume_setup_exit(
+        docker_service,
+        monkeypatch,
+        exit_status=exit_status,
+        state=_state(status="restarting", running=True, restarting=True, exit_code=1, restart_count=1),
+    )
+
+    # the step lium-platform reads the image-exit markers at, so the renter gets the start-command hint
+    assert result.failure_step == "add_public_keys"
+    assert result.volume_encryption_status is None
+    error = _failure_error_field(result)
+    assert "is restarting" in error, error
+    assert f"image {_CUDA_IMAGE!r} has no long-running command" in error
+    assert f"exit_status={exit_status}" in error
 
 
 _OOM_STATES = {

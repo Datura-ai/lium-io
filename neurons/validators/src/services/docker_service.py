@@ -1508,6 +1508,10 @@ class AuthorizedKeysWriteFailed(RuntimeError):
     """The volume setup exec mounted the encrypted volume but could not write the renter's keys."""
 
 
+class VolumeSetupExecFailed(RuntimeError):
+    """`docker exec` itself failed for the volume setup (no status of the script's own): the image may have exited."""
+
+
 # DAH-5037: a default job's own last output rides as `container_logs_tail` in the failure detail, so a
 # provider whose image exits at start sees why; the backend's GPU-fault check skips that field. Filler
 # (default-job) containers only: a renter's container output is never read.
@@ -6203,7 +6207,7 @@ class DockerService:
         while wrapped_var == pad_var:
             wrapped_var = _opaque_shell_name()
 
-        async def fail_step(step: str, message: str, result: Any | None = None) -> None:
+        async def fail_step(step: str, message: str, result: Any | None = None, exec_failed: bool = False) -> None:
             exit_status = getattr(result, "exit_status", None)
             stdout = (getattr(result, "stdout", "") or "")[-2000:] if result else ""
             stderr = (getattr(result, "stderr", "") or "")[-2000:] if result else ""
@@ -6229,7 +6233,13 @@ class DockerService:
                     }),
                 )
             )
-            error_class = AuthorizedKeysWriteFailed if step == "add_public_keys" else RuntimeError
+            error_class = (
+                AuthorizedKeysWriteFailed
+                if step == "add_public_keys"
+                else VolumeSetupExecFailed
+                if exec_failed
+                else RuntimeError
+            )
             raise error_class(
                 f"{message} (step={step}, exit_status={exit_status}, stderr={stderr or '<empty>'})"
             )
@@ -6310,10 +6320,9 @@ class DockerService:
             if isinstance(outcome, BaseException):
                 raise outcome
         if setup_result.exit_status != 0:
-            step, message = _VOLUME_SETUP_EXEC_FAILURES.get(
-                setup_result.exit_status, _VOLUME_SETUP_UPLOAD_FAILURE
-            )
-            await fail_step(step, message, setup_result)
+            own_failure = _VOLUME_SETUP_EXEC_FAILURES.get(setup_result.exit_status)
+            step, message = own_failure or _VOLUME_SETUP_UPLOAD_FAILURE
+            await fail_step(step, message, setup_result, exec_failed=own_failure is None)
 
         # The mount is created by root, so on an image whose USER is not root the
         # renter's own workload would own nothing inside its workspace and could
@@ -10537,6 +10546,30 @@ class DockerService:
                         except AuthorizedKeysWriteFailed as exc:
                             # the mount is up: fail at add_public_keys below, as a separate keys exec did
                             keys_write_failure = exc
+                        except VolumeSetupExecFailed as setup_exc:
+                            # An image whose command exits at start breaks the setup exec itself ("OCI runtime
+                            # exec failed", prod 3 Nov): name the exiting image as the keys step does. The keys
+                            # ride in this exec, and the backend tells the renter only at add_public_keys.
+                            explained = await _explain_add_public_keys_failure(
+                                docker_client,
+                                container_name=container_name,
+                                image=payload.docker_image,
+                                cause=setup_exc,
+                                log_extra=default_extra,
+                            )
+                            if explained is setup_exc:
+                                raise
+                            if isinstance(explained, ImageExitedDuringKeyInjection):
+                                current_step = "add_public_keys"
+                            await _attach_filler_log_tail(
+                                explained,
+                                docker_client,
+                                container_name=container_name,
+                                workload_kind=payload.workload_kind,
+                                environment=custom_options.environment,
+                                log_extra=default_extra,
+                            )
+                            raise explained from setup_exc
                         volume_encryption_status = VolumeEncryptionStatus.ENABLED
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
