@@ -627,6 +627,31 @@ class PostRentalGpuRecheckMessages:
     )
 
 
+class GpuClockLockMessages:
+    OK = MessageTemplate(
+        event="No stuck GPU clock lock",
+        reason="GPU_CLOCK_LOCK_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    RESET = MessageTemplate(
+        event="A GPU clock lock left by an ended rental was reset",
+        reason="GPU_CLOCK_LOCK_RESET",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    STUCK = MessageTemplate(
+        event="GPU clocks an ended rental locked could not be reset",
+        reason="GPU_CLOCK_LOCK_STUCK",
+        severity="warning",
+        category="env",
+        impact="Job skipped; score set to 0 until the clock reset succeeds",
+        remediation="Make sure nvidia-smi -i <uuid> -rgc succeeds on every GPU of the host.",
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",
@@ -2380,6 +2405,17 @@ class GpuKernelCountMessages:
         severity="warning",
         category="env",
         impact="Shadow observation only: the validation result was NOT changed",
+    )
+    UNATTACHABLE = MessageTemplate(
+        event="A reported GPU cannot be attached to a container",
+        reason="GPU_KERNEL_UNATTACHABLE",
+        severity="error",
+        category="env",
+        impact="Validation failed; score set to 0",
+        remediation=(
+            "Every rent on the listed GPU fails. Restart the executor container, or reboot the host "
+            "if the GPU is still missing."
+        ),
     )
     NOT_EVALUATED = MessageTemplate(
         event="Kernel GPU list not available; reported GPU count not evaluated",
