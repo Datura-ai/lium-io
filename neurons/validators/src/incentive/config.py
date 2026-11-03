@@ -63,7 +63,7 @@ RENTAL_PRICES_PER_HOUR.update({
     "NVIDIA GeForce RTX 3080": 0.09,
     "NVIDIA GeForce RTX 3060": 0.06,
     "NVIDIA GeForce RTX 2080 Ti": 0.08,
-    "NVIDIA Tesla V100 Tensor Core GPU": 0.17,
+    "NVIDIA Tesla V100 Tensor Core GPU": 0.017,  # DAH-5611: 0.17 / 10; ~60 idle GPUs took ~$250/day, none rented
     "NVIDIA RTX PRO 5000 Blackwell": 0.67,
     "NVIDIA RTX PRO 4500 Blackwell": 0.40,
     "NVIDIA RTX PRO 4500 Blackwell Server Edition": 0.40,
@@ -139,8 +139,7 @@ RENTAL_PRICES_PER_HOUR.update({
 # `gpu_count`. Cap dilution is computed independently per `(base_model, bucket)`.
 #
 # An empty dict `{}` means the base model is known but not eligible for rental
-# subsidy (no buckets → no subsidy path). Since DAH-5070 every base model has buckets,
-# except V100 (DAH-5611).
+# subsidy (no buckets → no subsidy path). Since DAH-5070 every base model has buckets.
 #
 # The cap is expressed in GPUs (the per-bucket sum of executor `gpu_count`), so a
 # bucket cap equals `machines × gpus_per_machine`. Eligible families default to
@@ -209,7 +208,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "A10": {1: 10, 8: 64},
     "RTX A2000": {1: 10, 8: 64},
     "T4": {1: 10, 8: 64},
-    "V100": {},  # DAH-5611: no idle pay; ~60 idle GPUs took ~$250/day, renters rented none
+    "V100": {1: 10, 8: 64},
     "TITAN V": {1: 10, 8: 64},
     "RTX 3090 Ti": {1: 10, 8: 64},
     "RTX 3080 Ti": {1: 10, 8: 64},

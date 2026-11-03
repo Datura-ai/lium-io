@@ -18,7 +18,6 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job, _total_gpu_cou
 A100 = "NVIDIA A100-SXM4-80GB"
 L40S = "NVIDIA L40S"
 V100 = "NVIDIA Tesla V100 Tensor Core GPU"
-NO_IDLE_PAY_BASE_MODELS = {"V100"}  # DAH-5611
 
 
 async def _run_with_production_config(
@@ -88,22 +87,19 @@ async def test_one_idle_node_per_family_is_paid_in_full():
 def test_every_gpu_model_has_a_positive_idle_cap_and_a_rate():
     """Regression: a model whose base model had an empty cap earned nothing while free (DAH-5070, Fish 23 Oct)."""
     for gpu_model, base_model in BASE_GPU_MAP.items():
-        if base_model in NO_IDLE_PAY_BASE_MODELS:
-            assert MAX_UNRENTED_GPUS_BY_TYPE[base_model] == {}, gpu_model
-            continue
         assert MAX_UNRENTED_GPUS_BY_TYPE.get(base_model), gpu_model
         assert all(cap > 0 for cap in MAX_UNRENTED_GPUS_BY_TYPE[base_model].values()), gpu_model
         assert RENTAL_PRICES_PER_HOUR.get(gpu_model, 0) > 0, gpu_model
 
 
 @pytest.mark.asyncio
-async def test_idle_v100_earns_no_idle_pay():
-    """V100 nodes sat idle with no renters, so they are out of the idle program (DAH-5611)."""
+async def test_idle_v100_is_paid_a_tenth_of_its_old_rate():
+    """V100 nodes sat idle with no renters, so their idle rate is 10x lower: $0.017, was $0.17 (DAH-5611)."""
     jobs = {"miner_v100": [_make_pcc_job("v100-8x", V100, 8)]}
 
-    incentive = await _run_with_production_config(jobs)
+    await _run_with_production_config(jobs)
 
     result = jobs["miner_v100"][0]
-    assert "V100" not in incentive.config.rental_incentive_gpu_types
-    assert result.eligible_for_rental_share is False
-    assert result.mining_score == 0
+    assert result.eligible_for_rental_share is True
+    assert result.hourly_rate == pytest.approx(0.017)
+    assert result.effective_rate == pytest.approx(0.017)
