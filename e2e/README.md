@@ -121,6 +121,13 @@ does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite e
 and the first pod keeps its container; a re-sent create that meets its own leftover `pod_<id>` replaces it and runs; a
 customer create on a node running a `filler_*` container removes the filler and starts the pod.
 
+Also, each in its own file beside the suite's main one: the executor's public `GET /miner-identity` names the
+configured miner hotkey and echoes a hex nonce (422 without one), and `GET /update-status` answers 200 without a
+signature (`tests/protocol/test_executor_public_routes.py`); with `UNREACHABLE_EXECUTOR_REPORT_ENABLED` on, the seeded
+offline executor gets its own `EXECUTOR_UNREACHABLE_BY_MINER` result at score 0 (`tests/cycle/test_cycle_unreachable_executor.py`);
+a pod whose image defaults to a bare shell (`CMD ["/bin/bash"]`) stays up and opens to the renter, and the cycle's rented
+pod SSH probe reads a banner from a live pod and none once its container is stopped (`tests/rental/test_rental_pod_runtime.py`).
+
 ## Known verdicts the suite pins
 
 - **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
