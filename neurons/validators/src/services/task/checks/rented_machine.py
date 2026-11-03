@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedPod
+from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import (
     ContainerState,
     PodContainerState,
@@ -24,10 +24,13 @@ from ...const import (
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
+from services.gpu_reset import renter_gpu_reset_in_progress
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
+from .rental_owner import rental_of_this_node
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)
@@ -97,33 +100,16 @@ def _gpu_usage_violation_details(
     }
 
 
-def _rental_of_validated_miner(
-    ctx: Context, rented_executor: RentedExecutor | None
-) -> RentedExecutor | None:
-    """The rental listed under this executor's UUID, or None when enforcement is on and it belongs
-    to another miner. The mismatch is logged either way."""
-    if not rented_executor or rented_executor.miner_hotkey == ctx.miner_hotkey:
-        return rented_executor
-    logger.warning(
-        _m(
-            "RENTED_OWNER_MISMATCH",
-            extra=get_extra_info(
-                {
-                    **ctx.default_extra,
-                    "executor_uuid": ctx.executor.uuid,
-                    "rental_miner_hotkey": rented_executor.miner_hotkey,
-                    "enforced": settings.RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED,
-                }
-            ),
-        )
-    )
-    return None if settings.RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED else rented_executor
+# The backend's create is still running for a pod in these statuses (a first rental or a reboot), and it
+# records the container name only when that create answers: a custom-Dockerfile build can take longer
+# than the grace below.
+_CREATE_IN_FLIGHT_POD_STATUSES = frozenset({"PENDING", "REBOOT_PENDING"})
 
 
 def _within_container_name_grace(pod: RentedPod) -> bool:
-    """An unnamed pod is waited for only this long after it was created; a pod with no
-    created_at (backend predates the field) is waited for as before."""
-    if pod.created_at is None:
+    """An unnamed pod is waited for while the backend's create is still running, else only this long
+    after it was created; a pod with no created_at (backend predates the field) is waited for as before."""
+    if pod.status in _CREATE_IN_FLIGHT_POD_STATUSES or pod.created_at is None:
         return True
     created_at = pod.created_at
     if created_at.tzinfo is None:
@@ -168,9 +154,7 @@ class TenantEnforcementCheck:
 
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
-        rented_executor = _rental_of_validated_miner(
-            ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        )
+        rented_executor = rental_of_this_node(ctx, log_mismatch=True)
         # EVERY filler on the node: a partially rented split node keeps one filler per free VRAM
         # bundle running beside the renter (DAH-2465/DAH-2467), and allowlisting only the first
         # makes its siblings' GPU processes read as usage outside the tenant.
@@ -221,6 +205,10 @@ class TenantEnforcementCheck:
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
+        # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
+        # is the provider's work, not POD_NOT_RUNNING, and is not recovered.
+        maintenance_window = maintenance_window_at_cycle_start(ctx)
+
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
@@ -246,9 +234,18 @@ class TenantEnforcementCheck:
                 extra.setdefault("pods_awaiting_container", []).append(pod_id)
                 ssh_pub_keys = []
                 continue
+            elif await renter_gpu_reset_in_progress(ctx.services.redis, ctx.miner_hotkey, ctx.executor.uuid, pod_id):
+                # DAH-4658: the renter's own GPU reset stops the pod for a moment. Judged next cycle, not penalised.
+                state_by_pod_id[pod_id] = ContainerState.UNKNOWN
+                extra.setdefault("pods_resetting_gpus", []).append(pod_id)
+                ssh_pub_keys = []
+                continue
             else:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
+                if maintenance_window is not None:
+                    ssh_pub_keys = []
+                    continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
                     stale_what = {
@@ -333,6 +330,19 @@ class TenantEnforcementCheck:
             if ssh_pub_keys is None:
                 # dockerd refused the keys read
                 ssh_pub_keys = []
+
+        if maintenance_window is not None:
+            return with_pod_states(
+                maintenance_failure(
+                    ctx,
+                    self.check_id,
+                    maintenance_window,
+                    extra,
+                    default_extra=extra,
+                    rented=True,
+                    ssh_pub_keys=ssh_pub_keys,
+                )
+            )
 
         container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)

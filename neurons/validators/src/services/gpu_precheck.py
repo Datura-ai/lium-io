@@ -14,6 +14,7 @@ from .gpu_spec_table import (
     KNOWN_UNRANGED,
     get_expected_vram_windows,
     normalize_gpu_model,
+    reference_gpu_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,11 @@ def precheck_gpu_spec(gpu_model: Optional[str], gpu_capacity_mb: int) -> None:
 
     windows = get_expected_vram_windows(normalized)
     if windows is None:
+        reference = reference_gpu_model(normalized, gpu_capacity_mb)
+        if reference:
+            # DAH-5088: an unknown name has no window; its reported VRAM is its size
+            logger.debug("precheck: %r unknown, scored as %r; passthrough", normalized, reference)
+            return
         raise UnsupportedGpuModelError(
             f"no VRAM windows for normalized model {normalized!r} (raw={raw!r})"
         )

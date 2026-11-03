@@ -331,9 +331,6 @@ async def measure_and_attach(
     `job_started_at` is `time.monotonic()` taken when this miner's job began, and it is what keeps
     the sweep inside the cycle that is already running.
     """
-    if not settings.ROCE_LINK_PROBE_ENABLED:
-        return
-
     budget_seconds: float = 0.0
     # Nothing in here may reach the caller: an exception in the probe would abort the miner's whole
     # job and score it zero for the cycle, which is a far worse outcome than an unmeasured pair.

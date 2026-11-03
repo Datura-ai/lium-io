@@ -13,9 +13,9 @@ log line. Nothing is returned to the caller, stored, or scored.
 
 It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (reserved, non-rentable
 dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default),
-never on an express-lane first pass. With `VERIFYX_COLD_SAMPLE_RETRY_ENABLED`, VerifyX is not
-compared on an executor with no stored download EMA: today's check may take a second sample there,
-the shadow takes one (`liumd_reason="cold_sample_retry"`).
+never on an express-lane first pass. VerifyX is not compared on an executor with no stored download
+EMA: today's check may take a second sample there, the shadow takes one
+(`liumd_reason="cold_sample_retry"`).
 
 Today's verdict per step comes from the pipeline's events: both checks are fatal, so a check that
 failed is the run's last event on a run that did not pass; one that reported a skip reason did not
@@ -51,9 +51,11 @@ from core.utils import _m, get_extra_info
 from .checks.capability import CapabilityCheck
 from .checks.local_verify import _step_reason
 from .checks.verifyx import (
+    MAX_KEPT_UPLOAD_PROBES,
     MAX_PACKAGE_FALLBACK_PROBES,
     VerifyXCheck,
     _first_pass_challenge_config,
+    _kept_upload_probes,
     _package_fallback_probes,
     verifyx_verdict,
 )
@@ -214,11 +216,19 @@ async def _compare(
         _package_fallback_probes.get((ctx.miner_hotkey, ctx.executor.uuid), 0)
         > MAX_PACKAGE_FALLBACK_PROBES
     )
+    # Past the upload keep cap today's check feeds the 429's 0; the shadow's verdict keeps the EMA.
+    upload_cap = (
+        _kept_upload_probes.get((ctx.miner_hotkey, ctx.executor.uuid), 0) > MAX_KEPT_UPLOAD_PROBES
+    )
     if cold_retry:
         steps["verifyx"]["liumd_reason"] = "cold_sample_retry"
     elif fallback_cap:
         steps["verifyx"]["liumd_reason"] = "package_fallback_cap"
-    ask_verifyx = today["verifyx"].verdict in RAN and not cold_retry and not fallback_cap
+    elif upload_cap:
+        steps["verifyx"]["liumd_reason"] = "upload_fallback_cap"
+    ask_verifyx = (
+        today["verifyx"].verdict in RAN and not cold_retry and not fallback_cap and not upload_cap
+    )
     if not (ask_matmul or ask_verifyx):
         return _skipped("no_gpu_step_ran", steps=steps)
     specs = ctx.state.specs
@@ -316,9 +326,9 @@ def _stored_ema(ctx: Context):
 
 
 def _cold_retry_possible(ctx: Context) -> bool:
-    """Whether today's VerifyX could have taken a cold-sample retry on this executor: retries on,
-    the backend's answer present, and no stored download EMA (`_is_cold_sample_below_gate`)."""
-    if not settings.VERIFYX_COLD_SAMPLE_RETRY_ENABLED or ctx.state.rented_data is None:
+    """Whether today's VerifyX could have taken a cold-sample retry on this executor: the
+    backend's answer present and no stored download EMA (`_is_cold_sample_below_gate`)."""
+    if ctx.state.rented_data is None:
         return False
     prev_ema = _stored_ema(ctx)
     return prev_ema is None or prev_ema.ema_verifyx_download_speed is None

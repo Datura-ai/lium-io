@@ -6,7 +6,6 @@ from typing import Any
 import asyncssh
 from asyncssh import SSHClientConnection, SSHKey
 
-from core.config import settings
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import (
@@ -31,6 +30,12 @@ logger = logging.getLogger(__name__)
 # connect, key exchange AND authentication against it, none of which carry over to the next
 # attempt, so a host slow enough to need 6s would fail every single try. An attempt is shortened
 # only when less than 12s of the deadline is left, which is time it could not have used anyway.
+# DAH-5419: `docker run` over SSH has no timeout of its own; a stuck daemon held it until the task was dropped.
+# Long enough for a first pull of the DinD image. It is enforced on the node (`timeout -s KILL`): cancelling only
+# our SSH wait leaves the remote CLI running, and it could create the container after the removal in `finally`.
+DIND_RUN_TIMEOUT_SECONDS = 180
+# our own wait on top of it, for an SSH channel that hangs after the remote command is gone
+DIND_RUN_SSH_GRACE_SECONDS = 30
 DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
@@ -172,6 +177,7 @@ class DindVerifier:
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
         created = False
         sshd_answered = False
+        sysbox_timed_out = False
 
         try:
             logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
@@ -180,7 +186,9 @@ class DindVerifier:
             cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
             logger.debug("run: %s...", cmd[:100])
 
-            result = await ssh_client.run(cmd)
+            cmd = f"timeout -s KILL {DIND_RUN_TIMEOUT_SECONDS} {cmd}"
+            async with asyncio.timeout(DIND_RUN_TIMEOUT_SECONDS + DIND_RUN_SSH_GRACE_SECONDS):
+                result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                 # carried whether or not the probe asked for sysbox-runc: the executor's own sysbox
@@ -212,7 +220,9 @@ class DindVerifier:
             ) as ssh:
                 sshd_answered = True
                 if sysbox:
-                    sysbox = await self._sysbox_works(ssh, log_ctx)
+                    measured = await self._sysbox_works(ssh, log_ctx)
+                    sysbox_timed_out = measured is None
+                    sysbox = measured is True
 
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
@@ -221,6 +231,7 @@ class DindVerifier:
                 log_text=f"dind: check ok port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
+                sysbox_timed_out=sysbox_timed_out,
             )
 
         except Exception as e:
@@ -267,8 +278,12 @@ class DindVerifier:
                 _m("DinD container removal failed", extra=get_extra_info({**log_ctx, "error": str(e)}))
             )
 
-    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
-        """Run hello-world inside the DinD container; True when it exits 0 within 30s.
+    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool | None:
+        """Run hello-world inside the DinD container; True when it exits 0 within 30s, None when it timed out.
+
+        A timeout measured nothing: on a busy rented host (30 Oct, pod c0877f60) it is load, not a missing
+        Sysbox, and reading it as False forgot the node's verified Sysbox, so the renter's next launches ran
+        their Docker-in-Docker image without Sysbox and Docker could not start inside.
 
         daturaai/dind loads hello-world into the inner dockerd at start (DAH-1959), so no registry
         pull is needed; when that load failed, docker falls back to a Docker Hub pull.
@@ -276,7 +291,9 @@ class DindVerifier:
         try:
             result = await asyncio.wait_for(ssh.run("docker run --rm hello-world"), timeout=30)
         except asyncio.TimeoutError:
-            error_msg = "sysbox check timed out after 30s"
+            timed_out = {**log_ctx, "error": "sysbox check timed out after 30s"}
+            logger.warning(_m("Sysbox check failed", extra=get_extra_info(timed_out)))
+            return None
         else:
             if result.exit_status == 0:
                 uid_map = await self._read_uid_map(ssh)
@@ -307,20 +324,16 @@ class DindVerifier:
 
     @staticmethod
     def _user_namespace_allows_sysbox(uid_map: str, log_ctx: dict[str, Any]) -> bool:
-        """False only for the identity map under SYSBOX_USERNS_ENFORCEMENT_ENABLED. True for a user namespace,
-        for an unreadable map (logged as SYSBOX_UID_MAP_UNREADABLE: no answer decides nothing) and for the
-        identity map while the flag is off (logged as SYSBOX_IDENTITY_UID_MAP).
+        """False only for the identity map (logged as SYSBOX_IDENTITY_UID_MAP). True for a user namespace
+        and for an unreadable map (logged as SYSBOX_UID_MAP_UNREADABLE: no answer decides nothing).
         """
         if uid_map == UID_MAP_USER_NAMESPACE:
             return True
-        enforced = settings.SYSBOX_USERNS_ENFORCEMENT_ENABLED
         if uid_map == UID_MAP_UNREADABLE:
-            logger.warning(
-                _m("SYSBOX_UID_MAP_UNREADABLE", extra=get_extra_info({**log_ctx, "enforced": enforced}))
-            )
+            logger.warning(_m("SYSBOX_UID_MAP_UNREADABLE", extra=get_extra_info(log_ctx)))
             return True
-        logger.warning(_m("SYSBOX_IDENTITY_UID_MAP", extra=get_extra_info({**log_ctx, "enforced": enforced})))
-        return not enforced
+        logger.warning(_m("SYSBOX_IDENTITY_UID_MAP", extra=get_extra_info(log_ctx)))
+        return False
 
     async def _diagnose_unanswered_container(
         self,

@@ -10,7 +10,6 @@ not one validation row. With UNREACHABLE_EXECUTOR_REPORT_ENABLED the wave writes
 per such node (EXECUTOR_UNREACHABLE_BY_MINER). Flag off: nothing is added.
 """
 
-from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -27,7 +26,6 @@ from tests.test_rented_executor_not_listed import (
     request,
     rest_service,  # noqa: F401 - fixture
 )
-from tests.test_verification_started_report import _FakeMinerClient
 
 UNREACHABLE = "83963038-0a21-41ab-8d4a-b915cd40702c"
 
@@ -153,14 +151,15 @@ async def test_rest_zero_executors_writes_no_unreachable_row(rest_service, flag_
 
 
 @pytest.mark.asyncio
-async def test_websocket_cycle_carries_listed_verdict_and_unreachable_row(rest_service, flag_on, monkeypatch):  # noqa: F811
-    from core.config import settings
+async def test_cycle_carries_listed_verdict_and_unreachable_row(rest_service, flag_on):  # noqa: F811
+    async def _make_rest_request(method, url, json_data, headers, timeout, log_extra, operation_name):
+        if url.endswith("ssh-pubkey-submit"):
+            return 200, accepted([LISTED], [LISTED, UNREACHABLE]).model_dump(mode="json")
+        return 200, {"message_type": "SSHKeyRemoved"}
 
-    monkeypatch.setattr(settings, "USE_REST_API", False)
-    msg = accepted([LISTED], [LISTED, UNREACHABLE])
+    rest_service._make_rest_request = _make_rest_request
 
-    with patch("services.miner_service.MinerClient", return_value=_FakeMinerClient(msg)):
-        out = await request(rest_service, RentedExecutorsResponse(executors={}))
+    out = await request(rest_service, RentedExecutorsResponse(executors={}))
 
     by_uuid = {r.executor_info.uuid: r for r in out["results"]}
     assert set(by_uuid) == {LISTED, UNREACHABLE}
