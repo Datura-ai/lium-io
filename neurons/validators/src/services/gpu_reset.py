@@ -402,6 +402,18 @@ async def _reset_unit_gone(runner: SSHCommandRunner) -> bool:
     return False
 
 
+async def _reset_unit_pending(runner: SSHCommandRunner) -> bool:
+    """True when the host unit of an earlier reset still has processes in its cgroup.
+
+    An unreadable count (no systemd, no nsenter) is not pending: such a host never ran the unit."""
+    try:
+        procs = await _run(runner, FABRIC_RESET_UNIT_PROCS)
+    except Exception as exc:
+        logger.error("could not read the GPU reset unit: %s", exc)
+        return False
+    return procs.exit_code == 0 and (procs.stdout or "").strip() not in ("", "0")
+
+
 async def _restore_fabric_services(runner: SSHCommandRunner, units: list[str]) -> str | None:
     """Starts every fabric service that is not active after the reset; the problem left, else None."""
     problems: list[str] = []
@@ -476,6 +488,14 @@ async def reset_pod_gpus(
     notes: list[str] = []
     fabric_manager_problem: str | None = None
     reset_still_running = False
+    if await _reset_unit_pending(runner):
+        # an earlier reset that outlived its SSH timeout still holds the GPUs and the fabric: before the stopped
+        # container is started and before the fabric check (Fabric Manager is down until that unit ends)
+        return GpuResetReport(
+            ok=False,
+            error_code=GpuResetErrorCode.OperationInProgress,
+            detail="the GPU reset is still running on the host",
+        )
     try:
         plan = await precheck()
     except ContainerNotRunning as refused:

@@ -84,6 +84,8 @@ class FakeHost:
         self.reset_hangs = False
         self.reset_unit_stuck = False
         self.reset_unit_state, self.reset_unit_procs = "inactive", 0
+        # processes of an earlier reset's unit, still there when this reset begins
+        self.prior_unit_procs = 0
         self.hung_units: list[str] = []
         self.active_during_cure: dict[str, bool] | None = None
         self.fm_log: list[tuple[str, str]] = []
@@ -132,6 +134,8 @@ class FakeHost:
                 raise RuntimeError("ssh dropped")
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
         if cmd == gpu_reset.FABRIC_RESET_UNIT_PROCS:
+            if not self.hung_units and not self.reset_unit_stuck:
+                return make_command_result(True, f"{self.prior_unit_procs}\n")
             if self.reset_unit_procs is None:
                 return make_command_result(False, exit_code=1)
             return make_command_result(True, f"{self.reset_unit_procs}\n")
@@ -384,6 +388,18 @@ async def test_a_hung_reset_whose_unit_will_not_stop_skips_the_fallback_and_the_
     assert ("stop", gpu_reset.FABRIC_RESET_UNIT) not in host.fm_log and ("start", FM) not in host.fm_log
     assert host.active[FM] is False and host.active_during_cure is None
     start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_retry_while_an_earlier_reset_unit_still_runs_changes_nothing():
+    # the earlier reset outlived its SSH timeout: its container is stopped and Fabric Manager is down
+    host = FakeHost(main_pid=0, device_ids=(), count=-1)
+    host.prior_unit_procs = 2
+    report, start = await _reset(host, backend=U)
+    assert not report.ok and report.error_code == GpuResetErrorCode.OperationInProgress
+    assert "still running on the host" in report.detail and not report.container_restarted
+    assert host.commands == [gpu_reset.FABRIC_RESET_UNIT_PROCS]
+    _no_change(host, start)
 
 
 @pytest.mark.asyncio
