@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 from neurons.validators.src.services.task.checks.custom_build_orphan_sweep import (
     CustomBuildOrphanSweepCheck,
 )
@@ -81,16 +83,15 @@ async def test_a_build_pending_past_30_minutes_is_still_listed_for_the_sweep():
 async def test_a_later_pending_pod_write_keeps_a_build_past_30_minutes():
     entry = {"time": int(time.time()) - 40 * 60, "pod_id": "pod-long-build"}
     service = RedisService.__new__(RedisService)
-    service.hget = AsyncMock(return_value=json.dumps([entry, {"time": 0, "pod_id": "pod-other"}]))
-    service.hset = AsyncMock()
-    service.hdel = AsyncMock()
+    service.redis = FakeRedis(server=FakeServer())
+    await service.redis.hset(PENDING_PODS_PREFIX, "miner:exec", json.dumps([entry, {"time": 0, "pod_id": "pod-other"}]))
     service._remove_unacked_container_created_unless = AsyncMock()  # the saved-report hash, not this one
 
+    async def stored() -> list[dict]:
+        return json.loads(await service.redis.hget(PENDING_PODS_PREFIX, "miner:exec"))
+
     await service.add_pending_pod("miner", "exec", "pod-new")
-    assert [i["pod_id"] for i in json.loads(service.hset.await_args.args[2])][:2] == [
-        "pod-long-build",
-        "pod-other",
-    ]
+    assert [i["pod_id"] for i in await stored()][:2] == ["pod-long-build", "pod-other"]
 
     await service.remove_pending_pod("miner", "exec", "pod-other")
-    assert json.loads(service.hset.await_args.args[2]) == [entry]
+    assert [i["pod_id"] for i in await stored()] == ["pod-long-build", "pod-new"]

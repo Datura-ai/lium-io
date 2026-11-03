@@ -228,6 +228,20 @@ class FakeRedis:
         for field in fields:
             self.hashes.get(key, {}).pop(field, None)
 
+    async def _update_pending_pods(self, miner_hotkey: str, executor_id: str, change):
+        """`RedisService._update_pending_pods`: read, change and write with no await between, so atomic here"""
+        import json
+
+        from neurons.validators.src.services.redis_service import PENDING_PODS_PREFIX, _parse_pending_pods
+
+        self._touch()
+        field = f"{miner_hotkey}:{executor_id}"
+        pending_pods = change(_parse_pending_pods(self.hashes.get(PENDING_PODS_PREFIX, {}).get(field)))
+        if pending_pods:
+            self.hashes.setdefault(PENDING_PODS_PREFIX, {})[field] = json.dumps(pending_pods)
+        else:
+            self.hashes.get(PENDING_PODS_PREFIX, {}).pop(field, None)
+
     async def expire(self, key: str, seconds: int):
         self._touch()
         if key in self.store or key in self.hashes:

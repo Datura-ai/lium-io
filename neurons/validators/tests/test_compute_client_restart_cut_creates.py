@@ -4,6 +4,8 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 
 from clients.compute_client import (
     CREATE_CUT_OFF_BY_RESTART_STEP,
@@ -20,40 +22,32 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import Response
-from services.redis_service import InflightBackendCreate, RedisService
+from services.redis_service import (
+    GPU_CLOCKS_PENDING_KIND,
+    GPU_RESET_PENDING_KIND,
+    InflightBackendCreate,
+    RedisService,
+)
 
 
-class _FakeRedis:
-    """the hash commands RedisService uses, in memory"""
+class _FakeRedis(FakeRedis):
+    """fakeredis (WATCH/MULTI included), plus the one Lua script RedisService runs on a hash: fakeredis has no Lua
+    without lupa"""
 
-    def __init__(self) -> None:
-        self.hashes: dict[str, dict[str, str]] = {}
-
-    async def hset(self, key: str, field: str, value: str) -> None:
-        self.hashes.setdefault(key, {})[field] = value
-
-    async def hget(self, key: str, field: str) -> str | None:
-        return self.hashes.get(key, {}).get(field)
-
-    async def hgetall(self, key: str) -> dict[bytes, bytes]:
-        return {k.encode(): v.encode() for k, v in self.hashes.get(key, {}).items()}
-
-    async def hdel(self, key: str, *fields: str) -> None:
-        for field in fields:
-            self.hashes.get(key, {}).pop(field, None)
+    def __init__(self, server: FakeServer | None = None) -> None:
+        super().__init__(server=server or FakeServer(), decode_responses=True)
 
     async def eval(self, script: str, numkeys: int, key: str, field: str, expected: str) -> int:
-        # the one script RedisService runs on a hash: HDEL the field only while it still holds `expected`
+        # HDEL the field only while it still holds `expected`
         assert "HDEL" in script and numkeys == 1
-        if self.hashes.get(key, {}).get(field) != expected:
+        if await self.hget(key, field) != expected:
             return 0
-        del self.hashes[key][field]
-        return 1
+        return await self.hdel(key, field)
 
 
-def _redis_service() -> RedisService:
+def _redis_service(server: FakeServer | None = None) -> RedisService:
     service = RedisService.__new__(RedisService)
-    service.redis = _FakeRedis()
+    service.redis = _FakeRedis(server)
     service.lock = asyncio.Lock()
     return service
 
@@ -256,7 +250,7 @@ async def test_the_redis_record_of_a_create_holds_ids_and_counters_only() -> Non
     stored_raw: list[str] = []
 
     async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
-        stored_raw.append(redis_service.redis.hashes["inflight_backend_creates"]["pod-1"])
+        stored_raw.append(await redis_service.redis.hget("inflight_backend_creates", "pod-1"))
 
     client._drive_miner_job = fake_drive_miner_job
     await client._run_miner_job(request)
@@ -283,7 +277,7 @@ async def test_an_old_record_with_the_whole_request_is_rewritten_without_it_on_s
 
     await client.fail_creates_cut_off_by_restart()
 
-    raw = redis_service.redis.hashes["inflight_backend_creates"]["pod-1"]
+    raw = await redis_service.redis.hget("inflight_backend_creates", "pod-1")
     assert "request" not in json.loads(raw) and "registry-pw" not in raw and "env-secret" not in raw
     assert client.resumed_creates_report.pod_ids == ["pod-1"]
 
@@ -669,6 +663,62 @@ async def test_a_receipt_clears_only_the_pending_state_of_the_dispatch_it_names(
     assert [item.get("command_id", "") for item in left] == pending_left
     unacked = await redis_service.unacked_container_created()
     assert (json.loads(unacked["pod-1"])["command_id"] if unacked else None) == saved_left
+
+
+@pytest.mark.parametrize(
+    ("receipt", "pods_left"),
+    [
+        # bound: the create it names and a legacy kindless create go; a GPU op's mark (no command_id) stays
+        ("cmd-a", ["pod-1:" + GPU_RESET_PENDING_KIND, "pod-1:" + GPU_CLOCKS_PENDING_KIND]),
+        # a backend that sends no id: as before, everything for the pod goes
+        ("", []),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_bound_receipt_keeps_the_gpu_op_marks_of_the_pod(receipt, pods_left) -> None:
+    redis_service = _redis_service()
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")  # create
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1")  # legacy create
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", kind=GPU_RESET_PENDING_KIND)
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", kind=GPU_CLOCKS_PENDING_KIND)
+
+    await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1", command_id=receipt)
+
+    left = await redis_service.get_pending_pods("miner-hk", "exec-1", max_age_seconds=None)
+    assert [f"{item['pod_id']}:{item.get('kind', '')}" for item in left] == pods_left
+
+
+@pytest.mark.parametrize("write", ["add", "remove"])
+@pytest.mark.asyncio
+async def test_a_pending_write_never_loses_one_another_validator_made_after_its_read(write) -> None:
+    server = FakeServer()
+    redis_service, other = _redis_service(server), _redis_service(server)
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-a", command_id="cmd-a")
+    pipeline = redis_service.redis.pipeline
+    landed: list[bool] = []
+
+    def pipeline_where_b_lands_after_the_read(*args, **kwargs):
+        pipe = pipeline(*args, **kwargs)
+        hget = pipe.hget
+
+        async def read_then_b_adds(*hget_args):
+            raw = await hget(*hget_args)
+            if not landed:
+                landed.append(True)
+                await other.add_pending_pod("miner-hk", "exec-1", "pod-b", command_id="cmd-b")
+            return raw
+
+        pipe.hget = read_then_b_adds
+        return pipe
+
+    redis_service.redis.pipeline = pipeline_where_b_lands_after_the_read
+    if write == "add":
+        await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-c", command_id="cmd-c")
+    else:
+        await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-a", command_id="cmd-a")
+
+    left = await redis_service.get_pending_pods("miner-hk", "exec-1", max_age_seconds=None)
+    assert landed and [item["pod_id"] for item in left] == (["pod-a", "pod-b", "pod-c"] if write == "add" else ["pod-b"])
 
 
 @pytest.mark.parametrize("failing_read", ["unacked_container_created", "renting_in_progress"])
