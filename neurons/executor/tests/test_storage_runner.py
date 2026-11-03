@@ -2017,17 +2017,29 @@ def test_backup_reruns_once_after_an_s3_upload_timeout(
         assert first_runs[-1].split('"message":"')[1][:30] in runner._events._reporter._restic_failure_detail
 
 
+_ENOENT = "open : no such file or directory"
+_SUMMARY = {"message_type": "summary", "files_restored": 38373, "total_files": 38374}
+
+
 @pytest.mark.parametrize(
-    ("exit_code", "summary", "expected"),
+    ("exit_code", "summary", "errors", "expected"),
     [
-        (1, {"message_type": "summary", "files_restored": 38373}, "PARTIAL"),
-        (1, {"message_type": "summary", "files_restored": 0}, None),
-        (1, None, None),
-        (2, {"message_type": "summary", "files_restored": 5}, None),
+        (1, _SUMMARY, [_ENOENT, "Fatal: There were 1 errors"], "PARTIAL"),
+        (1, _SUMMARY, ["mkdir : no such file or directory", "lstat : no such file or directory"], "PARTIAL"),
+        (1, _SUMMARY, ["write : no space left on device", "Fatal: There were 1 errors"], None),
+        (1, _SUMMARY, [_ENOENT, "ciphertext verification failed"], None),
+        (1, _SUMMARY, ["Fatal: unable to load index: pack not found"], None),
+        (1, _SUMMARY, ["open : permission denied"], None),
+        (1, _SUMMARY, [_ENOENT] * 101, None),
+        (1, {"message_type": "summary", "files_restored": 50, "total_files": 52}, [_ENOENT] * 2, None),
+        (1, _SUMMARY, [], None),
+        (1, {"message_type": "summary", "files_restored": 0}, [_ENOENT], None),
+        (1, None, [_ENOENT], None),
+        (2, _SUMMARY, [_ENOENT], None),
     ],
 )
-def test_restore_with_file_errors_completes_partial_only_on_exit_1_with_files(
-    monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, expected: str | None
+def test_restore_completes_partial_only_for_vanished_files_within_the_loss_bound(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, errors: list[str], expected: str | None
 ) -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
     workspace = DockerVolumeWorkspace(
@@ -2037,7 +2049,12 @@ def test_restore_with_file_errors_completes_partial_only_on_exit_1_with_files(
         read_only=False,
     )
     runner = ResticStorageRunner(operation, workspace)
-    monkeypatch.setattr(runner, "_stream_command", lambda *_a, **_k: (exit_code, summary))
+
+    def stream(*_a, **_k):
+        runner._restore_errors.extend(errors)
+        return exit_code, summary
+
+    monkeypatch.setattr(runner, "_stream_command", stream)
 
     if expected is None:
         with pytest.raises(ResticOperationError):
@@ -2046,6 +2063,23 @@ def test_restore_with_file_errors_completes_partial_only_on_exit_1_with_files(
     result = runner._restore()
     assert result.status == "COMPLETED"
     assert result.result_quality is OperationResultQuality.PARTIAL
+
+
+def test_failed_restore_reports_the_renter_path_not_proc_root() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    first = "write /proc/88100/root/root/restored/model.safetensors: no space left on device"
+    reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": first}}})
+    reporter.send({"event": "result", "status": "FAILED", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["status"] == "FAILED"
+    assert final["error_message"] == "write /root/restored/model.safetensors: no space left on device"
 
 
 def test_partial_restore_result_keeps_first_restic_error_as_warning() -> None:

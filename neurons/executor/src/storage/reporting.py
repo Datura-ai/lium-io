@@ -122,7 +122,7 @@ class StorageEventReporter:
                 snapshot_id=_optional_string(event.get("snapshot_id")),
                 exit_code=_optional_integer(event.get("exit_code")),
                 error_code=_optional_string(event.get("error_code")),
-                error_message=(self._restic_failure_detail or self._diagnostic_detail)
+                error_message=_renter_paths(self._restic_failure_detail or self._diagnostic_detail)
                 if status != "COMPLETED"
                 else self._partial_restore_warning(result_quality),
             )
@@ -182,8 +182,7 @@ class StorageEventReporter:
     def _partial_restore_warning(self, result_quality: str | None) -> str | None:
         if result_quality != "PARTIAL" or self._spec.resource is ReporterResource.BACKUP:
             return None
-        # The restore writes through /proc/<pid>/root of the live container; the renter knows only the path inside it.
-        detail = re.sub(r"/proc/\d+/root(?=/)", "", self._restic_failure_detail or "")
+        detail = _renter_paths(self._restic_failure_detail) or ""
         return f"Restored with errors; some files were not restored: {detail}"[:2000] if detail else (
             "Restored with errors; some files were not restored"
         )
@@ -327,6 +326,11 @@ def _summary_counts(summary: Mapping[str, object]) -> dict[str, int]:
 def _updated_integer(value: Mapping[str, object], current: int | None, *keys: str) -> int | None:
     updated = _first_integer(value, *keys)
     return current if updated is None else updated
+
+
+def _renter_paths(message: str | None) -> str | None:
+    # The restore writes through /proc/<pid>/root of the live container; the renter knows only the path inside it.
+    return re.sub(r"/proc/\d+/root(?=/)", "", message) if message else message
 
 
 def _optional_string(value: object) -> str | None:
