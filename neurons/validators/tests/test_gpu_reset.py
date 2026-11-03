@@ -81,6 +81,8 @@ class FakeHost:
         self.fm_start_ok = fm_start_ok
         self.active_during_reset: dict[str, bool] | None = None
         self.reset_raises = False
+        self.reset_hangs = False
+        self.active_during_cure: dict[str, bool] | None = None
         self.fm_log: list[tuple[str, str]] = []
 
     async def run(self, cmd: str, *, timeout: int = 60, retryable: bool = True, **_):
@@ -114,6 +116,9 @@ class FakeHost:
                 self.fm_log.append(("stop", unit))
             self.commands.append(re.search(r"\{ (nvidia-smi -r [^;]*);", script).group(1))
             self.active_during_reset = dict(self.active)
+            if self.reset_hangs:
+                # the SSH timeout fires while the host unit still holds the fabric down
+                return make_command_result(False, stderr="timed out", exit_code=-1)
             for unit in reversed(units):
                 self.active[unit] = unit != "nvidia-fabricmanager" or self.fm_start_ok
                 self.fm_log.append(("start", unit))
@@ -123,6 +128,8 @@ class FakeHost:
         if cmd.startswith("nsenter -t 1 -m -- systemctl "):
             verb, unit = cmd.split()[-2:]
             self.fm_log.append((verb, unit))
+            if unit == gpu_reset.FABRIC_RESET_UNIT:
+                return make_command_result(True)
             if verb == "is-active":
                 up = self.active[unit]
                 return make_command_result(up, "active" if up else "inactive", exit_code=0 if up else 3)
@@ -135,6 +142,7 @@ class FakeHost:
                 raise RuntimeError("ssh dropped")
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
         if cmd.startswith("CUDA_VISIBLE_DEVICES="):
+            self.active_during_cure = self.active_during_cure or dict(self.active)
             return make_command_result(True, "ctx open/close OK")
         raise AssertionError(f"unexpected command {cmd}")
 
@@ -311,6 +319,39 @@ async def test_fabric_manager_is_started_again_when_the_reset_fails():
     host.reset_raises = True
     report, start = await _reset(host, backend=U)
     assert not report.ok and host.active == {FM: True, NVLSM: True}
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_hung_reset_starts_the_fabric_again_before_the_fallback_and_the_container():
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True, nvlsm=True)
+    host.reset_hangs = True
+    active_at_start = {}
+    start = AsyncMock(side_effect=lambda: active_at_start.update(host.active))
+    report, _ = await _reset(host, backend=U, start=start)
+    up = {FM: True, NVLSM: True}
+    assert host.active_during_cure == up and active_at_start == up
+    i = host.fm_log.index(("stop", gpu_reset.FABRIC_RESET_UNIT))
+    assert host.fm_log[i:] == [
+        ("stop", gpu_reset.FABRIC_RESET_UNIT),
+        ("is-active", NVLSM),
+        ("start", NVLSM),
+        ("is-active", NVLSM),
+        ("is-active", FM),
+        ("start", FM),
+        ("is-active", FM),
+    ]
+    assert report.container_restarted
+
+
+@pytest.mark.asyncio
+async def test_a_hung_reset_whose_fabric_stays_down_skips_the_fallback():
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True, fm_start_ok=False)
+    host.reset_hangs = True
+    report, start = await _reset(host, backend=U)
+    assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert "nvidia-fabricmanager is not active" in report.detail
+    assert host.active_during_cure is None
     start.assert_awaited_once()
 
 
