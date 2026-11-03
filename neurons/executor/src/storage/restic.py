@@ -746,8 +746,10 @@ class ResticStorageRunner:
         # Docker's OOMKilled can miss a kill; the kernel log settles OOM against an outside SIGKILL
         note = kernel_kill_note(self._helper_id)
         self._events.log(note)
-        if "oom-kill:" in note:  # the kernel's OOM kill that Docker's flag missed
+        if "oom-kill:" in note and self._helper_id:  # the kernel's OOM kill that Docker's flag missed
             return f"{action} ran out of memory"
+        if not state:  # inspect found no container: something removed it mid-run, not an OOM
+            return f"{action} helper container was removed while running"
         if state.get("OOMKilled") is False:
             return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
         return f"{action} helper was killed (often out of memory)"
@@ -1029,8 +1031,6 @@ def kernel_kill_lines(dmesg: str, container_id: str) -> list[str]:
 
 def kernel_kill_note(container_id: str) -> str:
     """One log line naming the kernel's kill of the helper, or saying there was none; never raises."""
-    if not container_id:
-        return "kernel: no helper container ID to match"
     try:
         dmesg = subprocess.run(["dmesg", "--kernel", "--nopager"], capture_output=True, text=True, timeout=5)
     except Exception as error:  # noqa: BLE001 - diagnostics only
@@ -1038,10 +1038,12 @@ def kernel_kill_note(container_id: str) -> str:
     if dmesg.returncode != 0:
         return f"kernel: dmesg unreadable (exit {dmesg.returncode})"
     # the kill happened seconds ago; a bounded tail keeps a long-running host's ring buffer cheap
+    # no ID ("" matches every line): list any recent OOM kill as a diagnostic, not as the helper's
     found = kernel_kill_lines("\n".join(dmesg.stdout.splitlines()[-2000:]), container_id)
+    prefix = "kernel: " if container_id else "kernel (no helper ID, any container): "
     if not found:
-        return "kernel: no kernel kill line for the helper"
-    return "kernel: " + " | ".join(found)
+        return prefix + "no kernel kill line for the helper"
+    return prefix + " | ".join(found)
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:

@@ -59,3 +59,39 @@ def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(fi
 
     assert subprocess.run([sys.executable, "-c", probe, field], check=False).returncode == 0
     assert subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper_running", [True, False])
+async def test_start_never_removes_a_running_helper(
+    monkeypatch: pytest.MonkeyPatch, helper_running: bool
+) -> None:
+    # A repeated dispatch sees no runner PID yet (STARTING) while the first run's helper works.
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
+    commands: list[str] = []
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        commands.append(command)
+        stdout = ""
+        if "echo STARTING" in command:
+            stdout = "STARTING\n"
+        elif "docker ps -q" in command:
+            stdout = "abc123\n" if helper_running else ""
+        return SimpleNamespace(exit_status=0 if not command.startswith("test -e") else 1, stdout=stdout, stderr="")
+
+    ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
+    if helper_running:
+        files = await storage_operations.start_storage_operation(
+            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+        assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    else:
+        monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+        with pytest.raises(TypeError):  # stops at the sftp spec write, after the stale-helper removal
+            await storage_operations.start_storage_operation(
+                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            )
+    helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
+    assert f"name=^{helper}$" in next(c for c in commands if "docker ps -q" in c)
+    assert any("docker rm -f" in c for c in commands) is not helper_running

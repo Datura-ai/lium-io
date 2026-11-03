@@ -138,6 +138,9 @@ async def start_storage_operation(
                     break
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
             return files
+        if await _helper_container_running(ssh_client, operation_id):
+            # an earlier dispatch's helper is still working; removing it would kill that run
+            return files
         if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
             ssh_client, files.spec
         ):
@@ -320,6 +323,18 @@ async def _remote_file_exists(
 ) -> bool:
     result = await ssh_client.run(f"test -e {shlex.quote(str(path))}", check=False)
     return result.exit_status == 0
+
+
+async def _helper_container_running(
+    ssh_client: asyncssh.SSHClientConnection,
+    operation_id: UUID,
+) -> bool:
+    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    result = await ssh_client.run(
+        f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running",
+        check=False,
+    )
+    return bool((result.stdout or "").strip())
 
 
 async def _remove_stale_helper_container(

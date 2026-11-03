@@ -819,8 +819,8 @@ class _KilledPopen(_FakePopen):
         (True, "", " ran out of memory"),
         (False, "", " helper was killed (Docker recorded no out-of-memory kill)"),
         (False, OOM_KILL_DMESG, " ran out of memory"),  # the kernel's OOM kill that Docker's flag missed
-        (None, OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect failed
-        ("", OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect printed nothing
+        (None, OOM_KILL_DMESG, " helper container was removed while running"),  # container gone
+        ("", OOM_KILL_DMESG, " helper container was removed while running"),  # docker inspect printed nothing
     ],
 )
 def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
@@ -878,7 +878,8 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
     elif oom_killed is True:
         assert not any(c[0] == "dmesg" for c in calls)
     else:
-        assert "kernel: no helper container ID to match" in log
+        # no ID: recent OOM kills are still listed, but never claimed as the helper's
+        assert "kernel (no helper ID, any container): " + OOM_KILL_DMESG.splitlines()[1] in log
 
 
 
