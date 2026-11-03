@@ -445,6 +445,30 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
 
 
 @pytest.mark.asyncio
+async def test_create_container_mounts_a_new_volume_at_a_bare_template_path(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    # DAH-5426: a bare "/workspace" is the container side of the pod's own named volume, not a bind mount
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    payload = _base_create_payload(custom_options=CustomOptions(volumes=["/workspace"]))
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
+    assert [(v.source, v.target) for v in run_spec.volumes] == [(f"volume_{payload.pod_id}", "/workspace")]
+    assert result.local_volume_path == "/workspace"
+
+
+@pytest.mark.asyncio
 async def test_create_container_keeps_sysbox_runtime_for_s3fs_external_volume(
     docker_service,
     executor_info,
