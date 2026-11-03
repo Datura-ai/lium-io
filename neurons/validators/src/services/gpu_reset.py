@@ -64,8 +64,10 @@ FABRIC_SERVICES = ("nvidia-fabricmanager", "nvidia-nvlsm")
 FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
 # processes left in the reset unit's cgroup (v2, or v1's systemd hierarchy); 0 only for an unloaded unit or an
-# existing, readable, empty cgroup.procs. Neither file there, or a failed read, exits 1: unknown, never 0
+# existing, readable, empty cgroup.procs, or a host without systemctl (no unit can have run there). Neither file
+# there, or a failed read, exits 1: unknown, never 0
 FABRIC_RESET_UNIT_PROCS = "nsenter -t 1 -m -- sh -c " + shlex.quote(
+    "command -v systemctl >/dev/null 2>&1 || { echo 0; exit 0; }; "
     f"cg=$(systemctl show -p ControlGroup --value {FABRIC_RESET_UNIT}) || exit 1; "
     '[ -z "$cg" ] && { echo 0; exit 0; }; '
     'for f in /sys/fs/cgroup"$cg"/cgroup.procs /sys/fs/cgroup/systemd"$cg"/cgroup.procs; do '
@@ -403,15 +405,22 @@ async def _reset_unit_gone(runner: SSHCommandRunner) -> bool:
 
 
 async def _reset_unit_pending(runner: SSHCommandRunner) -> bool:
-    """True when the host unit of an earlier reset still has processes in its cgroup.
+    """False only once the earlier reset unit is proven gone (empty cgroup, or no unit can exist on the host).
 
-    An unreadable count (no systemd, no nsenter) is not pending: such a host never ran the unit."""
+    Fails closed: an unreadable count may hide a reset that still owns the GPUs. Only a missing nsenter (127) is
+    proof, since the unit is started through nsenter too."""
     try:
         procs = await _run(runner, FABRIC_RESET_UNIT_PROCS)
     except Exception as exc:
         logger.error("could not read the GPU reset unit: %s", exc)
+        return True
+    if procs.exit_code == 127:
         return False
-    return procs.exit_code == 0 and (procs.stdout or "").strip() not in ("", "0")
+    left = (procs.stdout or "").strip() if procs.exit_code == 0 else ""
+    if left == "0":
+        return False
+    logger.error("an earlier GPU reset unit may still run: exit %s, %r processes", procs.exit_code, left)
+    return True
 
 
 async def _restore_fabric_services(runner: SSHCommandRunner, units: list[str]) -> str | None:

@@ -135,7 +135,11 @@ class FakeHost:
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
         if cmd == gpu_reset.FABRIC_RESET_UNIT_PROCS:
             if not self.hung_units and not self.reset_unit_stuck:
-                return make_command_result(True, f"{self.prior_unit_procs}\n")
+                if isinstance(self.prior_unit_procs, int):
+                    return make_command_result(True, f"{self.prior_unit_procs}\n")
+                if self.prior_unit_procs == "raise":
+                    raise RuntimeError("ssh dropped")
+                return make_command_result(False, exit_code=int(self.prior_unit_procs))
             if self.reset_unit_procs is None:
                 return make_command_result(False, exit_code=1)
             return make_command_result(True, f"{self.reset_unit_procs}\n")
@@ -403,6 +407,25 @@ async def test_a_retry_while_an_earlier_reset_unit_still_runs_changes_nothing():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prior", ["1", "raise"])
+async def test_a_retry_whose_earlier_reset_unit_count_is_unreadable_changes_nothing(prior):
+    host = FakeHost(main_pid=0, device_ids=(), count=-1)
+    host.prior_unit_procs = prior
+    report, start = await _reset(host, backend=U)
+    assert not report.ok and report.error_code == GpuResetErrorCode.OperationInProgress
+    assert host.commands == [gpu_reset.FABRIC_RESET_UNIT_PROCS]
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_a_host_without_nsenter_never_ran_the_reset_unit():
+    host = FakeHost(device_ids=(), count=-1)
+    host.prior_unit_procs = "127"
+    report, start = await _reset(host, backend=U)
+    assert report.ok and report.container_restarted
+
+
+@pytest.mark.asyncio
 async def test_a_failed_reset_unit_with_surviving_processes_skips_the_fallback_and_the_container_start():
     # systemd marks the unit failed when the reset survives its final SIGKILL (D state on a wedged GPU)
     host = FakeHost(device_ids=(), count=-1, fabric_manager=True)
@@ -437,6 +460,10 @@ def test_unit_process_count_reads_the_cgroup(tmp_path):
         return out.returncode, out.stdout.strip()
 
     assert count("") == (0, "0")
+    no_systemctl = tmp_path / "empty"
+    no_systemctl.mkdir()
+    out = subprocess.run(["/bin/sh", "-c", script], env={"PATH": str(no_systemctl)}, capture_output=True, text=True)
+    assert (out.returncode, out.stdout.strip()) == (0, "0")
     assert count("/system.slice/x.service")[0] == 1
     (root / "systemd/system.slice/x.service").mkdir(parents=True)
     (root / "systemd/system.slice/x.service/cgroup.procs").write_text("")
