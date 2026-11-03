@@ -12,6 +12,14 @@ set -eu
 # running) has nothing to break and skips the probe.
 running_executor=$(docker compose ps --quiet executor 2>/dev/null || true)
 if [ -n "$running_executor" ]; then
+    # A backup or restore runs as storage_runner.py inside the executor; recreating the container kills it and
+    # the renter's backup fails as "stopped reporting progress" (26 backups at executor-v1.167, 2 Nov 21Z).
+    case "$(docker top "$running_executor" -o args 2>/dev/null || true)" in
+        *storage_runner.py*)
+            echo "Update held, running executor kept: a backup or restore is running in it. Retrying in ${RUNNER_STORAGE_RETRY_SECONDS:-120}s."
+            sleep "${RUNNER_STORAGE_RETRY_SECONDS:-120}"
+            exit 1 ;;
+    esac
     # `timeout` stops only the docker client: a hung probe container outlives it, and every retry would add one.
     leftovers=$(docker ps --all --quiet --filter label=io.lium.executor-runner.probe=nvidia-runtime 2>/dev/null || true)
     if [ -n "$leftovers" ] && ! docker rm --force $leftovers >/dev/null 2>&1; then
