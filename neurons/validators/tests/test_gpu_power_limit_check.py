@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from helpers import FakeRedis, build_services, build_state
@@ -167,58 +167,51 @@ async def test_a_passing_80_percent_tier_reading_is_kept_for_the_rental_start_an
 
 
 @pytest.mark.asyncio
-async def test_a_stock_reading_retries_a_lost_clear_of_the_tier_reading(context_factory, read_records_mock) -> None:
-    # F-37: a clear lost once must not leave the 80 % reading as a later stock rental's floor
+@pytest.mark.parametrize(
+    ("kept", "read_fails", "writes_lost", "outcome"),
+    [
+        # a clear lost once is tried again and lands
+        ("0.8", False, 1, "GPU_POWER_LIMIT_OK"),
+        # F-43: 0.8 kept and both clears lost, or the read lost too: no verdict, the previous result stands
+        ("0.8", False, 2, "GPU_POWER_TIER_STATE_UNKNOWN"),
+        ("0.8", True, 2, "GPU_POWER_TIER_STATE_UNKNOWN"),
+        # F-50: nothing kept, or the clear landed: our outage never fails a stock node
+        (None, False, 2, "GPU_POWER_LIMIT_OK"),
+        ("0.8", True, 0, "GPU_POWER_LIMIT_OK"),
+    ],
+)
+async def test_a_stock_reading_never_passes_while_a_tier_reading_may_still_be_kept(
+    context_factory, read_records_mock, kept, read_fails, writes_lost, outcome
+) -> None:
     redis = FakeRedis()
     key = scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")
-    redis.store[key] = "0.8"
+    if kept:
+        redis.store[key] = kept
     write, calls = redis.write_atomically, []
 
-    async def lost_once(writes):
+    async def lossy(writes):
         calls.append(writes)
-        if len(calls) == 1:
-            raise ConnectionError("blip")
+        if len(calls) <= writes_lost:
+            raise ConnectionError("down")
         return await write(writes)
 
-    redis.write_atomically = lost_once
-    ctx = context_factory(state=_state(current_limit=350, default_limit=350), services=build_services(redis=redis))
-    result = await GpuPowerLimitCheck().run(ctx)
-    assert result.passed is True
-    assert len(calls) == 2
-    assert key not in redis.store
-
-
-@pytest.mark.asyncio
-async def test_a_stock_cycle_whose_clear_is_lost_twice_fails_instead_of_passing(context_factory, read_records_mock) -> None:
-    # F-37: tier, then stock with both clears lost: the cycle must not pass while 0.8 is still kept for a rental start
-    redis = FakeRedis()
-    key = scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")
-
-    def ctx(watts: int):
-        return context_factory(state=_state(current_limit=watts, default_limit=350), services=build_services(redis=redis))
-
-    await GpuPowerLimitCheck().run(ctx(280))
-    assert redis.store[key] == "0.8"
-    redis.write_atomically = AsyncMock(side_effect=ConnectionError("down"))
-    with pytest.raises(ConnectionError):
-        await GpuPowerLimitCheck().run(ctx(350))
-    assert redis.write_atomically.await_count == 2
-    # a lost set only leaves a missed GPU at stock: that cycle still passes
-    assert (await GpuPowerLimitCheck().run(ctx(280))).passed is True
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("read_fails", [False, True])
-async def test_a_redis_outage_does_not_zero_a_stock_node_with_no_kept_tier_reading(
-    context_factory, read_records_mock, read_fails
-) -> None:
-    # nothing kept (or Redis down for the read too): our outage must not fail a healthy stock node
-    redis = FakeRedis()
-    redis.write_atomically = AsyncMock(side_effect=ConnectionError("down"))
+    redis.write_atomically = lossy
     if read_fails:
         redis.mget = AsyncMock(side_effect=ConnectionError("down"))
     ctx = context_factory(state=_state(current_limit=350, default_limit=350), services=build_services(redis=redis))
-    assert (await GpuPowerLimitCheck().run(ctx)).passed is True
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.event.reason_code == outcome
+    assert result.passed is (outcome == "GPU_POWER_LIMIT_OK")
+    assert "score" not in result.updates  # never a zero score from our Redis
+    assert (key in redis.store) is (outcome != "GPU_POWER_LIMIT_OK" or (kept is not None and writes_lost >= 2))
+
+
+def test_an_unknown_power_tier_state_is_held_like_a_gpu_reset() -> None:
+    from services.executor_rollout import withhold_renter_gpu_reset_verdicts
+
+    held = Mock(failure_reason_code="GPU_POWER_TIER_STATE_UNKNOWN", executor_info=Mock(uuid="e"), job_batch_id="b")
+    standing, withheld = withhold_renter_gpu_reset_verdicts({"hk": [held]})
+    assert standing == {"hk": []} and [w.result for w in withheld] == [held]
 
 
 @pytest.mark.asyncio

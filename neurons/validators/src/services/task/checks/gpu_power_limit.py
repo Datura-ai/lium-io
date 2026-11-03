@@ -162,8 +162,14 @@ class GpuPowerLimitCheck:
                 },
             )
 
-        if self.restore_stale_caps:  # the dry-run pipeline writes nothing
-            await self._remember_tier_ratios(ctx, measurements)
+        if self.restore_stale_caps and not await self._remember_tier_ratios(ctx, measurements):  # the dry run writes nothing
+            event = render_message(
+                Msg.TIER_STATE_UNKNOWN,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"threshold": MIN_POWER_LIMIT_RATIO, "measurements": _dump_measurements(measurements)},
+            )
+            return CheckResult(passed=False, event=event)
         event = render_message(
             Msg.LIMIT_OK,
             ctx=ctx,
@@ -175,9 +181,12 @@ class GpuPowerLimitCheck:
         )
         return CheckResult(passed=True, event=event)
 
-    async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> None:
+    async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> bool:
         """Keep each GPU's passing reading in the 80 % tier (and clear it at stock) for a rental-start
-        read that misses the GPU: it then starts at what the renter's badge showed, not at stock (F-36)."""
+        read that misses the GPU: it then starts at what the renter's badge showed, not at stock (F-36).
+
+        False when a tier reading may still be kept after a stock reading (Redis failed): the cycle then gives
+        no verdict, so the node is neither zeroed by our outage nor shown at stock while 0.8 is kept (F-43)."""
         writes, stock_keys = RedisWrites(), []
         for m in measurements:
             if not m.uuid or m.power_limit_ratio is None:
@@ -189,19 +198,17 @@ class GpuPowerLimitCheck:
                 writes.delete(key)
                 stock_keys.append(key)
         try:
-            kept = any(await ctx.services.redis.mget(stock_keys)) if stock_keys else False
+            kept: bool | None = any(await ctx.services.redis.mget(stock_keys)) if stock_keys else False
         except Exception:
-            kept = False  # Redis is down: our outage must not zero a node; the next cycle clears what is kept
-        # a lost set leaves a missed GPU at stock, the safe side; a lost clear of a kept tier reading would leave it as
-        # a later stock rental's floor (F-37), so it is tried once more and then fails the cycle instead of passing it
-        try:
-            await ctx.services.redis.write_atomically(writes)
-        except Exception:
+            kept = None  # unknown, never taken as proof that nothing is kept
+        for _ in range(2):
             try:
                 await ctx.services.redis.write_atomically(writes)
+                return True
             except Exception:
-                if kept:
-                    raise
+                continue
+        # a lost set leaves a missed GPU at stock, the safe side; a lost clear is safe only when nothing was kept
+        return kept is False
 
     async def _rented_floors(self, ctx: Context) -> dict[str, float]:
         """Per-GPU floor while the node is rented, by GPU uuid; "" is the floor for any other GPU.

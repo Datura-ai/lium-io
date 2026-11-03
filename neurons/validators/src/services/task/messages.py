@@ -680,6 +680,14 @@ class GpuPowerLimitMessages:
         category="env",
         impact="Proceed",
     )
+    # F-43: a kept 80 % tier reading whose clear is not confirmed (Redis failed): neither zero nor show stock
+    TIER_STATE_UNKNOWN = MessageTemplate(
+        event="GPU power limit at stock, but the validator could not clear its earlier tier reading",
+        reason="GPU_POWER_TIER_STATE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
+    )
     SKIPPED_ACTIVE_LIUM_FILLER = MessageTemplate(
         event="GPU power limit check skipped for active Lium default job",
         reason="GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER",
