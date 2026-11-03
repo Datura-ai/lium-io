@@ -26,6 +26,8 @@ def test_add_executor_prints_spot_tier_notice(monkeypatch):
     assert "Change Tier" in result.output
     # only a portal delete keeps the old tier on a re-add (a remove-executor does not), so the notice names the portal
     assert "deleted it in the Provider Portal" in result.output
+    # the backend matches both IP and port (recently_deleted_tier), so the notice must say both
+    assert "same IP and port" in result.output
 
 
 def test_failed_add_prints_no_tier_notice(monkeypatch):
