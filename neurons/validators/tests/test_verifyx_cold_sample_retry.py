@@ -348,25 +348,28 @@ async def test_a_retry_run_cleans_its_scratch_dir_and_keeps_its_exit_status(tmp_
     assert not (tmp_path / ".vx-run").exists()
 
 
-@pytest.mark.asyncio
-async def test_a_retry_run_still_starts_on_a_host_whose_timeout_lacks_k(tmp_path, monkeypatch):
-    # busybox `timeout` has no -k: the run goes ahead without the remote deadline
+def _timeout_without_k(tmp_path, monkeypatch):
+    # busybox `timeout` has no -k
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "timeout"
     stub.write_text("#!/bin/sh\necho 'timeout: unrecognized option: k' >&2\nexit 1\n")
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    executor = _fake_python(tmp_path, "touch temp_1.dat; echo answer; exit 3")
+
+
+@pytest.mark.asyncio
+async def test_a_retry_run_does_not_start_on_a_host_whose_timeout_lacks_k(tmp_path, monkeypatch):
+    # without a remote deadline a run whose cleanup failed could outlive every reap
+    _timeout_without_k(tmp_path, monkeypatch)
+    executor = _fake_python(tmp_path, f"touch {tmp_path}/started")
     service = VerifyXValidationService()
     command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="c"), "lib", ".vx-run")
 
-    capture = await asyncio.create_subprocess_exec(
-        "/bin/sh", "-c", command, cwd=tmp_path, stdout=asyncio.subprocess.PIPE
-    )
-    out, _ = await asyncio.wait_for(capture.communicate(), 10)
+    capture = await service._run_ssh_command(_LocalShell(tmp_path), command)
 
-    assert (out.decode().strip(), capture.returncode) == ("answer", 3)
+    assert capture.exit_status == 1
+    assert not (tmp_path / "started").exists()
     assert not (tmp_path / ".vx-run").exists()
 
 
@@ -446,7 +449,8 @@ class _HungRetryService(VerifyXValidationService):
             return self.firsts.pop(0)
         self.run_dirs.append(run_dir)
         challenge = SimpleNamespace(seed=1, cipher_text="c")
-        await self._run_ssh_command(shell, self._verifyx_command(self.executor, challenge, "lib", run_dir))
+        capture = await self._run_ssh_command(shell, self._verifyx_command(self.executor, challenge, "lib", run_dir))
+        return MockVerifyXResponse(error=f"exit {capture.exit_status}", diagnostics={})
 
 
 @pytest.mark.asyncio
@@ -489,6 +493,36 @@ async def test_a_cut_off_retry_whose_cleanup_timed_out_is_reaped_on_the_next_run
     assert await ctx.services.redis.hgetall(
         verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
     ) == {}
+
+
+@pytest.mark.asyncio
+async def test_no_timeout_k_with_failed_cleanup_and_pruning_leaves_no_forgotten_run(
+    context_factory, monkeypatch, tmp_path
+):
+    # PR review, 3 Nov: a retry without a remote deadline, its cleanup stalled, could be pruned and forgotten
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
+    monkeypatch.setattr(verifyx_validation_service, "VERIFYX_KILL_TIMEOUT_SECONDS", 0.2)
+    _timeout_without_k(tmp_path, monkeypatch)
+    executor = _fake_python(tmp_path, f"touch {tmp_path}/started; exec sleep 60")
+    service = _HungRetryService(executor, _probe(88.0))
+    ctx = context_factory(
+        services=build_services(verifyx=service, shell=_FlakyCleanupShell(tmp_path)),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}}, rented_data=_never_measured()),
+    )
+    key = verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
+    now = time.time()
+    for i in range(verifyx_check.STALE_RUNS_KEPT + 2):
+        await ctx.services.redis.hset(key, f".verifyx-retry-{i}", str(now - i))
+
+    result = await _run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["cold_sample_retry"]["used"] == "first"
+    assert not (tmp_path / "started").exists()  # the retry never ran
+    assert not (tmp_path / service.run_dirs[0]).exists()
+    left = {k.decode() for k in await ctx.services.redis.hgetall(key)}
+    assert left == {f".verifyx-retry-{i}" for i in range(verifyx_check.STALE_RUNS_KEPT)}  # still bounded
 
 
 @pytest.mark.asyncio

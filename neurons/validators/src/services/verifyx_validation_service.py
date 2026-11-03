@@ -625,11 +625,11 @@ class VerifyXValidationService:
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
         return (
-            f"mkdir {d} && cd {d} || exit 1; "
             # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
-            # a host whose `timeout` lacks -k (busybox) runs it without one rather than not at all
-            f'if timeout -k 1 1 true 2>/dev/null; then T="timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS}"; '
-            f"else T=; fi; $T {command} & echo $! > pid; wait $!; rc=$?; "
+            # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
+            f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
+            f"mkdir {d} && cd {d} || exit 1; "
+            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
             f"cd .. && rm -rf {d}; exit $rc"
         )
 
