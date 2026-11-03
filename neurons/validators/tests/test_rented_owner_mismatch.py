@@ -197,7 +197,7 @@ def test_banned_provider_live_rental_gate_ignores_another_miners_rental(context_
     assert has_live_rental(_ctx(context_factory, **OTHER)) is False
 
 
-# DAH-4263 review round 3 on #1834: a filler listed under this UUID for another miner is not this node's.
+# a filler listed under this UUID for another miner is not this node's
 def _filler_owned_by(owner_hotkey: str) -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={},

@@ -15,7 +15,7 @@ from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from .matmul_speed_log import log_matmul_speed
-from .rental_owner import filler_of_another_miner, rental_of_this_node
+from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
 if TYPE_CHECKING:
     from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -212,7 +212,7 @@ async def lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
         return None
     executor_uuid = ctx.executor.uuid
     filler_containers = fresh.get_filler_containers(executor_uuid)
-    if filler_containers and not filler_of_another_miner(ctx, fresh):
+    if filler_containers and not uuid_listed_under_another_miner(ctx, fresh):
         return _LiumWorkload(
             kind="filler", container_names=tuple(sorted(filler_containers)), snapshot=fresh
         )

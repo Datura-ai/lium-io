@@ -9,7 +9,7 @@ from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
-from .rental_owner import filler_of_another_miner, rental_of_this_node
+from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
 
 def port_count_below_listing_floor(state: ContextState) -> int | None:
@@ -87,7 +87,7 @@ class PortCountCheck:
         probed = list((ctx.state.specs or {}).get("verified_ports") or [])
         held = (
             rented_data.get_filler_ports(ctx.executor.uuid)
-            if rented_data and not filler_of_another_miner(ctx, rented_data)
+            if rented_data and not uuid_listed_under_another_miner(ctx, rented_data)
             else []
         )
         if ctx.state.externally_unreachable:
