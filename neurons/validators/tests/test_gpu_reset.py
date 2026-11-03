@@ -642,8 +642,40 @@ trap 'echo "$pending $noops"' EXIT
     if stuck:
         assert f"--unit={gpu_reset.EXPORTER_RESTART_UNIT}" in handoff.read_text()
         assert handoff.read_text().strip().endswith("e1")
+        assert "-p Restart=on-failure" in handoff.read_text()
     assert ("e1 did not exit after a kill: restart pending" in done.stderr) == (stuck and handoff_rc == 0)
     assert ("could not start e1: it did not exit after a kill" in done.stderr) == (stuck and handoff_rc != 0)
+
+
+@pytest.mark.parametrize(
+    "wait_rc, wait_err, start_rc, rc, started",
+    [
+        (0, "", 0, 0, True),
+        # a failed start (Docker restarting) fails the unit, so systemd runs it again
+        (0, "", 1, 1, True),
+        # a failed wait (daemon restart) is no exit: fail without a no-op start, so systemd runs it again
+        (1, "Cannot connect to the Docker daemon", 0, 1, False),
+        # a removed container ends the unit: nothing is left to start
+        (1, "Error: No such container: e1", 0, 0, False),
+    ],
+)
+def test_the_exporter_restart_unit_fails_until_it_has_started_the_exporter(
+    wait_rc, wait_err, start_rc, rc, started
+):
+    stubs = f"""
+docker() {{
+  case "$1" in
+    wait) return {wait_rc};;
+    inspect) [ -z '{wait_err}' ] || {{ echo '{wait_err}' >&2; return 1; }};;
+    start) echo started >&2; return {start_rc};;
+  esac
+}}
+"""
+    done = subprocess.run(
+        ["/bin/sh", "-c", stubs + gpu_reset.EXPORTER_RESTART_SCRIPT, "e1"], capture_output=True, text=True, timeout=30
+    )
+    assert done.returncode == rc
+    assert ("started" in done.stderr) == started
 
 
 AGENT = "some-gpu-agent.service"
