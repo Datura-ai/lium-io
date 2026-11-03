@@ -147,3 +147,12 @@ async def test_stale_procfs_bind_is_unreadable_and_the_node_passes(context_facto
     assert result.passed is True
     assert result.event.what_we_saw["kernel_gpu_uuids"] is None
     assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
+
+
+def test_a_stale_bind_counts_only_on_the_gpus_path_boundary():
+    def line(root, point):
+        return f"700 600 0:5 {root} {point} rw - proc proc rw"
+
+    assert nvidia_devices._has_stale_proc_bind(line("/driver/nvidia/gpus//deleted", "/proc/driver/nvidia/gpus"))
+    assert nvidia_devices._has_stale_proc_bind(line("/x//deleted", "/proc/driver/nvidia/gpus/0001:00:00.0"))
+    assert not nvidia_devices._has_stale_proc_bind(line("/x//deleted", "/proc/driver/nvidia/gpus-other"))

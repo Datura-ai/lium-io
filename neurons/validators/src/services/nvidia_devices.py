@@ -419,7 +419,7 @@ def _has_stale_proc_bind(mountinfo: str) -> bool:
     return any(
         len(f := line.split()) > 4
         and f[3].endswith(STALE_ROOT_SUFFIX)
-        and f[4].startswith(PROC_NVIDIA_GPUS_PATH)
+        and (f[4] == PROC_NVIDIA_GPUS_PATH or f[4].startswith(PROC_NVIDIA_GPUS_PATH + "/"))
         for line in mountinfo.splitlines()
     )
 
