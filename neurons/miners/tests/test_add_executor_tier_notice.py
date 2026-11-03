@@ -24,8 +24,8 @@ def test_add_executor_prints_spot_tier_notice(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "starts on the Spot tier" in result.output
     assert "Change Tier" in result.output
-    # a node removed here and re-added does not keep its earlier tier, so the notice must not say it does
-    assert "keeps its earlier tier" not in result.output
+    # only a portal delete keeps the old tier on a re-add (a remove-executor does not), so the notice names the portal
+    assert "deleted it in the Provider Portal" in result.output
 
 
 def test_failed_add_prints_no_tier_notice(monkeypatch):

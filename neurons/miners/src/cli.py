@@ -235,10 +235,12 @@ def get_balance_of_eth_address(private_key: str):
         sys.exit(1)
 
 
-# the backend lists a node added through this command on Spot; the CLI cannot pick a tier
+# the backend lists a new node on Spot, except one deleted in the Provider Portal at the same address within 7 days,
+# which keeps its old tier; the CLI cannot pick a tier
 ADD_EXECUTOR_TIER_NOTICE = (
-    "Note: this node starts on the Spot tier. To move it to Secure, open the node's page in the "
-    "Provider Portal and click Change Tier once the node has been listed for 7 days."
+    "Note: this node starts on the Spot tier, unless you deleted it in the Provider Portal in the last 7 days; "
+    "then it keeps its earlier tier. To move it to Secure, open the node's page in the Provider Portal and "
+    "click Change Tier once the node has been listed for 7 days."
 )
 
 
@@ -257,7 +259,7 @@ def add_executor(
     price: float,
     validator: str | None = None,
 ):
-    """Add executor machine to the database. A new node starts on the Spot tier."""
+    """Add executor machine to the database. A new node starts on the Spot tier (see the notice it prints)."""
     cli_service = CliService(with_executor_db=True)
     success = asyncio.run(cli_service.add_executor(address, port, price, validator))
     if success:
