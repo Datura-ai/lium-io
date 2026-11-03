@@ -178,7 +178,7 @@ class GpuPowerLimitCheck:
     async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> None:
         """Keep each GPU's passing reading in the 80 % tier (and clear it at stock) for a rental-start
         read that misses the GPU: it then starts at what the renter's badge showed, not at stock (F-36)."""
-        writes = RedisWrites()
+        writes, clears = RedisWrites(), False
         for m in measurements:
             if not m.uuid or m.power_limit_ratio is None:
                 continue
@@ -187,14 +187,17 @@ class GpuPowerLimitCheck:
                 writes.set(key, str(m.power_limit_ratio), ex=SCORED_TIER_RATIO_TTL_SECONDS)
             else:
                 writes.delete(key)
-        # a lost set leaves a missed GPU at stock, the safe side; a lost clear leaves the last tier reading until its
-        # TTL, so it is tried once more (F-37: a stale 0.8 would become a stock rental's floor)
-        for _ in range(2):
+                clears = True
+        # a lost set leaves a missed GPU at stock, the safe side; a lost clear would leave the last tier reading as a
+        # later stock rental's floor (F-37), so it is tried once more and then fails the cycle instead of passing it
+        try:
+            await ctx.services.redis.write_atomically(writes)
+        except Exception:
             try:
                 await ctx.services.redis.write_atomically(writes)
-                return
             except Exception:
-                continue
+                if clears:
+                    raise
 
     async def _rented_floors(self, ctx: Context) -> dict[str, float]:
         """Per-GPU floor while the node is rented, by GPU uuid; "" is the floor for any other GPU.

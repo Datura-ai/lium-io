@@ -189,6 +189,25 @@ async def test_a_stock_reading_retries_a_lost_clear_of_the_tier_reading(context_
 
 
 @pytest.mark.asyncio
+async def test_a_stock_cycle_whose_clear_is_lost_twice_fails_instead_of_passing(context_factory, read_records_mock) -> None:
+    # F-37: tier, then stock with both clears lost: the cycle must not pass while 0.8 is still kept for a rental start
+    redis = FakeRedis()
+    key = scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")
+
+    def ctx(watts: int):
+        return context_factory(state=_state(current_limit=watts, default_limit=350), services=build_services(redis=redis))
+
+    await GpuPowerLimitCheck().run(ctx(280))
+    assert redis.store[key] == "0.8"
+    redis.write_atomically = AsyncMock(side_effect=ConnectionError("down"))
+    with pytest.raises(ConnectionError):
+        await GpuPowerLimitCheck().run(ctx(350))
+    assert redis.write_atomically.await_count == 2
+    # a lost set only leaves a missed GPU at stock: that cycle still passes
+    assert (await GpuPowerLimitCheck().run(ctx(280))).passed is True
+
+
+@pytest.mark.asyncio
 async def test_power_limit_rejects_below_the_80_percent_tier(context_factory, read_records_mock) -> None:
     ctx = context_factory(state=_state(current_limit=276, default_limit=350))
     result = await GpuPowerLimitCheck().run(ctx)
