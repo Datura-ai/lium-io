@@ -647,15 +647,6 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
-    # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
-    # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
-    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
-    # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
-    # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
-    # False: every spot node earns 0, as before.
-    ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
     # Lium filler runs on it: a filler Lium did not start is Lium's doing (Fish). Provider-caused
@@ -670,14 +661,16 @@ class Settings(BaseSettings):
     # restriction, and the free remainder of a partially rented spot node, earn 0 as before.
     # False: every rented spot node earns 0, as before.
     ENABLE_SPOT_RENTAL_INCENTIVE: bool = Field(env="ENABLE_SPOT_RENTAL_INCENTIVE", default=False)
-    # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
-    # bucket-cap dilution is raised to 1.0 x its configuration's average filler revenue, even above
-    # its listed rate (1.0 = SECURE_FILLER_REVENUE_FLOOR_FACTOR, set apart from the spot factor).
-    # False: dilution applies as before.
-    ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
-    # A configuration's filler average is used only when it was taken over at least this many
-    # filler GPU-hours; a thinner sample reads as no average.
-    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
+    # A Spot node's configuration filler average is used only when it was taken over at least this
+    # many filler GPU-hours; a thinner sample reads as no average. 2 = the backend's floor for the
+    # per-card rate the average is built from; 24 left a lone 1-GPU Spot node unpaid for its first
+    # day of Default Job and after every restart.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=2.0)
+    # The same threshold for a secure node (the secure floor): kept at 24 GPU-hours, since its
+    # top-up is bounded by the remaining burn allocation, not by what the fillers earned.
+    SECURE_FILLER_REVENUE_MIN_GPU_HOURS: float = Field(
+        env="SECURE_FILLER_REVENUE_MIN_GPU_HOURS", default=24.0
+    )
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
     # unrented node) when every pod in the batch-start rented list is stale: not running and its
@@ -798,6 +791,13 @@ class Settings(BaseSettings):
 
     def get_allowed_gpu_hwmodels(self) -> set[str]:
         return {s.strip() for s in self.GPU_ATTESTATION_ALLOWED_HWMODELS.split(",") if s.strip()}
+
+    def get_filler_revenue_min_gpu_hours(self, is_spot: bool) -> float:
+        return (
+            self.FILLER_REVENUE_MIN_GPU_HOURS
+            if is_spot
+            else self.SECURE_FILLER_REVENUE_MIN_GPU_HOURS
+        )
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
