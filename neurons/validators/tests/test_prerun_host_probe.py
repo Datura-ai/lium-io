@@ -149,7 +149,8 @@ def _ssh(*results):
 
 
 def _cmds(client) -> list[str]:
-    return [c.args[0] for c in client.run.await_args_list if c.args]
+    # the DAH-4663 clock-lock safety net (`-rgc` before a create) is covered in test_gpu_clocks; these tests pin the probe order
+    return [c.args[0] for c in client.run.await_args_list if c.args and " -rgc " not in c.args[0]]
 
 
 # ------------------------------------------------------------------
