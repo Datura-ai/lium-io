@@ -2035,6 +2035,8 @@ _SUMMARY = {"message_type": "summary", "files_restored": 38373, "total_files": 3
         # a folder the workload deleted: restic reports each item's open and then its lchown
         (1, _SUMMARY, [("/root/a", _ENOENT), ("/root/a", "lchown : no such file or directory")], "PARTIAL"),
         (1, {"message_type": "summary", "files_restored": 50, "total_files": 52}, [_ENOENT] * 2, "PARTIAL"),
+        # the whole target vanished: restic wrote every file, then each one was removed
+        (1, {"message_type": "summary", "files_restored": 2, "total_files": 2}, [_ENOENT] * 2, None),
         (1, _SUMMARY, [], None),
         (1, {"message_type": "summary", "files_restored": 0}, [_ENOENT], None),
         (1, None, [_ENOENT], None),
@@ -2112,3 +2114,24 @@ def test_partial_restore_reports_restored_of_total_and_removed_items() -> None:
     assert final["error_message"] == (
         "Restored 38373 of 38844 files; 471 were removed on the pod during the restore, first: /root/data/cache/0.bin"
     )
+
+
+def test_partial_restore_counts_files_left_on_the_pod() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    # restic counted 400 writes, but 5 of the 403 files were removed afterwards: only 398 are left
+    for i in range(5):
+        item = f"/proc/88100/root/root/data/{i}.bin"
+        message = f"open {item}: no such file or directory"
+        reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": message}, "item": item}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 400, "total_files": 403}})
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["error_message"].startswith("Restored 398 of 403 files; 5 were removed")
+    assert final["processed_files"] == 398
