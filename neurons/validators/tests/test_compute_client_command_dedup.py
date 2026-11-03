@@ -70,6 +70,8 @@ def client(monkeypatch):
     client.logging_extra = {}
     client.miner_service = MagicMock(redis_service=service)
     client._write_backend_create_record = AsyncMock(return_value=True)
+    client.deleted_pod_ids = set()
+    client.resume_by_pod_id = {}
     client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="127.0.0.1", port=8000))
     client.miner_service.handle_container = AsyncMock(
         return_value=ContainerCreated(
