@@ -75,7 +75,11 @@ HOST_GPU_SERVICES = (
     *FABRIC_SERVICES,
     "nvidia-persistenced",
 )
-DOCKER_PS_COMMAND = f"{DOCKER} ps --no-trunc --format '{{{{.ID}}}} {{{{.Image}}}}'"
+# id, AutoRemove, image of every running container: a --rm container is deleted by its stop, so it is never stopped
+DOCKER_PS_COMMAND = (
+    f"{DOCKER} inspect --format '{{{{.Id}}}} {{{{.HostConfig.AutoRemove}}}} {{{{.Config.Image}}}}' "
+    f"$({DOCKER} ps -q --no-trunc)"
+)
 # the process names still holding a GPU device (host PID view): what blocked a refused `nvidia-smi -r`
 GPU_HOLDERS_SCRIPT = (
     'for p in $(fuser /dev/nvidia* 2>/dev/null); do p=${p%%[!0-9]*}; [ -n "$p" ] && cat /proc/$p/comm; done '
@@ -102,6 +106,8 @@ FABRIC_RESET_UNIT_PROCS = "nsenter -t 1 -m -- sh -c " + shlex.quote(
     '[ -f "$f" ] || continue; n=$(wc -l < "$f") || exit 1; echo "$n"; exit 0; done; exit 1'
 )
 _FABRIC_STOP_FAILED_EXIT = 97
+# a host GPU holder the unit stopped is not active again after the reset
+_FABRIC_START_FAILED_EXIT = 98
 STOP_GRACE_SECONDS = 10
 # a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
 EXIT_WAIT_SECONDS = 90
@@ -283,6 +289,9 @@ class _Plan:
     # host services and containers to stop around the reset (only for a pod that owns every host GPU)
     host_services: list[str] = field(default_factory=list)
     holder_containers: list[str] = field(default_factory=list)
+    # the pod owns every host GPU (container and backend alike): the reset runs in the host unit, which also
+    # stops host GPU holders the validator does not list
+    owns_host: bool = False
 
 
 async def _precheck(
@@ -350,7 +359,9 @@ async def _precheck(
         )
     host_services: list[str] = list(fabric_services)
     holder_containers: list[str] = []
-    if set(ordered) == set(host_by_uuid):
+    # both ownership sources: a `--gpus all` container may see more GPUs than the backend gave the pod
+    owns_host = set(ordered) == set(host_by_uuid) == set(pod_gpu_uuids)
+    if owns_host:
         # the pod owns every host GPU: the host's own GPU holders may be stopped around its reset too
         host_services = [
             unit
@@ -359,8 +370,13 @@ async def _precheck(
         ]
         listed = await _run(runner, DOCKER_PS_COMMAND)
         for line in (listed.stdout or "").splitlines() if listed.exit_code == 0 else []:
-            cid, _, image = line.strip().partition(" ")
-            if "dcgm-exporter" in image and cid != container_id and re.fullmatch(r"[0-9a-f]{12,64}", cid):
+            cid, auto_remove, image = (line.strip().split(" ", 2) + ["", ""])[:3]
+            if (
+                "dcgm-exporter" in image
+                and auto_remove == "false"
+                and cid != container_id
+                and re.fullmatch(r"[0-9a-f]{12,64}", cid)
+            ):
                 holder_containers.append(cid)
     return _Plan(
         container_id,
@@ -370,6 +386,7 @@ async def _precheck(
         widened=set(targets) != set(requested),
         host_services=host_services,
         holder_containers=holder_containers,
+        owns_host=owns_host,
     )
 
 
@@ -429,10 +446,12 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         script += f'[ $rc -ne 0 ] || for u in {stop}; do systemctl stop "$u" {fail}; done; '
     script += (
         f"[ $rc -ne 0 ] || for u in $({GPU_HOLDER_UNITS_SCRIPT}); do "
-        f'echo "stopping GPU holder $u"; systemctl stop "$u" {fail}; up="$u $up"; done; '
+        f'echo "stopping GPU holder $u"; up="$u $up"; systemctl stop "$u" {fail}; done; '
         f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; "
         f'[ $rc -eq 0 ] || echo "GPU holders left: $({GPU_HOLDERS_SCRIPT})"; }}; '
-        'for u in $up; do systemctl start "$u"; done; '
+        # a discovered holder is checked here (the validator knows only the listed ones); the rest still start
+        'for u in $up; do { systemctl start "$u" && systemctl is-active "$u" >/dev/null; } '
+        f'|| {{ echo "could not start $u" >&2; rc={_FABRIC_START_FAILED_EXIT}; }}; done; '
     )
     if units:
         start = " ".join(shlex.quote(u) for u in reversed(units))
@@ -622,7 +641,7 @@ async def reset_pod_gpus(
             )
 
         command = build_reset_command(plan.targets, container_uuids=plan.container_uuids, pod_gpu_uuids=pod_gpu_uuids)
-        if not plan.host_services and not plan.holder_containers:
+        if not plan.owns_host:
             reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
         else:
             # the driver refuses -r while Fabric Manager or another host client holds the GPUs; the pod owns them all
@@ -649,8 +668,10 @@ async def reset_pod_gpus(
                 raise GpuResetRefused(
                     GpuResetErrorCode.ResetNotSupported, "no latch cure while a host GPU service is down"
                 )
-            if reset.exit_code == _FABRIC_STOP_FAILED_EXIT:
-                raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, _tail(reset.stderr) or "could not stop")
+            if reset.exit_code in (_FABRIC_STOP_FAILED_EXIT, _FABRIC_START_FAILED_EXIT):
+                raise GpuResetRefused(
+                    GpuResetErrorCode.ResetNotSupported, _tail(reset.stderr) or "a host GPU holder did not stop or start"
+                )
         if reset.exit_code == 0:
             report.ok = True
             report.gpus = [GpuResetOutcome(index=plan.index_by_uuid[u], uuid=u, result="reset") for u in plan.targets]
