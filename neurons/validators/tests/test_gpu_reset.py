@@ -599,8 +599,8 @@ def test_the_host_unit_waits_for_an_exporter_whose_stop_failed_before_starting_i
         ("Cannot connect to the Docker daemon", 2, "0 0"),
         # a removed container ends the wait; its failed start is the validator's restoration failure
         ("Error: No such object: e1", 99, "1 1"),
-        # an exporter that outlives its kill (stuck in the kernel) no longer holds the unit: it ends, and the
-        # validator's restore check reports the exporter down
+        # an exporter that outlives its kill (stuck in the kernel) no longer holds the unit: it ends and names it
+        # (it still reads running, so the validator's restore check cannot)
         ("", 99, "1 1"),
     ],
 )
@@ -630,6 +630,8 @@ trap 'echo "$pending $noops"' EXIT
     done = subprocess.run(["/bin/sh", "-c", stubs + script], capture_output=True, text=True, timeout=30)
     assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
     assert done.stdout.strip() == expected
+    stuck = not inspect_err and waits_to_exit == 99
+    assert ("could not start e1: it did not exit after a kill" in done.stderr) == stuck
 
 
 AGENT = "some-gpu-agent.service"

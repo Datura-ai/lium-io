@@ -475,13 +475,14 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     if containers:
         # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: wait for
         # the exit (a removed container ends the wait), then kill one still there and wait once more. Bounded, so
-        # the unit always ends inside the validator's wait and the renter pod starts; a holder still down is
-        # reported by the validator's restore check
+        # the unit always ends inside the validator's wait and the renter pod starts. One that outlives its kill
+        # (stuck in the kernel) still reads running, so the restore check cannot see it: the unit names it
         script += (
             f'[ -z "$dying" ] || until timeout {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
             '! docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; '
             'echo "$dying did not exit, killing it" >&2; docker kill "$dying" >/dev/null 2>&1; '
-            f'timeout {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1; break; done; '
+            f'timeout {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1 || '
+            'echo "could not start $dying: it did not exit after a kill" >&2; break; done; '
         )
         ids = " ".join(shlex.quote(c) for c in reversed(containers))
         script += f'for u in {ids}; do docker start "$u" >/dev/null; done; '
