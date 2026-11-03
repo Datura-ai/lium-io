@@ -1146,22 +1146,32 @@ class ComputeClient:
         return await self.miner_service.redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id)
 
     async def resend_unacked_container_created(self, ws=None) -> None:
-        """ws given: each one is sent on it now, not queued (ahead of the ResumedCreatesReport)"""
+        """ws given: each one is sent on it now, not queued, ahead of the ResumedCreatesReport; a Redis error then
+        raises, so the report waits for the next socket instead of failing a create whose replay could not be read"""
         redis_service = self.miner_service.redis_service
         try:
             unacked = await redis_service.unacked_container_created()
         except Exception as exc:
             self._log_unacked_container_created_error(None, exc)
+            if ws is not None:
+                raise
             return
         for pod_id, message_json in unacked.items():
             try:
                 created = ContainerCreated.model_validate_json(message_json)
+            except pydantic.ValidationError as exc:
+                # unreadable: the startup sweep did not count it as a replay either, so the report lists the create
+                self._log_unacked_container_created_error(pod_id, exc)
+                continue
+            try:
                 if not await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id):
                     # the pending flag expired or was wiped: the backend no longer waits on this create
                     await redis_service.remove_unacked_container_created(pod_id)
                     continue
             except Exception as exc:
                 self._log_unacked_container_created_error(pod_id, exc)
+                if ws is not None:
+                    raise
                 continue
             if ws is not None:
                 await ws.send(created.model_dump_json())

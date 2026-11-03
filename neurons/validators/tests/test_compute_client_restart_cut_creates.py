@@ -543,3 +543,23 @@ async def test_a_saved_success_goes_on_the_socket_ahead_of_the_resumed_creates_r
     assert json.loads(socket.sent[2])["message_type"] == "ResumedCreatesReport"
     assert len(socket.sent) == 3
     assert client.message_queue == []  # sent on the socket, not queued a second time
+
+
+@pytest.mark.parametrize("failing_read", ["unacked_container_created", "renting_in_progress"])
+@pytest.mark.asyncio
+async def test_a_redis_error_in_the_replay_keeps_the_report_for_the_next_socket(failing_read) -> None:
+    # sent without the replay, the report would make the backend fail a create whose container exists
+    redis_service = _redis_service()
+    client = await _create_and_send_container_created(redis_service)
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL)
+    await client.fail_creates_cut_off_by_restart()
+    setattr(redis_service, failing_read, AsyncMock(side_effect=ConnectionError("redis down")))
+    socket = _FakeSocket()
+
+    auth = MagicMock(model_dump_json=lambda: "auth")
+    with patch("clients.compute_client.AuthenticateRequest.from_keypair", return_value=auth):
+        with pytest.raises(ConnectionError):
+            await client.handle_connection(socket)
+
+    assert socket.sent == ["auth"]
+    assert client.resumed_creates_report is not None
