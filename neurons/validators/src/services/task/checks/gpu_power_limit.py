@@ -7,20 +7,20 @@ from typing import Any
 
 from pydantic import BaseModel
 from services.const import DEFAULT_JOB_OWNER_LIUM
-from services.redis_service import RedisWrites
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     RENTAL_START_RATIO_TTL_SECONDS,
     RENTED_MIN_POWER_LIMIT_RATIO,
+    SCORED_TIER_RATIO_TTL_SECONDS,
     STALE_CAP_GRACE_SECONDS,
     GpuPowerRestoreRecord,
     read_gpu_power_restore_records,
     rental_legacy_pod_key,
-    SCORED_TIER_RATIO_TTL_SECONDS,
     rental_start_ratio_key,
     restore_tracked_gpu_power_limits,
     scored_tier_ratio_key,
 )
+from services.redis_service import RedisWrites
 
 from ..messages import GpuPowerLimitMessages as Msg
 from ..messages import render_message
@@ -187,10 +187,14 @@ class GpuPowerLimitCheck:
                 writes.set(key, str(m.power_limit_ratio), ex=SCORED_TIER_RATIO_TTL_SECONDS)
             else:
                 writes.delete(key)
-        try:
-            await ctx.services.redis.write_atomically(writes)
-        except Exception:
-            pass  # without it a missed GPU starts at stock, the safe side
+        # a lost set leaves a missed GPU at stock, the safe side; a lost clear leaves the last tier reading until its
+        # TTL, so it is tried once more (F-37: a stale 0.8 would become a stock rental's floor)
+        for _ in range(2):
+            try:
+                await ctx.services.redis.write_atomically(writes)
+                return
+            except Exception:
+                continue
 
     async def _rented_floors(self, ctx: Context) -> dict[str, float]:
         """Per-GPU floor while the node is rented, by GPU uuid; "" is the floor for any other GPU.

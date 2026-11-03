@@ -71,6 +71,8 @@ def test_rental_creates_a_container_the_renter_can_ssh_into_then_deletes_it(serv
     renter_priv, renter_pub = lib.ssh_keypair()
     pod_id = str(uuid.uuid4())
     t0 = time.monotonic()
+    # the backend's first rented list (empty), which compute-app sends the connector; before it a create is retried
+    lib.run(services["MinerService"].redis_service.replace_rented_machines([]))
     created = lib.run(services["MinerService"].handle_container(_create_request(pod_id, renter_pub)))
     create_s = round(time.monotonic() - t0, 1)
     dump = created.model_dump(mode="json") if hasattr(created, "model_dump") else str(created)

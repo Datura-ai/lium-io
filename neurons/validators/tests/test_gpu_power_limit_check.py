@@ -167,6 +167,28 @@ async def test_a_passing_80_percent_tier_reading_is_kept_for_the_rental_start_an
 
 
 @pytest.mark.asyncio
+async def test_a_stock_reading_retries_a_lost_clear_of_the_tier_reading(context_factory, read_records_mock) -> None:
+    # F-37: a clear lost once must not leave the 80 % reading as a later stock rental's floor
+    redis = FakeRedis()
+    key = scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")
+    redis.store[key] = "0.8"
+    write, calls = redis.write_atomically, []
+
+    async def lost_once(writes):
+        calls.append(writes)
+        if len(calls) == 1:
+            raise ConnectionError("blip")
+        return await write(writes)
+
+    redis.write_atomically = lost_once
+    ctx = context_factory(state=_state(current_limit=350, default_limit=350), services=build_services(redis=redis))
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is True
+    assert len(calls) == 2
+    assert key not in redis.store
+
+
+@pytest.mark.asyncio
 async def test_power_limit_rejects_below_the_80_percent_tier(context_factory, read_records_mock) -> None:
     ctx = context_factory(state=_state(current_limit=276, default_limit=350))
     result = await GpuPowerLimitCheck().run(ctx)
