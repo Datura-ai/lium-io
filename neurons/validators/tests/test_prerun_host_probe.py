@@ -563,8 +563,8 @@ def _relisting_commands(ssh_client) -> list[str]:
 
 
 def _fresh_sizing_payload(**over):
-    # the DAH-2183 contract: the volume is sized on the host's free disk
-    return _deploy_payload(disk_share=0.5, volume_limit_gb=1000, min_volume_gb=2, **over)
+    # the DAH-2183 contract: the volume is sized on the host's free disk; the backend orders what the listing gave
+    return _deploy_payload(disk_share=0.5, volume_limit_gb=40, min_volume_gb=2, **over)
 
 
 @pytest.mark.asyncio
@@ -999,6 +999,28 @@ async def test_a_rental_volume_clamped_far_below_the_order_fails_the_create(
     )
 
     result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=2620, storage_limit_gb=1310))
+
+    if created:
+        assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    else:
+        assert type(result).__name__ == "FailedContainerRequest"
+        assert result.failure_step == ds_module.RENTAL_DISK_SHORT_STEP
+        svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("sized_gb", "created"), [(120, True), (106, False)])
+async def test_the_ordered_share_is_checked_on_the_final_volume_size(svc_fixture, monkeypatch, sized_gb, created):
+    """DAH-5260 live test: the reclaim kept the cache (no clamp), then the fresh sizing gave 106 GB of 123 ordered and
+    the pod went RUNNING. The 95% check runs on the size the volume is created with."""
+    svc = svc_fixture
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(return_value=ds_module.VolumeSizingResult(sized_gb, 61, "fresh"))
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=123, storage_limit_gb=61))
 
     if created:
         assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")

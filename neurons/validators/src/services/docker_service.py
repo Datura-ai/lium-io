@@ -5265,11 +5265,13 @@ class DockerService:
                 payload.storage_limit_gb or 0
             )
             # a fresh-sized (disk_share) rental gets its share of free disk plus the pod volumes already on it,
-            # so a half-node one needs twice its size there or resolve_volume_sizing short-changes it
+            # less the overhead resolve_volume_sizing reserves, so a half-node one needs twice its size there
             fresh_sizing = self.measures_host_for_volume_sizing(payload)
             disk_share: float = payload.disk_share if fresh_sizing and payload.disk_share else 1
             existing_gb: float = (
-                await self._get_existing_vloopback_bytes(ssh_client) / (1024**3) if fresh_sizing else 0
+                await self._get_existing_vloopback_bytes(ssh_client) / (1024**3) - _FRESH_SIZING_OVERHEAD_GB
+                if fresh_sizing
+                else 0
             )
             rental_needs_free_gb: float = rental_own_gb / disk_share - existing_gb
             if free_gb >= rental_needs_free_gb:
@@ -9437,13 +9439,6 @@ class DockerService:
                         host_probe=docker_listing_probe,
                     )
                 )
-                # the reclaim clamped the volume to the disk actually free; within 5% the pod is created
-                if ordered_volume_gb and payload.volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_CLAMP_MIN_SHARE:
-                    current_step = RENTAL_DISK_SHORT_STEP
-                    raise RuntimeError(
-                        f"Not enough free disk for the ordered volume: {payload.volume_limit_gb} GB free "
-                        f"of {ordered_volume_gb} GB ordered"
-                    )
                 cleanup_changed_host = bool(
                     removal_at_ssh_connect_lost_its_channel
                     or removed_containers
@@ -9589,6 +9584,19 @@ class DockerService:
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
+                    # the reclaim clamp and the fresh sizing can both shrink the volume: checked on the final
+                    # size, a customer volume within 5% of the order is created, below it the create fails
+                    if (
+                        payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                        and ordered_volume_gb
+                        and effective_volume_limit_gb is not None
+                        and effective_volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_CLAMP_MIN_SHARE
+                    ):
+                        current_step = RENTAL_DISK_SHORT_STEP
+                        raise RuntimeError(
+                            f"Not enough free disk for the ordered volume: {effective_volume_limit_gb} GB free "
+                            f"of {ordered_volume_gb} GB ordered"
+                        )
 
                     current_step = "volume_creation"
                     local_volume = f"volume_{payload.pod_id}"

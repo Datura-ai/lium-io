@@ -422,12 +422,13 @@ async def test_a_rental_takes_the_engy_cache_before_an_older_dolphin_cache(docke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("free_after_gb", "volume_gb"), [(3950, 1310), (2389, 796)])
+@pytest.mark.parametrize(("free_after_gb", "volume_gb"), [(3950, 1310), (2389, 789)])
 async def test_a_half_node_rental_evicts_the_cache_its_share_was_sized_on(
     docker_service, monkeypatch, free_after_gb, volume_gb
 ):
-    # 1310 GB volume + 655 GB storage at half the node needs 3930 GB free; 2389 GB beside the cache is not
-    # enough, so the cache goes. A removal that freed nothing clamps the volume to what the sizing will give.
+    # 1310 GB volume + 655 GB storage at half the node needs 3930 GB free plus the sizing's 20 GB overhead; 2389 GB
+    # beside the cache is not enough, so the cache goes. A removal that freed nothing clamps the volume to what the
+    # sizing will give.
     ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
     gb = 1024**3
     monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=0))
@@ -440,3 +441,17 @@ async def test_a_half_node_rental_evicts_the_cache_its_share_was_sized_on(
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
     assert _removed_volumes(ssh_client) == [_KIMI]
     assert rental.volume_limit_gb == volume_gb
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(130, [_KIMI]), (150, [])])
+async def test_a_fresh_sized_rental_counts_the_sizing_overhead_in_its_fit(docker_service, monkeypatch, free_gb, removed):
+    # DAH-5260 live test: 82 + 41 GB fit 130 GB free, but resolve_volume_sizing keeps 20 GB back, so the pod got
+    # 116 GB of 123 and the cache stayed. The fit check leaves out the same 20 GB.
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=0))
+    rental = _rental(82, 41)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed
