@@ -69,7 +69,7 @@ def _in_cvm() -> bool:
 
 def _validator_source_pin_option() -> bytes:
     """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin."""
-    if not VALIDATOR_SSH_SOURCES or _in_cvm():
+    if not VALIDATOR_SSH_SOURCES or not settings.EXECUTOR_SSH_SOURCE_PIN or _in_cvm():
         return b""
     return b'from="' + VALIDATOR_SSH_SOURCES.encode() + b'" '
 

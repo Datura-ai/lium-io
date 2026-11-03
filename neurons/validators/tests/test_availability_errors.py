@@ -39,6 +39,7 @@ def test_ssh_unreachable_is_an_availability_error() -> None:
     assert event.what_we_saw["reach_target"] == "executor_ssh"
     assert event.what_we_saw["ssh_port"] == 2200
     assert "relay, tunnel or Docker userland-proxy" in event.remediation  # the source pin is explained
+    assert "EXECUTOR_SSH_SOURCE_PIN=false" in event.remediation  # and the switch that turns it off
     assert [e.reason_code for e in availability_errors([event])] == ["EXECUTOR_SSH_UNREACHABLE"]
 
 

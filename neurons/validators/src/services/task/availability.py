@@ -172,7 +172,8 @@ def build_ssh_unreachable_event(
             "Check that sshd on the node accepts the validator on its management port, "
             "and that no firewall or rate limit rejects the connection. Inbound SSH must reach the "
             "executor directly: the validator's keys log in only from the validator's addresses, so "
-            "a relay, tunnel or Docker userland-proxy in front of sshd makes every login fail."
+            "a relay, tunnel or Docker userland-proxy in front of sshd makes every login fail. If your "
+            "host relays inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false in the executor .env and restart it."
         ),
         what_we_saw={
             "executor_uuid": executor_uuid,
