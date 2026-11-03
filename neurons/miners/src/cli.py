@@ -235,6 +235,14 @@ def get_balance_of_eth_address(private_key: str):
         sys.exit(1)
 
 
+# the backend lists a node added through this command on Spot; the CLI cannot pick a tier
+ADD_EXECUTOR_TIER_NOTICE = (
+    "Note: this node starts on the Spot tier. To move it to Secure, open the node's page in the "
+    "Provider Portal and click Change Tier once the node has been listed for 7 days. "
+    "A node re-added at the same address within 7 days keeps its earlier tier."
+)
+
+
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
@@ -250,11 +258,12 @@ def add_executor(
     price: float,
     validator: str | None = None,
 ):
-    """Add executor machine to the database"""
+    """Add executor machine to the database. A new node starts on the Spot tier."""
     cli_service = CliService(with_executor_db=True)
     success = asyncio.run(cli_service.add_executor(address, port, price, validator))
     if success:
         logger.info("✅ Added executor successfully.")
+        click.echo(ADD_EXECUTOR_TIER_NOTICE)
     else:
         logger.error("❌ Failed to add executor.")
 
