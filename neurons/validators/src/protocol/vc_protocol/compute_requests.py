@@ -93,6 +93,9 @@ class RentedExecutor(BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-5244 (protocol 2.1.0): a pod on the node has an open rental contracted as a self-rent. A backend
+    # before 2.1.0 omits it, so every rental reads as a third party's - today's behaviour.
+    self_rent: bool = False
 
     def get_rented_ports(self) -> list[int]:
         """Aggregate rented ports from all pods."""
@@ -196,9 +199,6 @@ class RentedExecutorsResponse(BaseModel):
     # and rentals are untouched. A held new node is also absent from the Discord list above.
     # Additive with an empty default: an older backend names nobody.
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters in the
-    # backend's report window (DAH-4482): each owes a post-rental GPU recheck. Additive with an empty default.
-    renter_hardware_fault_executor_ids: list[str] = []
     # executor_ids inside a running provider maintenance window (DAH-4709): no incentive from either pool,
     # rented or not. Additive with an empty default: an older backend names nobody.
     maintenance_executor_ids: list[str] = []
@@ -221,6 +221,10 @@ class RentedExecutorsResponse(BaseModel):
     # executor_ids of the nodes of banned pool accounts, listed as soon as a node is added, so a node
     # added after an account ban fails the ban check in its first cycle. An older backend bans none.
     banned_executor_ids: list[str] = []
+    # DAH-5510: old containers of pods moved off a down node, which the backend keeps on that node until their
+    # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
+    # and its volume_<pod_id>. An older backend names none.
+    retained_container_names: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

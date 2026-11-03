@@ -1,10 +1,15 @@
 import enum
+import re
 from datetime import datetime
 from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
+
+# absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` (the encrypted volume's ciphertext mount) and
+# `/mnt` (where an attached Volume mounts) are reserved
+_BARE_VOLUME_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
 
 
 class CustomOptions(BaseModel):
@@ -55,10 +60,20 @@ class CustomOptions(BaseModel):
             # Remove any extra flags or commands
             clean_volume = volume.strip().split()[0]
             
-            # Validate format: must be host_path:container_path
+            # DAH-5426: the backend sends a template's volume as a bare container path ("/workspace"): the
+            # container side of the pod's own named volume. Only a plain absolute path is taken, and one
+            # that came with flags is refused whole rather than stripped.
             if ':' not in clean_volume:
+                # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace"
+                bare = volume.strip().rstrip('/')
+                if (
+                    _BARE_VOLUME_PATH_RE.fullmatch(bare)
+                    and bare.split('/')[1] not in ('lium-cipher', 'mnt')
+                    and not CustomOptions._is_dangerous_path(bare)
+                ):
+                    sanitized.append(bare)
                 continue
-                
+
             host_path, container_path = clean_volume.split(':', 1)
             
             # Basic validation - reject dangerous paths
@@ -198,6 +213,7 @@ class ContainerRequestType(enum.Enum):
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
     ResetPodGpuRequest = "ResetPodGpuRequest"
+    LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
 
 
 class ForcedValidationCycleRequest(BaseModel):
@@ -388,6 +404,9 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
     # drops it on deserialization of the backend's request.
     cache_volumes: list[CacheVolume] | None = None
+    # protocol 1.18.0: False when the backend rents the pod part of its host, so it gets no host-wide devices
+    # (RDMA, nvidia-caps) even when every GPU the host shows is requested. None from an older backend.
+    whole_host: bool | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -436,6 +455,20 @@ class ResetPodGpuRequest(ContainerBaseRequest):
     request_id: str
     # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
     local_volume_path: str | None = None
+
+
+class LockPodGpuClocksRequest(ContainerBaseRequest):
+    """DAH-4663: lock (or with reset, release) a running pod's GPU clocks; answered by PodGpuClocksResult
+    (lium_protocol 2.4.0)."""
+
+    message_type: ContainerRequestType = ContainerRequestType.LockPodGpuClocksRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    min_mhz: int | None = None
+    max_mhz: int | None = None
+    reset: bool = False
+    request_id: str
 
 
 class ContainerStopRequest(ContainerBaseRequest):
@@ -517,6 +550,7 @@ class ContainerResponseType(enum.Enum):
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
     PodGpuResetResult = "PodGpuResetResult"
+    PodGpuClocksResult = "PodGpuClocksResult"
 
 
 class DeliveryStamps(BaseModel):
@@ -820,6 +854,7 @@ class GpuResetErrorCode(enum.Enum):
     ContainerNotFound = "ContainerNotFound"
     OperationInProgress = "OperationInProgress"
     ExecutorUnreachable = "ExecutorUnreachable"
+    ClockLockNotSupported = "ClockLockNotSupported"
 
 
 class GpuResetOutcome(BaseModel):
@@ -836,6 +871,24 @@ class PodGpuResetResult(ContainerBaseResponse):
     error_code: GpuResetErrorCode | None = None
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
+    detail: str | None = None
+
+
+class GpuClockOutcome(BaseModel):
+    index: int
+    uuid: str
+    result: Literal["locked", "reset", "failed"]
+    applied_min_mhz: int | None = None
+    applied_max_mhz: int | None = None
+    detail: str | None = None
+
+
+class PodGpuClocksResult(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodGpuClocksResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    gpus: list[GpuClockOutcome] = []
     detail: str | None = None
 
 

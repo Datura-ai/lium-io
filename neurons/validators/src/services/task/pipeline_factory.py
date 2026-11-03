@@ -49,6 +49,7 @@ from .checks import (
     GpuKernelCountCheck,
     GpuLossHoldCheck,
     GpuModelValidCheck,
+    GpuClockLockCheck,
     GpuPowerLimitCheck,
     GpuThermalThrottleCheck,
     GpuUsageCheck,
@@ -406,6 +407,8 @@ class PipelineFactory:
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
+                # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
+                GpuClockLockCheck(),
                 GpuUsageCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
@@ -422,7 +425,8 @@ class PipelineFactory:
                 # passes the matmul but cannot DMA pinned memory). On by default, shadow (logged only) until enforcement is enabled.
                 PinnedMemoryProbeCheck(),
                 # DAH-4482: a node the rented health read flagged proves every card before it re-lists.
-                # Rented nodes halted above, so this only runs unrented. Off by default: logs only.
+                # Rented nodes halted above, so this only runs unrented. Also the every-card load test a node owes
+                # after a GPU dropout (GpuLossHoldCheck) before it re-lists.
                 PostRentalGpuRecheckCheck(),
                 # a sticky NVLink fault leaves every single-GPU check passing; NVLS cannot bind (23 Oct)
                 NvlinkFaultCheck(),
@@ -531,6 +535,8 @@ class PipelineFactory:
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
+                # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
+                GpuClockLockCheck(),
                 GpuUsageCheck(),
                 LocalVerifyCheck(),
                 VerifyXCheck(),

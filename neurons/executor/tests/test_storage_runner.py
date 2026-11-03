@@ -819,8 +819,10 @@ class _KilledPopen(_FakePopen):
         (True, "", " ran out of memory"),
         (False, "", " helper was killed (Docker recorded no out-of-memory kill)"),
         (False, OOM_KILL_DMESG, " ran out of memory"),  # the kernel's OOM kill that Docker's flag missed
-        (None, OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect failed
-        ("", OOM_KILL_DMESG, " helper was killed (often out of memory)"),  # docker inspect printed nothing
+        (None, OOM_KILL_DMESG, " helper container was removed while running"),  # container gone
+        ("removing", "", " helper container was removed while running"),  # docker mid-removal
+        ("", OOM_KILL_DMESG, " helper was killed (helper state unknown)"),  # docker inspect printed nothing
+        ("error", OOM_KILL_DMESG, " helper was killed (helper state unknown)"),  # inspect failed otherwise
     ],
 )
 def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
@@ -832,12 +834,16 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
 ) -> None:
     calls: list[list[str]] = []
     state = {"Status": "exited", "OOMKilled": oom_killed, "ExitCode": 137}
+    if oom_killed == "removing":
+        state = {"Status": "removing", "OOMKilled": False, "ExitCode": 137}
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
         if "inspect" in command:
             if oom_killed is None:
-                return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
+                return SimpleNamespace(returncode=1, stdout="", stderr="Error: No such container: x")
+            if oom_killed == "error":
+                return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
             inspection = json.dumps({"Id": HELPER_ID, "State": state})
             return SimpleNamespace(returncode=0, stdout=inspection if oom_killed != "" else "", stderr="")
         if command[0] == "dmesg":
@@ -871,14 +877,16 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
     # detached runs delete stderr, so the state line must reach the reported operation logs
     log = "\n".join(session.puts[-1]["json"]["logs"] or [])
     assert ("docker state" in log) is (oom_killed is not True)
-    if oom_killed is False:
+    if oom_killed in (False, "removing"):
         assert '"ExitCode": 137' in log
         kernel_line = "kernel: " + " | ".join(OOM_KILL_DMESG.splitlines()[1:3])
         assert (kernel_line in log) is bool(kernel_log)
     elif oom_killed is True:
         assert not any(c[0] == "dmesg" for c in calls)
     else:
-        assert "kernel: no helper container ID to match" in log
+        # no ID: the host's OOM lines are never read, they would show other pods' data in the renter's logs
+        assert "kernel: no helper ID to match" in log
+        assert OOM_KILL_DMESG.splitlines()[1] not in log
 
 
 
@@ -1339,6 +1347,43 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
     assert terminal_payload["error_message"] == (
         "failed to save model.bin: no space left on device"
     )
+
+
+def test_reporter_sends_restic_summary_only_on_completed_backup() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+        ),
+        session=session,
+    )
+    summary = {
+        "message_type": "summary",
+        "data_added": 4096,
+        "data_added_packed": 2048,
+        "files_new": 2,
+        "files_changed": 1,
+        "files_unmodified": 7,
+        "snapshot_id": "a" * 64,
+    }
+
+    reporter.send({"event": "restic", "payload": summary})
+    assert "data_added_bytes" not in session.requests[-1]["json"]
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "FULL"})
+
+    terminal_payload = session.requests[-1]["json"]
+    assert isinstance(terminal_payload, dict)
+    assert terminal_payload["data_added_bytes"] == 4096
+    assert terminal_payload["data_added_packed_bytes"] == 2048
+    assert (
+        terminal_payload["files_new"],
+        terminal_payload["files_changed"],
+        terminal_payload["files_unmodified"],
+    ) == (2, 1, 7)
 
 
 class _FailingReporterSession:
@@ -1978,3 +2023,153 @@ def test_backup_reruns_once_after_an_s3_upload_timeout(
         assert len(calls) == runs
         # the reported cause is the last run's own fatal error, not the first run's timeout
         assert first_runs[-1].split('"message":"')[1][:30] in runner._events._reporter._restic_failure_detail
+
+
+_ENOENT = "open : no such file or directory"
+_SUMMARY = {"message_type": "summary", "files_restored": 38373, "total_files": 38374}
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "summary", "errors", "expected"),
+    [
+        (1, _SUMMARY, [_ENOENT, "Fatal: There were 1 errors"], "PARTIAL"),
+        (1, _SUMMARY, ["mkdir : no such file or directory", "lstat : no such file or directory"], "PARTIAL"),
+        (1, _SUMMARY, ["write : no space left on device", "Fatal: There were 1 errors"], None),
+        (1, _SUMMARY, [_ENOENT, "ciphertext verification failed"], None),
+        (1, _SUMMARY, ["Fatal: unable to load index: pack not found"], None),
+        (1, _SUMMARY, ["open : permission denied"], None),
+        # no loss bound: restore 98b90ab8 lost 471 of 38,844 files from one deleted folder
+        (1, {"message_type": "summary", "files_restored": 38373, "total_files": 38844}, [_ENOENT] * 471, "PARTIAL"),
+        # a folder the workload deleted: restic reports each item's open and then its lchown
+        (1, _SUMMARY, [("/root/a", _ENOENT), ("/root/a", "lchown : no such file or directory")], "PARTIAL"),
+        (1, {"message_type": "summary", "files_restored": 50, "total_files": 52}, [_ENOENT] * 2, "PARTIAL"),
+        # the whole target vanished: restic wrote every file, then each one was removed
+        (1, {"message_type": "summary", "files_restored": 2, "total_files": 2}, [_ENOENT] * 2, None),
+        (1, _SUMMARY, [], None),
+        (1, {"message_type": "summary", "files_restored": 0}, [_ENOENT], None),
+        (1, None, [_ENOENT], None),
+        (2, _SUMMARY, [_ENOENT], None),
+    ],
+)
+def test_restore_completes_partial_only_for_vanished_files(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, errors: list, expected: str | None
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace/restored"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+
+    def stream(*_a, **_k):
+        # a bare message is its own item
+        runner._restore_errors.extend(e if isinstance(e, tuple) else (f"/root/item{i}", e) for i, e in enumerate(errors))
+        return exit_code, summary
+
+    monkeypatch.setattr(runner, "_stream_command", stream)
+
+    if expected is None:
+        with pytest.raises(ResticOperationError):
+            runner._restore()
+        return
+    result = runner._restore()
+    assert result.status == "COMPLETED"
+    assert result.result_quality is OperationResultQuality.PARTIAL
+
+
+def test_failed_restore_reports_the_renter_path_not_proc_root() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    first = "write /proc/88100/root/root/restored/model.safetensors: no space left on device"
+    reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": first}}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 120, "total_files": 400}})
+    reporter.send({"event": "result", "status": "FAILED", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["status"] == "FAILED"
+    assert final["error_message"] == (
+        "write /root/restored/model.safetensors: no space left on device; restored 120 of 400 files"
+    )
+
+
+def test_partial_restore_reports_restored_of_total_and_removed_items() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    for i in range(471):
+        item = f"/proc/88100/root/root/data/cache/{i}.bin"
+        for op in ("open", "lchown"):  # restic reports a vanished item twice; N counts items
+            message = f"{op} {item}: no such file or directory"
+            reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": message}, "item": item}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 38373, "total_files": 38844}})
+    reporter.send({"event": "restic", "payload": {"message_type": "exit_error", "message": "Fatal: There were 942 errors"}})
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["status"] == "COMPLETED"
+    assert final["result_quality"] == "PARTIAL"
+    assert final["error_message"] == (
+        "Restored 38373 of 38844 files; 471 were removed on the pod during the restore, first: /root/data/cache/0.bin"
+    )
+
+
+def test_partial_restore_counts_files_left_on_the_pod() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    # restic counted 400 writes, but 5 of the 403 files were removed afterwards: only 398 are left
+    for i in range(5):
+        item = f"/proc/88100/root/root/data/{i}.bin"
+        message = f"open {item}: no such file or directory"
+        reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": message}, "item": item}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 400, "total_files": 403}})
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["error_message"].startswith("Restored 398 of 403 files; 5 were removed")
+    assert final["processed_files"] == 398
+
+
+def test_real_restic_finds_the_parent_when_the_backup_path_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restic_binary: str
+) -> None:
+    """An encrypted pod's /proc/<pid>/root path changes on restart: the second backup must still find its parent."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for index in range(20):
+        (workspace / f"file{index}").write_text(str(index))
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(workspace))
+    commands = []
+    monkeypatch.setattr(runner, "_stream", lambda command, **kwargs: commands.append(command) or (0, {"snapshot_id": SNAPSHOT_ID}))
+    runner._backup()
+    env = {**os.environ, "RESTIC_REPOSITORY": str(tmp_path / "repo"), "RESTIC_PASSWORD": "test"}
+    subprocess.run([restic_binary, "init"], env=env, check=True, capture_output=True)
+
+    summaries = []
+    for name in ("before-restart", "after-restart"):
+        path = tmp_path / name
+        path.symlink_to(workspace)
+        # restic reads the backup path from PWD, as the shell's cd leaves it
+        result = subprocess.run(
+            [restic_binary, *commands[0]], cwd=path, env={**env, "PWD": str(path)}, check=True, capture_output=True, text=True
+        )
+        summaries.append(next(m for m in map(json.loads, result.stdout.splitlines()) if m.get("message_type") == "summary"))
+
+    assert summaries[0]["files_new"] == 20
+    assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
+
