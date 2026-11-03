@@ -535,6 +535,11 @@ class TenantEnforcementCheck:
         with contextlib.suppress(Exception):
             mark = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}")
             stopped_by_validator = (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED
+        if stopped_by_validator and diagnostics.get("container_missing") is True:
+            # the container we stopped is gone (provider rm, reinstall): passing it would keep billing a pod that no
+            # longer exists, since only the POD_NOT_RUNNING reset stops billing. Drop the mark and report it down.
+            await _clear_leftover_recovery_mark(ctx, container_name, pod_id, pod_status, container_gone=True)
+            stopped_by_validator = False
         if stopped_by_validator:
             extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
             return _DownedPodOutcome(failure=None, ssh_pub_keys=[], container_state=container_state)
@@ -913,9 +918,12 @@ async def _recover_parked_pod_container(
             return False
 
 
-async def _clear_leftover_recovery_mark(ctx: Context, container_name: str, pod_id: str, pod_status: str | None) -> None:
+async def _clear_leftover_recovery_mark(
+    ctx: Context, container_name: str, pod_id: str, pod_status: str | None, *, container_gone: bool = False
+) -> None:
     # the mark means something only while the pod is stopped: one a lost delete left on a running pod would restart a
-    # later provider stop. Bounded and best-effort; the next cycle retries.
+    # later provider stop, and one left on a removed container would pass a billed pod forever (container_gone).
+    # Bounded and best-effort; the next cycle retries.
     key = f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"
 
     async def clear() -> None:
@@ -929,7 +937,9 @@ async def _clear_leftover_recovery_mark(ctx: Context, container_name: str, pod_i
             inspect_result = await ctx.ssh.run(
                 f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(container_name)}"
             )
-            if (inspect_result.stdout or "").strip() == "true":
+            if (inspect_result.stdout or "").strip() == "true" or (
+                container_gone and inspect_result.exit_status != 0 and "No such" in str(inspect_result.stderr)
+            ):
                 await ctx.services.redis.delete(key)
 
     with contextlib.suppress(Exception):

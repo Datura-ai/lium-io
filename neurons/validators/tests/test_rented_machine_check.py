@@ -1337,6 +1337,39 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
 
 
 @pytest.mark.asyncio
+async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_container_is_gone(context_factory, monkeypatch):
+    # a pod the validator stopped passes only while its container exists: once it is removed, the mark is dropped and
+    # POD_NOT_RUNNING resets the node, or the renter is billed for a pod that no longer exists (lio#1827 review)
+    ssh = DummySSHClient(pod_running=False)
+    real_run = ssh.run
+
+    async def run(command):
+        if "{{.State.Running}}" not in command:
+            return await real_run(command)
+        return Mock(stdout="", stderr="Error: No such object: pod_pod-1", exit_status=1)
+
+    ssh.run = run
+    marks = {"stopped_by_recovery:pod-1": "stopped"}
+    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    docker = AsyncMock()
+    docker.recover_parked_pod_container.return_value = False  # neither <name> nor <name>__prev is listed
+    docker.recover_pod_after_stale_vloopback_mount.return_value = False
+    docker.encrypted_volume_mount_missing.return_value = False
+
+    async def missing(*args, **kwargs):
+        return {"container_missing": True}
+
+    monkeypatch.setattr(rented_machine_module, "_collect_pod_diagnostics", missing)
+    ctx = build_recovery_context(context_factory, ssh, docker, redis=_recovery_redis(lock, marks))
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert not result.passed
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+    assert not marks
+
+
+@pytest.mark.asyncio
 async def test_tenant_enforcement_leaves_the_pod_untouched_when_cancelled_during_the_path_lookup(context_factory):
     # the path is looked up before the mount probe, so a cancel there has not judged or changed anything yet
     ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
