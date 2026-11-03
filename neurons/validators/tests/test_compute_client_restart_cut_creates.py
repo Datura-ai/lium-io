@@ -8,10 +8,8 @@ import pytest
 from clients.compute_client import (
     CREATE_CUT_OFF_BY_RESTART_STEP,
     INFLIGHT_CREATE_MAX_AGE_SECONDS,
-    MAX_REPLAY_RECEIPT_WAITS,
     ComputeClient,
     OutgoingMessages,
-    ReplayReceiptsMissing,
 )
 from payload_models.payloads import (
     ContainerCreated,
@@ -44,6 +42,14 @@ class _FakeRedis:
         for field in fields:
             self.hashes.get(key, {}).pop(field, None)
 
+    async def eval(self, script: str, numkeys: int, key: str, field: str, expected: str) -> int:
+        # the one script RedisService runs on a hash: HDEL the field only while it still holds `expected`
+        assert "HDEL" in script and numkeys == 1
+        if self.hashes.get(key, {}).get(field) != expected:
+            return 0
+        del self.hashes[key][field]
+        return 1
+
 
 def _redis_service() -> RedisService:
     service = RedisService.__new__(RedisService)
@@ -62,7 +68,8 @@ def _client(redis_service: RedisService) -> ComputeClient:
     client.deleted_pod_ids = set()
     client.miner_drivers = asyncio.Queue()
     client.resumed_creates_report = None
-    client.replay_receipt_waits = 0
+    client.report_awaiting = {}
+    client.create_accepted_while_report_pending = False
     return client
 
 
@@ -529,24 +536,21 @@ async def test_the_startup_sweep_leaves_a_saved_success_to_the_replay(saved_succ
 
 
 class _BackendSocket(_FakeSocket):
-    """accepts the auth, then yields `frames`; past them it stays silent"""
+    """accepts the auth, then yields `frames` and closes"""
 
     def __init__(self, frames: list[str]) -> None:
         super().__init__()
-        self.frames = [json.dumps({"status": "success"}), *frames]
+        self.frames = list(frames)
 
-    async def recv(self) -> str:
+    async def __anext__(self) -> str:
         if not self.frames:
-            await asyncio.Event().wait()
+            raise StopAsyncIteration
         return self.frames.pop(0)
 
-    async def close(self) -> None:
-        pass
 
-
-def _receipt(command_id: str) -> str:
+def _receipt(create_command_id: str) -> str:
     return ExecutorRentFinishedRequest(
-        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1", command_id=command_id
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1", create_command_id=create_command_id
     ).model_dump_json()
 
 
@@ -560,6 +564,9 @@ async def _client_with_a_replayed_success(command_id: str = "cmd-a") -> ComputeC
     return client
 
 
+OTHER_FRAME = json.dumps({"message_type": "SomethingElse"})
+
+
 @pytest.mark.parametrize(
     ("frames", "applied"),
     [
@@ -567,61 +574,59 @@ async def _client_with_a_replayed_success(command_id: str = "cmd-a") -> ComputeC
         ([_receipt("cmd-a")], True),
         # a backend that sends receipts without ids
         ([_receipt("")], True),
-        # its handler raised (the backend logs it and reads on): no receipt, the report must not fail the pod
-        ([], False),
+        # other traffic is handled while the report waits; the report goes right after the receipt
+        ([OTHER_FRAME, _receipt("cmd-a")], True),
+        # its handler raised (the backend logs it and reads on): no receipt, so no report to fail the pod
+        ([OTHER_FRAME], False),
         # a receipt for another dispatch of the pod does not answer this success
         ([_receipt("cmd-b")], False),
     ],
 )
 @pytest.mark.asyncio
-async def test_the_resumed_creates_report_waits_for_the_receipt_of_each_replayed_success(
-    monkeypatch, frames, applied
-) -> None:
-    monkeypatch.setattr("clients.compute_client.REPLAY_RECEIPT_WAIT_SECONDS", 0.05)
+async def test_the_resumed_creates_report_waits_for_the_receipt_of_each_replayed_success(frames, applied) -> None:
     client = await _client_with_a_replayed_success()
     socket = _BackendSocket(frames)
 
     auth = MagicMock(model_dump_json=lambda: "auth")
     with patch("clients.compute_client.AuthenticateRequest.from_keypair", return_value=auth):
-        if applied:
-            await client.handle_connection(socket)
-        else:
-            with pytest.raises(ReplayReceiptsMissing):
-                await client.handle_connection(socket)
+        await client.handle_connection(socket)
 
     # the success went first, on the socket, not queued a second time
     assert socket.sent[0] == "auth"
     assert json.loads(socket.sent[1])["command_id"] == "cmd-a"
     assert client.message_queue == []
-    # frames that came meanwhile were handled
+    # no wait holds other traffic back
     assert [c.args[0] for c in client.handle_message.await_args_list] == frames
     if applied:
         assert json.loads(socket.sent[2])["message_type"] == "ResumedCreatesReport"
         assert len(socket.sent) == 3
         assert client.resumed_creates_report is None
     else:
+        # never sent without the receipt, however long it takes; the next socket replays and waits again
         assert len(socket.sent) == 2
-        assert client.resumed_creates_report is not None  # the next socket replays and waits again
-        assert client.ws is None  # no other reply went out ahead of the report
+        assert client.resumed_creates_report is not None
 
 
+@pytest.mark.parametrize("took_a_create", [False, True])
 @pytest.mark.asyncio
-async def test_the_report_goes_without_receipts_after_the_last_wait(monkeypatch) -> None:
-    # a backend that never answers one success must not hold every other reply back for good
-    monkeypatch.setattr("clients.compute_client.REPLAY_RECEIPT_WAIT_SECONDS", 0.01)
+async def test_a_report_still_waiting_when_its_socket_closes(took_a_create) -> None:
     client = await _client_with_a_replayed_success()
 
     auth = MagicMock(model_dump_json=lambda: "auth")
     with patch("clients.compute_client.AuthenticateRequest.from_keypair", return_value=auth):
-        for _ in range(MAX_REPLAY_RECEIPT_WAITS - 1):
-            with pytest.raises(ReplayReceiptsMissing):
-                await client.handle_connection(_BackendSocket([]))
-        socket = _BackendSocket([])
+        await client.handle_connection(_BackendSocket([]))
+        client.create_accepted_while_report_pending = took_a_create
+        socket = _BackendSocket([_receipt("cmd-a")])
         await client.handle_connection(socket)
 
-    assert json.loads(socket.sent[-1])["message_type"] == "ResumedCreatesReport"
+    if took_a_create:
+        # the backend would fail that create as lost (sent before this socket authenticated): the report is dropped
+        # and the success is replayed like any other unanswered one
+        assert socket.sent == ["auth"]
+        assert [type(m) for m in client.message_queue] == [ContainerCreated]
+    else:
+        assert [json.loads(m).get("message_type") for m in socket.sent[1:]] == ["ContainerCreated", "ResumedCreatesReport"]
     assert client.resumed_creates_report is None
-    assert client.replay_receipt_waits == 0
 
 
 @pytest.mark.parametrize(
@@ -655,7 +660,9 @@ async def test_a_receipt_clears_only_the_pending_state_of_the_dispatch_it_names(
     client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="1.2.3.4", port=8000))
 
     await client._drive_miner_job(
-        ExecutorRentFinishedRequest(miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1", command_id=receipt)
+        ExecutorRentFinishedRequest(
+            miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1", create_command_id=receipt
+        )
     )
 
     left = await redis_service.get_pending_pods("miner-hk", "exec-1", max_age_seconds=None)
@@ -682,3 +689,44 @@ async def test_a_redis_error_in_the_replay_keeps_the_report_for_the_next_socket(
 
     assert socket.sent == ["auth"]
     assert client.resumed_creates_report is not None
+
+
+@pytest.mark.parametrize(("saved", "new_dispatch", "saved_left"), [("cmd-a", "cmd-b", None), ("cmd-b", "cmd-b", "cmd-b")])
+@pytest.mark.asyncio
+async def test_a_new_dispatch_of_the_pod_drops_the_success_saved_for_an_older_one(saved, new_dispatch, saved_left) -> None:
+    # replayed while the reboot runs, the old success would complete the reboot with the old container's ports
+    redis_service = _redis_service()
+    created = ContainerCreated(
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1",
+        container_name="c-1", volume_name="v-1", port_maps=[(22, 40022)], command_id=saved,
+    )
+    await redis_service.add_unacked_container_created("pod-1", created.model_dump_json())
+
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id=new_dispatch)
+
+    unacked = await redis_service.unacked_container_created()
+    assert (json.loads(unacked["pod-1"])["command_id"] if unacked else None) == saved_left
+
+
+@pytest.mark.asyncio
+async def test_a_late_receipt_never_deletes_a_success_saved_after_its_check() -> None:
+    redis_service = _redis_service()
+    old, new = (
+        ContainerCreated(
+            miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1",
+            container_name="c-1", volume_name="v-1", port_maps=[(22, port)], command_id=command_id,
+        ).model_dump_json()
+        for port, command_id in [(40022, "cmd-a"), (40023, "cmd-b")]
+    )
+    await redis_service.add_unacked_container_created("pod-1", old)
+    read = redis_service.hget
+
+    async def read_then_reboot_saves(key: str, field: str):
+        saved = await read(key, field)
+        await redis_service.add_unacked_container_created("pod-1", new)  # the reboot's success lands here
+        return saved
+
+    redis_service.hget = read_then_reboot_saves
+    await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")
+
+    assert (await redis_service.unacked_container_created())["pod-1"] == new

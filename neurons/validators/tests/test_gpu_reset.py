@@ -288,6 +288,7 @@ class PendingRedis(FakeRedis):
     gpu_reset_marks = RedisService.gpu_reset_marks
     renting_in_progress = RedisService.renting_in_progress
     remove_unacked_container_created = RedisService.remove_unacked_container_created
+    _remove_unacked_container_created_unless = RedisService._remove_unacked_container_created_unless
 
 
 @pytest.mark.asyncio

@@ -229,6 +229,9 @@ class DuplicateExecutorsResponse(BackendMessage):
 @BACKEND_MESSAGES.register
 class ExecutorRentFinishedRequest(ContainerRequest):
     message_type: BackendMessageType = BackendMessageType.ExecutorRentFinished
+    # 2.7.0: the command_id of the ContainerCreated this receipt answers. Not `command_id`: the validator dedupes
+    # on that, and would take the receipt for a repeat of the create
+    create_command_id: str = ""
 
 
 @BACKEND_MESSAGES.register

@@ -4,7 +4,7 @@ import logging
 import math
 import time
 from contextlib import asynccontextmanager
-from typing import Literal, NamedTuple
+from typing import Callable, Literal, NamedTuple
 
 import redis.asyncio as aioredis
 import redis.exceptions
@@ -757,6 +757,10 @@ class RedisService:
             item["command_id"] = command_id
         pending_pods.append(item)
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        if command_id:
+            # lium-io#1952: a new dispatch (a reboot, an edit, a retry) supersedes the success saved for an older one;
+            # replayed while this one runs, the backend would complete this one with the old container's ports
+            await self._remove_unacked_container_created_unless(pod_id, lambda saved_id: saved_id == command_id)
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str = ""):
         """command_id given (a rent-finished bound to one dispatch): only that dispatch's flag and saved report go, and
@@ -775,12 +779,29 @@ class RedisService:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
         else:
             await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
-        if command_id:
-            saved = await self.hget(UNACKED_CONTAINER_CREATED_KEY, pod_id)
-            if saved is not None and other_dispatch(json.loads(saved).get("command_id", "")):
-                return
         # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
-        await self.remove_unacked_container_created(pod_id)
+        await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
+
+    async def _remove_unacked_container_created_unless(self, pod_id: str, keep: Callable[[str], bool]) -> None:
+        """keep: called with the saved report's command_id. The delete compares the whole saved report, so one a
+        newer dispatch saved after the read is never the one deleted."""
+        saved = await self.hget(UNACKED_CONTAINER_CREATED_KEY, pod_id)
+        if saved is None:
+            return
+        try:
+            saved_command_id = json.loads(saved).get("command_id", "")
+        except (ValueError, AttributeError):
+            saved_command_id = ""  # unreadable: never resent anyway
+        if keep(saved_command_id):
+            return
+        async with self.lock:
+            await self.redis.eval(
+                "if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then return redis.call('HDEL', KEYS[1], ARGV[1]) end return 0",
+                1,
+                UNACKED_CONTAINER_CREATED_KEY,
+                pod_id,
+                saved,
+            )
 
     async def claim_backend_command(self, command_id: str, claim: str) -> BackendCommand | None:
         key = f"{BACKEND_COMMAND_PREFIX}{command_id}"

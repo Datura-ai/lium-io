@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 18 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.5.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.7.0`) is semver over the wire.
 
 ## Using it
 
@@ -66,7 +66,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.4.0` — `LockPodGpuClocksRequest` (backend → validator) and its answer `PodGpuClocksResult` with `GpuClockOutcome`; `GpuResetErrorCode.ClockLockNotSupported` (a renter locks their pod's GPU clocks with `nvidia-smi -i <uuid> -lgc`, clamped to the supported clocks, or resets them with `-rgc`; the pod's delete resets them).
 - `1.18.0` — `ContainerCreateRequest.whole_host` (optional): False when the backend rents the pod part of its host. The validator then hands it no host-wide devices even if every GPU the host shows is in the request. An older validator ignores it.
 - `2.5.0` — `ResumedCreatesReport` (`pod_ids`): sent once by a validator connector after its start sweep, first on its first authenticated socket; the creates the previous connector was running when it was cut off. The validator stores no create request: the backend sends each listed create again from its own records. The backend fails at once a create it sent before that socket authenticated, still waiting and not listed. An older validator never sends it.
-- `2.6.0` — `ContainerCreated.command_id` (optional, default empty): the `ContainerCreateRequest`'s `command_id`, echoed; the backend echoes it in that create's `ExecutorRentFinishedRequest`. The backend applies a success only for the pod's current create (an older one gets its receipt alone), and the validator clears only the pending state of the dispatch a receipt names. Empty on either side: as before.
+- `2.7.0` — `ContainerCreated.command_id` (optional, default empty): the `ContainerCreateRequest`'s `command_id`, echoed. `ExecutorRentFinishedRequest.create_command_id` (optional, default empty): the backend names in it the `ContainerCreated.command_id` the receipt answers. It is not `command_id`, which the validator dedupes requests on. The backend applies a success only for the pod's current create; an older one gets its receipt alone. The validator clears only the pending state of the dispatch a receipt names, and the `ResumedCreatesReport` goes once every success replayed ahead of it has its receipt. Empty on either side: as before.
 - `1.0.0` — first release.
 
 ## Tests

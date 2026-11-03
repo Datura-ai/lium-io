@@ -84,6 +84,7 @@ async def test_a_later_pending_pod_write_keeps_a_build_past_30_minutes():
     service.hget = AsyncMock(return_value=json.dumps([entry, {"time": 0, "pod_id": "pod-other"}]))
     service.hset = AsyncMock()
     service.hdel = AsyncMock()
+    service._remove_unacked_container_created_unless = AsyncMock()  # the saved-report hash, not this one
 
     await service.add_pending_pod("miner", "exec", "pod-new")
     assert [i["pod_id"] for i in json.loads(service.hset.await_args.args[2])][:2] == [

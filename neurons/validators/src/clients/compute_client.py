@@ -124,11 +124,6 @@ MAX_CREATE_RESUMES = 1
 # a record older than the longest create (the custom-build budget, past the backend's 1 h PENDING limit with the
 # margin) is one whose removal failed: the create ended long ago, so it is dropped, never run again or reported
 INFLIGHT_CREATE_MAX_AGE_SECONDS = settings.CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS + 600
-# DAH-5380: how long the ResumedCreatesReport waits on a socket for the receipts of the saved successes sent ahead of
-# it, and on how many sockets. shortcut: past the last one it goes anyway (a backend that never answers one success
-# must not hold every other reply back); a pod whose success still failed there is the old restart-failure path.
-REPLAY_RECEIPT_WAIT_SECONDS = 30
-MAX_REPLAY_RECEIPT_WAITS = 3
 
 
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
@@ -210,10 +205,6 @@ class FrameTooBig(Exception):
         self.size = size
 
 
-class ReplayReceiptsMissing(Exception):
-    pass
-
-
 class AuthenticationError(Exception):
     def __init__(self, reason: str, errors: list[Error]):
         self.reason = reason
@@ -242,7 +233,10 @@ class ComputeClient:
         self.deleted_pod_ids: set[str] = set()
         # set by a start sweep that read the in-flight records; sent once, first on the next authenticated socket
         self.resumed_creates_report: ResumedCreatesReport | None = None
-        self.replay_receipt_waits = 0
+        # pod id -> command_id of each success replayed ahead of the report and not yet answered by its receipt
+        self.report_awaiting: dict[str, str] = {}
+        # a create the backend sent while the report waited: a later socket's report would fail it as lost
+        self.create_accepted_while_report_pending = False
 
         self.logging_extra = {
             "validator_hotkey": self.my_hotkey(),
@@ -408,29 +402,22 @@ class ComputeClient:
         if response.status != "success":
             raise AuthenticationError("auth request received failed response", response.errors)
 
-        if (report := self.resumed_creates_report) is not None:
-            # DAH-5380: saved successes go first: the backend handles frames in order, so their pods no longer wait
-            # when the report fails every unlisted waiting create
-            replayed = await self.resend_unacked_container_created(ws)
-            # a delivered frame is not a handled one: a success whose handling failed would leave its pod waiting
-            # and unlisted, so the report waits until each one's receipt says the backend applied it
-            if replayed and not await self._receipts_for_replayed_successes(ws, replayed):
-                self.replay_receipt_waits += 1
-                if self.replay_receipt_waits < MAX_REPLAY_RECEIPT_WAITS:
-                    await ws.close()
-                    raise ReplayReceiptsMissing("no receipt for a replayed success; the report waits for the next socket")
-                logger.error(
-                    _m(
-                        "Sending the resumed-creates report without the receipts of the successes sent before it",
-                        extra=get_extra_info(self.logging_extra),
-                    )
+        if self.resumed_creates_report is not None and self.create_accepted_while_report_pending:
+            # the backend fails a waiting create sent before THIS socket authenticated that is not listed, and listing
+            # one still running would start it twice; unsent, the cut-off creates wait for retry_failed_pods as before
+            logger.error(
+                _m(
+                    "Dropping the resumed-creates report: its socket closed before the receipts it waited on",
+                    extra=get_extra_info({**self.logging_extra, "awaiting": sorted(self.report_awaiting)}),
                 )
-            # once, and before any reply: the backend fails a waiting create sent before THIS socket authenticated
-            # that is not listed, so a report re-sent on a later socket would fail the creates sent on this one
-            report.sent_at = time.time()
-            await ws.send(report.model_dump_json())
+            )
             self.resumed_creates_report = None
-            self.replay_receipt_waits = 0
+        if (report := self.resumed_creates_report) is not None:
+            # DAH-5380: saved successes go first. A delivered frame is not a handled one: a success whose handling
+            # failed would leave its pod waiting and unlisted, so the report goes only once each one's receipt says
+            # the backend applied it. No timeout: unsent, no pod is failed and retry_failed_pods is the backstop.
+            self.report_awaiting = await self.resend_unacked_container_created(ws)
+            await self._send_resumed_creates_report_once_answered(ws)
 
         self.ws = ws
         if report is None:
@@ -438,29 +425,29 @@ class ComputeClient:
 
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
+            if self.resumed_creates_report is not None and self._answers_a_replayed_success(raw_msg):
+                await self._send_resumed_creates_report_once_answered(ws)
 
-    async def _receipts_for_replayed_successes(self, ws: ClientConnection, replayed: dict[str, str]) -> bool:
-        """replayed: pod id -> the command_id its success carries. Frames are handled as they come; True once each
-        has its rent-finished (one naming another dispatch does not count), False when the wait runs out."""
-        waiting = dict(replayed)
-        deadline = time.monotonic() + REPLAY_RECEIPT_WAIT_SECONDS
-        while waiting:
-            try:
-                raw_msg = await asyncio.wait_for(ws.recv(), deadline - time.monotonic())
-            except asyncio.TimeoutError:
-                return False
-            await self.handle_message(raw_msg)
-            try:
-                receipt = ExecutorRentFinishedRequest.model_validate_json(raw_msg)
-            except pydantic.ValidationError:
-                continue
-            if (
-                receipt.message_type == ContainerRequestType.ExecutorRentFinished
-                and receipt.pod_id in waiting
-                and receipt.command_id in ("", waiting[receipt.pod_id])
-            ):
-                del waiting[receipt.pod_id]
-        return True
+    def _answers_a_replayed_success(self, raw_msg: str | bytes) -> bool:
+        """pops the success a rent-finished answers; one naming another dispatch of the pod answers nothing"""
+        try:
+            receipt = ExecutorRentFinishedRequest.model_validate_json(raw_msg)
+        except pydantic.ValidationError:
+            return False
+        if receipt.message_type != ContainerRequestType.ExecutorRentFinished or receipt.create_command_id not in (
+            "",
+            self.report_awaiting.get(receipt.pod_id),
+        ):
+            return False
+        return self.report_awaiting.pop(receipt.pod_id, None) is not None
+
+    async def _send_resumed_creates_report_once_answered(self, ws: ClientConnection) -> None:
+        if self.report_awaiting or (report := self.resumed_creates_report) is None:
+            return
+        report.sent_at = time.time()
+        await ws.send(report.model_dump_json())
+        self.resumed_creates_report = None
+        self.create_accepted_while_report_pending = False
 
     async def subscribe_mesages_from_redis(self):
         validator_hotkey = self.my_hotkey()
@@ -968,6 +955,8 @@ class ComputeClient:
             )
             pass
         else:
+            if isinstance(job_request, ContainerCreateRequest) and self.resumed_creates_report is not None:
+                self.create_accepted_while_report_pending = True
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
@@ -1542,7 +1531,7 @@ class ComputeClient:
 
             # DAH-5380: a receipt names the dispatch it answers; a late one for an older create keeps a reboot's state
             await self.miner_service.redis_service.remove_pending_pod(
-                job_request.miner_hotkey, job_request.executor_id, job_request.pod_id, command_id=job_request.command_id
+                job_request.miner_hotkey, job_request.executor_id, job_request.pod_id, command_id=job_request.create_command_id
             )
         elif isinstance(job_request, GetPodLogsRequestFromServer):
             job_request.miner_address = miner_axon_info.ip
