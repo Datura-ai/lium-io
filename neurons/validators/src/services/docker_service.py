@@ -513,7 +513,7 @@ _ANONYMOUS_VOLUME_NAME_RE = re.compile(r"[0-9a-f]{64}")
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # a clamp within 5% is listing drift (the scrape is ~15 min old and a filler download may still be writing);
 # below it the renter is short-changed, so the create fails and the backend's rent retry moves the pod to another node
-RENTAL_VOLUME_CLAMP_MIN_SHARE = 0.95
+RENTAL_VOLUME_MIN_SHARE_OF_ORDER = 0.95
 RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
@@ -5297,6 +5297,7 @@ class DockerService:
                 return free_now_gb >= rental_needs_free_gb
 
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
+            removal_failed = False
             try:
                 await evict_cache_volumes_oldest_first(
                     ssh_client, cache_volumes, remove, rental_fits, evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX
@@ -5304,6 +5305,7 @@ class DockerService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                removal_failed = True
                 logger.warning(
                     _m(
                         "DPHN cache reclaim for rental failed; continuing with the rent",
@@ -5311,9 +5313,16 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
-            # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed
+            # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed.
+            # Still short after every removal worked: the cache was not what was missing, so the size stays as ordered.
             if not payload.local_volume and not await rental_fits():
-                await self._clamp_rental_volume_to_free_disk(ssh_client, payload, docker_root_dir, fit)
+                if not removal_failed:
+                    left: list[str] = await self._find_cache_volumes_to_sweep(
+                        ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES
+                    )
+                    removal_failed = bool(set(left) & set(cache_volumes))
+                if removal_failed:
+                    await self._clamp_rental_volume_to_free_disk(ssh_client, payload, docker_root_dir, fit)
             return True
         except asyncio.CancelledError:
             raise
@@ -9606,7 +9615,7 @@ class DockerService:
                     if (
                         clamped_for_cache
                         and effective_volume_limit_gb is not None
-                        and effective_volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_CLAMP_MIN_SHARE
+                        and effective_volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_MIN_SHARE_OF_ORDER
                     ):
                         current_step = RENTAL_DISK_SHORT_STEP
                         raise RuntimeError(

@@ -367,6 +367,25 @@ async def test_a_rental_that_still_does_not_fit_after_the_eviction_is_clamped_to
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("removal_works", "volume_gb"), [(True, 2620), (False, 2389 - 1310)])
+async def test_a_rental_still_short_is_clamped_only_when_a_removal_failed(docker_service, removal_works, volume_gb):
+    # DAH-5260 review: every removal worked and the disk is still short, so the cache was not what was missing and the
+    # size stays as ordered; a removal that left its volume behind clamps
+    class RemovingSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command and removal_works:
+                self._listing = "volume_pod"
+            return await super().run(command, *args, **kwargs)
+
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        RemovingSshClient([_KIMI, "volume_pod"], free_gb=2389), rental, {}
+    ) is True
+    assert rental.volume_limit_gb == volume_gb
+
+
+@pytest.mark.asyncio
 async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(docker_service, monkeypatch):
     class HangingRemoval(HostSshClient):
         async def run(self, command: str, *args, **kwargs):
