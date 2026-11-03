@@ -377,8 +377,8 @@ class GpuAttestationIdentityCheck:
                 findings.append("identity_changed")  # the UUID now on another card, or gone dark
             if changed:
                 findings.append("hardware_changed_under_uuid")
-            if not findings:  # a node under a finding cannot rewrite its pins
-                writes = RedisWrites()
+            writes = RedisWrites()
+            if not findings:  # a node under a finding cannot rewrite its per-card pins
                 for gpu_uuid, v in verified.items():
                     writes.set(f"{KEY_UUID}:{gpu_uuid}", v["identity"], ex=KEY_TTL_SECONDS)
                     writes.set(f"{KEY_IDENTITY}:{v['identity']}", gpu_uuid, ex=KEY_TTL_SECONDS)
@@ -386,9 +386,9 @@ class GpuAttestationIdentityCheck:
                     writes.set(f"{KEY_HW}:{gpu_uuid}", json.dumps(hw), ex=KEY_TTL_SECONDS)
                     if serial := _serial(hw):
                         writes.set(f"{KEY_SERIAL}:{serial}", gpu_uuid, ex=KEY_TTL_SECONDS)
-                if slots:
-                    writes.set(host_key, json.dumps({"uuids": reported, "slots": slots}), ex=KEY_TTL_SECONDS)
-                await redis.write_atomically(writes)
+            if slots:  # always: a whole-set change is reported once, not on every cycle for the TTL
+                writes.set(host_key, json.dumps({"uuids": reported, "slots": slots}), ex=KEY_TTL_SECONDS)
+            await redis.write_atomically(writes)
         except Exception:
             logger.warning("gpu identity record unavailable", exc_info=True, extra=ctx.default_extra)
 

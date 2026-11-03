@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import shlex
 from unittest.mock import AsyncMock, Mock
 
@@ -11,13 +12,18 @@ import pytest
 from core.config import settings
 from payload_models.payloads import ContainerCreateRequest
 from services import docker_service as docker_service_module
-from services.loopback_plugin_setup import loopback_plugin_setup_command
+from services.loopback_plugin_setup import (
+    LOOPBACK_PLUGIN_BUILDS,
+    loopback_plugin_probe_marker_path,
+    loopback_plugin_setup_command,
+)
 from services.docker_service import (
     DockerService,
     NoUsableLoopbackPluginError,
     SshSessionMayStillBeTakenError,
     VolumeHostProbe,
     _run_with_host_timeout,
+    _volume_host_probe_command,
 )
 from test_deploy_optimizations import (
     _patch_happy,
@@ -70,10 +76,34 @@ def docker_service():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _v3_is_the_current_plugin(monkeypatch):
+    # this module describes the v3 generation; the flag-off tests switch it back to v2
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", True)
+
+
+@pytest.mark.parametrize(
+    "v3_enabled, named, other",
+    [(True, "vloopback:v3", "vloopback:v2"), (False, "vloopback:v2", "vloopback:v3")],
+)
+def test_host_probe_command_reads_the_current_alias_at_call_time(
+    monkeypatch, v3_enabled, named, other
+):
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", v3_enabled)
+
+    command = _volume_host_probe_command(with_df=False)
+
+    assert named in command and other not in command
+
+
 @pytest.mark.asyncio
-async def test_probe_volume_host_lets_a_session_that_may_stay_taken_stop_the_create(docker_service, monkeypatch):
+async def test_probe_volume_host_lets_a_session_that_may_stay_taken_stop_the_create(
+    docker_service, monkeypatch
+):
     monkeypatch.setattr(
-        docker_service_module, "_run_with_host_timeout", AsyncMock(side_effect=SshSessionMayStillBeTakenError())
+        docker_service_module,
+        "_run_with_host_timeout",
+        AsyncMock(side_effect=SshSessionMayStillBeTakenError()),
     )
 
     with pytest.raises(SshSessionMayStillBeTakenError):
@@ -108,7 +138,9 @@ async def _create_volume(docker_service, ssh_client, probe):
 
 
 @pytest.mark.asyncio
-async def test_v2_switch_uses_enabled_v1_even_when_the_probe_saw_enabled_v2(docker_service, monkeypatch):
+async def test_v2_switch_uses_enabled_v1_even_when_the_probe_saw_enabled_v2(
+    docker_service, monkeypatch
+):
     # Arrange
     monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V2_ENABLED", False)
     ssh_client = _plugin_host(old_state="true")
@@ -120,13 +152,14 @@ async def test_v2_switch_uses_enabled_v1_even_when_the_probe_saw_enabled_v2(dock
     # Assert: the switch prevents v2 installation, verification, enable and volume creation.
     assert created[0]["driver"] == "vloopback"
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert len(commands) == 1
-    assert "vloopback:v2" not in commands[0]
-    assert "python3" not in commands[0]
+    assert commands and all("plugin inspect" in command for command in commands)
+    assert not any("vloopback:v3" in command or "python3" in command for command in commands)
 
 
 @pytest.mark.asyncio
-async def test_v2_setup_transport_loss_stops_without_fallback_or_volume_creation(docker_service, monkeypatch):
+async def test_v2_setup_transport_loss_stops_without_fallback_or_volume_creation(
+    docker_service, monkeypatch
+):
     # Arrange
     run = AsyncMock(side_effect=asyncssh.ConnectionLost("connection closed"))
     monkeypatch.setattr(docker_service_module, "_run_with_host_timeout", run)
@@ -156,7 +189,9 @@ async def test_create_local_volume_disabled_plugin_enable_error_logs_only_its_ty
 ):
     secret_text = "ssh ubuntu@10.1.2.3: token=ghp_leakme at /home/provider/.ssh/id_rsa"
     ssh_client = Mock()
-    ssh_client.run = AsyncMock(side_effect=[OSError(secret_text), TimeoutError()])
+    ssh_client.run = AsyncMock(
+        side_effect=[OSError(secret_text), TimeoutError(), TimeoutError(), TimeoutError()]
+    )
     ssh_client = ssh_client_answering_through_run(ssh_client.run)
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
@@ -164,10 +199,9 @@ async def test_create_local_volume_disabled_plugin_enable_error_logs_only_its_ty
     with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
         await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
-    assert "v2 setup error: OSError" in str(exc_info.value)
+    assert "v3 setup error: OSError" in str(exc_info.value)
     assert secret_text not in str(exc_info.value)
     assert all(secret_text not in str(call) for call in warning.call_args_list)
-
 
 
 # v2 beside the old plugin: a stalled command frees its SSH channel (MaxSessions=1) or stops the create;
@@ -198,8 +232,18 @@ def _channel_ssh(*, open_s: float, run_s: float, closes: bool = True) -> tuple[M
         (0, 0, True, None),
         (0, 1, True, TimeoutError),  # the command outlives the deadline: its channel is closed
         (0, 1, False, SshSessionMayStillBeTakenError),  # ... and the close is not confirmed
-        (0.075, 0, True, TimeoutError),  # the open answers after the deadline, within the second wait
-        (0.3, 0, True, SshSessionMayStillBeTakenError),  # never in time: closed whenever it does answer
+        (
+            0.075,
+            0,
+            True,
+            TimeoutError,
+        ),  # the open answers after the deadline, within the second wait
+        (
+            0.3,
+            0,
+            True,
+            SshSessionMayStillBeTakenError,
+        ),  # never in time: closed whenever it does answer
     ],
 )
 async def test_run_with_host_timeout_frees_the_channel_or_stops_the_create(
@@ -220,28 +264,48 @@ async def test_run_with_host_timeout_frees_the_channel_or_stops_the_create(
 
 
 def _plugin_host(
-    *, v2_state: str = "absent", old_state: str = "true", install: str = "fails", docker_root: str = "/var/lib/docker", enable_succeeds: bool = False
+    *,
+    v2_state: str = "absent",
+    previous_state: str = "absent",
+    old_state: str = "true",
+    install: str = "fails",
+    docker_root: str = "/var/lib/docker",
+    enable_succeeds: bool = False,
+    previous_install: str = "fails",
 ) -> Mock:
     # the host's docker through ssh: a v2 install or enable that fails (or never answers), and the plugin states
     async def answer(command: str):
         nonlocal v2_state
         command = shlex.split(command)[-1] if command.startswith("timeout -k 5 ") else command
+        if command.startswith("python3 ") and "vloopback:v2" in command and settings.LOOPBACK_PLUGIN_V3_ENABLED:
+            # the previous plugin's setup, run when v3 cannot be used on a node without an enabled v2
+            if previous_install == "succeeds":
+                return Mock(stdout="verified plugin ready\n", stderr="", exit_status=0)
+            return Mock(stdout="", stderr="installation did not produce a plugin", exit_status=1)
         if command.startswith("python3 "):
             if v2_state == "true" or (v2_state == "false" and enable_succeeds):
-                return Mock(stdout="verified v2 ready\n", stderr="", exit_status=0)
+                return Mock(stdout="verified plugin ready\n", stderr="", exit_status=0)
             if install == "hangs":
                 await asyncio.Event().wait()
-            return Mock(stdout="", stderr="v2 installation did not produce a plugin", exit_status=1)
+            return Mock(stdout="", stderr="installation did not produce a plugin", exit_status=1)
         if "docker info" in command:
             return Mock(stdout=f"{docker_root}\n", stderr="", exit_status=0)
         if "plugin inspect" in command:
-            state = v2_state if "vloopback:v2" in command else old_state
+            state = (
+                v2_state
+                if "vloopback:v3" in command
+                else previous_state
+                if "vloopback:v2" in command
+                else old_state
+            )
             if state == "unreadable":
                 raise TimeoutError
             return Mock(stdout=f"{state}\n", stderr="", exit_status=0)
         if install == "hangs":
             await asyncio.Event().wait()
-        return Mock(stdout="", stderr="Error response from daemon: registry unreachable", exit_status=1)
+        return Mock(
+            stdout="", stderr="Error response from daemon: registry unreachable", exit_status=1
+        )
 
     return ssh_client_answering_through_run(AsyncMock(side_effect=answer))
 
@@ -259,11 +323,11 @@ async def test_run_with_host_timeout_waits_the_margin_past_the_host_timeout(monk
 @pytest.mark.parametrize(
     "probe, install, v2_state, reason",
     [
-        (None, "fails", "absent", "v2 setup exit 1:"),
-        (None, "hangs", "absent", "v2 setup timed out"),
-        (_disabled_plugin_probe(), "fails", "false", "v2 setup exit 1:"),
-        (None, "fails", "false", "v2 setup exit 1:"),
-        (None, "fails", "unreadable", "v2 setup exit 1:"),
+        (None, "fails", "absent", "v3 setup exit 1:"),
+        (None, "hangs", "absent", "v3 setup timed out"),
+        (_disabled_plugin_probe(), "fails", "false", "v3 setup exit 1:"),
+        (None, "fails", "false", "v3 setup exit 1:"),
+        (None, "fails", "unreadable", "v3 setup exit 1:"),
     ],
 )
 async def test_create_local_volume_falls_back_to_the_enabled_old_plugin_when_v2_cannot_be_used(
@@ -272,6 +336,7 @@ async def test_create_local_volume_falls_back_to_the_enabled_old_plugin_when_v2_
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
     monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
     ssh_client = _plugin_host(v2_state=v2_state, install=install)
 
@@ -279,15 +344,108 @@ async def test_create_local_volume_falls_back_to_the_enabled_old_plugin_when_v2_
 
     assert [volume["driver"] for volume in created] == ["vloopback"]
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert all(command.startswith("timeout -k 5 ") for command in commands if "docker info" not in command)
+    assert all(
+        command.startswith("timeout -k 5 ") for command in commands if "docker info" not in command
+    )
     (logged,), _ = warning.call_args
-    assert str(logged).startswith("Loopback plugin v2 unusable; creating this volume on the old plugin")
+    assert str(logged).startswith(
+        "Loopback plugin unusable; creating this volume on an older plugin"
+    )
     assert logged.extra["reason"].startswith(reason)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("old_state", ["absent", "true"])
+async def test_create_local_volume_falls_back_to_the_enabled_previous_plugin_before_the_legacy_one(
+    docker_service, monkeypatch, old_state
+):
+    monkeypatch.setattr(docker_service_module.logger, "warning", Mock())
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
+    ssh_client = _plugin_host(v2_state="absent", previous_state="true", old_state=old_state)
+
+    created = await asyncio.wait_for(_create_volume(docker_service, ssh_client, None), timeout=5)
+
+    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    legacy_state_command = docker_service_module._loopback_plugin_state_command("vloopback")
+    assert not any(legacy_state_command in command for command in commands)
+    assert not any("plugin enable" in command for command in commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old_state, outcome",
+    [("true", "vloopback"), ("absent", NoUsableLoopbackPluginError)],
+    ids=["legacy-enabled", "only-v2-enabled"],
+)
+async def test_v2_switch_off_never_creates_on_the_previous_plugin(
+    docker_service, monkeypatch, old_state, outcome
+):
+    # the switch off makes RentalVerificationCheck name the legacy plugin to the backend's health
+    # check, so a volume on v2 would be one the check never probes
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V2_ENABLED", False)
+    monkeypatch.setattr(docker_service_module.logger, "warning", Mock())
+    ssh_client = _plugin_host(previous_state="true", old_state=old_state)
+
+    if outcome is NoUsableLoopbackPluginError:
+        with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
+            await _create_volume(docker_service, ssh_client, None)
+        assert "vloopback:v2" not in str(exc_info.value)
+        created = []
+    else:
+        created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == ([outcome] if created else [])
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert not any("vloopback:v2" in command for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_v3_switch_off_creates_on_v2_exactly_as_before(docker_service, monkeypatch):
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", False)
+    ssh_client = _plugin_host(v2_state="true")
+
+    created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert commands[-1] == _bounded(
+        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2", 60), 60
+    )
+    assert "1.0.0-lium1" in commands[-1]
+    assert not any("vloopback:v3" in command or "lium3" in command for command in commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old_state, outcome", [("true", "vloopback"), ("absent", NoUsableLoopbackPluginError)]
+)
+async def test_v3_switch_off_falls_back_from_v2_straight_to_the_legacy_plugin(
+    docker_service, monkeypatch, old_state, outcome
+):
+    # with v3 off, v2 is the current plugin: when it cannot be used only the legacy one is left
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", False)
+    monkeypatch.setattr(docker_service_module.logger, "warning", Mock())
+    ssh_client = _plugin_host(v2_state="absent", previous_state="absent", old_state=old_state)
+
+    if outcome is NoUsableLoopbackPluginError:
+        with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
+            await _create_volume(docker_service, ssh_client, None)
+        assert str(exc_info.value).endswith("; old plugin vloopback state absent)")
+        created = []
+    else:
+        created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == ([outcome] if created else [])
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert not any("vloopback:v3" in command for command in commands)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("old_state", ["absent", "false"])
-async def test_create_local_volume_fails_naming_both_and_never_installs_or_enables_the_old_plugin(
+async def test_create_local_volume_fails_naming_both_setups_and_never_sets_up_the_legacy_plugin(
     docker_service, old_state
 ):
     ssh_client = _plugin_host(old_state=old_state)
@@ -296,16 +454,48 @@ async def test_create_local_volume_fails_naming_both_and_never_installs_or_enabl
         await _create_volume(docker_service, ssh_client, None)
 
     message = str(exc_info.value)
-    assert message.startswith("no usable vloopback plugin on host (v2: v2 setup exit 1:")
-    assert message.endswith(f"; old plugin vloopback state {old_state})")
-    commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert all("vloopback:v2" in command for command in commands if "plugin install" in command)
-    assert not any("plugin enable" in command for command in commands)
+    # the message names the generation that failed, not v2 (review, 27.10)
+    assert message.startswith("no usable vloopback plugin on host (v3: v3 setup exit 1:")
+    assert message.endswith(
+        "; old plugin vloopback:v2 state absent (v2 setup exit 1: installation did not produce a plugin), "
+        f"plugin vloopback state {old_state})"
+    )
+    setup_commands = [call.args[0] for call in ssh_client.run.await_args_list if "python3 " in call.args[0]]
+    assert ["vloopback:v3" in command for command in setup_commands] == [True, False]
+    assert all("vloopback:v3" in command or "vloopback:v2" in command for command in setup_commands)
     assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("v2_state, old_state, driver", [("true", "absent", "vloopback:v2"), ("absent", "true", "vloopback")])
+@pytest.mark.parametrize("previous_state", ["absent", "false"])
+async def test_create_local_volume_sets_up_v2_when_v3_cannot_be_used_on_a_node_without_an_enabled_v2(
+    docker_service, monkeypatch, previous_state
+):
+    # Arrange: a node that joined with v3 on never had v2 installed; the host refuses v3's probe
+    # (review, 30.10: such a node lost every size-limited rent, the fallback only read states)
+    warning = Mock()
+    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
+    ssh_client = _plugin_host(previous_state=previous_state, old_state="absent", previous_install="succeeds")
+
+    # Act
+    created = await _create_volume(docker_service, ssh_client, None)
+
+    # Assert: v2 is set up as the flag off would, under the plain install budget, before the legacy plugin is read
+    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert commands[-1] == _bounded(loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2", 60), 60)
+    legacy_state_command = docker_service_module._loopback_plugin_state_command("vloopback")
+    assert not any(legacy_state_command in command for command in commands)
+    (logged,), _ = warning.call_args
+    assert logged.extra["loopback_plugin"] == "vloopback:v2"
+    assert logged.extra["reason"].startswith("v3 setup exit 1:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "v2_state, old_state, driver",
+    [("true", "absent", "vloopback:v3"), ("absent", "true", "vloopback")],
+)
 async def test_create_local_volume_without_a_docker_data_root_never_installs_v2(
     docker_service, v2_state, old_state, driver
 ):
@@ -328,10 +518,12 @@ async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_
     # Act
     created = await _create_volume(docker_service, ssh_client, None)
     # Assert: recover disabled v2 before considering any legacy plugin, whatever its state.
-    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
+    assert [volume["driver"] for volume in created] == ["vloopback:v3"]
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert commands[-1] == _bounded(loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2"), 60)
-    assert all("vloopback:v2" in command for command in commands if "plugin" in command)
+    assert commands[-1] == _bounded(
+        loopback_plugin_setup_command("/var/lib/docker", "vloopback:v3", 150), 150
+    )
+    assert all("vloopback:v3" in command for command in commands if "plugin" in command)
 
 
 @pytest.mark.asyncio
@@ -406,9 +598,7 @@ async def test_create_container_passthrough_sizing_with_a_limit_probes_without_d
 
 
 @pytest.mark.asyncio
-async def test_create_container_unlimited_volume_on_passthrough_never_probes(
-    svc, monkeypatch
-):
+async def test_create_container_unlimited_volume_on_passthrough_never_probes(svc, monkeypatch):
     # No df to measure (passthrough) and no `-o size=` volume (no plugin, no root dir needed):
     # nothing would read the probe, so it is not run.
     ssh_client = _deploy_ssh_client()
@@ -432,3 +622,81 @@ async def test_create_container_probe_failure_takes_the_per_command_path(svc, mo
     assert result.__class__.__name__ == "ContainerCreated"
     assert svc.resolve_volume_sizing.await_args.kwargs["host_probe"] is None
     assert svc.create_local_volume.await_args.kwargs["host_probe"] is None
+
+
+@pytest.mark.parametrize(
+    "enabled, marker, expected",
+    [
+        ("true", "current", "true"),
+        ("true", None, "unverified"),
+        ("true", "old", "unverified"),
+        ("true", "another-install", "unverified"),
+        ("true", "another-data-dir", "unverified"),
+        ("false", None, "false"),
+    ],
+    ids=[
+        "probed",
+        "enabled-unprobed",
+        "enabled-probed-as-old-build",
+        "enabled-probed-as-another-install",
+        "enabled-probed-in-another-data-dir",
+        "disabled",
+    ],
+)
+def test_plugin_state_reads_unverified_for_an_enabled_v3_without_its_probe_marker(
+    tmp_path, enabled, marker, expected
+):
+    # an enabled v3 is handed out by the fast path only once the setup script's probe volume mounted
+    # on it: a probe cut short by the validator's deadline leaves the plugin enabled without the
+    # marker, and the next create must probe again instead of renting on it (reread, 27.10). The
+    # marker holds the digest, plugin ID and Env it was written for: the marker of another build, of a
+    # plugin since removed and installed again, or set to another data directory, does not count
+    # (review, 30.10)
+    installation = "a" * 64 + ' ["DATA_DIR=/srv/var/lib/docker/vloopback-v3"]'
+    docker = tmp_path / "docker"
+    docker.write_text(f"#!/bin/sh\ncase \"$*\" in *.Id*) echo '{installation}' ;; *) echo {enabled} ;; esac\n")
+    docker.chmod(0o700)
+    marker_path = tmp_path / "probe-ok"
+    digest = LOOPBACK_PLUGIN_BUILDS["vloopback:v3"].digest
+    if marker == "current":
+        marker_path.write_text(f"{digest} {installation}")
+    elif marker == "another-install":
+        marker_path.write_text(f"{digest} {installation.replace('a', 'b')}")
+    elif marker == "another-data-dir":
+        marker_path.write_text(f"{digest} {installation.replace('vloopback-v3', 'moved')}")
+    elif marker == "old":
+        marker_path.write_text("sha256:" + "0" * 64)
+    command = (
+        docker_service_module._loopback_plugin_state_command("vloopback:v3")
+        .replace("/usr/bin/docker", str(docker))
+        .replace(loopback_plugin_probe_marker_path("vloopback:v3"), str(marker_path))
+    )
+
+    state = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=5)
+
+    assert state.stdout.strip() == expected
+    assert "probe-ok" not in docker_service_module._loopback_plugin_state_command("vloopback:v2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "v3_enabled, alias, budget",
+    [(True, "vloopback:v3", "150"), (False, "vloopback:v2", "60")],
+)
+async def test_plugin_setup_runs_under_the_probed_budget_only_for_the_generation_that_probes(
+    docker_service, monkeypatch, v3_enabled, alias, budget
+):
+    # the direct-I/O setup also mounts a probe volume, so it gets more host time than a plain install
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", v3_enabled)
+    ssh_client = _plugin_host(v2_state="true", previous_state="true")
+
+    created = await asyncio.wait_for(_create_volume(docker_service, ssh_client, None), timeout=5)
+
+    assert [volume["driver"] for volume in created] == [alias]
+    setup_commands = [
+        call.args[0] for call in ssh_client.run.await_args_list if "python3 " in call.args[0]
+    ]
+    assert len(setup_commands) == 1
+    assert setup_commands[0].startswith(f"timeout -k 5 {budget} ")
+    # the script measures its probe against the same deadline
+    assert shlex.split(shlex.split(setup_commands[0])[-1])[9] == budget

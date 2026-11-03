@@ -603,19 +603,20 @@ async def test_a_filler_that_is_not_exiting_fails_at_its_own_step(
 
 
 @pytest.mark.asyncio
-async def test_a_not_exiting_filler_that_dockerd_then_removes_does_not_fail_the_create(
+async def test_a_not_exiting_filler_removed_by_a_later_rm_does_not_fail_the_create(
     docker_service, retry_ssh_mock, _short_filler_only_bound, monkeypatch
 ):
-    """28 Oct (8x B300): the filler's processes were in D state on a FUSE lookup, SIGKILL pending; dockerd
-    removed it ~30 s after the rm, while the cleanup deadline still had time left."""
+    """The filler's processes sat in D state on a FUSE lookup, SIGKILL pending. dockerd gave up the first rm
+    and never retried it: the stopped filler stayed listed until another rm removed it in seconds."""
     monkeypatch.setattr(ds_module, "_STUCK_FILLER_RELIST_SECONDS", 0.01)
     ssh_client = _stuck_filler_host(f"HOSTPID\nPROC\t{_STUCK_ID}\t4242\tD\t4194560\trequest_wait_answer\n")
     stuck_host = ssh_client.run.side_effect
-    listings = iter([f"filler_stuck {_STUCK_ID}\n", f"filler_stuck {_STUCK_ID}\n", ""])
+    rm_answers = iter([None, f"RM\t1\nNAME\tfiller_stuck {_STUCK_ID}\nPS\t0\n", "RM\t0\nPS\t0\n"])
 
     async def run(cmd, *args, **kwargs):
-        if cmd == ds_module.DOCKER_PS_ALL_NAMES_IDS_CMD:
-            return _listing(next(listings))
+        if "docker rm -fv" in cmd and (answer := next(rm_answers)) is not None:
+            return _listing(answer)
+        # the first rm hangs; a plain listing keeps the filler
         return await stuck_host(cmd, *args, **kwargs)
 
     ssh_client.run.side_effect = run
@@ -629,6 +630,7 @@ async def test_a_not_exiting_filler_that_dockerd_then_removes_does_not_fail_the_
 
     assert removed.listed_id_by_filler_name == {"filler_stuck": _STUCK_ID}
     assert _STUCK_ID not in ds_module.fillers_exiting_after_kill
+    assert len([cmd for cmd in _commands(ssh_client) if "docker rm -fv" in cmd]) == 3
 
 
 @pytest.mark.asyncio
