@@ -30,7 +30,7 @@ DISK_HELPERS = {
     "DOCKER_SOCKET_PATH",
     "DOCKER_API_TIMEOUT_SECONDS",
     "VLOOPBACK_DRIVER_PREFIX",
-    "VLOOPBACK_V2_DATA_DIR_NAME",
+    "VLOOPBACK_HOST_DATA_DIR_NAMES",
     "UnixSocketHTTPConnection",
     "docker_api_get",
     "get_vloopback_volume_bytes",
@@ -87,7 +87,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_images": (45079943748 + 2000000000) // 1024,
         "hard_disk_containers": (282628096 + 1024) // 1024,
         "hard_disk_volumes": 5454000000 // 1024,
-        "filler_run_volume_kb": 0,
+        "filler_released_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
         "hard_disk_by_container": {},
         "hard_disk_by_volume": {},
@@ -261,7 +261,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
         "hard_disk_volumes": 0,
-        "filler_run_volume_kb": 0,
+        "filler_released_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
         "hard_disk_by_container": {},
         "hard_disk_by_volume": {},
@@ -360,14 +360,17 @@ def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, 
 
 
 @pytest.mark.parametrize("old_blocks, total_blocks", [(1953136, 1953136 + 7488), (None, 7488)])
-def test_vloopback_volume_bytes_counts_the_v2_host_data_dir_beside_the_old_plugin_rootfs(
+def test_vloopback_volume_bytes_counts_the_v2_and_v3_host_data_dirs_beside_the_old_plugin_rootfs(
     scrape: dict, monkeypatch, old_blocks, total_blocks
 ) -> None:
     # the old plugin's files sit in its rootfs (found by the glob), v2's in a host dir under DockerRootDir;
     # a node with v2 only is a fresh one, not a structural miss
     old_dir = "/proc/1/root/var/lib/docker/plugins/abc/rootfs/var/lib/docker/loopback"
     v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
-    blocks = {f"{v2_dir}/volume_v2": 7488} | ({f"{old_dir}/volume_old": old_blocks} if old_blocks else {})
+    v3_dir = "/proc/1/root/var/lib/docker/vloopback-v3"
+    blocks = {f"{v2_dir}/volume_v2": 7488, f"{v3_dir}/volume_v3": 96} | (
+        {f"{old_dir}/volume_old": old_blocks} if old_blocks else {}
+    )
 
     def stat(path):
         if path not in blocks:
@@ -375,12 +378,16 @@ def test_vloopback_volume_bytes_counts_the_v2_host_data_dir_beside_the_old_plugi
         return SimpleNamespace(st_blocks=blocks[path])
 
     monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [old_dir] if old_blocks else []))
-    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate in (v2_dir, v3_dir))
     monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
-    volumes = [{"Name": "volume_old", "Driver": "vloopback:latest"}, {"Name": "volume_v2", "Driver": "vloopback:v2"}]
+    volumes = [
+        {"Name": "volume_old", "Driver": "vloopback:latest"},
+        {"Name": "volume_v2", "Driver": "vloopback:v2"},
+        {"Name": "volume_v3", "Driver": "vloopback:v3"},
+    ]
     _stub_docker_api(scrape, {"/volumes": {"Volumes": volumes}})
 
-    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == total_blocks * 512
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == (total_blocks + 96) * 512
 
 
 def _obfuscation_tables() -> tuple[set[str], set[str]]:
@@ -596,9 +603,9 @@ def test_disk_usage_survives_a_silent_docker_socket(scrape: dict, monkeypatch) -
     assert asked == ["/proc/1/root/var/lib/docker"]
 
 
-def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
-    # Arrange — an engy checkpoint and a dolphin cache next to a renter's volume. Kept across rentals
-    # (Fish 26 Oct), so a renter is listed the free disk beside them, not the disk they hold.
+def test_the_engy_cache_is_reported_as_free_disk_and_the_dolphin_cache_stays_used(scrape: dict) -> None:
+    # Arrange — an engy checkpoint and a dolphin cache next to a renter's volume. DAH-5260: a customer create
+    # removes the Engy cache when the renter needs its space, so an idle node lists it as free.
     _stub_docker_api(
         scrape,
         {
@@ -626,15 +633,15 @@ def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
     hard_disk.update(scrape["get_docker_disk_usage"]())
     scrape["release_filler_cache"](hard_disk)
 
-    # Assert — used/free untouched, the caches counted in the volumes breakdown
+    # Assert — the engy cache moved from used to free and out of the volumes breakdown
     assert hard_disk == {
         "hard_disk_total": 4000 * 1024**2,
-        "hard_disk_used": 1600 * 1024**2,
-        "hard_disk_free": 2400 * 1024**2,
-        "hard_disk_utilization": 40.0,
+        "hard_disk_used": 100 * 1024**2,
+        "hard_disk_free": 3900 * 1024**2,
+        "hard_disk_utilization": 2.5,
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
-        "hard_disk_volumes": 1550 * 1024**2,
+        "hard_disk_volumes": 50 * 1024**2,
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
         "hard_disk_by_container": {},
@@ -686,7 +693,7 @@ def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeyp
 
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:
     # Arrange — the host half of the scrape failed, the docker half did not
-    hard_disk = {"hard_disk_volumes": 0, "filler_run_volume_kb": 5}
+    hard_disk = {"hard_disk_volumes": 0, "filler_released_kb": 5}
 
     # Act
     scrape["release_filler_cache"](hard_disk)

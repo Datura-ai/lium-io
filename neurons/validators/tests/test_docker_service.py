@@ -3237,6 +3237,8 @@ async def test_stop_container_sdk_failure_returns_failed_request_without_shell_f
     )
 
     assert isinstance(result, FailedContainerRequest)
+    # DAH-5510: Docker's own error reaches the backend, the renter-facing headline stays bare
+    assert "SDK stop failed" in result.detail and "SDK stop failed" not in result.msg
     assert connect_mock.call_count == 0
     assert docker_service.rental_docker_client_factory.client.stopped_containers == [
         "pod_test"
@@ -4044,7 +4046,7 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
-        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
     )
     docker_client.pull_error = Exception("blocked")
     payload = _private_registry_create_payload()
@@ -4069,9 +4071,111 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_login"
     assert (
-        "earlier login failure: Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker login failed: Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
         in result.detail
     )
+    assert "pull without login then failed: blocked" in result.detail
+    # the wire msg the backend shows the renter: the reason only, no registry or executor text
+    assert result.msg == "Docker login refused by the image registry: check the template's registry credentials"
+
+
+@pytest.mark.parametrize(
+    ("login_error", "expected"),
+    [
+        ("Docker SDK login for r.example failed: 503 Server Error: Service Unavailable", "Docker login to the image registry failed"),
+        ("Docker SDK login for r.example failed: UnixHTTPConnectionPool: Read timed out. (read timeout=60)", "Docker login to the image registry failed"),
+        ('Get "https://r.example/v2/": dial tcp: i/o timeout', "Docker login timed out while contacting the image registry"),
+        ("401 Client Error: unauthorized: incorrect username or password", "Docker login refused by the image registry: check the template's registry credentials"),
+        ('Get "https://r.example/v2/": net/http: TLS handshake timeout', "Docker login timed out while contacting the image registry"),
+        ('Get "https://r.example/v2/": net/http: timeout awaiting response headers', "Docker login timed out while contacting the image registry"),
+        (
+            'Docker SDK login for unauthorized.example failed: 503 Server Error for http+docker://ssh/v1.52/auth: '
+            'Service Unavailable ("Get "https://unauthorized.example/v2/": service unavailable")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example failed: 500 Server Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://unauthorized.example/v2/": dial tcp: lookup unauthorized.example: no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example:5000 failed: 500 Server Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://unauthorized.example:5000/v2/": dial tcp: lookup unauthorized.example on 127.0.0.53:53: '
+            'no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example:5000 failed: 500 Server Error: (\"Get \"https://unauthorized.example:5000/v2/\": "
+            'x509: certificate is valid for other.example, not unauthorized.example")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for auth:5000 failed: 401 Client Error for http+docker://ssh/v1.52/auth: "
+            '("Get "https://auth:5000/v2/": unauthorized: incorrect username or password")',
+            "Docker login refused by the image registry: check the template's registry credentials",
+        ),
+        (
+            'Docker SDK login for unauthorized:5000 failed: 500 Server Error: ("Get "https://unauthorized:5000/v2/": '
+            'dial tcp: lookup unauthorized: no such host")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            'Docker SDK login for timeout:5000 failed: 500 Server Error: ("Get "https://timeout:5000/v2/": '
+            'net/http: TLS handshake timeout")',
+            "Docker login timed out while contacting the image registry",
+        ),
+        (
+            'Docker SDK login for registry.example failed: 500 Server Error: ("Get "https://registry.example/v2/": '
+            'x509: certificate is valid for unauthorized.example, not registry.example")',
+            "Docker login to the image registry failed",
+        ),
+        (
+            "Docker SDK login for unauthorized.example failed: 401 Client Error: unauthorized: authentication required",
+            "Docker login refused by the image registry: check the template's registry credentials",
+        ),
+    ],
+)
+def test_docker_login_failed_names_only_the_reason_the_error_shows(login_error, expected):
+    """A registry 5xx is not a credential problem, and a validator->daemon read timeout is not the registry's."""
+    from services.docker_service import DockerLoginFailed
+
+    assert DockerLoginFailed("text", login_error).renter_sentence == expected
+
+
+@pytest.mark.asyncio
+async def test_create_container_login_timeout_has_its_own_renter_headline(docker_service, monkeypatch):
+    """A login that timed out reaching the registry must not read as bad credentials (30 Oct prod: Scaleway)."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        'Docker SDK login for rg.fr-par.scw.cloud failed: 500 Server Error ("Get "https://rg.fr-par.scw.cloud/v2/":'
+        ' context deadline exceeded")'
+    )
+    docker_client.pull_error = Exception("pull access denied, may require 'docker login'")
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_login"
+    assert result.msg == "Docker login timed out while contacting the image registry"
+    assert "127.0.0.1" not in result.msg and "scw.cloud" not in result.msg
+    assert "context deadline exceeded" in result.detail
 
 
 @pytest.mark.asyncio
@@ -4082,7 +4186,7 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
     _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
-        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
     )
     payload = _private_registry_create_payload()
     executor_info = ExecutorSSHInfo(
@@ -4760,6 +4864,41 @@ async def test_failed_create_without_container_id_removes_by_name_only_when_no_o
                 ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
             )
     assert any("rm -fv pod_test" in str(call) for call in ssh_commands.call_args_list) is removed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_creates, removed", [(1, True), (2, False)])
+async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_is_live(
+    docker_service, monkeypatch, live_creates, removed,
+):
+    # F-78: the volume is named by pod; another live create of the pod may have restored into it
+    monkeypatch.setattr(
+        docker_service, "capture_failed_container_diagnostics", AsyncMock(return_value=Mock(container_missing=False))
+    )
+    ssh_commands = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        with registry.track("test"):
+            await docker_service.cleanup_failed_container_creation(
+                ssh_client=Mock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
+                remove_volume=True, container_id="cid", pod_id="test",
+            )
+    assert any("volume rm volume_test" in str(call) for call in ssh_commands.call_args_list) is removed
+
+
+def test_every_failed_create_cleanup_that_may_remove_a_volume_names_its_pod():
+    # F-78 (review): without pod_id the cleanup cannot see another live create of the pod and removes its volume
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(docker_service_module))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "cleanup_failed_container_creation"
+    ]
+    removing = [call for call in calls if any(k.arg == "remove_volume" for k in call.keywords)]
+    assert removing and all(any(k.arg == "pod_id" for k in call.keywords) for call in removing)
 
 
 @pytest.mark.asyncio
@@ -5926,7 +6065,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     """disk_share set: effective fresh values (not payload echoes) must flow into
     create_local_volume, the docker run --storage-opt flag, and ContainerCreated."""
     # Arrange: df_avail=900GB, existing vloopback=300GB, share=0.5 -> pool 1180GB,
-    # slice 590GB (request cap 500*1.5=750GB does not bind) -> volume 393, storage 196.
+    # slice 590GB (request cap 400*1.5=600GB does not bind) -> volume 393, storage 196.
     def ssh_run(command, **kwargs):
         if "docker info" in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
@@ -5988,7 +6127,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         gpu_uuids=["GPU-test"],
         cpu_count=1,
         memory_gb=1,
-        volume_limit_gb=500,
+        volume_limit_gb=400,
         storage_limit_gb=250,
         disk_share=0.5,
         available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
@@ -6860,6 +6999,66 @@ async def test_create_container_encrypted_setup_failure_cleans_up(
     assert cleanup_kwargs["container_name"] == f"pod_{pod_id}"
     assert cleanup_kwargs["volume_name"] == f"volume_{pod_id}"
     assert cleanup_kwargs["remove_volume"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("local_volume", "removed"), [(None, True), ("volume_kept", False)], ids=["fresh", "edit"])
+async def test_create_container_a_clock_reset_refusal_runs_the_failed_create_cleanup(
+    docker_service, monkeypatch, local_volume, removed
+):
+    # DAH-4663 (review): refused after the volume was made; the cleanup removes a fresh create's volume only
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "_reset_leftover_clock_locks_before_create",
+        AsyncMock(side_effect=RuntimeError("GPU clocks a previous rental locked could not be reset: GPU-test")),
+    )
+    cleanup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup_spy)
+    docker_run = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
+    pod_id = str(uuid4())
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="custom/with-label:1",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+        local_volume=local_volume,
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    cleanup_spy.assert_awaited_once()
+    assert cleanup_spy.await_args.kwargs["ssh_client"] is ssh_client
+    assert cleanup_spy.await_args.kwargs["remove_volume"] is removed
+    docker_run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -8653,6 +8852,28 @@ async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(m
 def test_no_usable_loopback_plugin_error_preserves_the_disabled_classification():
     # the stats classifier files any error with "plugin vloopback" + "disabled" as
     # volume.plugin_disabled; the message names the plugin the rent used
-    message = str(NoUsableLoopbackPluginError("verified v2 plugin remains disabled", "false"))
+    message = str(NoUsableLoopbackPluginError("verified plugin remains disabled", "vloopback:v3", {"vloopback:v2": "absent", "vloopback": "false"}))
 
     assert "plugin vloopback" in message and "disabled" in message
+
+
+@pytest.mark.asyncio
+async def test_stop_container_success_replies_container_stopped(docker_service, monkeypatch):
+    # DAH-5510: the backend's stop of a moved pod's old container waits for this reply
+    from payload_models.payloads import ContainerStopped
+
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    payload = ContainerStopRequest(
+        miner_hotkey="miner-hotkey", executor_id=str(uuid4()), pod_id="pod-id", container_name="pod_test"
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()), address="127.0.0.1", port=8001, ssh_username="root", ssh_port=2200,
+        python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.stop_container(payload, executor_info, Mock(ss58_address="v"), "encrypted")
+
+    assert isinstance(result, ContainerStopped) and result.container_name == "pod_test"
+    assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]

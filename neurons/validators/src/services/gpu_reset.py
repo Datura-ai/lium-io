@@ -16,7 +16,8 @@ Safety invariants, each pinned by a test:
 - the reset set is a subset of BOTH the container's own DeviceRequests GPUs (from the docker
   daemon) and the GPUs the backend holds for the pod;
 - `nvidia-smi -r` never runs without `-i`;
-- the container is always started again once it was stopped.
+- the container is always started again once it was stopped (or a stop of it failed), and a reset
+  of a pod whose container is not running starts it first.
 """
 
 from __future__ import annotations
@@ -53,6 +54,8 @@ HOST_SYSTEMCTL = "nsenter -t 1 -m -- systemctl"
 # NVLink subnet manager it uses on HGX Blackwell
 FABRIC_SERVICES = ("nvidia-fabricmanager", "nvidia-nvlsm")
 STOP_GRACE_SECONDS = 10
+# a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
+EXIT_WAIT_SECONDS = 90
 _QUERY_TIMEOUT_SECONDS = 30
 _RESET_TIMEOUT_SECONDS = 120
 _DETAIL_TAIL_CHARS = 300
@@ -65,6 +68,11 @@ class GpuResetRefused(Exception):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+class ContainerNotRunning(GpuResetRefused):
+    def __init__(self):
+        super().__init__(GpuResetErrorCode.ResetNotSupported, "the container is not running")
 
 
 @dataclass
@@ -113,6 +121,39 @@ def container_gpu_uuids(device_requests: list[dict] | None, host_gpus: list[Host
         elif request.get("Count") == -1:
             uuids += [gpu.uuid for gpu in host_gpus]
     return list(dict.fromkeys(uuids))
+
+
+@dataclass
+class PodGpus:
+    ordered: list[str]  # the container's GPUs in pod order
+    requested: list[str]  # the ones gpu_indices picks (None: the backend's)
+    index_by_uuid: dict[str, int]  # uuid -> pod index
+
+
+def pod_gpus(
+    device_requests: list[dict] | None,
+    host_gpus: list[HostGpu],
+    pod_gpu_uuids: list[str],
+    gpu_indices: list[int] | None,
+) -> PodGpus:
+    """The one numbering the reset and the clock lock share. Pod index = the container's GPUs by host PCI bus
+    id, the 0..n-1 order nvidia-smi shows inside the pod. Refuses a backend GPU the container was not given,
+    or an index it lacks."""
+    host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
+    container_uuids = [uuid for uuid in container_gpu_uuids(device_requests, host_gpus) if uuid in host_by_uuid]
+    missing = [uuid for uuid in pod_gpu_uuids if uuid not in container_uuids]
+    if not container_uuids or not pod_gpu_uuids or missing:
+        raise GpuResetRefused(
+            GpuResetErrorCode.GpuNotInContainer, f"GPUs not given to the container: {missing or pod_gpu_uuids}"
+        )
+    ordered = sorted(container_uuids, key=lambda uuid: host_by_uuid[uuid].bus_id)
+    index_by_uuid = {uuid: index for index, uuid in enumerate(ordered)}
+    if gpu_indices is None:
+        # all of the pod's GPUs: the backend's, also in a `--gpus all` container that sees more of the host
+        return PodGpus(ordered, [uuid for uuid in ordered if uuid in pod_gpu_uuids], index_by_uuid)
+    if any(index < 0 or index >= len(ordered) for index in gpu_indices):
+        raise GpuResetRefused(GpuResetErrorCode.GpuNotInContainer, f"no pod GPU at index {gpu_indices}")
+    return PodGpus(ordered, [ordered[index] for index in sorted(set(gpu_indices))], index_by_uuid)
 
 
 def parse_nvlink_peers(topology: str, host_gpus: list[HostGpu]) -> dict[str, set[str]]:
@@ -218,15 +259,7 @@ async def _precheck(
         mounts = container.get("Mounts") or []
     except (ValueError, KeyError, TypeError) as exc:
         raise GpuResetRefused(GpuResetErrorCode.ContainerNotFound, f"unreadable docker inspect: {exc}") from exc
-    if container_pid <= 0:
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "the container is not running")
-
-    # no host PID view = no way to tell whose a GPU process is: the container's own main process must
-    # show up in our /proc with the container's cgroup
-    own = await _cgroups(runner, [container_pid])
-    if container_id not in own.get(container_pid, ""):
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "the executor has no host PID view")
-
+    # before the not-running check: a stopped pod is started first, and its remount needs the path (review 4447076002)
     if encrypted_volume_mount and not local_volume_path:
         if any(mount.get("Destination") == encrypted_volume_mount for mount in mounts):
             # the restart has to remount the encrypted volume and cannot guess its plaintext path
@@ -234,27 +267,22 @@ async def _precheck(
                 GpuResetErrorCode.ResetNotSupported, "encrypted volume without its plaintext path"
             )
 
+    if container_pid <= 0:
+        raise ContainerNotRunning()
+
+    # no host PID view = no way to tell whose a GPU process is: the container's own main process must
+    # show up in our /proc with the container's cgroup
+    own = await _cgroups(runner, [container_pid])
+    if container_id not in own.get(container_pid, ""):
+        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "the executor has no host PID view")
+
     host_gpus_result = await _run(runner, HOST_GPUS_COMMAND)
     host_gpus = parse_host_gpus(host_gpus_result.stdout or "")
     if host_gpus_result.exit_code != 0 or not host_gpus:
         raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "nvidia-smi listed no GPU on the host")
     host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
-
-    container_uuids = [uuid for uuid in container_gpu_uuids(device_requests, host_gpus) if uuid in host_by_uuid]
-    missing = [uuid for uuid in pod_gpu_uuids if uuid not in container_uuids]
-    if not container_uuids or missing:
-        raise GpuResetRefused(
-            GpuResetErrorCode.GpuNotInContainer, f"GPUs not given to the container: {missing or pod_gpu_uuids}"
-        )
-    # pod GPU index = the container's GPUs by host PCI bus id: the 0..n-1 order nvidia-smi shows in the pod
-    ordered = sorted(container_uuids, key=lambda uuid: host_by_uuid[uuid].bus_id)
-    index_by_uuid = {uuid: index for index, uuid in enumerate(ordered)}
-    if gpu_indices is None:
-        requested = list(ordered)
-    else:
-        if any(index < 0 or index >= len(ordered) for index in gpu_indices):
-            raise GpuResetRefused(GpuResetErrorCode.GpuNotInContainer, f"no pod GPU at index {gpu_indices}")
-        requested = [ordered[index] for index in sorted(set(gpu_indices))]
+    gpus = pod_gpus(device_requests, host_gpus, pod_gpu_uuids, gpu_indices)
+    ordered, requested, index_by_uuid = gpus.ordered, gpus.requested, gpus.index_by_uuid
 
     targets, fabric_services = await _widen_targets_to_nvlink_peers(runner, requested, ordered, host_gpus)
     # on the final set: an NVLink peer reset with the requested GPUs must not be MIG either
@@ -271,7 +299,7 @@ async def _precheck(
         )
     return _Plan(
         container_id,
-        container_uuids,
+        ordered,
         targets,
         index_by_uuid,
         widened=set(targets) != set(requested),
@@ -375,8 +403,8 @@ async def reset_pod_gpus(
     local_volume_path: str | None = None,
     settle_seconds: float = 2.0,
 ) -> GpuResetReport:
-    try:
-        plan = await _precheck(
+    async def precheck() -> _Plan:
+        return await _precheck(
             runner,
             container_name=container_name,
             pod_gpu_uuids=pod_gpu_uuids,
@@ -385,19 +413,39 @@ async def reset_pod_gpus(
             encrypted_volume_mount=encrypted_volume_mount,
             local_volume_path=local_volume_path,
         )
-    except GpuResetRefused as refused:
-        return GpuResetReport(ok=False, error_code=refused.code, detail=refused.detail)
 
     report = GpuResetReport(ok=False)
     notes: list[str] = []
+    try:
+        plan = await precheck()
+    except ContainerNotRunning as refused:
+        # the backend sends a reset only for a RUNNING pod: a stopped container (an earlier reset whose stop
+        # timed out) is started first, so the renter's next reset is the recovery, not a refusal
+        try:
+            await start_container()
+        except Exception as exc:
+            return GpuResetReport(ok=False, error_code=refused.code, detail=f"{refused.detail}; it did not start: {exc}")
+        report.container_restarted = True
+        notes.append("the container was not running: started it again")
+        try:
+            plan = await precheck()
+        except GpuResetRefused as again:
+            report.error_code = again.code
+            report.detail = "; ".join([*notes, again.detail])
+            return report
+    except GpuResetRefused as refused:
+        return GpuResetReport(ok=False, error_code=refused.code, detail=refused.detail)
+
     fabric_manager_problem: str | None = None
     if plan.widened:
         notes.append("NVLink peers inside the pod were reset together")
+    stop_failed = False
     try:
         stopped = await _run(
             runner, f"{DOCKER} stop -t {STOP_GRACE_SECONDS} {shlex.quote(container_name)}", timeout=60
         )
         if stopped.exit_code != 0:
+            stop_failed = True
             raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, f"docker stop failed: {_tail(stopped.stderr)}")
         report.pod_stopped = True
         # docker stop killed every process of the pod: anything still on the targets is someone else's,
@@ -460,17 +508,38 @@ async def reset_pod_gpus(
         report.error_code = GpuResetErrorCode.ExecutorUnreachable
         notes.append(f"reset failed: {exc}")
     finally:
-        try:
-            await start_container()
-            report.container_restarted = True
-        except Exception as exc:
-            report.ok = False
-            notes.append(f"the container did not start again: {exc}")
+        # a stop without an exit event leaves the container dying: `docker start` is then a no-op,
+        # the remount's exec fails on setns and the pod exits seconds later. Wait for the exit, then start; a
+        # start that fails for any other reason gets one more try after the same wait.
+        for attempt in range(2):
+            try:
+                if stop_failed or attempt:
+                    await _wait_exited(runner, container_name)
+                await start_container()
+                report.container_restarted = True
+                break
+            except Exception as exc:
+                if attempt:
+                    # the flag reports the last start: an earlier recovery start does not count (review 4447075986)
+                    report.ok, report.container_restarted = False, False
+                    notes.append(f"the container did not start again: {exc}")
     if fabric_manager_problem:
         report.ok = False
         report.error_code = report.error_code or GpuResetErrorCode.ResetNotSupported
     report.detail = "; ".join(notes) or None
     return report
+
+
+async def _wait_exited(runner: SSHCommandRunner, container_name: str) -> None:
+    """Until the container has exited, at most EXIT_WAIT_SECONDS (`docker wait` answers at once for a stopped one)."""
+    try:
+        await _run(
+            runner,
+            f"timeout {EXIT_WAIT_SECONDS} {DOCKER} wait {shlex.quote(container_name)}",
+            timeout=EXIT_WAIT_SECONDS + 30,
+        )
+    except Exception:  # best effort: the start runs over its own session either way
+        pass
 
 
 # a scrape this soon after a renter's reset can still miss the cards the driver is bringing back

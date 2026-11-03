@@ -261,6 +261,7 @@ def _miner_service_recording(order: list[str]) -> MinerService:
     service.attestation_service = MagicMock()
     service.attestation_service.maybe_issue_nonce = AsyncMock(return_value=None)
     service.in_flight = {}
+    service.express_queued = frozenset()
     service.miners_awaiting_wave_list = {}
     service.rented_missed_last_cycle = {}
 

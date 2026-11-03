@@ -91,10 +91,12 @@ executor `/version`; the miner lists both seeded executors for the validator's s
 stranger's signature under the validator's hotkey (401); the four REST headers (`AuthenticationPayload`) are
 accepted, the miner installs the key on the executor and the key opens it over SSH, `ssh-pubkey-remove` closes it
 again; a stranger's signature → 401, an unregistered validator → 403, a stale or future timestamp → 401, headers
-naming another miner still yield only this miner's executors (the miner does not compare the hotkey; the test
-accepts 200/401/403 and checks the list); on the executor, the miner+validator double signature is accepted
+naming another miner → 403; on the executor, the miner+validator double signature is accepted
 (`/upload_ssh_key` → SSH coordinates → SSH works → `/remove_ssh_key`), a spoofed validator signature → 401, a spoofed
-miner signature → 401/403, a substituted public key (#744) → 400/401.
+miner signature → 401/403, a substituted public key (#744) → 400/401. The stack's executor enforces the miner binding
+(`REQUIRE_MINER_BOUND_SSH_KEY=true`, `executor/e2e.env`), so every suite proves the validator and the miner send it: a
+key bound to the pool hotkey (`E2E_POOL_HOTKEY`) is accepted, one bound to another miner, one without a binding and a
+binding a stranger signed → 403. A fresh dated nonce is accepted; a stale one, a stripped one and a swapped one → 401.
 
 **`tests/cycle`** — `MinerService.request_job_to_miner` (the REST path `lium mine` providers are on):
 the pyarmor+PyInstaller scrape build, key install through the miner, SSH, scrape upload + run, the check pipeline,
@@ -115,7 +117,9 @@ AVAILABLE verdict can be observed).
 `ContainerCreated` with the port map; the renter's key opens the pod on the executor's address (what `lium exec`
 does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite expects `nvidia-smi -L` to list GPUs — not yet observed);
 `ContainerDeleteRequest` → `ContainerDeleted` and the port is closed. A create for an executor the miner does not own
-→ `FailedContainerRequest`, fast.
+→ `FailedContainerRequest`, fast. A delayed duplicate of a create the platform has not recorded yet → `RentingInProgress`,
+and the first pod keeps its container; a re-sent create that meets its own leftover `pod_<id>` replaces it and runs; a
+customer create on a node running a `filler_*` container removes the filler and starts the pod.
 
 ## Known verdicts the suite pins
 
