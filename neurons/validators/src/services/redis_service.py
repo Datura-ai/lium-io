@@ -183,9 +183,8 @@ class InflightBackendCreate(BaseModel):
     executor_id: str
     workload_kind: WorkloadKind
     started_at_unix_seconds: int
-    # DAH-5437: the create request itself, so the next connector can run it again; "" in entries written before
-    request: str = ""
-    # how many connector restarts this create has already been resumed after
+    # DAH-5437: how many connector restarts this create has already been resumed after. The request itself is never
+    # stored (it carries the renter's environment and credentials); the backend re-sends it from its own records.
     resumes: int = 0
 
 
@@ -806,7 +805,6 @@ class RedisService:
         miner_hotkey: str,
         executor_id: str,
         workload_kind: WorkloadKind,
-        request: str = "",
         resumes: int = 0,
     ) -> None:
         create = InflightBackendCreate(
@@ -814,7 +812,6 @@ class RedisService:
             executor_id=executor_id,
             workload_kind=workload_kind,
             started_at_unix_seconds=int(time.time()),
-            request=request,
             resumes=resumes,
         )
         await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
@@ -834,6 +831,10 @@ class RedisService:
                 # one bad entry must not block the sweep of the others on every start
                 logger.error(_m("Dropping an unreadable inflight backend create", extra={"pod_id": pod_id}))
                 await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+                continue
+            if set(json.loads(entry)) - set(InflightBackendCreate.model_fields):
+                # an entry an earlier build wrote with the whole create request in it: rewritten without
+                await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, creates[pod_id].model_dump_json())
         return creates
 
     async def get_pending_pods(

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -58,7 +59,8 @@ def _client(redis_service: RedisService) -> ComputeClient:
 async def test_a_create_cut_off_by_a_restart_is_reported_failed_and_its_pending_flag_cleared() -> None:
     redis_service = _redis_service()
     await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1")
-    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+    # already resumed once (DAH-5437): past MAX_CREATE_RESUMES it is reported failed
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, resumes=1)
     client = _client(redis_service)
 
     await client.fail_creates_cut_off_by_restart()
@@ -77,7 +79,7 @@ async def test_a_create_cut_off_by_a_restart_is_reported_failed_and_its_pending_
 @pytest.mark.asyncio
 async def test_the_restart_report_untracks_the_create_once_it_is_sent():
     redis_service = _redis_service()
-    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, resumes=1)
     client = _client(redis_service)
     client.message_queue = OutgoingMessages()
     client.lock = asyncio.Lock()
@@ -171,61 +173,101 @@ def _create_request() -> ContainerCreateRequest:
 
 
 @pytest.mark.asyncio
-async def test_a_create_cut_off_by_a_restart_runs_again_instead_of_failing() -> None:
+async def test_a_create_cut_off_by_a_restart_is_listed_for_the_backend_to_send_again() -> None:
     redis_service = _redis_service()
-    request = _create_request()
-    stored = request.model_dump_json()
-    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, request=stored)
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1")
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
     client = _client(redis_service)
-    client.miner_service.redis_service = MagicMock(wraps=redis_service)
-    client.miner_service.redis_service.claim_backend_command = AsyncMock(return_value=None)
-    client.miner_service.redis_service.update_backend_command = AsyncMock()
-    ran: list[tuple[ContainerCreateRequest, InflightBackendCreate]] = []
-
-    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
-        ran.append((job_request, (await redis_service.inflight_backend_creates())["pod-1"]))
-
-    client._drive_miner_job = fake_drive_miner_job
 
     await client.fail_creates_cut_off_by_restart()
-    await client.miner_drivers.get_nowait()
 
+    # nothing runs here and nothing fails: the backend re-sends the create from its own records
+    assert client.miner_drivers.empty()
     assert client.message_queue == []
-    assert ran[0][0] == request
     assert client.resumed_creates_report.pod_ids == ["pod-1"]
-    # tracked again with its resume counted, so a second restart in the re-run reports it failed
-    assert (ran[0][1].request, ran[0][1].resumes) == (stored, 1)
-    # the re-run claims the command id, so a backend re-send of the same create is a duplicate
-    assert client.miner_service.redis_service.claim_backend_command.await_args.args[0] == "cmd-1"
+    assert not await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1")
+    # the resume is counted in Redis, so a second restart before the re-send reports it failed
+    assert (await redis_service.inflight_backend_creates())["pod-1"].resumes == 1
+
+
+@pytest.mark.asyncio
+async def test_the_backends_resend_is_tracked_with_its_resume_counted() -> None:
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+    client = _client(redis_service)
+    await client.fail_creates_cut_off_by_restart()
+    seen: list[InflightBackendCreate] = []
+
+    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
+        seen.append((await redis_service.inflight_backend_creates())["pod-1"])
+
+    client._drive_miner_job = fake_drive_miner_job
+    await client._run_miner_job(_create_request())
+
+    assert seen[0].resumes == 1
     assert await redis_service.inflight_backend_creates() == {}
 
 
 @pytest.mark.asyncio
 async def test_a_create_already_resumed_once_is_reported_failed() -> None:
     redis_service = _redis_service()
-    await redis_service.add_inflight_backend_create(
-        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, request=_create_request().model_dump_json(), resumes=1
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, resumes=1)
+    client = _client(redis_service)
+
+    await client.fail_creates_cut_off_by_restart()
+
+    assert [m.failure_step for m in client.message_queue] == [CREATE_CUT_OFF_BY_RESTART_STEP]
+    # not listed: the backend sends it no more and fails it at once even if this failure report is lost
+    assert client.resumed_creates_report.pod_ids == []
+
+
+SECRETS = {
+    "docker_username": "renter",
+    "docker_password": "registry-pw",
+    "custom_options": {"environment": {"HF_TOKEN": "env-secret"}},
+    "external_volume_info": {"name": "b", "plugin": "p", "iam_user_access_key": "ak", "iam_user_secret_key": "sk-1"},
+}
+
+
+@pytest.mark.asyncio
+async def test_the_redis_record_of_a_create_holds_ids_and_counters_only() -> None:
+    # Rustam 3 Nov: no logins, passwords or tokens in Redis; the record never carries the request
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    request = ContainerCreateRequest(**{**_create_request().model_dump(), **SECRETS})
+    stored_raw: list[str] = []
+
+    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
+        stored_raw.append(redis_service.redis.hashes["inflight_backend_creates"]["pod-1"])
+
+    client._drive_miner_job = fake_drive_miner_job
+    await client._run_miner_job(request)
+
+    record = json.loads(stored_raw[0])
+    assert set(record) == {"miner_hotkey", "executor_id", "workload_kind", "started_at_unix_seconds", "resumes"}
+    for secret in ("registry-pw", "env-secret", "sk-1", "HF_TOKEN", "environment", "docker_password"):
+        assert secret not in stored_raw[0]
+
+
+@pytest.mark.asyncio
+async def test_an_old_record_with_the_whole_request_is_rewritten_without_it_on_start() -> None:
+    redis_service = _redis_service()
+    request = ContainerCreateRequest(**{**_create_request().model_dump(), **SECRETS})
+    old = InflightBackendCreate(
+        miner_hotkey="miner-hk", executor_id="exec-1", workload_kind=WorkloadKind.FILLER, started_at_unix_seconds=1
+    ).model_dump(mode="json")
+    await redis_service.redis.hset(
+        "inflight_backend_creates",
+        "pod-1",
+        json.dumps({**old, "started_at_unix_seconds": int(time.time()), "request": request.model_dump_json()}),
     )
     client = _client(redis_service)
 
     await client.fail_creates_cut_off_by_restart()
 
-    assert client.miner_drivers.empty()
-    assert [m.failure_step for m in client.message_queue] == [CREATE_CUT_OFF_BY_RESTART_STEP]
-    # not run again, so not listed: the backend fails it at once even if this failure report is lost
-    assert client.resumed_creates_report.pod_ids == []
-
-
-@pytest.mark.asyncio
-async def test_a_create_with_an_unreadable_stored_request_is_reported_failed() -> None:
-    redis_service = _redis_service()
-    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, request="{}")
-    client = _client(redis_service)
-
-    await client.fail_creates_cut_off_by_restart()
-
-    assert client.miner_drivers.empty()
-    assert [m.failure_step for m in client.message_queue] == [CREATE_CUT_OFF_BY_RESTART_STEP]
+    raw = redis_service.redis.hashes["inflight_backend_creates"]["pod-1"]
+    assert "request" not in json.loads(raw) and "registry-pw" not in raw and "env-secret" not in raw
+    assert client.resumed_creates_report.pod_ids == ["pod-1"]
 
 
 class _FakeSocket:
@@ -268,9 +310,7 @@ async def test_the_resumed_creates_report_goes_first_on_the_first_socket_only() 
 @pytest.mark.asyncio
 async def test_a_pod_deleted_during_its_create_is_not_resumed_after_a_restart() -> None:
     redis_service = _redis_service()
-    await redis_service.add_inflight_backend_create(
-        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, request=_create_request().model_dump_json()
-    )
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
     client = _client(redis_service)
     client._drive_miner_job = AsyncMock()
 
@@ -304,9 +344,7 @@ async def test_a_delete_before_the_creates_record_write_is_not_undone_by_it() ->
 async def test_a_create_whose_container_runs_is_not_resumed_after_a_restart() -> None:
     # it ended, but its record removal failed; a re-run would replace the running container by name
     redis_service = _redis_service()
-    await redis_service.add_inflight_backend_create(
-        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, request=_create_request().model_dump_json()
-    )
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
     await redis_service.hset(
         "rented_machines_prefix", "1.2.3.4:22", json.dumps({"containers": [{"name": "pod_pod-1", "pod_id": "pod-1"}]})
     )
@@ -324,9 +362,7 @@ async def test_a_create_whose_container_runs_is_not_resumed_after_a_restart() ->
 async def test_a_record_older_than_the_longest_create_is_dropped_not_resumed() -> None:
     # its removal failed long ago; the pod may be running now, and a re-run would replace its container by name
     redis_service = _redis_service()
-    await redis_service.add_inflight_backend_create(
-        "pod-1", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL, request=_create_request().model_dump_json()
-    )
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL)
     stale = (await redis_service.inflight_backend_creates())["pod-1"]
     stale.started_at_unix_seconds -= INFLIGHT_CREATE_MAX_AGE_SECONDS + 1
     await redis_service.redis.hset("inflight_backend_creates", "pod-1", stale.model_dump_json())
@@ -338,46 +374,6 @@ async def test_a_record_older_than_the_longest_create_is_dropped_not_resumed() -
     assert client.message_queue == []
     assert client.resumed_creates_report.pod_ids == []
     assert await redis_service.inflight_backend_creates() == {}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "secret",
-    [
-        {"docker_username": "renter", "docker_password": "registry-pw"},
-        {"cluster_membership": {"node_index": 0, "wireguard_conf": "PrivateKey = wg-secret"}},
-    ],
-)
-async def test_a_create_carrying_a_credential_is_tracked_without_its_request(secret) -> None:
-    # Redis keeps a disk volume: the request is not stored, so a restart reports the create failed and the backend retries
-    redis_service = _redis_service()
-    client = _client(redis_service)
-    request = ContainerCreateRequest(**{**_create_request().model_dump(), **secret})
-    stored_raw: list[str] = []
-
-    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
-        stored_raw.append(json.dumps(redis_service.redis.hashes))
-
-    client._drive_miner_job = fake_drive_miner_job
-    client.miner_service.redis_service = MagicMock(wraps=redis_service)
-    client.miner_service.redis_service.claim_backend_command = AsyncMock(return_value=None)
-    client.miner_service.redis_service.update_backend_command = AsyncMock()
-    await client.miner_driver(request)
-
-    assert "pod-1" in stored_raw[0]
-    assert "registry-pw" not in stored_raw[0] and "wg-secret" not in stored_raw[0]
-
-
-@pytest.mark.asyncio
-async def test_a_create_without_a_stored_request_is_reported_failed_not_resumed() -> None:
-    redis_service = _redis_service()
-    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL)
-    client = _client(redis_service)
-
-    await client.fail_creates_cut_off_by_restart()
-
-    assert client.miner_drivers.empty()
-    assert [m.failure_step for m in client.message_queue] == [CREATE_CUT_OFF_BY_RESTART_STEP]
 
 
 class _SocketFailingAfterAuth(_FakeSocket):

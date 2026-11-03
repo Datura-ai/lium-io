@@ -252,7 +252,8 @@ class PodStatesReport(ValidatorMessage):
 @VALIDATOR_MESSAGES.register
 class ResumedCreatesReport(ValidatorMessage):
     """2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.
-    `pod_ids` are the creates the previous connector was running that this one runs again; each still gets its
+    `pod_ids` are the creates the previous connector was running that were cut off; the validator keeps no copy
+    of a create request, so the backend sends each listed create again from its own records, and each gets its
     own reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the
     old connector: the backend fails it at once. An older validator never sends this, and the backend then
     changes nothing."""

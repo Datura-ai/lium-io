@@ -125,18 +125,6 @@ MAX_CREATE_RESUMES = 1
 INFLIGHT_CREATE_MAX_AGE_SECONDS = settings.CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS + 600
 
 
-def _carries_secret(model: pydantic.BaseModel) -> bool:
-    """a field the model hides from logs (repr=False) is a credential; True when one is set, nested models included"""
-    for name, field in type(model).model_fields.items():
-        value = getattr(model, name, None)
-        if not field.repr and value:
-            return True
-        for item in value if isinstance(value, list) else [value]:
-            if isinstance(item, pydantic.BaseModel) and _carries_secret(item):
-                return True
-    return False
-
-
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
 # pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
 # so the backend loses the validator for seconds, not the whole startup.
@@ -314,7 +302,6 @@ class ComputeClient:
             await self.miner_service.redis_service.clear_running_backend_commands()
         except Exception:
             logger.exception("Failed to clear running backend commands on connector start")
-        # after the clear: a resumed create claims its command id again, so a backend re-send of it is a duplicate
         try:
             await self.fail_creates_cut_off_by_restart()
         except Exception as exc:  # the sweep is best-effort; it must never keep the connector from starting
@@ -1144,9 +1131,6 @@ class ComputeClient:
                 job_request.miner_hotkey,
                 job_request.executor_id,
                 job_request.workload_kind,
-                # a request with a credential (registry password, volume keys, ...) is never stored: Redis is on
-                # disk. Without its request the next connector reports the create failed and the backend retries it.
-                request="" if _carries_secret(job_request) else job_request.model_dump_json(),
                 resumes=self.resume_count_by_pod_id.pop(job_request.pod_id, 0),
             )
         except Exception as exc:
@@ -1210,9 +1194,10 @@ class ComputeClient:
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never
         replied, so the backend kept the pod PENDING / the filler STARTING, and its pending-pod flag refused the
-        delete for 30 min. DAH-5437: each one runs again from its stored request (a re-run replaces what the cut-off
-        attempt left under the pod's names), so the backend still gets one reply; one without a stored request, or
-        already resumed MAX_CREATE_RESUMES times, is reported failed, which frees the node, and its flag is cleared."""
+        delete for 30 min. DAH-5437: each one is listed in the ResumedCreatesReport and the backend sends it again from
+        its own records (Redis holds no request: it carries the renter's environment and credentials); a re-run
+        replaces what the cut-off attempt left under the pod's names, so the backend still gets one reply. One already
+        resumed MAX_CREATE_RESUMES times is reported failed, which frees the node. Every one's flag is cleared."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
         rented_pod_ids = await redis_service.rented_pod_ids() if creates else frozenset()
@@ -1227,24 +1212,20 @@ class ComputeClient:
                 continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
-            if create.request and create.resumes < MAX_CREATE_RESUMES:
-                try:
-                    request = ContainerCreateRequest.model_validate_json(create.request)
-                except pydantic.ValidationError:
-                    request = None
-                if request is not None and request.pod_id == pod_id:
-                    self.resume_count_by_pod_id[pod_id] = create.resumes + 1
-                    resumed.append(pod_id)
-                    await self.miner_drivers.put(asyncio.create_task(self.miner_driver(request)))
-                    logger.warning(
-                        _m(
-                            "Create cut off by a connector restart, running it again",
-                            extra=get_extra_info(
-                                {**self.logging_extra, "pod_id": pod_id, "resumes": create.resumes + 1}
-                            ),
-                        )
+            if create.resumes < MAX_CREATE_RESUMES:
+                # the count survives another restart before the backend's re-send arrives
+                await redis_service.add_inflight_backend_create(
+                    pod_id, create.miner_hotkey, create.executor_id, create.workload_kind, resumes=create.resumes + 1
+                )
+                self.resume_count_by_pod_id[pod_id] = create.resumes + 1
+                resumed.append(pod_id)
+                logger.warning(
+                    _m(
+                        "Create cut off by a connector restart, asking the backend to send it again",
+                        extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, "resumes": create.resumes + 1}),
                     )
-                    continue
+                )
+                continue
             self.message_queue.append(
                 FailedContainerRequest(
                     miner_hotkey=create.miner_hotkey,
@@ -1262,7 +1243,7 @@ class ComputeClient:
                 _m(
                     "Create cut off by a connector restart, reported failed",
                     extra=get_extra_info(
-                        {**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json", exclude={"request"})}
+                        {**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json")}
                     ),
                 )
             )

@@ -5969,7 +5969,7 @@
       "type": "object"
     },
     "ResumedCreatesReport": {
-      "description": "2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.\n`pod_ids` are the creates the previous connector was running that this one runs again; each still gets its\nown reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the\nold connector: the backend fails it at once. An older validator never sends this, and the backend then\nchanges nothing.",
+      "description": "2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.\n`pod_ids` are the creates the previous connector was running that were cut off; the validator keeps no copy\nof a create request, so the backend sends each listed create again from its own records, and each gets its\nown reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the\nold connector: the backend fails it at once. An older validator never sends this, and the backend then\nchanges nothing.",
       "properties": {
         "forwarded_at": {
           "anyOf": [
