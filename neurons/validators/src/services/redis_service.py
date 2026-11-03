@@ -63,6 +63,15 @@ def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
     return f"{CREATE_STARTED_AT_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
+# VerifyX runs the validator cut off and could not clean up: hash of run_dir -> epoch, reaped before the next run
+VERIFYX_STALE_RUNS_PREFIX = "verifyx_stale_runs"
+VERIFYX_STALE_RUNS_TTL_SECONDS = 7 * 24 * 3600
+
+
+def verifyx_stale_runs_key(miner_hotkey: str, executor_uuid: str) -> str:
+    return f"{VERIFYX_STALE_RUNS_PREFIX}:{miner_hotkey}:{executor_uuid}"
+
+
 def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
     # the UUID is the miner's word: keyed with the hotkey, a node copying it cannot set or clear the owner's stamp
     return f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{miner_hotkey}:{executor_uuid}"

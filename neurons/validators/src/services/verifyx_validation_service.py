@@ -625,35 +625,47 @@ class VerifyXValidationService:
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
         return (
-            f"mkdir {d} && cd {d} || exit 1; {command} & echo $! > pid; wait $!; rc=$?; "
+            f"mkdir {d} && cd {d} || exit 1; "
+            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
+            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
             f"cd .. && rm -rf {d}; exit $rc"
         )
 
-    async def kill_remote_verifyx(self, shell, run_dir: str, default_extra: dict) -> None:
-        """Best-effort kill of a VerifyX run started with `run_dir` and cut off by the validator.
+    async def kill_remote_verifyx(self, shell, run_dir: str, default_extra: dict) -> bool:
+        """Kill a VerifyX run started with `run_dir` and cut off by the validator; True once it is gone.
 
-        Kills only the recorded PID (the executor runs with the host PID namespace, so a pattern
-        kill could hit a renter's process) and removes the scratch dir with any half-written
+        Kills only the recorded PID's process group (the executor runs with the host PID namespace,
+        so a pattern kill could hit a renter's process), and only while that PID still works in the
+        run's dir (a reused PID is spared), then removes the scratch dir with any half-written
         disk-test file, which a SIGKILL leaves behind."""
         d = shlex.quote(run_dir)
         try:
             capture = await asyncio.wait_for(
                 self._run_ssh_command(
                     shell,
-                    f'[ -f {d}/pid ] && kill -9 "$(cat {d}/pid)"; rm -rf {d}',
+                    f'p=$(cat {d}/pid 2>/dev/null); [ -n "$p" ] && [ /proc/"$p"/cwd -ef {d} ] '
+                    f'&& kill -KILL -"$p" "$p" 2>/dev/null; rm -rf {d} && [ ! -e {d} ]',
                     timeout=VERIFYX_KILL_TIMEOUT_SECONDS,
                 ),
                 timeout=VERIFYX_KILL_TIMEOUT_SECONDS,
             )
         except TimeoutError:
             capture = SSHCapture(transport_error="TimeoutError: cleanup SSH did not finish")
-        if capture.transport_error is not None:
-            logger.warning(
-                _m(
-                    "Failed to kill remote VerifyX process",
-                    extra=get_extra_info({**default_extra, "transport_error": capture.transport_error}),
-                )
+        if capture.transport_error is None and capture.exit_status == 0:
+            return True
+        logger.warning(
+            _m(
+                "Failed to kill remote VerifyX process",
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "transport_error": capture.transport_error,
+                        "exit_status": capture.exit_status,
+                    }
+                ),
             )
+        )
+        return False
 
     async def _run_ssh_command(
         self, shell, command: str, timeout: float = VERIFYX_COMMAND_TIMEOUT_SECONDS

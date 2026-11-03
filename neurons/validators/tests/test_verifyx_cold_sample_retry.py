@@ -22,6 +22,7 @@ from neurons.validators.src.services.redis_service import (
     PENDING_PODS_PREFIX,
     RedisService,
     create_started_at_key,
+    verifyx_stale_runs_key,
 )
 from neurons.validators.src.services import verifyx_validation_service
 from neurons.validators.src.services.verifyx_validation_service import (
@@ -233,6 +234,7 @@ class _TimedProbeSequence(_ProbeSequence):
     async def kill_remote_verifyx(self, shell, run_dir, default_extra):
         assert run_dir == self.run_dir  # the retry's own scratch dir and PID, nothing else
         self.kills += 1
+        return True
 
 
 @pytest.mark.asyncio
@@ -386,7 +388,83 @@ class _StalledChannelShell:
 async def test_the_cleanup_of_a_cut_off_retry_is_bounded_when_the_channel_stalls(monkeypatch):
     monkeypatch.setattr(verifyx_validation_service, "VERIFYX_KILL_TIMEOUT_SECONDS", 0.05)
 
-    await asyncio.wait_for(VerifyXValidationService().kill_remote_verifyx(_StalledChannelShell(), ".vx-run", {}), 2)
+    assert (
+        await asyncio.wait_for(
+            VerifyXValidationService().kill_remote_verifyx(_StalledChannelShell(), ".vx-run", {}), 2
+        )
+        is False
+    )
+
+
+class _FlakyCleanupShell(_LocalShell):
+    """A local shell on which the cleanup channel stalls while `stalled` is set."""
+
+    stalled = True
+
+    async def run(self, command, timeout=None):
+        if self.stalled and command.startswith("p=$(cat"):
+            await asyncio.Event().wait()
+        return await super().run(command, timeout)
+
+
+class _HungRetryService(VerifyXValidationService):
+    """First samples come from `firsts`; the retry really starts the remote run (which hangs)."""
+
+    def __init__(self, executor, *firsts):
+        super().__init__()
+        self.executor, self.firsts = executor, list(firsts)
+        self.run_dirs = []
+
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+    ):
+        if run_dir is None:
+            return self.firsts.pop(0)
+        self.run_dirs.append(run_dir)
+        challenge = SimpleNamespace(seed=1, cipher_text="c")
+        await self._run_ssh_command(shell, self._verifyx_command(self.executor, challenge, "lib", run_dir))
+
+
+@pytest.mark.asyncio
+async def test_a_cut_off_retry_whose_cleanup_timed_out_is_reaped_on_the_next_run(
+    context_factory, monkeypatch, tmp_path
+):
+    # PR review, 3 Nov: a cleanup channel that never opened left the cut-off run alive and forgotten
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
+    monkeypatch.setattr(verifyx_check, "VERIFYX_COMMAND_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(verifyx_validation_service, "VERIFYX_KILL_TIMEOUT_SECONDS", 0.2)
+    executor = _fake_python(tmp_path, "touch temp_1.dat; exec sleep 60")
+    service = _HungRetryService(executor, _probe(88.0), _probe(900.0))
+    shell = _FlakyCleanupShell(tmp_path)
+    ctx = context_factory(
+        services=build_services(verifyx=service, shell=shell),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}}, rented_data=_never_measured()),
+    )
+
+    result = await _run(ctx)
+
+    assert result.event.what_we_saw["cold_sample_retry"]["timed_out"] is True
+    run_dir = tmp_path / service.run_dirs[0]
+    pid = int((run_dir / "pid").read_text())
+    os.kill(pid, 0)  # the cut-off run lives on: its cleanup never reached the node
+    assert (run_dir / "temp_1.dat").exists()
+
+    shell.stalled = False  # the node is reachable again on the next cycle
+    await VerifyXCheck().run(ctx)
+
+    for _ in range(100):  # the killed run's wrapper shell exits and is reaped by the local bash
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("the old run is still alive")
+    assert not run_dir.exists()
+    assert await ctx.services.redis.hgetall(
+        verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
+    ) == {}
 
 
 @pytest.mark.parametrize("fast_path", [False, True])

@@ -12,7 +12,11 @@ from protocol.vc_protocol.compute_requests import NetworkEMA
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.redis_service import create_started_at_key
+from services.redis_service import (
+    VERIFYX_STALE_RUNS_TTL_SECONDS,
+    create_started_at_key,
+    verifyx_stale_runs_key,
+)
 from services.verifyx_validation_service import (
     NETWORK_GATE_TALLY,
     VERIFYX_COMMAND_TIMEOUT_SECONDS,
@@ -133,6 +137,7 @@ class VerifyXCheck:
             )
             return CheckResult(passed=False, event=event)
 
+        await _reap_stale_runs(ctx)
         filler_container = _get_filler_only_container(ctx)
         stored_ema = _stored_network_ema(ctx)
         # A never-measured node is probed even under a filler: with no EMA to reuse it would
@@ -760,6 +765,40 @@ def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
     return {**specs, "network": held}
 
 
+async def _remember_stale_run(ctx: Context, run_dir: str) -> None:
+    """Keep a cut-off run whose cleanup failed, so the next VerifyX run on the node reaps it."""
+    key = verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
+    try:
+        await ctx.services.redis.hset(key, run_dir, str(time.time()))
+        await ctx.services.redis.expire(key, VERIFYX_STALE_RUNS_TTL_SECONDS)
+    except Exception as e:
+        logger.warning(
+            _m(
+                "Failed to record a stale VerifyX run",
+                extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
+            )
+        )
+
+
+async def _reap_stale_runs(ctx: Context) -> None:
+    """Kill and remove the runs earlier cycles cut off but could not clean up."""
+    key = verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
+    try:
+        for raw in await ctx.services.redis.hgetall(key) or {}:
+            run_dir = raw.decode() if isinstance(raw, bytes) else raw
+            if await ctx.services.verifyx.kill_remote_verifyx(
+                ctx.services.shell, run_dir, ctx.default_extra
+            ):
+                await ctx.services.redis.hdel(key, run_dir)
+    except Exception as e:
+        logger.warning(
+            _m(
+                "Failed to reap stale VerifyX runs",
+                extra=get_extra_info({**ctx.default_extra, "error": str(e)}),
+            )
+        )
+
+
 def _get_filler_only_container(ctx: Context) -> str | None:
     rented_data = ctx.state.rented_data
     if not rented_data:
@@ -892,10 +931,12 @@ class VerifyXColdRetryCheck:
             watch.cancel()
             await asyncio.gather(probe, watch, return_exceptions=True)
             # Cut off (deadline, SSH timeout, lost connection, rental, outer cancel): the remote run may live on.
-            if retry is None or transport_error is not None:
+            if (retry is None or transport_error is not None) and not (
                 await verifyx_service.kill_remote_verifyx(
                     ctx.services.shell, run_dir, ctx.default_extra
                 )
+            ):
+                await _remember_stale_run(ctx, run_dir)
         if busy is not None:
             logger.info(
                 _m(
