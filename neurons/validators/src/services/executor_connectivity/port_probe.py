@@ -35,7 +35,7 @@ class PortProbe:
             host=host,
             log_ctx=log_ctx,
         )
-        if batch.external == "blocked":
+        if batch.external == "blocked" and batch.successful:
             # the other tiers probe from the validator too, so they would pass the same host. The validator's
             # ports are kept: PortConnectivityCheck decides whether this reading fails the node.
             return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
