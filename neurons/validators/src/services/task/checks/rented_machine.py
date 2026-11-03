@@ -901,6 +901,7 @@ async def _clear_leftover_recovery_mark(
     # Bounded and best-effort; the next cycle retries. Returns True only for container_gone once neither <name> nor
     # <name>__prev exists under the create lock, whether or not the mark's delete then lands.
     key = f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"
+    absence_confirmed = False  # survives a mark delete that outlives the deadline
 
     async def inspect(name: str):
         return await ctx.ssh.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(name)}")
@@ -909,6 +910,7 @@ async def _clear_leftover_recovery_mark(
         return result.exit_status != 0 and "No such" in str(result.stderr)
 
     async def clear() -> bool:
+        nonlocal absence_confirmed
         if not container_gone and await ctx.services.redis.get(key) is None:
             return False
         # under the create lock every mark write and its stop run under: never between a recovery's mark and its stop
@@ -924,6 +926,7 @@ async def _clear_leftover_recovery_mark(
             # a failed recovery can leave the stopped original parked as <name>__prev: still the renter's pod
             if not (absent(inspect_result) and absent(await inspect(f"{container_name}{EDIT_PARKED_SUFFIX}"))):
                 return False
+            absence_confirmed = True
             with contextlib.suppress(Exception):
                 await ctx.services.redis.delete(key)
             return True
@@ -931,7 +934,7 @@ async def _clear_leftover_recovery_mark(
     try:
         return await asyncio.wait_for(clear(), timeout=_RECOVERY_MARK_CLEAR_TIMEOUT_SEC)
     except Exception:
-        return False
+        return absence_confirmed
 
 
 def _log_recovery_failed(event: str, ctx: Context, container_name: str, pod_id: str, exc: Exception) -> None:

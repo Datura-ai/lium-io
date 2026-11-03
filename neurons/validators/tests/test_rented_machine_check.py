@@ -1337,7 +1337,8 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
 
 
 @pytest.mark.parametrize(
-    "state", ["both_gone", "parked", "stopped_canonical", "lock_busy", "create_in_flight", "delete_fails"]
+    "state",
+    ["both_gone", "parked", "stopped_canonical", "lock_busy", "create_in_flight", "delete_fails", "delete_hangs"],
 )
 @pytest.mark.asyncio
 async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_container_is_gone(
@@ -1364,6 +1365,14 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
     redis.backend_create_inflight = AsyncMock(return_value=state == "create_in_flight")
     if state == "delete_fails":
         redis.delete = AsyncMock(side_effect=ConnectionError("redis down"))
+    if state == "delete_hangs":
+        # a stalled delete past the deadline: the confirmed absence still stands, every cycle
+
+        async def hang_delete(_key):
+            await asyncio.Event().wait()
+
+        redis.delete = hang_delete
+        monkeypatch.setattr(rented_machine_module, "_RECOVERY_MARK_CLEAR_TIMEOUT_SEC", 0.01)
     docker = AsyncMock()
     docker.recover_parked_pod_container.return_value = False  # a failed recovery: nothing renamed back
     docker.recover_pod_after_stale_vloopback_mount.return_value = False
@@ -1375,8 +1384,10 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
     monkeypatch.setattr(rented_machine_module, "_collect_pod_diagnostics", missing)
     ctx = build_recovery_context(context_factory, ssh, docker, redis=redis)
     result = await TenantEnforcementCheck().run(ctx)
+    if state == "delete_hangs":
+        result = await TenantEnforcementCheck().run(ctx)
 
-    if state in ("both_gone", "delete_fails"):
+    if state in ("both_gone", "delete_fails", "delete_hangs"):
         assert not result.passed
         assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
         assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
