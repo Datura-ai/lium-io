@@ -6065,7 +6065,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     """disk_share set: effective fresh values (not payload echoes) must flow into
     create_local_volume, the docker run --storage-opt flag, and ContainerCreated."""
     # Arrange: df_avail=900GB, existing vloopback=300GB, share=0.5 -> pool 1180GB,
-    # slice 590GB (request cap 500*1.5=750GB does not bind) -> volume 393, storage 196.
+    # slice 590GB (request cap 400*1.5=600GB does not bind) -> volume 393, storage 196.
     def ssh_run(command, **kwargs):
         if "docker info" in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
@@ -6127,7 +6127,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         gpu_uuids=["GPU-test"],
         cpu_count=1,
         memory_gb=1,
-        volume_limit_gb=500,
+        volume_limit_gb=400,
         storage_limit_gb=250,
         disk_share=0.5,
         available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
