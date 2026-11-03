@@ -74,6 +74,8 @@ class FakeHost:
         self.commands.append(cmd)
         if cmd.startswith("/usr/bin/docker inspect"):
             return make_command_result(self.inspect_exit == 0, self.inspect, exit_code=self.inspect_exit)
+        if cmd.startswith("timeout 90 /usr/bin/docker wait"):
+            return make_command_result(True, "137")
         if cmd.startswith("/usr/bin/docker stop"):
             self.stopped = self.stop_exit == 0
             return make_command_result(self.stop_exit == 0, stderr="boom", exit_code=self.stop_exit)
@@ -168,7 +170,6 @@ async def test_a_whole_host_rental_resolves_gpus_all_on_the_host():
         (FakeHost(apps=[(998, U[0])]), {}, GpuResetErrorCode.GpuInUseOutsidePod),  # cgroup unreadable
         (FakeHost(), {"in_tee": True}, GpuResetErrorCode.ResetNotSupported),
         (FakeHost(cgroups={4242: "0::/"}), {}, GpuResetErrorCode.ResetNotSupported),  # no host PID view
-        (FakeHost(main_pid=0), {}, GpuResetErrorCode.ResetNotSupported),
         (
             FakeHost(mounts=[{"Destination": "/lium-cipher"}]),
             {"encrypted_volume_mount": "/lium-cipher"},
@@ -470,3 +471,92 @@ async def test_a_failed_docker_stop_does_not_report_the_pod_stopped():
     report, _ = await _reset(host)
     assert not report.ok and not report.pod_stopped
     assert not any(cmd.startswith("nvidia-smi -r") for cmd in host.commands)
+
+
+def _waited(host: FakeHost) -> bool:
+    return any(cmd.startswith("timeout 90 /usr/bin/docker wait") for cmd in host.commands)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_without_an_exit_event_waits_for_the_exit_then_starts():
+    # `docker stop` timed out waiting for the exit event; starting at once was a no-op on a dying container
+    host = FakeHost(stop_exit=1)
+    report, start = await _reset(host)
+    assert not report.ok and report.container_restarted
+    assert _waited(host)
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_waits_for_the_exit_and_starts_once_more():
+    # the remount's exec into the dying container failed on setns: the second start after the exit brings it up
+    start = AsyncMock(side_effect=[RuntimeError("OCI runtime exec failed: setns"), None])
+    report, _ = await _reset(FakeHost(stop_exit=1), start=start)
+    assert report.container_restarted and "did not start" not in (report.detail or "")
+    assert start.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_good_stop_starts_without_waiting():
+    host = FakeHost()
+    report, start = await _reset(host)
+    assert report.ok and report.container_restarted and not _waited(host)
+
+
+@pytest.mark.asyncio
+async def test_a_reset_of_a_stopped_container_starts_it_then_resets():
+    host, running = FakeHost(main_pid=0), FakeHost()
+
+    async def start_it():
+        host.inspect, host.cgroups = running.inspect, running.cgroups
+
+    start = AsyncMock(side_effect=start_it)
+    report, _ = await _reset(host, start=start)
+    assert report.ok and report.container_restarted and "not running" in report.detail
+    assert any(cmd.startswith("nvidia-smi -r") for cmd in host.commands)
+    assert start.await_count == 2  # once before the reset, once after its stop
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_container_that_does_not_start_changes_nothing_else():
+    host = FakeHost(main_pid=0)
+    report, start = await _reset(host, start=AsyncMock(side_effect=RuntimeError("no start")))
+    assert not report.ok and not report.container_restarted and "did not start" in report.detail
+    assert not any(cmd.startswith(("/usr/bin/docker stop", "nvidia-smi -r")) for cmd in host.commands)
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_container_started_but_refused_by_the_precheck_reports_the_start():
+    host = FakeHost(main_pid=0)
+    report, start = await _reset(host)  # the start does not make the fake run: the precheck refuses again
+    assert not report.ok and report.container_restarted and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert not any(cmd.startswith("/usr/bin/docker stop") for cmd in host.commands)
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_container_whose_final_start_fails_does_not_report_a_restart():
+    # review 4447075986: the recovery start set the flag; the failed start after the reset must clear it
+    host, running = FakeHost(main_pid=0), FakeHost()
+    starts = 0
+
+    async def start_it():
+        nonlocal starts
+        starts += 1
+        if starts > 1:
+            raise RuntimeError("no start")
+        host.inspect, host.cgroups = running.inspect, running.cgroups
+
+    report, _ = await _reset(host, start=AsyncMock(side_effect=start_it))
+    assert not report.ok and not report.container_restarted and "did not start again" in report.detail
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_encrypted_pod_without_its_plaintext_path_is_refused_before_any_start():
+    # review 4447076002: the start would leave the pod running without its plaintext mount
+    host = FakeHost(main_pid=0, mounts=[{"Destination": "/lium-cipher"}])
+    report, start = await _reset(host, encrypted_volume_mount="/lium-cipher")
+    assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert not report.container_restarted
+    _no_change(host, start)
