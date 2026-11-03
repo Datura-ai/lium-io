@@ -778,6 +778,14 @@ async def test_an_empty_or_unknown_fleet_snapshot_removes_nothing_and_warns(rent
             {LIVE_POD, LIVE_FILLER, STRAY_POD},
             id="idle-node-orphans-still-reaped",
         ),
+        pytest.param(
+            # DAH-5510: a moved pod's old container no listed pod names, kept only by the retained list
+            _real_rented_data("another-node", [ELSEWHERE_POD]).model_copy(
+                update={"retained_container_names": [STRAY_POD]}
+            ),
+            {LIVE_POD, LIVE_FILLER},
+            id="retained-old-container-kept",
+        ),
     ],
 )
 async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_listed_one(rented_data, expected_removed):
@@ -838,6 +846,22 @@ def test_listed_container_names_protects_the_pod_container_of_an_unnamed_pod():
 
     assert "pod_pod-0" in names and "pod_pod-0__prev" in names
     assert "" not in names and "__prev" not in names
+
+
+def test_listed_container_names_keeps_a_moved_pods_retained_old_container():
+    # DAH-5510: the backend keeps a moved pod's old container on the node it left until its removal time
+    data = RentedExecutorsResponse(executors={}, retained_container_names=["pod_moved"])
+
+    assert "pod_moved" in listed_container_names(data)
+    assert rented_list_unknown_reason(data) is None
+
+
+def test_listed_container_names_reads_a_snapshot_shape_without_the_retained_list():
+    from types import SimpleNamespace
+
+    data = SimpleNamespace(executors={}, all_filler_containers_by_executor={"e": ["filler_x"]}, filler_containers_by_executor={})
+
+    assert listed_container_names(data) == {"filler_x"}
 
 
 PROVIDER_NAMES = [

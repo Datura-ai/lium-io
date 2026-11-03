@@ -3,6 +3,7 @@ from __future__ import annotations
 from ..messages import PidHostRequiredMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 
 class PidHostRequiredCheck:
@@ -19,7 +20,7 @@ class PidHostRequiredCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         pid_mode = (ctx.state.specs or {}).get("executor_pid_mode")
-        rented = ctx.state.rented_data.executors.get(ctx.executor.uuid) if ctx.state.rented_data else None
+        rented = rental_of_this_node(ctx)
         is_rented = rented is not None and len(rented.pods) > 0
         what = {"executor_pid_mode": pid_mode, "is_rented": is_rented}
         if isinstance(pid_mode, str) and pid_mode != "host":
