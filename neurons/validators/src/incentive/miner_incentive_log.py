@@ -365,7 +365,7 @@ class MinerLogLine(BaseModel):
             reason=ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
             message=(
                 f"No unrented incentive: your price ${price_per_gpu}/GPU/h is above the "
-                f"soft price limit ${soft_limit} (Lium's hand-set price for this GPU model "
+                f"soft price limit ${soft_limit} (configured base price for this GPU model "
                 f"${market_p90} x {rate}). Lower the price to ${soft_limit} or below to earn the "
                 "unrented incentive."
             ),
