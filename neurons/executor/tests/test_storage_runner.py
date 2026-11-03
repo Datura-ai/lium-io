@@ -2030,19 +2030,18 @@ _SUMMARY = {"message_type": "summary", "files_restored": 38373, "total_files": 3
         (1, _SUMMARY, [_ENOENT, "ciphertext verification failed"], None),
         (1, _SUMMARY, ["Fatal: unable to load index: pack not found"], None),
         (1, _SUMMARY, ["open : permission denied"], None),
-        (1, _SUMMARY, [_ENOENT] * 101, None),
+        # no loss bound: restore 98b90ab8 lost 471 of 38,844 files from one deleted folder
+        (1, {"message_type": "summary", "files_restored": 38373, "total_files": 38844}, [_ENOENT] * 471, "PARTIAL"),
         # a folder the workload deleted: restic reports each item's open and then its lchown
         (1, _SUMMARY, [("/root/a", _ENOENT), ("/root/a", "lchown : no such file or directory")], "PARTIAL"),
-        # the bound counts items, not events: 100 items reported twice each stay within it
-        (1, _SUMMARY, [(f"/root/{i}", e) for i in range(100) for e in (_ENOENT, "lchown : no such file or directory")], "PARTIAL"),
-        (1, {"message_type": "summary", "files_restored": 50, "total_files": 52}, [_ENOENT] * 2, None),
+        (1, {"message_type": "summary", "files_restored": 50, "total_files": 52}, [_ENOENT] * 2, "PARTIAL"),
         (1, _SUMMARY, [], None),
         (1, {"message_type": "summary", "files_restored": 0}, [_ENOENT], None),
         (1, None, [_ENOENT], None),
         (2, _SUMMARY, [_ENOENT], None),
     ],
 )
-def test_restore_completes_partial_only_for_vanished_files_within_the_loss_bound(
+def test_restore_completes_partial_only_for_vanished_files(
     monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, errors: list, expected: str | None
 ) -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
@@ -2080,14 +2079,17 @@ def test_failed_restore_reports_the_renter_path_not_proc_root() -> None:
     )
     first = "write /proc/88100/root/root/restored/model.safetensors: no space left on device"
     reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": first}}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 120, "total_files": 400}})
     reporter.send({"event": "result", "status": "FAILED", "exit_code": 1})
 
     final = session.requests[-1]["json"]
     assert final["status"] == "FAILED"
-    assert final["error_message"] == "write /root/restored/model.safetensors: no space left on device"
+    assert final["error_message"] == (
+        "write /root/restored/model.safetensors: no space left on device; restored 120 of 400 files"
+    )
 
 
-def test_partial_restore_result_keeps_first_restic_error_as_warning() -> None:
+def test_partial_restore_reports_restored_of_total_and_removed_items() -> None:
     session = _ReporterSession()
     reporter = StorageEventReporter(
         OPERATION_ID,
@@ -2095,14 +2097,18 @@ def test_partial_restore_result_keeps_first_restic_error_as_warning() -> None:
         ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
         session=session,
     )
-    first = "open /proc/88100/root/root/restored/model.safetensors: no such file or directory"
-    reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": first}}})
-    reporter.send({"event": "restic", "payload": {"message_type": "exit_error", "message": "Fatal: 1 errors"}})
+    for i in range(471):
+        item = f"/proc/88100/root/root/data/cache/{i}.bin"
+        for op in ("open", "lchown"):  # restic reports a vanished item twice; N counts items
+            message = f"{op} {item}: no such file or directory"
+            reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": message}, "item": item}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 38373, "total_files": 38844}})
+    reporter.send({"event": "restic", "payload": {"message_type": "exit_error", "message": "Fatal: There were 942 errors"}})
     reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
 
     final = session.requests[-1]["json"]
     assert final["status"] == "COMPLETED"
     assert final["result_quality"] == "PARTIAL"
     assert final["error_message"] == (
-        "Restored with errors; some files were not restored: open /root/restored/model.safetensors: no such file or directory"
+        "Restored 38373 of 38844 files; 471 were removed on the pod during the restore, first: /root/data/cache/0.bin"
     )

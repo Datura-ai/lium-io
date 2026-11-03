@@ -54,6 +54,8 @@ class StorageEventReporter:
         self._state = ProgressState(stage=initial_stage)
         self._cancel_requested = False
         self._restic_failure_detail: str | None = None
+        self._restore_counts: tuple[int, int] | None = None  # (files_restored, total_files) from restic's summary
+        self._failed_items: dict[str, None] = {}  # distinct restic error items, first-seen order
         self._diagnostic_detail: str | None = None
         self._next_progress_at = self._clock()
         self._progress_failures = 0
@@ -81,6 +83,7 @@ class StorageEventReporter:
                 and self._spec.resource is ReporterResource.BACKUP
             ):
                 self._state.summary = _summary_counts(payload)
+            self._remember_restore_counts(payload)
             if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
             elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
@@ -90,7 +93,8 @@ class StorageEventReporter:
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
         if event_type == "rerun":
-            self._restic_failure_detail = self._diagnostic_detail = None
+            self._restic_failure_detail = self._diagnostic_detail = self._restore_counts = None
+            self._failed_items = {}
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
@@ -122,7 +126,7 @@ class StorageEventReporter:
                 snapshot_id=_optional_string(event.get("snapshot_id")),
                 exit_code=_optional_integer(event.get("exit_code")),
                 error_code=_optional_string(event.get("error_code")),
-                error_message=_renter_paths(self._restic_failure_detail or self._diagnostic_detail)
+                error_message=self._failure_message()
                 if status != "COMPLETED"
                 else self._partial_restore_warning(result_quality),
             )
@@ -179,13 +183,37 @@ class StorageEventReporter:
         if message:
             self._restic_failure_detail = message[:2000]
 
+    def _remember_restore_counts(self, event: Mapping[str, object]) -> None:
+        if self._spec.resource is ReporterResource.BACKUP:
+            return
+        if event.get("message_type") in ("error", "exit_error"):
+            item = _optional_string(event.get("item"))
+            if item:
+                self._failed_items[item] = None
+        elif event.get("message_type") == "summary":
+            restored = _optional_integer(event.get("files_restored"))
+            total = _optional_integer(event.get("total_files"))
+            if restored is not None and total is not None:
+                self._restore_counts = (restored, total)
+
+    def _failure_message(self) -> str | None:
+        detail = _renter_paths(self._restic_failure_detail or self._diagnostic_detail)
+        if self._restore_counts is None:
+            return detail
+        restored = "restored {} of {} files".format(*self._restore_counts)
+        return f"{detail}; {restored}"[:2000] if detail else restored.capitalize()
+
     def _partial_restore_warning(self, result_quality: str | None) -> str | None:
         if result_quality != "PARTIAL" or self._spec.resource is ReporterResource.BACKUP:
             return None
-        detail = _renter_paths(self._restic_failure_detail) or ""
-        return f"Restored with errors; some files were not restored: {detail}"[:2000] if detail else (
-            "Restored with errors; some files were not restored"
-        )
+        if self._restore_counts is None or not self._failed_items:
+            return "Restored with errors; some files were not restored"
+        restored, total = self._restore_counts
+        first = _renter_paths(next(iter(self._failed_items)))
+        return (
+            f"Restored {restored} of {total} files; {len(self._failed_items)} were removed on the pod "
+            f"during the restore, first: {first}"
+        )[:2000]
 
     def _restore_has_started(self) -> bool:
         return bool(
