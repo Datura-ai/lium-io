@@ -83,6 +83,7 @@ class FakeHost:
         self.reset_raises = False
         self.reset_hangs = False
         self.reset_unit_stuck = False
+        self.reset_unit_state, self.reset_unit_procs = "inactive", 0
         self.active_during_cure: dict[str, bool] | None = None
         self.fm_log: list[tuple[str, str]] = []
 
@@ -126,12 +127,14 @@ class FakeHost:
             if self.reset_raises:
                 raise RuntimeError("ssh dropped")
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
+        if cmd == gpu_reset.FABRIC_RESET_UNIT_PROCS:
+            return make_command_result(True, f"{self.reset_unit_procs}\n")
         if cmd.startswith("nsenter -t 1 -m -- systemctl "):
             verb, unit = cmd.split()[-2:]
             self.fm_log.append((verb, unit))
             if unit == gpu_reset.FABRIC_RESET_UNIT:
                 if verb == "is-active":
-                    state = "deactivating" if self.reset_unit_stuck else "inactive"
+                    state = "deactivating" if self.reset_unit_stuck else self.reset_unit_state
                     return make_command_result(False, state, exit_code=0 if self.reset_unit_stuck else 3)
                 return make_command_result(not self.reset_unit_stuck, exit_code=0 if not self.reset_unit_stuck else 1)
             if verb == "is-active":
@@ -370,6 +373,40 @@ async def test_a_hung_reset_whose_unit_will_not_stop_skips_the_fallback_and_the_
     # the fabric is left to the still-running unit, never started under it
     assert ("start", FM) not in host.fm_log and host.active_during_cure is None
     start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reset_unit_with_surviving_processes_skips_the_fallback_and_the_container_start():
+    # systemd marks the unit failed when the reset survives its final SIGKILL (D state on a wedged GPU)
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True)
+    host.reset_hangs = True
+    host.reset_unit_state, host.reset_unit_procs = "failed", 1
+    report, start = await _reset(host, backend=U)
+    assert not report.ok and "still running on the host" in report.detail and not report.container_restarted
+    assert ("start", FM) not in host.fm_log and host.active_during_cure is None
+    start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reset_unit_with_an_empty_cgroup_counts_as_stopped():
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True, nvlsm=True)
+    host.reset_hangs = True
+    host.reset_unit_state = "failed"
+    report, start = await _reset(host, backend=U)
+    assert report.container_restarted and host.active == {FM: True, NVLSM: True}
+    start.assert_awaited_once()
+
+
+def test_unit_process_count_reads_the_cgroup(tmp_path):
+    """The host check prints the unit cgroup's process count, and 0 once the cgroup is gone."""
+    script = shlex.split(gpu_reset.FABRIC_RESET_UNIT_PROCS)[-1]
+    (tmp_path / "systemctl").write_text('#!/bin/sh\necho "$CG"\n')
+    (tmp_path / "systemctl").chmod(0o755)
+    env = {"PATH": f"{tmp_path}:/usr/bin:/bin"}
+    out = subprocess.run(["/bin/sh", "-c", script], env={**env, "CG": ""}, capture_output=True, text=True)
+    assert out.stdout.strip() == "0"
+    gone = subprocess.run(["/bin/sh", "-c", script], env={**env, "CG": "/lium-x"}, capture_output=True, text=True)
+    assert gone.stdout.strip() == "0"
 
 
 def _run_fabric_script(tmp_path, *, stop_fails=False, reset_exit=0):

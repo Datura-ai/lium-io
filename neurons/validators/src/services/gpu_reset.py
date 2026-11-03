@@ -61,6 +61,13 @@ FABRIC_SERVICES = ("nvidia-fabricmanager", "nvidia-nvlsm")
 # named, so a reset that outlives its SSH timeout can be stopped (one per host: it owns every host GPU)
 FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
+# processes left in the reset unit's cgroup (v2, or v1's systemd hierarchy); a gone cgroup is empty, since the
+# kernel never removes a cgroup that still holds a process
+FABRIC_RESET_UNIT_PROCS = "nsenter -t 1 -m -- sh -c " + shlex.quote(
+    f"cg=$(systemctl show -p ControlGroup --value {FABRIC_RESET_UNIT}) || exit 1; "
+    '[ -z "$cg" ] && echo 0 || cat /sys/fs/cgroup"$cg"/cgroup.procs /sys/fs/cgroup/systemd"$cg"/cgroup.procs '
+    "2>/dev/null | wc -l"
+)
 _FABRIC_STOP_FAILED_EXIT = 97
 STOP_GRACE_SECONDS = 10
 _QUERY_TIMEOUT_SECONDS = 30
@@ -369,13 +376,17 @@ async def _stop_hung_reset_unit(runner: SSHCommandRunner) -> bool:
     try:
         await _run(runner, f"{HOST_SYSTEMCTL} stop {FABRIC_RESET_UNIT}", timeout=_QUERY_TIMEOUT_SECONDS + 60)
         state = await _run(runner, f"{HOST_SYSTEMCTL} is-active {FABRIC_RESET_UNIT}")
+        procs = await _run(runner, FABRIC_RESET_UNIT_PROCS)
     except Exception as exc:
         logger.error("could not stop the hung GPU reset unit: %s", exc)
         return False
-    # a collected unit reads "inactive"; anything else (running, stopping, no answer) may still be resetting
-    if (state.stdout or "").strip() in ("inactive", "failed"):
+    # a collected unit reads "inactive"; anything else (running, stopping, no answer) may still be resetting.
+    # "failed" alone is no proof: systemd also fails a unit whose processes survive its final SIGKILL (a reset in
+    # D state on a wedged GPU), so the unit's cgroup must also be empty
+    left = (procs.stdout or "").strip() if procs.exit_code == 0 else "unknown"
+    if (state.stdout or "").strip() in ("inactive", "failed") and left == "0":
         return True
-    logger.error("the hung GPU reset unit is still running: %r", (state.stdout or "").strip())
+    logger.error("the hung GPU reset unit is still running: %r, %s processes", (state.stdout or "").strip(), left)
     return False
 
 
