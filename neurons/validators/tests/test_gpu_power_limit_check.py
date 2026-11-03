@@ -208,6 +208,20 @@ async def test_a_stock_cycle_whose_clear_is_lost_twice_fails_instead_of_passing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_fails", [False, True])
+async def test_a_redis_outage_does_not_zero_a_stock_node_with_no_kept_tier_reading(
+    context_factory, read_records_mock, read_fails
+) -> None:
+    # nothing kept (or Redis down for the read too): our outage must not fail a healthy stock node
+    redis = FakeRedis()
+    redis.write_atomically = AsyncMock(side_effect=ConnectionError("down"))
+    if read_fails:
+        redis.mget = AsyncMock(side_effect=ConnectionError("down"))
+    ctx = context_factory(state=_state(current_limit=350, default_limit=350), services=build_services(redis=redis))
+    assert (await GpuPowerLimitCheck().run(ctx)).passed is True
+
+
+@pytest.mark.asyncio
 async def test_power_limit_rejects_below_the_80_percent_tier(context_factory, read_records_mock) -> None:
     ctx = context_factory(state=_state(current_limit=276, default_limit=350))
     result = await GpuPowerLimitCheck().run(ctx)
