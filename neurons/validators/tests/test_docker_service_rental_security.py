@@ -253,8 +253,8 @@ def _base_create_payload(**overrides) -> ContainerCreateRequest:
             startup_commands=HOSTILE_STARTUP_COMMAND,
             shm_size="1g",
         ),
-        "volume_limit_gb": 100,
-        "storage_limit_gb": 50,
+        "volume_limit_gb": 44,
+        "storage_limit_gb": 22,
         "available_ports": [
             PayloadPortMapping(internal_port=22, external_port=30022),
             PayloadPortMapping(internal_port=20000, external_port=30000),
