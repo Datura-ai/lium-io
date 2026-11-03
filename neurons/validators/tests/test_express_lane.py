@@ -166,6 +166,20 @@ async def test_the_cycle_asks_for_every_executor(rest_miner_service):
     assert rest_miner_service.in_flight == {first: CYCLE_DONE, second: CYCLE_DONE}
 
 
+@pytest.mark.asyncio
+async def test_the_wave_leaves_a_node_the_express_lane_has_queued_to_it(rest_miner_service):
+    """DAH-5601: queued, not yet running (per-miner cap, retry wait), the node still goes express:
+    in the wave it waited its turn and ran the full check, 7-15 min from add to listed."""
+    queued, known = str(uuid4()), str(uuid4())
+    rest_miner_service.miner_returns(queued, known)
+    rest_miner_service.express_queued = {queued: object()}
+
+    job = await _request(rest_miner_service)
+
+    assert {r.executor_info.uuid for r in job["results"]} == {known}
+    assert queued not in rest_miner_service.in_flight
+
+
 # --- ExpressLane: discovery, caps, publish, retries -----------------------------------------
 
 
@@ -185,6 +199,7 @@ class _Harness:
             miner_service = MinerService.__new__(MinerService)
             miner_service.in_flight = {}
             miner_service.miners_awaiting_wave_list = {}
+            miner_service.express_queued = frozenset()
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         # A self-hosted miner that does not answer its executor list (the portal-snapshot cases).
