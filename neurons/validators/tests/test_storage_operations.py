@@ -62,9 +62,11 @@ def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(fi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("helper_running", [True, False])
+@pytest.mark.parametrize(
+    ("helper_running", "runner_alive"), [(True, True), (False, True), (True, False), (False, False)]
+)
 async def test_start_never_removes_a_running_helper(
-    monkeypatch: pytest.MonkeyPatch, helper_running: bool
+    monkeypatch: pytest.MonkeyPatch, helper_running: bool, runner_alive: bool
 ) -> None:
     # A repeated dispatch sees no runner PID yet (STARTING) while the first run's helper works.
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
@@ -74,14 +76,17 @@ async def test_start_never_removes_a_running_helper(
     async def run(command: str, check: bool = False) -> SimpleNamespace:
         commands.append(command)
         stdout = ""
+        status = 1 if command.startswith("test -e") else 0
         if "echo STARTING" in command:
             stdout = "STARTING\n"
         elif "docker ps -q" in command:
-            stdout = "abc123\n" if helper_running else ""
-        return SimpleNamespace(exit_status=0 if not command.startswith("test -e") else 1, stdout=stdout, stderr="")
+            # a dead runner's helper is an orphan: only a live runner's helper is kept
+            status = 0 if helper_running and runner_alive else 1
+        return SimpleNamespace(exit_status=status, stdout=stdout, stderr="")
 
     ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
-    if helper_running:
+    kept = helper_running and runner_alive
+    if kept:
         files = await storage_operations.start_storage_operation(
             ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
         )
@@ -93,5 +98,6 @@ async def test_start_never_removes_a_running_helper(
                 ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
             )
     helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
-    assert f"name=^{helper}$" in next(c for c in commands if "docker ps -q" in c)
-    assert any("docker rm -f" in c for c in commands) is not helper_running
+    probe = next(c for c in commands if "docker ps -q" in c)
+    assert f"name=^{helper}$" in probe and "pgrep -f" in probe
+    assert any("docker rm -f" in c for c in commands) is not kept

@@ -820,7 +820,9 @@ class _KilledPopen(_FakePopen):
         (False, "", " helper was killed (Docker recorded no out-of-memory kill)"),
         (False, OOM_KILL_DMESG, " ran out of memory"),  # the kernel's OOM kill that Docker's flag missed
         (None, OOM_KILL_DMESG, " helper container was removed while running"),  # container gone
-        ("", OOM_KILL_DMESG, " helper container was removed while running"),  # docker inspect printed nothing
+        ("removing", "", " helper container was removed while running"),  # docker mid-removal
+        ("", OOM_KILL_DMESG, " helper was killed (helper state unknown)"),  # docker inspect printed nothing
+        ("error", OOM_KILL_DMESG, " helper was killed (helper state unknown)"),  # inspect failed otherwise
     ],
 )
 def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
@@ -832,12 +834,16 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
 ) -> None:
     calls: list[list[str]] = []
     state = {"Status": "exited", "OOMKilled": oom_killed, "ExitCode": 137}
+    if oom_killed == "removing":
+        state = {"Status": "removing", "OOMKilled": False, "ExitCode": 137}
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
         if "inspect" in command:
             if oom_killed is None:
-                return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
+                return SimpleNamespace(returncode=1, stdout="", stderr="Error: No such container: x")
+            if oom_killed == "error":
+                return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
             inspection = json.dumps({"Id": HELPER_ID, "State": state})
             return SimpleNamespace(returncode=0, stdout=inspection if oom_killed != "" else "", stderr="")
         if command[0] == "dmesg":
@@ -871,7 +877,7 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
     # detached runs delete stderr, so the state line must reach the reported operation logs
     log = "\n".join(session.puts[-1]["json"]["logs"] or [])
     assert ("docker state" in log) is (oom_killed is not True)
-    if oom_killed is False:
+    if oom_killed in (False, "removing"):
         assert '"ExitCode": 137' in log
         kernel_line = "kernel: " + " | ".join(OOM_KILL_DMESG.splitlines()[1:3])
         assert (kernel_line in log) is bool(kernel_log)

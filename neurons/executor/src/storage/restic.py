@@ -718,7 +718,10 @@ class ResticStorageRunner:
                 subprocess.run([self._docker_binary, "rm", "--force", fields[0]], capture_output=True, text=True)
 
     def _remove_helper_container(self) -> Mapping[str, object]:
-        """Remove the helper container; return its docker inspect object ({} when it could not be read)."""
+        """Remove the helper container; return its docker inspect object.
+
+        {} when docker has no such container; State.Status "unknown" when inspect failed otherwise.
+        """
         name = self._helper_container_name()
         inspection = subprocess.run(
             [self._docker_binary, "inspect", "--format", "{{json .}}", name],
@@ -726,11 +729,13 @@ class ResticStorageRunner:
             text=True,
         )
         subprocess.run([self._docker_binary, "rm", "--force", name], capture_output=True, text=True)
+        if inspection.returncode != 0 and "no such" in (inspection.stderr or "").lower():
+            return {}
         try:
-            state = json.loads(inspection.stdout) if inspection.returncode == 0 else {}
+            state = json.loads(inspection.stdout) if inspection.returncode == 0 else None
         except ValueError:
-            state = {}
-        return state if isinstance(state, dict) else {}
+            state = None
+        return state if isinstance(state, dict) else {"State": {"Status": "unknown"}}
 
     def _killed_helper_message(self, action: str) -> str:
         """Exit 137: say out of memory only when docker recorded an OOM kill."""
@@ -748,8 +753,10 @@ class ResticStorageRunner:
         self._events.log(note)
         if "oom-kill:" in note and self._helper_id:  # the kernel's OOM kill that Docker's flag missed
             return f"{action} ran out of memory"
-        if not state:  # inspect found no container: something removed it mid-run, not an OOM
+        if not state or state.get("Status") == "removing":  # removed mid-run, not an OOM
             return f"{action} helper container was removed while running"
+        if state.get("Status") == "unknown":  # docker inspect failed for another reason
+            return f"{action} helper was killed (helper state unknown)"
         if state.get("OOMKilled") is False:
             return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
         return f"{action} helper was killed (often out of memory)"
