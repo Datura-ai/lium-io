@@ -364,16 +364,23 @@ def build_fabric_reset_command(units: list[str], reset_command: str) -> str:
     return f"{HOST_SYSTEMD_RUN} /bin/sh -c {shlex.quote(script)}"
 
 
-async def _restore_fabric_services(runner: SSHCommandRunner, units: list[str], *, hung: bool) -> str | None:
-    """Starts every fabric service that is not active after the reset; the problem left, else None.
+async def _stop_hung_reset_unit(runner: SSHCommandRunner) -> bool:
+    """Stops the host unit of a reset that did not return (which kills the reset); True once it is proven gone."""
+    try:
+        await _run(runner, f"{HOST_SYSTEMCTL} stop {FABRIC_RESET_UNIT}", timeout=_QUERY_TIMEOUT_SECONDS + 60)
+        state = await _run(runner, f"{HOST_SYSTEMCTL} is-active {FABRIC_RESET_UNIT}")
+    except Exception as exc:
+        logger.error("could not stop the hung GPU reset unit: %s", exc)
+        return False
+    # a collected unit reads "inactive"; anything else (running, stopping, no answer) may still be resetting
+    if (state.stdout or "").strip() in ("inactive", "failed"):
+        return True
+    logger.error("the hung GPU reset unit is still running: %r", (state.stdout or "").strip())
+    return False
 
-    hung: the reset did not return (timeout or dropped session), so its host unit may still hold Fabric Manager
-    down; it is stopped first, which kills the reset and skips the unit's own start."""
-    if hung:
-        try:
-            await _run(runner, f"{HOST_SYSTEMCTL} stop {FABRIC_RESET_UNIT}", timeout=_QUERY_TIMEOUT_SECONDS + 60)
-        except Exception as exc:
-            logger.warning("could not stop the hung GPU reset unit: %s", exc)
+
+async def _restore_fabric_services(runner: SSHCommandRunner, units: list[str]) -> str | None:
+    """Starts every fabric service that is not active after the reset; the problem left, else None."""
     problems: list[str] = []
     for unit in reversed(units):
         try:
@@ -447,6 +454,7 @@ async def reset_pod_gpus(
     report = GpuResetReport(ok=False)
     notes: list[str] = []
     fabric_manager_problem: str | None = None
+    reset_still_running = False
     if plan.widened:
         notes.append("NVLink peers inside the pod were reset together")
     try:
@@ -484,10 +492,13 @@ async def reset_pod_gpus(
                     timeout=_RESET_TIMEOUT_SECONDS + 120,
                 )
             finally:
-                # before the latch cure and the container start: CUDA on an NVSwitch node needs Fabric Manager
-                fabric_manager_problem = await _restore_fabric_services(
-                    runner, plan.fabric_services, hung=reset is None or reset.exit_code < 0
-                )
+                # a reset that did not return (timeout, dropped session) may still hold the GPUs and the fabric
+                if (reset is None or reset.exit_code < 0) and not await _stop_hung_reset_unit(runner):
+                    reset_still_running = True
+                    fabric_manager_problem = "the GPU reset is still running on the host"
+                else:
+                    # before the latch cure and the container start: CUDA on an NVSwitch node needs Fabric Manager
+                    fabric_manager_problem = await _restore_fabric_services(runner, plan.fabric_services)
                 if fabric_manager_problem:
                     notes.append(fabric_manager_problem)
             if fabric_manager_problem:
@@ -521,12 +532,16 @@ async def reset_pod_gpus(
         report.error_code = GpuResetErrorCode.ExecutorUnreachable
         notes.append(f"reset failed: {exc}")
     finally:
-        try:
-            await start_container()
-            report.container_restarted = True
-        except Exception as exc:
-            report.ok = False
-            notes.append(f"the container did not start again: {exc}")
+        if reset_still_running:
+            # never start the pod on GPUs a reset may still be resetting; the host unit starts the fabric itself
+            notes.append("the container was not started again while the GPU reset still runs")
+        else:
+            try:
+                await start_container()
+                report.container_restarted = True
+            except Exception as exc:
+                report.ok = False
+                notes.append(f"the container did not start again: {exc}")
     if fabric_manager_problem:
         report.ok = False
         report.error_code = report.error_code or GpuResetErrorCode.ResetNotSupported
