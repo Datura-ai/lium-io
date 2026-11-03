@@ -33,6 +33,7 @@ from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
+from .rental_owner import rental_of_this_node
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 from .task_time import task_seconds_left
 
@@ -233,6 +234,12 @@ class RentalProbeCheck:
     removes no `filler_*`, lifts no GPU power cap and reclaims no filler cache. The validator cannot
     stop a filler run in the backend, so removing the container would read as the provider killing
     it, and lifting a PEARL filler's cap is DAH-2356's hard-ban case.
+
+    DAH-5244: a cycle whose port check was deferred for disk pressure (`ContextState.port_check_deferred`:
+    the Docker root's sync stalls under a tenant's writes, so the port check republished its memory rather
+    than start a container) is skipped here too, standing failure applied as for any other skip: the
+    probe's create would wait in the same sync. The port check's bounded deferral streak ends in a real
+    check, and the probe runs with it.
     """
 
     check_id = "executor.validate.rental_probe"
@@ -323,8 +330,8 @@ class RentalProbeCheck:
     async def _may_probe(self, ctx: Context) -> _ProbeGate | CheckResult:
         """May the probe run on this node now? The gate, or the verdict-less result that stops the cycle.
 
-        In order: the standing failure, the cycle's skip reasons (rented, filler,
-        interval), the validator's inputs, the default renter image and its presence on the node, the
+        In order: the standing failure, the cycle's skip reasons (rented, the port check deferred for
+        disk pressure, interval), the validator's inputs, the default renter image and its presence on the node, the
         per-executor create lock, and the node's idleness re-read under that lock. A gate is returned
         with the lock held; every refusal after the lock was taken releases it first.
         """
@@ -522,10 +529,14 @@ def _create_deadline_seconds(ctx: Context) -> float:
 
 
 async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[str | None, dict[str, Any]]:
-    rented_data = ctx.state.rented_data
-    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor and rented_executor.pods:
         return "rented", {"pods": [pod.pod_id for pod in rented_executor.pods]}
+    if ctx.state.port_check_deferred:
+        # DAH-5244: the port check republished its memory instead of starting a container on a Docker root
+        # whose sync stalls; the probe's create would wait in that same sync and fail the filler node at
+        # container_start. Bounded by the port check's own deferral streak, which ends in a real check.
+        return "port check deferred for disk pressure", {}
     seconds_left = task_seconds_left(ctx)
     if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
         return "too little cycle time left", {"task_seconds_left": int(seconds_left)}
@@ -576,7 +587,7 @@ async def _busy_now(ctx: Context) -> _BusyNow:
         return _BusyNow(None)
     if rented is None:
         return _BusyNow(None)
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return _BusyNow(_RENTED_SINCE_CYCLE_START)
     fillers = frozenset(rented.get_filler_containers(ctx.executor.uuid))
@@ -818,7 +829,7 @@ async def _rented_meanwhile(ctx: Context, fillers_beside: frozenset[str]) -> str
         return None
     if rented is None:
         return None
-    rented_executor = rented.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx, rented_data=rented)
     if rented_executor and rented_executor.pods:
         return "rented"
     if set(rented.get_filler_containers(ctx.executor.uuid)) - fillers_beside:
