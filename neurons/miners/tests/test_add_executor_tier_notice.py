@@ -24,6 +24,8 @@ def test_add_executor_prints_spot_tier_notice(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "starts on the Spot tier" in result.output
     assert "Change Tier" in result.output
+    # a node removed here and re-added does not keep its earlier tier, so the notice must not say it does
+    assert "keeps its earlier tier" not in result.output
 
 
 def test_failed_add_prints_no_tier_notice(monkeypatch):
