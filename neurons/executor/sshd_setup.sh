@@ -20,9 +20,10 @@
 # (DAH-3236, ticket-0287, ticket-0302). Such hosts turn both per-source limits off:
 # `start` puts the off drop-in in place when EXECUTOR_SSH_SOURCE_LIMITS=false or the executor
 # runs in a CVM (the dstack socket is there; QEMU slirp shows sshd 10.0.2.2 for everyone), and
-# sshd_log_receiver.py puts it in place (and reloads sshd) on the first login from a private
-# address, which is what such a host shows for every client. Until then private ranges and the
-# validator's own addresses are on PerSourcePenaltyExemptList, so they are never penalised.
+# sshd_log_receiver.py puts it in place (and reloads sshd) on the first connection from a private
+# address (sshd's VERBOSE "Connection from" line, before authentication), which is what such a host
+# shows for every client, so scanners cannot fill PerSourceMaxStartups ahead of the validator. Private
+# ranges and the validator's own addresses are also on PerSourcePenaltyExemptList, never penalised.
 #
 # The directive is unknown to OpenSSH < 9.8, where sshd refuses to start on it, so it is
 # written only when this sshd accepts it. It goes into a drop-in that sshd_config's

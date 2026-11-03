@@ -150,6 +150,13 @@ def test_a_login_from_a_shared_address_turns_the_per_source_limits_off(tmp_path,
 
     line = ACCEPTED.replace("203.0.113.9", source)
     assert sshd_log_receiver.shared_source(line) is shared
+    # PR review, 3 Nov: the connection line, before authentication, so scanners cannot fill PerSourceMaxStartups first
+    connection = f"<38>Oct 18 06:27:29 sshd-session[811]: Connection from {source} port 51022 on 172.17.0.2 port 22"
+    assert sshd_log_receiver.shared_source(connection) is shared
+    # a client-chosen user name cannot pose as one
+    assert not sshd_log_receiver.shared_source(
+        f"<38>Oct 18 06:27:32 sshd[815]: Invalid user x Connection from {source} port 1 from 198.51.100.4 port 4023"
+    )
     if shared:
         sshd_log_receiver.turn_off_source_limits()
         sshd_log_receiver.turn_off_source_limits()  # once in place, no second reload

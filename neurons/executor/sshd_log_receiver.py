@@ -3,9 +3,10 @@
 Keeps the `Accepted ...` login lines with sshd's own envelope (time and `sshd[pid]`), prefixed by the
 time received in UTC, in SSHD_AUTH_LOG for the validator to read (it keeps its own cursor there).
 
-A login from a private address means port 2200 shows one address for every client (NAT, Docker gateway,
+A connection from a private address means port 2200 shows one address for every client (NAT, Docker gateway,
 tunnel): the per-source limits would refuse the validator along with the scanners, so it turns them off
-(sshd_setup.sh says why) and reloads sshd."""
+(sshd_setup.sh says why) and reloads sshd. It acts on sshd's "Connection from" line, logged before
+authentication, so scanners cannot fill PerSourceMaxStartups ahead of the validator's first login."""
 
 import ipaddress
 import os
@@ -36,7 +37,11 @@ MAX_PENDING = 1000
 SOURCE_OFF = "/etc/ssh/lium-source-limits-off.conf"
 SOURCE_OFF_IN = "/etc/ssh/sshd_config.d/00-lium-source-limits-off.conf"
 SSHD_PID_FILE = "/run/sshd.pid"
-SOURCE = re.compile(r" Accepted \S+ for \S+ from (\S+) port ")
+# the client address sshd saw, from a connection (VERBOSE, before authentication) or a login, after the envelope
+SOURCE = re.compile(
+    r"^<\d+>[A-Z][a-z]{2} \d{1,2} \d\d:\d\d:\d\d sshd(?:-session)?\[\d+\]: "
+    r"(?:Connection from|Accepted \S+ for \S+ from) (\S+) port "
+)
 # the ranges sshd_setup.sh exempts from penalties (ipaddress's is_private also counts documentation ranges)
 SHARED = [
     ipaddress.ip_network(n)
@@ -49,8 +54,8 @@ def is_login(message: str) -> bool:
 
 
 def shared_source(line: str) -> bool:
-    """True for a login from a private, CGNAT or loopback address."""
-    match = SOURCE.search(line)
+    """True for a connection or login from a private, CGNAT or loopback address."""
+    match = SOURCE.match(" ".join(line.split()))
     try:
         ip = ipaddress.ip_address(match.group(1)) if match else None
     except ValueError:
@@ -121,11 +126,11 @@ def serve(sock: socket.socket) -> None:
             # filtered before it is kept: scanner noise during a full disk must not push a login out
             if is_login(message):
                 pending.append(message)
-                if shared_source(message):
-                    try:
-                        turn_off_source_limits()
-                    except OSError:
-                        pass  # a full disk: tried again on the next such login
+            if shared_source(message):
+                try:
+                    turn_off_source_limits()
+                except OSError:
+                    pass  # a full disk: tried again on the next such connection
         except TimeoutError:
             pass
         try:
