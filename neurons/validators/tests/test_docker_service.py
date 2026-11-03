@@ -4116,16 +4116,21 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
         (WorkloadKind.CUSTOMER_RENTAL, True, "created"),
         (WorkloadKind.CUSTOMER_RENTAL, False, "failed at ssh_reachable"),  # F-1679: a reboot said success
         (WorkloadKind.FILLER, False, "created, not checked"),
+        # an image our bootstrap cannot give sshd: the renter may run it without SSH (never turned away)
+        (WorkloadKind.CUSTOMER_RENTAL, False, "created, no sshd, not checked"),
     ],
 )
 async def test_a_create_succeeds_only_once_the_pods_ssh_port_answers(
     docker_service, monkeypatch, pod_ssh_answers_on_create_path, workload_kind, answers, outcome
 ):
-    """DAH-5618: the check runs on the node's address and the port mapped to the pod's 22."""
+    """DAH-5618: the check runs on the node's address and the port mapped to the pod's 22, only where
+    SSH is expected (our bootstrap left sshd listening)."""
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
     monkeypatch.setattr(
-        docker_service, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", AsyncMock(return_value=True)
+        docker_service,
+        "install_open_ssh_server_and_start_ssh_service_with_rental_docker",
+        AsyncMock(return_value="no sshd" not in outcome),
     )
     if not answers:
         pod_ssh_answers_on_create_path.side_effect = RuntimeError("the pod's SSH port 20001 did not answer")
@@ -4153,10 +4158,45 @@ async def test_a_create_succeeds_only_once_the_pods_ssh_port_answers(
         assert result.failure_step == "ssh_reachable" and "did not answer" in result.detail
     else:
         assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
-    if outcome == "created, not checked":
+    if "not checked" in outcome:
         pod_ssh_answers_on_create_path.assert_not_awaited()
     else:
-        pod_ssh_answers_on_create_path.assert_awaited_once_with("127.0.0.1", 20001)
+        pod_ssh_answers_on_create_path.assert_awaited_once()
+        assert pod_ssh_answers_on_create_path.await_args.args == ("127.0.0.1", 20001)
+
+
+@pytest.mark.asyncio
+async def test_a_template_that_starts_its_own_sshd_is_checked_without_the_bootstrap(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """DAH-5618: a template that declares SSH (ships_sshd) skips our bootstrap; SSH is still expected."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    bootstrap = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", bootstrap)
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", AsyncMock())
+    payload = _private_registry_create_payload().model_copy(update={"ships_sshd": True})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    bootstrap.assert_not_awaited()
+    pod_ssh_answers_on_create_path.assert_awaited_once()
 
 
 @pytest.mark.asyncio

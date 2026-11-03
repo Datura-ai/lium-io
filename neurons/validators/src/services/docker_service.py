@@ -1289,16 +1289,34 @@ POD_SSH_ANSWER_ATTEMPT_TIMEOUT_S = 5.0
 POD_SSH_ANSWER_RETRY_DELAY_S = 3.0
 
 
-async def _raise_unless_pod_ssh_answers(host: str, port: int) -> None:
+async def _raise_unless_pod_ssh_answers(host: str, port: int, *, log_extra: dict | None = None) -> None:
     """DAH-5618: the renter's SSH reaches the pod at host:port, so the create succeeds only once that port sends an
     SSH identification line (the per-cycle pod SSH probe's check). A host that drops SSH sessions or does not
     forward the port fails the create, and a reboot then ends REBOOT_FAILED instead of RUNNING. Retried for a
     while, since an image that starts its own sshd may not be listening yet."""
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + POD_SSH_ANSWER_DEADLINE_S
+    started = loop.time()
+    deadline = started + POD_SSH_ANSWER_DEADLINE_S
+    attempts = 0
     while True:
+        attempts += 1
         outcome = await tcp_connect_fault(host, port, POD_SSH_ANSWER_ATTEMPT_TIMEOUT_S)
-        if outcome.result == PodSshResult.BANNER:
+        answered = outcome.result == PodSshResult.BANNER
+        if answered or loop.time() + POD_SSH_ANSWER_RETRY_DELAY_S >= deadline:
+            # the time to the first SSH line on real creates, to size the budget from
+            logger.info(
+                _m(
+                    "pod SSH answer before ContainerCreated",
+                    extra=get_extra_info({
+                        **(log_extra or {}),
+                        "answered": answered,
+                        "result": outcome.result.value,
+                        "attempts": attempts,
+                        "elapsed_s": round(loop.time() - started, 2),
+                    }),
+                )
+            )
+        if answered:
             return
         if loop.time() + POD_SSH_ANSWER_RETRY_DELAY_S >= deadline:
             raise RuntimeError(
@@ -10260,10 +10278,14 @@ class DockerService:
                     await _raise_unless_running_before_created(
                         docker_client, container_name=container_name, container_id=container_id
                     )
-                    # a soft-failed sshd bootstrap keeps its own step; a filler has no renter to reach it
-                    if ssh_port_map and soft_failed_step is None and payload.workload_kind != WorkloadKind.FILLER:
+                    # SSH is expected only when our bootstrap left sshd listening or the template starts its own:
+                    # an image our bootstrap cannot give sshd still rents (soft failure), and a filler has no renter
+                    ssh_expected = soft_failed_step is None
+                    if ssh_port_map and ssh_expected and payload.workload_kind != WorkloadKind.FILLER:
                         current_step = "ssh_reachable"
-                        await _raise_unless_pod_ssh_answers(executor_info.address, ssh_port_map[2])
+                        await _raise_unless_pod_ssh_answers(
+                            executor_info.address, ssh_port_map[2], log_extra=default_extra
+                        )
                         current_step = "finalize"
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
