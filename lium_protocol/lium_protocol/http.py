@@ -37,6 +37,9 @@ class RentedExecutor(pydantic.BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-5244: a pod on the node has an open rental contracted as a self-rent (the renter is the node's own
+    # operator). Separate from owner_flag, which keeps its GPU-outside-tenant meaning and stays False.
+    self_rent: bool = False
 
 
 class NetworkEMA(pydantic.BaseModel):
@@ -100,8 +103,6 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     provider_discord_connected_executor_ids: list[str] | None = None
     # executor_ids the backend keeps unlisted until the provider confirms an e-mail address
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters
-    renter_hardware_fault_executor_ids: list[str] = []
     # executor_ids inside a running provider maintenance window: no incentive from either pool, rented or not
     maintenance_executor_ids: list[str] = []
     # executor_id → its maintenance window; the validator fails a node whose cycle started inside it

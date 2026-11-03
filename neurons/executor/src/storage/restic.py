@@ -718,7 +718,10 @@ class ResticStorageRunner:
                 subprocess.run([self._docker_binary, "rm", "--force", fields[0]], capture_output=True, text=True)
 
     def _remove_helper_container(self) -> Mapping[str, object]:
-        """Remove the helper container; return its docker inspect object ({} when it could not be read)."""
+        """Remove the helper container; return its docker inspect object.
+
+        {} when docker has no such container; State.Status "unknown" when inspect failed otherwise.
+        """
         name = self._helper_container_name()
         inspection = subprocess.run(
             [self._docker_binary, "inspect", "--format", "{{json .}}", name],
@@ -726,11 +729,13 @@ class ResticStorageRunner:
             text=True,
         )
         subprocess.run([self._docker_binary, "rm", "--force", name], capture_output=True, text=True)
+        if inspection.returncode != 0 and "no such" in (inspection.stderr or "").lower():
+            return {}
         try:
-            state = json.loads(inspection.stdout) if inspection.returncode == 0 else {}
+            state = json.loads(inspection.stdout) if inspection.returncode == 0 else None
         except ValueError:
-            state = {}
-        return state if isinstance(state, dict) else {}
+            state = None
+        return state if isinstance(state, dict) else {"State": {"Status": "unknown"}}
 
     def _killed_helper_message(self, action: str) -> str:
         """Exit 137: say out of memory only when docker recorded an OOM kill."""
@@ -746,8 +751,12 @@ class ResticStorageRunner:
         # Docker's OOMKilled can miss a kill; the kernel log settles OOM against an outside SIGKILL
         note = kernel_kill_note(self._helper_id)
         self._events.log(note)
-        if "oom-kill:" in note:  # the kernel's OOM kill that Docker's flag missed
+        if "oom-kill:" in note and self._helper_id:  # the kernel's OOM kill that Docker's flag missed
             return f"{action} ran out of memory"
+        if not state or state.get("Status") == "removing":  # removed mid-run, not an OOM
+            return f"{action} helper container was removed while running"
+        if state.get("Status") == "unknown":  # docker inspect failed for another reason
+            return f"{action} helper was killed (helper state unknown)"
         if state.get("OOMKilled") is False:
             return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
         return f"{action} helper was killed (often out of memory)"
@@ -1030,7 +1039,8 @@ def kernel_kill_lines(dmesg: str, container_id: str) -> list[str]:
 def kernel_kill_note(container_id: str) -> str:
     """One log line naming the kernel's kill of the helper, or saying there was none; never raises."""
     if not container_id:
-        return "kernel: no helper container ID to match"
+        # without an ID every host OOM line matches, and these lines reach the renter's logs: other pods' data
+        return "kernel: no helper ID to match"
     try:
         dmesg = subprocess.run(["dmesg", "--kernel", "--nopager"], capture_output=True, text=True, timeout=5)
     except Exception as error:  # noqa: BLE001 - diagnostics only

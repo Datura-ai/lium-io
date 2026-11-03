@@ -6,6 +6,7 @@ from services.nvidia_devices import KernelGpuView, read_kernel_gpu_view
 
 from ..messages import BannedProviderMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 
 def reported_gpu_uuids(ctx: Context) -> list[str]:
@@ -41,11 +42,8 @@ def has_live_rental(ctx: Context) -> bool:
     in use. A node that stops being verified goes stale, is flipped inactive by the hourly
     sweep and loses renter billing and its payouts, which is not what a ban should do.
     """
-    rented_data = ctx.state.rented_data
-    if rented_data is None:
-        return False
-    executor = rented_data.executors.get(ctx.executor.uuid)
-    return bool(executor and executor.pods)
+    rental = rental_of_this_node(ctx)
+    return bool(rental and rental.pods)
 
 
 class BannedProviderCheck:

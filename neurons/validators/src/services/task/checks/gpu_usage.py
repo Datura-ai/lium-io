@@ -40,6 +40,7 @@ from services.gpu_wedge import (
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ class PodContainerRental:
     # Completes "no live rental on this node uses it: ..." in the remediation.
     provider_facing_rental_status: str
     rental_closed_at: datetime | None = None
+    # the node the backend's closed-rental record names; None when the record names none
+    rental_executor_id: str | None = None
 
 
 class GpuUsageCheck:
@@ -327,6 +330,14 @@ class GpuUsageCheck:
             # This node's portal page shows no rental for a pod registered elsewhere, so the usual
             # "confirm, then remove" advice would clear the removal of a live rental's container.
             remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
+        elif (
+            orphan.pod_id is None
+            or orphan.rental_closed_at is None
+            or orphan.rental_executor_id is None
+            or str(orphan.rental_executor_id) != str(ctx.executor.uuid)
+        ):
+            # the stale cleanup removes only a container whose ended rental the backend places on this node
+            remediation_template = Msg.ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION
         else:
             remediation_template = Msg.ORPHANED_CONTAINER.remediation
         event = render_message(
@@ -450,7 +461,7 @@ def lium_workload_containers(ctx: Context) -> set[str]:
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
-    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(pod.docker_container_name for pod in rented_executor.pods)
     containers.discard("")
@@ -641,7 +652,7 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
 
-    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid) if ctx.state.rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     rented_at_run_start: bool = rented_executor is not None and any(
         pod.pod_id == pod_id for pod in rented_executor.pods
     )
@@ -668,7 +679,9 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             status = (
                 f"its rental's close time is {_in_minutes(-since_closed)} ahead of the validator's clock"
             )
-            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+            return PodContainerRental(
+                container_name, pod_id, PodRentalState.ORPHAN, status, closed_at, pod_rental.executor_id
+            )
         # A close time slightly ahead of this clock is backend-validator skew on a rental that just ended.
         status = (
             f"its rental ended {_in_minutes(since_closed)} ago"
@@ -676,7 +689,9 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             else "its rental ended just now"
         )
         if since_closed >= timedelta(minutes=RENTAL_TEARDOWN_GRACE_MINUTES):
-            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+            return PodContainerRental(
+                container_name, pod_id, PodRentalState.ORPHAN, status, closed_at, pod_rental.executor_id
+            )
         if rented_at_run_start:
             return PodContainerRental(container_name, pod_id, PodRentalState.ENDED_DURING_RUN, status, closed_at)
         # The backend deletes the pod row as it closes the rental, so a closed rental usually comes
@@ -712,9 +727,12 @@ def _the_answer_is_about_this_node(ctx: Context, owning_executor_id: str | None)
     nodes could name a squatter container after a live run of their honest one. A backend that
     predates the field sends nothing, and then the fleet snapshot is the only owner test we have.
     """
-    if owning_executor_id is None:
-        return True
-    return str(owning_executor_id) == str(ctx.executor.uuid)
+    if owning_executor_id is not None and str(owning_executor_id) != str(ctx.executor.uuid):
+        return False
+    # the UUID is the miner's word: a snapshot that lists it as another miner's rental elsewhere wins
+    rented_data = ctx.state.rented_data
+    listed = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    return listed is None or rental_of_this_node(ctx) is not None
 
 
 def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:

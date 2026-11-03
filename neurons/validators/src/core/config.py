@@ -273,6 +273,9 @@ class Settings(BaseSettings):
     )
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
+    # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
+    # the volume image); off = vloopback:v2 as before. Volumes already created keep their plugin.
+    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=False)
     # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
     # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
     POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
@@ -286,8 +289,8 @@ class Settings(BaseSettings):
     # validator reaches them, the node gets no verified ports. Unset URL: no outside probe.
     EXTERNAL_PORT_PROBE_URL: str = Field(env="EXTERNAL_PORT_PROBE_URL", default="")
     EXTERNAL_PORT_PROBE_TOKEN: str = Field(env="EXTERNAL_PORT_PROBE_TOKEN", default="")
-    # Off: a node whose ports answer only the validator is logged ("log-only"), not failed, so prod can count
-    # those nodes before enforcing.
+    # Off: an outside failure is logged ("log-only"), never failed, so prod can count the nodes it would fail
+    # (the shadow step). On: a node fails on its second outside failure in a row.
     EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
@@ -429,9 +432,6 @@ class Settings(BaseSettings):
     )
     # The per-pod incident mark expires this long after the last cycle that saw the fault.
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
-    # DAH-4457: a node whose GPU dropped out stays hidden (GPU_LOST availability entry, no new rentals) until its
-    # cards have read clean this long after the last faulty cycle (GpuLossHoldCheck).
-    GPU_LOSS_HOLD_SECONDS: int = Field(env="GPU_LOSS_HOLD_SECONDS", default=7200, gt=0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
@@ -451,6 +451,11 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
+    # DAH-5508: an RTX 4090 reporting ~48 GB is scored as its own model "NVIDIA GeForce RTX 4090 48GB" (own VRAM
+    # window, rate, anchor and idle tier) instead of failing the 24 GB window. Off: such a card is rejected as before.
+    # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
+    # preflight classifies it too, and the all-card probe is sized from the classified model.
+    RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
@@ -543,17 +548,34 @@ class Settings(BaseSettings):
     # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
     # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
     # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
+    # So is a failing side the rented pods' own counters show they used while the probe measured it (rented_throughput.DURING_*).
     RENTED_THROUGHPUT_CHECK_ENABLED: bool = Field(env="RENTED_THROUGHPUT_CHECK_ENABLED", default=True)
     RENTED_THROUGHPUT_INTERVAL_HOURS: float = Field(env="RENTED_THROUGHPUT_INTERVAL_HOURS", default=3.0, gt=0)
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5244: before its port-check container (and the rented-throughput probe) the validator times `sync -f` on
+    # the host's Docker root - the wait every `docker run` pays while a tenant's dirty pages sit on that filesystem
+    # - and reads the Docker-root disk and host Dirty around it (services/task/host_disk.py). CHECK_ENABLED takes
+    # the reading, logs it and sends it to the backend (specs.disk_pressure). ENFORCEMENT additionally lets a node
+    # rented by someone else, or running our filler, keep its last verified ports and sysbox instead of a port
+    # check into the stall (DISK_PRESSURE_MAX_DEFERRALS cycles in a row at most; the rental probe rents nothing on
+    # such a cycle), and leaves out the rented-throughput probe container under pressure (a probe that runs under
+    # it judges no disk side). Shadow by default: a week of readings decides the flip.
+    DISK_PRESSURE_CHECK_ENABLED: bool = Field(env="DISK_PRESSURE_CHECK_ENABLED", default=True)
+    DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED: bool = Field(env="DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", default=False)
+
     # DAH-5320: IdleDiskWriteCheck, last in the pipeline, writes the same 256 MiB with fsync on idle and filler nodes
     # once a day per node (skipped while the docker root disk already moves DISK_BUSY_MB_PER_S) and logs
     # IDLE_DISK_WRITE with a shadow verdict against DISK_MIN_MB_PER_S. Logged only; ENFORCE_ENABLED is read by nothing
     # yet (the follow-up zeroes the score on a slow disk).
     IDLE_DISK_WRITE_CHECK_ENABLED: bool = Field(env="IDLE_DISK_WRITE_CHECK_ENABLED", default=True)
     IDLE_DISK_WRITE_ENFORCE_ENABLED: bool = Field(env="IDLE_DISK_WRITE_ENFORCE_ENABLED", default=False)
+    # a node running a filler is busy from this rate of sectors read plus written on the docker root disks: a filler
+    # moving less than DISK_BUSY_MB_PER_S would otherwise share the disk with the probe and lower the reading
+    IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S: float = Field(
+        env="IDLE_DISK_WRITE_FILLER_BUSY_MB_PER_S", default=5.0, gt=0
+    )
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and
@@ -620,15 +642,6 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
-    # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
-    # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
-    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
-    # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
-    # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
-    # False: every spot node earns 0, as before.
-    ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
     # Lium filler runs on it: a filler Lium did not start is Lium's doing (Fish). Provider-caused
@@ -643,14 +656,16 @@ class Settings(BaseSettings):
     # restriction, and the free remainder of a partially rented spot node, earn 0 as before.
     # False: every rented spot node earns 0, as before.
     ENABLE_SPOT_RENTAL_INCENTIVE: bool = Field(env="ENABLE_SPOT_RENTAL_INCENTIVE", default=False)
-    # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
-    # bucket-cap dilution is raised to 1.0 x its configuration's average filler revenue, even above
-    # its listed rate (1.0 = SECURE_FILLER_REVENUE_FLOOR_FACTOR, set apart from the spot factor).
-    # False: dilution applies as before.
-    ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
-    # A configuration's filler average is used only when it was taken over at least this many
-    # filler GPU-hours; a thinner sample reads as no average.
-    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
+    # A Spot node's configuration filler average is used only when it was taken over at least this
+    # many filler GPU-hours; a thinner sample reads as no average. 2 = the backend's floor for the
+    # per-card rate the average is built from; 24 left a lone 1-GPU Spot node unpaid for its first
+    # day of Default Job and after every restart.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=2.0)
+    # The same threshold for a secure node (the secure floor): kept at 24 GPU-hours, since its
+    # top-up is bounded by the remaining burn allocation, not by what the fillers earned.
+    SECURE_FILLER_REVENUE_MIN_GPU_HOURS: float = Field(
+        env="SECURE_FILLER_REVENUE_MIN_GPU_HOURS", default=24.0
+    )
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
     # unrented node) when every pod in the batch-start rented list is stale: not running and its
@@ -717,6 +732,13 @@ class Settings(BaseSettings):
     GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED: bool = Field(
         env="GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED", default=False
     )
+    # NVIDIA's minimum VBIOS for CC in R595, per GPU model (Trusted Computing Solutions Release Notes R595,
+    # RN-12817-001_v02, Tables 1 (SPT CC) and 3 (MPT CC) for Blackwell). Dotted hex fields; "XX" matches any value.
+    CC_VBIOS_MINIMUMS: dict[str, str] = Field(
+        env="CC_VBIOS_MINIMUMS", default={"B200": "97.00.E4.00.XX", "B300": "97.10.64.00.XX"}
+    )
+    # On (default) = a CC multi-GPU node below the minimum fails like an identity finding. Off = shadow: only logged.
+    CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED: bool = Field(env="CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED", default=True)
     # Hosted NRAS endpoint (interim verification locus; a local nv-verifier removes
     # this outbound SPOF before fleet enforcement — see remediation plan CD4).
     NVIDIA_NRAS_URL: str = Field(
@@ -764,6 +786,13 @@ class Settings(BaseSettings):
 
     def get_allowed_gpu_hwmodels(self) -> set[str]:
         return {s.strip() for s in self.GPU_ATTESTATION_ALLOWED_HWMODELS.split(",") if s.strip()}
+
+    def get_filler_revenue_min_gpu_hours(self, is_spot: bool) -> float:
+        return (
+            self.FILLER_REVENUE_MIN_GPU_HOURS
+            if is_spot
+            else self.SECURE_FILLER_REVENUE_MIN_GPU_HOURS
+        )
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}
@@ -824,6 +853,20 @@ class Settings(BaseSettings):
     CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS", default=1200,
         description="Hard timeout for `docker build` of a custom-dockerfile pod (seconds).",
+    )
+    CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND: int = Field(
+        env="CUSTOM_DOCKERFILE_EXPORT_MIN_BYTES_PER_SECOND", default=10 * 1024 * 1024, gt=0,
+        description=(
+            "Slowest image export (DinD `docker save | docker load` onto the host) the export timeout allows "
+            "for: the timeout is the built image's size at this rate, never below the build timeout."
+        ),
+    )
+    CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS", default=3300, gt=0,
+        description=(
+            "Ceiling for setup + build + export of one custom-dockerfile pod. The backend fails a pod "
+            "still PENDING after 1 h, so a size-scaled export never runs past this."
+        ),
     )
     CUSTOM_DOCKERFILE_MAX_BYTES: int = Field(
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,

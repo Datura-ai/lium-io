@@ -18,6 +18,7 @@ from .gpu_fingerprint import GpuFingerprintCheck
 from .gpu_kernel_count import GpuKernelCountCheck
 from .gpu_loss_hold import GpuLossHoldCheck
 from .gpu_model_valid import GpuModelValidCheck
+from .gpu_clock_lock import GpuClockLockCheck
 from .gpu_power_limit import GpuPowerLimitCheck
 from .gpu_thermal_throttle import GpuThermalThrottleCheck
 from .gpu_usage import GpuUsageCheck
@@ -78,6 +79,7 @@ __all__ = [
     "GpuKernelCountCheck",
     "GpuLossHoldCheck",
     "GpuModelValidCheck",
+    "GpuClockLockCheck",
     "GpuPowerLimitCheck",
     "GpuThermalThrottleCheck",
     "GpuUsageCheck",
