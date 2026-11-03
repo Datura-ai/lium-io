@@ -61,12 +61,13 @@ FABRIC_SERVICES = ("nvidia-fabricmanager", "nvidia-nvlsm")
 # named, so a reset that outlives its SSH timeout can be stopped (one per host: it owns every host GPU)
 FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
-# processes left in the reset unit's cgroup (v2, or v1's systemd hierarchy); a gone cgroup is empty, since the
-# kernel never removes a cgroup that still holds a process
+# processes left in the reset unit's cgroup (v2, or v1's systemd hierarchy); 0 only for an unloaded unit or an
+# existing, readable, empty cgroup.procs. Neither file there, or a failed read, exits 1: unknown, never 0
 FABRIC_RESET_UNIT_PROCS = "nsenter -t 1 -m -- sh -c " + shlex.quote(
     f"cg=$(systemctl show -p ControlGroup --value {FABRIC_RESET_UNIT}) || exit 1; "
-    '[ -z "$cg" ] && echo 0 || cat /sys/fs/cgroup"$cg"/cgroup.procs /sys/fs/cgroup/systemd"$cg"/cgroup.procs '
-    "2>/dev/null | wc -l"
+    '[ -z "$cg" ] && { echo 0; exit 0; }; '
+    'for f in /sys/fs/cgroup"$cg"/cgroup.procs /sys/fs/cgroup/systemd"$cg"/cgroup.procs; do '
+    '[ -f "$f" ] || continue; n=$(wc -l < "$f") || exit 1; echo "$n"; exit 0; done; exit 1'
 )
 _FABRIC_STOP_FAILED_EXIT = 97
 STOP_GRACE_SECONDS = 10

@@ -128,6 +128,8 @@ class FakeHost:
                 raise RuntimeError("ssh dropped")
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
         if cmd == gpu_reset.FABRIC_RESET_UNIT_PROCS:
+            if self.reset_unit_procs is None:
+                return make_command_result(False, exit_code=1)
             return make_command_result(True, f"{self.reset_unit_procs}\n")
         if cmd.startswith("nsenter -t 1 -m -- systemctl "):
             verb, unit = cmd.split()[-2:]
@@ -398,15 +400,36 @@ async def test_a_failed_reset_unit_with_an_empty_cgroup_counts_as_stopped():
 
 
 def test_unit_process_count_reads_the_cgroup(tmp_path):
-    """The host check prints the unit cgroup's process count, and 0 once the cgroup is gone."""
-    script = shlex.split(gpu_reset.FABRIC_RESET_UNIT_PROCS)[-1]
+    """0 only for an unloaded unit or an existing empty cgroup.procs; a missing file is unknown (exit 1)."""
+    root = tmp_path / "cg"
+    script = shlex.split(gpu_reset.FABRIC_RESET_UNIT_PROCS)[-1].replace("/sys/fs/cgroup", str(root))
     (tmp_path / "systemctl").write_text('#!/bin/sh\necho "$CG"\n')
     (tmp_path / "systemctl").chmod(0o755)
-    env = {"PATH": f"{tmp_path}:/usr/bin:/bin"}
-    out = subprocess.run(["/bin/sh", "-c", script], env={**env, "CG": ""}, capture_output=True, text=True)
-    assert out.stdout.strip() == "0"
-    gone = subprocess.run(["/bin/sh", "-c", script], env={**env, "CG": "/lium-x"}, capture_output=True, text=True)
-    assert gone.stdout.strip() == "0"
+
+    def count(cg):
+        env = {"PATH": f"{tmp_path}:/usr/bin:/bin", "CG": cg}
+        out = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True)
+        return out.returncode, out.stdout.strip()
+
+    assert count("") == (0, "0")
+    assert count("/system.slice/x.service")[0] == 1
+    (root / "systemd/system.slice/x.service").mkdir(parents=True)
+    (root / "systemd/system.slice/x.service/cgroup.procs").write_text("")
+    assert count("/system.slice/x.service") == (0, "0")
+    (root / "system.slice/x.service").mkdir(parents=True)
+    (root / "system.slice/x.service/cgroup.procs").write_text("4242\n")
+    assert count("/system.slice/x.service") == (0, "1")
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_reset_unit_cgroup_skips_the_fallback_and_the_container_start():
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True)
+    host.reset_hangs = True
+    host.reset_unit_state, host.reset_unit_procs = "failed", None
+    report, start = await _reset(host, backend=U)
+    assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert "still running on the host" in report.detail and not report.container_restarted
+    start.assert_not_awaited()
 
 
 def _run_fabric_script(tmp_path, *, stop_fails=False, reset_exit=0):
