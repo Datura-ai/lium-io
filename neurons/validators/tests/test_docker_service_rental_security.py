@@ -1318,3 +1318,13 @@ async def test_a_refused_create_drops_the_s3fs_plugin_only_once_its_volume_is_go
 
     assert any("docker volume rm celium-volume-safe" in c for c in ssh_client.commands)
     assert any("docker plugin rm s3fs-celium-volume-safe" in c for c in ssh_client.commands) is plugin_removed
+
+
+def test_create_request_str_leaves_out_renter_supplied_values():
+    # every create logs str(payload); renter-supplied env, commands, Dockerfile and password stay out
+    payload = _base_create_payload(dockerfile_content="FROM scratch\nDOCKERFILE_MARKER")
+    logged = str(payload)
+    for value in (HOSTILE_ENV_VALUE, HOSTILE_STARTUP_COMMAND, HOSTILE_PASSWORD, "DOCKERFILE_MARKER"):
+        assert value not in logged
+    assert payload.custom_options.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
+    assert "HOSTILE_ENV" in payload.model_dump_json()
