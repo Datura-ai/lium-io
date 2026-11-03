@@ -4,7 +4,7 @@ A real executor (`neurons/executor`, this checkout) on its own docker daemon, a 
 owns it, and the validator's own services (`neurons/validators/src`) driving them the way `Validator.sync` and the
 connector do — sign in over REST, install the cycle's SSH key through the miner, SSH in, upload and run the
 obfuscated scrape, walk the check pipeline, publish the verdict, rent a container, tear it down. The only thing
-missing is the chain: the subtensor client is never constructed, the miner never syncs, and the hotkeys are three
+missing is the chain: the subtensor client is never connected, the miner never syncs, and the hotkeys are three
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
@@ -123,9 +123,9 @@ customer create on a node running a `filler_*` container removes the filler and 
 
 ## Known verdicts the suite pins
 
-- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
-  `gpu_details[0]`, so a host with zero GPUs cannot report `gpu.count = 0`; the validator sees the scrape's
-  `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
+- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** The stack's executor has no `libnvidia-ml`, so
+  `miner_jobs/machine_scrape.py` returns before any GPU field and then derives its output key from `gpu_details[0]`;
+  the validator sees the scrape's `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
   the current behaviour so a change to it is a visible diff (and the misleading remediation is tracked as a ticket).
 
 ## What it cannot prove (and where that is proven)
