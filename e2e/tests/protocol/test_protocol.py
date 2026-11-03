@@ -110,17 +110,12 @@ def test_future_timestamp_is_refused_401():
     assert r.status_code == 401 and "future" in r.text.lower(), r.text
 
 
-def test_headers_naming_another_miner_still_yield_only_this_miners_executors():
-    """X-Miner-Hotkey is part of the signed blob but, outside CENTRAL_MODE, a selector the single miner does not
-    compare with its own hotkey (dependencies/auth.py): the reply must still be this miner's own executors and
-    nothing else — there is nothing else to leak, and no 5xx."""
+def test_headers_naming_another_miner_are_refused_403():
+    """X-Miner-Hotkey is part of the signed blob; outside CENTRAL_MODE the miner serves one hotkey and refuses a
+    correctly signed sign-in made for another miner (dependencies/auth.py, lium-io#1324)."""
     vk = lib.validator_keypair()
-    r, _, pub = _submit(lib.validator_rest_headers(vk, miner_hotkey=lib.stranger_keypair().ss58_address))
-    assert r.status_code in (200, 401, 403), r.text
-    if r.status_code == 200:
-        assert {e["uuid"] for e in r.json()["executors"]} <= {lib.EXECUTOR_UUID}, r.text
-        lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-remove", headers=lib.validator_rest_headers(vk), timeout=60,
-                 json={"message_type": "SSHPubKeyRemoveRequest", "public_key": pub, "validator_signature": lib.sign(vk, pub), "miner_hotkey": lib.MINER_HOTKEY})
+    r, _, _ = _submit(lib.validator_rest_headers(vk, miner_hotkey=lib.stranger_keypair().ss58_address))
+    assert r.status_code == 403 and "another miner" in r.text, r.text
 
 
 # ------------------------------------------------------------ miner → executor /upload_ssh_key -------------------------
@@ -175,3 +170,93 @@ def test_executor_refuses_a_substituted_public_key():
     body["validator_signature"] = lib.sign(lib.validator_keypair(), other)
     r = lib.http("POST", f"{lib.EXECUTOR_URL}/upload_ssh_key", json=body)
     assert r.status_code in (400, 401), r.text
+
+
+# --------------------------------------------------- executor: key bound to a miner, dated nonce ------------------------
+
+
+def _upload(body: dict):
+    return lib.http("POST", f"{lib.EXECUTOR_URL}/upload_ssh_key", json=body)
+
+
+def _remove(body: dict) -> None:
+    lib.http("POST", f"{lib.EXECUTOR_URL}/remove_ssh_key", json=body)
+
+
+def test_executor_accepts_a_key_bound_to_the_pool_hotkey():
+    """A provider on Lium-held payouts is served under the pool hotkey: a key the validator bound to it is accepted
+    like one bound to the executor's own miner (lium-io#1923)."""
+    priv, pub = lib.ssh_keypair()
+    body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, bound_to=lib.POOL_HOTKEY)
+    r = _upload(body)
+    assert r.status_code == 200, r.text
+    try:
+        rc, _ = lib.run(lib.ssh_run(lib.EXECUTOR_IP, r.json()["ssh_port"], r.json()["ssh_username"], priv, "true"))
+        assert rc == 0
+    finally:
+        _remove(body)
+
+
+def test_executor_refuses_a_key_bound_to_another_miner_403():
+    _, pub = lib.ssh_keypair()
+    body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, bound_to=lib.stranger_keypair().ss58_address)
+    r = _upload(body)
+    assert r.status_code == 403, r.text
+
+
+def test_executor_refuses_a_key_without_a_miner_binding_403():
+    """The stack's executor enforces the binding (REQUIRE_MINER_BOUND_SSH_KEY): a legacy upload without one is refused."""
+    _, pub = lib.ssh_keypair()
+    r = _upload(lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, bound_to=None))
+    assert r.status_code == 403, r.text
+
+
+def test_executor_refuses_a_binding_signed_by_a_stranger_403():
+    _, pub = lib.ssh_keypair()
+    body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub)
+    body["validator_miner_signature"] = lib.sign(lib.stranger_keypair(), lib.ssh_pubkey_signing_blob(pub, None, lib.MINER_HOTKEY))
+    r = _upload(body)
+    assert r.status_code == 403, r.text
+
+
+def _dated_nonce(issued_at: int) -> str:
+    # the shape of datura's fresh_upload_nonce, minted at `issued_at`
+    import secrets
+
+    from datura.requests.validator_requests import UPLOAD_NONCE_MAGIC
+
+    return (UPLOAD_NONCE_MAGIC + issued_at.to_bytes(8, "big") + secrets.token_bytes(20)).hex()
+
+
+def test_executor_accepts_a_fresh_dated_nonce():
+    from datura.requests.validator_requests import fresh_upload_nonce
+
+    priv, pub = lib.ssh_keypair()
+    body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, nonce=fresh_upload_nonce())
+    r = _upload(body)
+    assert r.status_code == 200, r.text
+    try:
+        rc, _ = lib.run(lib.ssh_run(lib.EXECUTOR_IP, r.json()["ssh_port"], r.json()["ssh_username"], priv, "true"))
+        assert rc == 0
+    finally:
+        _remove(body)
+
+
+def test_executor_refuses_a_stale_nonce_401():
+    """A captured upload is worth at most UPLOAD_NONCE_MAX_AGE_SECONDS (600 s): one minted an hour ago is refused."""
+    _, pub = lib.ssh_keypair()
+    r = _upload(lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, nonce=_dated_nonce(int(time.time()) - 3600)))
+    assert r.status_code == 401 and "nonce" in r.text.lower(), r.text
+
+
+def test_executor_refuses_a_stripped_or_swapped_nonce_401():
+    """The validator signature covers the nonce: dropping it or replacing it in transit breaks the signature."""
+    from datura.requests.validator_requests import fresh_upload_nonce
+
+    _, pub = lib.ssh_keypair()
+    signed = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub, nonce=fresh_upload_nonce())
+    stripped = {k: v for k, v in signed.items() if k != "nonce"}
+    r = _upload(stripped)
+    assert r.status_code == 401, r.text
+    r = _upload({**signed, "nonce": fresh_upload_nonce()})
+    assert r.status_code == 401, r.text

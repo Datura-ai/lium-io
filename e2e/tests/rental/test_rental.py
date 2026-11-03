@@ -122,3 +122,97 @@ def test_rental_on_an_executor_the_miner_does_not_own_is_refused(services):
     assert isinstance(resp, FailedContainerRequest), resp
     lib.write_artifact("rental-refused.json", resp.model_dump(mode="json"))
     assert resp.msg, resp
+
+
+def _ssh_port(created) -> int:
+    return [m for m in created.port_maps if m[0] == 22][0][1]
+
+
+def _renter_can_ssh(created, renter_priv: str) -> None:
+    rc, _ = lib.wait_for(
+        lambda: lib.run(lib.ssh_run(lib.EXECUTOR_IP, _ssh_port(created), "root", renter_priv, "true")),
+        timeout=120, interval=3, what="ssh into the rented container",
+    )
+    assert rc == 0
+
+
+def _release_and_delete(services, pod_id: str, created) -> None:
+    """What the platform does after recording the pod (clear the pending flag), then the delete."""
+    from payload_models.payloads import ContainerDeleted
+
+    lib.run(services["MinerService"].redis_service.remove_pending_pod(lib.MINER_HOTKEY, lib.EXECUTOR_UUID, pod_id))
+    deleted = lib.run(services["MinerService"].handle_container(_delete_request(pod_id, created.container_name, created.volume_name)))
+    assert isinstance(deleted, ContainerDeleted), deleted
+
+
+def _container_id(name: str) -> str:
+    rc, out = lib.executor_sh(f"docker ps -aq --no-trunc --filter 'name=^/{name}$'")
+    assert rc == 0, out
+    return out.strip()
+
+
+def _create_ok(services, pod_id: str, renter_pub: str):
+    from payload_models.payloads import ContainerCreated
+
+    created = lib.run(services["MinerService"].handle_container(_create_request(pod_id, renter_pub)))
+    assert isinstance(created, ContainerCreated), created
+    return created
+
+
+def test_a_delayed_duplicate_create_is_refused_and_leaves_the_first_pod_alone(services):
+    """The platform re-sends a create whose ContainerCreated it has not recorded yet (the pending flag is still set):
+    the duplicate is refused with RentingInProgress and the pod the first create made keeps running, same container
+    (lium-io#1889: a re-sent create must never remove or replace the live attempt's container)."""
+    from payload_models.payloads import FailedContainerErrorCodes, FailedContainerRequest
+
+    renter_priv, renter_pub = lib.ssh_keypair()
+    pod_id = str(uuid.uuid4())
+    created = _create_ok(services, pod_id, renter_pub)
+    try:
+        first_id = _container_id(created.container_name)
+        assert first_id, "the created pod is not on the host"
+        dup = lib.run(services["MinerService"].handle_container(_create_request(pod_id, renter_pub)))
+        lib.write_artifact("rental-duplicate.json", dup.model_dump(mode="json") if hasattr(dup, "model_dump") else str(dup))
+        assert isinstance(dup, FailedContainerRequest) and dup.error_code == FailedContainerErrorCodes.RentingInProgress, dup
+        assert _container_id(created.container_name) == first_id, "the duplicate create replaced the first pod's container"
+        _renter_can_ssh(created, renter_priv)
+    finally:
+        _release_and_delete(services, pod_id, created)
+
+
+def test_a_re_sent_create_replaces_its_own_leftover_container(services):
+    """An earlier attempt for this pod died after `docker run` and left `pod_<id>` on the host; the re-sent create
+    (no pending flag any more) must not fail on its own name: the leftover goes and the new pod runs."""
+    renter_priv, renter_pub = lib.ssh_keypair()
+    pod_id = str(uuid.uuid4())
+    name = f"pod_{pod_id}"
+    rc, out = lib.executor_sh(f"docker run -d --name {name} --entrypoint sleep {lib.ENV['E2E_POD_IMAGE']} infinity")
+    assert rc == 0, out
+    leftover_id = out.strip()
+    created = _create_ok(services, pod_id, renter_pub)
+    try:
+        assert created.container_name == name, created
+        now = _container_id(name)
+        assert now and now != leftover_id, "the leftover container is still the pod"
+        _renter_can_ssh(created, renter_priv)
+    finally:
+        _release_and_delete(services, pod_id, created)
+
+
+def test_a_customer_create_on_a_node_running_a_filler_removes_the_filler(services):
+    """A customer's pod never shares the node with a filler: a whole-node create on a host where a `filler_*`
+    container runs removes it and starts the pod (lium-io#1934, #1993: the rent must not fail on the filler)."""
+    renter_priv, renter_pub = lib.ssh_keypair()
+    filler = f"filler_{uuid.uuid4()}"
+    rc, out = lib.executor_sh(f"docker run -d --name {filler} --entrypoint sleep {lib.ENV['E2E_POD_IMAGE']} infinity")
+    assert rc == 0, out
+    pod_id = str(uuid.uuid4())
+    try:
+        created = _create_ok(services, pod_id, renter_pub)
+        try:
+            assert not _container_id(filler), f"{filler} still on the host beside the customer's pod"
+            _renter_can_ssh(created, renter_priv)
+        finally:
+            _release_and_delete(services, pod_id, created)
+    finally:
+        lib.executor_sh(f"docker rm -f {filler} >/dev/null 2>&1; true")

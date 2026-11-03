@@ -21,6 +21,7 @@ MINER_IP = ENV["E2E_MINER_IP"]
 MINER_PORT = int(ENV["E2E_MINER_PORT"])
 VALIDATOR_HOTKEY = ENV["E2E_VALIDATOR_HOTKEY"]
 MINER_HOTKEY = ENV["E2E_MINER_HOTKEY"]
+POOL_HOTKEY = ENV["E2E_POOL_HOTKEY"]
 GPU = ENV.get("E2E_GPU", "") not in ("", "0", "false")
 ARTIFACTS = "/e2e/artifacts"
 
@@ -69,8 +70,13 @@ def validator_rest_headers(kp: Keypair, miner_hotkey: str = MINER_HOTKEY, timest
     }
 
 
-def upload_ssh_key_payload(miner_kp: Keypair, validator_kp: Keypair, public_key: str, nonce: str | None = None) -> dict:
-    """What the miner posts to the executor's /upload_ssh_key (ExecutorService.send_pubkey_to_executor)."""
+def upload_ssh_key_payload(
+    miner_kp: Keypair, validator_kp: Keypair, public_key: str, nonce: str | None = None, bound_to: str | None = MINER_HOTKEY
+) -> dict:
+    """What the miner posts to the executor's /upload_ssh_key (ExecutorService.send_pubkey_to_executor).
+
+    `bound_to` is the miner hotkey the validator issued the key for (`validator_miner_signature`), as every validator
+    upload carries; the stack's executor refuses a key without it (REQUIRE_MINER_BOUND_SSH_KEY, executor/e2e.env)."""
     body = {
         "public_key": public_key,
         "validator_signature": sign(validator_kp, ssh_pubkey_signing_blob(public_key, nonce)),
@@ -79,7 +85,23 @@ def upload_ssh_key_payload(miner_kp: Keypair, validator_kp: Keypair, public_key:
     }
     if nonce is not None:
         body["nonce"] = nonce
+    if bound_to is not None:
+        body["miner_hotkey"] = bound_to
+        body["validator_miner_signature"] = sign(validator_kp, ssh_pubkey_signing_blob(public_key, nonce, bound_to))
     return body
+
+
+def executor_sh(command: str, timeout: float = 60) -> tuple[int, str]:
+    """Run one shell command on the executor over SSH (its docker CLI talks to the host's dockerd, where pods land);
+    the key is installed for this command and removed after it."""
+    priv, pub = ssh_keypair()
+    body = upload_ssh_key_payload(miner_keypair(), validator_keypair(), pub)
+    r = http("POST", f"{EXECUTOR_URL}/upload_ssh_key", json=body)
+    assert r.status_code == 200, r.text
+    try:
+        return run(ssh_run(EXECUTOR_IP, r.json()["ssh_port"], r.json()["ssh_username"], priv, command, timeout=timeout))
+    finally:
+        http("POST", f"{EXECUTOR_URL}/remove_ssh_key", json=body)
 
 
 def ssh_keypair() -> tuple[str, str]:
