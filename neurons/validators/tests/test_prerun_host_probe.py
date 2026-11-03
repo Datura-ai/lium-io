@@ -1009,13 +1009,25 @@ async def test_a_rental_volume_clamped_far_below_the_order_fails_the_create(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("sized_gb", "created"), [(120, True), (106, False)])
-async def test_the_ordered_share_is_checked_on_the_final_volume_size(svc_fixture, monkeypatch, sized_gb, created):
-    """DAH-5260 live test: the reclaim kept the cache (no clamp), then the fresh sizing gave 106 GB of 123 ordered and
-    the pod went RUNNING. The 95% check runs on the size the volume is created with."""
+@pytest.mark.parametrize(
+    ("clamped_gb", "sized_gb", "created"), [(None, 106, True), (120, 120, True), (120, 106, False)]
+)
+async def test_the_ordered_share_is_checked_on_the_final_volume_size_only_after_a_clamp(
+    svc_fixture, monkeypatch, clamped_gb, sized_gb, created
+):
+    """DAH-5260: the 95% check runs on the size the volume is created with, and only when a cache removal failed (the
+    reclaim clamped the order). The fresh sizing alone often gives a rental under 95% with no cache on the
+    node: those are created as before (Rustam, 3 Nov)."""
     svc = svc_fixture
     _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
-    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(return_value=False))
+
+    async def reclaim(*, payload, **_kwargs):
+        if clamped_gb is None:
+            return False
+        payload.volume_limit_gb = clamped_gb
+        return True
+
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(side_effect=reclaim))
     monkeypatch.setattr(
         svc, "resolve_volume_sizing", AsyncMock(return_value=ds_module.VolumeSizingResult(sized_gb, 61, "fresh"))
     )
@@ -1027,4 +1039,5 @@ async def test_the_ordered_share_is_checked_on_the_final_volume_size(svc_fixture
     else:
         assert type(result).__name__ == "FailedContainerRequest"
         assert result.failure_step == ds_module.RENTAL_DISK_SHORT_STEP
+        assert "106 GB sized of 123 GB ordered" in result.detail
         svc._run_rental_docker_create_with_port_retry.assert_not_awaited()

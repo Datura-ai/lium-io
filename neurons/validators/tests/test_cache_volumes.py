@@ -455,3 +455,17 @@ async def test_a_fresh_sized_rental_counts_the_sizing_overhead_in_its_fit(docker
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
     assert _removed_volumes(ssh_client) == removed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(105, [_KIMI]), (115, [])])
+async def test_a_fresh_sized_rental_fits_only_under_the_df_guard_too(docker_service, monkeypatch, free_gb, removed):
+    # DAH-5260 review: 500 GB of pod volumes already on the node make the pool fit, but resolve_volume_sizing's
+    # df_guard caps the volume at df free less 10 GB, so 100 GB needs 110 GB free or the cache goes
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=500 * 1024**3))
+    rental = _rental(100, 50)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed

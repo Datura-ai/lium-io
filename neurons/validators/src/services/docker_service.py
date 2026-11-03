@@ -817,6 +817,16 @@ def _docker_rm_command(targets: list[str]) -> str:
     return "/usr/bin/docker rm -fv " + " ".join(shlex.quote(target) for target in targets)
 
 
+class RentalDiskFit(NamedTuple):
+    """What a customer rental needs free beside the filler caches (DAH-5260)."""
+
+    own_gb: float  # its volume (unless already on disk) plus its container storage
+    existing_gb: float  # pod volumes already on disk less the sizing overhead (fresh sizing only)
+    disk_share: float
+    fresh_sizing: bool
+    needs_free_gb: float
+
+
 class CustomerContainerRemoval(NamedTuple):
     first_rm_exited_zero: bool
     listing_after_rm: ContainerListing | None
@@ -5260,20 +5270,8 @@ class DockerService:
 
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
             free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-            # a re-create's volume is already preallocated, outside df free: counting it again never fits
-            rental_own_gb: float = (0 if payload.local_volume else payload.volume_limit_gb) + (
-                payload.storage_limit_gb or 0
-            )
-            # a fresh-sized (disk_share) rental gets its share of free disk plus the pod volumes already on it,
-            # less the overhead resolve_volume_sizing reserves, so a half-node one needs twice its size there
-            fresh_sizing = self.measures_host_for_volume_sizing(payload)
-            disk_share: float = payload.disk_share if fresh_sizing and payload.disk_share else 1
-            existing_gb: float = (
-                await self._get_existing_vloopback_bytes(ssh_client) / (1024**3) - _FRESH_SIZING_OVERHEAD_GB
-                if fresh_sizing
-                else 0
-            )
-            rental_needs_free_gb: float = rental_own_gb / disk_share - existing_gb
+            fit = await self._rental_disk_fit(ssh_client, payload)
+            rental_needs_free_gb = fit.needs_free_gb
             if free_gb >= rental_needs_free_gb:
                 return False
 
@@ -5315,9 +5313,7 @@ class DockerService:
                 )
             # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed
             if not payload.local_volume and not await rental_fits():
-                await self._clamp_rental_volume_to_free_disk(
-                    ssh_client, payload, docker_root_dir, rental_own_gb, existing_gb, disk_share, fresh_sizing
-                )
+                await self._clamp_rental_volume_to_free_disk(ssh_client, payload, docker_root_dir, fit)
             return True
         except asyncio.CancelledError:
             raise
@@ -5331,24 +5327,42 @@ class DockerService:
             )
             return True  # the removal may have run before the failure
 
+    async def _rental_disk_fit(
+        self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest
+    ) -> RentalDiskFit:
+        """The free disk a customer rental needs to be sized as ordered (DAH-5260)."""
+        # a re-create's volume is already preallocated, outside df free: counting it again never fits
+        own_gb: float = (0 if payload.local_volume else payload.volume_limit_gb) + (payload.storage_limit_gb or 0)
+        # a fresh-sized (disk_share) rental gets its share of free disk plus the pod volumes already on it,
+        # less the overhead resolve_volume_sizing reserves, so a half-node one needs twice its size there
+        fresh_sizing = self.measures_host_for_volume_sizing(payload)
+        disk_share: float = payload.disk_share if fresh_sizing and payload.disk_share else 1
+        existing_gb: float = (
+            await self._get_existing_vloopback_bytes(ssh_client) / (1024**3) - _FRESH_SIZING_OVERHEAD_GB
+            if fresh_sizing
+            else 0
+        )
+        needs_free_gb: float = own_gb / disk_share - existing_gb
+        if fresh_sizing and not payload.local_volume:
+            # resolve_volume_sizing's df_guard caps the volume at df free less its headroom
+            needs_free_gb = max(needs_free_gb, payload.volume_limit_gb + _FRESH_SIZING_HEADROOM_GB)
+        return RentalDiskFit(own_gb, existing_gb, disk_share, fresh_sizing, needs_free_gb)
+
     async def _clamp_rental_volume_to_free_disk(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         docker_root_dir: str,
-        rental_own_gb: float,
-        existing_gb: float,
-        disk_share: float,
-        fresh_sizing: bool,
+        fit: RentalDiskFit,
     ) -> None:
         """Clamp a rental's volume to the disk actually free after the cache eviction (DAH-5260)."""
         free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-        rental_gets_gb = (free_now_gb + existing_gb) * disk_share
+        rental_gets_gb = (free_now_gb + fit.existing_gb) * fit.disk_share
         payload.volume_limit_gb = max(
             int(
                 # fresh sizing splits the slice between volume and storage in the order's proportion
-                rental_gets_gb * payload.volume_limit_gb / rental_own_gb
-                if fresh_sizing
+                rental_gets_gb * payload.volume_limit_gb / fit.own_gb
+                if fit.fresh_sizing
                 else rental_gets_gb - (payload.storage_limit_gb or 0)
             ),
             1,
@@ -9439,6 +9453,8 @@ class DockerService:
                         host_probe=docker_listing_probe,
                     )
                 )
+                # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
+                clamped_for_cache = bool(ordered_volume_gb) and payload.volume_limit_gb != ordered_volume_gb
                 cleanup_changed_host = bool(
                     removal_at_ssh_connect_lost_its_channel
                     or removed_containers
@@ -9584,17 +9600,17 @@ class DockerService:
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
-                    # the reclaim clamp and the fresh sizing can both shrink the volume: checked on the final
-                    # size, a customer volume within 5% of the order is created, below it the create fails
+                    # only when a cache removal failed (the reclaim clamped the volume): checked on the final size,
+                    # within 5% of the order it is created, below it the create fails. The fresh sizing alone
+                    # often shrinks a customer volume below 95% with no cache on the node, as it always has.
                     if (
-                        payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
-                        and ordered_volume_gb
+                        clamped_for_cache
                         and effective_volume_limit_gb is not None
                         and effective_volume_limit_gb < ordered_volume_gb * RENTAL_VOLUME_CLAMP_MIN_SHARE
                     ):
                         current_step = RENTAL_DISK_SHORT_STEP
                         raise RuntimeError(
-                            f"Not enough free disk for the ordered volume: {effective_volume_limit_gb} GB free "
+                            f"Not enough free disk for the ordered volume: {effective_volume_limit_gb} GB sized "
                             f"of {ordered_volume_gb} GB ordered"
                         )
 
