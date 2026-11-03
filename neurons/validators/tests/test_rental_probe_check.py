@@ -424,10 +424,37 @@ async def test_never_rents_beside_a_renter():
 
 @pytest.mark.asyncio
 async def test_late_in_the_cycle_creates_nothing():
-    ctx, docker, _ = make_probe_context()
+    # passed a probe 7 h ago: due again, not overdue, so it keeps the full create reserve
+    ctx, docker, _ = make_probe_context(redis=FakeRedis(last_ok=time.time() - 7 * 3600))
     late = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 500})
-    result = await RentalProbeCheck().run(late)
+    with probe_settings():
+        result = await RentalProbeCheck().run(late)
     assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+    assert result.event.what_we_saw["reason"] == "too little cycle time left"
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_ok_hours_ago", [None, 4 * 6 + 1])
+async def test_a_node_without_a_recent_pass_is_probed_late_in_the_cycle(last_ok_hours_ago):
+    """Regression (3 Nov): every cycle of a node with long checks left 277-296 s, under the full
+    reserve, so its probe never ran and it stayed listed while every container start on it failed."""
+    last_ok = None if last_ok_hours_ago is None else time.time() - last_ok_hours_ago * 3600
+    docker = FakeDocker(create_result=create_failed("docker_run"))
+    ctx, docker, redis = make_probe_context(docker=docker, redis=FakeRedis(last_ok=last_ok))
+    late = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 500})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(late)
+    assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert result.updates["score"] == 0.0 and result.updates["clear_verified_job_info"] is True
+    assert len(docker.create_calls) == 1
+    assert redis.standing_failure() == STEP_CONTAINER_START
+
+    # still no create once even the shorter budget does not fit
+    ctx, docker, _ = make_probe_context(redis=FakeRedis(last_ok=last_ok))
+    too_late = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 650})
+    with probe_settings():
+        result = await RentalProbeCheck().run(too_late)
     assert result.event.what_we_saw["reason"] == "too little cycle time left"
     assert docker.create_calls == []
 

@@ -537,10 +537,6 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
         # whose sync stalls; the probe's create would wait in that same sync and fail the filler node at
         # container_start. Bounded by the port check's own deferral streak, which ends in a real check.
         return "port check deferred for disk pressure", {}
-    seconds_left = task_seconds_left(ctx)
-    if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
-        return "too little cycle time left", {"task_seconds_left": int(seconds_left)}
-
     try:
         last_ok = await _last_ok_at(ctx)
     except Exception:
@@ -548,6 +544,14 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
         _read_failed(ctx, "its interval stamp in Redis")
         return "interval state unreadable", {}
     interval_seconds = settings.RENTAL_PROBE_INTERVAL_HOURS * 3600
+    # A node with no passed probe for _LONG_UNPROBED_INTERVALS gets the shorter budget too: its long
+    # cycles always left less than the full reserve, so it stayed listed while no container could
+    # start on it (3 Nov: 277 s and 296 s left).
+    overdue = last_ok is None or time.time() - last_ok >= _LONG_UNPROBED_INTERVALS * interval_seconds
+    seconds_left = task_seconds_left(ctx)
+    if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing or overdue else _MIN_TASK_SECONDS_LEFT):
+        return "too little cycle time left", {"task_seconds_left": int(seconds_left)}
+
     if last_ok is not None and time.time() - last_ok < interval_seconds:
         return "within interval", {"last_ok_seconds_ago": int(time.time() - last_ok)}
     return None, {}
