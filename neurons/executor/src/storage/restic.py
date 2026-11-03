@@ -221,7 +221,7 @@ class ResticStorageRunner:
         self._environment = self._build_environment()
         self._snapshot_empty = False
         self._last_error_text = ""
-        self._restore_errors: list[str] = []
+        self._restore_errors: list[tuple[str, str]] = []  # (item, message without the item)
         self._helper_state: Mapping[str, object] = {}
         self._helper_id = ""
 
@@ -653,7 +653,10 @@ class ResticStorageRunner:
                     self._raise_if_credentials_expired(_error_text(payload))
                     self._last_error_text = _error_text(payload) or self._last_error_text
                 if payload.get("message_type") in ("error", "exit_error"):
-                    self._restore_errors.append(_error_text(payload))
+                    item = payload.get("item")
+                    text = _error_text(payload)
+                    # restic reports one item several times (open, then lchown): the bound counts items
+                    self._restore_errors.append((item if isinstance(item, str) and item else text, text))
                 self._events.restic_event(payload)
                 self._events.heartbeat_if_due()
                 self._cancel_if_requested(process)
@@ -1014,21 +1017,22 @@ def _credentials_expired(error_text: str) -> bool:
 
 
 # a restore item the live workload removed mid-restore; anything else (ENOSPC, permission, repository) stays FAILED
-_VANISHED_FILE = re.compile(r"^(open|lstat|mkdir|rename|remove|chmod|chown|utimes?|symlink|link)\b.*: no such file or directory$")
+_VANISHED_FILE = re.compile(r"^(open|lstat|mkdir|rename|remove|chmod|l?chown|utimes?|symlink|link)\b.*: no such file or directory$")
 _ERRORS_SUMMARY = re.compile(r"^Fatal: (There were )?\d+ errors?\.?$")
 PARTIAL_RESTORE_MAX_FAILED_FILES = 100
 PARTIAL_RESTORE_MAX_FAILED_PERCENT = 1
 
 
-def _restore_loss_acceptable(errors: list[str], total_files: object) -> bool:
-    """PARTIAL only if every error is a vanished file or restic's "N errors" summary, and failed files are
-    <= 100 and <= 1% of the snapshot's files"""
-    failed = [e for e in errors if not _ERRORS_SUMMARY.match(e.strip())]
-    if not failed or not all(_VANISHED_FILE.match(e.strip()) for e in failed):
+def _restore_loss_acceptable(errors: list[tuple[str, str]], total_files: object) -> bool:
+    """PARTIAL only if every error is a vanished file or restic's "N errors" summary, and the distinct failed items
+    are <= 100 and <= 1% of the snapshot's files"""
+    failed = [(item, text) for item, text in errors if not _ERRORS_SUMMARY.match(text.strip())]
+    if not failed or not all(_VANISHED_FILE.match(text.strip()) for _, text in failed):
         return False
     if not isinstance(total_files, int) or total_files <= 0:
         return False
-    return len(failed) <= PARTIAL_RESTORE_MAX_FAILED_FILES and len(failed) * 100 <= total_files * PARTIAL_RESTORE_MAX_FAILED_PERCENT
+    items = len({item for item, _ in failed})
+    return items <= PARTIAL_RESTORE_MAX_FAILED_FILES and items * 100 <= total_files * PARTIAL_RESTORE_MAX_FAILED_PERCENT
 
 
 def _error_text(payload: Mapping[str, object]) -> str:

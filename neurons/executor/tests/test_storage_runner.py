@@ -2031,6 +2031,10 @@ _SUMMARY = {"message_type": "summary", "files_restored": 38373, "total_files": 3
         (1, _SUMMARY, ["Fatal: unable to load index: pack not found"], None),
         (1, _SUMMARY, ["open : permission denied"], None),
         (1, _SUMMARY, [_ENOENT] * 101, None),
+        # a folder the workload deleted: restic reports each item's open and then its lchown
+        (1, _SUMMARY, [("/root/a", _ENOENT), ("/root/a", "lchown : no such file or directory")], "PARTIAL"),
+        # the bound counts items, not events: 100 items reported twice each stay within it
+        (1, _SUMMARY, [(f"/root/{i}", e) for i in range(100) for e in (_ENOENT, "lchown : no such file or directory")], "PARTIAL"),
         (1, {"message_type": "summary", "files_restored": 50, "total_files": 52}, [_ENOENT] * 2, None),
         (1, _SUMMARY, [], None),
         (1, {"message_type": "summary", "files_restored": 0}, [_ENOENT], None),
@@ -2039,7 +2043,7 @@ _SUMMARY = {"message_type": "summary", "files_restored": 38373, "total_files": 3
     ],
 )
 def test_restore_completes_partial_only_for_vanished_files_within_the_loss_bound(
-    monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, errors: list[str], expected: str | None
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, errors: list, expected: str | None
 ) -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
     workspace = DockerVolumeWorkspace(
@@ -2051,7 +2055,8 @@ def test_restore_completes_partial_only_for_vanished_files_within_the_loss_bound
     runner = ResticStorageRunner(operation, workspace)
 
     def stream(*_a, **_k):
-        runner._restore_errors.extend(errors)
+        # a bare message is its own item
+        runner._restore_errors.extend(e if isinstance(e, tuple) else (f"/root/item{i}", e) for i, e in enumerate(errors))
         return exit_code, summary
 
     monkeypatch.setattr(runner, "_stream_command", stream)
