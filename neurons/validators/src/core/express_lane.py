@@ -133,6 +133,9 @@ class ExpressLane:
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
         self._pending: dict[str, _Pending] = {}
+        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle). The
+        # same dict, never rebound, so the wave always reads the current queue.
+        self.miner_service.express_queued = self._pending
         self._tasks: set[asyncio.Task] = set()
         self._my_hotkey: str | None = None
         # Given up on this process's watch (MAX_ATTEMPTS without the miner returning them); the

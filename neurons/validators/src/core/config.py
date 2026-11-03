@@ -273,6 +273,9 @@ class Settings(BaseSettings):
     )
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
+    # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
+    # the volume image); off = vloopback:v2 as before. Volumes already created keep their plugin.
+    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=False)
     # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
     # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
     POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
@@ -556,6 +559,17 @@ class Settings(BaseSettings):
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
     RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
     RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
+    # DAH-5244: before its port-check container (and the rented-throughput probe) the validator times `sync -f` on
+    # the host's Docker root - the wait every `docker run` pays while a tenant's dirty pages sit on that filesystem
+    # - and reads the Docker-root disk and host Dirty around it (services/task/host_disk.py). CHECK_ENABLED takes
+    # the reading, logs it and sends it to the backend (specs.disk_pressure). ENFORCEMENT additionally lets a node
+    # rented by someone else, or running our filler, keep its last verified ports and sysbox instead of a port
+    # check into the stall (DISK_PRESSURE_MAX_DEFERRALS cycles in a row at most; the rental probe rents nothing on
+    # such a cycle), and leaves out the rented-throughput probe container under pressure (a probe that runs under
+    # it judges no disk side). Shadow by default: a week of readings decides the flip.
+    DISK_PRESSURE_CHECK_ENABLED: bool = Field(env="DISK_PRESSURE_CHECK_ENABLED", default=True)
+    DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED: bool = Field(env="DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", default=False)
+
     # DAH-5320: IdleDiskWriteCheck, last in the pipeline, writes the same 256 MiB with fsync on idle and filler nodes
     # once a day per node (skipped while the docker root disk already moves DISK_BUSY_MB_PER_S) and logs
     # IDLE_DISK_WRITE with a shadow verdict against DISK_MIN_MB_PER_S. Logged only; ENFORCE_ENABLED is read by nothing
@@ -633,15 +647,6 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
-    # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
-    # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
-    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
-    # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
-    # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
-    # False: every spot node earns 0, as before.
-    ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
     # Lium filler runs on it: a filler Lium did not start is Lium's doing (Fish). Provider-caused
@@ -656,14 +661,16 @@ class Settings(BaseSettings):
     # restriction, and the free remainder of a partially rented spot node, earn 0 as before.
     # False: every rented spot node earns 0, as before.
     ENABLE_SPOT_RENTAL_INCENTIVE: bool = Field(env="ENABLE_SPOT_RENTAL_INCENTIVE", default=False)
-    # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
-    # bucket-cap dilution is raised to 1.0 x its configuration's average filler revenue, even above
-    # its listed rate (1.0 = SECURE_FILLER_REVENUE_FLOOR_FACTOR, set apart from the spot factor).
-    # False: dilution applies as before.
-    ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
-    # A configuration's filler average is used only when it was taken over at least this many
-    # filler GPU-hours; a thinner sample reads as no average.
-    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
+    # A Spot node's configuration filler average is used only when it was taken over at least this
+    # many filler GPU-hours; a thinner sample reads as no average. 2 = the backend's floor for the
+    # per-card rate the average is built from; 24 left a lone 1-GPU Spot node unpaid for its first
+    # day of Default Job and after every restart.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=2.0)
+    # The same threshold for a secure node (the secure floor): kept at 24 GPU-hours, since its
+    # top-up is bounded by the remaining burn allocation, not by what the fillers earned.
+    SECURE_FILLER_REVENUE_MIN_GPU_HOURS: float = Field(
+        env="SECURE_FILLER_REVENUE_MIN_GPU_HOURS", default=24.0
+    )
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
     # unrented node) when every pod in the batch-start rented list is stale: not running and its
@@ -784,6 +791,13 @@ class Settings(BaseSettings):
 
     def get_allowed_gpu_hwmodels(self) -> set[str]:
         return {s.strip() for s in self.GPU_ATTESTATION_ALLOWED_HWMODELS.split(",") if s.strip()}
+
+    def get_filler_revenue_min_gpu_hours(self, is_spot: bool) -> float:
+        return (
+            self.FILLER_REVENUE_MIN_GPU_HOURS
+            if is_spot
+            else self.SECURE_FILLER_REVENUE_MIN_GPU_HOURS
+        )
 
     def get_scoring_excluded_hotkeys(self) -> set[str]:
         return {s.strip() for s in self.SCORING_EXCLUDED_HOTKEYS.split(",") if s.strip()}

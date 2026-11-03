@@ -4,7 +4,7 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Container, Iterator
 from typing import Annotated
 from uuid import UUID
 
@@ -39,6 +39,7 @@ from payload_models.payloads import (
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    ContainerStopRequest,
     AddSshPublicKeyRequest,
     RemoveSshPublicKeysRequest,
     FailedContainerErrorCodes,
@@ -55,6 +56,8 @@ from payload_models.payloads import (
     GpuResetErrorCode,
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
+    LockPodGpuClocksRequest,
+    PodGpuClocksResult,
     PodGpuResetResult,
     ResetPodGpuRequest,
     WorkloadKind,
@@ -360,6 +363,10 @@ class MinerService:
         # wave's list of the node's miner, or the wave could verify and publish the node again
         # under the same id once the lane let go of it.
         self.miners_awaiting_wave_list: dict[str, str] = {}
+        # The express lane's queue (its live _pending map): new executors it will verify within
+        # minutes. The wave leaves them to it too, not only the ones it is running: in the wave a
+        # new node waits its turn and runs the full check, 7-15 min to listed (DAH-5601).
+        self.express_queued: Container[str] = frozenset()
         # per miner hotkey, the rented executor uuids it left out of its previous answer (one-cycle grace: a
         # single miss is mostly a key upload that missed the miner's 10 s window, so the row starts at the second).
         # shortcut: in memory, so a restart costs one extra cycle before a real outage is reported.
@@ -384,7 +391,7 @@ class MinerService:
         default_extra: dict,
     ) -> list[ExecutorSSHInfo]:
         """The wave takes every executor the miner returned, minus those the express lane is
-        verifying at this moment, so a new node's hardware tests never run twice concurrently
+        verifying or has queued, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched.
 
@@ -396,7 +403,10 @@ class MinerService:
         executors = self._first_entry_per_uuid(executors, default_extra)
         claimed: list[ExecutorSSHInfo] = []
         for executor in executors:
-            if self.in_flight.get(executor.uuid) == EXPRESS_LANE:
+            if (
+                self.in_flight.get(executor.uuid) == EXPRESS_LANE
+                or executor.uuid in self.express_queued
+            ):
                 logger.info(
                     _m(
                         "Executor left to the express lane this cycle",
@@ -1412,6 +1422,17 @@ class MinerService:
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
             )
+        elif isinstance(payload, ContainerStopRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=headline,
+                detail=detail,
+                error_type=FailedContainerErrorTypes.ContainerStopFailed,
+                error_code=error_code,
+            )
         elif isinstance(payload, AddSshPublicKeyRequest):
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -1444,6 +1465,19 @@ class MinerService:
                 if error_code == FailedContainerErrorCodes.RentingInProgress
                 else GpuResetErrorCode.ExecutorUnreachable,
                 detail=headline,
+            )
+        elif isinstance(payload, LockPodGpuClocksRequest):
+            # nothing on the host changed: the request never reached the executor
+            return PodGpuClocksResult(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                request_id=payload.request_id,
+                ok=False,
+                error_code=GpuResetErrorCode.OperationInProgress
+                if error_code == FailedContainerErrorCodes.RentingInProgress
+                else GpuResetErrorCode.ExecutorUnreachable,
             )
         else:
             return FailedContainerRequest(
@@ -2437,6 +2471,9 @@ class MinerService:
                         my_key,
                         private_key.decode("utf-8"),
                     )
+                elif isinstance(payload, ContainerStopRequest):
+                    # DAH-5510: the platform stops a moved pod's old container on the node it left
+                    result = await docker_service.stop_container(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, AddSshPublicKeyRequest):
                     logger.info(
                         _m(
@@ -2458,6 +2495,8 @@ class MinerService:
                     result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, ResetPodGpuRequest):
                     result = await docker_service.reset_pod_gpus(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, LockPodGpuClocksRequest):
+                    result = await docker_service.lock_pod_gpu_clocks(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, BackupContainerRequest):
                     result = await self.handle_backup_container_req(executor, payload, ssh_pkey, docker_service)
                 elif isinstance(payload, RestoreContainerRequest):
