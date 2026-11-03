@@ -2025,6 +2025,126 @@ def test_backup_reruns_once_after_an_s3_upload_timeout(
         assert first_runs[-1].split('"message":"')[1][:30] in runner._events._reporter._restic_failure_detail
 
 
+_ENOENT = "open : no such file or directory"
+_SUMMARY = {"message_type": "summary", "files_restored": 38373, "total_files": 38374}
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "summary", "errors", "expected"),
+    [
+        (1, _SUMMARY, [_ENOENT, "Fatal: There were 1 errors"], "PARTIAL"),
+        (1, _SUMMARY, ["mkdir : no such file or directory", "lstat : no such file or directory"], "PARTIAL"),
+        (1, _SUMMARY, ["write : no space left on device", "Fatal: There were 1 errors"], None),
+        (1, _SUMMARY, [_ENOENT, "ciphertext verification failed"], None),
+        (1, _SUMMARY, ["Fatal: unable to load index: pack not found"], None),
+        (1, _SUMMARY, ["open : permission denied"], None),
+        # no loss bound: restore 98b90ab8 lost 471 of 38,844 files from one deleted folder
+        (1, {"message_type": "summary", "files_restored": 38373, "total_files": 38844}, [_ENOENT] * 471, "PARTIAL"),
+        # a folder the workload deleted: restic reports each item's open and then its lchown
+        (1, _SUMMARY, [("/root/a", _ENOENT), ("/root/a", "lchown : no such file or directory")], "PARTIAL"),
+        (1, {"message_type": "summary", "files_restored": 50, "total_files": 52}, [_ENOENT] * 2, "PARTIAL"),
+        # the whole target vanished: restic wrote every file, then each one was removed
+        (1, {"message_type": "summary", "files_restored": 2, "total_files": 2}, [_ENOENT] * 2, None),
+        (1, _SUMMARY, [], None),
+        (1, {"message_type": "summary", "files_restored": 0}, [_ENOENT], None),
+        (1, None, [_ENOENT], None),
+        (2, _SUMMARY, [_ENOENT], None),
+    ],
+)
+def test_restore_completes_partial_only_for_vanished_files(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, summary: dict | None, errors: list, expected: str | None
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace/restored"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+
+    def stream(*_a, **_k):
+        # a bare message is its own item
+        runner._restore_errors.extend(e if isinstance(e, tuple) else (f"/root/item{i}", e) for i, e in enumerate(errors))
+        return exit_code, summary
+
+    monkeypatch.setattr(runner, "_stream_command", stream)
+
+    if expected is None:
+        with pytest.raises(ResticOperationError):
+            runner._restore()
+        return
+    result = runner._restore()
+    assert result.status == "COMPLETED"
+    assert result.result_quality is OperationResultQuality.PARTIAL
+
+
+def test_failed_restore_reports_the_renter_path_not_proc_root() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    first = "write /proc/88100/root/root/restored/model.safetensors: no space left on device"
+    reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": first}}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 120, "total_files": 400}})
+    reporter.send({"event": "result", "status": "FAILED", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["status"] == "FAILED"
+    assert final["error_message"] == (
+        "write /root/restored/model.safetensors: no space left on device; restored 120 of 400 files"
+    )
+
+
+def test_partial_restore_reports_restored_of_total_and_removed_items() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    for i in range(471):
+        item = f"/proc/88100/root/root/data/cache/{i}.bin"
+        for op in ("open", "lchown"):  # restic reports a vanished item twice; N counts items
+            message = f"{op} {item}: no such file or directory"
+            reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": message}, "item": item}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 38373, "total_files": 38844}})
+    reporter.send({"event": "restic", "payload": {"message_type": "exit_error", "message": "Fatal: There were 942 errors"}})
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["status"] == "COMPLETED"
+    assert final["result_quality"] == "PARTIAL"
+    assert final["error_message"] == (
+        "Restored 38373 of 38844 files; 471 were removed on the pod during the restore, first: /root/data/cache/0.bin"
+    )
+
+
+def test_partial_restore_counts_files_left_on_the_pod() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.RESTORE),
+        session=session,
+    )
+    # restic counted 400 writes, but 5 of the 403 files were removed afterwards: only 398 are left
+    for i in range(5):
+        item = f"/proc/88100/root/root/data/{i}.bin"
+        message = f"open {item}: no such file or directory"
+        reporter.send({"event": "restic", "payload": {"message_type": "error", "error": {"message": message}, "item": item}})
+    reporter.send({"event": "restic", "payload": {"message_type": "summary", "files_restored": 400, "total_files": 403}})
+    reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "PARTIAL", "exit_code": 1})
+
+    final = session.requests[-1]["json"]
+    assert final["error_message"].startswith("Restored 398 of 403 files; 5 were removed")
+    assert final["processed_files"] == 398
+
+
 def test_backup_picks_its_parent_by_host_not_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # an encrypted pod's /proc/<pid>/root path changes on restart; a host+paths match would miss the parent
     operation = StorageOperationSpec.from_mapping(_operation_payload())
