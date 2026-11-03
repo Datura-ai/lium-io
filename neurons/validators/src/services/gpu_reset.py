@@ -114,6 +114,8 @@ _FABRIC_STOP_FAILED_EXIT = 97
 # a host GPU holder the unit stopped is not active again after the reset
 _FABRIC_START_FAILED_EXIT = 98
 STOP_GRACE_SECONDS = 10
+# "<running> <restarting>" of a holder container: only "true false" is up
+CONTAINER_STATE_COMMAND = f"{DOCKER} inspect -f '{{{{.State.Running}}}} {{{{.State.Restarting}}}}'"
 # a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
 EXIT_WAIT_SECONDS = 90
 _QUERY_TIMEOUT_SECONDS = 30
@@ -446,10 +448,13 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
 
     The unit outlives the SSH session, and SIGPIPE is ignored so a closed pipe cannot kill it before the start."""
     fail = f'|| {{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; break; }}'
-    script = "trap '' PIPE; rc=0; up=''; "
+    script = "trap '' PIPE; rc=0; up=''; dying=''; "
     if containers:
         ids = " ".join(shlex.quote(c) for c in containers)
-        script += f'for u in {ids}; do docker stop -t {STOP_GRACE_SECONDS} "$u" >/dev/null {fail}; done; '
+        script += (
+            f'for u in {ids}; do docker stop -t {STOP_GRACE_SECONDS} "$u" >/dev/null || '
+            f'{{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; dying="$u"; break; }}; done; '
+        )
     if units:
         stop = " ".join(shlex.quote(u) for u in units)
         script += f'[ $rc -ne 0 ] || for u in {stop}; do systemctl stop "$u" {fail}; done; '
@@ -466,6 +471,8 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         start = " ".join(shlex.quote(u) for u in reversed(units))
         script += f'for u in {start}; do systemctl start "$u"; done; '
     if containers:
+        # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: wait for its exit
+        script += f'[ -z "$dying" ] || timeout {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; '
         ids = " ".join(shlex.quote(c) for c in reversed(containers))
         script += f'for u in {ids}; do docker start "$u" >/dev/null; done; '
     script += "exit $rc"
@@ -512,16 +519,24 @@ async def _reset_unit_pending(runner: SSHCommandRunner) -> bool:
 
 
 async def _restore_fabric_services(
-    runner: SSHCommandRunner, units: list[str], containers: list[str] = ()
+    runner: SSHCommandRunner, units: list[str], containers: list[str] = (), settle_seconds: float = 0
 ) -> str | None:
     """Starts every stopped host service and holder container that is not up after the reset; the problem left,
-    else None."""
+    else None. A container counts as up only when it still runs (not exited, not restarting) after settle_seconds."""
     problems: list[str] = []
     for cid in reversed(containers):
         try:
             started = await _run(runner, f"{DOCKER} start {shlex.quote(cid)}", timeout=_RESET_TIMEOUT_SECONDS)
             if started.exit_code != 0:
                 problems.append(f"container {cid[:12]} is not running again after the reset: {_tail(started.stderr)}")
+                continue
+            await asyncio.sleep(settle_seconds)
+            state = await _run(runner, f"{CONTAINER_STATE_COMMAND} {shlex.quote(cid)}")
+            answer = (state.stdout or "").strip() if state.exit_code == 0 else ""
+            if answer != "true false":
+                problems.append(
+                    f"container {cid[:12]} is not running again after the reset: {answer or 'state unreadable'}"
+                )
         except Exception as exc:
             problems.append(f"container {cid[:12]} state unknown after the reset: {exc}")
     for unit in reversed(units):
@@ -669,7 +684,7 @@ async def reset_pod_gpus(
                 else:
                     # before the latch cure and the container start: CUDA on an NVSwitch node needs Fabric Manager
                     fabric_manager_problem = await _restore_fabric_services(
-                        runner, plan.host_services, plan.holder_containers
+                        runner, plan.host_services, plan.holder_containers, settle_seconds
                     )
                 if fabric_manager_problem:
                     notes.append(fabric_manager_problem)

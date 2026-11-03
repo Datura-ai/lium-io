@@ -65,6 +65,8 @@ class FakeHost:
         holders=None,
         ps="",
         systemd=True,
+        docker_start_ok=True,
+        container_state="true false",
     ):
         self.commands: list[str] = []
         self.stopped = False
@@ -83,6 +85,7 @@ class FakeHost:
         self.active = {"nvidia-fabricmanager": fabric_manager, "nvidia-nvlsm": nvlsm, **(holders or {})}
         self.ps = ps
         self.systemd = systemd
+        self.docker_start_ok, self.container_state = docker_start_ok, container_state
         self.fm_start_ok = fm_start_ok
         self.active_during_reset: dict[str, bool] | None = None
         self.reset_raises = False
@@ -99,13 +102,16 @@ class FakeHost:
         self.commands.append(cmd)
         if cmd == gpu_reset.DOCKER_PS_COMMAND:
             return make_command_result(True, self.ps)
+        if cmd.startswith(gpu_reset.CONTAINER_STATE_COMMAND):
+            return make_command_result(True, f"{self.container_state}\n")
         if cmd.startswith("/usr/bin/docker inspect"):
             return make_command_result(self.inspect_exit == 0, self.inspect, exit_code=self.inspect_exit)
         if cmd.startswith("timeout 90 /usr/bin/docker wait"):
             return make_command_result(True, "137")
         if cmd.startswith("/usr/bin/docker start"):
             self.fm_log.append(("docker start", cmd.split()[-1]))
-            return make_command_result(True)
+            ok = self.docker_start_ok
+            return make_command_result(ok, stderr="" if ok else "no such container", exit_code=0 if ok else 1)
         if cmd.startswith("/usr/bin/docker stop"):
             self.stopped = self.stop_exit == 0
             return make_command_result(self.stop_exit == 0, stderr="boom", exit_code=self.stop_exit)
@@ -524,7 +530,7 @@ def _run_fabric_script(
             f'echo "$1 $2" >> {log}; [ "$1" = stop ] && [ "$2" = "$STOP_FAILS" ] && exit 1; '
             '[ "$1" = start ] && [ "$2" = "$START_FAILS" ] && exit 1; exit 0',
         ),
-        ("docker", f'echo "docker $*" >> {log}; exit 0'),
+        ("docker", f'echo "docker $*" >> {log}; [ "$1" = stop ] && [ "$4" = "$STOP_FAILS" ] && exit 1; exit 0'),
         ("fuser", f'echo "$*" | grep -q "/dev/nvidia" && echo " {fuser_out}"; exit 0'),
         ("nvidia-smi", f'echo "reset $*" >> {log}; echo "In use by another client"; exit {reset_exit}'),
     ):
@@ -576,6 +582,13 @@ def test_the_host_unit_skips_the_reset_when_a_stop_fails_and_still_starts_the_fa
     done, log = _run_fabric_script(tmp_path, stop_fails=FM)
     assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT and f"could not stop {FM}" in done.stderr
     assert log == [f"stop {FM}", f"start {NVLSM}", f"start {FM}"]
+
+
+def test_the_host_unit_waits_for_an_exporter_whose_stop_failed_before_starting_it(tmp_path):
+    # a stop that timed out before the exit event: the container is still dying, so a start right away is a no-op
+    done, log = _run_fabric_script(tmp_path, units=(), containers=("e1",), stop_fails="e1")
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT and "could not stop e1" in done.stderr
+    assert log == ["docker stop -t 10 e1", "docker wait e1", "docker start e1"]
 
 
 AGENT = "some-gpu-agent.service"
@@ -639,6 +652,23 @@ async def test_a_whole_host_pod_stops_every_host_gpu_holder_around_the_reset(aut
     assert (("docker start", EXPORTER) in started) == (not auto_remove)
     assert all(host.active[u] for u in (FM, DCGM, PERSISTENCED, *exporter))
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start_ok,state,ok",
+    [
+        (True, "true false", True),
+        (False, "false false", False),  # the start failed
+        (True, "false false", False),  # started, then exited at once
+        (True, "true true", False),  # restarting in a loop
+    ],
+)
+async def test_a_reset_is_ok_only_when_the_exporter_runs_again(start_ok, state, ok):
+    host = _b300(docker_start_ok=start_ok, container_state=state)
+    report, _ = await _reset(host, backend=U)
+    assert report.ok == ok
+    assert ("is not running again" in (report.detail or "")) == (not ok)
 
 
 @pytest.mark.asyncio
