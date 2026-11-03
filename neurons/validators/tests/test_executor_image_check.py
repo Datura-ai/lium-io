@@ -128,3 +128,18 @@ def test_score_calculator_zeroes_outdated_executor(
     assert "Required executor image is outdated" in warning
 
 
+
+
+@pytest.mark.asyncio
+async def test_outdated_event_says_the_update_is_held_for_a_backup(warn_only):
+    hold = "Update held, running executor kept: a backup is running in it (held 4 min of 30). Retrying in 120s."
+    held_specs = specs(executor_digest=STALE_DIGEST)
+    held_specs["docker"]["update_hold"] = hold
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=held_specs, rented_data=rented_data()),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.event.what_we_saw["update_hold"] == hold

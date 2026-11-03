@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import textwrap
+import time
 
 import pytest
 
@@ -27,6 +28,7 @@ DOCKER_STUB = textwrap.dedent(
         "compose up") exit 0 ;;
         "inspect --format") echo "sha256:executorimage" ;;
         "ps --all") echo "${STUB_PROBE_LEFTOVERS:-}" ;;
+        "ps --no-trunc") echo "${STUB_HELPERS:-}" ;;
         "rm --force") exit "${STUB_RM_EXIT:-0}" ;;
         "image ls") echo "${STUB_EXECUTOR_IMAGES:-}" ;;
         "image rm") exit "${STUB_IMAGE_RM_EXIT:-0}" ;;
@@ -207,7 +209,7 @@ def test_running_backup_holds_the_update(tmp_path):
 
     assert not recreated(calls)
     assert not any(c.startswith("run ") for c in calls)
-    assert "a backup or restore is running in it (held 0 min of 30)" in result.stdout
+    assert "a backup is running in it (held 0 min of 30)" in result.stdout
     assert "sleep 120" in calls
     assert (tmp_path / "hold").read_text().strip().isdigit()
 
@@ -228,3 +230,26 @@ def test_no_storage_operation_updates_and_clears_hold(tmp_path):
     assert "top abc123 -o args" in calls
     assert recreated(calls)
     assert not (tmp_path / "hold").exists()
+
+
+RESTORE_HELPER = '"nsenter -t 4242 -m -U -- restic restore 8a42d9ed --target /root/restored --json"'
+
+
+def test_running_restore_holds_up_to_two_hours(tmp_path):
+    (tmp_path / "hold").write_text(f"{int(time.time()) - 3600}\n")  # held 1 h: past the backup cap
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP=STORAGE_TOP, STUB_HELPERS=RESTORE_HELPER
+    )
+
+    assert not recreated(calls)
+    assert "a restore is running in it (held 60 min of 120)" in result.stdout
+
+
+def test_restore_hold_expires_after_two_hours(tmp_path):
+    (tmp_path / "hold").write_text(f"{int(time.time()) - 7300}\n")
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP=STORAGE_TOP, STUB_HELPERS=RESTORE_HELPER
+    )
+
+    assert "Update hold expired after 121 min: updating with a restore still running." in result.stdout
+    assert recreated(calls)

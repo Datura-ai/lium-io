@@ -1040,6 +1040,20 @@ def get_docker_info(content: bytes):
 
         data["docker_containers"] = containers
 
+        # The runner holds an executor update while a backup or restore runs (entrypoint.sh) and says so only in its
+        # own log, on the provider's host; pass its last hold line on so an outdated image shows why it is behind.
+        for container in containers:
+            name = container["each_name"]
+            if "executor-runner" in name and "-previous-" not in name:
+                try:
+                    tail = run_cmd(f'{docker_path} logs --tail 20 {container["each_container_id"]} 2>&1')
+                except RuntimeError:
+                    break
+                holds = [line for line in tail.splitlines() if line.startswith(("Update held", "Update hold expired"))]
+                if holds:
+                    data["docker_update_hold"] = holds[-1][:300]
+                break
+
     finally:
         os.remove(docker_path)
 

@@ -77,6 +77,10 @@ class ExecutorImageCheck:
         report = snapshot.report(observed_executor_digest(ctx.state.specs))
         updated_state = replace(ctx.state, executor_image_report=report)
         what = report.as_dict()
+        docker_specs = (ctx.state.specs or {}).get("docker")
+        if report.status is not ImageVerdict.CURRENT and isinstance(docker_specs, dict) and docker_specs.get("update_hold"):
+            # Why the node is behind, from the runner's own log: an update held for a running backup or restore.
+            what["update_hold"] = docker_specs["update_hold"]
 
         if report.status is ImageVerdict.CURRENT:
             event = render_message(Msg.CURRENT, ctx=ctx, check_id=self.check_id, what=what)

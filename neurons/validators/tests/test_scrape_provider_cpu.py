@@ -146,3 +146,26 @@ def test_a_container_whose_image_is_gone_is_listed_without_a_digest_and_the_scra
     assert data["docker_containers"][0]["each_digest"] == ""
     assert data["docker_containers"][0]["each_cpu_percent"] == 5.0
     assert data["docker_version"] == "24.0.7"
+
+
+def test_the_runners_last_update_hold_line_is_reported():
+    # The runner holds an executor update while a backup runs and logs it only on the provider's host.
+    outputs = _docker_outputs(f"{RENTER[:12]}|1.00%\n", [RENTER])
+    outputs["{{.Name}}"] = "/executor-executor-runner-1\n"
+    outputs["logs --tail"] = (
+        "Update held, running executor kept: a backup is running in it (held 2 min of 30). Retrying in 120s.\n"
+        "Update held, running executor kept: a backup is running in it (held 4 min of 30). Retrying in 120s.\n"
+    )
+    data = _scrape(outputs)["get_docker_info"](b"#!/bin/sh\n")
+
+    assert data["docker_update_hold"].startswith("Update held") and "held 4 min of 30" in data["docker_update_hold"]
+    original_keys, mapped_keys = _obfuscation_tables()
+    assert "docker_update_hold" in original_keys and "docker_update_hold" in mapped_keys
+
+
+def test_no_hold_line_no_key():
+    outputs = _docker_outputs(f"{RENTER[:12]}|1.00%\n", [RENTER])
+    outputs["{{.Name}}"] = "/executor-executor-runner-1\n"
+    outputs["logs --tail"] = "executor-1  | INFO started\n"
+
+    assert "docker_update_hold" not in _scrape(outputs)["get_docker_info"](b"#!/bin/sh\n")
