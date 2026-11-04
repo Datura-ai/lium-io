@@ -143,3 +143,94 @@ async def test_default_job_or_filler_does_not_exempt_a_full_disk(context_factory
 
     assert result.passed is False
     assert result.event.reason_code == Msg.TOO_FULL.reason
+
+
+def _split_rental(*pod_gpu_counts: int | None) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=[
+                    RentedPod(pod_id=f"pod-{i}", container_name=f"c{i}", rented_ports=[], gpu_count=n)
+                    for i, n in enumerate(pod_gpu_counts)
+                ],
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gpu_count, min_count, pods, free_gb, free_splits, listable",
+    [
+        # 2 GPUs, 1 rented: under the whole-host floor, but enough for the one free split
+        (2, 1, (1,), settings.MIN_FREE_DISK_GB * 0.6, 1, 1),
+        (2, 1, (1,), settings.MIN_FREE_DISK_GB * 0.4, 1, 0),
+        # 8 GPUs in 2-GPU splits, 2 rented: 3 free splits, room for 2 of them
+        (8, 2, (2,), settings.MIN_FREE_DISK_GB * 0.5, 3, 2),
+    ],
+)
+async def test_split_rented_node_sizes_disk_per_free_split(
+    context_factory, gpu_count, min_count, pods, free_gb, free_splits, listable
+):
+    state = build_state(
+        specs=_disk(50, free_gb),
+        rented_data=_split_rental(*pods),
+        gpu_count=gpu_count,
+        supports_gpu_splitting=True,
+        gpu_splitting_min_count=min_count,
+    )
+    ctx = context_factory(state=state, rented=True)
+
+    result = await DiskSpaceCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FREE_TOO_LOW.reason
+    split = result.updates["state"].specs["split_disk"]
+    assert split["free_split_count"] == free_splits
+    assert split["listable_split_count"] == listable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "supports_splitting, min_count, pods",
+    [
+        (False, None, (1,)),  # unsplit node: the whole-host floor only
+        (True, 1, (None,)),  # a pod with no GPU count: free GPUs unknown
+        (True, 1, (2,)),  # fully rented: no free split
+    ],
+)
+async def test_unsplit_or_unknown_node_keeps_the_whole_host_floor(
+    context_factory, supports_splitting, min_count, pods
+):
+    state = build_state(
+        specs=_disk(50, settings.MIN_FREE_DISK_GB - 1),
+        rented_data=_split_rental(*pods),
+        gpu_count=2,
+        supports_gpu_splitting=supports_splitting,
+        gpu_splitting_min_count=min_count,
+    )
+    ctx = context_factory(state=state, rented=True)
+
+    result = await DiskSpaceCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FREE_TOO_LOW.reason
+    assert "split_disk" not in result.updates.get("state", state).specs
+
+
+@pytest.mark.asyncio
+async def test_idle_split_node_still_fails_the_whole_host_floor(context_factory):
+    state = build_state(
+        specs=_disk(50, settings.MIN_FREE_DISK_GB - 1),
+        gpu_count=2,
+        supports_gpu_splitting=True,
+        gpu_splitting_min_count=1,
+    )
+
+    result = await DiskSpaceCheck().run(context_factory(state=state))
+
+    assert result.passed is False
+    assert "updates" not in result.model_fields_set

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Any
 
 from services.const import MAX_DISK_UTILIZATION_PERCENT
@@ -30,6 +31,31 @@ def _as_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return math.nan
+
+
+def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | None:
+    """Disk sizing for the free splits of a partly rented split node, or None when it does not apply.
+
+    Each free split is sized against its GPU share of the host floor, so a host under the whole-host
+    floor can still offer its free GPUs while every free split has room for its share.
+    """
+    gpu_count = ctx.state.gpu_count
+    min_count = ctx.state.gpu_splitting_min_count
+    rented_gpus = [pod.gpu_count for pod in pods]
+    if not (ctx.state.supports_gpu_splitting and gpu_count and min_count and rented_gpus):
+        return None
+    # a pod that does not report its GPUs leaves the free count unknown
+    if any(not count or count <= 0 for count in rented_gpus):
+        return None
+    free_split_count = (gpu_count - sum(rented_gpus)) // min_count
+    if free_split_count <= 0:
+        return None
+    required_kb = settings.MIN_FREE_DISK_GB * KB_PER_GB * min_count / gpu_count
+    return {
+        "free_split_count": free_split_count,
+        "listable_split_count": min(free_split_count, int(free_kb // required_kb)),
+        "required_free_gb_per_split": round(required_kb / KB_PER_GB, 1),
+    }
 
 
 class DiskSpaceCheck:
@@ -78,14 +104,30 @@ class DiskSpaceCheck:
             and rental.pods
             and (ctx.rented or await _any_listed_rental_active(ctx, rental.pods))
         ):
+            # the free splits are judged on their own share of the disk, not the whole-host floor
+            per_split = split_disk(ctx, rental.pods, free_kb) if math.isfinite(free_kb) else None
+            if per_split is None:
+                return CheckResult(
+                    passed=True,
+                    event=render_message(
+                        template,
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        what=what,
+                        impact="Proceed; a live rental is not failed",
+                    ),
+                )
+            listable = per_split["listable_split_count"]
             event = render_message(
                 template,
                 ctx=ctx,
                 check_id=self.check_id,
-                what=what,
-                impact="Proceed; a live rental is not failed",
+                what={**what, "split_disk": per_split},
+                impact=f"Proceed; a live rental is not failed; {listable} of "
+                f"{per_split['free_split_count']} free splits have enough disk",
             )
-            return CheckResult(passed=True, event=event)
+            state = replace(ctx.state, specs={**ctx.state.specs, "split_disk": per_split})
+            return CheckResult(passed=True, event=event, updates={"state": state})
         return CheckResult(
             passed=False, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         )
