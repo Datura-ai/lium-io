@@ -80,15 +80,16 @@ DOCKER_PS_COMMAND = (
     f"{DOCKER} inspect --format '{{{{.Id}}}} {{{{.HostConfig.AutoRemove}}}} {{{{.Config.Image}}}}' "
     f"$({DOCKER} ps -q --no-trunc)"
 )
-# the process names still holding a GPU device (host PID view): what blocked a refused `nvidia-smi -r`
+# the process names still holding a GPU device (host PID view): what blocked a refused `nvidia-smi -r`.
+# No ${...} in a unit script: systemd expands it in the command line before /bin/sh runs (to "" if unknown)
 GPU_HOLDERS_SCRIPT = (
-    'for p in $(fuser /dev/nvidia* 2>/dev/null); do p=${p%%[!0-9]*}; [ -n "$p" ] && cat /proc/$p/comm; done '
+    "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do cat /proc/$p/comm; done "
     "2>/dev/null | sort -u | tr '\\n' ' '"
 )
 # the host services (system.slice) of the processes still holding a GPU device, but the reset unit itself
 GPU_HOLDER_UNITS_SCRIPT = (
-    "for p in $(fuser /dev/nvidia* 2>/dev/null); do "
-    "sed -n 's#.*:/system.slice/\\([^/]*\\.service\\)$#\\1#p' /proc/${p%%[!0-9]*}/cgroup; done 2>/dev/null "
+    "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do "
+    "sed -n 's#.*:/system.slice/\\([^/]*\\.service\\)$#\\1#p' /proc/$p/cgroup; done 2>/dev/null "
     "| grep -vx 'lium-gpu-reset-fabric.service' | sort -u"
 )
 # a fabric reset runs as one host systemd unit, so a dropped SSH session cannot leave Fabric Manager down

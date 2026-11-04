@@ -542,6 +542,8 @@ def _run_fabric_script(
     cmd = build_fabric_reset_command(list(units), f"nvidia-smi -r -i {U[0]}", list(containers))
     assert cmd.startswith("nsenter -t 1 -m -- systemd-run ")
     script = shlex.split(cmd)[-1].replace("/proc/", f"{proc}/")
+    # what systemd does to the command line before the shell runs: unknown ${...} becomes "", $$ becomes $
+    script = re.sub(r"\$\{[^}]*\}", "", script).replace("$$", "$")
     env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": stop_fails, "START_FAILS": start_fails, "NEEDS": needs}
     done = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True)
     return done, log.read_text().splitlines()
