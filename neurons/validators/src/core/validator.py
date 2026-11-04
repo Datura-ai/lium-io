@@ -30,6 +30,7 @@ from services.executor_rollout import (
     remember_rented_scored_results,
     withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
+    session_kept_hotkeys,
     withhold_session_lost_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -684,7 +685,7 @@ class Validator:
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
                         if any(result.is_successful or result.duplicate_kept_by for result in results)
-                    } | {withheld.miner_hotkey for withheld in withheld_results}
+                    } | session_kept_hotkeys(withheld_results)
 
                     incentive = IncentiveFactory.create(
                         config=self.incentive,
@@ -1580,7 +1581,8 @@ class Validator:
             if not (result.session_lost_in_port_check and result.availability_errors and miner_coldkey):
                 continue
             before = self.miner_service.cycle_published_availability.get(str(result.executor_info.uuid).lower(), [])
-            result.availability_errors += [error for error in before if error not in result.availability_errors]
+            found = {error.get("reason_code") for error in result.availability_errors}
+            result.availability_errors += [error for error in before if error.get("reason_code") not in found]
             await self.miner_service.publish_machine_specs(
                 [result], withheld.miner_hotkey, miner_coldkey, is_whole_miner_batch=False
             )

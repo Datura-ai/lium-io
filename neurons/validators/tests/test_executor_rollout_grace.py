@@ -17,7 +17,9 @@ from services.executor_rollout import (
     ROLLOUT_FAILURE_REASONS,
     ExecutorRolloutTracker,
     RolloutWindow,
+    WithheldVerdict,
     rollout_grace_reason,
+    session_kept_hotkeys,
     withhold_rollout_verdicts,
 )
 from services.task.models import JobResult
@@ -286,3 +288,13 @@ async def test_a_session_lost_in_the_port_check_is_unscored_and_publishes_only_i
         publish.assert_awaited_once_with([lost], "5Miner", "5Cold", is_whole_miner_batch=False)
         assert lost.availability_errors == [GPU_FINDING, STORED_HOLD]
         assert lost.scored_at is None
+
+
+def test_a_miner_whose_only_withheld_result_is_a_lost_session_gets_no_eligibility_floor():
+    """Review 4469609776: a miner that closes SSH in every port check must not stay active (eligibility floor)."""
+    withheld = [
+        WithheldVerdict(miner_hotkey="5Closer", result=_session_lost("node-1", None)),
+        WithheldVerdict(miner_hotkey="5Rollout", result=_failed("node-2", "EXECUTOR_TRANSPORT_UNREACHABLE")),
+    ]
+
+    assert session_kept_hotkeys(withheld) == {"5Rollout"}

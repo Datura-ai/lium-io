@@ -1762,7 +1762,7 @@ class _CleanScrapeAfterDropout:
         return CheckResult(passed=True, event=event)
 
 
-async def _create_task_on_a_session_lost_in_the_port_check(context_factory, monkeypatch, first_check):
+async def _create_task_on_a_session_lost_in_the_port_check(context_factory, monkeypatch, *first_checks):
     ctx = _port_ctx(
         context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status="error")
     )
@@ -1781,7 +1781,7 @@ async def _create_task_on_a_session_lost_in_the_port_check(context_factory, monk
     service.redis_service = MagicMock()
     service.pipeline_factory = MagicMock(
         build_context=AsyncMock(return_value=ctx),
-        build_checks=MagicMock(return_value=[first_check, PortConnectivityCheck(), PortCountCheck()]),
+        build_checks=MagicMock(return_value=[*first_checks, PortConnectivityCheck(), PortCountCheck()]),
         build_pipeline=lambda checks: Pipeline(checks, sink=AsyncMock()),
     )
     handler = MagicMock(handle_result=AsyncMock(return_value=_PublishedResult()))
@@ -1818,15 +1818,19 @@ async def test_a_session_lost_in_the_port_check_keeps_an_earlier_gpu_finding_pub
 
 
 @pytest.mark.asyncio
-async def test_a_session_lost_after_a_clean_scrape_ended_a_gpu_loss_hold_leaves_the_stored_hold(
-    context_factory, monkeypatch
+@pytest.mark.parametrize("with_gpu_finding", [False, True])
+async def test_a_session_lost_after_a_clean_scrape_ended_a_gpu_loss_hold_publishes_the_hold(
+    context_factory, monkeypatch, with_gpu_finding
 ):
-    # review 4469140353: [] cleared the stored GPU_LOST hold before the load test could republish it
+    # reviews 4469140353 / 4469609761: [] cleared the stored GPU_LOST hold before the load test could republish it,
+    # and after a restart the last published list is empty, so the run itself carries the hold
+    checks = [_NonFatalGpuMemoryFinding()] if with_gpu_finding else []
     result = await _create_task_on_a_session_lost_in_the_port_check(
-        context_factory, monkeypatch, _CleanScrapeAfterDropout()
+        context_factory, monkeypatch, *checks, _CleanScrapeAfterDropout()
     )
 
-    assert result.availability_errors is None
+    expected = [GpuMemoryHealthMessages.FAILED.reason] if with_gpu_finding else []
+    assert [e["reason_code"] for e in result.availability_errors] == [*expected, "GPU_LOST"]
 
 
 @pytest.mark.asyncio

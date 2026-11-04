@@ -513,6 +513,12 @@ def withhold_session_lost_verdicts(
     return standing_by_miner, withheld
 
 
+def session_kept_hotkeys(withheld_results: list[WithheldVerdict]) -> set[str]:
+    """The miners a withheld verdict keeps active this cycle. Not one whose session died in the port check (review
+    4469609776): a miner can close SSH itself, and that must not earn the eligibility floor."""
+    return {withheld.miner_hotkey for withheld in withheld_results if not withheld.result.session_lost_in_port_check}
+
+
 def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
