@@ -328,6 +328,26 @@ async def test_the_real_client_posts_the_report_and_asks_for_the_404_raise(monke
         "source": "watch",
     }
 
+# review comment 4469024024: the whole tick is bounded and the next one is scheduled from its start
+@pytest.mark.asyncio
+async def test_run_bounds_the_whole_tick_and_schedules_from_its_start(monkeypatch):
+    monkeypatch.setattr(settings, "RENTED_POD_WATCH_INTERVAL_SECONDS", 0.2)
+    watch = _watch(FakeBackend(_rented()), FakeProbe())
+    loop = asyncio.get_running_loop()
+    starts = []
+
+    async def slow_tick():
+        starts.append(loop.time())
+        await asyncio.sleep(0.15 if len(starts) == 1 else 10)  # a tick in time, then one that hangs
+
+    watch.tick = slow_tick
+    await asyncio.wait_for(watch.run(lambda: len(starts) >= 3), timeout=2)
+
+    assert len(starts) == 3
+    assert starts[1] - starts[0] < 0.3  # 0.2 from the first start, not 0.15 + 0.2 after it
+    assert starts[2] - starts[1] < 0.3  # the hung tick was cut at the interval
+
+
 # review ask 1: the light target list, shaped as the rented list the probe takes
 @pytest.mark.asyncio
 async def test_the_light_list_becomes_probe_targets_and_a_4xx_falls_back(monkeypatch):

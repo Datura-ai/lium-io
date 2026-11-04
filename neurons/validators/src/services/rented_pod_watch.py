@@ -60,15 +60,19 @@ class RentedPodWatch:
         self._reconciled = False
 
     async def run(self, should_exit: Callable[[], bool]) -> None:
+        loop = asyncio.get_running_loop()
+        interval = settings.RENTED_POD_WATCH_INTERVAL_SECONDS
         while not should_exit():
+            started = loop.time()
             try:
-                await self.tick()
+                # the whole tick (list, probes, reports) fits in one interval; the next starts from this start
+                await asyncio.wait_for(self.tick(), timeout=interval)
             except Exception as exc:
                 logger.error(
-                    _m("[pod-watch] Tick failed", extra=get_extra_info({"error": str(exc)})),
+                    _m("[pod-watch] Tick failed", extra=get_extra_info({"error": repr(exc)})),
                     exc_info=True,
                 )
-            await asyncio.sleep(settings.RENTED_POD_WATCH_INTERVAL_SECONDS)
+            await asyncio.sleep(max(0.0, started + interval - loop.time()))
 
     async def tick(self) -> None:
         rented = await self.backend_client.get_rented_pod_targets()
@@ -181,9 +185,11 @@ class RentedPodWatch:
         if not reports:
             return 0
         tasks = [asyncio.ensure_future(coro) for _, coro in reports]
-        done, pending = await asyncio.wait(tasks, timeout=REPORTS_DEADLINE_SECONDS)
-        for task in pending:
-            task.cancel()
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=REPORTS_DEADLINE_SECONDS)
+        finally:
+            for task in tasks:
+                task.cancel()  # no-op on the finished ones; also when the tick deadline cancels us
         failed = 0
         for (state, _), task in zip(reports, tasks, strict=True):
             ok = (
