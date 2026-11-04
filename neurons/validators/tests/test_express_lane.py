@@ -676,3 +676,49 @@ async def test_a_recheck_survives_a_deferral_and_ends_with_its_run_budget(monkey
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0
     harness.miner_service.publish_machine_specs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_that_never_starts_keeps_its_request_and_budget(monkeypatch, wallet):
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+    rented = harness.lane.backend_client.get_all_rented_executors
+    rented.return_value = None  # the launch gives up before any run
+
+    for _ in range(3):
+        assert await harness.tick_and_settle() == 0
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+    assert harness.lane._recheck_runs[node] == 0
+
+    rented.return_value = RentedExecutorsResponse(executors={})
+    assert await harness.tick_and_settle() == 1
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recheck_runs_again_when_the_first_pass_retry_is_on(monkeypatch, wallet):
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED", True)
+    harness.job_for = lambda payload, executor_id: {
+        "results": [_job_result(executor_id, score=0.0, job_batch_id=payload.job_batch_id)]
+    }
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+
+    assert await harness.tick_and_settle() == 1
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+    assert await harness.tick_and_settle() == 1  # the retry, the budget's last run
+    assert harness.miner_service.publish_machine_specs.await_count == 2
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+    assert await harness.tick_and_settle() == 0

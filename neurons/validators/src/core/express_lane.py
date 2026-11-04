@@ -131,6 +131,8 @@ class _Pending:
     recheck_deadline: float | None = None
     # Taken only because it was requested: never queued in _pending, so the wave never leaves it out.
     recheck_only: bool = False
+    # Picked this tick because a recheck was requested; its run spends the request's budget.
+    requested: bool = False
 
 
 class ExpressLane:
@@ -233,13 +235,10 @@ class ExpressLane:
             rechecks = set()  # left in Redis: they run once the next wave has listed their miners
         chosen = self._select(snapshot, validated, inputs.fleet_known_since, rechecks)
         for pending in chosen:
-            if pending.executor.id in rechecks:
-                self._recheck_runs[pending.executor.id] += 1
-                if self._recheck_runs[pending.executor.id] >= RECHECK_MAX_RUNS:
-                    # Last run of the budget: whatever its outcome, the request ends here.
-                    await self._end_recheck(pending.executor.id)
-                if pending.executor.id in validated:
-                    pending.recheck_deadline = recheck_deadline
+            pending.requested = pending.executor.id in rechecks
+            pending.recheck_deadline = (
+                recheck_deadline if pending.requested and pending.executor.id in validated else None
+            )
         if not chosen:
             return 0
         return await self._launch(chosen)
@@ -429,6 +428,7 @@ class ExpressLane:
             return 0
 
         launched = 0
+        budget_spent: list[str] = []
         for pending in chosen:
             if pending.executor.id in in_flight:
                 # The wave accepted it during the awaits above; it publishes it at the wave's end.
@@ -444,11 +444,20 @@ class ExpressLane:
             in_flight[pending.executor.id] = EXPRESS_LANE
             if pending.recheck_only:
                 self._rechecks_in_flight[pending.executor.id] = pending.miner_hotkey
+            if pending.requested:
+                self._recheck_runs[pending.executor.id] += 1
+                if self._recheck_runs[pending.executor.id] >= RECHECK_MAX_RUNS:
+                    budget_spent.append(pending.executor.id)
             self._directories_in_use[directory] += 1
             task = asyncio.create_task(self._verify(pending, miner, inputs, rented_data))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             launched += 1
+        # Last run of the budget started: whatever its outcome, the request ends here. After the
+        # loop, so nothing awaits between reading the inputs and the holds above.
+        for executor_id in budget_spent:
+            with suppress(Exception):
+                await self._end_recheck(executor_id)
         return launched
 
     async def _verify(
@@ -564,8 +573,10 @@ class ExpressLane:
             results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
         )
         pending.recheck_deadline = None
-        with suppress(Exception):
-            await self._end_recheck(executor_id)
+        if not should_run_first_pass_again:
+            # A failed first pass that runs again keeps the request: the next tick selects it.
+            with suppress(Exception):
+                await self._end_recheck(executor_id)
         if should_run_first_pass_again:
             # Not recorded as validated, so the lane runs it again; a wave that starts meanwhile
             # claims it through in_flight and its publish records it.
