@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import secrets
 import time
@@ -20,6 +21,7 @@ from services.redis_service import (
 from services.verifyx_validation_service import (
     NETWORK_GATE_TALLY,
     VERIFYX_COMMAND_TIMEOUT_SECONDS,
+    NetworkGateTally,
     _is_positive_number,
     _is_speed_reading,
 )
@@ -104,14 +106,16 @@ class ColdSampleRetry:
 
 @dataclass(frozen=True)
 class ColdRetryPending:
-    """What VerifyXCheck leaves for VerifyXColdRetryCheck: how to re-run the probe and judge it,
-    and the first sample's verdict, which stands unless the retry replaces it."""
+    """What VerifyXCheck leaves for VerifyXColdRetryCheck: how to re-run the probe, the first
+    sample, and the specs it was judged on. Exactly one of the two samples is judged for good
+    (counters, tally, specs), there."""
 
     sizing: dict
     prev_ema: NetworkEMA | None
     first_download_speed_mbps: float | None
-    first_passed: bool
-    first_event: Any
+    first_result: Any
+    transport: str
+    base_specs: dict
 
 
 class VerifyXCheck:
@@ -209,9 +213,8 @@ class VerifyXCheck:
             else None
         )
 
-        judged = self._judge(ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema)
         if not _is_cold_sample_below_gate(ctx, result, prev_ema):
-            return judged
+            return self._judge(ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema)
         # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
         # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
         # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps
@@ -221,14 +224,19 @@ class VerifyXCheck:
         # provider a whole cycle. Known hosts (any prior EMA) are not retried, and the gate is
         # unchanged: one of the two samples must clear it.
         # DAH-5462: the second sample is taken by VerifyXColdRetryCheck, last before scoring, so it
-        # only ever uses time the other checks left. Until then the first sample stands; a gate it
-        # failed is held back and decided there.
+        # only ever uses time the other checks left. Until then the first sample's specs stand,
+        # uncounted; the one sample used is judged there, and a gate it fails fails the node there.
+        base_specs = copy.deepcopy(_judged_specs(ctx.state.specs))  # _judge edits network in place
+        judged = self._judge(
+            ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema, counted=False
+        )
         pending = ColdRetryPending(
             sizing=sizing,
             prev_ema=prev_ema,
             first_download_speed_mbps=_download_speed(result),
-            first_passed=judged.passed,
-            first_event=judged.event.model_copy(deep=True),
+            first_result=result,
+            transport=transport,
+            base_specs=base_specs,
         )
         state = (judged.updates or {}).get("state", ctx.state)
         judged.event.what_we_saw["cold_sample_retry"] = "pending"
@@ -247,8 +255,31 @@ class VerifyXCheck:
         sizing: dict,
         prev_ema: NetworkEMA | None,
         cold_sample_retry: ColdSampleRetry | None = None,
+        counted: bool = True,
+        tally: NetworkGateTally | None = None,
     ) -> CheckResult:
-        """Judge one VerifyX result: the specs it updates, the EMA it feeds and the download gate."""
+        """Judge one VerifyX result: the specs it updates, the EMA it feeds and the download gate.
+        `counted=False` leaves the per-host probe counters and the gate tally as they were."""
+        if not counted:
+            key = (ctx.miner_hotkey, ctx.executor.uuid)
+            saved = [(c, c.get(key)) for c in (_package_fallback_probes, _kept_upload_probes)]
+            try:
+                return self._judge(
+                    ctx,
+                    result,
+                    transport=transport,
+                    sizing=sizing,
+                    prev_ema=prev_ema,
+                    cold_sample_retry=cold_sample_retry,
+                    tally=NetworkGateTally(),
+                )
+            finally:
+                for counter, value in saved:
+                    if value is None:
+                        counter.pop(key, None)
+                    else:
+                        counter[key] = value
+        tally = NETWORK_GATE_TALLY if tally is None else tally
         # Extract errors with clear priority: data.errors > result.error
         errors = self._extract_errors(result)
 
@@ -340,7 +371,7 @@ class VerifyXCheck:
             network_gate = _network_gate(verifyx_network, prev_ema, ema_download, ema_upload)
             if network_gate is not None:
                 event.what_we_saw["network_gate"] = network_gate
-                NETWORK_GATE_TALLY.record(
+                tally.record(
                     ema_download,
                     MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
                     fallback=cloudflare_fallback,
@@ -413,7 +444,7 @@ class VerifyXCheck:
                 },
             )
 
-        NETWORK_GATE_TALLY.record_probe_failed()
+        tally.record_probe_failed()
 
         # Ensure we have an error message for the failure case
         error_message = errors or "Unknown errors"
@@ -655,6 +686,14 @@ def _network_gate(
     }
 
 
+# the specs keys VerifyXCheck._judge writes
+_JUDGED_SPEC_KEYS = ("ram", "network", "hard_disk")
+
+
+def _judged_specs(specs: dict) -> dict:
+    return {k: specs[k] for k in _JUDGED_SPEC_KEYS if k in specs}
+
+
 def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     """The one case DAH-2959 re-measures: a never-measured executor whose probe otherwise passed
     but whose single download sample would fail the EMA gate on its own.
@@ -881,7 +920,6 @@ class VerifyXColdRetryCheck:
                     Msg.COLD_RETRY, ctx=ctx, check_id=self.check_id, what={"pending": False}
                 ),
             )
-        cleared = {"state": replace(ctx.state, verifyx_cold_retry=None)}
         busy = None
         # creates started after the rental data the lookup relies on was read (or after now, if
         # earlier) cut the retry off; the lookup's data shows the earlier ones
@@ -897,7 +935,7 @@ class VerifyXColdRetryCheck:
             )
         if busy is not None:
             # a renter may be on the node now: never load it with a second RAM, disk and network test
-            return self._first_sample_stands(ctx, pending, cleared, {"skipped": busy})
+            return self._first_sample_stands(ctx, pending, {"skipped": busy})
         budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
         if budget < MIN_COLD_RETRY_SECONDS:
             logger.info(
@@ -914,7 +952,6 @@ class VerifyXColdRetryCheck:
             return self._first_sample_stands(
                 ctx,
                 pending,
-                cleared,
                 {"skipped_task_seconds_left": int(budget + COLD_RETRY_MARGIN_SECONDS)},
             )
 
@@ -969,7 +1006,7 @@ class VerifyXColdRetryCheck:
                     extra=get_extra_info({**ctx.default_extra, "reason": busy}),
                 )
             )
-            return self._first_sample_stands(ctx, pending, cleared, {"cancelled": busy})
+            return self._first_sample_stands(ctx, pending, {"cancelled": busy})
         retry_speed = _download_speed(retry) if retry is not None else None
         use_retry = (
             retry is not None
@@ -990,20 +1027,30 @@ class VerifyXColdRetryCheck:
             )
         )
         if not use_retry:
-            return self._first_sample_stands(ctx, pending, cleared, asdict(cold_sample_retry))
+            return self._first_sample_stands(ctx, pending, asdict(cold_sample_retry))
+        return self._judge_once(ctx, pending, retry, "ssh", asdict(cold_sample_retry))
+
+    def _first_sample_stands(
+        self, ctx: Context, pending: ColdRetryPending, what: dict
+    ) -> CheckResult:
+        return self._judge_once(ctx, pending, pending.first_result, pending.transport, what)
+
+    def _judge_once(
+        self, ctx: Context, pending: ColdRetryPending, result, transport: str, what: dict
+    ) -> CheckResult:
+        """The probe's one counted judgement, of the sample used, on the specs the first sample was
+        judged on (VerifyXCheck applied the first sample's readings uncounted)."""
+        specs = {k: v for k, v in ctx.state.specs.items() if k not in _JUDGED_SPEC_KEYS}
+        specs.update(copy.deepcopy(pending.base_specs))
+        state = replace(ctx.state, specs=specs, verifyx_cold_retry=None)
         judged = VerifyXCheck()._judge(
-            ctx.model_copy(update=cleared),
-            retry,
-            transport="ssh",
+            ctx.model_copy(update={"state": state}),
+            result,
+            transport=transport,
             sizing=pending.sizing,
             prev_ema=pending.prev_ema,
         )
-        judged.event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
+        judged.event.what_we_saw["cold_sample_retry"] = what
+        if judged.updates is None or "state" not in judged.updates:
+            judged.updates = {**(judged.updates or {}), "state": state}
         return judged
-
-    def _first_sample_stands(
-        self, ctx: Context, pending: ColdRetryPending, cleared: dict, what: dict
-    ) -> CheckResult:
-        event = pending.first_event.model_copy(deep=True)
-        event.what_we_saw["cold_sample_retry"] = what
-        return CheckResult(passed=pending.first_passed, event=event, updates=cleared)

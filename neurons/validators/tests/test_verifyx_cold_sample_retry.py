@@ -856,3 +856,30 @@ async def test_a_create_done_between_the_shared_read_and_the_retry_skips_it(cont
     else:
         assert (service.calls, result.passed) == (2, True)
         assert result.event.what_we_saw["cold_sample_retry"]["used"] == "retry"
+
+
+@pytest.mark.asyncio
+async def test_a_used_retry_replaces_the_first_samples_judgement(context_factory, monkeypatch):
+    # review 5765394179: one probe is judged once. A first sample below the gate, then a better
+    # retry: the package fallback is counted once and the retry's disk reading is the one published.
+    monkeypatch.setattr(verifyx_check, "_package_fallback_probes", {})
+    tally = verifyx_validation_service.NetworkGateTally()
+    monkeypatch.setattr(verifyx_check, "NETWORK_GATE_TALLY", tally)
+
+    def probe(download, disk):
+        response = _probe(download)
+        response.data["network"]["cloudflare_fallback"] = True
+        response.data["hard_disk"] = {"total": 1000, "write_speed": disk}
+        return response
+
+    ctx = _ctx(context_factory, _ProbeSequence(probe(40.0, 100.0), probe(760.0, 900.0)), _never_measured())
+
+    result = await _run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["cold_sample_retry"]["used"] == "retry"
+    assert verifyx_check._package_fallback_probes == {(ctx.miner_hotkey, EXECUTOR): 1}
+    assert tally.capacity_pass + tally.capacity_fail + tally.unmeasured == 1
+    specs = result.updates["state"].specs
+    assert specs["hard_disk"]["write_speed"] == 900.0
+    assert specs["network"]["verifyx_download_speed"] == pytest.approx(760.0)
