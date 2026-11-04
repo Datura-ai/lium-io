@@ -1292,10 +1292,13 @@ class RentalPriceIncentive(DefaultIncentive):
             result.filler_revenue_per_gpu_hour is None
             or not result.max_cap
             or not result.hourly_rate
-            or result.sxm_on_pcie_adapter  # already priced from the filler average, below the floor
         ):
             return diluted_rate
-        return max(diluted_rate, SECURE_FILLER_REVENUE_FLOOR_FACTOR * result.filler_revenue_per_gpu_hour)
+        # an adapter node is floored at its own share of the average, so dilution never pays it less (DAH-5677)
+        factor: float = (
+            SXM_ON_PCIE_ADAPTER_FILLER_PAY_FACTOR if result.sxm_on_pcie_adapter else SECURE_FILLER_REVENUE_FLOOR_FACTOR
+        )
+        return max(diluted_rate, factor * result.filler_revenue_per_gpu_hour)
 
     def _secure_floor_top_up(self) -> float:
         """USD/hour the secure floor adds on top of the bucket sums, paid from the unbucketed share."""

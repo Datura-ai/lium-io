@@ -238,12 +238,15 @@ def is_sxm_on_pcie_adapter(specs: dict[str, Any]) -> bool:
     """DAH-5677 (Rustam): H100 SXM modules on SXM-to-PCIe adapter boards, listed and paid as H100 PCIe.
 
     The driver names them "H100 80GB HBM3" like an HGX board, but there is no NVLink: the scrape reads
-    `interconnect.nvlink` False (every pair on PCIe; None on one GPU or an old executor, never this).
+    `interconnect.nvlink` False with no NVLink pair at all (`nvlink_pairs` 0: an HGX board with only some pairs
+    down keeps its name; None on one GPU or an old executor, never this).
     No signal tells such a build from an HGX board whose fabric is down; only this one node was ever
     caught, so both are listed as what renters get, a PCIe card with no NVLink.
     """
     interconnect = specs.get("interconnect")
-    if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is False):
+    if not (
+        isinstance(interconnect, dict) and interconnect.get("nvlink") is False and interconnect.get("nvlink_pairs") == 0
+    ):
         return False
     details = (specs.get("gpu") or {}).get("details") or []
     return {normalize_gpu_model(gpu.get("name")) for gpu in details if isinstance(gpu, dict)} == {H100_SXM}

@@ -1483,7 +1483,7 @@ async def test_secure_uses_an_average_taken_over_24_gpu_hours(context_factory):
     assert secure.filler_revenue_per_gpu_hour == 2.0
 
 
-ADAPTER_FACTOR = 0.9  # DAH-5677 (Rustam), written out like the factors above
+ADAPTER_IDLE_PAY_SHARE_OF_FILLER = 0.9  # DAH-5677 (Rustam), written out like the factors above
 
 
 @pytest.mark.asyncio
@@ -1493,8 +1493,8 @@ async def test_an_sxm_on_pcie_adapter_node_is_paid_90_percent_of_its_filler_aver
 
     incentive = await _run([adapter, pcie], _config(cap=16))  # both fit: no dilution
 
-    assert adapter.hourly_rate == pytest.approx(ADAPTER_FACTOR * 0.664)
-    assert _paid_rate(adapter) == pytest.approx(ADAPTER_FACTOR * 0.664)  # no floor up to 1.0 x
+    assert adapter.hourly_rate == pytest.approx(ADAPTER_IDLE_PAY_SHARE_OF_FILLER * 0.664)
+    assert _paid_rate(adapter) == pytest.approx(ADAPTER_IDLE_PAY_SHARE_OF_FILLER * 0.664)  # no floor up to 1.0 x
     assert pcie.hourly_rate == HOURLY_RATE  # a real H100 PCIe keeps its listed rate
     _assert_pool_pays_exactly(incentive)
 
@@ -1507,3 +1507,15 @@ async def test_an_sxm_on_pcie_adapter_node_without_an_average_earns_no_idle_pay(
 
     assert adapter.hourly_rate == 0
     assert _paid_rate(adapter) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_sxm_on_pcie_adapter_node_is_floored_at_its_share_after_dilution():
+    adapters = [_node(f"adapter-{i}", sxm_on_pcie_adapter=True, filler_revenue_per_gpu_hour=0.664) for i in range(2)]
+
+    incentive = await _run(adapters)  # 16 GPUs in a cap of 8: halved
+
+    for node in adapters:
+        assert node.unrented_cap_multiplier == 0.5
+        assert _paid_rate(node) == pytest.approx(ADAPTER_IDLE_PAY_SHARE_OF_FILLER * 0.664)
+    _assert_pool_pays_exactly(incentive)

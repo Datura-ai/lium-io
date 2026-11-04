@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.gpu_spec_table import H100_PCIE, H100_SXM
+
 from ..messages import SpecChangeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -19,7 +21,7 @@ class SpecChangeCheck:
         prev_spec = (ctx.verified or {}).get("spec") or ""
         current_spec = ctx.state.gpu_model_count or ""
 
-        if prev_spec and current_spec and prev_spec != current_spec:
+        if prev_spec and current_spec and _as_listed(prev_spec) != _as_listed(current_spec):
             event = render_message(
                 Msg.SPEC_CHANGED,
                 ctx=ctx,
@@ -44,3 +46,9 @@ class SpecChangeCheck:
             what={"gpu_model_count": current_spec},
         )
         return CheckResult(passed=True, event=event)
+
+
+def _as_listed(spec: str) -> str:
+    # DAH-5677: an H100 SXM-on-PCIe-adapter node verified before as "H100 80GB HBM3:N" is listed as "H100 PCIe:N" now
+    model, sep, count = spec.rpartition(":")
+    return f"{H100_PCIE}{sep}{count}" if model == H100_SXM else spec
