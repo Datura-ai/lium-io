@@ -12,7 +12,12 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
-from services.gpu_spec_table import classify_gpu_model, reference_gpu_model
+from services.gpu_spec_table import (
+    classify_gpu_model,
+    is_sxm_on_pcie_adapter,
+    list_sxm_on_pcie_adapter_as_pcie,
+    reference_gpu_model,
+)
 from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
@@ -46,6 +51,7 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
         else detail
         for detail in details
     ]
+    canonical_details = list_sxm_on_pcie_adapter_as_pcie(specs, canonical_details)
     if canonical_details == details:
         return specs
 
@@ -285,6 +291,7 @@ class ResultHandler:
             has_lium_filler=has_lium_filler,
             filler_revenue_per_gpu_hour=filler_revenue_per_gpu_hour,
             filler_revenue_usd_per_hour=filler_revenue_usd_per_hour,
+            sxm_on_pcie_adapter=is_sxm_on_pcie_adapter(context.state.specs or {}),
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,
