@@ -2458,6 +2458,12 @@ async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service)
 def _patch_create_container_happy_path(docker_service, monkeypatch):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+
+    # the edit swap's bounded commands open with create_process; answer them through run, as a test sets it
+    async def create_process(command: str):
+        return Mock(wait=lambda: ssh_client.run(command), wait_closed=AsyncMock())
+
+    ssh_client.create_process = create_process
     monkeypatch.setattr(
         "services.docker_service.asyncssh.connect",
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
