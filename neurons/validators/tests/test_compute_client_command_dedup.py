@@ -282,8 +282,9 @@ async def test_a_create_failure_echoes_the_create_command_id(client):
     [(FailedContainerErrorCodes.ExecutorUnreachable, True), (FailedContainerErrorCodes.InvalidExecutorId, True),
      (FailedContainerErrorCodes.UnknownError, False)],
 )
+@pytest.mark.parametrize("reconnect_during_cleanup", [False, True])
 async def test_a_host_fault_create_failure_is_sent_again_on_each_new_socket_for_two_hours(
-    client, monkeypatch, code, kept
+    client, monkeypatch, code, kept, reconnect_during_cleanup
 ):
     """DAH-5592 review 5765544241: the backend may lose this failure (its database and broker down, then a restart),
     and only it stops the renter's billing; the validator sends it again on every new socket until it is too old."""
@@ -299,6 +300,14 @@ async def test_a_host_fault_create_failure_is_sent_again_on_each_new_socket_for_
     )
     clock = [1000.0]
     monkeypatch.setattr(redis_module.time, "time", lambda: clock[0])
+    if reconnect_during_cleanup:  # review 5766355530: a socket that replaces this one before the command finishes
+
+        async def reconnect_before_finish(_pod_id):
+            client.message_queue.clear()  # the first socket took the frame
+            await client._resend_host_fault_failures()
+            assert len(client.message_queue) == int(kept)
+
+        client._untrack_backend_create_for_restart_report.side_effect = reconnect_before_finish
     await client.miner_driver(request("reboot-a"))
     client.message_queue.clear()
 

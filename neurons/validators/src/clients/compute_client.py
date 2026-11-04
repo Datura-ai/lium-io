@@ -1078,11 +1078,6 @@ class ComputeClient:
                 )
             except Exception:
                 logger.exception("Failed to finish backend command: %s", command_id)
-            if any(_is_host_fault_failure(raw) for raw in responses):
-                try:
-                    await redis_service.keep_host_fault_failure(command_id, responses)
-                except Exception:
-                    logger.exception("Failed to keep a host-fault create failure: %s", command_id)
 
     async def _handle_backend_command_duplicate(
         self, job_request: BaseServerRequest, existing: BackendCommand
@@ -1349,6 +1344,12 @@ class ComputeClient:
                 # the backend fences a failure on the create it answers: a late failure of an earlier create (a
                 # reboot the backend already gave up on) must not fail or exempt the one that replaced it
                 response.command_id = job_request.command_id
+                # kept before it is queued: a socket that replaces this one mid-command must already find it
+                if _is_host_fault_failure(raw := response.model_dump_json()):
+                    try:
+                        await self.miner_service.redis_service.keep_host_fault_failure(job_request.command_id, [raw])
+                    except Exception:
+                        logger.exception("Failed to keep a host-fault create failure: %s", job_request.command_id)
 
             logger.info(
                 _m(
