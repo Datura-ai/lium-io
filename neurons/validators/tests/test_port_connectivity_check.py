@@ -2,14 +2,15 @@ import asyncio
 import dataclasses
 import time
 from dataclasses import replace
+from unittest.mock import AsyncMock, MagicMock
 
-import asyncssh
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
     RentedPod,
 )
+from neurons.validators.src.services.attestation_service import HostPolicyResult
 from neurons.validators.src.services.executor_connectivity.models import (
     DindLogCause,
     PortPair,
@@ -17,6 +18,7 @@ from neurons.validators.src.services.executor_connectivity.models import (
     PortVerificationResult,
 )
 from neurons.validators.src.services.redis_service import VerifiedPortsMemory
+from neurons.validators.src.services.task import service as task_service_module
 from neurons.validators.src.services.task.checks import (
     port_connectivity as port_connectivity_module,
 )
@@ -24,8 +26,16 @@ from neurons.validators.src.services.task.checks.port_connectivity import (
     VERIFIED_PORTS_MEMORY_TTL_SECONDS,
     PortConnectivityCheck,
 )
+from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
+from neurons.validators.src.services.task.messages import (
+    GpuMemoryHealthMessages,
+    TenantEnforcementMessages,
+    render_message,
+)
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
+from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
+from neurons.validators.src.services.task.service import TaskService
 
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state
@@ -1714,15 +1724,77 @@ class _Session:
         {"success": True, "verified_port_count": 2, "dind_ok": False},
     ],
 )
-async def test_a_lost_ssh_session_raises_instead_of_a_zero_ports_verdict(context_factory, connectivity):
-    # DAH-5718: the session died, so nothing was measured; TaskService names the raise EXECUTOR_TRANSPORT_UNREACHABLE
+async def test_a_lost_ssh_session_ends_the_run_without_a_ports_verdict(context_factory, connectivity):
+    # DAH-5718: the session died, so nothing was measured or saved; the run ends on EXECUTOR_TRANSPORT_UNREACHABLE
+    redis_service = DummyRedis()
+    ctx = _port_ctx(context_factory, redis_service, success=False, connectivity=DummyConnectivityService(**connectivity))
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=True)})
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert (result.passed, result.fatal, result.updates) == (False, True, {})
+    assert result.event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert redis_service.verified_ports == {}
+
+
+class _NonFatalGpuMemoryFinding:
+    # GpuMemoryHealthCheck on a partly rented node: the broken card is reported, the run goes on
+    check_id = "gpu.memory_health"
+    fatal = False
+
+    async def run(self, ctx):
+        event = render_message(GpuMemoryHealthMessages.FAILED, ctx=ctx, check_id=self.check_id)
+        return CheckResult(passed=False, event=event, fatal=False)
+
+
+class _PublishedResult:
+    score = 0
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_in_the_port_check_keeps_an_earlier_gpu_finding_published(context_factory, monkeypatch):
+    # review 4468576252: a raise dropped every event and published availability_errors=[], re-listing the broken GPU
     ctx = _port_ctx(
-        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(**connectivity)
+        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status="error")
     )
     ctx = ctx.model_copy(update={"ssh": _Session(closed=True)})
 
-    with pytest.raises(asyncssh.ConnectionLost):
-        await PortConnectivityCheck().run(ctx)
+    class _Shell:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    service = TaskService.__new__(TaskService)
+    service.ssh_service = MagicMock(decrypt_payload=MagicMock(return_value="key"))
+    service.attestation_service = MagicMock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult()))
+    service.redis_service = MagicMock()
+    service.pipeline_factory = MagicMock(
+        build_context=AsyncMock(return_value=ctx),
+        build_checks=MagicMock(return_value=[_NonFatalGpuMemoryFinding(), PortConnectivityCheck(), PortCountCheck()]),
+        build_pipeline=lambda checks: Pipeline(checks, sink=AsyncMock()),
+    )
+    handler = MagicMock(handle_result=AsyncMock(return_value=_PublishedResult()))
+    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _Shell())
+    monkeypatch.setattr(task_service_module, "ResultHandler", lambda *a, **k: handler)
+    monkeypatch.setattr(task_service_module.settings, "DRY_RUN", False)
+    monkeypatch.setattr(task_service_module.settings, "VALIDATOR_LIUMD_SHADOW", False)
+
+    result = await service.create_task(
+        miner_info=MagicMock(job_batch_id="batch-123", miner_hotkey="5Miner"),
+        executor_info=ctx.executor,
+        keypair=MagicMock(ss58_address="5Val"),
+        private_key="key",
+        public_key="pub",
+        encrypted_files=MagicMock(),
+        rented_data=None,
+        default_docker_image_digests={},
+    )
+
+    assert [e["reason_code"] for e in result.availability_errors] == [GpuMemoryHealthMessages.FAILED.reason]
+    assert result.failure_reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert handler.handle_result.await_args.kwargs["success"] is False
 
 
 @pytest.mark.asyncio
