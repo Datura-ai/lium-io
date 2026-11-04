@@ -379,10 +379,10 @@ async def test_a_partial_publication_after_a_restart_keeps_the_reason_published_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cache", ["missing", "malformed", "read_fails"])
 @pytest.mark.parametrize("with_pod_ssh", [False, True])
-async def test_a_partial_publication_replaces_no_list_when_the_earlier_one_is_unknown(cache, with_pod_ssh):
-    """Review 4472141980 / 4472141972: a missing (pre-upgrade or expired), malformed or unreadable cache was read as
-    "nothing published before", so the partial list could replace a stored hold. Now nothing is replaced; the pod
-    SSH observations still go out with availability_errors None."""
+async def test_a_new_finding_is_published_for_a_merge_when_the_earlier_list_is_unknown(cache, with_pod_ssh):
+    """Review 4472994399: a missing (pre-upgrade or expired), malformed or unreadable cache suppressed the new
+    GPU finding, for good on a node that loses SSH every cycle. The finding now goes out alone (no guessed carry,
+    nothing cached as the full list); the backend merges a session-lost report by reason code, keeping a stored hold."""
     redis = _FakeRedis()
     if cache == "malformed":
         redis.store["published_availability:node-1"] = "{not json"
@@ -399,13 +399,32 @@ async def test_a_partial_publication_replaces_no_list_when_the_earlier_one_is_un
         {"node-1": observations} if with_pod_ssh else None,
     )
 
-    assert lost.availability_errors is None
+    assert lost.availability_errors == [GPU_FINDING]
+    assert lost.scored_at is None  # the backend's marker for a session-lost (merged) report
     assert "node-1" not in validator_process.miner_service.cycle_published_availability
-    publish = validator_process.miner_service.publish_machine_specs
-    if with_pod_ssh:
-        publish.assert_awaited_once_with([lost], "5Miner", "5Cold", is_whole_miner_batch=False)
-    else:
-        publish.assert_not_awaited()
+    validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
+        [lost], "5Miner", "5Cold", is_whole_miner_batch=False
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("findings", [None, []])
+async def test_pod_ssh_only_with_an_unknown_earlier_list_erases_nothing(findings):
+    """Review 4472994399: with no finding and only pod SSH observations, availability_errors goes out None, so the
+    backend leaves its stored reasons alone even when the validator does not know them."""
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = _miner_service({})
+    lost = _session_lost("node-1", findings)
+    observations = [PodSshObservation(pod_id="pod-1", result=PodSshResult.TIMEOUT)]
+
+    await validator_process.publish_session_lost_findings(
+        [WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"}, {"node-1": observations}
+    )
+
+    assert lost.availability_errors is None
+    validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
+        [lost], "5Miner", "5Cold", is_whole_miner_batch=False
+    )
 
 
 def test_a_miner_whose_only_withheld_result_is_a_lost_session_gets_no_eligibility_floor():
