@@ -56,11 +56,10 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # {"nonce": <hex>, "arch": <str>, "evidence_list": [...]} — collected in-CVM
     # only and bound to the same nonce as the TDX quote when one was issued.
     nvidia_payload: str | None = None
-    # DAH-5729: who registered this node, sent by a central miner: the listing hotkey and, for a node on the
-    # shared pool hotkey, the account's claim. The validator compares them with what the executor answers at the
-    # address it dials. None from a standalone or older miner.
-    expected_miner_hotkey: str | None = None
-    expected_account_claim: str | None = None
+    # DAH-5729: the node's SSH host key as the portal recorded it when the account proved control of the node, sent
+    # by a central miner. The validator requires the host key presented in its SSH handshake to be this one for a
+    # hostname-addressed node. None from a standalone or older miner, or a portal that does not record it.
+    expected_ssh_host_key: str | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

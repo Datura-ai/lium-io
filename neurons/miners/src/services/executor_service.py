@@ -289,7 +289,12 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    async def get_executors_for_validator(self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None)  -> list[Executor]:
+    async def get_executors_for_validator(
+        self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None,
+        host_keys: dict[str, str] | None = None,
+    ) -> list[Executor]:
+        """`host_keys`, when given, is filled (central mode) with each node's SSH host key as the portal recorded it
+        at registration, by executor id, from the same portal read as the list (DAH-5729)."""
         # Standard mode: use local DB, in Standard mode
         if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
@@ -313,9 +318,12 @@ class ExecutorService:
                 if item.get("validator_hotkey") != validator_hotkey:
                     continue
 
+                uuid = UUID(item.get("id"))
+                if host_keys is not None and item.get("ssh_host_key"):
+                    host_keys[str(uuid)] = item["ssh_host_key"]
                 result.append(
                     Executor(
-                        uuid=UUID(item.get("id")),
+                        uuid=uuid,
                         validator=item.get("validator_hotkey"),
                         address=item.get("executor_ip_address"),
                         port=int(item.get("executor_ip_port")),
@@ -331,26 +339,6 @@ class ExecutorService:
                 )
 
         return result
-
-    @staticmethod
-    async def _attach_expected_identity(
-        infos: list, miner_hotkey: str, executor_id: Optional[str]
-    ) -> None:
-        """Central mode: tell the validator which account registered each node (DAH-5729), so it can check the
-        node answering at the address it dials is that account's. The portal snapshot is keyed by the listing
-        hotkey; `account_claim` is the portal's per-account claim for pool-hotkey nodes (absent from an older
-        portal, and the validator then skips the claim)."""
-        from clients.miner_portal_api import MinerPortalAPI
-
-        # the snapshot get_executors_for_validator just read (cached), not a second portal request
-        claims = {
-            str(item.get("id")).lower(): item.get("account_claim")
-            for item in await MinerPortalAPI.fetch_executors(miner_hotkey, executor_id)
-        }
-        for info in infos:
-            if isinstance(info, ExecutorSSHInfo):
-                info.expected_miner_hotkey = miner_hotkey
-                info.expected_account_claim = claims.get(str(info.uuid).lower()) or None
 
     async def send_pubkey_to_executor(
         self, executor: Executor, pubkey: str, validator_signature: str,
@@ -542,7 +530,10 @@ class ExecutorService:
         if is_rental_request and settings.RENTAL_REQUEST_HOOK:
             budget -= RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS
         deadline = time.monotonic() + budget
-        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
+        host_keys: dict[str, str] = {}
+        executors = await self.get_executors_for_validator(
+            validator_hotkey, miner_hotkey, executor_id, host_keys=host_keys
+        )
         tasks = [
             asyncio.create_task(
                 self.send_pubkey_to_executor(
@@ -558,8 +549,10 @@ class ExecutorService:
         results = [
             result for result in await asyncio.gather(*tasks, return_exceptions=True) if result
         ]
-        if settings.CENTRAL_MODE:
-            await self._attach_expected_identity(results, miner_hotkey, executor_id)
+        for info in results:
+            # no portal read here: the uploads can outlast the snapshot cache, and the reply must meet its deadline
+            if isinstance(info, ExecutorSSHInfo):
+                info.expected_ssh_host_key = host_keys.get(str(info.uuid))
         logger.info(
             _m( 
                 "Sent pubkey register to executors",
