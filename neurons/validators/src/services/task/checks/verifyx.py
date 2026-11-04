@@ -936,7 +936,7 @@ class VerifyXColdRetryCheck:
             )
         if busy is not None:
             # a renter may be on the node now: never load it with a second RAM, disk and network test
-            return self._first_sample_stands(ctx, pending, {"skipped": busy})
+            return await self._first_sample_stands(ctx, pending, {"skipped": busy})
         budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
         if budget < MIN_COLD_RETRY_SECONDS:
             logger.info(
@@ -950,7 +950,7 @@ class VerifyXColdRetryCheck:
                     ),
                 )
             )
-            return self._first_sample_stands(
+            return await self._first_sample_stands(
                 ctx,
                 pending,
                 {"skipped_task_seconds_left": int(budget + COLD_RETRY_MARGIN_SECONDS)},
@@ -1007,7 +1007,7 @@ class VerifyXColdRetryCheck:
                     extra=get_extra_info({**ctx.default_extra, "reason": busy}),
                 )
             )
-            return self._first_sample_stands(ctx, pending, {"cancelled": busy})
+            return await self._first_sample_stands(ctx, pending, {"cancelled": busy})
         retry_speed = _download_speed(retry) if retry is not None else None
         use_retry = (
             retry is not None
@@ -1028,23 +1028,29 @@ class VerifyXColdRetryCheck:
             )
         )
         if not use_retry:
-            return self._first_sample_stands(ctx, pending, asdict(cold_sample_retry))
-        judged = self._judge_once(ctx, pending, retry, "ssh", asdict(cold_sample_retry))
+            return await self._first_sample_stands(ctx, pending, asdict(cold_sample_retry))
+        return await self._with_disk(
+            ctx, self._judge_once(ctx, pending, retry, "ssh", asdict(cold_sample_retry))
+        )
+
+    async def _first_sample_stands(
+        self, ctx: Context, pending: ColdRetryPending, what: dict
+    ) -> CheckResult:
+        return await self._with_disk(
+            ctx, self._judge_once(ctx, pending, pending.first_result, pending.transport, what)
+        )
+
+    async def _with_disk(self, ctx: Context, judged: CheckResult) -> CheckResult:
+        """DiskSpaceCheck left a pending cold retry's disk to this check: judge the disk readings of
+        the sample kept (first or retry), the ones the node is scored on."""
         if not judged.passed:
             return judged
-        # the adopted retry replaced the disk readings DiskSpaceCheck judged earlier: judge them once more,
-        # only here, so a cycle that kept its first sample never spends time on a second disk check
         disk = await DiskSpaceCheck().run(ctx.model_copy(update=judged.updates))
         if disk.passed:
             return judged
         return disk.model_copy(
             update={"updates": judged.updates, "extra_events": [*judged.extra_events, judged.event]}
         )
-
-    def _first_sample_stands(
-        self, ctx: Context, pending: ColdRetryPending, what: dict
-    ) -> CheckResult:
-        return self._judge_once(ctx, pending, pending.first_result, pending.transport, what)
 
     def _judge_once(
         self, ctx: Context, pending: ColdRetryPending, result, transport: str, what: dict

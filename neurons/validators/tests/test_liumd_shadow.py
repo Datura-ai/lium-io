@@ -466,9 +466,9 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
         verifyx_check._package_fallback_probes[("5Miner", UUID)] = prior_fallbacks
     if prior_upload_kept:
         verifyx_check._kept_upload_probes[("5Miner", UUID)] = prior_upload_kept
-    judged = {"success": True, "ram": {}, "network": network}
-    # a disk reading that clears the floor: an adopted retry's disk is judged again (DiskSpaceCheck)
+    # a disk reading that clears the floor: the retry check judges the disk of the sample it keeps (DiskSpaceCheck)
     retry_disk = {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024}
+    judged = {"success": True, "ram": {}, "hard_disk": retry_disk, "network": network}
     retried = [{"success": True, "ram": {}, "hard_disk": retry_disk, "network": retry}] if retry else []
     verifyx_service.judged = judged
     rented = _network_ema(prev_ema, 10.0 if prior_upload_kept else None)

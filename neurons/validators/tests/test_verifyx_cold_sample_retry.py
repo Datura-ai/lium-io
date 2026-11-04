@@ -577,7 +577,7 @@ def test_the_cold_retry_runs_after_every_other_check_right_before_scoring(fast_p
     checks = PipelineFactory.build_checks(fast_path=fast_path)
     names = [type(c).__name__ for c in checks]
     assert names.index("VerifyXCheck") < names.index("VerifyXColdRetryCheck") == names.index("ScoreCheck") - 1
-    # review 5766876557: the disk floor is judged again inside the retry check, only on an adopted retry
+    # review 5771536147: the retry check judges the disk of the sample it keeps, so nothing but scoring follows it
     assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["ScoreCheck", "FinalizeCheck"]
     assert not any(isinstance(c, ParallelStage) for c in checks[names.index("VerifyXColdRetryCheck") :])
 
@@ -981,3 +981,42 @@ async def test_an_adopted_retry_that_fails_the_disk_floor_names_the_disk_check_a
     assert ok is False
     assert events[-1].check_id == "executor.validate.disk_space"
     assert events[-1].what_we_saw["steps_failed"] == "executor.validate.disk_space"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("retry_utilization", "ok"), [(50.0, True), (94.0, False)])
+async def test_a_full_first_disk_reading_waits_for_the_sample_the_cold_retry_keeps(
+    context_factory, retry_utilization, ok
+):
+    # review 5771536147: DiskSpaceCheck runs before the retry, so a 94%-full first reading must not fail the node
+    # when the adopted retry reads 50%; the retry check judges the disk of the sample it keeps
+    from neurons.validators.src.services.task.checks.disk_space import DiskSpaceCheck
+    from neurons.validators.src.services.task.pipeline import Pipeline
+
+    class Sink:
+        async def emit(self, event) -> None:
+            pass
+
+    def probe(download, utilization):
+        response = _probe(download)
+        response.data["hard_disk"] = {"total": 1000, "utilization": utilization, "free": 120 * GIB_KB}
+        return response
+
+    service = _ProbeSequence(probe(88.0, 94.0), probe(760.0, retry_utilization))
+    ctx = context_factory(
+        services=build_services(verifyx=service),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}, "hard_disk": {}}, rented_data=_never_measured()),
+    )
+    _idle_now(ctx.services)
+
+    passed, events, _ = await Pipeline([VerifyXCheck(), DiskSpaceCheck(), VerifyXColdRetryCheck()], Sink()).run(ctx)
+
+    assert passed is ok
+    assert service.calls == 2
+    disk_events = [e for e in events if e.check_id == "executor.validate.disk_space"]
+    assert disk_events[0].reason_code == "DISK_TOO_FULL" and disk_events[0].what_we_saw["judged_after_cold_retry"]
+    # a full retry reading fails the node on the disk check; a passing one adds no second disk event
+    assert [e.reason_code for e in disk_events[1:]] == ([] if ok else ["DISK_TOO_FULL"])
+    if not ok:
+        assert "judged_after_cold_retry" not in disk_events[-1].what_we_saw

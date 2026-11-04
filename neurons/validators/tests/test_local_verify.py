@@ -1463,7 +1463,12 @@ async def test_transport_names_the_sample_the_cold_retry_kept(
     must say so; a consumed local answer that lost to it is not what the event describes.
     First pass, so the kept-first case ends in the DAH-3011 deferred-gate success event too."""
     local_answer = vvs.VerifyXResponse(
-        data={"success": True, "network": {"download_speed": 59.9, "upload_speed": 20.0}}
+        data={
+            "success": True,
+            # clears the disk floor: the retry check judges the disk of the sample it keeps (DiskSpaceCheck)
+            "hard_disk": {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024},
+            "network": {"download_speed": 59.9, "upload_speed": 20.0},
+        }
     )
     ssh_answer = vvs.VerifyXResponse(
         data={

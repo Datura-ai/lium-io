@@ -68,6 +68,16 @@ class DiskSpaceCheck:
                     passed=True,
                     event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what),
                 )
+        # DAH-5462: a cold retry may replace these readings; VerifyXColdRetryCheck judges the sample it keeps
+        if ctx.state.verifyx_cold_retry is not None:
+            event = render_message(
+                template,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what, "judged_after_cold_retry": True},
+                impact="Proceed; judged again on the VerifyX sample the cold retry keeps",
+            )
+            return CheckResult(passed=True, event=event)
         # same ownership rule as TenantEnforcementCheck: another miner's rental on a different
         # endpoint does not exempt this node
         rental = rental_of_this_node(ctx)
