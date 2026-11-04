@@ -39,7 +39,7 @@ async def _record(service: RedisService) -> dict:
     return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, f"hk:{EXECUTOR}"))
 
 
-async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool):
+async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool, later_check_fails: bool = False):
     """One validation cycle as the service runs it: record from Redis, the two GPU-set checks through the real
     Pipeline, the outcome persisted by the ResultHandler."""
     verified = await service.get_verified_job_info("hk", EXECUTOR)
@@ -50,9 +50,10 @@ async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool):
         s.GPU_ANCHOR_HARD_ENABLED = hard
         ok, events, ctx = await Pipeline([GpuFingerprintCheck(), SpecChangeCheck()], _Sink()).run(ctx)
     await handler._persist_verification_data(
-        miner_hotkey="hk", executor_id=EXECUTOR, verified_job_info=verified, context=ctx, success=ok
+        miner_hotkey="hk", executor_id=EXECUTOR, verified_job_info=verified, context=ctx,
+        success=ok and not later_check_fails,
     )
-    return ok, events[-1], await _record(service)
+    return ok, ctx, await _record(service)
 
 
 @pytest.mark.asyncio
@@ -84,3 +85,18 @@ async def test_a_full_set_of_other_cards_is_re_anchored_and_verified_the_same_cy
 
     ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=hard)
     assert record["uuids"] == anchored_after and ok is passes
+
+
+@pytest.mark.asyncio
+async def test_a_re_anchor_is_kept_when_a_later_check_fails_the_cycle(context_factory):
+    """Regression: a re-anchor on a cycle failed later without a reset was dropped, so every cycle re-anchored."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001", hard=False)
+
+    _, ctx, record = await _cycle(service, handler, context_factory, uuids="gpu-002", hard=False, later_check_fails=True)
+    assert ctx.gpu_reanchor and record["uuids"] == "gpu-002" and record["failed"] == 1
+
+    _, ctx, record = await _cycle(service, handler, context_factory, uuids="gpu-002", hard=False, later_check_fails=True)
+    assert not ctx.gpu_reanchor and record["uuids"] == "gpu-002" and record["failed"] == 2
