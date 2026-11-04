@@ -131,3 +131,5 @@ async def test_port_probe_only_logs_the_skip_after_a_hung_start_when_the_flag_is
     message = log.call_args.args[0]
     assert message.message == "port check would skip later tiers"
     assert message.extra["later_tiers_found_ports"] is False
+    assert message.extra["later_tiers_port_count"] == 0
+    assert message.extra["later_tiers_seconds"] >= 0

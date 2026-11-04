@@ -1,4 +1,5 @@
 import logging
+import time
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -43,9 +44,11 @@ class PortProbe:
         successful, failed = batch.successful, batch.failed
         tier = "batch"
         if batch.start_hung and settings.PORT_PROBE_SKIP_TIERS_ON_HUNG_START:
-            # DAH-5682: their containers start on the same stuck Docker; ~120 s each spent for the same verdict
+            # DAH-5682: their containers start on the same stuck Docker; ~90 s (semi-batch 60 s, fallback 30 s) for the
+            # same verdict
             return PortProbeResult((), tuple(failed), tier, batch.external)
 
+        later_tiers_started_at = time.monotonic()
         if not successful:
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
             logger.debug(
@@ -77,7 +80,15 @@ class PortProbe:
             logger.info(
                 _m(
                     "port check would skip later tiers",
-                    extra=get_extra_info({**log_ctx, "later_tiers_found_ports": bool(successful), "tier": tier}),
+                    extra=get_extra_info(
+                        {
+                            **log_ctx,
+                            "later_tiers_found_ports": bool(successful),
+                            "later_tiers_port_count": len(successful),
+                            "later_tiers_seconds": round(time.monotonic() - later_tiers_started_at, 1),
+                            "tier": tier,
+                        }
+                    ),
                 )
             )
         return PortProbeResult(tuple(successful), tuple(failed), tier, batch.external)
