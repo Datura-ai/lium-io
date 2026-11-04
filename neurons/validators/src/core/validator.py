@@ -1581,7 +1581,6 @@ class Validator:
         None) and not the miner's whole batch, like an early publish; with no finding availability_errors stays None,
         so the stored reasons are left alone; a run with neither publishes nothing."""
         pod_ssh = pod_ssh or {}
-        published = self.miner_service.cycle_published_availability
         for withheld in withheld_results:
             result = withheld.result
             executor_uuid = str(result.executor_info.uuid).lower()
@@ -1591,10 +1590,12 @@ class Validator:
             result.pod_ssh = pod_ssh.get(executor_uuid, result.pod_ssh)
             if result.availability_errors:
                 found = {error.get("reason_code") for error in result.availability_errors}
-                before = published.get(executor_uuid, [])
+                before = await self.miner_service.published_availability(executor_uuid)
                 result.availability_errors += [error for error in before if error.get("reason_code") not in found]
                 # review 4470167912: the next partial publication merges with this one, not with an older list
-                published[executor_uuid] = list(result.availability_errors)
+                await self.miner_service.remember_published_availability(
+                    executor_uuid, list(result.availability_errors)
+                )
             elif not result.pod_ssh:
                 continue
             await self.miner_service.publish_machine_specs(

@@ -23,6 +23,7 @@ from services.executor_rollout import (
     withhold_rollout_verdicts,
 )
 from protocol.vc_protocol.validator_requests import PodSshObservation, PodSshResult
+from services.miner_service import MinerService
 from services.task.models import JobResult
 
 
@@ -43,8 +44,11 @@ class _FakeRedis:
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.store[key] = value
+
+    async def publish(self, channel: str, message: dict) -> None:
+        pass
 
 
 def _tracker(redis: _FakeRedis, grace_cycles: int = 2) -> ExecutorRolloutTracker:
@@ -253,6 +257,14 @@ def _session_lost(uuid: str, availability_errors: list[dict] | None) -> JobResul
     return result
 
 
+def _miner_service(published: dict[str, list[dict]], redis: "_FakeRedis | None" = None) -> MinerService:
+    service = MinerService.__new__(MinerService)
+    service.cycle_published_availability = published
+    service.redis_service = redis or _FakeRedis()
+    service.publish_machine_specs = AsyncMock()
+    return service
+
+
 GPU_FINDING = {"reason_code": "GPU_MEMORY_HEALTH_FAILED"}
 STORED_HOLD = {"reason_code": "GPU_LOST"}
 
@@ -269,9 +281,7 @@ async def test_a_session_lost_in_the_port_check_is_unscored_and_publishes_only_i
     validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=NEW)
     window = _open_window() if in_rollout else MagicMock(covers=lambda _: False)
     validator_process.observe_executor_rollout = AsyncMock(return_value=window)
-    validator_process.miner_service = MagicMock(
-        cycle_published_availability={"node-1": [STORED_HOLD]}, publish_machine_specs=AsyncMock()
-    )
+    validator_process.miner_service = _miner_service({"node-1": [STORED_HOLD]})
     lost = _session_lost("node-1", findings)
     healthy = _scored("node-2")
 
@@ -297,7 +307,7 @@ async def test_a_session_lost_with_no_finding_still_publishes_the_pod_ssh_observ
     """Review 4470167895: withholding the result dropped the rented pod's SSH observations, so billing could not
     tell a silent pod (TIMEOUT) and kept charging. They go out on the unscored result, the stored reasons untouched."""
     validator_process = _validator_process(_tracker(_FakeRedis()))
-    validator_process.miner_service = MagicMock(cycle_published_availability={}, publish_machine_specs=AsyncMock())
+    validator_process.miner_service = _miner_service({})
     lost = _session_lost("node-1", None)
     observations = [PodSshObservation(pod_id="pod-1", result=probe)]
 
@@ -318,9 +328,7 @@ async def test_consecutive_partial_publications_keep_every_earlier_reason():
     """Review 4470167912: a second lost-session publication merged with the last whole-batch list only, so it
     dropped the reason the first one published."""
     validator_process = _validator_process(_tracker(_FakeRedis()))
-    validator_process.miner_service = MagicMock(
-        cycle_published_availability={"node-1": [STORED_HOLD]}, publish_machine_specs=AsyncMock()
-    )
+    validator_process.miner_service = _miner_service({"node-1": [STORED_HOLD]})
     other = {"reason_code": "GPU_COUNT_MISMATCH"}
     first, second = _session_lost("node-1", [GPU_FINDING]), _session_lost("node-1", [other])
 
@@ -330,6 +338,42 @@ async def test_consecutive_partial_publications_keep_every_earlier_reason():
         )
 
     assert second.availability_errors == [other, GPU_FINDING, STORED_HOLD]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before_restart", ["whole_batch", "partial"])
+async def test_a_partial_publication_after_a_restart_keeps_the_reason_published_before_it(
+    monkeypatch, before_restart
+):
+    """Review 4471425927: the last published list lived only in memory, so after a validator restart a partial
+    publication had nothing to merge with and sent GPU_MEMORY_HEALTH_FAILED over a stored GPU_LOST. The list is kept
+    in Redis as well, and a new process reads it back."""
+    monkeypatch.setattr("services.miner_service.settings.DRY_RUN", False)
+    redis = _FakeRedis()
+
+    def process() -> Validator:
+        validator_process = _validator_process(_tracker(redis))
+        validator_process.miner_service = _miner_service({}, redis)
+        return validator_process
+
+    before = process()
+    if before_restart == "whole_batch":
+        held = _failed("node-1", "GPU_LOST")
+        held.availability_errors = [STORED_HOLD]
+        del before.miner_service.publish_machine_specs  # the real one
+        before.miner_service._pod_states_capped_for_spec = lambda result, extra: None
+        await before.miner_service.publish_machine_specs([held], "5Miner", "5Cold", is_whole_miner_batch=True)
+    else:
+        before.miner_service.cycle_published_availability = {"node-1": []}
+        await before.publish_session_lost_findings(
+            [WithheldVerdict(miner_hotkey="5Miner", result=_session_lost("node-1", [STORED_HOLD]))], {"5Miner": "5Cold"}
+        )
+
+    after = process()  # the restart: nothing in memory
+    lost = _session_lost("node-1", [GPU_FINDING])
+    await after.publish_session_lost_findings([WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"})
+
+    assert lost.availability_errors == [GPU_FINDING, STORED_HOLD]
 
 
 def test_a_miner_whose_only_withheld_result_is_a_lost_session_gets_no_eligibility_floor():

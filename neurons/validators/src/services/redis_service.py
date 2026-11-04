@@ -28,6 +28,9 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
+# executor uuid -> the availability errors last published for it; outlives a restart by far, a cycle rewrites it
+PUBLISHED_AVAILABILITY_PREFIX = "published_availability"
+PUBLISHED_AVAILABILITY_TTL = 24 * 3600
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
 GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
