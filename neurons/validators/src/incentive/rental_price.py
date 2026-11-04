@@ -638,22 +638,22 @@ class RentalPriceIncentive(DefaultIncentive):
         if not result.is_split_remainder or result.spec is None or not result.gpu_splitting_min_count:
             return None
         sizing: Any = result.spec.get("split_disk")
-        listable: Any = sizing.get("listable_split_count") if isinstance(sizing, dict) else None
-        if not isinstance(listable, int) or isinstance(listable, bool):
+        if not isinstance(sizing, dict):
+            return None
+        listable: Any = sizing.get("listable_split_count")
+        # the listing offers exactly listable_gpu_count free GPUs, so scoring pays the same count
+        listable_gpus: Any = sizing.get("listable_gpu_count")
+        if any(not isinstance(v, int) or isinstance(v, bool) for v in (listable, listable_gpus)):
             return None
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
-        free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
-        paid_split_count: int = min(free_split_count, max(listable, 0))
-        # below one whole split the port rule already pays nothing
-        if paid_split_count >= free_split_count:
+        paid_gpu_count: int = min(free_gpu_count, max(listable_gpus, 0))
+        if paid_gpu_count >= free_gpu_count:
             return None
         required: Any = sizing.get("required_free_gb_per_split")
         return DiskLimitedRemainder(
-            free_split_count=free_split_count,
-            paid_split_count=paid_split_count,
-            unpaid_gpu_count=free_gpu_count
-            if paid_split_count == 0
-            else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+            free_split_count=free_gpu_count // result.gpu_splitting_min_count,
+            paid_split_count=max(listable, 0) if paid_gpu_count else 0,
+            unpaid_gpu_count=free_gpu_count - paid_gpu_count,
             required_free_gb_per_split=float(required) if isinstance(required, (int, float)) else 0.0,
         )
 

@@ -57,8 +57,8 @@ def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | Non
     return {
         "free_split_count": free_split_count,
         "listable_split_count": listable,
-        # GPUs left over below one split ride with the last listable split, as with ports
-        "listable_gpu_count": free_gpu_count if listable == free_split_count else listable * min_count,
+        # GPUs left over below one split ride with the last listable split, as with ports; scoring pays this count
+        "listable_gpu_count": free_gpu_count - (free_split_count - listable) * min_count if listable else 0,
         "required_free_gb_per_split": round(required_kb / KB_PER_GB, 1),
     }
 
