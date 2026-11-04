@@ -3,6 +3,7 @@ import dataclasses
 import time
 from dataclasses import replace
 
+import asyncssh
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutor,
@@ -1693,3 +1694,37 @@ async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
     assert await service.redis.ttl("disk_pressure_deferrals:hk:ex") > 3000
     await service.clear_disk_pressure_deferrals("hk", "ex", shadow=False)
     assert await service.disk_pressure_deferrals("hk", "ex", shadow=False) == 0
+
+
+class _Session:
+    def __init__(self, closed: bool):
+        self.closed = closed
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["error", "no_working_ports"])
+async def test_a_lost_ssh_session_raises_instead_of_a_zero_ports_verdict(context_factory, status):
+    # DAH-5718: the session died, so nothing was measured; TaskService names the raise EXECUTOR_TRANSPORT_UNREACHABLE
+    ctx = _port_ctx(
+        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status=status)
+    )
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=True)})
+
+    with pytest.raises(asyncssh.ConnectionLost):
+        await PortConnectivityCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_port_check_on_a_live_session_stays_a_ports_verdict(context_factory):
+    ctx = _port_ctx(
+        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status="error")
+    )
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=False)})
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED.reason

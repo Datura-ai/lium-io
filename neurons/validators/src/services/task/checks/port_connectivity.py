@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass, replace
 from typing import TypedDict
 
+import asyncssh
+
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from services.const import DEFAULT_JOB_OWNER_LIUM, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
@@ -112,6 +114,11 @@ class _SysboxMemoryUpdate:
     use_last_verified: bool = False
 
 
+def _ssh_session_closed(ssh: object) -> bool:
+    is_closed = getattr(ssh, "is_closed", None)  # asyncssh.SSHClientConnection.is_closed
+    return callable(is_closed) and is_closed() is True
+
+
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
 
@@ -170,6 +177,10 @@ class PortConnectivityCheck:
             },
             dind_deadline_monotonic=time.monotonic() + task_seconds_left(ctx) - CHECKS_AFTER_DIND_RESERVE_SECONDS,
         )
+        if result.status != "ok" and _ssh_session_closed(ctx.ssh):
+            # the validator's own session died, so no port was measured: raised, the run ends as
+            # EXECUTOR_TRANSPORT_UNREACHABLE (no verdict) instead of 0 ports and INSUFFICIENT_PORTS
+            raise asyncssh.ConnectionLost(f"SSH session closed during the port check ({result.status}: {result.error})")
         if probe_sysbox and not ctx.state.sysbox_runtime:
             # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
             # own in-container measurement may say Sysbox works
