@@ -538,7 +538,9 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
         # container_start. Bounded by the port check's own deferral streak, which ends in a real check.
         return "port check deferred for disk pressure", {}
     seconds_left = task_seconds_left(ctx)
-    if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
+    # a node paused for a failed start is unrentable until a probe passes, so it gets the standing budget too
+    reduced = standing is not None or _start_paused(ctx)
+    if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if reduced else _MIN_TASK_SECONDS_LEFT):
         return "too little cycle time left", {"task_seconds_left": int(seconds_left)}
 
     try:

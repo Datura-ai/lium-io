@@ -538,6 +538,20 @@ async def test_a_node_paused_for_a_failed_start_is_probed_within_the_interval():
 
 
 @pytest.mark.asyncio
+async def test_a_node_paused_for_a_failed_start_is_probed_late_in_the_cycle():
+    """DAH-5672 regression (review): a paused node whose other checks leave under 360 s was never probed,
+    so its pause never lifted; it gets the standing failure's 270 s budget."""
+    paused = rented_data().model_copy(
+        update={"container_start_paused_executor_ids": [EXECUTOR.uuid]}
+    )
+    ctx, docker, _ = make_probe_context(rented=paused)
+    late = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 471})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(late)
+    assert result.event.reason_code == Msg.PROBE_OK.reason
+    assert len(docker.create_calls) == 1
+
+@pytest.mark.asyncio
 async def test_a_failed_probe_clears_an_earlier_pass_stamp_and_records_the_failed_step():
     """Regression: a pass stamped earlier in the interval shields the failure, so the next cycle skips the
     node as "within interval" and relists it; or the failure is not recorded, so a cycle without a verdict
