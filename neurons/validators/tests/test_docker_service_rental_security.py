@@ -937,7 +937,8 @@ async def test_create_container_emits_secret_safe_sdk_operation_logs(
     assert run_extra["container_name"] == "pod_00000000-0000-0000-0000-0000000000aa"
     assert run_extra["pod_id"] == payload.pod_id
     assert run_extra["image"] == HOSTILE_IMAGE
-    assert run_extra["command_argv"] == ["sh", "/tmp/Jtd7.sh"]
+    assert run_extra["command_argc"] == 2
+    assert "Jtd7" not in str(sdk_extras)
     assert sorted(run_extra["environment_keys"]) == [
         "APP_MODE",
         "HOSTILE_ENV",
@@ -1324,7 +1325,8 @@ def test_create_request_str_leaves_out_renter_supplied_values():
     # every create logs str(payload); renter-supplied env, commands, Dockerfile and password stay out
     payload = _base_create_payload(dockerfile_content="FROM scratch\nDOCKERFILE_MARKER")
     logged = str(payload)
-    for value in (HOSTILE_ENV_VALUE, HOSTILE_STARTUP_COMMAND, HOSTILE_PASSWORD, "DOCKERFILE_MARKER"):
-        assert value not in logged
+    # markers, not whole values: repr escapes the newlines in the startup command
+    for marker in ("ENV_MARKER", "Jtd7", "mney", "DOCKERFILE_MARKER"):
+        assert marker not in logged
     assert payload.custom_options.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
     assert "HOSTILE_ENV" in payload.model_dump_json()
