@@ -533,10 +533,6 @@ RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
-# A preempted filler killed at the customer create still mounts its cache while it exits (12-60 s on 8x B300, prod
-# 4 Nov: ~45 s with 25 GB dirty), and dockerd refuses `volume rm` of a volume in use: the eviction waits this long.
-CACHE_VOLUME_RELEASE_WAIT_SECONDS = 90
-_CACHE_VOLUME_RELEASE_POLL_SECONDS = 3
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
@@ -2677,7 +2673,7 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
-def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
+def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     # unlink the volume's files on the host, through the executor's view of the host root: the
     # pod's open files stay writable until its processes die, and the kernel drops an unlinked
     # file's unwritten pages at that last close instead of writing them. No `docker run`: with
@@ -2686,14 +2682,15 @@ def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
     # from the validated name and each lookup must answer, so a failed or empty answer can never
     # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
     # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
+    # Only `container_names` may mount it (docker names never hold a space).
     volume = shlex.quote(local_volume)
-    pod = shlex.quote(container_name)
+    allowed = shlex.quote(f" {' '.join(container_names)} ")
     docker = "/usr/bin/docker"
     return (
         f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
         'd=${dm%% *}; m=${dm#* }; '
         f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
-        f'for u in $users; do [ "$u" = {pod} ] || {{ echo "volume in use by $u"; exit 6; }}; done; '
+        f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
@@ -5616,6 +5613,7 @@ class DockerService:
         payload: ContainerCreateRequest,
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
+        killed_fillers: Iterable[str] = (),
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
@@ -5633,6 +5631,10 @@ class DockerService:
         re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
         there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
         at the volume step instead of short-changing the renter.
+        A filler this create just killed can still be exiting and mount its Engy cache, so dockerd refuses the
+        `volume rm` (prod 4 Nov, 8x B300): the cache's files are then unlinked on the host (_wipe_volume_cmd), only
+        while every container mounting it is one of ``killed_fillers``; the empty volume is swept later, and a
+        filler asking for it again is charged the whole download (_engy_cache_missing_gb).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -5663,8 +5665,6 @@ class DockerService:
                     }),
                 )
             )
-            await self._wait_for_cache_volumes_released(ssh_client, cache_volumes, default_extra)
-
             async def remove(command: str) -> object:
                 return await asyncio.wait_for(
                     retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental"),
@@ -5675,11 +5675,27 @@ class DockerService:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
                 return free_now_gb >= rental_needs_free_gb
 
+            killed: tuple[str, ...] = tuple(killed_fillers)
+
+            def volume_remove(name: str) -> str:
+                # a Dolphin cache is never wiped: its readiness is not measured, so an empty one would read as ready
+                if not killed or not name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+                    return DockerCommand.volume_remove(name)
+                return (
+                    f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
+                    f"( {_wipe_volume_cmd(name, *killed)} ) || true"
+                )
+
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
             removal_failed = False
             try:
                 await evict_cache_volumes_oldest_first(
-                    ssh_client, cache_volumes, remove, rental_fits, evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX
+                    ssh_client,
+                    cache_volumes,
+                    remove,
+                    rental_fits,
+                    evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
+                    volume_remove=volume_remove,
                 )
             except asyncio.CancelledError:
                 raise
@@ -5723,34 +5739,6 @@ class DockerService:
                 exc_info=True,
             )
             return True  # the removal may have run before the failure
-
-    async def _wait_for_cache_volumes_released(
-        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str], default_extra: dict
-    ) -> None:
-        """Wait, bounded, until no container mounts ``volume_names``: a killed filler still exiting holds its cache,
-        so its `volume rm` fails and the rental is clamped and refused at rental_disk_short (DAH-5260, prod 4 Nov).
-        The users are the fillers this create removed; past the bound the eviction runs anyway, as before."""
-        command = "/usr/bin/docker ps -aq " + " ".join(f"--filter volume={shlex.quote(name)}" for name in volume_names)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + CACHE_VOLUME_RELEASE_WAIT_SECONDS
-        while True:
-            try:
-                result = await ssh_client.run(command, check=False, timeout=_CACHE_VOLUME_RELEASE_POLL_SECONDS * 5)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return  # an unreadable listing never stops the eviction
-            if result.exit_status != 0 or not (result.stdout or "").strip():
-                return
-            if loop.time() >= deadline:
-                logger.warning(
-                    _m(
-                        "Filler cache volumes still in use after the wait; evicting anyway",
-                        extra=get_extra_info({**default_extra, "volumes": volume_names}),
-                    )
-                )
-                return
-            await asyncio.sleep(_CACHE_VOLUME_RELEASE_POLL_SECONDS)
 
     async def _rental_disk_fit(
         self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest
@@ -9959,6 +9947,7 @@ class DockerService:
                         payload=payload,
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
+                        killed_fillers=[name for name in removed_containers if name.startswith(FILLER_CONTAINER_PREFIX)],
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
