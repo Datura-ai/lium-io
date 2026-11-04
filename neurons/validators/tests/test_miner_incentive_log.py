@@ -48,6 +48,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_no_headroom_at_burn_cap",
         "validation_failed",
         "rented_sysbox_not_confirmed",
+        "disk_limited_remainder",
     }
 
 
