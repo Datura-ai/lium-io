@@ -4,6 +4,7 @@ per-split port rule (DAH-3698)."""
 
 import pytest
 from incentive.miner_incentive_log import ZeroIncentiveReason
+from services.const import FRESH_SIZING_HEADROOM_GB
 from services.task.checks.disk_space import SplitDiskCheck
 from tests.test_disk_space_check import _split_state
 from tests.test_split_remainder_port_floor import MINER_HOTKEY, _build_incentive, _make_job, _reason_codes, _score_split
@@ -60,7 +61,7 @@ async def test_a_gpu_both_rules_leave_unpaid_is_counted_once():
 @pytest.mark.parametrize("room_for_splits", [0, 1, 2, 3])
 async def test_scoring_pays_exactly_the_gpus_the_listing_offers(context_factory, room_for_splits):
     # 8 GPUs in 2-GPU splits, 1 rented: 7 free = 3 splits + 1 leftover GPU riding with the last listable split
-    free_gb = settings.MIN_FREE_DISK_GB / 4 * room_for_splits
+    free_gb = (settings.MIN_FREE_DISK_GB / 4 + FRESH_SIZING_HEADROOM_GB) * room_for_splits
     ctx = context_factory(state=_split_state(free_gb, pods=(1,)), rented=True)
     sizing = (await SplitDiskCheck().run(ctx)).updates["state"].specs["split_disk"]
 

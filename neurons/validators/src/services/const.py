@@ -154,6 +154,8 @@ MIN_POD_PORT_COUNT = 1
 # DAH-4961: the disk floor the renter listing used to apply itself; an idle node past it now fails
 # validation instead of being hidden. The free-space floor is settings.MIN_FREE_DISK_GB (per environment).
 MAX_DISK_UTILIZATION_PERCENT = 90
+# DAH-2183: min free space fresh volume sizing leaves on the fs after a rental's volume allocation
+FRESH_SIZING_HEADROOM_GB = 10
 BATCH_PORT_VERIFICATION_SIZE = 300
 # DAH-3698: window in which only the first failed port verification is forgiven
 PORT_VERIFY_FIRST_MISS_TTL_SECONDS = 3600
