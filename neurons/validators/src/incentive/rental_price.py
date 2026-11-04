@@ -141,6 +141,17 @@ class PortLimitedRemainder(BaseModel):
     unpaid_gpu_count: int
 
 
+class DiskLimitedRemainder(BaseModel):
+    """The free remainder of a partially rented split node where fewer free splits have room for their GPU
+    share of the free-disk floor than it has free splits (DAH-4961). The sizing is SplitDiskCheck's
+    `specs.split_disk`; only the splits with room are listed, so only they earn idle pay."""
+
+    free_split_count: int
+    paid_split_count: int  # splits with disk room: their GPUs keep the idle pay
+    unpaid_gpu_count: int
+    required_free_gb_per_split: float
+
+
 # ── Snapshot models ──────────────────────────────────────────────────────────
 
 class GpuBucketRentalState(BaseModel):
@@ -619,6 +630,50 @@ class RentalPriceIncentive(DefaultIncentive):
             unpaid_gpu_count=free_gpu_count
             if paid_split_count == 0
             else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+        )
+
+    @staticmethod
+    def _disk_limited_remainder(result: JobResult) -> DiskLimitedRemainder | None:
+        # None when the spec carries no readable sizing (unsplit node, older validator): no change to idle pay
+        if not result.is_split_remainder or result.spec is None or not result.gpu_splitting_min_count:
+            return None
+        sizing: Any = result.spec.get("split_disk")
+        listable: Any = sizing.get("listable_split_count") if isinstance(sizing, dict) else None
+        if not isinstance(listable, int) or isinstance(listable, bool):
+            return None
+        free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
+        free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
+        paid_split_count: int = min(free_split_count, max(listable, 0))
+        # below one whole split the port rule already pays nothing
+        if paid_split_count >= free_split_count:
+            return None
+        required: Any = sizing.get("required_free_gb_per_split")
+        return DiskLimitedRemainder(
+            free_split_count=free_split_count,
+            paid_split_count=paid_split_count,
+            unpaid_gpu_count=free_gpu_count
+            if paid_split_count == 0
+            else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+            required_free_gb_per_split=float(required) if isinstance(required, (int, float)) else 0.0,
+        )
+
+    def _log_disk_limited_remainder(self, result: JobResult, disk_limited: DiskLimitedRemainder) -> None:
+        logger.info(
+            _m(
+                "Free remainder of a partially rented split node has disk room for fewer splits than it has",
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "free_split_count": disk_limited.free_split_count,
+                    "paid_split_count": disk_limited.paid_split_count,
+                    "unpaid_gpu_count": disk_limited.unpaid_gpu_count,
+                    "required_free_gb_per_split": disk_limited.required_free_gb_per_split,
+                    "enforced": True,
+                    "reason": ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
+                    "pool": "rental_partial" if disk_limited.paid_split_count else "rental_excluded",
+                },
+            )
         )
 
     def _log_port_limited_remainder(
@@ -1414,6 +1469,25 @@ class RentalPriceIncentive(DefaultIncentive):
                 job_result.port_unpaid_gpu_count += port_limited_remainder.unpaid_gpu_count
             job_result.record_incentive_log(
                 MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited_remainder)
+            )
+
+        # DAH-4961: likewise only the free splits with disk room for their share are listed, so only they earn
+        # idle pay. Read after the port rule so a GPU either rule leaves unpaid is counted once.
+        disk_limited_remainder: DiskLimitedRemainder | None = (
+            self._disk_limited_remainder(job_result) if idle_pool_candidate else None
+        )
+        if disk_limited_remainder is not None:
+            if eligible_for_rental_share:
+                self._log_disk_limited_remainder(job_result, disk_limited_remainder)
+            if disk_limited_remainder.paid_split_count == 0:
+                eligible_for_rental_share = False
+            else:
+                # port_unpaid_gpu_count holds every free GPU left out of the pools; the merge adds it back
+                newly_unpaid: int = max(0, disk_limited_remainder.unpaid_gpu_count - job_result.port_unpaid_gpu_count)
+                job_result.gpu_count -= newly_unpaid
+                job_result.port_unpaid_gpu_count += newly_unpaid
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_disk_limited_remainder(job_result, disk_limited_remainder)
             )
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced

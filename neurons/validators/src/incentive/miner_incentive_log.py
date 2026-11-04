@@ -81,6 +81,7 @@ from services.const import MIN_PORT_COUNT
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
+        DiskLimitedRemainder,
         InsufficientDisk,
         MissingFull8xCapability,
         PortLimitedRemainder,
@@ -127,6 +128,8 @@ class ZeroIncentiveReason(StrEnum):
     PROVIDER_EMAIL_NOT_CONFIRMED = "provider_email_not_confirmed"
     # Rented: in the mining pool, but the Sysbox portion zeroed the mining score
     RENTED_SYSBOX_NOT_CONFIRMED = "rented_sysbox_not_confirmed"
+    # Group B (appended): free splits of a partly rented split node without disk room for their share (DAH-4961)
+    DISK_LIMITED_REMAINDER = "disk_limited_remainder"
 
 
 # The reason code a failed run carries when no check produced one (an exception in the pipeline).
@@ -573,6 +576,39 @@ class MinerLogLine(BaseModel):
                 "required_port_count": port_limited.required_port_count,
                 "free_split_count": port_limited.free_split_count,
                 "paid_split_count": port_limited.paid_split_count,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_disk_limited_remainder(
+        result: JobResult, disk_limited: DiskLimitedRemainder
+    ) -> MinerLogLine:
+        # `result` is the free portion; the message names the GPUs the missing disk room leaves unpaid
+        unpaid: int = disk_limited.unpaid_gpu_count
+        need: str = f"{disk_limited.required_free_gb_per_split:g} GB"
+        if disk_limited.paid_split_count:
+            lead = (
+                f"No unrented incentive for {unpaid} of the free GPUs on this partially rented node: its free disk "
+                f"has room for {disk_limited.paid_split_count} of its {disk_limited.free_split_count} free GPU "
+                f"split(s) at {need} each, so only those are listed and keep earning. "
+            )
+        else:
+            lead = (
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: its free disk "
+                f"has no room for one GPU split ({need}), so they are not listed. "
+            )
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
+            message=(
+                lead + "The rented GPUs keep earning. Full idle pay resumes when the rental ends or the node has "
+                f"{need} free per free split."
+            ),
+            extra_fields={
+                "gpu_count": unpaid,
+                "free_split_count": disk_limited.free_split_count,
+                "paid_split_count": disk_limited.paid_split_count,
+                "required_free_gb_per_split": disk_limited.required_free_gb_per_split,
             },
         )
 

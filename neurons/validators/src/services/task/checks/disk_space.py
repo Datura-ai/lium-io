@@ -47,15 +47,45 @@ def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | Non
     # a pod that does not report its GPUs leaves the free count unknown
     if any(not count or count <= 0 for count in rented_gpus):
         return None
-    free_split_count = (gpu_count - sum(rented_gpus)) // min_count
+    free_gpu_count = gpu_count - sum(rented_gpus)
+    free_split_count = free_gpu_count // min_count
     if free_split_count <= 0:
         return None
     required_kb = settings.MIN_FREE_DISK_GB * KB_PER_GB * min_count / gpu_count
+    # a zero floor asks no disk of a split
+    listable = free_split_count if required_kb <= 0 else max(0, min(free_split_count, int(free_kb // required_kb)))
     return {
         "free_split_count": free_split_count,
-        "listable_split_count": min(free_split_count, int(free_kb // required_kb)),
+        "listable_split_count": listable,
+        # GPUs left over below one split ride with the last listable split, as with ports
+        "listable_gpu_count": free_gpu_count if listable == free_split_count else listable * min_count,
         "required_free_gb_per_split": round(required_kb / KB_PER_GB, 1),
     }
+
+
+class SplitDiskCheck:
+    """DAH-4961: writes ``specs.split_disk`` on a partly rented split node from the scraped disk figure.
+
+    Pure data and never fails. It sits before TenantEnforcementCheck, which halts a rented node's cycle before
+    DiskSpaceCheck runs, so the sizing is published for every partly rented node. No rental, an unsplit node or no
+    disk reading writes nothing.
+    """
+
+    check_id = "executor.validate.split_disk"
+    fatal = False
+
+    async def run(self, ctx: Context) -> CheckResult:
+        rental = rental_of_this_node(ctx)
+        hard_disk = (ctx.state.specs or {}).get("hard_disk")
+        free_kb = _as_float(hard_disk.get("free")) if isinstance(hard_disk, dict) else math.nan
+        per_split = (
+            split_disk(ctx, rental.pods, free_kb) if rental and rental.pods and math.isfinite(free_kb) else None
+        )
+        event = render_message(Msg.SPLIT_DISK, ctx=ctx, check_id=self.check_id, what={"split_disk": per_split})
+        if per_split is None:
+            return CheckResult(passed=True, event=event)
+        state = replace(ctx.state, specs={**ctx.state.specs, "split_disk": per_split})
+        return CheckResult(passed=True, event=event, updates={"state": state})
 
 
 class DiskSpaceCheck:

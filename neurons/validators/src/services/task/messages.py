@@ -1492,6 +1492,13 @@ class DiskSpaceMessages:
         remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
         "longer need, or grow the disk. The next validation reads the disk again.",
     )
+    SPLIT_DISK = MessageTemplate(
+        event="Disk space per free split inspected",
+        reason="SPLIT_DISK_SIZED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
 
 
 class PortCountMessages:

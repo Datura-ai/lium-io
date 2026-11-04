@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.const import MAX_DISK_UTILIZATION_PERCENT
-from services.task.checks.disk_space import KB_PER_GB, DiskSpaceCheck
+from services.task.checks.disk_space import KB_PER_GB, DiskSpaceCheck, SplitDiskCheck
+from services.task.checks.rented_machine import TenantEnforcementCheck
+from services.task.pipeline_factory import PipelineFactory
 from services.task.messages import DiskSpaceMessages as Msg
 
 from core.config import settings
@@ -234,3 +236,70 @@ async def test_idle_split_node_still_fails_the_whole_host_floor(context_factory)
 
     assert result.passed is False
     assert "updates" not in result.model_fields_set
+
+
+@pytest.mark.parametrize(
+    "build",
+    [PipelineFactory.build_checks, PipelineFactory.build_fast_path_checks, PipelineFactory.build_dry_run_checks],
+)
+def test_split_disk_is_sized_before_the_rented_halt_in_every_pipeline(build):
+    # TenantEnforcementCheck halts a rented node's cycle, so DiskSpaceCheck never sees a normal partly rented node
+    ids = [check.check_id for check in build()]
+
+    assert ids.index(SplitDiskCheck.check_id) < ids.index(TenantEnforcementCheck.check_id)
+
+
+def _split_state(free_gb: float, utilization: float = 50, **kwargs):
+    defaults = dict(gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=2)
+    rented_data = _split_rental(*kwargs.pop("pods", (2,)))
+    return build_state(specs=_disk(utilization, free_gb), rented_data=rented_data, **{**defaults, **kwargs})
+
+
+@pytest.mark.asyncio
+async def test_split_disk_check_publishes_the_sizing_on_a_partly_rented_node(context_factory):
+    # 8 GPUs in 2-GPU splits, 2 rented: 3 free splits, room for 2 of them
+    ctx = context_factory(state=_split_state(settings.MIN_FREE_DISK_GB * 0.5), rented=True)
+
+    result = await SplitDiskCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates["state"].specs["split_disk"] == {
+        "free_split_count": 3,
+        "listable_split_count": 2,
+        "listable_gpu_count": 4,
+        "required_free_gb_per_split": round(settings.MIN_FREE_DISK_GB / 4, 1),
+    }
+
+
+@pytest.mark.asyncio
+async def test_split_disk_check_writes_nothing_on_an_idle_node(context_factory):
+    state = build_state(specs=_disk(50, 1), gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=2)
+
+    result = await SplitDiskCheck().run(context_factory(state=state))
+
+    assert result.passed is True
+    assert "updates" not in result.model_fields_set
+
+
+@pytest.mark.asyncio
+async def test_leftover_gpus_ride_with_the_last_listable_split(context_factory):
+    # 8 GPUs in 2-GPU splits, 1 rented: 7 free GPUs = 3 splits + 1 leftover, all with room
+    ctx = context_factory(state=_split_state(settings.MIN_FREE_DISK_GB, pods=(1,)), rented=True)
+
+    split = (await SplitDiskCheck().run(ctx)).updates["state"].specs["split_disk"]
+
+    assert (split["listable_split_count"], split["listable_gpu_count"]) == (3, 7)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check", [SplitDiskCheck, DiskSpaceCheck])
+async def test_a_zero_floor_asks_no_disk_of_a_split(context_factory, monkeypatch, check):
+    # MIN_FREE_DISK_GB=0 is accepted; an over-90% rented split node must not divide by zero
+    monkeypatch.setattr(settings, "MIN_FREE_DISK_GB", 0)
+    ctx = context_factory(state=_split_state(1, utilization=MAX_DISK_UTILIZATION_PERCENT + 5), rented=True)
+
+    result = await check().run(ctx)
+
+    assert result.passed is True
+    split = result.updates["state"].specs["split_disk"]
+    assert (split["listable_split_count"], split["required_free_gb_per_split"]) == (3, 0)
