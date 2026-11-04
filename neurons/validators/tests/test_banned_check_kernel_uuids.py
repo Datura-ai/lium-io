@@ -6,7 +6,8 @@ operator's choice; /proc/driver/nvidia/gpus/*/information is the kernel's and th
 author it (the DAH-2614 truth path). A ban keyed only on the reported UUID is void the moment the
 banned operator re-registers with new UUIDs and a fresh hotkey.
 
-Bans are matched against the reported UUIDs and the kernel's.
+Bans are matched against the reported UUIDs and the kernel's. A foreign mount over the kernel's list fails the
+node only with KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED; off, it is recorded on the event.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +21,7 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
+from core.config import settings
 from services import nvidia_devices  # the module banned_provider.py reads the timeout from
 from tests.helpers import build_state
 
@@ -42,6 +44,11 @@ OVERLAY_MOUNT = (
 
 
 INFO_FILE = "/proc/driver/nvidia/gpus/0001:00:00.0/information"
+
+
+@pytest.fixture
+def overlay_enforced(monkeypatch):
+    monkeypatch.setattr(settings, "KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED", True)
 
 
 def _ssh_with_procfs(
@@ -84,7 +91,7 @@ async def test_provider_ban_catches_spoofed_uuid_through_the_kernel_view(context
 
 
 @pytest.mark.asyncio
-async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(context_factory):
+async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(context_factory, overlay_enforced):
     """The shim test: the overlay serves a clean UUID, the kernel list is withheld, the check fails."""
     rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
     ctx = context_factory(
@@ -106,7 +113,7 @@ async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(cont
 
 
 @pytest.mark.asyncio
-async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factory):
+async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factory, overlay_enforced):
     """Like a ban, the overlay finding must not stop verifying a node whose pod is in use."""
     ctx = context_factory(
         ssh=_ssh_with_procfs([f"{SPOOFED}, 0"], mounts=[*CONTAINER_MOUNTS, OVERLAY_MOUNT])
@@ -132,27 +139,18 @@ async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factor
 
 
 @pytest.mark.asyncio
-async def test_stale_procfs_bind_is_unreadable_and_the_node_passes(context_factory):
-    stale = CONTAINER_MOUNTS[1].replace(
-        "/driver/nvidia/gpus/0001:00:00.0 ", "/driver/nvidia/gpus/0001:00:00.0//deleted ", 1
-    )
-    rented = RentedExecutorsResponse(executors={})
+async def test_an_overlaid_kernel_view_only_records_its_mounts_while_the_overlay_flag_is_off(context_factory):
+    """Shadow: the overlay is recorded on the event and the node passes."""
     ctx = context_factory(
-        state=build_state(gpu_uuids=REAL, rented_data=rented),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"], mounts=[CONTAINER_MOUNTS[0], stale]),
+        state=build_state(gpu_uuids=REAL, rented_data=RentedExecutorsResponse(executors={})),
+        ssh=_ssh_with_procfs([f"{REAL}, 0"], mounts=[*CONTAINER_MOUNTS, OVERLAY_MOUNT]),
     )
 
     result = await BannedProviderCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
-    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
-
-
-def test_a_stale_bind_counts_only_on_the_gpus_path_boundary():
-    def line(root, point):
-        return f"700 600 0:5 {root} {point} rw - proc proc rw"
-
-    assert nvidia_devices._has_stale_proc_bind(line("/driver/nvidia/gpus//deleted", "/proc/driver/nvidia/gpus"))
-    assert nvidia_devices._has_stale_proc_bind(line("/x//deleted", "/proc/driver/nvidia/gpus/0001:00:00.0"))
-    assert not nvidia_devices._has_stale_proc_bind(line("/x//deleted", "/proc/driver/nvidia/gpus-other"))
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == [
+        "/proc/driver/nvidia/gpus/0001:00:00.0 tmpfs"
+    ]
+    assert result.event.what_we_saw["kernel_overlay_enforced"] is False
+    assert "kernel_gpu_view_passed" not in result.updates

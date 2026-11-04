@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from core.config import settings
 from services.nvidia_devices import KernelGpuView, read_kernel_gpu_view
 
 from ..messages import BannedProviderMessages as Msg, render_message
@@ -81,6 +82,7 @@ class BannedProviderCheck:
             "kernel_view_would_ban": kernel_view_would_ban,
             "kernel_ban_enforced": True,
             "kernel_gpu_foreign_mounts": foreign_mounts,
+            "kernel_overlay_enforced": settings.KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED,
         }
         specs = ctx.state.specs
         if kernel_uuids is not None:
@@ -104,7 +106,7 @@ class BannedProviderCheck:
                 fatal=not has_live_rental(ctx),
             )
 
-        if foreign_mounts:
+        if foreign_mounts and settings.KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED:
             event = render_message(
                 Msg.KERNEL_GPU_VIEW_OVERLAID, ctx=ctx, check_id=self.check_id, what=what
             )
