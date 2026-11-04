@@ -4,6 +4,7 @@ import logging
 import math
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Literal, NamedTuple
 
 import redis.asyncio as aioredis
@@ -171,6 +172,33 @@ REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
+# Set by the express lane for a new node's first pass (core/express_lane.py). Every RedisService command
+# runs under one process-wide lock; after a wave send hundreds of wave pipelines queue on it, and a new
+# node's few reads waited behind them (69 s before one rental probe's create, 4 Nov). The first pass gets
+# its own slot: its commands queue only behind other first passes.
+EXPRESS_REDIS_SLOT: ContextVar[bool] = ContextVar("express_redis_slot", default=False)
+_HELD_SLOT: ContextVar[asyncio.Lock] = ContextVar("redis_held_slot")
+
+
+class _CommandLock:
+    """The command lock: one slot for the express lane's first passes, one for everything else."""
+
+    def __init__(self):
+        self._default = asyncio.Lock()
+        self._express = asyncio.Lock()
+
+    def _slot(self) -> asyncio.Lock:
+        return self._express if EXPRESS_REDIS_SLOT.get() else self._default
+
+    async def __aenter__(self) -> None:
+        lock = self._slot()
+        await lock.acquire()
+        _HELD_SLOT.set(lock)  # released by the slot it took, even if the flag changed meanwhile
+
+    async def __aexit__(self, *exc) -> None:
+        _HELD_SLOT.get().release()
+
+
 
 class BackendCommand(BaseModel):
     state: Literal["running", "finished"]
@@ -275,7 +303,7 @@ class RedisService:
                 retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
             )
         )
-        self.lock = asyncio.Lock()
+        self.lock = _CommandLock()
 
     @asynccontextmanager
     async def acquire_executor_lock(

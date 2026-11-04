@@ -33,7 +33,7 @@ from fixtures.rest_miner_fixtures import executor_info as _executor_info
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.miner_service import CYCLE_DONE, MinerService
-from services.redis_service import RedisService
+from services.redis_service import EXPRESS_REDIS_SLOT, RedisService, _CommandLock
 from services.task.models import JobResult
 
 pytest_plugins = ["fixtures.incentive_fixtures", "fixtures.rest_miner_fixtures"]
@@ -567,3 +567,43 @@ async def test_wave_publishes_nothing_at_pass_while_the_validated_set_is_cold():
     await service.publish_new_executors_at_pass(job)
 
     service.publish_machine_specs.assert_not_awaited()
+
+
+# --- The first pass's Redis commands do not queue behind the wave's ------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_first_pass_redis_read_is_not_blocked_by_the_wave_holding_the_command_lock():
+    service = _redis_service()
+    service.lock = _CommandLock()
+    await service.set("k", "v")
+
+    async with service.lock:  # the wave's slot is held (hundreds of queued wave commands, 4 Nov)
+        wave_read = asyncio.create_task(service.get("k"))
+
+        async def first_pass_read():
+            EXPRESS_REDIS_SLOT.set(True)
+            return await service.get("k")
+
+        assert await asyncio.wait_for(asyncio.create_task(first_pass_read()), timeout=1) == b"v"
+        await asyncio.sleep(0)
+        assert not wave_read.done()  # the wave's own commands still wait their turn
+    assert await wave_read == b"v"
+
+
+@pytest.mark.asyncio
+async def test_the_express_lane_runs_its_first_pass_in_the_express_redis_slot(monkeypatch, wallet):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node, registered_seconds_ago=40)]}, [_Neuron("miner-a")])
+    slot_seen = []
+    job_for = harness.job_for
+
+    def record_slot(payload, executor_id):
+        slot_seen.append(EXPRESS_REDIS_SLOT.get())
+        return job_for(payload, executor_id)
+
+    harness.job_for = record_slot
+
+    assert await harness.tick_and_settle() == 1
+    assert slot_seen == [True]
+    assert EXPRESS_REDIS_SLOT.get() is False  # set in the lane's own task only

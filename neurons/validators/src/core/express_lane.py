@@ -34,6 +34,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
+from services.redis_service import EXPRESS_REDIS_SLOT
 from services.task_service import JobResult
 
 from core.config import settings
@@ -410,6 +411,8 @@ class ExpressLane:
         inputs: CycleInputs,
         rented_data: RentedExecutorsResponse,
     ) -> None:
+        # this task's Redis commands (and its children's) use the express slot, not the wave's queue
+        EXPRESS_REDIS_SLOT.set(True)
         executor_id = pending.executor.id
         directory = inputs.encrypted_files.tmp_directory
         # Counted against the node once the outcome is the node's (below); a verification the

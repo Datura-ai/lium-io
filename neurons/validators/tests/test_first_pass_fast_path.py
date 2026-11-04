@@ -14,7 +14,7 @@ import pytest
 import services.matrix_validation_service as mvs
 from core.config import settings
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
-from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
+from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck, _first_pass_challenge_config
 from neurons.validators.src.services.task.messages import CapabilityMessages as CapMsg
 from neurons.validators.src.services.task.messages import VerifyXMessages as VxMsg
 from neurons.validators.src.services.task import pipeline_factory as pipeline_factory_module
@@ -230,12 +230,17 @@ async def test_first_pass_verifyx_uses_the_smaller_challenge_config(context_fact
     result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 
     assert service.kwargs == {
-        "challenge_config_overrides": {"memory_max_test_gb": 16, "storage_throughput_test_gb": 1}
+        "challenge_config_overrides": {
+            "memory_max_test_gb": 16,
+            "storage_throughput_test_gb": 1,
+            "network_timeout_seconds": 45,
+        }
     }
     assert result.passed is True
     assert result.event.what_we_saw["first_pass_challenge_config"] == {
         "memory_max_test_gb": 16,
         "storage_throughput_test_gb": 1,
+        "network_timeout_seconds": 45,
     }
     # A warm sample seeds the EMA exactly as today.
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
@@ -291,7 +296,13 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 
-    first_pass_overrides = {"challenge_config_overrides": {"memory_max_test_gb": 16, "storage_throughput_test_gb": 1}}
+    first_pass_overrides = {
+        "challenge_config_overrides": {
+            "memory_max_test_gb": 16,
+            "storage_throughput_test_gb": 1,
+            "network_timeout_seconds": 45,
+        }
+    }
     assert service.kwargs_per_call == [first_pass_overrides, first_pass_overrides]
     assert result.passed is True
     assert result.event.what_we_saw["cold_sample_retry"]["used"] == "retry"
@@ -376,7 +387,15 @@ async def test_verifyx_service_applies_overrides_to_the_challenge_config_only():
     assert default_config["memory_max_test_gb"] == settings.verifyx.MEMORY_MAX_TEST_GB
     assert default_config["storage_throughput_test_gb"] == settings.verifyx.STORAGE_THROUGHPUT_TEST_GB
     assert first_pass_config == {**default_config, "memory_max_test_gb": 16, "storage_throughput_test_gb": 1}
-    # Untouched: the RAM minimum the executor must still allocate, the disk minimum, the download.
+    # Untouched: the RAM minimum the executor must still allocate, the disk minimum.
     assert first_pass_config["memory_min_test_gb"] == default_config["memory_min_test_gb"]
     assert first_pass_config["storage_min_available_gb"] == default_config["storage_min_available_gb"]
-    assert first_pass_config["network_timeout_seconds"] == default_config["network_timeout_seconds"]
+    assert default_config["network_timeout_seconds"] == settings.verifyx.NETWORK_TIMEOUT_SECONDS
+
+
+def test_first_pass_network_wait_is_capped_below_the_cycle_wait():
+    """A slow package mirror on a new node: the first pass waits 45 s per try, not 120 s (two tries plus
+    the speed test then stay inside the express budget); the cycle's challenge keeps the full wait."""
+    capped = _first_pass_challenge_config()["network_timeout_seconds"]
+    assert capped == settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS == 45
+    assert capped < settings.verifyx.NETWORK_TIMEOUT_SECONDS

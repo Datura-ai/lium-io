@@ -319,6 +319,11 @@ class Settings(BaseSettings):
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
     FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
+    # The first pass's VerifyX network wait (package download, each speed-test direction) instead of
+    # VERIFYX NETWORK_TIMEOUT_SECONDS (120). A failed package download is retried once on the node, so a
+    # slow mirror cost a new node 4 min at 120 s. 45 s still fits the 450 MB speed test and a 500 MiB
+    # package at 100 Mbps; a slower link is measured again with the full wait in the next cycle.
+    FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS: int = Field(env="FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS", default=45)
     # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
     # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
     # judge the answer with the same unseal/verify code. The POST travels through a direct-tcpip
