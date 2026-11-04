@@ -873,7 +873,7 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
 
     assert str(raised.value) == f"{action}{message}"
     assert session.puts[-1]["json"]["error_message"] == f"{action}{message}"
-    assert [c for c in calls if c[0] != "dmesg"][-1][1:3] == ["rm", "--force"]
+    assert [c for c in calls if c[0] != "dmesg" and c[1] != "events"][-1][1:3] == ["rm", "--force"]
     # detached runs delete stderr, so the state line must reach the reported operation logs
     log = "\n".join(session.puts[-1]["json"]["logs"] or [])
     assert ("docker state" in log) is (oom_killed is not True)
@@ -889,6 +889,47 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
         assert OOM_KILL_DMESG.splitlines()[1] not in log
 
 
+
+
+def test_removed_helper_logs_its_docker_events_and_matches_the_kernel_by_their_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events_out = "\n".join(
+        json.dumps({"id": HELPER_ID, "Action": action, "time": 1000 + i, "Actor": {"ID": HELPER_ID, "Attributes": attrs}})
+        for i, (action, attrs) in enumerate(
+            [("kill", {"signal": "9", "image": "x"}), ("die", {"exitCode": "137"}), ("destroy", {})]
+        )
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        if "inspect" in command:
+            return SimpleNamespace(returncode=1, stdout="", stderr="Error: No such container: x")
+        if "events" in command:
+            return SimpleNamespace(returncode=0, stdout=events_out + "\nnot json\n", stderr="")
+        if command[0] == "dmesg":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps([{"id": SNAPSHOT_ID}]), stderr="")
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)
+    monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
+    monkeypatch.setattr("storage.restic.subprocess.Popen", _KilledPopen)
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="backup"))
+    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
+    output = io.StringIO()
+    runner = ResticStorageRunner(operation, workspace, event_writer=JsonEventWriter(str(OPERATION_ID), 0, output=output))
+
+    with pytest.raises(ResticOperationError, match="removed while running"):
+        runner.run()
+
+    events_call = next(c for c in calls if "events" in c)
+    assert events_call[events_call.index("--filter") + 1] == f"container=lium-storage-{str(OPERATION_ID)[:12]}"
+    log = output.getvalue()
+    assert 'kill {\\"signal\\": \\"9\\"}' in log and "destroy {}" in log
+    assert f"{HELPER_ID[:12]} kill" in log  # the ID is logged for correlation when dmesg has no match
+    assert "image" not in log.split("helper docker events")[1].split("\n")[0]
+    assert "kernel: no kernel kill line for the helper" in log  # the ID from the events reached the kernel check
 
 
 def test_kernel_kill_lines_match_the_helper_container_only() -> None:
