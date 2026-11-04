@@ -25,9 +25,6 @@ from protocol.vc_protocol import validator_requests  # noqa: E402
 
 # declared in both enums, sent by neither peer, and the validator has no model for it
 VALIDATOR_TYPES_WITHOUT_A_VALIDATOR_MODEL = {"MachineSpecRequest"}
-# backend messages the validator has no model for yet: it logs and drops them. The validator side of DAH-5716
-# (lium-io#2056) adds payloads.RecheckExecutorRequest and replaces this entry with a branch below.
-BACKEND_TYPES_WITHOUT_A_VALIDATOR_MODEL = {"RecheckExecutorRequest"}
 # the validator sends this body to the backend and builds it ad hoc: no model to compare
 # fields the backend puts on the wire that the validator's model does not declare (so ignores):
 # the known drift, by recording. A new entry here is a wire field the validator silently drops —
@@ -132,11 +129,10 @@ def test_what_the_backend_sends_parses_through_the_validators_own_parser(entry: 
     raw = json.dumps(message)
     ours = lium_protocol.BACKEND_MESSAGES.parse_obj(message)
     assert type(ours).__name__ == entry["expect"]
-    if entry["expect"] in BACKEND_TYPES_WITHOUT_A_VALIDATOR_MODEL:
-        assert not hasattr(payloads, entry["expect"])
-        return
     if entry["expect"] == "ForcedValidationCycleRequest":
         theirs = pydantic.TypeAdapter(payloads.ForcedValidationCycleRequest).validate_json(raw)
+    elif entry["expect"] == "RecheckExecutorRequest":
+        theirs = pydantic.TypeAdapter(payloads.RecheckExecutorRequest).validate_json(raw)
     elif entry["expect"] == "GetEstimateRequest":
         theirs = pydantic.TypeAdapter(payloads.GetEstimateRequest).validate_json(raw)
         # the validator's model has no message_type: it ignores the discriminator, reads the rest
