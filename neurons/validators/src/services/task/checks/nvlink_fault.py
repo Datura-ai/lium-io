@@ -32,6 +32,9 @@ NVLINK_BASEBOARD_GPUS = frozenset(
     }
 )
 BASEBOARD_GPU_COUNT = 8
+# CUDA_ERROR_UNKNOWN adding a GPU to the multicast object: on a full NVLink baseboard whose GPUs all report
+# multicast support, NCCL NVLS cannot start (8x H200, 4 Nov). Elsewhere (a VM slice) it stays "could not measure".
+ADD_DEVICE_UNKNOWN_ERROR = "cuMulticastAddDevice -> CUresult 999"
 
 
 class NvlinkFaultCheck:
@@ -46,6 +49,10 @@ class NvlinkFaultCheck:
     It runs beside an active filler: on 8x H100 and 8x B300 (28 Oct) the probe passed beside an NVLS
     all-reduce filler, which kept exact results with one slower second per probe. A filler holding
     nearly all GPU memory can leave no room for the probe's context: NVLINK_UNKNOWN, the node passes.
+
+    On a full 8x board of SXM-only GPUs, CUDA_ERROR_UNKNOWN (999) from cuMulticastAddDevice fails the node
+    the same way (NVLINK_FAULT): two 8x H200 (4 Nov) returned it on every probe and renters' NVLS
+    all-reduce could not start. On any other board 999 is NVLINK_UNKNOWN.
 
     A full 8x board of SXM-only GPUs that reports no NVLink at all fails with NVLINK_MISSING: an 8x H100
     HBM3 (1 Nov) was listed with PCIe-only topology (fabric down) and a renter found no NVLink.
@@ -94,6 +101,17 @@ class NvlinkFaultCheck:
             and isinstance(value, (str, int, float))
         }
         status = report.get("status")
+        if (
+            status == "error"
+            and report.get("error") == ADD_DEVICE_UNKNOWN_ERROR
+            and _full_sxm_board_gpu(specs) is not None
+        ):
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.MULTICAST_FAILED, ctx=ctx, check_id=self.check_id, what=what
+                ),
+            )
         if status == "fault":
             return CheckResult(
                 passed=False,
@@ -111,17 +129,25 @@ def _missing_nvlink_on_sxm_board(specs: dict[str, Any], interconnect: Any) -> di
         return None
     if is_sxm_on_pcie_adapter(specs):
         return None
+    gpu_name = _full_sxm_board_gpu(specs)
+    if gpu_name is None:
+        return None
+    return {
+        "gpu_name": gpu_name,
+        "gpu_count": len((specs.get("gpu") or {}).get("details") or []),
+        "nvlink_active_links": interconnect.get("nvlink_active_links"),
+        "pcie_class": interconnect.get("pcie_class"),
+    }
+
+
+def _full_sxm_board_gpu(specs: dict[str, Any]) -> str | None:
+    """The GPU model when the node is a full baseboard (8+) of one SXM-only model, else None."""
     details = (specs.get("gpu") or {}).get("details") or []
     # specs keep the raw NVML name (e.g. "Tesla H100 80GB HBM3")
     names = {normalize_gpu_model(gpu.get("name")) for gpu in details if isinstance(gpu, dict)}
     if len(details) < BASEBOARD_GPU_COUNT or len(names) != 1 or not names <= NVLINK_BASEBOARD_GPUS:
         return None
-    return {
-        "gpu_name": next(iter(names)),
-        "gpu_count": len(details),
-        "nvlink_active_links": interconnect.get("nvlink_active_links"),
-        "pcie_class": interconnect.get("pcie_class"),
-    }
+    return next(iter(names))
 
 
 def _parse_report(stdout: str) -> dict[str, Any] | None:

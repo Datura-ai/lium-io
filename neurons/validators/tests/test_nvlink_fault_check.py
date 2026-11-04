@@ -309,3 +309,59 @@ async def test_an_adapter_node_verified_under_its_sxm_name_keeps_its_verificatio
         result = await SpecChangeCheck().run(context)
 
         assert result.passed is passed, (previous, current)
+
+
+ADD_DEVICE_999 = report(status="error", error="cuMulticastAddDevice -> CUresult 999")
+
+
+def nvlink_board(name="NVIDIA H200", count=8):
+    return {**sxm_board(name=name, count=count), **NVLINK_BOARD}
+
+
+@pytest.mark.asyncio
+async def test_add_device_999_on_a_full_nvlink_board_fails(context_factory):
+    result, _ = await run_check(context_factory, nvlink_board(), ADD_DEVICE_999)
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVLINK_FAULT"
+    assert result.event.severity == "error"
+    assert result.event.event == Msg.MULTICAST_FAILED.event
+    assert "999" in result.event.what_we_saw["probe"]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("specs", "stdout"),
+    [
+        (nvlink_board(count=4), ADD_DEVICE_999),  # a VM slice: could not measure
+        (nvlink_board(name="NVIDIA H100 PCIe"), ADD_DEVICE_999),
+        (NVLINK_BOARD, ADD_DEVICE_999),  # no GPU details
+        (nvlink_board(), report(status="error", error="cuMulticastCreate -> CUresult 999")),
+        (nvlink_board(), report(status="error", error="cuMulticastAddDevice -> CUresult 1")),
+        (nvlink_board(), report(status="error", error="probe hung")),
+    ],
+)
+async def test_999_elsewhere_or_other_errors_still_pass_as_unknown(context_factory, specs, stdout):
+    result, _ = await run_check(context_factory, specs, stdout)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UNKNOWN.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [220, 401])
+async def test_220_and_401_still_fail_as_a_fault(context_factory, code):
+    stdout = report(status="fault", error=f"cuMulticastAddDevice -> CUresult {code}")
+    for specs in (NVLINK_BOARD, nvlink_board(count=4)):
+        result, _ = await run_check(context_factory, specs, stdout)
+
+        assert result.passed is False
+        assert result.event.event == Msg.PROBE_FAILED.event
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_full_nvlink_board_passes(context_factory):
+    result, _ = await run_check(context_factory, nvlink_board(), report(status="ok", gpus=8))
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.PROBE_OK.reason
