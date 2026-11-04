@@ -277,6 +277,7 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unbucketed_paid_fraction = 1.0
         # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
+        self._spot_seeded: list[JobResult] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
@@ -1055,7 +1056,11 @@ class RentalPriceIncentive(DefaultIncentive):
                         hotkey,
                         result,
                         secure_rate=self._spot_secure_rate(result),
-                        filler_rate=FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
+                        filler_rate=(
+                            self._spot_secure_rate(result)
+                            if result.filler_revenue_per_gpu_hour is None
+                            else FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour
+                        ),
                         paid_fraction=self.unbucketed_paid_fraction,
                         pay_factor=FILLER_REVENUE_PAY_FACTOR,
                     )
@@ -1193,11 +1198,6 @@ class RentalPriceIncentive(DefaultIncentive):
         if not job_result.has_lium_filler:
             job_result.record_incentive_log(MinerLogLine.no_payout_because_spot_without_lium_filler(job_result))
             return job_result
-        if job_result.filler_revenue_per_gpu_hour is None:
-            job_result.record_incentive_log(
-                MinerLogLine.no_payout_because_spot_no_filler_revenue_for_gpu_config(job_result)
-            )
-            return job_result
         job_result.spot_pay_candidate = True
         return job_result
 
@@ -1208,11 +1208,6 @@ class RentalPriceIncentive(DefaultIncentive):
         would not be paid for takes the unrented not-paid path in calculate_executor_score."""
         job_result.eligible_for_rental_share = False
         job_result.mining_score = 0
-        if job_result.filler_revenue_per_gpu_hour is None:
-            job_result.record_incentive_log(
-                MinerLogLine.no_payout_because_spot_no_filler_revenue_for_gpu_config(job_result)
-            )
-            return job_result
         job_result.spot_pay_candidate = True
         return job_result
 
@@ -1222,6 +1217,8 @@ class RentalPriceIncentive(DefaultIncentive):
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
         runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
         0 where a secure node of this configuration earns no idle pay, so the min() pays 0 there.
+        A configuration with no filler average yet is seeded with the secure rate (Fish 23 Oct: every
+        GPU model gets idle pay), and the seed is not scaled to the model's filler earnings.
         """
         base_model: str = self.get_base_model_for_gpu(result.gpu_model)
         cap_spec: dict[int, int] = self.config.max_unrented_gpus.get(base_model, {})
@@ -1240,6 +1237,12 @@ class RentalPriceIncentive(DefaultIncentive):
         else:
             result.hourly_rate = self._listed_hourly_rate(result)
         self._record_zero_driver_and_sysbox_reasons(result, result.driver_multiplier, result.sysbox_multiplier)
+        if result.filler_revenue_per_gpu_hour is None:
+            result.effective_rate = self._spot_secure_rate(result)
+            result.spot_pool_multiplier = 1.0
+            result.record_incentive_log(MinerLogLine.spot_rate_seeded_from_secure_rate(result))
+            self._spot_seeded.append(result)
+            return
         result.effective_rate = min(
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
@@ -1276,7 +1279,8 @@ class RentalPriceIncentive(DefaultIncentive):
             result.spot_pool_multiplier = multiplier
             result.effective_rate *= multiplier
             total += result.gpu_count * result.effective_rate
-        return total
+        # a seeded node's pool is its own seed x gpu_count, so the scaling above keeps it whole
+        return total + sum(r.gpu_count * r.effective_rate for r in self._spot_seeded)
 
     @staticmethod
     def _spot_secure_rate(result: JobResult) -> float:
