@@ -12602,6 +12602,15 @@ class DockerService:
                             await _sweep_wedged_gpus_after_teardown(ssh_client, log)
                     raise
 
+                if payload.workload_kind == WorkloadKind.FILLER:
+                    # Review (#1924): the clear before the stop is best-effort, so a Redis blip
+                    # there would leave our claim on a filler that is gone. Clear again now that
+                    # it is gone; a claim already cleared is rewritten unchanged.
+                    with _best_effort_delete_step(log, "reclear_filler_applied_cap"):
+                        await clear_filler_pod_applied_caps(
+                            self.redis_service, payload.pod_id, log_extra=default_extra
+                        )
+
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
                 # (self-guarding: logs and never raises)
