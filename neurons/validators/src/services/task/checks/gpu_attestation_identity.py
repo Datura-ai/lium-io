@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from core.config import settings
 from core.utils import _m
+from services.gpu_spec_table import H100_PCIE, H100_SXM, is_sxm_on_pcie_adapter, normalize_gpu_model
 from services.redis_service import RedisWrites
 
 from ..messages import GpuAttestationIdentityMessages as Msg, render_message
@@ -176,14 +177,20 @@ def _serial(hw: dict) -> str | None:
     return None if serial in NO_SERIAL else serial
 
 
-def hw_changes(previous: dict, current: dict) -> list[str]:
-    """The pinned fields a UUID changed; a field unknown on either side is not compared."""
+def hw_changes(previous: dict, current: dict, sxm_on_pcie_adapter: bool = False) -> list[str]:
+    """The pinned fields a UUID changed; a field unknown on either side is not compared. On an SXM-on-PCIe adapter
+    build (DAH-5677) the H100 SXM name and the H100 PCIe name it is listed under are the same card (DAH-5684)."""
     changed = []
     for name in PINNED_HW_FIELDS:
         old, new = previous.get(name), current.get(name)
         if name == "serial":
             old, new = _serial(previous), _serial(current)
         if old in (None, "") or new in (None, ""):
+            continue
+        if name == "name" and sxm_on_pcie_adapter and {normalize_gpu_model(old), normalize_gpu_model(new)} <= {
+            H100_SXM,
+            H100_PCIE,
+        }:
             continue
         if name == "capacity":
             if abs(float(old) - float(new)) > CAPACITY_TOLERANCE * max(float(old), float(new)):
@@ -322,6 +329,7 @@ class GpuAttestationIdentityCheck:
         moved: dict[str, str] = {}
         changed: dict[str, list[str]] = {}
         slots = host_slots(hw_by_uuid)
+        sxm_on_pcie_adapter = is_sxm_on_pcie_adapter(ctx.state.specs or {})
         host_key = f"{KEY_HOST}:{ctx.executor.address}:{ctx.executor.port}"
         try:
             redis = ctx.services.redis
@@ -351,7 +359,7 @@ class GpuAttestationIdentityCheck:
                 hw = hw_by_uuid.get(gpu_uuid)
                 if hw:
                     previous_hw = stored[f"{KEY_HW}:{gpu_uuid}"]
-                    if previous_hw and (fields := hw_changes(json.loads(previous_hw), hw)):
+                    if previous_hw and (fields := hw_changes(json.loads(previous_hw), hw, sxm_on_pcie_adapter)):
                         changed[gpu_uuid] = fields
                     if serial := _serial(hw):
                         owner = stored[f"{KEY_SERIAL}:{serial}"]
