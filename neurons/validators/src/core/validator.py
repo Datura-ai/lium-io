@@ -50,7 +50,7 @@ from services.redis_service import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
-from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.availability import RunningOutageTally, silence_availability_errors_on_our_own_outage
 from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
@@ -505,6 +505,19 @@ class Validator:
                                 extra=get_extra_info({**self.default_extra, "error": str(exc)}),
                             ),
                         )
+                # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
+                # where the cycle withholds an unreachable verdict that an early publish would leak.
+                self.miner_service.outage_tally = (
+                    None
+                    if rollout_window.covers(job_block)
+                    else RunningOutageTally(
+                        job_batch_id,
+                        frozenset(
+                            str(executor_id).lower()
+                            for executor_id in (rented_executors.executors if rented_executors else {})
+                        ),
+                    )
+                )
                 # every listed rented pod's SSH (any status), probed once while the miners work
                 pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
@@ -777,6 +790,11 @@ class Validator:
                                 extra={"silenced_results": silenced_count},
                             )
                         )
+                        # DAH-5635: a node published early gets back what the last cycle published for it
+                        if self.miner_service.outage_tally is not None:
+                            self.miner_service.outage_tally.restore_published_early(
+                                cycle_results, self.miner_service.cycle_published_availability
+                            )
 
                     # each node's pod SSH observations ride on its result; a probed rented
                     # node the cycle has no result for gets one carrying only them. A withheld
@@ -1393,9 +1411,11 @@ class Validator:
         )
 
     async def request_wave_job(self, **kwargs) -> dict | None:
-        """One miner's wave request; its new executors that passed are listed now, not at the cycle's end."""
+        """One miner's wave request; its new executors that passed are listed now, and its unrented nodes that
+        failed with an availability error are hidden now (DAH-5635), not at the cycle's end."""
         job = await self.miner_service.request_job_to_miner(**kwargs)
         await self.miner_service.publish_new_executors_at_pass(job)
+        await self.miner_service.publish_unreachable_early(job)
         return job
 
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
