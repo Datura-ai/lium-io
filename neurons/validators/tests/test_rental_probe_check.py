@@ -1718,7 +1718,7 @@ async def test_a_filler_node_is_probed_beside_its_filler():
         result = await RentalProbeCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
-    assert docker.create_options == [{"beside_fillers": True}]
+    assert docker.create_options == [{"beside_fillers": True, "synthetic_probe": True}]
     assert redis.stamped()
 
 
@@ -1743,7 +1743,7 @@ async def test_a_probe_on_a_node_without_a_filler_creates_with_beside_fillers_of
     with probe_settings(), renter_path():
         await RentalProbeCheck().run(ctx)
 
-    assert docker.create_options == [{"beside_fillers": False}]
+    assert docker.create_options == [{"beside_fillers": False, "synthetic_probe": True}]
 
 
 @pytest.mark.asyncio

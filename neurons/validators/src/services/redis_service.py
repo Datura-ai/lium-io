@@ -755,6 +755,7 @@ class RedisService:
         pod_id: str,
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
+        synthetic_probe: bool = False,
     ):
         # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
@@ -768,11 +769,13 @@ class RedisService:
             item["gpu_uuids"] = list(gpu_uuids)
         pending_pods.append(item)
         # one step: a marker written without its stamp would abort the caller before its cleanup and leave the marker behind
-        await self.write_atomically(
-            RedisWrites()
-            .hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
-            .set(create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS)
-        )
+        writes = RedisWrites().hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        if not synthetic_probe:
+            # the validator's own rental probe keeps its marker but leaves no stamp: once done it is no rental
+            writes = writes.set(
+                create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
+            )
+        await self.write_atomically(writes)
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)

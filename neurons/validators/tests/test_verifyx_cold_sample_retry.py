@@ -827,11 +827,22 @@ async def test_concurrent_cold_retries_share_one_backend_read(context_factory, m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("create", ["after_snapshot", "before_snapshot"])
-async def test_a_create_done_between_the_shared_read_and_the_retry_skips_it(context_factory, monkeypatch, create):
+@pytest.mark.parametrize(
+    ("create", "busy"),
+    [
+        ("after_snapshot", "rental_create_in_progress"),
+        ("before_snapshot", None),
+        ("probe_done_after_snapshot", None),
+        ("probe_running", "rental_create_in_progress"),
+    ],
+)
+async def test_a_create_done_between_the_shared_read_and_the_retry_skips_it(
+    context_factory, monkeypatch, create, busy
+):
     # PR review F-20, 31 Oct: another executor's lookup filled the shared rented list at t0; this node's
     # customer create ran t1-t4 (marker set and cleared); its retry starts at t6 and reuses the t0 list.
     # A create stamped after the list was read counts as busy; one stamped before it is in the list.
+    # PR review, 4 Nov: the validator's own rental probe leaves no stamp once done; while it runs its marker counts.
     monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
     monkeypatch.setattr(verifyx_check, "_rented_now", None)
     redis = _PendingRedis()
@@ -847,19 +858,20 @@ async def test_a_create_done_between_the_shared_read_and_the_retry_skips_it(cont
         await redis.remove_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-old")
         await asyncio.sleep(0.01)
     await verifyx_check._rented_executors_now_shared(ctx.services.backend)  # t0: another executor's read
-    if create == "after_snapshot":
+    if create != "before_snapshot":
         await asyncio.sleep(0.01)
-        await redis.add_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-fast")
-        await redis.remove_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-fast")
+        await redis.add_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-fast", synthetic_probe=create != "after_snapshot")
+        if create != "probe_running":
+            await redis.remove_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-fast")
     await asyncio.sleep(0.01)
     first = await VerifyXCheck().run(ctx)
 
     result = await asyncio.wait_for(VerifyXColdRetryCheck().run(ctx.model_copy(update=first.updates)), 2)
 
     assert ctx.services.backend.get_rented_executors_now.await_count == 1  # the t0 read was reused
-    if create == "after_snapshot":
+    if busy:
         assert (service.calls, result.passed) == (1, False)
-        assert result.event.what_we_saw["cold_sample_retry"] == {"skipped": "rental_create_in_progress"}
+        assert result.event.what_we_saw["cold_sample_retry"] == {"skipped": busy}
     else:
         assert (service.calls, result.passed) == (2, True)
         assert result.event.what_we_saw["cold_sample_retry"]["used"] == "retry"
