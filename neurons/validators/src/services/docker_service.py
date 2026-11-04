@@ -3698,7 +3698,7 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
-            ulimits=self._memlock_ulimit_for(devices, memory_gb),
+            ulimits=self._memlock_ulimit_for(memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
@@ -3912,26 +3912,20 @@ class DockerService:
             return ("NET_ADMIN",)
         return ("NET_ADMIN", "IPC_LOCK")
 
-    @classmethod
-    def _memlock_ulimit_for(
-        cls, devices: tuple[DeviceMount, ...], memory_gb: int | None
-    ) -> tuple[ContainerUlimit, ...]:
-        """Unlimited memlock, for a container that got RDMA devices AND a memory limit.
+    @staticmethod
+    def _memlock_ulimit_for(memory_gb: int | None) -> tuple[ContainerUlimit, ...]:
+        """Unlimited memlock for a container with a memory limit.
 
         RDMA pins the memory it registers and the default 64 KB is far below one queue pair, so the
-        forwarded verbs devices are unusable without this (DAH-2571).
+        forwarded verbs devices are unusable without this (DAH-2571). NCCL, NVSHMEM, UCX and gdrcopy
+        in a partial pod also pin host buffers and refuse or warn under the 8 MB default.
 
-        Both conditions matter, though the limit is a bound, not safety. Locked pages are charged to
-        the container's memory cgroup, so the tenant can pin at most `memory_gb` — but on a
-        whole-host rental that is the machine: `ram_total` is host RAM less ~2 GiB. What the cgroup
-        buys is a ceiling the kernel enforces and the OOM killer can act on. Without one —
-        `mem_limit` is skipped for a falsy `memory_gb`, and a pod's `ram_total` defaults to 0 —
-        there is no ceiling at all, and mlocked pages never reclaim.
+        The memory limit is required. Locked pages are charged to the container's memory cgroup, so
+        the tenant can pin at most `memory_gb`, a ceiling the kernel enforces and the OOM killer can
+        act on. Without one (`mem_limit` is skipped for a falsy `memory_gb`, and a pod's
+        `ram_total` defaults to 0) there is no ceiling at all, and mlocked pages never reclaim.
         """
-        forwards_rdma = any(
-            device.path_on_host.startswith("/dev/infiniband/") for device in devices
-        )
-        if not forwards_rdma or not memory_gb:
+        if not memory_gb:
             return ()
         return (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
 
