@@ -1,20 +1,20 @@
 {
   "schema": "liumd.vendored/1",
-  "source_head_sha": "57263631e1dded703b55c0f7cb1f9887b3d706e8",
-  "source_merge_sha": "ae248c8461edb3d42c54625d33f07ec0a6485f17",
+  "source_head_sha": "d040d1022def338106ed85e32f674d4c0162264d",
+  "source_merge_sha": "d040d1022def338106ed85e32f674d4c0162264d",
   "source_pr": 2222,
   "source_repo": "Datura-ai/lium-platform",
-  "source_run": "https://github.com/Datura-ai/lium-platform/actions/runs/41520009200",
+  "source_run": "https://github.com/Datura-ai/lium-platform/actions/runs/41798583020",
   "targets": {
     "aarch64-unknown-linux-gnu": {
       "artifact": "liumd-arm64",
-      "build_sha": "ae248c8461ed",
-      "sha256": "169553cc0978a3df884f91e9c97e2a3eb3a8e8ce52fad34809f1942b24e92a47"
+      "build_sha": "d040d1022def",
+      "sha256": "b2cfa9a3b277612541691aedeb60fe6906caaebd66d6af2360978d060e54f545"
     },
     "x86_64-unknown-linux-gnu": {
       "artifact": "liumd-amd64",
-      "build_sha": "ae248c8461ed",
-      "sha256": "653ac373217870fa0075a98450fc05699cf15f723eedded37d9fb22a01671a21"
+      "build_sha": "d040d1022def",
+      "sha256": "5ec55625098d6618057ce9b08a4fdc08e60c4653ca4cc2e817c7f62db1b1819f"
     }
   }
 }
