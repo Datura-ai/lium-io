@@ -987,6 +987,41 @@ async def test_a_verifyx_response_the_library_rejects_is_left_to_ssh(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_verifyx_verdict_logs_its_errors(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """A verdict that decrypts but fails (RAM, disk) carries no `error`: the metric line names
+    the verdict's own errors, not "None"."""
+    monkeypatch.setattr(
+        vvs,
+        "_perform_verification_checks",
+        lambda payload, **_: {
+            "success": False,
+            "errors": ["Insufficient memory: 10 GB allocated, 16 GB required"],
+        },
+    )
+    validation = matmul_service(monkeypatch)
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        with patch("neurons.validators.src.services.task.checks.local_verify.logger") as log:
+            local, _, _ = await run_local_then_consumers(
+                ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+            )
+    assert local.event.what_we_saw["fallbacks"] == {"verifyx": "local_failed"}
+    verifyx_outcome = next(
+        call.args[0].extra
+        for call in log.info.call_args_list
+        if str(call.args[0]) == "[local_verify] outcome" and call.args[0].extra["step"] == "verifyx"
+    )
+    assert verifyx_outcome["detail"] == "Insufficient memory: 10 GB allocated, 16 GB required"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "matmul_step,verifyx_step,expected_fallbacks,expected_consumed",
     [

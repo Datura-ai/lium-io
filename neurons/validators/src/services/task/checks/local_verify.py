@@ -351,9 +351,9 @@ class LocalVerifyCheck:
                 self._metric(ctx, "consumed", "verifyx", "ok", step_ms=step.ms, **common)
             else:
                 outcome.fallbacks["verifyx"] = "local_failed"
-                self._metric(
-                    ctx, "fallback", "verifyx", "local_failed", detail=str(response.error), **common
-                )
+                # a verdict that decrypts but fails (RAM, disk) has no `error`, only `errors`
+                detail = response.error or "; ".join((response.data or {}).get("errors") or [])
+                self._metric(ctx, "fallback", "verifyx", "local_failed", detail=detail, **common)
         return outcome
 
     def _skipped(self, ctx: Context, why: str) -> CheckResult:
