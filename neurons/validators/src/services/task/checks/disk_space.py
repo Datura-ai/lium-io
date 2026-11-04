@@ -36,8 +36,9 @@ def _as_float(value: Any) -> float:
 def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | None:
     """Disk sizing for the free splits of a partly rented split node, or None when it does not apply.
 
-    Each free split is sized against its GPU share of the host floor plus the fresh-sizing headroom, so a host
-    under the whole-host floor can still offer its free GPUs while every free split has room for a usable volume.
+    Each free split is sized against its GPU share of the host floor, with the fresh-sizing headroom kept once per
+    disk, so a host under the whole-host floor can still offer its free GPUs while every free split has room for a
+    usable volume.
     """
     gpu_count = ctx.state.gpu_count
     min_count = ctx.state.gpu_splitting_min_count
@@ -51,12 +52,12 @@ def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | Non
     free_split_count = free_gpu_count // min_count
     if free_split_count <= 0:
         return None
-    # its share of the host floor plus the headroom the rental's fresh volume sizing leaves free, else it gets the
-    # 1 GB floor volume; a zero floor (the rule turned off) asks nothing
-    share_gb = settings.MIN_FREE_DISK_GB * min_count / gpu_count
-    required_kb = (share_gb + FRESH_SIZING_HEADROOM_GB) * KB_PER_GB if share_gb > 0 else 0
-    # a zero floor asks no disk of a split
-    listable = free_split_count if required_kb <= 0 else max(0, min(free_split_count, int(free_kb // required_kb)))
+    # each split needs its share of the host floor; the headroom rental fresh volume sizing leaves free is kept
+    # once per disk, as that sizing keeps it (df free less the headroom), not once per split
+    required_kb = settings.MIN_FREE_DISK_GB * KB_PER_GB * min_count / gpu_count
+    usable_kb = free_kb - FRESH_SIZING_HEADROOM_GB * KB_PER_GB
+    # a zero floor (the rule turned off) asks no disk of a split
+    listable = free_split_count if required_kb <= 0 else max(0, min(free_split_count, int(usable_kb // required_kb)))
     return {
         "free_split_count": free_split_count,
         "listable_split_count": listable,
