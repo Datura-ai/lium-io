@@ -1705,11 +1705,19 @@ class _Session:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["error", "no_working_ports"])
-async def test_a_lost_ssh_session_raises_instead_of_a_zero_ports_verdict(context_factory, status):
+@pytest.mark.parametrize(
+    "connectivity",
+    [
+        {"success": False, "status": "error"},
+        {"success": False, "status": "no_working_ports"},
+        # review 4467949141: the drop failed only the DinD probe, so two batch ports read as a partial "ok"
+        {"success": True, "verified_port_count": 2, "dind_ok": False},
+    ],
+)
+async def test_a_lost_ssh_session_raises_instead_of_a_zero_ports_verdict(context_factory, connectivity):
     # DAH-5718: the session died, so nothing was measured; TaskService names the raise EXECUTOR_TRANSPORT_UNREACHABLE
     ctx = _port_ctx(
-        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status=status)
+        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(**connectivity)
     )
     ctx = ctx.model_copy(update={"ssh": _Session(closed=True)})
 

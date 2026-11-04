@@ -177,9 +177,10 @@ class PortConnectivityCheck:
             },
             dind_deadline_monotonic=time.monotonic() + task_seconds_left(ctx) - CHECKS_AFTER_DIND_RESERVE_SECONDS,
         )
-        if result.status != "ok" and _ssh_session_closed(ctx.ssh):
-            # the validator's own session died, so no port was measured: raised, the run ends as
-            # EXECUTOR_TRANSPORT_UNREACHABLE (no verdict) instead of 0 ports and INSUFFICIENT_PORTS
+        if _ssh_session_closed(ctx.ssh):
+            # the validator's own session died during the check, so no reading of it can be trusted (a partial
+            # "ok" can lose its DinD port to the drop): raised, the run ends as EXECUTOR_TRANSPORT_UNREACHABLE
+            # (no verdict) instead of a short port count and INSUFFICIENT_PORTS
             raise asyncssh.ConnectionLost(f"SSH session closed during the port check ({result.status}: {result.error})")
         if probe_sysbox and not ctx.state.sysbox_runtime:
             # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
