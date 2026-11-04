@@ -1,5 +1,7 @@
 import logging
+import time
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.models import PortPair, PortProbeResult
@@ -53,6 +55,10 @@ class PortProbe:
             return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
         successful, failed = list(batch.successful), list(batch.failed)
         tier, best = "batch", len(successful)
+        if batch.start_hung and settings.PORT_PROBE_SKIP_TIERS_ON_HUNG_START:
+            # DAH-5682: their containers start on the same stuck Docker; ~90 s (semi-batch 60 s, fallback 30 s) for the
+            # same verdict
+            return PortProbeResult((), tuple(failed), tier, batch.external)
 
         def merge(ok, bad, name) -> None:
             # a port any tier verified counts: tiers can verify different ports of the same node
@@ -62,6 +68,7 @@ class PortProbe:
             if len(ok) >= best:
                 tier, best = name, len(ok)
 
+        later_tiers_started_at = time.monotonic()
         if short(successful):
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
             logger.debug(
@@ -89,4 +96,19 @@ class PortProbe:
             )
             merge(fb_ok, fb_failed, "fallback")
 
+        if batch.start_hung:
+            logger.info(
+                _m(
+                    "port check would skip later tiers",
+                    extra=get_extra_info(
+                        {
+                            **log_ctx,
+                            "later_tiers_found_ports": bool(successful),
+                            "later_tiers_port_count": len(successful),
+                            "later_tiers_seconds": round(time.monotonic() - later_tiers_started_at, 1),
+                            "tier": tier,
+                        }
+                    ),
+                )
+            )
         return PortProbeResult(tuple(successful), tuple(failed), tier, batch.external)

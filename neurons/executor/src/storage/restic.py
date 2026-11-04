@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -220,6 +221,7 @@ class ResticStorageRunner:
         self._environment = self._build_environment()
         self._snapshot_empty = False
         self._last_error_text = ""
+        self._restore_errors: list[tuple[str, str]] = []  # (item, message without the item)
         self._helper_state: Mapping[str, object] = {}
         self._helper_id = ""
 
@@ -443,6 +445,10 @@ class ResticStorageRunner:
             "--json",
             "--host",
             f"lium-pod-{self._operation.pod_id}",
+            # encrypted pods back up /proc/<pid>/root/..., a path that changes on every container restart;
+            # restic's default host+paths parent match then misses and rescans every file
+            "--group-by",
+            "host",
             "--tag",
             f"lium-operation:{self._operation.operation_id}",
             *(f"--exclude={pattern}" for pattern in self._operation.workspace.exclude_patterns),
@@ -518,9 +524,23 @@ class ResticStorageRunner:
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
         command, cwd = self._restore_execution_command(snapshot_id)
-        exit_code, _ = self._stream_command(command, cwd)
+        exit_code, summary = self._stream_command(command, cwd)
         if exit_code == SIGKILL_EXIT:
             raise ResticOperationError(self._killed_helper_message("restore"))
+        # restic exits 1 when some files failed (e.g. the live workload removed a dir mid-restore), but also on
+        # disk-full and repository errors: only vanished-file errors count as PARTIAL, however many
+        # restic counts files it wrote, even ones removed afterwards: the files left are the total less the distinct
+        # failed items, and a restore whose whole target vanished has none left
+        total_files = (summary or {}).get("total_files")
+        failed_items = len({item for item, text in self._restore_errors if not _ERRORS_SUMMARY.match(text.strip())})
+        if (
+            exit_code == 1
+            and isinstance(total_files, int)
+            and total_files > failed_items
+            and _only_vanished_files(self._restore_errors)
+        ):
+            self._events.stage("FINALIZING")
+            return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
         self._events.stage("FINALIZING")
@@ -642,6 +662,10 @@ class ResticStorageRunner:
                 if not _snapshot_id(summary):
                     self._raise_if_credentials_expired(_error_text(payload))
                     self._last_error_text = _error_text(payload) or self._last_error_text
+                if payload.get("message_type") in ("error", "exit_error"):
+                    item = payload.get("item")
+                    text = _error_text(payload)
+                    self._restore_errors.append((item if isinstance(item, str) and item else text, text))
                 self._events.restic_event(payload)
                 self._events.heartbeat_if_due()
                 self._cancel_if_requested(process)
@@ -1008,6 +1032,19 @@ def _credentials_expired(error_text: str) -> bool:
     # Only the last ": " component counts, so a file name like "open ExpiredToken.java: ..." never matches.
     normalized = "".join(error_text.rsplit(":", 1)[-1].casefold().split()).rstrip(".")
     return normalized in ("expiredtoken", "theprovidedtokenhasexpired")
+
+
+# a restore item the live workload removed mid-restore; anything else (ENOSPC, permission, repository) stays FAILED
+_VANISHED_FILE = re.compile(r"^(open|lstat|mkdir|rename|remove|chmod|l?chown|utimes?|symlink|link)\b.*: no such file or directory$")
+_ERRORS_SUMMARY = re.compile(r"^Fatal: (There were )?\d+ errors?\.?$")
+
+
+def _only_vanished_files(errors: list[tuple[str, str]]) -> bool:
+    """every error is a file the workload removed mid-restore, or restic's "N errors" summary. No loss bound
+    (Pixel, PR #2018): a whole deleted folder can be hundreds of files. Trade-off: a restic bug that loses files
+    as "no such file or directory" would also read as PARTIAL."""
+    failed = [text for _, text in errors if not _ERRORS_SUMMARY.match(text.strip())]
+    return bool(failed) and all(_VANISHED_FILE.match(text.strip()) for text in failed)
 
 
 def _error_text(payload: Mapping[str, object]) -> str:

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import uuid
+from dataclasses import dataclass
 
 import aiohttp
 from asyncssh import SSHClientConnection
@@ -10,7 +11,7 @@ from core.utils import _m, get_extra_info
 from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.external_probe import ExternalPortProbe
-from services.executor_connectivity.models import BatchResult, PortPair
+from services.executor_connectivity.models import BatchResult, ContainerStartResult, PortPair
 from services.executor_connectivity.netcat_script import NetcatScript
 from services.executor_connectivity.port_tester import PortTester
 from services.node_host import public_host_connector
@@ -24,11 +25,19 @@ logger = logging.getLogger(__name__)
 EXTERNAL_PROBE_SAMPLE = 3
 
 
+@dataclass
+class ContainerStartWatch:
+    """DAH-5682: whether `docker run` of an attempt's test container has not returned yet."""
+
+    in_progress: bool = False
+
+
 class BatchVerifier:
     """Verifies ports using --network=host in batches."""
 
     REPROBE_DELAY_SEC = 3
     REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
+    ATTEMPT_TIMEOUT_SEC = 60
 
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
@@ -48,13 +57,15 @@ class BatchVerifier:
     ) -> BatchResult:
         """Verify ports with retries; refused ports are re-probed until `min_ports` answer."""
         log_ctx = log_ctx or {}
-        timeout_sec = 60
+        timeout_sec = self.ATTEMPT_TIMEOUT_SEC
         max_attempts = 2
 
         external = None  # the last attempt's outside reading, kept when no attempt verified a port
+        start_hung = 0
         for attempt in range(1, max_attempts + 1):
             token = uuid.uuid4().hex
             container_name = f"port_test_{token[:8]}"
+            start_watch = ContainerStartWatch()
 
             logger.info(
                 _m(
@@ -65,7 +76,7 @@ class BatchVerifier:
 
             try:
                 attempt_result = await asyncio.wait_for(
-                    self._attempt(ports, token, container_name, ssh_client, host, log_ctx, min_ports),
+                    self._attempt(ports, token, container_name, ssh_client, host, start_watch, log_ctx, min_ports),
                     timeout=timeout_sec
                 )
                 external = attempt_result.external
@@ -85,8 +96,13 @@ class BatchVerifier:
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
+                start_hung += start_watch.in_progress
                 logger.debug(
-                    _m(f"attempt {attempt} timed out after {timeout_sec}s", extra=get_extra_info(log_ctx))
+                    _m(
+                        f"attempt {attempt} timed out after {timeout_sec}s"
+                        + (" inside the container start" if start_watch.in_progress else ""),
+                        extra=get_extra_info(log_ctx),
+                    )
                 )
                 await self.runner.cleanup(ssh_client, container_name)
                 if attempt < max_attempts:
@@ -105,7 +121,7 @@ class BatchVerifier:
         # attempts and tiers on the way there are DEBUG. An exception inside an attempt keeps
         # ERROR above: that is the validator's own failure, not the node's ports.
         logger.debug(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
-        return BatchResult([], ports, external)
+        return BatchResult([], ports, external, start_hung=start_hung == max_attempts)
 
     async def _attempt(
         self,
@@ -114,13 +130,14 @@ class BatchVerifier:
         name: str,
         ssh_client,
         host: str,
+        start_watch: ContainerStartWatch,
         log_ctx: dict | None = None,
         min_ports: int = MIN_PORT_COUNT,
     ) -> BatchResult:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
         sample = random.sample(ports, min(EXTERNAL_PROBE_SAMPLE, len(ports))) if self.external_probe else []
-        reached, first_round = await self._outside_reading(sample, token, ssh_client, host, log_ctx)
+        reached, first_round = await self._outside_reading(sample, token, ssh_client, host, log_ctx, start_watch)
         sampled_ok = [p for p in sample if p in (reached or []) or p in first_round]
         ports_left = [p for p in ports if p not in sampled_ok]
         external_blocked = reached == [] and all(p in first_round for p in sample)
@@ -136,7 +153,7 @@ class BatchVerifier:
             return BatchResult(sampled_ok, [], external)
 
         script = NetcatScript.batch(ports_left, token, 0)
-        start_result = await self.runner.run(ssh_client, name, script, "host", 60)
+        start_result = await self._start_container(start_watch, ssh_client, name, script, "host", 60)
         if not start_result.ok:
             logger.debug(
                 _m(
@@ -173,8 +190,29 @@ class BatchVerifier:
         answered = set(sampled_ok + successful)
         return BatchResult([p for p in ports if p in answered], failed, external)
 
+    async def _start_container(
+        self,
+        start_watch: ContainerStartWatch,
+        ssh_client: SSHClientConnection,
+        name: str,
+        script: str,
+        network_mode: str,
+        timeout: int,
+    ) -> ContainerStartResult:
+        # no `finally`: a cancelled start must stay marked in progress for the attempt's timeout handler
+        start_watch.in_progress = True
+        result = await self.runner.run(ssh_client, name, script, network_mode, timeout)
+        start_watch.in_progress = False
+        return result
+
     async def _outside_reading(
-        self, sample: list[PortPair], token: str, ssh_client, host: str, log_ctx: dict
+        self,
+        sample: list[PortPair],
+        token: str,
+        ssh_client,
+        host: str,
+        log_ctx: dict,
+        start_watch: ContainerStartWatch,
     ) -> tuple[list[PortPair] | None, list[PortPair]]:
         """DAH-5597: the outside prober fetches ports published with `-p`, as a renter's pod publishes them, so it
         goes through the docker DNAT/FORWARD path; a --network=host listener would test the host INPUT chain
@@ -184,7 +222,9 @@ class BatchVerifier:
             return None, []
         name = f"port_test_out_{token[:8]}"
         publish_flags = " ".join(f"-p {p.internal}:{p.internal}" for p in sample)
-        start = await self.runner.run(ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30)
+        start = await self._start_container(
+            start_watch, ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30
+        )
         try:
             if not start.ok:
                 logger.debug(
