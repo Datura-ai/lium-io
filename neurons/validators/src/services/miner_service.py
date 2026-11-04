@@ -1305,6 +1305,7 @@ class MinerService:
                         "ssh_host_key": (
                             result.executor_info.ssh_host_key if result.ssh_host_key_verified else None
                         ),
+                        "container_start_ok": result.container_start_ok,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
                         "job_batch_id": result.job_batch_id,

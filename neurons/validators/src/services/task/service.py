@@ -30,7 +30,7 @@ from .availability import (
     failed_check_event,
 )
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
-from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
+from .messages import REASON_CODE_DOCS_URL, RentalProbeMessages, TenantEnforcementMessages
 from .models import JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
@@ -249,6 +249,10 @@ class TaskService:
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed
                 result.ssh_host_key_verified = known_hosts_policy is not None
+                # DAH-5672: a failed-start pause lifts only on a cycle whose probe passed
+                result.container_start_ok = any(
+                    event.reason_code == RentalProbeMessages.PROBE_OK.reason for event in events
+                )
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
                 # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too

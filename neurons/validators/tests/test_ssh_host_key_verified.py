@@ -24,7 +24,7 @@ class _Shell:
         return False
 
 
-def _service(known_hosts: asyncssh.SSHKnownHosts | None) -> TaskService:
+def _service(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK") -> TaskService:
     service = TaskService.__new__(TaskService)
     service.redis_service = MagicMock()
     service.ssh_service = MagicMock()
@@ -34,7 +34,7 @@ def _service(known_hosts: asyncssh.SSHKnownHosts | None) -> TaskService:
         return_value=HostPolicyResult(known_hosts=known_hosts)
     )
     event = build_msg(
-        event="Validation finished", reason="OK", severity="info", impact="none"
+        event="Validation finished", reason=reason, severity="info", impact="none"
     )
     pipeline = MagicMock()
     pipeline.run = AsyncMock(return_value=(True, [event], MagicMock(success=True)))
@@ -44,7 +44,7 @@ def _service(known_hosts: asyncssh.SSHKnownHosts | None) -> TaskService:
     return service
 
 
-async def _run(known_hosts: asyncssh.SSHKnownHosts | None) -> JobResult:
+async def _run(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK") -> JobResult:
     executor = ExecutorSSHInfo(
         uuid="node-9", address="10.0.0.5", port=8080, ssh_username="root", ssh_port=2200,
         python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=HOST_KEY,
@@ -65,7 +65,7 @@ async def _run(known_hosts: asyncssh.SSHKnownHosts | None) -> JobResult:
         patch("services.task.service.settings") as settings,
     ):
         settings.DRY_RUN = True
-        return await _service(known_hosts).create_task(
+        return await _service(known_hosts, reason).create_task(
             miner_info=miner, executor_info=executor, keypair=MagicMock(ss58_address="5Val"),
             private_key="key", public_key="pub", encrypted_files=MagicMock(),
             rented_data=MagicMock(), default_docker_image_digests={},
@@ -86,3 +86,10 @@ async def test_a_connect_with_a_pinned_host_key_is_verified() -> None:
     result = await _run(pinned)
 
     assert result.ssh_host_key_verified is True
+
+
+@pytest.mark.asyncio
+async def test_container_start_ok_only_on_a_cycle_whose_rental_probe_passed() -> None:
+    """DAH-5672: a failed-start pause lifts only on a report whose probe started its container."""
+    assert (await _run(None)).container_start_ok is False
+    assert (await _run(None, "RENTAL_PROBE_OK")).container_start_ok is True

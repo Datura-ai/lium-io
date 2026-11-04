@@ -548,9 +548,17 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
         _read_failed(ctx, "its interval stamp in Redis")
         return "interval state unreadable", {}
     interval_seconds = settings.RENTAL_PROBE_INTERVAL_HOURS * 3600
-    if last_ok is not None and time.time() - last_ok < interval_seconds:
+    # DAH-5672: a node the backend paused for a failed pod start is probed every cycle; its pause
+    # lifts only on a cycle whose probe started the container, so an earlier pass must not count
+    if last_ok is not None and time.time() - last_ok < interval_seconds and not _start_paused(ctx):
         return "within interval", {"last_ok_seconds_ago": int(time.time() - last_ok)}
     return None, {}
+
+
+def _start_paused(ctx: Context) -> bool:
+    rented_data = ctx.state.rented_data
+    paused = rented_data.container_start_paused_executor_ids if rented_data else []
+    return ctx.executor.uuid in paused
 
 
 def _read_failed(ctx: Context, what: str) -> None:

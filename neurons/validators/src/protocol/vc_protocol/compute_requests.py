@@ -225,6 +225,10 @@ class RentedExecutorsResponse(BaseModel):
     # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
     # and its volume_<pod_id>. An older backend names none.
     retained_container_names: list[str] = []
+    # executor_ids the backend paused because a pod failed to start on them (DAH-5672): the
+    # rental probe starts its container on such a node every cycle, not once per interval, and
+    # the pause lifts only on a cycle whose probe started it. An older backend names none.
+    container_start_paused_executor_ids: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

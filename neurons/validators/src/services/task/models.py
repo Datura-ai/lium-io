@@ -97,6 +97,8 @@ class JobResult(BaseModel):
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False
+    # DAH-5672: this cycle's rental probe started its container and passed (RENTAL_PROBE_OK)
+    container_start_ok: bool = False
 
     inspector_outcome: str = "SKIPPED"
 

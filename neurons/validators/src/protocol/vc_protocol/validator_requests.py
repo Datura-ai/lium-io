@@ -235,6 +235,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # The node's SSH host public key, sent only when this cycle connected with known_hosts pinned to it.
     # The backend trusts a heartbeat key only from here; None when the cycle did not reach the node.
     ssh_host_key: str | None = None
+    # DAH-5672: True when this cycle's rental probe started its container on the node and it passed;
+    # False on every other cycle. None from a validator that predates the field.
+    container_start_ok: bool | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

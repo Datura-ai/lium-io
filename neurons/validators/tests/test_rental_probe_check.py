@@ -524,6 +524,20 @@ async def test_interval_skips_a_recently_passed_node():
 
 
 @pytest.mark.asyncio
+async def test_a_node_paused_for_a_failed_start_is_probed_within_the_interval():
+    """DAH-5672 regression: a pass from before a renter's pod failed to start stands in for a new
+    start, so the node's pause is never tested again until the interval runs out."""
+    paused = rented_data().model_copy(
+        update={"container_start_paused_executor_ids": [EXECUTOR.uuid]}
+    )
+    ctx, docker, _ = make_probe_context(redis=FakeRedis(last_ok=time.time() - 3600), rented=paused)
+    with probe_settings(interval_hours=6), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.PROBE_OK.reason
+    assert len(docker.create_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_failed_probe_clears_an_earlier_pass_stamp_and_records_the_failed_step():
     """Regression: a pass stamped earlier in the interval shields the failure, so the next cycle skips the
     node as "within interval" and relists it; or the failure is not recorded, so a cycle without a verdict
