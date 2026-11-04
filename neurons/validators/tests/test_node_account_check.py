@@ -1,8 +1,12 @@
 """DAH-5729: NodeAccountCheck over real SSH handshakes with two machines on two loopback addresses.
 
 Machine A holds the host key the portal recorded when the account registered the node; machine B (another
-account's) holds its own. The validator's SSH session to the dialed address is a real asyncssh connection.
+account's) holds its own. Host keys come from the executor's real ssh_host_keys.sh, and machine A serves the key of
+its executor container after the container was recreated. The validator's SSH session is a real asyncssh connection.
 """
+
+import subprocess
+from pathlib import Path
 
 import asyncssh
 import pytest
@@ -13,6 +17,7 @@ from services.task.checks.node_account import NodeAccountCheck
 from tests.helpers import make_context
 
 IP_A, IP_B = "127.0.0.1", "127.0.0.2"
+HOST_KEYS_SCRIPT = Path(__file__).resolve().parents[2] / "executor" / "ssh_host_keys.sh"
 
 pytestmark = pytest.mark.asyncio
 
@@ -22,9 +27,19 @@ class _OpenServer(asyncssh.SSHServer):
         return False  # no auth needed: the test only needs the key exchange
 
 
+def _executor_container_start(container: Path, volume: Path) -> asyncssh.SSHKey:
+    """The executor container's start (run.sh runs ssh_host_keys.sh); the ed25519 host key its sshd then serves."""
+    env = {"PATH": "/usr/bin:/bin", "SSH_ROOT": str(container), "SSH_HOST_KEYS_DIR": str(volume)}
+    subprocess.run(["sh", str(HOST_KEYS_SCRIPT)], env=env, check=True, capture_output=True)
+    return asyncssh.read_private_key(container / "etc/ssh/ssh_host_ed25519_key")
+
+
 @pytest_asyncio.fixture
-async def two_machines():
-    key_a, key_b = asyncssh.generate_private_key("ssh-ed25519"), asyncssh.generate_private_key("ssh-ed25519")
+async def two_machines(tmp_path):
+    # machine A registers, then its executor container is recreated (fresh filesystem, same volume)
+    registered = _executor_container_start(tmp_path / "a-container-1", tmp_path / "a-volume")
+    key_a = _executor_container_start(tmp_path / "a-container-2", tmp_path / "a-volume")
+    key_b = _executor_container_start(tmp_path / "b-container", tmp_path / "b-volume")
     server_a = await asyncssh.listen(IP_A, 0, server_host_keys=[key_a], server_factory=_OpenServer)
     port = server_a.sockets[0].getsockname()[1]
     server_b = await asyncssh.listen(IP_B, port, server_host_keys=[key_b], server_factory=_OpenServer)
@@ -35,7 +50,7 @@ async def two_machines():
         conns.append(conn)
         return conn
 
-    registered_key = key_a.export_public_key("openssh").decode().strip() + " root@registered"
+    registered_key = registered.export_public_key("openssh").decode().strip() + " root@registered"
     yield dial, registered_key
     for conn in conns:
         conn.close()
@@ -51,7 +66,7 @@ def _ctx(address: str, ssh, expected_ssh_host_key: str | None):
     return make_context(executor=executor, ssh=ssh)
 
 
-async def test_hostname_node_on_its_registered_machine_passes(two_machines):
+async def test_hostname_node_on_its_registered_machine_passes_after_recreation(two_machines):
     dial, registered_key = two_machines
     result = await NodeAccountCheck().run(_ctx("node.example.com", await dial(IP_A), registered_key))
     assert result.passed
