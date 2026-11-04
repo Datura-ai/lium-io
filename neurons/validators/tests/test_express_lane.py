@@ -513,6 +513,37 @@ async def test_a_failed_first_pass_logs_as_failed(monkeypatch, wallet, caplog):
     assert failed.msg.extra["outcome"] == "failed"
 
 
+@pytest.mark.asyncio
+async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pass(monkeypatch, wallet):
+    """The validator's own session closed in the port check: no verdict. Its findings go out, the run is
+    retried as a deferral and never spends a failed first pass or marks the node validated."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    finding = {"reason_code": "GPU_MEMORY_HEALTH_FAILED"}
+
+    def lost(payload, executor_id, findings):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        result.availability_errors = findings
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = lambda payload, executor_id: lost(payload, executor_id, [finding])
+    assert await harness.tick_and_settle() == 1
+    (results, *_), _ = harness.miner_service.publish_machine_specs.await_args
+    assert results[0].availability_errors == [finding]
+    pending = harness.lane._pending[new_node]
+    assert (pending.failed_runs, pending.attempts) == (0, 1) and pending.not_before > 0
+    assert await harness.redis_service.get_validated_executors() == set()
+
+    # no finding: nothing is published
+    harness.miner_service.publish_machine_specs.reset_mock()
+    harness.job_for = lambda payload, executor_id: lost(payload, executor_id, None)
+    pending.not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert (pending.failed_runs, pending.attempts) == (0, 2)
+
+
 # --- Redis seed and portal auth -------------------------------------------------------------
 
 

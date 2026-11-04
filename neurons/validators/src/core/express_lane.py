@@ -64,6 +64,7 @@ MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
 FIRST_PASS_FAILED = "first pass failed"
 FIRST_PASS_FAILED_RETRY_SECONDS = 60
 FIRST_PASS_MAX_RUNS = 3
+SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port check"
 # Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
 # that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
 # Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
@@ -502,6 +503,15 @@ class ExpressLane:
         """
         executor_id = pending.executor.id
         result = results[0]
+        if result.session_lost_in_port_check:
+            # The run has no verdict: its findings still go out, and it is retried as a deferral (bounded by
+            # MAX_ATTEMPTS), neither a failed first pass nor recorded as validated.
+            if result.availability_errors:
+                await self.miner_service.publish_machine_specs(
+                    results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
+                )
+            self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
+            return
         passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (
             not passed
