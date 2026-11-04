@@ -216,3 +216,37 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
     # each of the 2 attempts: one probe plus REPROBE_ROUNDS re-probes, then the attempt fails
     assert port_tester.test_many.await_count == 2 * (1 + BatchVerifier.REPROBE_ROUNDS)
     assert result.successful == [] and result.failed == ports
+
+
+@pytest.mark.asyncio
+async def test_batch_is_start_hung_only_when_every_attempt_times_out_inside_the_container_start(mocker):
+    # DAH-5682: a stuck Docker never returns `docker run`; both 60 s attempts end there
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    async def hang(*_args):
+        await asyncio.sleep(5)
+
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
+    verifier.runner.run.side_effect = hang
+    mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
+
+    result = await verifier.verify([PortPair(9000, 9000)], ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.start_hung
+    assert verifier.runner.run.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_is_not_start_hung_when_the_container_started_and_the_ports_timed_out(mocker):
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    async def slow_ports(_s, _h, probed, *_a):
+        await asyncio.sleep(5)
+
+    verifier, _ = _batch_verifier(mocker, slow_ports)
+    mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
+
+    result = await verifier.verify([PortPair(9000, 9000)], ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert not result.start_hung
+    assert result.successful == []
