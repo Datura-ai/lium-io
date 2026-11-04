@@ -1579,7 +1579,8 @@ class Validator:
         GPU safety failure) still hides the node, together with what the last cycle hid it for, and its rented pods'
         SSH observations still go out (review 4470167895: billing reads a silent pod from them). Unscored (scored_at
         None) and not the miner's whole batch, like an early publish; with no finding availability_errors stays None,
-        so the stored reasons are left alone; a run with neither publishes nothing."""
+        so the stored reasons are left alone, and the same when the earlier list is unknown (review 4472141980); a run
+        with neither publishes nothing."""
         pod_ssh = pod_ssh or {}
         for withheld in withheld_results:
             result = withheld.result
@@ -1588,15 +1589,20 @@ class Validator:
             if not result.session_lost_in_port_check or not miner_coldkey:
                 continue
             result.pod_ssh = pod_ssh.get(executor_uuid, result.pod_ssh)
-            if result.availability_errors:
+            before = (
+                await self.miner_service.published_availability(executor_uuid) if result.availability_errors else None
+            )
+            if before is None:
+                # review 4472141980: no list, or the earlier one is unknown: replace nothing (the next full cycle does)
+                result.availability_errors = None
+            else:
                 found = {error.get("reason_code") for error in result.availability_errors}
-                before = await self.miner_service.published_availability(executor_uuid)
                 result.availability_errors += [error for error in before if error.get("reason_code") not in found]
                 # review 4470167912: the next partial publication merges with this one, not with an older list
                 await self.miner_service.remember_published_availability(
                     executor_uuid, list(result.availability_errors)
                 )
-            elif not result.pod_ssh:
+            if not result.availability_errors and not result.pod_ssh:
                 continue
             await self.miner_service.publish_machine_specs(
                 [result], withheld.miner_hotkey, miner_coldkey, is_whole_miner_batch=False

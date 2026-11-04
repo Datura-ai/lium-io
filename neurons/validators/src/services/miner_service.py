@@ -395,16 +395,18 @@ class MinerService:
         except Exception as exc:  # noqa: BLE001 - the memory copy still serves this process
             logger.warning(_m("published availability not kept in Redis", extra={"error": str(exc)}))
 
-    async def published_availability(self, executor_uuid: str) -> list[dict]:
-        """What this validator last published for the node, read back from Redis after a restart ([] if unknown)."""
+    async def published_availability(self, executor_uuid: str) -> list[dict] | None:
+        """What this validator last published for the node, read back from Redis after a restart. None when it cannot
+        be established (no key, expired, unreadable or malformed): that is not proof the backend holds nothing."""
         if executor_uuid in self.cycle_published_availability:
             return self.cycle_published_availability[executor_uuid]
         try:
             stored = await self.redis_service.get(f"{PUBLISHED_AVAILABILITY_PREFIX}:{executor_uuid}")
-            return json.loads(stored) if stored else []
-        except Exception as exc:  # noqa: BLE001 - unknown, as before this was kept
+            errors = json.loads(stored) if stored is not None else None
+        except Exception as exc:  # noqa: BLE001 - unknown
             logger.warning(_m("published availability not read from Redis", extra={"error": str(exc)}))
-            return []
+            return None
+        return errors if isinstance(errors, list) else None
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
