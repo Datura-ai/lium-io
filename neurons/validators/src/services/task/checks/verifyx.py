@@ -42,7 +42,9 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 # job cycles); then it is probed once, so a slower link than the stored figure shows up.
 # shortcut: per process, so a validator restart starts the count again; a backend-held measured-at would survive it.
 MAX_FILLER_SKIPS = 96
-_filler_skips: dict[tuple[str, str], int] = {}
+# (skips, the stored EMA they reused): the count restarts only once the backend stores a new reading, so a failed
+# day-probe (stored only on a passing cycle) probes again next cycle instead of skipping another day on the old speed
+_filler_skips: dict[tuple[str, str], tuple[int, tuple]] = {}
 
 
 @dataclass(frozen=True)
@@ -93,9 +95,15 @@ class VerifyXCheck:
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
         # filler runs, and a fresh sample is what lets it recover.
         skip_key = (ctx.miner_hotkey, ctx.executor.uuid)
+        stored = (
+            (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if stored_ema else None
+        )
+        skips, skipped_on = _filler_skips.get(skip_key, (0, stored))
+        if skipped_on != stored:
+            skips = 0
         if (
             filler_container
-            and _filler_skips.get(skip_key, 0) < MAX_FILLER_SKIPS
+            and skips < MAX_FILLER_SKIPS
             and stored_ema
             and stored_ema.ema_verifyx_download_speed is not None
             and (
@@ -103,7 +111,7 @@ class VerifyXCheck:
                 or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
         ):
-            _filler_skips[skip_key] = _filler_skips.get(skip_key, 0) + 1
+            _filler_skips[skip_key] = (skips + 1, stored)
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -122,7 +130,6 @@ class VerifyXCheck:
                 updates={"state": replace(ctx.state, specs=updated_specs)},
             )
 
-        _filler_skips.pop(skip_key, None)
         # DAH-3011: a first, unscored verification writes less RAM/disk (the measurements are still
         # taken and published). The keyword is only passed on that path so the scored call is
         # byte-for-byte today's.

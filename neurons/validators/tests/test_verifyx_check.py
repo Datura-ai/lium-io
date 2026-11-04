@@ -308,7 +308,14 @@ async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_skips(context_f
 
     assert reasons[:2] == [Msg.FILLER_SKIPPED.reason] * 2
     assert reasons[2] != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
-    assert reasons[3] == Msg.FILLER_SKIPPED.reason
+    # r4472207526: the backend has not stored a new reading (a failed probe stores none), so it probes again
+    assert reasons[3] != Msg.FILLER_SKIPPED.reason
+
+    # the backend stored the probe's reading: the count restarts and skipping resumes
+    ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(
+        ema_verifyx_download_speed=95.0, ema_verifyx_upload_speed=85.0
+    )
+    assert (await VerifyXCheck().run(ctx)).event.reason_code == Msg.FILLER_SKIPPED.reason
 
 
 @pytest.mark.asyncio
