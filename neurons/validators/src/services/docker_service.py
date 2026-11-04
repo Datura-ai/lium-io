@@ -108,7 +108,9 @@ from services.gpu_power_limit import (
     POWER_LIMIT_SET_CONCURRENCY,
     GpuPowerRestoreStateError,
     apply_filler_gpu_power_limits,
+    clear_filler_pod_applied_caps,
     raise_low_power_limits_to_default,
+    restore_filler_pod_applied_caps,
     restore_all_host_gpu_power_limits,
     restore_filler_pod_gpu_power_limits,
     restore_tracked_gpu_power_limits,
@@ -210,6 +212,8 @@ from services.storage_operations import (
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
+from services.task.checks.rented_pod_ssh import tcp_connect_fault
+from protocol.vc_protocol.validator_requests import PodSshResult
 from tenacity import RetryError
 
 from core.config import settings
@@ -1364,6 +1368,47 @@ async def _raise_if_killed_after_exec(
 
 FINAL_STATE_INSPECT_ATTEMPTS = 3
 FINAL_STATE_INSPECT_RETRY_DELAY_S = 1.0
+# DAH-5618: how long a new or rebooted pod gets to answer on its mapped SSH port before the create fails
+POD_SSH_ANSWER_DEADLINE_S = 60.0
+POD_SSH_ANSWER_ATTEMPT_TIMEOUT_S = 5.0
+POD_SSH_ANSWER_RETRY_DELAY_S = 3.0
+
+
+async def _raise_unless_pod_ssh_answers(host: str, port: int, *, log_extra: dict | None = None) -> None:
+    """DAH-5618: the renter's SSH reaches the pod at host:port, so the create succeeds only once that port sends an
+    SSH identification line (the per-cycle pod SSH probe's check). A host that drops SSH sessions or does not
+    forward the port fails the create, and a reboot then ends REBOOT_FAILED instead of RUNNING. Retried for a
+    while, since an image that starts its own sshd may not be listening yet."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + POD_SSH_ANSWER_DEADLINE_S
+    attempts = 0
+    while True:
+        attempts += 1
+        outcome = await tcp_connect_fault(host, port, POD_SSH_ANSWER_ATTEMPT_TIMEOUT_S)
+        answered = outcome.result == PodSshResult.BANNER
+        if answered or loop.time() + POD_SSH_ANSWER_RETRY_DELAY_S >= deadline:
+            # the time to the first SSH line on real creates, to size the budget from
+            logger.info(
+                _m(
+                    "pod SSH answer before ContainerCreated",
+                    extra=get_extra_info({
+                        **(log_extra or {}),
+                        "answered": answered,
+                        "result": outcome.result.value,
+                        "attempts": attempts,
+                        "elapsed_s": round(loop.time() - started, 2),
+                    }),
+                )
+            )
+        if answered:
+            return
+        if loop.time() + POD_SSH_ANSWER_RETRY_DELAY_S >= deadline:
+            raise RuntimeError(
+                f"the pod's SSH port {port} did not answer on {host} ({outcome.result.value}); "
+                "the host may be dropping SSH connections or not forwarding the port"
+            )
+        await asyncio.sleep(POD_SSH_ANSWER_RETRY_DELAY_S)
 
 
 async def _raise_unless_running_before_created(
@@ -1506,6 +1551,10 @@ def _refused_exec_kill_detail(cause: Exception, state_after: str) -> str | None:
 
 class AuthorizedKeysWriteFailed(RuntimeError):
     """The volume setup exec mounted the encrypted volume but could not write the renter's keys."""
+
+
+class VolumeSetupExecFailed(RuntimeError):
+    """`docker exec` itself failed for the volume setup (no status of the script's own): the image may have exited."""
 
 
 # DAH-5037: a default job's own last output rides as `container_logs_tail` in the failure detail, so a
@@ -2624,7 +2673,7 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
-def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
+def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     # unlink the volume's files on the host, through the executor's view of the host root: the
     # pod's open files stay writable until its processes die, and the kernel drops an unlinked
     # file's unwritten pages at that last close instead of writing them. No `docker run`: with
@@ -2633,14 +2682,15 @@ def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
     # from the validated name and each lookup must answer, so a failed or empty answer can never
     # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
     # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
+    # Only `container_names` may mount it (docker names never hold a space).
     volume = shlex.quote(local_volume)
-    pod = shlex.quote(container_name)
+    allowed = shlex.quote(f" {' '.join(container_names)} ")
     docker = "/usr/bin/docker"
     return (
         f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
         'd=${dm%% *}; m=${dm#* }; '
         f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
-        f'for u in $users; do [ "$u" = {pod} ] || {{ echo "volume in use by $u"; exit 6; }}; done; '
+        f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
@@ -5563,6 +5613,7 @@ class DockerService:
         payload: ContainerCreateRequest,
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
+        killed_fillers: Iterable[str] = (),
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
@@ -5580,6 +5631,10 @@ class DockerService:
         re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
         there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
         at the volume step instead of short-changing the renter.
+        A filler this create just killed can still be exiting and mount its Engy cache, so dockerd refuses the
+        `volume rm` (prod 4 Nov, 8x B300): the cache's files are then unlinked on the host (_wipe_volume_cmd), only
+        while every container mounting it is one of ``killed_fillers``; the empty volume is swept later, and a
+        filler asking for it again is charged the whole download (_engy_cache_missing_gb).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -5620,11 +5675,27 @@ class DockerService:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
                 return free_now_gb >= rental_needs_free_gb
 
+            killed: tuple[str, ...] = tuple(killed_fillers)
+
+            def volume_remove(name: str) -> str:
+                # a Dolphin cache is never wiped: its readiness is not measured, so an empty one would read as ready
+                if not killed or not name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+                    return DockerCommand.volume_remove(name)
+                return (
+                    f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
+                    f"( {_wipe_volume_cmd(name, *killed)} ) || true"
+                )
+
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
             removal_failed = False
             try:
                 await evict_cache_volumes_oldest_first(
-                    ssh_client, cache_volumes, remove, rental_fits, evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX
+                    ssh_client,
+                    cache_volumes,
+                    remove,
+                    rental_fits,
+                    evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
+                    volume_remove=volume_remove,
                 )
             except asyncio.CancelledError:
                 raise
@@ -6203,7 +6274,7 @@ class DockerService:
         while wrapped_var == pad_var:
             wrapped_var = _opaque_shell_name()
 
-        async def fail_step(step: str, message: str, result: Any | None = None) -> None:
+        async def fail_step(step: str, message: str, result: Any | None = None, exec_failed: bool = False) -> None:
             exit_status = getattr(result, "exit_status", None)
             stdout = (getattr(result, "stdout", "") or "")[-2000:] if result else ""
             stderr = (getattr(result, "stderr", "") or "")[-2000:] if result else ""
@@ -6229,7 +6300,13 @@ class DockerService:
                     }),
                 )
             )
-            error_class = AuthorizedKeysWriteFailed if step == "add_public_keys" else RuntimeError
+            error_class = (
+                AuthorizedKeysWriteFailed
+                if step == "add_public_keys"
+                else VolumeSetupExecFailed
+                if exec_failed
+                else RuntimeError
+            )
             raise error_class(
                 f"{message} (step={step}, exit_status={exit_status}, stderr={stderr or '<empty>'})"
             )
@@ -6310,10 +6387,9 @@ class DockerService:
             if isinstance(outcome, BaseException):
                 raise outcome
         if setup_result.exit_status != 0:
-            step, message = _VOLUME_SETUP_EXEC_FAILURES.get(
-                setup_result.exit_status, _VOLUME_SETUP_UPLOAD_FAILURE
-            )
-            await fail_step(step, message, setup_result)
+            script_reported_failure = _VOLUME_SETUP_EXEC_FAILURES.get(setup_result.exit_status)
+            step, message = script_reported_failure or _VOLUME_SETUP_UPLOAD_FAILURE
+            await fail_step(step, message, setup_result, exec_failed=script_reported_failure is None)
 
         # The mount is created by root, so on an image whose USER is not root the
         # renter's own workload would own nothing inside its workspace and could
@@ -9871,6 +9947,7 @@ class DockerService:
                         payload=payload,
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
+                        killed_fillers=[name for name in removed_containers if name.startswith(FILLER_CONTAINER_PREFIX)],
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
@@ -10537,6 +10614,30 @@ class DockerService:
                         except AuthorizedKeysWriteFailed as exc:
                             # the mount is up: fail at add_public_keys below, as a separate keys exec did
                             keys_write_failure = exc
+                        except VolumeSetupExecFailed as setup_exc:
+                            # An image whose command exits at start breaks the setup exec itself ("OCI runtime
+                            # exec failed", prod 3 Nov): name the exiting image as the keys step does. The keys
+                            # ride in this exec, and the backend tells the renter only at add_public_keys.
+                            explained = await _explain_add_public_keys_failure(
+                                docker_client,
+                                container_name=container_name,
+                                image=payload.docker_image,
+                                cause=setup_exc,
+                                log_extra=default_extra,
+                            )
+                            if explained is setup_exc:
+                                raise
+                            if isinstance(explained, ImageExitedDuringKeyInjection):
+                                current_step = "add_public_keys"
+                            await _attach_filler_log_tail(
+                                explained,
+                                docker_client,
+                                container_name=container_name,
+                                workload_kind=payload.workload_kind,
+                                environment=custom_options.environment,
+                                log_extra=default_extra,
+                            )
+                            raise explained from setup_exc
                         volume_encryption_status = VolumeEncryptionStatus.ENABLED
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
@@ -10732,6 +10833,18 @@ class DockerService:
                     await _raise_unless_running_before_created(
                         docker_client, container_name=container_name, container_id=container_id
                     )
+                    # SSH is expected only when our bootstrap left sshd listening or the template starts its own:
+                    # an image our bootstrap cannot give sshd still rents (soft failure), and a filler has no renter
+                    ssh_expected = soft_failed_step is None
+                    # a port collision may have moved port 22 since ssh_port_map was read: probe the port the pod got
+                    ssh_mapping = self._find_mapping_by_docker_port(port_maps, 22)
+                    if ssh_mapping and ssh_expected and payload.workload_kind != WorkloadKind.FILLER:
+                        # the backend's creation-failure classifier knows this gate as ssh_ready
+                        current_step = "ssh_ready"
+                        await _raise_unless_pod_ssh_answers(
+                            executor_info.address, ssh_mapping[2], log_extra=default_extra
+                        )
+                        current_step = "finalize"
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.
@@ -12066,7 +12179,8 @@ class DockerService:
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
         log: _BoundLog,
-    ) -> None:
+    ) -> bool:
+        """True once the container is stopped or absent."""
         # DAH-2364: SIGTERM plus a grace window, so the workload exits cleanly before the forced
         # removal. Never fatal — the forced removal stays the single source of truth for deletion.
         # Called directly rather than through run_logged_rental_docker_sdk_operation so that an
@@ -12098,7 +12212,8 @@ class DockerService:
                     container_name=payload.container_name,
                     error=str(exc),
                 )
-            return
+                return False
+            return True
 
         log.info(
             "Graceful container stop completed",
@@ -12106,6 +12221,7 @@ class DockerService:
             stop_grace_seconds=stop_grace_seconds,
             duration_ms=int((time.monotonic() - stop_started) * 1000),
         )
+        return True
 
     async def _removal_after_read_timeout(
         self,
@@ -12424,18 +12540,36 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
+                cleared_cap_claims: dict[str, int] = {}
+                if payload.workload_kind == WorkloadKind.FILLER:
+                    # DAH-2786: our job ends here, so a limit reset from now on is no revert.
+                    with _best_effort_delete_step(log, "clear_filler_applied_cap"):
+                        cleared_cap_claims = await clear_filler_pod_applied_caps(
+                            self.redis_service, payload.pod_id, log_extra=default_extra
+                        )
+
+                async def _restore_cap_claims_if_container_alive() -> None:
+                    # Review (#1583): only a container that did not stop may still run with our cap.
+                    if cleared_cap_claims and not stopped:
+                        with _best_effort_delete_step(log, "restore_filler_applied_cap"):
+                            await restore_filler_pod_applied_caps(
+                                self.redis_service, cleared_cap_claims, log_extra=default_extra
+                            )
+
                 if self._wipes_volume_before_stop(payload):
                     await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
-                    if await self._terminate_and_wait(connect_ssh, payload, log):
+                    stopped = not await self._terminate_and_wait(connect_ssh, payload, log)
+                    if not stopped:
                         await self._wipe_volume(connect_ssh, payload, log, stage="before the kill")
                 else:
-                    await self._stop_container_gracefully(docker_client, payload, log)
+                    stopped = await self._stop_container_gracefully(docker_client, payload, log)
 
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
                 try:
                     removal = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
                     if removal.failure is not None:
+                        await _restore_cap_claims_if_container_alive()
                         # DeletionInProgress: the container is not gone yet and the backend will
                         # re-ask. A filler's wedge sweep ran here when this path raised (below);
                         # answering early must not skip it (DAH-3467, review). No-op while the
@@ -12446,6 +12580,7 @@ class DockerService:
                         pending_deletions.mark(payload.pod_id)
                         return removal.failure
                 except Exception:
+                    await _restore_cap_claims_if_container_alive()
                     # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
                     # classic wedge path — sweep before propagating so a wedged card does not
                     # outlive the failed delete. No-op while a live compute app still exists.

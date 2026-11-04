@@ -111,7 +111,7 @@ def test_rental_creates_a_container_the_renter_can_ssh_into_then_deletes_it(serv
 
 
 def test_rental_on_an_executor_the_miner_does_not_own_is_refused(services):
-    from payload_models.payloads import FailedContainerRequest
+    from payload_models.payloads import FailedContainerErrorCodes, FailedContainerRequest
 
     _, renter_pub = lib.ssh_keypair()
     req = _create_request(str(uuid.uuid4()), renter_pub)
@@ -121,6 +121,8 @@ def test_rental_on_an_executor_the_miner_does_not_own_is_refused(services):
     assert time.monotonic() - t0 < 120, "a refused rental must fail fast"
     assert isinstance(resp, FailedContainerRequest), resp
     lib.write_artifact("rental-refused.json", resp.model_dump(mode="json"))
+    # the miner does not list that id: "the miner no longer lists this executor", not an unreachable node
+    assert resp.error_code == FailedContainerErrorCodes.InvalidExecutorId, resp
     assert resp.msg, resp
 
 
