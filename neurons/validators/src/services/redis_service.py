@@ -143,6 +143,15 @@ EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (second
 EXECUTOR_CREATE_LOCK_TIMEOUT = 360  # TTL (seconds)
 EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT = 360  # a renter's create waits at most this long
 
+
+def _executor_create_lock_key(executor_id: str) -> str:
+    return f"lock:executor-create:{executor_id}"
+
+
+def _renter_create_lock_token(pod_id: str) -> str:
+    # names the create holding the lock, so a restarted connector can release exactly its cut-off creates' locks
+    return f"create:{pod_id}"
+
 # DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
 # meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
 # connection, and the resulting thundering herd of new TCP connects timed out ("Timeout connecting to
@@ -312,13 +321,13 @@ class RedisService:
         """
         return aioredis.lock.Lock(
             self.redis,
-            f"lock:executor-create:{executor_id}",
+            _executor_create_lock_key(executor_id),
             timeout=EXECUTOR_CREATE_LOCK_TIMEOUT,
             blocking_timeout=EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT,
         )
 
     @asynccontextmanager
-    async def executor_create_exclusion(self, executor_id: str):
+    async def executor_create_exclusion(self, executor_id: str, pod_id: str):
         """Hold the per-executor create lock around a renter's create_container (DAH-3436, review).
 
         The lock keeps the rental probe off a node whose rent is being created (the probe's sweep would
@@ -332,7 +341,7 @@ class RedisService:
         lock = self.executor_create_lock(executor_id)
         held = False
         try:
-            held = bool(await lock.acquire())
+            held = bool(await lock.acquire(token=_renter_create_lock_token(pod_id)))
             if not held:
                 logger.warning(
                     _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
@@ -357,6 +366,25 @@ class RedisService:
                             extra={"error": str(e)},
                         )
                     )
+
+    async def release_cut_off_create_lock(self, executor_id: str, pod_id: str) -> None:
+        """The create lock a create cut off by a connector restart still holds, released if it is that create's.
+
+        The connector that held it is gone, so nothing releases it before its TTL: the backend's re-send of the
+        same create would wait out the rest of EXECUTOR_CREATE_LOCK_TIMEOUT (up to 6 min) and renters deleted the
+        pod first. A lock with another token (the rental probe's, or another pod's create) is left alone.
+        """
+        key = _executor_create_lock_key(executor_id)
+        async with self.redis.pipeline(transaction=True) as pipe:
+            try:
+                await pipe.watch(key)
+                if await pipe.get(key) != _renter_create_lock_token(pod_id).encode():
+                    return
+                pipe.multi()
+                pipe.delete(key)
+                await pipe.execute()
+            except redis.exceptions.WatchError:
+                pass  # released or taken by someone else meanwhile: no longer the cut-off create's
 
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""
