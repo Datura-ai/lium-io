@@ -592,6 +592,7 @@ class ResticStorageRunner:
         if helper:
             self._remove_stopped_helpers()
             self._remove_helper_container()
+        helper_since = f"{time.time():.6f}"
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -688,6 +689,8 @@ class ResticStorageRunner:
                 state = inspection.get("State")
                 self._helper_state = state if isinstance(state, dict) else {}
                 self._helper_id = str(inspection.get("Id") or "")
+                if not inspection:  # gone before this cleanup: docker's events say who stopped and removed it
+                    self._log_helper_events(helper_since)
 
     def _raise_if_credentials_expired(self, error_text: str) -> None:
         # restic 0.19 retries an expired session for 15 minutes before failing; stop it now
@@ -760,6 +763,36 @@ class ResticStorageRunner:
         except ValueError:
             state = None
         return state if isinstance(state, dict) else {"State": {"Status": "unknown"}}
+
+    def _log_helper_events(self, since: str) -> None:
+        """Log the helper's docker events (kill signal, die exit code, destroy) and take its ID from them."""
+        try:
+            listed = subprocess.run(
+                [self._docker_binary, "events", "--since", since, "--until", str(int(time.time()) + 1),
+                 "--filter", f"container={self._helper_container_name()}", "--format", "{{json .}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._events.log(f"helper docker events unavailable: {error}")
+            return
+        lines = []
+        for line in listed.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            actor = event.get("Actor") if isinstance(event.get("Actor"), dict) else {}
+            attributes = actor.get("Attributes") if isinstance(actor.get("Attributes"), dict) else {}
+            event_id = str(event.get("id") or actor.get("ID") or "")
+            self._helper_id = self._helper_id or event_id
+            # signal/exitCode/execDuration only: other attributes are image labels
+            kept = {key: attributes[key] for key in ("signal", "exitCode", "execDuration") if key in attributes}
+            lines.append(f"{event.get('time')} {event_id[:12]} {event.get('Action') or event.get('status')} {json.dumps(kept)}")
+        self._events.log("helper docker events: " + (" | ".join(lines) or f"none (exit {listed.returncode})"))
 
     def _killed_helper_message(self, action: str) -> str:
         """Exit 137: say out of memory only when docker recorded an OOM kill."""

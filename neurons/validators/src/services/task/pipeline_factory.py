@@ -38,6 +38,7 @@ from .checks import (
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
+    SplitDiskCheck,
     DuplicateExecutorCheck,
     ExecutorImageCheck,
     FinalizeCheck,
@@ -320,6 +321,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
                 # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
                 # the published specs had no tdx_host_supported key and the backend stored false,
@@ -506,6 +509,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
@@ -602,6 +607,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
                 GpuCountCheck(),
