@@ -351,6 +351,11 @@ class Settings(BaseSettings):
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
+    # Flip this on when liumd's GPU checks are the thing being compared again.
+    LIUMD_SHADOW_GPU_STEPS_ENABLED: bool = Field(
+        env="LIUMD_SHADOW_GPU_STEPS_ENABLED", default=False
+    )
     # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
     # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
     # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the

@@ -207,7 +207,11 @@ async def _compare(
     # All-cards enforcement can reject a card before today's matmul; the shadow's one ordinary
     # matmul is not comparable (checks/local_verify.py `allcards_ssh`).
     allcards = settings.MATMUL_ALLCARDS_CHECK_ENABLED
-    ask_matmul = today["matmul"].verdict in RAN and not allcards
+    ask_matmul = (
+        settings.LIUMD_SHADOW_GPU_STEPS_ENABLED
+        and today["matmul"].verdict in RAN
+        and not allcards
+    )
     # On a never-measured executor today's check may re-measure a cold sample below the gate
     # (DAH-2959) and pass on the second; the shadow's one sample is not comparable.
     cold_retry = _cold_retry_possible(ctx)
@@ -228,7 +232,8 @@ async def _compare(
     elif upload_cap:
         steps["verifyx"]["liumd_reason"] = "upload_fallback_cap"
     ask_verifyx = (
-        today["verifyx"].verdict in RAN
+        settings.LIUMD_SHADOW_GPU_STEPS_ENABLED
+        and today["verifyx"].verdict in RAN
         and not cold_retry
         and not fallback_cap
         and not upload_cap
