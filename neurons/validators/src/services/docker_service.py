@@ -1694,6 +1694,8 @@ async def _explain_add_public_keys_failure(
 # minute apart failed, the third worked)
 _PARK_KILL_SETTLE_SECONDS = 2
 _PARK_KILL_WAIT_SECONDS = 30
+# each SSH command of the edit swap (stop -t 10 included); exit 124 when the host ends it
+_PARK_COMMAND_TIMEOUT_SECONDS = 60
 
 
 class _UnkillableParkedContainer(Exception):
@@ -1747,6 +1749,11 @@ class _EditSwap:
     async def __aenter__(self) -> "_EditSwap":
         return self
 
+    async def _run(self, command: str) -> asyncssh.SSHCompletedProcess:
+        # a wedged dockerd can hang `docker stop`/`kill`/`inspect` forever (a reboot hung until the
+        # connector pod was replaced): the host ends each command (exit 124), the validator bounds the rest
+        return await _run_with_host_timeout(self.ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+
     async def park(self) -> str | None:
         """Rename the running container aside and stop it. None when there is nothing to park."""
         try:
@@ -1760,7 +1767,7 @@ class _EditSwap:
 
     async def _park(self) -> str | None:
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
-        listed = await self.ssh_client.run(
+        listed = await self._run(
             f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
             f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
         )
@@ -1776,7 +1783,7 @@ class _EditSwap:
             if parked in names:
                 # An earlier edit crashed between park and restore: the parked container is the
                 # customer's only copy. Give it its name back and carry on; never remove it.
-                renamed = await self.ssh_client.run(
+                renamed = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                 )
                 if renamed.exit_status != 0:
@@ -1792,15 +1799,15 @@ class _EditSwap:
         elif parked in names:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
             # the leftover parked one is stale and must not block the rename.
-            await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
-        renamed = await self.ssh_client.run(
+            await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
+        renamed = await self._run(
             f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
         )
         if renamed.exit_status != 0:
             raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
         self.parked_name = parked
         self.parked_id = container_id
-        stopped = await self.ssh_client.run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
+        stopped = await self._run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
         if stopped.exit_status != 0 and not await self._killed_after_failed_stop(parked, stopped):
             # The container cannot be stopped: give it its name back and fail the edit with the
             # pod exactly as it was. This is the wedge that used to surface as RetryError[...]
@@ -1808,16 +1815,16 @@ class _EditSwap:
             # stays set so __aexit__ tries the full restore once more. The kill can still land after
             # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
             # container stays parked for __aexit__ to restore.
-            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
             if running.exit_status == 0 and (running.stdout or "").strip() == "true":
-                renamed_back = await self.ssh_client.run(
+                renamed_back = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                 )
                 if renamed_back.exit_status == 0:
                     self.parked_name = None
             raise (_UnkillableParkedContainer if self.unkillable else Exception)(
                 "[park_current_container] the running container could not be stopped, the pod was left "
-                f"as it was: {(stopped.stderr or '').strip()}"
+                f"as it was: {(stopped.stderr or '').strip() or f'exit {stopped.exit_status}'}"
             )
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
@@ -1825,17 +1832,17 @@ class _EditSwap:
     async def _killed_after_failed_stop(self, parked: str, stopped) -> bool:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
         2026: 12 park failures on 10 hosts, all on dind-lium1). Kill it once; True when Docker reports it stopped within _PARK_KILL_WAIT_SECONDS."""
-        killed = await self.ssh_client.run(f"/usr/bin/docker kill {shlex.quote(parked)}")
+        killed = await self._run(f"/usr/bin/docker kill {shlex.quote(parked)}")
         for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
             await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
-            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
             is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
             if is_stopped:
                 break
         if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
             # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
-            await self.ssh_client.run(DockerCommand.kill_container_processes(parked))
-            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            await self._run(DockerCommand.kill_container_processes(parked))
+            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
             is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
             self.unkillable = not is_stopped
         logger.warning(
@@ -1864,7 +1871,7 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
-                removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
+                removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(
@@ -1893,8 +1900,8 @@ class _EditSwap:
         cards, so it cannot start; the container gets its name back, stopped."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
         q_replacement = shlex.quote(self.replacement_id) if self.replacement_id else q_name
-        await self.ssh_client.run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
-        renamed = await self.ssh_client.run(f"/usr/bin/docker rename {q_parked} {q_name}")
+        await self._run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
+        renamed = await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")
         error: str | None = None
         if renamed.exit_status != 0:
             error = f"docker rename: {(renamed.stderr or '').strip()}"
@@ -1912,7 +1919,7 @@ class _EditSwap:
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
         else:
-            started = await self.ssh_client.run(f"/usr/bin/docker start {q_name}")
+            started = await self._run(f"/usr/bin/docker start {q_name}")
             if started.exit_status != 0:
                 error = f"docker start: {(started.stderr or '').strip()}"
         extra = get_extra_info({**self.default_extra, "parked": self.parked_name, "restored": error is None})
