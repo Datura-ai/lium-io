@@ -1050,6 +1050,39 @@ class CollateralStatusMessages:
     )
 
 
+class NodeAccountMessages:
+    MATCH = MessageTemplate(
+        event="Node answers for the account that registered it",
+        reason="NODE_ACCOUNT_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Node account check not applicable",
+        reason="NODE_ACCOUNT_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Node at this address is set up for another account",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Verification failed; verification cleared",
+        remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
+    )
+    UNREADABLE = MessageTemplate(
+        event="Node did not report which account it is set up for",
+        reason="NODE_ACCOUNT_UNREADABLE",
+        severity="warning",
+        category="policy",
+        impact="Verification failed this cycle",
+        remediation="Run the current executor release and keep its port reachable from the internet.",
+    )
+
+
 class StaleContainerCleanupMessages:
     CLEANED = MessageTemplate(
         event="Stale container cleanup complete",

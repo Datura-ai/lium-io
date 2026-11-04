@@ -332,6 +332,26 @@ class ExecutorService:
 
         return result
 
+    @staticmethod
+    async def _attach_expected_identity(
+        infos: list, miner_hotkey: str, executor_id: Optional[str]
+    ) -> None:
+        """Central mode: tell the validator which account registered each node (DAH-5729), so it can check the
+        node answering at the address it dials is that account's. The portal snapshot is keyed by the listing
+        hotkey; `account_claim` is the portal's per-account claim for pool-hotkey nodes (absent from an older
+        portal, and the validator then skips the claim)."""
+        from clients.miner_portal_api import MinerPortalAPI
+
+        # the snapshot get_executors_for_validator just read (cached), not a second portal request
+        claims = {
+            str(item.get("id")).lower(): item.get("account_claim")
+            for item in await MinerPortalAPI.fetch_executors(miner_hotkey, executor_id)
+        }
+        for info in infos:
+            if isinstance(info, ExecutorSSHInfo):
+                info.expected_miner_hotkey = miner_hotkey
+                info.expected_account_claim = claims.get(str(info.uuid).lower()) or None
+
     async def send_pubkey_to_executor(
         self, executor: Executor, pubkey: str, validator_signature: str,
         nonce: str | None = None,
@@ -538,6 +558,8 @@ class ExecutorService:
         results = [
             result for result in await asyncio.gather(*tasks, return_exceptions=True) if result
         ]
+        if settings.CENTRAL_MODE:
+            await self._attach_expected_identity(results, miner_hotkey, executor_id)
         logger.info(
             _m( 
                 "Sent pubkey register to executors",

@@ -355,3 +355,49 @@ def test_an_update_writes_only_the_fields_the_portal_sent(tmp_path, messages, ex
     with Session(engine) as session:
         node = session.get(Executor, node_id)
         assert (node.address, node.port, node.validator, node.price_per_gpu) == expected
+
+
+@pytest.mark.asyncio
+async def test_central_miner_lists_each_node_with_the_account_that_registered_it(executor_service):
+    """DAH-5729: the listing hotkey, and the portal's account claim when it sends one (pool-hotkey nodes)."""
+    from datura.requests.miner_requests import ExecutorSSHInfo
+    from clients.miner_portal_api import MinerPortalAPI
+
+    pool_node, own_node = str(uuid4()), str(uuid4())
+    portal_items = [
+        {"id": pool_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
+         "executor_ip_port": "8001", "account_claim": "c" * 32},
+        {"id": own_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
+    ]
+    es.settings.CENTRAL_MODE = True
+    es.settings.RENTAL_REQUEST_HOOK = None
+
+    async def answered(executor, *_args, **_kwargs):
+        return ExecutorSSHInfo(
+            uuid=str(executor.uuid), address=executor.address, port=executor.port, ssh_username="root",
+            ssh_port=22, python_path="/p", root_dir="/r",
+        )
+
+    executor_service.send_pubkey_to_executor = answered
+    with patch.object(MinerPortalAPI, "fetch_executors", AsyncMock(return_value=portal_items)):
+        registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    by_id = {info.uuid: info for info in registration.accepted}
+    assert by_id[pool_node.lower()].expected_miner_hotkey == "m"
+    assert by_id[pool_node.lower()].expected_account_claim == "c" * 32
+    assert by_id[own_node].expected_miner_hotkey == "m"
+    assert by_id[own_node].expected_account_claim is None
+
+
+@pytest.mark.asyncio
+async def test_standalone_miner_sends_no_expected_identity(executor_service, test_executor):
+    from datura.requests.miner_requests import ExecutorSSHInfo
+
+    executor_service.executor_dao.get_executors_for_validator.return_value = [test_executor]
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.send_pubkey_to_executor = AsyncMock(return_value=ExecutorSSHInfo(
+        uuid=str(test_executor.uuid), address="127.0.0.1", port=8001, ssh_username="root",
+        ssh_port=22, python_path="/p", root_dir="/r",
+    ))
+    registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+    assert registration.accepted[0].expected_miner_hotkey is None
