@@ -29,6 +29,7 @@ from neurons.validators.src.services.task.checks.port_connectivity import (
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
 from neurons.validators.src.services.task.messages import (
+    GpuLossHoldMessages,
     GpuMemoryHealthMessages,
     TenantEnforcementMessages,
     render_message,
@@ -1751,9 +1752,17 @@ class _PublishedResult:
     score = 0
 
 
-@pytest.mark.asyncio
-async def test_a_session_lost_in_the_port_check_keeps_an_earlier_gpu_finding_published(context_factory, monkeypatch):
-    # review 4468576252: a raise dropped every event and published availability_errors=[], re-listing the broken GPU
+class _CleanScrapeAfterDropout:
+    # GpuLossHoldCheck on a clean scrape: the hold ends, the load test after the port check must republish it
+    check_id = "gpu.loss_hold"
+    fatal = False
+
+    async def run(self, ctx):
+        event = render_message(GpuLossHoldMessages.CLEAN_AGAIN, ctx=ctx, check_id=self.check_id)
+        return CheckResult(passed=True, event=event)
+
+
+async def _create_task_on_a_session_lost_in_the_port_check(context_factory, monkeypatch, first_check):
     ctx = _port_ctx(
         context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status="error")
     )
@@ -1772,7 +1781,7 @@ async def test_a_session_lost_in_the_port_check_keeps_an_earlier_gpu_finding_pub
     service.redis_service = MagicMock()
     service.pipeline_factory = MagicMock(
         build_context=AsyncMock(return_value=ctx),
-        build_checks=MagicMock(return_value=[_NonFatalGpuMemoryFinding(), PortConnectivityCheck(), PortCountCheck()]),
+        build_checks=MagicMock(return_value=[first_check, PortConnectivityCheck(), PortCountCheck()]),
         build_pipeline=lambda checks: Pipeline(checks, sink=AsyncMock()),
     )
     handler = MagicMock(handle_result=AsyncMock(return_value=_PublishedResult()))
@@ -1791,10 +1800,33 @@ async def test_a_session_lost_in_the_port_check_keeps_an_earlier_gpu_finding_pub
         rented_data=None,
         default_docker_image_digests={},
     )
+    assert handler.handle_result.await_args.kwargs["success"] is False
+    assert result.failure_reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    # withheld at cycle end, in a rollout or not (test_executor_rollout_grace.py)
+    assert result.session_lost_in_port_check is True
+    return result
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_in_the_port_check_keeps_an_earlier_gpu_finding_published(context_factory, monkeypatch):
+    # review 4468576252: a raise dropped every event and published availability_errors=[], re-listing the broken GPU
+    result = await _create_task_on_a_session_lost_in_the_port_check(
+        context_factory, monkeypatch, _NonFatalGpuMemoryFinding()
+    )
 
     assert [e["reason_code"] for e in result.availability_errors] == [GpuMemoryHealthMessages.FAILED.reason]
-    assert result.failure_reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
-    assert handler.handle_result.await_args.kwargs["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_after_a_clean_scrape_ended_a_gpu_loss_hold_leaves_the_stored_hold(
+    context_factory, monkeypatch
+):
+    # review 4469140353: [] cleared the stored GPU_LOST hold before the load test could republish it
+    result = await _create_task_on_a_session_lost_in_the_port_check(
+        context_factory, monkeypatch, _CleanScrapeAfterDropout()
+    )
+
+    assert result.availability_errors is None
 
 
 @pytest.mark.asyncio

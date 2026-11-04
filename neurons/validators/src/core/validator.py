@@ -30,6 +30,7 @@ from services.executor_rollout import (
     remember_rented_scored_results,
     withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
+    withhold_session_lost_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
@@ -828,6 +829,7 @@ class Validator:
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
+                    await self.publish_session_lost_findings(withheld_results, miner_coldkeys)
 
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
@@ -1563,7 +1565,25 @@ class Validator:
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
         standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
-        return standing, withheld_results + held_for_gpu_reset
+        standing, session_lost = withhold_session_lost_verdicts(standing)
+        return standing, withheld_results + held_for_gpu_reset + session_lost
+
+    async def publish_session_lost_findings(
+        self, withheld_results: list[WithheldVerdict], miner_coldkeys: dict[str, str | None]
+    ) -> None:
+        """DAH-5718: a run whose session died in the port check has no score, but what its finished checks found (a
+        GPU safety failure) still hides the node, together with what the last cycle hid it for. Unscored (scored_at
+        None) and not the miner's whole batch, like an early publish; a run that found nothing publishes nothing."""
+        for withheld in withheld_results:
+            result = withheld.result
+            miner_coldkey = miner_coldkeys.get(withheld.miner_hotkey)
+            if not (result.session_lost_in_port_check and result.availability_errors and miner_coldkey):
+                continue
+            before = self.miner_service.cycle_published_availability.get(str(result.executor_info.uuid).lower(), [])
+            result.availability_errors += [error for error in before if error not in result.availability_errors]
+            await self.miner_service.publish_machine_specs(
+                [result], withheld.miner_hotkey, miner_coldkey, is_whole_miner_batch=False
+            )
 
     async def record_withheld_verdicts(
         self,

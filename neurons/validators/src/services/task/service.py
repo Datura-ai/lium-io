@@ -23,6 +23,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
+from .checks.port_connectivity import PortConnectivityCheck
 from .availability import (
     MAX_PEER_TEXT_LENGTH,
     availability_errors,
@@ -257,6 +258,14 @@ class TaskService:
                     error.model_dump(mode="json")
                     for error in availability_errors([*events, failed] if failed else events)
                 ]
+                if (
+                    last_event.check_id == PortConnectivityCheck.check_id
+                    and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+                ):
+                    # DAH-5718: the checks after the port check never ran, so [] would clear holds only they re-read
+                    # (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones alone
+                    result.session_lost_in_port_check = True
+                    result.availability_errors = result.availability_errors or None
                 # DAH-3405: the last event is the one that ended the run — the failed fatal check,
                 # the finalize event of a run that completed without a score, or the rented halt
                 # (success=True, score 0 when the image is OUTDATED).

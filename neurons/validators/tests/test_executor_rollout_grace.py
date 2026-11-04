@@ -238,3 +238,51 @@ def test_an_idle_node_the_miner_cannot_reach_during_the_rollout_gets_the_rented_
 
     assert "EXECUTOR_UNREACHABLE_BY_MINER" in ROLLOUT_FAILURE_REASONS
     assert rollout_grace_reason(still_on_old, _open_window(), J1) == "EXECUTOR_UNREACHABLE_BY_MINER"
+
+
+# --- DAH-5718: the validator's own session closed during the port check --------------------------
+
+
+def _session_lost(uuid: str, availability_errors: list[dict] | None) -> JobResult:
+    result = _failed(uuid, "EXECUTOR_TRANSPORT_UNREACHABLE", observed_digest=OLD)
+    result.session_lost_in_port_check = True
+    result.availability_errors = availability_errors
+    return result
+
+
+GPU_FINDING = {"reason_code": "GPU_MEMORY_HEALTH_FAILED"}
+STORED_HOLD = {"reason_code": "GPU_LOST"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_rollout", [False, True])
+@pytest.mark.parametrize("findings", [None, [GPU_FINDING]])
+async def test_a_session_lost_in_the_port_check_is_unscored_and_publishes_only_its_findings(in_rollout, findings):
+    """Reviews 4469140353 / 4469140371 / 4469140385: outside a rollout the lost session scored 0; inside one the
+    rollout withheld an earlier GPU finding with it; a [] cleared the stored hold. Now the result is out of
+    scoring either way, and only a finding the finished checks made is published, on top of the stored one."""
+    tracker = _tracker(_FakeRedis())
+    validator_process = _validator_process(tracker)
+    validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=NEW)
+    window = _open_window() if in_rollout else MagicMock(covers=lambda _: False)
+    validator_process.observe_executor_rollout = AsyncMock(return_value=window)
+    validator_process.miner_service = MagicMock(
+        cycle_published_availability={"node-1": [STORED_HOLD]}, publish_machine_specs=AsyncMock()
+    )
+    lost = _session_lost("node-1", findings)
+    healthy = _scored("node-2")
+
+    kept, withheld = await validator_process.withhold_verdicts_for_rollout(
+        {"5Miner": [lost, healthy]}, J0, "batch-1", window
+    )
+    await validator_process.publish_session_lost_findings(withheld, {"5Miner": "5Cold"})
+
+    assert kept == {"5Miner": [healthy]}  # what IncentiveFactory scores
+    assert [w.result for w in withheld] == [lost]
+    publish = validator_process.miner_service.publish_machine_specs
+    if findings is None:
+        publish.assert_not_awaited()
+    else:
+        publish.assert_awaited_once_with([lost], "5Miner", "5Cold", is_whole_miner_batch=False)
+        assert lost.availability_errors == [GPU_FINDING, STORED_HOLD]
+        assert lost.scored_at is None

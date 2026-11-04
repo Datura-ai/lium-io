@@ -487,6 +487,32 @@ def withhold_renter_gpu_reset_verdicts(
     return standing_by_miner, withheld
 
 
+def withhold_session_lost_verdicts(
+    job_results: dict[str, list[JobResult]],
+) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
+    """DAH-5718: the validator's session died in the port check, so the cycle is unscored, in a rollout or not."""
+    standing_by_miner: dict[str, list[JobResult]] = {}
+    withheld: list[WithheldVerdict] = []
+    for miner_hotkey, results in job_results.items():
+        standing_by_miner[miner_hotkey] = []
+        for result in results:
+            if not result.session_lost_in_port_check:
+                standing_by_miner[miner_hotkey].append(result)
+                continue
+            withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
+            logger.info(
+                _m(
+                    "Verdict withheld: the validator's SSH session closed during the port check",
+                    extra={
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": result.executor_info.uuid,
+                        "job_batch_id": result.job_batch_id,
+                    },
+                )
+            )
+    return standing_by_miner, withheld
+
+
 def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
