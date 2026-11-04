@@ -518,8 +518,6 @@ class ExpressLane:
                 )
             pending.attempts -= 1  # _verify counted this run
             pending.lost_sessions += 1
-            if pending.lost_sessions >= SESSION_LOST_MAX_RUNS:
-                pending.attempts = MAX_ATTEMPTS  # _defer leaves it to the cycle
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
             return
         passed = result.score > 0 or result.job_score > 0
@@ -616,7 +614,11 @@ class ExpressLane:
             "attempt": pending.attempts,
             "reason": reason,
         }
-        if pending.attempts >= max_attempts_for(reason):
+        if (
+            pending.lost_sessions >= SESSION_LOST_MAX_RUNS
+            if reason == SESSION_LOST_IN_PORT_CHECK
+            else pending.attempts >= max_attempts_for(reason)
+        ):
             self._left_to_cycle.add(pending.executor.id)
             self._pending.pop(pending.executor.id, None)
             logger.warning(

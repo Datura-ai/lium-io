@@ -24,6 +24,7 @@ from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
+    MAX_ATTEMPTS,
     SESSION_LOST_MAX_RUNS,
     CycleInputs,
     ExpressLane,
@@ -552,6 +553,29 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
     pending.not_before = 0.0
     assert await harness.tick_and_settle() == 1
     assert new_node not in harness.lane._pending and new_node in harness.lane._left_to_cycle
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_after_snapshot_misses_used_max_attempts_keeps_the_node_queued(
+    monkeypatch, wallet
+):
+    """Snapshot misses (which the fast path allows past MAX_ATTEMPTS) do not make a later lost session
+    leave the node to the cycle: that run is bounded only by SESSION_LOST_MAX_RUNS."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def lost(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = lost
+    assert await harness.tick_and_settle() == 1
+    pending = harness.lane._pending[new_node]
+    pending.attempts, pending.not_before = MAX_ATTEMPTS, 0.0  # three earlier snapshot misses
+    assert await harness.tick_and_settle() == 1
+    assert harness.lane._pending[new_node] is pending and new_node not in harness.lane._left_to_cycle
+    assert (pending.attempts, pending.lost_sessions) == (MAX_ATTEMPTS, 2)
 
 
 # --- Redis seed and portal auth -------------------------------------------------------------
