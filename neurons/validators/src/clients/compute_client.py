@@ -1427,6 +1427,10 @@ class ComputeClient:
             response: (
                 ContainerCreated | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            if isinstance(response, FailedContainerRequest):
+                # the backend fences a failure on the create it answers: a late failure of an earlier create (a
+                # reboot the backend already gave up on) must not fail or exempt the one that replaced it
+                response.command_id = job_request.command_id
 
             logger.info(
                 _m(

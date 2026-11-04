@@ -5,7 +5,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from services.gpu_spec_table import normalize_gpu_model
+from services.gpu_spec_table import is_sxm_on_pcie_adapter, normalize_gpu_model
 
 from ..messages import NvlinkFaultMessages as Msg
 from ..messages import render_message
@@ -49,6 +49,8 @@ class NvlinkFaultCheck:
 
     A full 8x board of SXM-only GPUs that reports no NVLink at all fails with NVLINK_MISSING: an 8x H100
     HBM3 (1 Nov) was listed with PCIe-only topology (fabric down) and a renter found no NVLink.
+    H100 HBM3 GPUs with no NVLink at all are not failed: they are listed as H100 PCIe (DAH-5677,
+    services.gpu_spec_table.is_sxm_on_pcie_adapter), the SXM-on-PCIe-adapter build renters get.
     """
 
     check_id = "gpu.validate.nvlink_fault"
@@ -106,6 +108,8 @@ class NvlinkFaultCheck:
 def _missing_nvlink_on_sxm_board(specs: dict[str, Any], interconnect: Any) -> dict[str, Any] | None:
     # only an explicit nvlink False counts; an old executor without the interconnect scrape is skipped
     if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is False):
+        return None
+    if is_sxm_on_pcie_adapter(specs):
         return None
     details = (specs.get("gpu") or {}).get("details") or []
     # specs keep the raw NVML name (e.g. "Tesla H100 80GB HBM3")
