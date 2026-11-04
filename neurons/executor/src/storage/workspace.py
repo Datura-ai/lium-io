@@ -166,8 +166,8 @@ class WorkspaceResolver:
             capture_output=True,
             text=True,
         )
-        if result.returncode != 0:
-            raise WorkspaceResolutionError(f"restore target must be new or empty: {workspace.path}")
+        error = f"restore target must be new or empty: {workspace.path}"
+        _raise_check_failure(result, (20, 21), error, "restore", workspace.path)
 
     def _validate_encrypted_path(
         self,
@@ -181,8 +181,9 @@ class WorkspaceResolver:
     ) -> None:
         if action is StorageAction.BACKUP:
             # DAH-2002: an absent path passes, so BACKUP_SOURCE_SCRIPT turns it into an EMPTY no-op; a file still fails
-            check_script = '[ ! -e "$1" ] || [ -d "$1" ]'
+            check_script = '[ ! -e "$1" ] || [ -d "$1" ] || exit 20'
             error = f"backup source is not a directory: {requested_path}"
+            codes: tuple[int, ...] = (20,)
         elif overwrite_fresh_target:
             # Create-time restore into the pod's fresh mount (DAH-3274): the entrypoint may have
             # dropped `.jupyter`, `.bashrc` or a shell history there since `docker run`. The
@@ -192,6 +193,7 @@ class WorkspaceResolver:
             # or a directory, never a file.
             check_script = 'target="$1"; if [ ! -e "$target" ]; then exit 0; fi; if [ ! -d "$target" ]; then exit 20; fi'
             error = f"restore target is not a directory: {requested_path}"
+            codes = (20,)
         else:
             check_script = (
                 'target="$1"; '
@@ -200,6 +202,7 @@ class WorkspaceResolver:
                 'if find "$target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then exit 21; fi'
             )
             error = f"restore target must be new or empty: {requested_path}"
+            codes = (20, 21)
 
         result = subprocess.run(
             [
@@ -234,8 +237,7 @@ class WorkspaceResolver:
             capture_output=True,
             text=True,
         )
-        if result.returncode != 0:
-            raise WorkspaceResolutionError(error)
+        _raise_check_failure(result, codes, error, action.value, requested_path)
 
     def _inspect_running_container(self, container_name: str) -> tuple[ContainerIdentity, Mapping[str, object]]:
         result = self._run_docker(["inspect", container_name], "inspect rental container")
@@ -338,3 +340,15 @@ def _unescape_mountinfo(value: str) -> str:
     for escaped, unescaped in replacements.items():
         value = value.replace(escaped, unescaped)
     return value
+
+
+def _raise_check_failure(
+    result: subprocess.CompletedProcess[str], codes: tuple[int, ...], error: str, action: str, path: object
+) -> None:
+    # Only the script's own exit codes mean a bad shape; anything else is docker/nsenter failing (DAH-5691)
+    if result.returncode == 0:
+        return
+    if result.returncode in codes:
+        raise WorkspaceResolutionError(error)
+    stderr = (result.stderr or "")[-300:].strip()
+    raise WorkspaceResolutionError(f"could not check {action} path {path}: exit {result.returncode}: {stderr}")
