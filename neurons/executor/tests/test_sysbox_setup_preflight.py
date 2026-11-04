@@ -423,11 +423,12 @@ def test_install_mode_does_not_change_the_plugin_under_a_rental(tmp_path):
 # ── fuse3 ───────────────────────────────────────────────────────────────────
 
 APPARMOR_RULE = "mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,"
+APPARMOR_ON = {"sys/module/apparmor/parameters/enabled": "Y\n", "etc/apparmor.d/fusermount3": "profile fusermount3 {}\n"}
 
 
 def test_ubuntu_2604_fusermount3_profile_without_the_sysboxfs_rule_is_a_fix(tmp_path):
     rc, out, fixes = run_check(
-        tmp_path, "check_fusermount3_apparmor", files={"etc/apparmor.d/fusermount3": "profile fusermount3 {}\n"}
+        tmp_path, "check_fusermount3_apparmor", files=APPARMOR_ON
     )
     assert (rc, fixes) == (1, 1)
     assert "FIX  The AppArmor profile /etc/apparmor.d/fusermount3 (Ubuntu 26.04)" in out
@@ -436,20 +437,29 @@ def test_ubuntu_2604_fusermount3_profile_without_the_sysboxfs_rule_is_a_fix(tmp_
 
 def test_install_reloads_the_profile_even_when_an_earlier_run_already_wrote_the_rule(tmp_path):
     # an earlier run may have appended the rule and then failed to reload: a rerun must retry the reload
-    files = {"etc/apparmor.d/fusermount3": "profile fusermount3 {}\n", "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
     rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
     assert rc == 0
     assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
     assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text().count(APPARMOR_RULE) == 1
 
 
+def test_install_with_apparmor_off_skips_the_reload(tmp_path):
+    # apparmor_parser fails with AppArmor off (apparmor=0); the install must not stop on it
+    files = {**APPARMOR_ON, "sys/module/apparmor/parameters/enabled": "N\n"}
+    rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
+    assert rc == 0
+    assert not (tmp_path / "root/.stub-docker/apparmor").exists()
+
+
 @pytest.mark.parametrize(
     "files",
     [
         {},
-        {"etc/apparmor.d/fusermount3": "profile fusermount3 {}\n", "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"},
+        {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"},
+        {**APPARMOR_ON, "sys/module/apparmor/parameters/enabled": "N\n"},
     ],
-    ids=["no-profile", "rule-in-local"],
+    ids=["no-profile", "rule-in-local", "apparmor-off"],
 )
 def test_fusermount3_without_a_profile_or_with_the_rule_passes(tmp_path, files):
     rc, out, _ = run_check(tmp_path, "check_fusermount3_apparmor", files=files)

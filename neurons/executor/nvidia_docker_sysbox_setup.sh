@@ -352,13 +352,18 @@ FUSERMOUNT3_PROFILE=/etc/apparmor.d/fusermount3
 FUSERMOUNT3_LOCAL=/etc/apparmor.d/local/fusermount3
 FUSERMOUNT3_RULE='mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,'
 
+# the profile only binds when AppArmor is on: with apparmor=0 there is nothing to fix and apparmor_parser fails
+fusermount3_profile_enforced() {
+    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] && grep -q Y "$(host_path /sys/module/apparmor/parameters/enabled)" 2>/dev/null
+}
+
 fusermount3_needs_sysboxfs_rule() {
-    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] && ! grep -qF "$FUSERMOUNT3_RULE" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null
+    fusermount3_profile_enforced && ! grep -qF "$FUSERMOUNT3_RULE" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null
 }
 
 check_fusermount3_apparmor() {
     if ! fusermount3_needs_sysboxfs_rule; then
-        pf_pass "fusermount3 may mount sysbox-fs under /var/lib/sysboxfs (no AppArmor profile, or the rule is in $FUSERMOUNT3_LOCAL)."
+        pf_pass "fusermount3 may mount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or the rule is in $FUSERMOUNT3_LOCAL)."
         return 0
     fi
     pf_fix "The AppArmor profile $FUSERMOUNT3_PROFILE (Ubuntu 26.04) stops sysbox-fs mounting under /var/lib/sysboxfs — every sysbox container fails." \
@@ -367,7 +372,7 @@ check_fusermount3_apparmor() {
 }
 
 allow_sysboxfs_in_fusermount3_apparmor() {
-    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] || return 0
+    fusermount3_profile_enforced || return 0
     if fusermount3_needs_sysboxfs_rule; then
         mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
         printf '%s\n' "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs" \
