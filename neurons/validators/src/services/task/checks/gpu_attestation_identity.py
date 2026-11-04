@@ -179,7 +179,8 @@ def _serial(hw: dict) -> str | None:
 
 def hw_changes(previous: dict, current: dict, sxm_on_pcie_adapter: bool = False) -> list[str]:
     """The pinned fields a UUID changed; a field unknown on either side is not compared. On an SXM-on-PCIe adapter
-    build (DAH-5677) the H100 SXM name and the H100 PCIe name it is listed under are the same card (DAH-5684)."""
+    build (DAH-5677) the H100 SXM name and the H100 PCIe name it is listed under are the same card (DAH-5684): a pin
+    written as H100 PCIe before the driver name was pinned still matches."""
     changed = []
     for name in PINNED_HW_FIELDS:
         old, new = previous.get(name), current.get(name)
@@ -303,13 +304,16 @@ class GpuAttestationIdentityCheck:
             except (AttestationInvalid, binascii.Error) as exc:
                 invalid[gpu_uuid] = str(exc)[:200]
 
+        sxm_on_pcie_adapter = is_sxm_on_pcie_adapter(ctx.state.specs or {})
         hw_by_uuid: dict[str, dict] = {}
         for detail in ctx.state.gpu_details or []:
             gpu_uuid = detail.get("uuid")
             if gpu_uuid in reported:
                 row = by_uuid.get(gpu_uuid) or {}
                 hw_by_uuid[gpu_uuid] = {
-                    "name": detail.get("name"),
+                    # the driver's name, not the listed one: an HGX board that loses NVLink for a cycle is listed as
+                    # H100 PCIe then (DAH-5677), and a pin of that name would flag the board once NVLink is back
+                    "name": H100_SXM if sxm_on_pcie_adapter else detail.get("name"),
                     "capacity": detail.get("capacity"),
                     **{k: row.get(k) for k in ("serial", "vbios", "pci", "board_part")},
                 }
@@ -329,7 +333,6 @@ class GpuAttestationIdentityCheck:
         moved: dict[str, str] = {}
         changed: dict[str, list[str]] = {}
         slots = host_slots(hw_by_uuid)
-        sxm_on_pcie_adapter = is_sxm_on_pcie_adapter(ctx.state.specs or {})
         host_key = f"{KEY_HOST}:{ctx.executor.address}:{ctx.executor.port}"
         try:
             redis = ctx.services.redis

@@ -302,10 +302,13 @@ async def _twice(context_factory, first, second, **kw):
     ca = FakeCa()
     rows, gpus, details = first
     specs = kw.pop("specs", None)
-    ctx = _ctx(context_factory, ca, lambda n: rows, gpus=gpus, details=details, specs=specs)
+    first_specs, second_specs = specs if isinstance(specs, tuple) else (specs, specs)
+    ctx = _ctx(context_factory, ca, lambda n: rows, gpus=gpus, details=details, specs=first_specs)
     assert (await _run(ctx, ca, enforce=True)).passed is True
     rows, gpus, details = second
-    ctx = _ctx(context_factory, ca, lambda n: rows, gpus=gpus, details=details, redis=ctx.services.redis, specs=specs)
+    ctx = _ctx(
+        context_factory, ca, lambda n: rows, gpus=gpus, details=details, redis=ctx.services.redis, specs=second_specs
+    )
     return await _run(ctx, ca, **kw)
 
 
@@ -466,6 +469,22 @@ async def test_an_adapter_build_listed_as_h100_pcie_is_not_a_hardware_change(con
     )
     assert result.passed is passed
     assert bool(result.event.what_we_saw["hardware_changed"]) is not passed
+
+
+@pytest.mark.asyncio
+async def test_an_hgx_board_back_from_a_cycle_without_nvlink_is_not_a_hardware_change(context_factory):
+    # DAH-5684: the cycle without NVLink lists the board as H100 PCIe; its pin keeps the driver's H100 SXM name
+    gpus = ("GPU-a", "GPU-b")
+    hgx_specs = {**ADAPTER_SPECS, "interconnect": {"nvlink": True, "nvlink_pairs": 1}}
+    result = await _twice(
+        context_factory,
+        ([_hw(u) for u in gpus], gpus, [{"uuid": u, "name": "NVIDIA H100 PCIe", "capacity": 81559} for u in gpus]),
+        ([_hw(u) for u in gpus], gpus, [{"uuid": u, "name": "NVIDIA H100 80GB HBM3", "capacity": 81559} for u in gpus]),
+        enforce=True,
+        specs=(ADAPTER_SPECS, hgx_specs),
+    )
+    assert result.passed is True
+    assert result.event.what_we_saw["hardware_changed"] == {}
 
 
 @pytest.mark.asyncio
