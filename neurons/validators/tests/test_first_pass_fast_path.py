@@ -234,6 +234,7 @@ async def test_first_pass_verifyx_uses_the_smaller_challenge_config(context_fact
             "memory_max_test_gb": 16,
             "storage_throughput_test_gb": 1,
             "network_timeout_seconds": 45,
+            "download_deadline_seconds": 60,
         }
     }
     assert result.passed is True
@@ -241,6 +242,7 @@ async def test_first_pass_verifyx_uses_the_smaller_challenge_config(context_fact
         "memory_max_test_gb": 16,
         "storage_throughput_test_gb": 1,
         "network_timeout_seconds": 45,
+        "download_deadline_seconds": 60,
     }
     # A warm sample seeds the EMA exactly as today.
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
@@ -301,6 +303,7 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
             "memory_max_test_gb": 16,
             "storage_throughput_test_gb": 1,
             "network_timeout_seconds": 45,
+            "download_deadline_seconds": 60,
         }
     }
     assert service.kwargs_per_call == [first_pass_overrides, first_pass_overrides]
@@ -391,6 +394,7 @@ async def test_verifyx_service_applies_overrides_to_the_challenge_config_only():
     assert first_pass_config["memory_min_test_gb"] == default_config["memory_min_test_gb"]
     assert first_pass_config["storage_min_available_gb"] == default_config["storage_min_available_gb"]
     assert default_config["network_timeout_seconds"] == settings.verifyx.NETWORK_TIMEOUT_SECONDS
+    assert "download_deadline_seconds" not in default_config  # the cycle's retry keeps two full tries
 
 
 def test_first_pass_network_wait_is_capped_below_the_cycle_wait():
@@ -399,3 +403,5 @@ def test_first_pass_network_wait_is_capped_below_the_cycle_wait():
     capped = _first_pass_challenge_config()["network_timeout_seconds"]
     assert capped == settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS == 45
     assert capped < settings.verifyx.NETWORK_TIMEOUT_SECONDS
+    # the package retry gets only what is left of 60 s, not a second 45 s
+    assert _first_pass_challenge_config()["download_deadline_seconds"] == 60

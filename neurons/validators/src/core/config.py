@@ -324,6 +324,11 @@ class Settings(BaseSettings):
     # slow mirror cost a new node 4 min at 120 s. 45 s still fits the 450 MB speed test and a 500 MiB
     # package at 100 Mbps; a slower link is measured again with the full wait in the next cycle.
     FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS: int = Field(env="FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS", default=45)
+    # The first pass's total time for the package download, both tries together (libverifyx.so
+    # download_deadline_seconds): the node's retry gets only what is left, so a failed download costs
+    # 60 s, not 45 + 5 + 45. Cycle challenges send none and keep two full tries. A library without the
+    # field ignores it.
+    FIRST_PASS_VERIFYX_DOWNLOAD_DEADLINE_SECONDS: int = Field(env="FIRST_PASS_VERIFYX_DOWNLOAD_DEADLINE_SECONDS", default=60)
     # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
     # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
     # judge the answer with the same unseal/verify code. The POST travels through a direct-tcpip
