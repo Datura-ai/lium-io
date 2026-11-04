@@ -16,10 +16,9 @@ path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the valid
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
-matmul path and a consumed local pass must not skip it). Nothing is sent outside the first pass
-(`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's budget and then run again
-over SSH, past `JOB_TIME_OUT`; the check is skipped and both steps stay on SSH. The call's budget is
-at most half the time the job has left, so a slow `/verify` still leaves the SSH fallback room. Every outcome is one
+matmul path and a consumed local pass must not skip it). Outside the first pass the
+full-size steps run one after the other, never side by side. The call's budget is at most half the
+time the job has left, so a slow `/verify` still leaves the SSH fallback room. Every outcome is one
 `[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
 """
 
@@ -138,9 +137,6 @@ class LocalVerifyCheck:
         if get_filler_only_container(ctx):
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
-        if not ctx.config.first_pass:
-            # a full-size VerifyX can time out on /verify and then run again over SSH, past JOB_TIME_OUT
-            return self._skipped(ctx, "not the first pass")
         if ctx.config.validator_keypair is None:
             return self._fallback(
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
