@@ -830,7 +830,7 @@ class Validator:
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
-                    await self.publish_session_lost_findings(withheld_results, miner_coldkeys)
+                    await self.publish_session_lost_findings(withheld_results, miner_coldkeys, pod_ssh)
 
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
@@ -1570,19 +1570,33 @@ class Validator:
         return standing, withheld_results + held_for_gpu_reset + session_lost
 
     async def publish_session_lost_findings(
-        self, withheld_results: list[WithheldVerdict], miner_coldkeys: dict[str, str | None]
+        self,
+        withheld_results: list[WithheldVerdict],
+        miner_coldkeys: dict[str, str | None],
+        pod_ssh: dict[str, list] | None = None,
     ) -> None:
         """DAH-5718: a run whose session died in the port check has no score, but what its finished checks found (a
-        GPU safety failure) still hides the node, together with what the last cycle hid it for. Unscored (scored_at
-        None) and not the miner's whole batch, like an early publish; a run that found nothing publishes nothing."""
+        GPU safety failure) still hides the node, together with what the last cycle hid it for, and its rented pods'
+        SSH observations still go out (review 4470167895: billing reads a silent pod from them). Unscored (scored_at
+        None) and not the miner's whole batch, like an early publish; with no finding availability_errors stays None,
+        so the stored reasons are left alone; a run with neither publishes nothing."""
+        pod_ssh = pod_ssh or {}
+        published = self.miner_service.cycle_published_availability
         for withheld in withheld_results:
             result = withheld.result
+            executor_uuid = str(result.executor_info.uuid).lower()
             miner_coldkey = miner_coldkeys.get(withheld.miner_hotkey)
-            if not (result.session_lost_in_port_check and result.availability_errors and miner_coldkey):
+            if not result.session_lost_in_port_check or not miner_coldkey:
                 continue
-            before = self.miner_service.cycle_published_availability.get(str(result.executor_info.uuid).lower(), [])
-            found = {error.get("reason_code") for error in result.availability_errors}
-            result.availability_errors += [error for error in before if error.get("reason_code") not in found]
+            result.pod_ssh = pod_ssh.get(executor_uuid, result.pod_ssh)
+            if result.availability_errors:
+                found = {error.get("reason_code") for error in result.availability_errors}
+                before = published.get(executor_uuid, [])
+                result.availability_errors += [error for error in before if error.get("reason_code") not in found]
+                # review 4470167912: the next partial publication merges with this one, not with an older list
+                published[executor_uuid] = list(result.availability_errors)
+            elif not result.pod_ssh:
+                continue
             await self.miner_service.publish_machine_specs(
                 [result], withheld.miner_hotkey, miner_coldkey, is_whole_miner_batch=False
             )

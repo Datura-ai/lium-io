@@ -22,6 +22,7 @@ from services.executor_rollout import (
     session_kept_hotkeys,
     withhold_rollout_verdicts,
 )
+from protocol.vc_protocol.validator_requests import PodSshObservation, PodSshResult
 from services.task.models import JobResult
 
 
@@ -288,6 +289,47 @@ async def test_a_session_lost_in_the_port_check_is_unscored_and_publishes_only_i
         publish.assert_awaited_once_with([lost], "5Miner", "5Cold", is_whole_miner_batch=False)
         assert lost.availability_errors == [GPU_FINDING, STORED_HOLD]
         assert lost.scored_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe", [PodSshResult.TIMEOUT, PodSshResult.BANNER])
+async def test_a_session_lost_with_no_finding_still_publishes_the_pod_ssh_observations(probe):
+    """Review 4470167895: withholding the result dropped the rented pod's SSH observations, so billing could not
+    tell a silent pod (TIMEOUT) and kept charging. They go out on the unscored result, the stored reasons untouched."""
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = MagicMock(cycle_published_availability={}, publish_machine_specs=AsyncMock())
+    lost = _session_lost("node-1", None)
+    observations = [PodSshObservation(pod_id="pod-1", result=probe)]
+
+    await validator_process.publish_session_lost_findings(
+        [WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"}, {"node-1": observations}
+    )
+
+    validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
+        [lost], "5Miner", "5Cold", is_whole_miner_batch=False
+    )
+    assert lost.pod_ssh == observations
+    assert lost.availability_errors is None  # None leaves the backend's stored reasons alone
+    assert lost.scored_at is None
+
+
+@pytest.mark.asyncio
+async def test_consecutive_partial_publications_keep_every_earlier_reason():
+    """Review 4470167912: a second lost-session publication merged with the last whole-batch list only, so it
+    dropped the reason the first one published."""
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = MagicMock(
+        cycle_published_availability={"node-1": [STORED_HOLD]}, publish_machine_specs=AsyncMock()
+    )
+    other = {"reason_code": "GPU_COUNT_MISMATCH"}
+    first, second = _session_lost("node-1", [GPU_FINDING]), _session_lost("node-1", [other])
+
+    for lost in (first, second):
+        await validator_process.publish_session_lost_findings(
+            [WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"}
+        )
+
+    assert second.availability_errors == [other, GPU_FINDING, STORED_HOLD]
 
 
 def test_a_miner_whose_only_withheld_result_is_a_lost_session_gets_no_eligibility_floor():
