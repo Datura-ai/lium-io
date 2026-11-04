@@ -412,10 +412,12 @@ class ResultHandler:
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                 )
             else:
+                # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle
+                reanchor_uuids = (context.state.gpu_uuids or '') if context.gpu_reanchor else ''
                 await self.redis_service.set_verified_job_info(
                     miner_hotkey=miner_hotkey,
                     executor_id=executor_id,
-                    prev_info=verified_job_info,
+                    prev_info={**verified_job_info, GPU_ANCHOR_KEY: reanchor_uuids} if reanchor_uuids else verified_job_info,
                     success=False,
                 )
 

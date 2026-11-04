@@ -5968,6 +5968,60 @@
       "title": "RestoreContainerRequest",
       "type": "object"
     },
+    "ResumedCreatesReport": {
+      "description": "2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.\n`pod_ids` are the creates the previous connector was running that were cut off; the validator keeps no copy\nof a create request, so the backend sends each listed create again from its own records, and each gets its\nown reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the\nold connector: the backend fails it at once. An older validator never sends this, and the backend then\nchanges nothing.",
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ResumedCreatesReport"
+        },
+        "pod_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pod Ids",
+          "type": "array"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "title": "ResumedCreatesReport",
+      "type": "object"
+    },
     "RevenuePerGpuTypeRequest": {
       "properties": {
         "forwarded_at": {
@@ -6390,7 +6444,8 @@
         "JupyterServerInstalled",
         "JupyterInstallationFailed",
         "PodGpuResetResult",
-        "PodGpuClocksResult"
+        "PodGpuClocksResult",
+        "ResumedCreatesReport"
       ],
       "title": "ValidatorMessageType",
       "type": "string"
@@ -6503,7 +6558,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.4.0",
+  "protocol_version": "2.5.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
@@ -6590,6 +6645,9 @@
     },
     "ResetVerifiedJobRequest": {
       "$ref": "#/$defs/ResetVerifiedJobRequest"
+    },
+    "ResumedCreatesReport": {
+      "$ref": "#/$defs/ResumedCreatesReport"
     },
     "RevenuePerGpuTypeRequest": {
       "$ref": "#/$defs/RevenuePerGpuTypeRequest"
