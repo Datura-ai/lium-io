@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import Any
 
@@ -24,6 +25,13 @@ async def _any_listed_rental_active(ctx: Context, pods: list) -> bool:
     return False
 
 
+async def _rental_active(ctx: Context, pods: list, limit_s: float | None) -> bool:
+    try:
+        return await asyncio.wait_for(_any_listed_rental_active(ctx, pods), timeout=limit_s)
+    except TimeoutError:
+        return True
+
+
 def _as_float(value: Any) -> float:
     # a null or unparsable figure is not a reading (NaN), so it fails as NOT_REPORTED
     try:
@@ -43,7 +51,9 @@ class DiskSpaceCheck:
     check_id = "executor.validate.disk_space"
     fatal = True
 
-    async def run(self, ctx: Context) -> CheckResult:
+    async def run(self, ctx: Context, rental_lookup_timeout: float | None = None) -> CheckResult:
+        """`rental_lookup_timeout` caps the backend's per-pod rental lookup; a slower answer counts as
+        a live rental, like an unknown one (VerifyXColdRetryCheck, which runs this near the deadline)."""
         hard_disk = (ctx.state.specs or {}).get("hard_disk")
         what: dict[str, Any] = {
             "max_utilization_percent": MAX_DISK_UTILIZATION_PERCENT,
@@ -86,7 +96,7 @@ class DiskSpaceCheck:
         if (
             rental
             and rental.pods
-            and (ctx.rented or await _any_listed_rental_active(ctx, rental.pods))
+            and (ctx.rented or await _rental_active(ctx, rental.pods, rental_lookup_timeout))
         ):
             event = render_message(
                 template,

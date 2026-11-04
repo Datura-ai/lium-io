@@ -919,9 +919,9 @@ async def test_the_disk_floor_is_judged_again_only_on_an_adopted_retry(
     disk_runs = []
     real_run = disk_space.DiskSpaceCheck.run
 
-    async def counted_run(self, ctx):
+    async def counted_run(self, ctx, **kwargs):
         disk_runs.append(ctx.state.specs["hard_disk"])
-        return await real_run(self, ctx)
+        return await real_run(self, ctx, **kwargs)
 
     monkeypatch.setattr(disk_space.DiskSpaceCheck, "run", counted_run)
     if case == "skipped":
@@ -1020,3 +1020,28 @@ async def test_a_full_first_disk_reading_waits_for_the_sample_the_cold_retry_kee
     assert [e.reason_code for e in disk_events[1:]] == ([] if ok else ["DISK_TOO_FULL"])
     if not ok:
         assert "judged_after_cold_retry" not in disk_events[-1].what_we_saw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("seconds_left", "cap"), [(65.0, 5.0), (40.0, 0.0), (900.0, 30.0)])
+async def test_the_deferred_disk_rental_lookup_never_eats_the_scoring_margin(
+    context_factory, monkeypatch, seconds_left, cap
+):
+    # review 5772289851: the disk floor judged after the retry caps its rental lookup at the time left
+    # less the margin (and the usual rental-state cap), so it cannot run the task into its deadline
+    from neurons.validators.src.services.task.checks import disk_space
+    from neurons.validators.src.services.task.pipeline import CheckResult
+
+    seen = []
+
+    async def run(self, ctx, rental_lookup_timeout=None):
+        seen.append(rental_lookup_timeout)
+        return CheckResult.model_construct(passed=True, event=None)
+
+    monkeypatch.setattr(disk_space.DiskSpaceCheck, "run", run)
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: seconds_left)
+    ctx = context_factory(state=build_state(specs={"gpu": {"count": 1}}))
+    judged = CheckResult.model_construct(passed=True, event=None, updates={})
+
+    assert await VerifyXColdRetryCheck()._with_disk(ctx, judged) is judged
+    assert seen == [pytest.approx(cap)]

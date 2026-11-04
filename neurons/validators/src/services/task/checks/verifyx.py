@@ -1045,7 +1045,13 @@ class VerifyXColdRetryCheck:
         the sample kept (first or retry), the ones the node is scored on."""
         if not judged.passed:
             return judged
-        disk = await DiskSpaceCheck().run(ctx.model_copy(update=judged.updates))
+        # the deferred rental lookup must not eat the margin left for scoring (review 5772289851)
+        disk = await DiskSpaceCheck().run(
+            ctx.model_copy(update=judged.updates),
+            rental_lookup_timeout=max(
+                0.0, min(RENTAL_STATE_TIMEOUT_SECONDS, task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS)
+            ),
+        )
         if disk.passed:
             return judged
         return disk.model_copy(
