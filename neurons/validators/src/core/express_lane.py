@@ -203,7 +203,11 @@ class ExpressLane:
         snapshot = self._with_self_hosted(snapshot)
 
         validated = await self.redis_service.get_validated_executors()
-        chosen = self._select(snapshot, validated, inputs.fleet_known_since)
+        rechecks = await self.redis_service.get_executor_recheck_requests()
+        chosen = self._select(snapshot, validated, inputs.fleet_known_since, rechecks)
+        for pending in chosen:
+            if pending.executor.id in rechecks:
+                await self.redis_service.pop_executor_recheck_request(pending.executor.id)
         if not chosen:
             return 0
         return await self._launch(chosen)
@@ -284,10 +288,12 @@ class ExpressLane:
         snapshot: dict[str, list[PortalExecutor]],
         validated: set[str],
         fleet_known_since: datetime,
+        rechecks: set[str] = frozenset(),
     ) -> list[_Pending]:
         """Track this validator's never-validated executors; return the ones to launch now.
 
-        Oldest registration first, under the two in-flight caps.
+        An executor in rechecks (DAH-5716: its provider asked for a check) is taken even when
+        validated before. Oldest registration first, under the two in-flight caps.
         """
         in_flight = self.miner_service.in_flight
         my_hotkey = self._hotkey()
@@ -298,23 +304,28 @@ class ExpressLane:
         candidates: list[_Pending] = []
         for miner_hotkey, executors in snapshot.items():
             for executor in executors:
-                if (
-                    executor.validator_hotkey != my_hotkey
-                    or executor.id in validated
+                if executor.validator_hotkey != my_hotkey:
+                    continue
+                new_to_lane = not (
+                    executor.id in validated
                     or executor.id in self._left_to_cycle
                     # Registered well before the first cycle since start (or with no registration
                     # time to go by; RESTART_LOOKBACK covers what a restart cut off): long-known to this validator even if never published since
                     # the flag went on — its miner failed or was offline. The cycle owns it.
                     or executor.created_at is None
                     or executor.created_at < fleet_known_since - RESTART_LOOKBACK
-                ):
+                )
+                if not new_to_lane and executor.id not in rechecks:
                     continue
                 present.add(executor.id)
                 pending = self._pending.get(executor.id)
                 if pending is None:
-                    pending = self._pending[executor.id] = _Pending(
+                    pending = _Pending(
                         executor=executor, miner_hotkey=miner_hotkey, first_seen_at=now_wall
                     )
+                    # A recheck is queued only once chosen: the wave leaves queued executors out.
+                    if new_to_lane:
+                        self._pending[executor.id] = pending
                 if executor.id in in_flight or pending.not_before > now:
                     continue
                 # The wave has not received this miner's list yet (a cycle started seconds ago):
@@ -341,6 +352,7 @@ class ExpressLane:
             if per_miner[pending.miner_hotkey] >= settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER:
                 continue
             chosen.append(pending)
+            self._pending[pending.executor.id] = pending
             per_miner[pending.miner_hotkey] += 1
             room -= 1
         return chosen
