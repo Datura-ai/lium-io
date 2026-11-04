@@ -293,6 +293,7 @@ async def _compare(
             parallel_gpu=first_pass,
             deadline_s=executor_deadline_s(int(budget)),
         )
+        intent["steps"]["inspector"] = False
         client = client_factory(ctx, budget)
         try:
             answer = await client.run(ctx.ssh, intent)
