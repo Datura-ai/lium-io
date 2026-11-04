@@ -1838,6 +1838,33 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
             validate()
 
 
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "message"),
+    [
+        (20, "", "backup source is not a directory: /root"),
+        (1, "nsenter: cannot open /proc/123/ns/user: No such file\n",
+         "could not check backup path /root: exit 1: nsenter: cannot open /proc/123/ns/user: No such file"),
+    ],
+)
+def test_encrypted_path_check_reports_the_real_failure(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stderr: str, message: str
+) -> None:
+    """DAH-5691: only the script's own exit code means "not a directory"; docker/nsenter errors surface as-is"""
+    monkeypatch.setattr(
+        "storage.workspace.subprocess.run",
+        lambda command, **kwargs: SimpleNamespace(returncode=returncode, stdout="", stderr=stderr),
+    )
+    with pytest.raises(WorkspaceResolutionError) as raised:
+        WorkspaceResolver(docker_binary="docker")._validate_encrypted_path(
+            image="executor:test",
+            pid=123,
+            visible_path=PurePosixPath("/proc/123/root/root"),
+            requested_path=PurePosixPath("/root"),
+            action=StorageAction.BACKUP,
+        )
+    assert str(raised.value) == message
+
 EXPIRED_LINE = "Save(<data/1234>) returned error, retrying after 1s: ExpiredToken: The provided token has expired.\n"
 
 
