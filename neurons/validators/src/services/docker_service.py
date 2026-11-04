@@ -78,7 +78,6 @@ from payload_models.payloads import (
 from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
-    FRESH_SIZING_HEADROOM_GB,
     EDIT_PARKED_SUFFIX,
     LIUM_POD_ID_LABEL,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
@@ -702,6 +701,7 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
 # from on-host disk state when the backend sends disk_share.
 _FRESH_SIZING_OVERHEAD_GB = 20   # reserved for system/docker overhead when reconstructing the pool
+_FRESH_SIZING_HEADROOM_GB = 10   # min free space left on the fs after volume allocation
 _FRESH_SIZING_GB_BYTES = 1024 ** 3
 # The loopback plugin backs a volume with one sparse file and ext4 caps a file at 16 TiB.
 _FRESH_SIZING_MAX_VOLUME_GB = 16 * 1024 - 1
@@ -5736,7 +5736,7 @@ class DockerService:
         needs_free_gb: float = own_gb / disk_share - existing_gb
         if fresh_sizing and not payload.local_volume:
             # resolve_volume_sizing's df_guard caps the volume at df free less its headroom
-            needs_free_gb = max(needs_free_gb, payload.volume_limit_gb + FRESH_SIZING_HEADROOM_GB)
+            needs_free_gb = max(needs_free_gb, payload.volume_limit_gb + _FRESH_SIZING_HEADROOM_GB)
         return RentalDiskFit(own_gb, existing_gb, disk_share, fresh_sizing, needs_free_gb)
 
     async def _clamp_rental_volume_to_free_disk(
@@ -7766,7 +7766,7 @@ class DockerService:
             (
                 "df_guard",
                 max(
-                    (df_avail_bytes - FRESH_SIZING_HEADROOM_GB * _FRESH_SIZING_GB_BYTES) * 1.5,
+                    (df_avail_bytes - _FRESH_SIZING_HEADROOM_GB * _FRESH_SIZING_GB_BYTES) * 1.5,
                     0,
                 ),
             )
@@ -7815,7 +7815,7 @@ class DockerService:
                     "df_avail_bytes": df_avail_bytes,
                     "existing_volumes_bytes": existing_volumes_bytes,
                     "overhead_gb": _FRESH_SIZING_OVERHEAD_GB,
-                    "headroom_gb": FRESH_SIZING_HEADROOM_GB,
+                    "headroom_gb": _FRESH_SIZING_HEADROOM_GB,
                     "pool_bytes": pool_bytes,
                     "slice_bytes": int(slice_bytes),
                     "slice_candidates": {name: int(value) for name, value in slice_candidates},

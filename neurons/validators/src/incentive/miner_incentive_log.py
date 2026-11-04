@@ -77,7 +77,7 @@ from pydantic import BaseModel, Field
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from services.executor_image_policy import outdated_image_remediation
-from services.const import FRESH_SIZING_HEADROOM_GB, MIN_PORT_COUNT
+from services.const import MIN_PORT_COUNT
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
@@ -585,31 +585,20 @@ class MinerLogLine(BaseModel):
     ) -> MinerLogLine:
         # `result` is the free portion; the message names the GPUs the missing disk room leaves unpaid
         unpaid: int = disk_limited.unpaid_gpu_count
-        need: str = f"{disk_limited.required_free_gb_per_split:g} GB"
-        once: str = f"plus {FRESH_SIZING_HEADROOM_GB} GB kept free once on the disk"
-        if disk_limited.paid_split_count:
-            lead = (
-                f"No unrented incentive for {unpaid} of the free GPUs on this partially rented node: its free disk "
-                f"has room for {disk_limited.paid_split_count} of its {disk_limited.free_split_count} free GPU "
-                f"split(s) at {need} each {once}, so only those are listed and keep earning. "
-            )
-        else:
-            lead = (
-                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: its free disk "
-                f"has no room for one GPU split ({need} {once}), so they are not listed. "
-            )
+        floor: str = f"{settings.MIN_FREE_DISK_GB} GB"
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
             message=(
-                lead + "The rented GPUs keep earning. Full idle pay resumes when the rental ends or the node has "
-                f"{need} free per free split {once}."
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: it has less "
+                f"than {floor} free disk, so they are not listed. The rented GPUs keep earning. Idle pay resumes "
+                f"when the node has {floor} free."
             ),
             extra_fields={
                 "gpu_count": unpaid,
                 "free_split_count": disk_limited.free_split_count,
                 "paid_split_count": disk_limited.paid_split_count,
-                "required_free_gb_per_split": disk_limited.required_free_gb_per_split,
+                "required_free_gb": settings.MIN_FREE_DISK_GB,
             },
         )
 

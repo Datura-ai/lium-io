@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-from services.const import FRESH_SIZING_HEADROOM_GB, MAX_DISK_UTILIZATION_PERCENT
+from services.const import MAX_DISK_UTILIZATION_PERCENT
 from services.task.checks.disk_space import KB_PER_GB, DiskSpaceCheck, SplitDiskCheck
 from services.task.checks.rented_machine import TenantEnforcementCheck
 from services.task.pipeline_factory import PipelineFactory
@@ -167,14 +167,12 @@ def _split_rental(*pod_gpu_counts: int | None) -> RentedExecutorsResponse:
 @pytest.mark.parametrize(
     "gpu_count, min_count, pods, free_gb, free_splits, listable",
     [
-        # 2 GPUs, 1 rented: under the whole-host floor, but enough for the one free split
-        (2, 1, (1,), settings.MIN_FREE_DISK_GB * 0.5 + FRESH_SIZING_HEADROOM_GB, 1, 1),
-        (2, 1, (1,), settings.MIN_FREE_DISK_GB * 0.4, 1, 0),
-        # 8 GPUs in 2-GPU splits, 2 rented: 3 free splits, room for 2 of them
-        (8, 2, (2,), 2 * settings.MIN_FREE_DISK_GB / 4 + FRESH_SIZING_HEADROOM_GB, 3, 2),
+        # under the whole-host floor no free split is listed, even one a share of the floor would fit
+        (2, 1, (1,), settings.MIN_FREE_DISK_GB - 1, 1, 0),
+        (8, 2, (2,), settings.MIN_FREE_DISK_GB * 0.9, 3, 0),
     ],
 )
-async def test_split_rented_node_sizes_disk_per_free_split(
+async def test_split_rented_node_under_the_host_floor_lists_no_free_split(
     context_factory, gpu_count, min_count, pods, free_gb, free_splits, listable
 ):
     state = build_state(
@@ -257,19 +255,16 @@ def _split_state(free_gb: float, utilization: float = 50, **kwargs):
 
 @pytest.mark.asyncio
 async def test_split_disk_check_publishes_the_sizing_on_a_partly_rented_node(context_factory):
-    # 8 GPUs in 2-GPU splits, 2 rented: 3 free splits, room for 2 of them
-    ctx = context_factory(
-        state=_split_state(2 * settings.MIN_FREE_DISK_GB / 4 + FRESH_SIZING_HEADROOM_GB), rented=True
-    )
+    # 8 GPUs in 2-GPU splits, 2 rented: 3 free splits, all listed at the host floor
+    ctx = context_factory(state=_split_state(settings.MIN_FREE_DISK_GB), rented=True)
 
     result = await SplitDiskCheck().run(ctx)
 
     assert result.passed is True
     assert result.updates["state"].specs["split_disk"] == {
         "free_split_count": 3,
-        "listable_split_count": 2,
-        "listable_gpu_count": 4,
-        "required_free_gb_per_split": round(settings.MIN_FREE_DISK_GB / 4, 1),
+        "listable_split_count": 3,
+        "listable_gpu_count": 6,
     }
 
 
@@ -284,10 +279,9 @@ async def test_split_disk_check_writes_nothing_on_an_idle_node(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_leftover_gpus_ride_with_the_last_listable_split(context_factory):
-    # 8 GPUs in 2-GPU splits, 1 rented: 7 free GPUs = 3 splits + 1 leftover, all with room
-    free_gb = 3 * settings.MIN_FREE_DISK_GB / 4 + FRESH_SIZING_HEADROOM_GB
-    ctx = context_factory(state=_split_state(free_gb, pods=(1,)), rented=True)
+async def test_leftover_gpus_ride_with_the_listed_splits(context_factory):
+    # 8 GPUs in 2-GPU splits, 1 rented: 7 free GPUs = 3 splits + 1 leftover
+    ctx = context_factory(state=_split_state(settings.MIN_FREE_DISK_GB, pods=(1,)), rented=True)
 
     split = (await SplitDiskCheck().run(ctx)).updates["state"].specs["split_disk"]
 
@@ -305,18 +299,4 @@ async def test_a_zero_floor_asks_no_disk_of_a_split(context_factory, monkeypatch
 
     assert result.passed is True
     split = result.updates["state"].specs["split_disk"]
-    assert (split["listable_split_count"], split["required_free_gb_per_split"]) == (3, 0)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("free_gb, listable", [(6.25, 0), (16.25, 1), (22.5, 2), (9, 0)])
-async def test_the_headroom_fresh_sizing_keeps_is_kept_once_per_disk(context_factory, monkeypatch, free_gb, listable):
-    # 1-of-8 splits need their 6.25 GB share of a 50 GB floor each, plus the 10 GB a rental's sizing leaves free
-    # once per disk: two splits fit in 22.5 GB, not the 32.5 GB a per-split headroom would ask
-    monkeypatch.setattr(settings, "MIN_FREE_DISK_GB", 50)
-    ctx = context_factory(state=_split_state(free_gb, gpu_splitting_min_count=1, pods=(1, 1, 1, 1, 1, 1)), rented=True)
-
-    split = (await SplitDiskCheck().run(ctx)).updates["state"].specs["split_disk"]
-
-    assert (split["free_split_count"], split["listable_split_count"]) == (2, listable)
-    assert split["required_free_gb_per_split"] == 6.2
+    assert split["listable_split_count"] == 3

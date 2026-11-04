@@ -1,10 +1,9 @@
 """DAH-4961: the free remainder of a partially rented split node earns idle pay only for the free splits
-SplitDiskCheck found disk room for (`specs.split_disk`), as only those are listed; same pattern as the
+SplitDiskCheck lists (`specs.split_disk`: none while the host is under the free-disk floor); same pattern as the
 per-split port rule (DAH-3698)."""
 
 import pytest
 from incentive.miner_incentive_log import ZeroIncentiveReason
-from services.const import FRESH_SIZING_HEADROOM_GB
 from services.task.checks.disk_space import SplitDiskCheck
 from tests.test_disk_space_check import _split_state
 from tests.test_split_remainder_port_floor import MINER_HOTKEY, _build_incentive, _make_job, _reason_codes, _score_split
@@ -18,7 +17,7 @@ PORT = ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value
 def _sizing(listable: int, free_splits: int = 8) -> dict:
     # 1-GPU splits: the listable GPUs are the listable splits
     sizing = {"free_split_count": free_splits, "listable_split_count": listable, "listable_gpu_count": listable}
-    return {"split_disk": {**sizing, "required_free_gb_per_split": 6.2}}
+    return {"split_disk": sizing}
 
 
 @pytest.mark.asyncio
@@ -58,10 +57,9 @@ async def test_a_gpu_both_rules_leave_unpaid_is_counted_once():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("room_for_splits", [0, 1, 2, 3])
-async def test_scoring_pays_exactly_the_gpus_the_listing_offers(context_factory, room_for_splits):
-    # 8 GPUs in 2-GPU splits, 1 rented: 7 free = 3 splits + 1 leftover GPU riding with the last listable split
-    free_gb = settings.MIN_FREE_DISK_GB / 4 * room_for_splits + FRESH_SIZING_HEADROOM_GB
+@pytest.mark.parametrize("free_gb, listed", [(settings.MIN_FREE_DISK_GB - 1, 0), (settings.MIN_FREE_DISK_GB, 7)])
+async def test_scoring_pays_exactly_the_gpus_the_listing_offers(context_factory, free_gb, listed):
+    # 8 GPUs in 2-GPU splits, 1 rented: 7 free = 3 splits + 1 leftover GPU, all or none listed
     ctx = context_factory(state=_split_state(free_gb, pods=(1,)), rented=True)
     sizing = (await SplitDiskCheck().run(ctx)).updates["state"].specs["split_disk"]
 
@@ -72,5 +70,5 @@ async def test_scoring_pays_exactly_the_gpus_the_listing_offers(context_factory,
     _, remainder = incentive.job_results[MINER_HOTKEY]
     limited = incentive._disk_limited_remainder(remainder)
 
-    assert sizing["listable_gpu_count"] == [0, 3, 5, 7][room_for_splits]
+    assert sizing["listable_gpu_count"] == listed
     assert remainder.gpu_count - (limited.unpaid_gpu_count if limited else 0) == sizing["listable_gpu_count"]

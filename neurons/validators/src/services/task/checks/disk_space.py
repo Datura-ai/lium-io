@@ -4,7 +4,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
-from services.const import FRESH_SIZING_HEADROOM_GB, MAX_DISK_UTILIZATION_PERCENT
+from services.const import MAX_DISK_UTILIZATION_PERCENT
 
 from core.config import settings
 
@@ -34,11 +34,11 @@ def _as_float(value: Any) -> float:
 
 
 def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | None:
-    """Disk sizing for the free splits of a partly rented split node, or None when it does not apply.
+    """Disk verdict for the free splits of a partly rented split node, or None when it does not apply.
 
-    Each free split is sized against its GPU share of the host floor, with the fresh-sizing headroom kept once per
-    disk, so a host under the whole-host floor can still offer its free GPUs while every free split has room for a
-    usable volume.
+    The free GPUs are listed only while the host keeps the whole-host free-disk floor, the same floor an idle node
+    is held to. A per-split share would not hold: nothing reserves it, and the rented pods' writable layers grow
+    into the free disk up to their storage caps.
     """
     gpu_count = ctx.state.gpu_count
     min_count = ctx.state.gpu_splitting_min_count
@@ -52,18 +52,12 @@ def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | Non
     free_split_count = free_gpu_count // min_count
     if free_split_count <= 0:
         return None
-    # each split needs its share of the host floor; the headroom rental fresh volume sizing leaves free is kept
-    # once per disk, as that sizing keeps it (df free less the headroom), not once per split
-    required_kb = settings.MIN_FREE_DISK_GB * KB_PER_GB * min_count / gpu_count
-    usable_kb = free_kb - FRESH_SIZING_HEADROOM_GB * KB_PER_GB
-    # a zero floor (the rule turned off) asks no disk of a split
-    listable = free_split_count if required_kb <= 0 else max(0, min(free_split_count, int(usable_kb // required_kb)))
+    fits = free_kb >= settings.MIN_FREE_DISK_GB * KB_PER_GB
     return {
         "free_split_count": free_split_count,
-        "listable_split_count": listable,
-        # GPUs left over below one split ride with the last listable split, as with ports; scoring pays this count
-        "listable_gpu_count": free_gpu_count - (free_split_count - listable) * min_count if listable else 0,
-        "required_free_gb_per_split": round(required_kb / KB_PER_GB, 1),
+        "listable_split_count": free_split_count if fits else 0,
+        # scoring pays this count
+        "listable_gpu_count": free_gpu_count if fits else 0,
     }
 
 
@@ -138,7 +132,7 @@ class DiskSpaceCheck:
             and rental.pods
             and (ctx.rented or await _any_listed_rental_active(ctx, rental.pods))
         ):
-            # the free splits are judged on their own share of the disk, not the whole-host floor
+            # the free splits are listed only while the host keeps the whole-host floor
             per_split = split_disk(ctx, rental.pods, free_kb) if math.isfinite(free_kb) else None
             if per_split is None:
                 return CheckResult(
@@ -158,7 +152,7 @@ class DiskSpaceCheck:
                 check_id=self.check_id,
                 what={**what, "split_disk": per_split},
                 impact=f"Proceed; a live rental is not failed; {listable} of "
-                f"{per_split['free_split_count']} free splits have enough disk",
+                f"{per_split['free_split_count']} free splits listed",
             )
             state = replace(ctx.state, specs={**ctx.state.specs, "split_disk": per_split})
             return CheckResult(passed=True, event=event, updates={"state": state})
