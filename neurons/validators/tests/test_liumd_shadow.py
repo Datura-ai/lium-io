@@ -77,6 +77,12 @@ def reserved_executor(monkeypatch):
 
 
 @pytest.fixture
+def gpu_steps(monkeypatch):
+    """The shadow's GPU steps are off by default; these tests cover what they compare."""
+    monkeypatch.setattr(settings, "LIUMD_SHADOW_GPU_STEPS_ENABLED", True)
+
+
+@pytest.fixture
 def keypair():
     return bittensor.Keypair.create_from_uri("//LiumdShadowTest")
 
@@ -227,7 +233,7 @@ def test_todays_verdicts_come_from_the_runs_events():
 
 @pytest.mark.asyncio
 async def test_agreeing_verdicts_are_logged_as_one_structured_line(
-    keypair, monkeypatch, verifyx_service, caplog
+    keypair, monkeypatch, verifyx_service, gpu_steps, caplog
 ):
     fake = FakeLiumd()
     ctx = _ctx(keypair, monkeypatch, verifyx_service)
@@ -268,6 +274,19 @@ async def test_all_reserved_runs_on_any_executor(keypair, monkeypatch, verifyx_s
 
 
 @pytest.mark.asyncio
+async def test_gpu_steps_are_off_by_default(keypair, monkeypatch, verifyx_service):
+    fake = FakeLiumd()
+
+    record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
+
+    [intent] = fake.intents
+    assert intent["steps"]["matmul"] is None and intent["steps"]["verifyx"] is None
+    assert intent["steps"]["inspector"] is False
+    assert record["outcome"] == "compared" and record["agree"] is None
+    assert "liumd_verdict" not in record["steps"]["matmul"]
+
+
+@pytest.mark.asyncio
 async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch, verifyx_service):
     specs = {**SPECS, "sysbox_runtime": True, "docker_containers": [{"each_name": "filler"}]}
     state = build_state(specs=specs)
@@ -292,7 +311,9 @@ async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_the_intent_mirrors_todays_steps_and_sizing(keypair, monkeypatch, verifyx_service):
+async def test_the_intent_mirrors_todays_steps_and_sizing(
+    keypair, monkeypatch, verifyx_service, gpu_steps
+):
     fake = FakeLiumd()
     ctx = _ctx(keypair, monkeypatch, verifyx_service, first_pass=True)
 
@@ -381,6 +402,7 @@ async def test_agreement_per_step_and_overall(
     keypair,
     monkeypatch,
     verifyx_service,
+    gpu_steps,
     sealed,
     fake_args,
     ok,
@@ -492,6 +514,7 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
     keypair,
     monkeypatch,
     verifyx_service,
+    gpu_steps,
     prev_ema,
     network,
     first_pass,
@@ -562,7 +585,9 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
 
 
 @pytest.mark.asyncio
-async def test_an_outdated_verifyx_library_disagrees(keypair, monkeypatch, verifyx_service):
+async def test_an_outdated_verifyx_library_disagrees(
+    keypair, monkeypatch, verifyx_service, gpu_steps
+):
     fake = FakeLiumd(lib_sha="old")
 
     record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake, events=PASSED)
@@ -572,7 +597,9 @@ async def test_an_outdated_verifyx_library_disagrees(keypair, monkeypatch, verif
 
 
 @pytest.mark.asyncio
-async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, verifyx_service):
+async def test_all_cards_mode_does_not_compare_the_matmul(
+    keypair, monkeypatch, verifyx_service, gpu_steps
+):
     monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
     fake = FakeLiumd()
 
@@ -702,7 +729,7 @@ async def test_a_host_that_outlives_the_task_budget_is_cut_off(
 
 @pytest.mark.asyncio
 async def test_refusals_and_unavailability_are_logged_outcomes(
-    keypair, monkeypatch, verifyx_service
+    keypair, monkeypatch, verifyx_service, gpu_steps
 ):
     refused = LiumdRefusal(
         exit_status=5, error="busy", detail="another verify", echoed=True, round_trip_ms=4

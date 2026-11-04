@@ -2,9 +2,10 @@
 
 `TaskService.create_task` calls `run_liumd_shadow` once per node, after the pipeline has run and
 the node's `JobResult` is built, on the SSH session the pipeline used. With
-`VALIDATOR_LIUMD_SHADOW` off nothing here runs. With it on, the GPU steps today's run executed
-(the capability matmul, VerifyX) are prepared again the way their checks prepare them, sent in one
-signed intent through `liumd run` (`LiumdExecClient`), judged with the same functions
+`VALIDATOR_LIUMD_SHADOW` off nothing here runs. With it on the fact steps always run, and with
+`LIUMD_SHADOW_GPU_STEPS_ENABLED` on the GPU steps today's run executed (the capability matmul,
+VerifyX) are prepared again the way their checks prepare them, sent in one signed intent through
+`liumd run` (`LiumdExecClient`), judged with the same functions
 (`evaluate_matmul_output`, `evaluate_verifyx_capture`), and compared with today's verdicts read from
 the run's events. VerifyX's verdict is `verifyx_verdict`, the check's own pass/fail including the
 download-EMA floor, read against the stored EMA; the capture is judged with `record_tally=False`, so
