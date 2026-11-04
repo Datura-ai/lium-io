@@ -24,6 +24,7 @@ from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
+    SESSION_LOST_MAX_RUNS,
     CycleInputs,
     ExpressLane,
 )
@@ -532,7 +533,7 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
     (results, *_), _ = harness.miner_service.publish_machine_specs.await_args
     assert results[0].availability_errors == [finding]
     pending = harness.lane._pending[new_node]
-    assert (pending.failed_runs, pending.attempts) == (0, 1) and pending.not_before > 0
+    assert (pending.failed_runs, pending.attempts) == (0, 0) and pending.not_before > 0
     assert await harness.redis_service.get_validated_executors() == set()
 
     # no finding: nothing is published
@@ -541,7 +542,16 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
     pending.not_before = 0.0
     assert await harness.tick_and_settle() == 1
     harness.miner_service.publish_machine_specs.assert_not_awaited()
-    assert (pending.failed_runs, pending.attempts) == (0, 2)
+    assert (pending.failed_runs, pending.attempts, pending.lost_sessions) == (0, 0, 2)
+
+    # more lost sessions than MAX_ATTEMPTS keep the node queued, up to SESSION_LOST_MAX_RUNS
+    for _ in range(SESSION_LOST_MAX_RUNS - 3):
+        pending.not_before = 0.0
+        assert await harness.tick_and_settle() == 1
+    assert harness.lane._pending[new_node] is pending and pending.attempts == 0
+    pending.not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    assert new_node not in harness.lane._pending and new_node in harness.lane._left_to_cycle
 
 
 # --- Redis seed and portal auth -------------------------------------------------------------

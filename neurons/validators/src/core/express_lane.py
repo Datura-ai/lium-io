@@ -65,6 +65,10 @@ FIRST_PASS_FAILED = "first pass failed"
 FIRST_PASS_FAILED_RETRY_SECONDS = 60
 FIRST_PASS_MAX_RUNS = 3
 SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port check"
+# A lost session is the validator's, not the node's, so it spends none of MAX_ATTEMPTS (which the
+# miner's snapshot misses may already have used). Its own bound keeps a node whose session always
+# drops from staying queued, and hidden from the wave, for good: ~20 min at RETRY_SECONDS.
+SESSION_LOST_MAX_RUNS = 10
 # Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
 # that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
 # Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
@@ -116,6 +120,8 @@ class _Pending:
     # First passes that ran to a failed result; counted apart from attempts, which the miner's
     # snapshot misses may already have spent.
     failed_runs: int = 0
+    # Runs whose validator session closed during the port check (no verdict).
+    lost_sessions: int = 0
 
 
 class ExpressLane:
@@ -504,12 +510,16 @@ class ExpressLane:
         executor_id = pending.executor.id
         result = results[0]
         if result.session_lost_in_port_check:
-            # The run has no verdict: its findings still go out, and it is retried as a deferral (bounded by
-            # MAX_ATTEMPTS), neither a failed first pass nor recorded as validated.
+            # The run has no verdict: its findings still go out, and it is retried without spending one of
+            # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
             if result.availability_errors:
                 await self.miner_service.publish_machine_specs(
                     results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
                 )
+            pending.attempts -= 1  # _verify counted this run
+            pending.lost_sessions += 1
+            if pending.lost_sessions >= SESSION_LOST_MAX_RUNS:
+                pending.attempts = MAX_ATTEMPTS  # _defer leaves it to the cycle
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
             return
         passed = result.score > 0 or result.job_score > 0
