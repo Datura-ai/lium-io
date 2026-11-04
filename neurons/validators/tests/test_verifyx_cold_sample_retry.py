@@ -952,3 +952,32 @@ async def test_the_disk_floor_is_judged_again_only_on_an_adopted_retry(
         assert result.event.check_id == "executor.validate.disk_space"
         assert result.extra_events[-1].what_we_saw["cold_sample_retry"]["used"] == "retry"
         assert result.updates["state"].specs["network"]["verifyx_download_speed"] == pytest.approx(760.0)
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_retry_that_fails_the_disk_floor_names_the_disk_check_as_failed(context_factory):
+    # review 5767306334: the pipeline's steps_failed (the provider timeline's failed step) is the failed event's
+    # check, executor.validate.disk_space, not the cold retry check that returned it
+    from neurons.validators.src.services.task.pipeline import Pipeline
+
+    class Sink:
+        async def emit(self, event) -> None:
+            pass
+
+    def probe(download, utilization):
+        response = _probe(download)
+        response.data["hard_disk"] = {"total": 1000, "utilization": utilization, "free": 120 * GIB_KB}
+        return response
+
+    ctx = context_factory(
+        services=build_services(verifyx=_ProbeSequence(probe(88.0, 80.0), probe(760.0, 94.0))),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}, "hard_disk": {}}, rented_data=_never_measured()),
+    )
+    _idle_now(ctx.services)
+
+    ok, events, _ = await Pipeline([VerifyXCheck(), VerifyXColdRetryCheck()], Sink()).run(ctx)
+
+    assert ok is False
+    assert events[-1].check_id == "executor.validate.disk_space"
+    assert events[-1].what_we_saw["steps_failed"] == "executor.validate.disk_space"
