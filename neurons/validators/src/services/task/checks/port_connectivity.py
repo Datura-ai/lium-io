@@ -297,7 +297,11 @@ class PortConnectivityCheck:
         if result.failed_ports:
             msg += f" fail={len(result.failed_ports)}{fail_sample}"
 
-        if result.status != "ok":
+        # DAH-3266: the rental holds every declared port, so nothing was free to probe: not a port fault
+        declared = sum(r.declared for r in result.port_ranges)
+        all_ports_rented = result.status == "no_ports" and declared > 0 and len(rented_ports) >= declared
+
+        if result.status != "ok" and not all_ports_rented:
             # Fetch fresh rental data from backend to ensure we have latest state
             backend_client = ctx.services.backend
             fresh_rented_data = await backend_client.get_all_rented_executors()
@@ -363,7 +367,7 @@ class PortConnectivityCheck:
             )
 
         event = render_message(
-            Msg.VERIFY_OK,
+            Msg.SKIPPED_ALL_PORTS_RENTED if all_ports_rented else Msg.VERIFY_OK,
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},
