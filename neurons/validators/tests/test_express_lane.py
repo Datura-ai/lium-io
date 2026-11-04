@@ -620,3 +620,34 @@ async def test_a_requested_validated_executor_is_rechecked_once_under_the_caps(m
     assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0  # each request runs once
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_never_overlaps_the_next_wave(monkeypatch, wallet):
+    import core.express_lane as express_lane
+
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+    period = harness.settings.BLOCKS_FOR_JOB * express_lane.SECONDS_PER_BLOCK
+
+    # Too close to the next cycle: not started, still requested.
+    harness.inputs.started_at = time.monotonic() - period + 200
+    assert await harness.tick_and_settle() == 0
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+
+    # Started, but cut off before the next cycle: asked again, nothing published.
+    monkeypatch.setattr(express_lane, "RECHECK_MIN_SECONDS", 0)
+    harness.inputs.started_at = (
+        time.monotonic() - period + express_lane.RECHECK_MARGIN_SECONDS + 0.2
+    )
+    harness.release.clear()
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert harness.miner_service.in_flight == {}
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}

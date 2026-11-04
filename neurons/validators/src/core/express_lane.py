@@ -25,7 +25,8 @@ import os
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import bittensor
@@ -72,6 +73,13 @@ SELF_HOSTED_LIST_CONCURRENCY = 8
 SELF_HOSTED_LIST_FAILURE_BACKOFF_SECONDS = 600
 # job_batch_id format the backend parses into the prod_executors row's time.
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
+# DAH-5716: a requested recheck of an already-validated executor must end before the next wave
+# lists its miner (the wave leaves out what this lane is running). The next cycle starts no
+# earlier than BLOCKS_FOR_JOB blocks after this one; a recheck starts only with at least
+# RECHECK_MIN_SECONDS left, and is cut off RECHECK_MARGIN_SECONDS before that start.
+SECONDS_PER_BLOCK = 12
+RECHECK_MIN_SECONDS = 300
+RECHECK_MARGIN_SECONDS = 60
 
 
 def _cycle_batch_id_or_clock(cycle_batch_id: str) -> str:
@@ -103,6 +111,8 @@ class CycleInputs:
     # failed or was offline that cycle and it never reached the validated set; only executors
     # registered after this instant can be new to this validator.
     fleet_known_since: datetime
+    # When this cycle's inputs were made (monotonic), the earliest base for the next cycle's start.
+    started_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -115,6 +125,8 @@ class _Pending:
     # First passes that ran to a failed result; counted apart from attempts, which the miner's
     # snapshot misses may already have spent.
     failed_runs: int = 0
+    # DAH-5716: set for a recheck of an already-validated executor; monotonic end of its run.
+    recheck_deadline: float | None = None
 
 
 class ExpressLane:
@@ -204,10 +216,19 @@ class ExpressLane:
 
         validated = await self.redis_service.get_validated_executors()
         rechecks = await self.redis_service.get_executor_recheck_requests()
+        recheck_deadline = (
+            inputs.started_at
+            + settings.BLOCKS_FOR_JOB * SECONDS_PER_BLOCK
+            - RECHECK_MARGIN_SECONDS
+        )
+        if recheck_deadline - time.monotonic() < RECHECK_MIN_SECONDS:
+            rechecks = set()  # left in Redis: they run once the next wave has listed their miners
         chosen = self._select(snapshot, validated, inputs.fleet_known_since, rechecks)
         for pending in chosen:
             if pending.executor.id in rechecks:
                 await self.redis_service.pop_executor_recheck_request(pending.executor.id)
+                if pending.executor.id in validated:
+                    pending.recheck_deadline = recheck_deadline
         if not chosen:
             return 0
         return await self._launch(chosen)
@@ -454,7 +475,9 @@ class ExpressLane:
                     # Never scored, so the pipeline right-sizes its probes (DAH-3011).
                     first_pass=True,
                 ),
-                timeout=settings.JOB_TIME_OUT,
+                timeout=settings.JOB_TIME_OUT
+                if pending.recheck_deadline is None
+                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started)),
             )
             if not os.path.isdir(directory):
                 # The hold keeps this directory across cycles, so it went away by another hand.
@@ -482,6 +505,11 @@ class ExpressLane:
             await self._publish(pending, miner, results, extra, started)
         except Exception as exc:
             pending.attempts = attempt
+            if pending.recheck_deadline is not None:
+                # Cut off before the next wave: ask again, so it runs after that wave.
+                pending.recheck_deadline = None
+                with suppress(Exception):
+                    await self.redis_service.request_executor_recheck(executor_id)
             logger.error(
                 _m(
                     "[express] Verification failed before a result could be published",
