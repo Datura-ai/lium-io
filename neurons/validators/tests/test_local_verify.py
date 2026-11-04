@@ -1466,7 +1466,12 @@ async def test_transport_names_the_sample_the_cold_retry_kept(
         data={"success": True, "network": {"download_speed": 59.9, "upload_speed": 20.0}}
     )
     ssh_answer = vvs.VerifyXResponse(
-        data={"success": True, "network": {"download_speed": retry_download, "upload_speed": 1.0}}
+        data={
+            "success": True,
+            # clears the disk floor: an adopted retry's disk is judged again (DiskSpaceCheck)
+            "hard_disk": {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024},
+            "network": {"download_speed": retry_download, "upload_speed": 1.0},
+        }
     )
     ssh = SimpleNamespace(validate_verifyx_and_process_job=AsyncMock(return_value=ssh_answer))
     ctx = make_context(
