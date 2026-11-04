@@ -133,6 +133,7 @@ STUBS = {
     ),
     # records "<seconds> <command>" in .stub-docker/timeouts, then runs the command
     "timeout": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/timeouts"\nshift\nexec "$@"\n',
+    "apparmor_parser": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/apparmor"\n',
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
     "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.7.1}\\n\\tcommit:\\tabc123\\n"\n',
@@ -431,6 +432,15 @@ def test_ubuntu_2604_fusermount3_profile_without_the_sysboxfs_rule_is_a_fix(tmp_
     assert (rc, fixes) == (1, 1)
     assert "FIX  The AppArmor profile /etc/apparmor.d/fusermount3 (Ubuntu 26.04)" in out
     assert f"printf '%s\\n' '{APPARMOR_RULE}'" in out
+
+
+def test_install_reloads_the_profile_even_when_an_earlier_run_already_wrote_the_rule(tmp_path):
+    # an earlier run may have appended the rule and then failed to reload: a rerun must retry the reload
+    files = {"etc/apparmor.d/fusermount3": "profile fusermount3 {}\n", "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
+    assert rc == 0
+    assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
+    assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text().count(APPARMOR_RULE) == 1
 
 
 @pytest.mark.parametrize(

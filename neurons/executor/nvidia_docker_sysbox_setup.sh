@@ -367,10 +367,13 @@ check_fusermount3_apparmor() {
 }
 
 allow_sysboxfs_in_fusermount3_apparmor() {
-    fusermount3_needs_sysboxfs_rule || return 0
-    mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
-    printf '%s\n' "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs" \
-        "$FUSERMOUNT3_RULE" 'umount /var/lib/sysboxfs/**,' >> "$(host_path "$FUSERMOUNT3_LOCAL")"
+    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] || return 0
+    if fusermount3_needs_sysboxfs_rule; then
+        mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
+        printf '%s\n' "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs" \
+            "$FUSERMOUNT3_RULE" 'umount /var/lib/sysboxfs/**,' >> "$(host_path "$FUSERMOUNT3_LOCAL")"
+    fi
+    # reload even when the rule was already on disk: an earlier run may have written it and then failed to reload
     apparmor_parser -r "$FUSERMOUNT3_PROFILE" || { fail "Could not reload $FUSERMOUNT3_PROFILE with the sysbox-fs rule."; return 1; }
     ok "AppArmor: fusermount3 may mount sysbox-fs under /var/lib/sysboxfs."
 }
