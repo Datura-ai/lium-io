@@ -1410,10 +1410,8 @@ async def test_delete_filler_restores_cap_claim_only_when_removal_fails(
     monkeypatch.setattr(
         "services.docker_service.restore_filler_pod_gpu_power_limits", AsyncMock(return_value=0)
     )
-    monkeypatch.setattr(
-        "services.docker_service.clear_filler_pod_applied_caps",
-        AsyncMock(return_value={"GPU-a": 280}),
-    )
+    clear_claims = AsyncMock(return_value={"GPU-a": 280})
+    monkeypatch.setattr("services.docker_service.clear_filler_pod_applied_caps", clear_claims)
     restore_claims = AsyncMock()
     monkeypatch.setattr("services.docker_service.restore_filler_pod_applied_caps", restore_claims)
     monkeypatch.setattr(docker_service, "_stop_container_gracefully", AsyncMock(return_value=stopped))
@@ -1455,6 +1453,8 @@ async def test_delete_filler_restores_cap_claim_only_when_removal_fails(
         assert restore_claims.await_args.args[1] == {"GPU-a": 280}
     else:
         restore_claims.assert_not_awaited()
+    # Review (#1924): once the container is gone the claim is cleared again
+    assert clear_claims.await_count == (1 if removal_fails else 2)
 
 
 @pytest.mark.asyncio
