@@ -352,7 +352,8 @@ class LocalVerifyCheck:
             else:
                 outcome.fallbacks["verifyx"] = "local_failed"
                 # a verdict that decrypts but fails (RAM, disk) has no `error`, only `errors`
-                detail = response.error or "; ".join((response.data or {}).get("errors") or [])
+                verdict_errors = (response.data or {}).get("errors") or []
+                detail = response.error or "; ".join(str(e) for e in verdict_errors)
                 self._metric(ctx, "fallback", "verifyx", "local_failed", detail=detail, **common)
         return outcome
 

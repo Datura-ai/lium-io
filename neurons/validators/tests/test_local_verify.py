@@ -997,7 +997,7 @@ async def test_a_failed_verifyx_verdict_logs_its_errors(
         "_perform_verification_checks",
         lambda payload, **_: {
             "success": False,
-            "errors": ["Insufficient memory: 10 GB allocated, 16 GB required"],
+            "errors": [None, "Insufficient memory: 10 GB allocated, 16 GB required"],
         },
     )
     validation = matmul_service(monkeypatch)
@@ -1018,7 +1018,7 @@ async def test_a_failed_verifyx_verdict_logs_its_errors(
         for call in log.info.call_args_list
         if str(call.args[0]) == "[local_verify] outcome" and call.args[0].extra["step"] == "verifyx"
     )
-    assert verifyx_outcome["detail"] == "Insufficient memory: 10 GB allocated, 16 GB required"
+    assert verifyx_outcome["detail"] == "None; Insufficient memory: 10 GB allocated, 16 GB required"
 
 
 @pytest.mark.asyncio
