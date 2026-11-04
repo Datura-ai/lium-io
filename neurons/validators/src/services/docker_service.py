@@ -2887,6 +2887,9 @@ def _jupyter_root_sed(root: str) -> str:
     return shlex.quote(f"s#--ServerApp.root_dir=/root #--ServerApp.root_dir={root} #")
 
 
+_DIND_STOP_ATTEMPTS = 3
+
+
 class DockerService:
     def __init__(
         self,
@@ -8624,8 +8627,11 @@ class DockerService:
         firewall helpers by name, then the DinD itself. The pause goes first:
         a build still running in the DinD (one a connector restart cut off)
         would otherwise run unfiltered once its rules are gone; a paused
-        container keeps its IP. A DinD that is still not paused after it
-        (`{{.State.Paused}}`) is killed instead. The helpers go before the DinD because removing the DinD
+        container keeps its IP. A DinD that is still running unpaused after it
+        is killed instead. Nothing else runs until the DinD is confirmed paused,
+        stopped or gone; if that cannot be confirmed (the command times out, the
+        daemon does not answer) the pause is retried, and after the last attempt
+        the rules, helpers and DinD are all kept. The helpers go before the DinD because removing the DinD
         releases its IP: an apply or remove helper that outlived its bound is
         still editing rules for that IP, and the next build to get the IP
         would inherit them.
@@ -8635,26 +8641,40 @@ class DockerService:
         """
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
-        try:
-            # A DinD the pause did not freeze is killed, so no build runs once the
-            # rules go; harmless on a DinD that is gone, stopped or already paused.
-            dind_q = shlex.quote(dind_name)
-            await ssh_client.run(
-                f"/usr/bin/docker pause {dind_q} 2>/dev/null; "
-                f"[ \"$(/usr/bin/docker inspect -f '{{{{.State.Paused}}}}' {dind_q} 2>/dev/null)\" = true ] "
-                f"|| /usr/bin/docker kill {dind_q} >/dev/null 2>&1 || true",
-                check=False,
-                timeout=setup_timeout_s,
-            )
-        except Exception as exc:  # noqa: BLE001 — best-effort
+        # A DinD the pause did not freeze is killed. Exit 0 only once it is confirmed
+        # paused, stopped or gone: a daemon error is none of those.
+        dind_q = shlex.quote(dind_name)
+        state = f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}{{{{.State.Paused}}}}' {dind_q} 2>&1"
+        stop_cmd = (
+            f"/usr/bin/docker pause {dind_q} >/dev/null 2>&1; s=$({state}); "
+            f"[ \"$s\" = truefalse ] && {{ /usr/bin/docker kill {dind_q} >/dev/null 2>&1; s=$({state}); }}; "
+            f'case "$s" in truetrue|false*|*"No such"*) exit 0;; esac; exit 1'
+        )
+        for attempt in range(1, _DIND_STOP_ATTEMPTS + 1):
+            try:
+                res = await ssh_client.run(stop_cmd, check=False, timeout=setup_timeout_s)
+                if res.exit_status == 0:
+                    break
+                error = f"exit {res.exit_status}"
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                error = str(exc)
             logger.warning(
                 _m(
-                    "Custom build DinD pause before teardown failed (non-fatal)",
+                    "Custom build DinD pause before teardown failed",
                     extra=get_extra_info(
-                        {**default_extra, "error": str(exc), "dind_name": dind_name}
+                        {**default_extra, "error": error, "dind_name": dind_name, "attempt": attempt}
                     ),
                 )
             )
+        else:
+            # Its build may still run: keep its network rules (and the DinD holding its IP).
+            logger.error(
+                _m(
+                    "Custom build DinD not confirmed stopped; network rules kept",
+                    extra=get_extra_info({**default_extra, "dind_name": dind_name, "dind_ip": dind_ip}),
+                )
+            )
+            return
         if dind_ip:
             try:
                 remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
