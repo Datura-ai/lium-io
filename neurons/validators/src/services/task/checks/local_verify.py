@@ -18,7 +18,8 @@ own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
 matmul path and a consumed local pass must not skip it). Nothing is sent outside the first pass
 (`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's budget and then run again
-over SSH, past `JOB_TIME_OUT`; both steps stay on SSH (`scored_ssh`). Every outcome is one
+over SSH, past `JOB_TIME_OUT`; the check is skipped and both steps stay on SSH. The call's budget is
+at most half the time the job has left, so a slow `/verify` still leaves the SSH fallback room. Every outcome is one
 `[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
 """
 
@@ -57,6 +58,7 @@ from ..messages import LocalVerifyMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .capability import get_filler_only_container
+from .task_time import task_seconds_left
 from .verifyx import _first_pass_challenge_config
 
 logger = logging.getLogger(__name__)
@@ -85,7 +87,7 @@ def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
     return answer.round_trip_ms > ROUND_TRIP_CAP_MS_BY_STEP[name]
 
 
-def _matmul_ssh_reason(ctx: Context) -> str | None:
+def _matmul_ssh_reason() -> str | None:
     """Why the matmul is not asked for in the one call, or None when it is.
 
     `allcards_ssh` (DAH-2671 item 3): the all-cards work-proof (`probe_all_claimed_cards`, one
@@ -138,14 +140,16 @@ class LocalVerifyCheck:
             return self._skipped(ctx, "filler only")
         if not ctx.config.first_pass:
             # a full-size VerifyX can time out on /verify and then run again over SSH, past JOB_TIME_OUT
-            return self._fallback(ctx, "call", "scored_ssh", "not the first pass: both steps run over SSH")
+            return self._skipped(ctx, "not the first pass")
         if ctx.config.validator_keypair is None:
             return self._fallback(
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
             )
 
-        matmul_ssh_reason = _matmul_ssh_reason(ctx)
+        matmul_ssh_reason = _matmul_ssh_reason()
         client = self._client_factory(ctx)
+        # half the time the job has left: a /verify that runs out still leaves the SSH fallback as much
+        client.timeout_s = max(1, min(client.timeout_s, int(task_seconds_left(ctx) / 2)))
         advertised = await client.advertised(ctx.executor)
         if CAPABILITY not in advertised.capabilities:
             self._metric(ctx, "fallback", "call", "not_advertised")
@@ -246,7 +250,7 @@ class LocalVerifyCheck:
             # Shorter than the client's whole-call timeout by a margin, so an answer the
             # executor cut at its deadline (`deadline_hit`, finished steps inside) still arrives
             # before the client gives up and is consumed step by step.
-            deadline_s=executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS),
+            deadline_s=executor_deadline_s(client.timeout_s),
         )
 
         try:
