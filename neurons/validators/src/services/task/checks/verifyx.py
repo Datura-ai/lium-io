@@ -380,12 +380,15 @@ _FAILURE_TEMPLATE_BY_CLASS = {
 }
 
 
-def _first_pass_challenge_config() -> dict[str, int]:
+def _first_pass_challenge_config() -> dict[str, float]:
     return {
         "memory_max_test_gb": settings.FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB,
         "storage_throughput_test_gb": settings.FIRST_PASS_VERIFYX_STORAGE_TEST_GB,
-        "network_timeout_seconds": settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS,
-        "download_deadline_seconds": settings.FIRST_PASS_VERIFYX_DOWNLOAD_DEADLINE_SECONDS,
+        # the waits are sized in libverifyx.so, which knows the package and speed-test sizes
+        "network_floor_mbps": min(
+            settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS, settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS
+        ),
+        "network_min_timeout_seconds": settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS,
     }
 
 

@@ -233,16 +233,16 @@ async def test_first_pass_verifyx_uses_the_smaller_challenge_config(context_fact
         "challenge_config_overrides": {
             "memory_max_test_gb": 16,
             "storage_throughput_test_gb": 1,
-            "network_timeout_seconds": 45,
-            "download_deadline_seconds": 60,
+            "network_floor_mbps": 50.0,
+            "network_min_timeout_seconds": 45,
         }
     }
     assert result.passed is True
     assert result.event.what_we_saw["first_pass_challenge_config"] == {
         "memory_max_test_gb": 16,
         "storage_throughput_test_gb": 1,
-        "network_timeout_seconds": 45,
-        "download_deadline_seconds": 60,
+        "network_floor_mbps": 50.0,
+        "network_min_timeout_seconds": 45,
     }
     # A warm sample seeds the EMA exactly as today.
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
@@ -302,8 +302,8 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
         "challenge_config_overrides": {
             "memory_max_test_gb": 16,
             "storage_throughput_test_gb": 1,
-            "network_timeout_seconds": 45,
-            "download_deadline_seconds": 60,
+            "network_floor_mbps": 50.0,
+            "network_min_timeout_seconds": 45,
         }
     }
     assert service.kwargs_per_call == [first_pass_overrides, first_pass_overrides]
@@ -394,14 +394,16 @@ async def test_verifyx_service_applies_overrides_to_the_challenge_config_only():
     assert first_pass_config["memory_min_test_gb"] == default_config["memory_min_test_gb"]
     assert first_pass_config["storage_min_available_gb"] == default_config["storage_min_available_gb"]
     assert default_config["network_timeout_seconds"] == settings.verifyx.NETWORK_TIMEOUT_SECONDS
-    assert "download_deadline_seconds" not in default_config  # the cycle's retry keeps two full tries
+    assert "network_floor_mbps" not in default_config  # the cycle's waits are not sized
 
 
-def test_first_pass_network_wait_is_capped_below_the_cycle_wait():
-    """A slow package mirror on a new node: the first pass waits 45 s per try, not 120 s (two tries plus
-    the speed test then stay inside the express budget); the cycle's challenge keeps the full wait."""
-    capped = _first_pass_challenge_config()["network_timeout_seconds"]
-    assert capped == settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS == 45
-    assert capped < settings.verifyx.NETWORK_TIMEOUT_SECONDS
-    # the package retry gets only what is left of 60 s, not a second 45 s
-    assert _first_pass_challenge_config()["download_deadline_seconds"] == 60
+def test_first_pass_network_waits_are_sized_from_the_acceptance_floor():
+    """A slow package mirror on a new node: the library sizes each wait from its transfer at the
+    acceptance floor (a 500 MiB package at 50 Mbps gets ~101 s, a small one on a fast floor 45 s; the
+    library's tests cover the sizing). The first pass sends the floor and the 45 s minimum; it no
+    longer caps the timeout itself, so a library without sizing keeps the full wait."""
+    config = _first_pass_challenge_config()
+    assert config["network_floor_mbps"] == settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS == 50.0
+    assert config["network_floor_mbps"] <= settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS
+    assert config["network_min_timeout_seconds"] == settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS == 45
+    assert "network_timeout_seconds" not in config
