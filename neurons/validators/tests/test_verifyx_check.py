@@ -56,6 +56,7 @@ class DummyVerifyXService:
             "executor_info": executor_info,
             "default_extra": default_extra,
             "machine_spec": machine_spec,
+            "challenge_config_overrides": challenge_config_overrides,
         }
 
         if self.success:
@@ -308,6 +309,8 @@ async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_skips(context_f
 
     assert reasons[:2] == [Msg.FILLER_SKIPPED.reason] * 2
     assert reasons[2] != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
+    # r4472607210: RAM and disk the filler holds are not tested at full size on the refresh
+    assert verifyx_service.called_with["challenge_config_overrides"] == verifyx_module.FILLER_REFRESH_CHALLENGE_CONFIG
     # r4472207526: the backend has not stored a new reading (a failed probe stores none), so it probes again
     assert reasons[3] != Msg.FILLER_SKIPPED.reason
 
@@ -343,6 +346,7 @@ async def test_verifyx_probes_never_measured_node_under_active_filler(context_fa
     assert result.passed is True
     assert result.event.reason_code != Msg.FILLER_SKIPPED.reason
     assert verifyx_service.called_with is not None
+    assert verifyx_service.called_with["challenge_config_overrides"] is None
     network = result.updates["state"].specs["network"]
     assert network["ema_verifyx_download_speed"] == pytest.approx(510.0)
 

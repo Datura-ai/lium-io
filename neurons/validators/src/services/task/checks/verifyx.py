@@ -101,16 +101,18 @@ class VerifyXCheck:
         skips, skipped_on = _filler_skips.get(skip_key, (0, stored))
         if skipped_on != stored:
             skips = 0
-        if (
+        reusable = (
             filler_container
-            and skips < MAX_FILLER_SKIPS
             and stored_ema
             and stored_ema.ema_verifyx_download_speed is not None
             and (
                 stored_ema.ema_verifyx_upload_speed is None
                 or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
-        ):
+        )
+        # a day of reuse is up: this probe refreshes the network reading only (r4472607210)
+        filler_refresh = bool(reusable) and skips >= MAX_FILLER_SKIPS
+        if reusable and not filler_refresh:
             _filler_skips[skip_key] = (skips + 1, stored)
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
@@ -136,6 +138,8 @@ class VerifyXCheck:
         sizing = (
             {"challenge_config_overrides": _first_pass_challenge_config()}
             if ctx.config.first_pass
+            else {"challenge_config_overrides": FILLER_REFRESH_CHALLENGE_CONFIG}
+            if filler_refresh
             else {}
         )
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
@@ -393,6 +397,16 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EXECUTOR_CRASH": Msg.VERIFY_FAILED_EXECUTOR_CRASH,
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
+}
+
+
+# DAH-5742 (r4472607210): the RAM and disk a filler holds are ours (lium-platform keeps a 50 GiB disk and 4 GiB RAM
+# reserve beside it), so the day's refresh tests them at 1 GB and keeps the network legs and the EMA gates as they are
+FILLER_REFRESH_CHALLENGE_CONFIG = {
+    "memory_min_test_gb": 1,
+    "memory_max_test_gb": 1,
+    "storage_min_available_gb": 1,
+    "storage_throughput_test_gb": 1,
 }
 
 
