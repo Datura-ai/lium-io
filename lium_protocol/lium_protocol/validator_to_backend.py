@@ -60,6 +60,8 @@ class ValidatorMessageType(enum.Enum):
     PodGpuResetResult = "PodGpuResetResult"
     # 2.4.0: the answer to LockPodGpuClocksRequest
     PodGpuClocksResult = "PodGpuClocksResult"
+    # 2.5.0: after its start sweep, the creates a new connector runs again (DAH-5437)
+    ResumedCreatesReport = "ResumedCreatesReport"
 
 
 VALIDATOR_MESSAGES: Registry[ValidatorMessage] = Registry(ValidatorMessageType)
@@ -245,6 +247,19 @@ class PodStatesReport(ValidatorMessage):
     chunk_index: int = pydantic.Field(ge=0)
     chunk_total: int = pydantic.Field(ge=1)
     pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
+
+
+@VALIDATOR_MESSAGES.register
+class ResumedCreatesReport(ValidatorMessage):
+    """2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.
+    `pod_ids` are the creates the previous connector was running that were cut off; the validator keeps no copy
+    of a create request, so the backend sends each listed create again from its own records, and each gets its
+    own reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the
+    old connector: the backend fails it at once. An older validator never sends this, and the backend then
+    changes nothing."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.ResumedCreatesReport
+    pod_ids: list[str] = pydantic.Field(default_factory=list)
 
 
 @VALIDATOR_MESSAGES.register

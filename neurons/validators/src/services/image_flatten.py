@@ -1,0 +1,325 @@
+"""Squash a renter's image into one layer on the node, for Sysbox nodes that cannot start it as is.
+
+Sysbox 0.7.1 on Docker's classic overlay2 store (and 0.6.6 and older on the containerd store) cannot
+ID-map the relative layer paths Docker uses once an image has more layers than fit in one page of
+overlay mount options (nestybox/sysbox#725, fixed upstream but not in a Sysbox release yet). A
+one-layer copy of the same files starts. Only on classic overlay2: the disk check measures Docker's
+data root, which the containerd store does not write its images to. `docker export | docker import`
+keeps only the root filesystem, so the image config is put back with `--change`; SHELL (written into a
+shell-form health check instead) and ONBUILD (build-time only) are not carried over.
+"""
+
+import json
+import shlex
+
+import asyncssh
+
+from core.docker_utils import df_command, parse_df_available_bytes
+
+FLATTENED_IMAGE_REPO = "lium-flattened"
+# headroom left on the Docker disk after the copy, so the pod and the node still have room to write
+FLATTEN_DISK_MARGIN_BYTES = 10 * 1024**3
+# a 24 GB image takes about 5-15 minutes to copy; past this the create fails with the original error
+FLATTEN_TIMEOUT_SECONDS = 1800
+_DOCKER_READ_TIMEOUT_SECONDS = 120
+FLATTEN_LOCK_PATH = "/root/app/lium-flatten.lock"  # held by a flatten from its disk check to its tag
+# touched under the node lock by every disk-measuring create as it measures: a flatten that saw no
+# other create before this changed refuses, as that create's grant is not on the node yet
+FLATTEN_SIZED_PATH = "/root/app/lium-flatten-sized"
+# short lock over "mark a copy as in use" and "remove copies not in use", so a removal never races a reuse
+FLATTEN_USE_LOCK_PATH = "/root/app/lium-flatten-use.lock"
+# One lease file `<copy id>.<rental lease>` per rental between its flatten (or reuse) and the end of its
+# create; a leased copy is never removed. The rental releases it when the create ends (success, failure or
+# cancel), after which a container using the copy protects it; the expiry only covers a validator crash.
+# Beside the validator's other node state, not on /tmp, which a renter's or provider's files can fill
+# (the lock and mark files above too).
+FLATTEN_LEASE_DIR = "/root/app/flatten-leases"
+FLATTEN_LEASE_EXIT = 93
+# the lease is written before the copy, so it covers the copy (bounded by the timeout) and the create after it
+FLATTEN_LEASE_MINUTES = FLATTEN_TIMEOUT_SECONDS // 60 + 60
+# rentals waiting with a new copy per node: more would let one renter hold that many abandoned copies
+FLATTEN_MAX_LEASES = 2
+FLATTEN_BUSY_EXIT = 92
+FLATTEN_NO_DISK_EXIT = 95
+FLATTEN_MEASURE_FAILED_EXIT = 90
+
+FLATTEN_NO_DISK_RENTER_SENTENCE = (
+    "not enough free disk on this node to prepare this image; choose another node or a smaller image"
+)
+
+
+class ImageFlattenNoDisk(RuntimeError):
+    renter_sentence = FLATTEN_NO_DISK_RENTER_SENTENCE
+
+
+class FlattenMeasureFailed(RuntimeError):
+    """Only the disk measure failed, after the node lock was held and the mark written."""
+
+
+def _dockerfile_word(value: str) -> str:
+    # inside double quotes the Dockerfile parser unescapes only \, " and $ (no variable expansion)
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+def _healthcheck_change(check: dict, shell: list[str]) -> str:
+    test = check.get("Test") or []
+    if test[:1] == ["NONE"]:
+        return "HEALTHCHECK NONE"
+    options = "".join(
+        f"--{flag}={check[key]}ns "  # inspect gives nanoseconds; 0 means Docker's default
+        for flag, key in (
+            ("interval", "Interval"),
+            ("timeout", "Timeout"),
+            ("start-period", "StartPeriod"),
+            ("start-interval", "StartInterval"),
+        )
+        if check.get(key)
+    )
+    if check.get("Retries"):
+        options += f"--retries={check['Retries']} "
+    if test[:1] == ["CMD-SHELL"] and len(test) == 2:
+        # Docker runs CMD-SHELL through the image's SHELL, which import cannot restore: spell the shell out
+        return f"HEALTHCHECK {options}CMD {json.dumps([*shell, test[1]])}"
+    if test[:1] == ["CMD"] and len(test) > 1:
+        return f"HEALTHCHECK {options}CMD {json.dumps(test[1:])}"
+    # one --change is one Dockerfile line; a health check that differs would change how the pod is judged
+    raise ValueError(f"health check {test[:1]} cannot be carried over")
+
+
+def image_flatten_changes(config: dict) -> list[str]:
+    """`docker import --change` lines that restore what the flatten drops from the image `Config`."""
+    changes: list[str] = []
+    # ENTRYPOINT first: in Dockerfile order it clears a CMD set before it
+    if config.get("Entrypoint"):
+        changes.append(f"ENTRYPOINT {json.dumps(config['Entrypoint'])}")
+    if config.get("Cmd"):
+        changes.append(f"CMD {json.dumps(config['Cmd'])}")
+    for entry in config.get("Env") or ():
+        key, _, value = entry.partition("=")
+        if "\n" in value or "\r" in value:
+            # one --change is one Dockerfile line; dropping the variable would change the program
+            raise ValueError(f"environment variable {key} has a line break; cannot carry it over")
+        changes.append(f"ENV {key}={_dockerfile_word(value)}")
+    if config.get("WorkingDir"):
+        changes.append(f"WORKDIR {_dockerfile_word(config['WorkingDir'])}")
+    if config.get("User"):
+        changes.append(f"USER {_dockerfile_word(config['User'])}")
+    for port in sorted(config.get("ExposedPorts") or ()):
+        changes.append(f"EXPOSE {port}")
+    if config.get("Volumes"):
+        changes.append(f"VOLUME {json.dumps(sorted(config['Volumes']))}")
+    if config.get("StopSignal"):
+        changes.append(f"STOPSIGNAL {config['StopSignal']}")
+    if config.get("Healthcheck"):
+        changes.append(_healthcheck_change(config["Healthcheck"], config.get("Shell") or ["/bin/sh", "-c"]))
+    for key, value in sorted((config.get("Labels") or {}).items()):
+        if "\n" in key + value or "\r" in key + value:
+            continue  # metadata only (e.g. a long description); nothing at run time reads it
+        changes.append(f"LABEL {_dockerfile_word(key)}={_dockerfile_word(value)}")
+    return changes
+
+
+def _lease_path(tag: str, lease: str) -> str:
+    return f"{FLATTEN_LEASE_DIR}/{shlex.quote(tag.partition(':')[2] + '.' + lease)}"
+
+
+def _lease_command(tag: str, lease: str) -> str:
+    """Mark `tag` as wanted by the rental `lease` until its create ends."""
+    return f"mkdir -p {FLATTEN_LEASE_DIR} && touch {_lease_path(tag, lease)}"
+
+
+def flatten_lease_release_command(lease: str) -> str:
+    """Drop the rental's lease: from here a container using the copy, or nothing, keeps it."""
+    return f"rm -f {FLATTEN_LEASE_DIR}/*.{shlex.quote(lease)}"
+
+
+def _reuse_command(tag: str, lease: str) -> str:
+    """Exit 0 and lease the copy when it exists; under the use lock so a cleanup cannot remove it in between.
+    A copy whose lease cannot be written is not handed out: nothing would stop a cleanup removing it."""
+    return (
+        f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
+        f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && {_lease_command(tag, lease)}"
+    )
+
+
+def _flatten_command(
+    image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int, lease: str, sized_mark: str = ""
+) -> str:
+    """Under a node-wide lock: reuse a copy another flatten finished meanwhile, refuse a new copy while
+    FLATTEN_MAX_LEASES other rentals still wait on theirs, remove every earlier copy
+    no container uses and no rental leased in the last FLATTEN_LEASE_MINUTES (so renters cannot fill the
+    disk with copies, and a rental never loses its copy before its create), check the Docker disk
+    holds `need_bytes` and no create sized its disk since `sized_mark` (flatten_sized_mark_command), create (never start) a container from the image ID, pipe its export into an
+    import, tag the result only when both sides succeeded, and always remove the container and its
+    volumes. Plain sh: no pipefail."""
+    t = FLATTEN_TIMEOUT_SECONDS
+    change_args = " ".join(f"--change {shlex.quote(c)}" for c in changes)
+    # an empty volume per VOLUME path: create would otherwise copy the image's files there (extra disk)
+    mounts = " ".join(f"--mount {shlex.quote(f'type=volume,dst={v},volume-nocopy')}" for v in volumes)
+    root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
+    return (
+        # one flatten per node: concurrent rentals would each pass the disk check and copy at once
+        f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
+        f"({_reuse_command(tag, lease)}) && exit 0; "
+        f'[ "$(stat -c %y {FLATTEN_SIZED_PATH} 2>/dev/null)" = {shlex.quote(sized_mark)} ] || '
+        f"{{ echo 'flatten refused: another create sized its disk meanwhile' >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; "
+        f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
+        # unknown lease count (unreadable dir) is treated as full: never more waiting copies than the cap
+        f"mkdir -p {FLATTEN_LEASE_DIR}; "
+        f"held=$(find {FLATTEN_LEASE_DIR} -maxdepth 1 -type f ! -mmin +{FLATTEN_LEASE_MINUTES}) && "
+        f'[ "$(printf %s "$held" | grep -c .)" -lt {FLATTEN_MAX_LEASES} ] || '
+        f"{{ echo 'flatten refused: other rentals on this node still wait for their copies' >&2; exit {FLATTEN_BUSY_EXIT}; }}; "
+        # leased before the copy: a disk that fills during the copy cannot leave the copy unleased
+        f"{_lease_command(tag, lease)} || {{ echo 'flatten failed: cannot write the lease' >&2; exit {FLATTEN_LEASE_EXIT}; }}; "
+        # any doubt about a lease keeps the copy: an unlistable lease dir skips the cleanup, a lease find
+        # cannot read keeps its copy; rmi without -f refuses a copy a container (running or stopped) uses
+        f"if ls {FLATTEN_LEASE_DIR} >/dev/null 2>&1 && [ -x {FLATTEN_LEASE_DIR} ]; then "
+        f"for old in $(/usr/bin/docker image ls --format '{{{{.Repository}}}}:{{{{.Tag}}}}' {FLATTENED_IMAGE_REPO}); "
+        f'do live=$(find {FLATTEN_LEASE_DIR} -maxdepth 1 -name "${{old#*:}}.*" ! -mmin +{FLATTEN_LEASE_MINUTES}) '
+        '&& [ -z "$live" ] && /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; '
+        "else echo 'flatten: lease dir unreadable, cleanup skipped' >&2; fi; flock -u 8; "
+        f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
+        'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
+        f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
+        # the ID, not the tag: a pull may move the tag after inspect and the copy would not match its name
+        f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {mounts} {shlex.quote(image_id)}) || exit 97; "
+        'st=$(mktemp); '
+        f'iid=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") '
+        f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
+        'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; rrc=$?; '
+        # a left-over container or volume fails the flatten untagged, so the next rental retries the cleanup
+        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag, lease)} 2>/dev/null; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
+        'else [ -n "$iid" ] && /usr/bin/docker rmi -f "$iid" >/dev/null 2>&1; '
+        'echo "flatten failed: export=$erc import=$irc rm=$rrc" >&2; exit 98; fi'
+    )
+
+
+def flatten_sized_mark_command() -> str:
+    """Prints the mtime of FLATTEN_SIZED_PATH (empty when absent); `_flatten_command` refuses once it changed."""
+    return f"stat -c %y {FLATTEN_SIZED_PATH} 2>/dev/null; true"
+
+
+def flatten_wait_command() -> str:
+    root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
+    # under the lock a copy holds for its whole run: no copy is half-written while df measures, and a
+    # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
+    return (
+        f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
+        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit 1; touch {FLATTEN_SIZED_PATH} || exit 1; "
+        f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
+    )
+
+
+async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int | None:
+    """The Docker disk's free bytes, measured under the node flatten lock, for a create's sizing.
+
+    A copy holds that lock from its disk check to its tag, so the measure waits for a running copy
+    (whose pod may have been deleted meanwhile) and counts every copy written so far; it also marks the
+    node as sized under that lock, so a flatten that has not started copying refuses (`sized_mark`).
+    A disk probe taken before this, outside the lock, may predate a copy and must not size the create.
+    None on a node without flock, which runs no flatten. Raises FlattenMeasureFailed when only the
+    measure failed (lock held, mark written); any other error when the lock or the mark was not taken,
+    which must stop the create: no other sizing is safe then."""
+    result = await ssh_client.run(flatten_wait_command(), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
+    if result.exit_status == FLATTEN_MEASURE_FAILED_EXIT:
+        raise FlattenMeasureFailed("measuring the disk under the node flatten lock failed")
+    if result.exit_status != 0:
+        raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status})")
+    out = str(result.stdout or "")
+    try:
+        return parse_df_available_bytes(out) if out.strip() else None
+    except Exception as exc:
+        raise FlattenMeasureFailed(str(exc)) from exc
+
+
+# Docker switches to the relative layer paths Sysbox cannot ID-map at ~40 layers on the default data root
+# and sooner on a longer one. shortcut: a fixed count; an image under it that still fails meets the flatten's own disk check
+FLATTEN_BUDGET_MIN_LAYERS = 30
+
+
+async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: str) -> int | None:
+    """The disk a one-layer copy of the local `image` would take (its size plus FLATTEN_DISK_MARGIN_BYTES), for
+    the sizing to keep free; None when the image has too few layers to need one, its copy is already on the
+    node (a flatten reuses it, writing nothing), or it cannot be read."""
+    try:
+        result = await ssh_client.run(
+            "/usr/bin/docker image inspect --format '{{.Size}} {{len .RootFS.Layers}} {{.Id}}' "
+            f"{shlex.quote(image)}",
+            check=True,
+            timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+        )
+        size_word, layers_word, image_id = str(result.stdout).split()
+        size, layers = int(size_word), int(layers_word)
+    except Exception:
+        return None
+    if layers < FLATTEN_BUDGET_MIN_LAYERS:
+        return None
+    tag = f"{FLATTENED_IMAGE_REPO}:{image_id.removeprefix('sha256:')}"
+    try:
+        copy = await ssh_client.run(
+            f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1",
+            check=False,
+            timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        copy = None  # unknown: keep the room for a new copy
+    # shortcut: the copy may be removed before the flatten reuses it; the flatten's own disk check then refuses
+    return None if copy is not None and copy.exit_status == 0 else size + FLATTEN_DISK_MARGIN_BYTES
+
+
+async def flatten_image_on_host(
+    ssh_client: asyncssh.SSHClientConnection,
+    image: str,
+    *,
+    lease: str,
+    reserved_bytes: int = 0,
+    sized_mark: str = "",
+) -> str:
+    """The local tag of a one-layer copy of `image`, built on the node unless one exists already.
+
+    The copy is leased to `lease` (hex, unique per rental): the caller must run
+    `flatten_lease_release_command(lease)` on the node once its create ended, however it ended.
+
+    Keyed by the image ID, so a retry or a later rental of the same image reuses the copy. Raises
+    ImageFlattenNoDisk when the Docker disk cannot hold the copy and still keep `reserved_bytes`
+    (granted to the pod, not yet written) free, or a create sized its disk since `sized_mark` was read
+    (flatten_sized_mark_command, before the caller checked for other creates); any other error when it failed or the node does not
+    use the classic overlay2 store.
+    """
+    driver = await ssh_client.run(
+        "/usr/bin/docker info --format '{{.Driver}}'", check=True, timeout=_DOCKER_READ_TIMEOUT_SECONDS
+    )
+    # the containerd store reports its snapshotter (e.g. overlayfs) and keeps images outside DockerRootDir
+    if str(driver.stdout).strip() != "overlay2":
+        raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
+    inspect = await ssh_client.run(
+        f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}",
+        check=True,
+        timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+    )
+    info = json.loads(inspect.stdout)
+    tag = f"{FLATTENED_IMAGE_REPO}:{info['Id'].removeprefix('sha256:')}"
+    existing = await ssh_client.run(
+        _reuse_command(tag, lease),
+        check=False,
+        timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+    )
+    if existing.exit_status == 0:
+        return tag
+    config = info.get("Config") or {}
+    command = _flatten_command(
+        info["Id"],
+        tag,
+        image_flatten_changes(config),
+        sorted(config.get("Volumes") or ()),
+        int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
+        lease,
+        sized_mark,
+    )
+    # waits up to one flatten for the node lock, then runs its own
+    result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
+    if result.exit_status == FLATTEN_NO_DISK_EXIT:
+        raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
+    if result.exit_status != 0:
+        raise RuntimeError(f"flatten exited {result.exit_status}: {str(result.stderr or '')[-2000:]}")
+    return tag

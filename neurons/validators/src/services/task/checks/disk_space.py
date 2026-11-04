@@ -10,7 +10,7 @@ from core.config import settings
 from ..messages import DiskSpaceMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rented_machine import _rental_of_validated_miner
+from .rental_owner import rental_of_this_node
 
 KB_PER_GB = 1024 * 1024
 
@@ -68,12 +68,9 @@ class DiskSpaceCheck:
                     passed=True,
                     event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what),
                 )
-        rented_data = ctx.state.rented_data
         # same ownership rule as TenantEnforcementCheck: another miner's rental on a different
         # endpoint does not exempt this node
-        rental = _rental_of_validated_miner(
-            ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        )
+        rental = rental_of_this_node(ctx)
         # TenantEnforcementCheck clears ctx.rented at the first ended pod, so a split node can still
         # hold a live rental; ask the backend for each listed pod
         if (
