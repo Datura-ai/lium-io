@@ -8,10 +8,12 @@ publishing one host port of the renting range.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import sys
 import textwrap
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -257,3 +259,16 @@ def test_replayed_nonce_is_refused(client, validator_keypair):
     assert replay.status_code == 409 and "nonce" in replay.text
 
 
+
+
+def test_version_advertises_local_verify_and_its_port(client):
+    body = client.get("/version").json()
+
+    assert "local_verify/1" in body["capabilities"]
+    assert body["local_verify_port"] == settings.INTERNAL_PORT
+
+
+def test_a_script_runs_in_the_home_dir_like_an_ssh_session():
+    result = asyncio.run(lvs.run_script([sys.executable, "-c", "import os; print(os.getcwd())"], timeout=10))
+
+    assert result.stdout.strip() == str(Path.home())

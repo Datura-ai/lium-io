@@ -423,11 +423,6 @@ async def ping(_: None = Depends(verify_ping_signature)):
     return {"status": "pong"}
 
 
-def _capabilities() -> list[str]:
-    # What a validator may call beyond the routes every executor has.
-    return [LOCAL_VERIFY_CAPABILITY]
-
-
 @apis_router.get("/version")
 async def get_version():
     """
@@ -442,7 +437,7 @@ async def get_version():
     """
     return {
         "version": _get_version(),
-        "capabilities": _capabilities(),
+        "capabilities": [LOCAL_VERIFY_CAPABILITY],
         "local_verify_port": settings.INTERNAL_PORT,
     }
 

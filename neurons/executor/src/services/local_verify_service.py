@@ -159,6 +159,8 @@ async def run_script(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, **(env or {})},
+            # an SSH session starts in the home dir; the process cwd (/root/app) is the disk-reserve overlay
+            cwd=Path.home(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
