@@ -151,6 +151,7 @@ class DummyConnectivityService:
         rented_pod_names: list[str] | None = None,
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
+        dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with

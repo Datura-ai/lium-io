@@ -40,9 +40,13 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .rental_owner import rental_of_this_node
+from .task_time import task_seconds_left
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)
+
+# cycle time kept after the rented pod reads, to report the result and close the shell
+POD_READ_RESERVE_SECONDS = 30
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -222,7 +226,12 @@ class TenantEnforcementCheck:
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
             try:
-                pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, pod_container_name, ctx.default_extra)
+                # bounded by the cycle time budget: a read hung on a dead shell ends as a TimeoutError (an OSError),
+                # so the cycle reports the node unreachable instead of being dropped without a result
+                async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
+                    pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(
+                        ctx.ssh, pod_container_name, ctx.default_extra
+                    )
             except (asyncssh.Error, OSError) as exc:
                 return with_pod_states(
                     _executor_transport_unreachable_result(

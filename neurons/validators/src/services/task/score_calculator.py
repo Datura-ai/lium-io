@@ -141,6 +141,12 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("The host wrote into a renter's container")
 
+    # Kernel GPU view gate: BannedProviderCheck is non-fatal on a live rental, so only this
+    # line zeroes the score there.
+    if not ctx.kernel_gpu_view_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Kernel GPU list was overlaid and could not be trusted")
     # Kernel GPU-count gate (DAH-4982): same mechanics as the CPU-truth gate above.
     if not ctx.gpu_kernel_count_passed:
         actual_score = 0.0

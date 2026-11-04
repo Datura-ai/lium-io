@@ -26,6 +26,8 @@ pdm run python src/liumd_host_files.py host || echo "[liumd] host files not writ
 
 # start ssh service
 ssh-keygen -A
+# per-source limits on, unless EXECUTOR_SSH_SOURCE_LIMITS=false or a CVM (sshd_setup.sh says why)
+sh sshd_setup.sh start || echo "[sshd] per-source limits not chosen; keeping the image's drop-ins"
 # sshd logs to syslog (LogLevel VERBOSE from sshd_setup.sh names the key of each login); this container
 # runs no syslog, so sshd_log_receiver.py is /dev/log and keeps the login lines for the validator.
 python3 sshd_log_receiver.py &
