@@ -34,19 +34,19 @@ def test_an_image_whose_default_command_is_a_bare_shell_stays_up(services):
     executor's dockerd, so no registry is involved."""
     from payload_models.payloads import ContainerCreated
 
-    builder = f"e2e-bare-shell-{uuid.uuid4().hex[:8]}"
-    rc, out = lib.executor_sh(
-        f"docker create --name {builder} {lib.ENV['E2E_POD_IMAGE']} >/dev/null"
-        f" && docker commit --change 'CMD [\"/bin/bash\"]' {builder} {BARE_SHELL_IMAGE} >/dev/null"
-        f" && docker rm {builder} >/dev/null"
-        f" && docker image inspect -f '{{{{json .Config.Cmd}}}}' {BARE_SHELL_IMAGE}"
-    )
-    assert rc == 0 and out.strip() == '["/bin/bash"]', (rc, out)
+    builder_container = f"e2e-bare-shell-{uuid.uuid4().hex[:8]}"
     renter_priv, renter_pub = lib.ssh_keypair()
     pod_id = str(uuid.uuid4())
     req = _create_request(pod_id, renter_pub)
     req.docker_image = BARE_SHELL_IMAGE
     try:
+        rc, out = lib.executor_sh(
+            f"docker create --name {builder_container} {lib.ENV['E2E_POD_IMAGE']} >/dev/null"
+            f" && docker commit --change 'CMD [\"/bin/bash\"]' {builder_container} {BARE_SHELL_IMAGE} >/dev/null"
+            f" && docker rm {builder_container} >/dev/null"
+            f" && docker image inspect -f '{{{{json .Config.Cmd}}}}' {BARE_SHELL_IMAGE}"
+        )
+        assert rc == 0 and out.strip() == '["/bin/bash"]', (rc, out)
         created = lib.run(services["MinerService"].handle_container(req))
         assert isinstance(created, ContainerCreated), created
         try:
@@ -65,7 +65,7 @@ def test_an_image_whose_default_command_is_a_bare_shell_stays_up(services):
             )
         )
         lib.executor_sh(
-            f"docker rm -f {builder} >/dev/null 2>&1; docker rmi {BARE_SHELL_IMAGE} >/dev/null 2>&1; true"
+            f"docker rm -f {builder_container} >/dev/null 2>&1; docker rmi {BARE_SHELL_IMAGE} >/dev/null 2>&1; true"
         )
 
 
