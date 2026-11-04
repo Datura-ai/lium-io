@@ -80,6 +80,8 @@ JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 SECONDS_PER_BLOCK = 12
 RECHECK_MIN_SECONDS = 300
 RECHECK_MARGIN_SECONDS = 60
+# A request stays queued until its run publishes, for at most this many runs.
+RECHECK_MAX_RUNS = 2
 
 
 def _cycle_batch_id_or_clock(cycle_batch_id: str) -> str:
@@ -127,6 +129,8 @@ class _Pending:
     failed_runs: int = 0
     # DAH-5716: set for a recheck of an already-validated executor; monotonic end of its run.
     recheck_deadline: float | None = None
+    # Taken only because it was requested: never queued in _pending, so the wave never leaves it out.
+    recheck_only: bool = False
 
 
 class ExpressLane:
@@ -168,6 +172,10 @@ class ExpressLane:
         self._self_hosted_misses: Counter[str] = Counter()  # miner hotkey -> misses in a row
         self._next_self_hosted_listing = 0.0  # monotonic
         self._listing: asyncio.Task | None = None
+        # DAH-5716: runs started per queued recheck request.
+        # shortcut: in memory, so a restart restarts the budget; the request's TTL still bounds it.
+        self._recheck_runs: Counter[str] = Counter()
+        self._rechecks_in_flight: dict[str, str] = {}  # executor id -> miner hotkey
 
     def directories_in_use(self) -> set[str]:
         """Job-files directories a running express verification still reads."""
@@ -226,7 +234,10 @@ class ExpressLane:
         chosen = self._select(snapshot, validated, inputs.fleet_known_since, rechecks)
         for pending in chosen:
             if pending.executor.id in rechecks:
-                await self.redis_service.pop_executor_recheck_request(pending.executor.id)
+                self._recheck_runs[pending.executor.id] += 1
+                if self._recheck_runs[pending.executor.id] >= RECHECK_MAX_RUNS:
+                    # Last run of the budget: whatever its outcome, the request ends here.
+                    await self._end_recheck(pending.executor.id)
                 if pending.executor.id in validated:
                     pending.recheck_deadline = recheck_deadline
         if not chosen:
@@ -342,9 +353,11 @@ class ExpressLane:
                 pending = self._pending.get(executor.id)
                 if pending is None:
                     pending = _Pending(
-                        executor=executor, miner_hotkey=miner_hotkey, first_seen_at=now_wall
+                        executor=executor,
+                        miner_hotkey=miner_hotkey,
+                        first_seen_at=now_wall,
+                        recheck_only=not new_to_lane,
                     )
-                    # A recheck is queued only once chosen: the wave leaves queued executors out.
                     if new_to_lane:
                         self._pending[executor.id] = pending
                 if executor.id in in_flight or pending.not_before > now:
@@ -366,6 +379,7 @@ class ExpressLane:
         per_miner: Counter[str] = Counter(
             self._pending[e].miner_hotkey for e in express_in_flight if e in self._pending
         )
+        per_miner.update(self._rechecks_in_flight.values())
         chosen: list[_Pending] = []
         for pending in candidates:
             if room <= 0:
@@ -373,7 +387,6 @@ class ExpressLane:
             if per_miner[pending.miner_hotkey] >= settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER:
                 continue
             chosen.append(pending)
-            self._pending[pending.executor.id] = pending
             per_miner[pending.miner_hotkey] += 1
             room -= 1
         return chosen
@@ -429,6 +442,8 @@ class ExpressLane:
                 self._defer(pending, "miner is not among the serving opted-in miners")
                 continue
             in_flight[pending.executor.id] = EXPRESS_LANE
+            if pending.recheck_only:
+                self._rechecks_in_flight[pending.executor.id] = pending.miner_hotkey
             self._directories_in_use[directory] += 1
             task = asyncio.create_task(self._verify(pending, miner, inputs, rented_data))
             self._tasks.add(task)
@@ -505,11 +520,6 @@ class ExpressLane:
             await self._publish(pending, miner, results, extra, started)
         except Exception as exc:
             pending.attempts = attempt
-            if pending.recheck_deadline is not None:
-                # Cut off before the next wave: ask again, so it runs after that wave.
-                pending.recheck_deadline = None
-                with suppress(Exception):
-                    await self.redis_service.request_executor_recheck(executor_id)
             logger.error(
                 _m(
                     "[express] Verification failed before a result could be published",
@@ -521,6 +531,7 @@ class ExpressLane:
         finally:
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
+            self._rechecks_in_flight.pop(executor_id, None)
             self._directories_in_use[directory] -= 1
             if self._directories_in_use[directory] <= 0:
                 del self._directories_in_use[directory]
@@ -552,6 +563,9 @@ class ExpressLane:
         await self.miner_service.publish_machine_specs(
             results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
         )
+        pending.recheck_deadline = None
+        with suppress(Exception):
+            await self._end_recheck(executor_id)
         if should_run_first_pass_again:
             # Not recorded as validated, so the lane runs it again; a wave that starts meanwhile
             # claims it through in_flight and its publish records it.
@@ -587,6 +601,10 @@ class ExpressLane:
             )
         self._pending.pop(executor_id, None)
         self._log_published(pending, result, passed, extra, started)
+
+    async def _end_recheck(self, executor_id: str) -> None:
+        self._recheck_runs.pop(executor_id, None)
+        await self.redis_service.pop_executor_recheck_request(executor_id)
 
     def _log_published(
         self,

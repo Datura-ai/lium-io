@@ -611,11 +611,11 @@ async def test_a_requested_validated_executor_is_rechecked_once_under_the_caps(m
     assert await harness.lane.tick() == 2  # per-miner cap
     picked = set(harness.miner_service.in_flight)
     (waiting,) = set(nodes) - picked
-    assert await harness.redis_service.get_executor_recheck_requests() == {waiting}
     assert waiting not in harness.lane._pending  # the wave does not leave a waiting recheck out
     harness.release.set()
     await asyncio.gather(*harness.lane._tasks)
     assert harness.miner_service.publish_machine_specs.await_count == 2
+    assert await harness.redis_service.get_executor_recheck_requests() == {waiting}
 
     assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == set()
@@ -651,3 +651,28 @@ async def test_a_recheck_never_overlaps_the_next_wave(monkeypatch, wallet):
     harness.miner_service.publish_machine_specs.assert_not_awaited()
     assert harness.miner_service.in_flight == {}
     assert await harness.redis_service.get_executor_recheck_requests() == {node}
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_survives_a_deferral_and_ends_with_its_run_budget(monkeypatch, wallet):
+    import core.express_lane as express_lane
+
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+    harness.job_for = lambda payload, executor_id: {"results": []}  # the miner did not return it
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+
+    assert await harness.tick_and_settle() == 1
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+    assert node not in harness.lane._pending  # never queued: the wave keeps scoring it
+
+    for _ in range(express_lane.RECHECK_MAX_RUNS - 1):
+        assert await harness.tick_and_settle() == 1
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+    assert await harness.tick_and_settle() == 0
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
