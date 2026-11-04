@@ -410,6 +410,12 @@ class Settings(BaseSettings):
     # with the same TIMEOUT and CONCURRENCY and reports a pod unreachable after MISSES missed probes in a row.
     RENTED_POD_WATCH_INTERVAL_SECONDS: int = Field(env="RENTED_POD_WATCH_INTERVAL_SECONDS", default=60, ge=0)
     RENTED_POD_WATCH_MISSES: int = Field(env="RENTED_POD_WATCH_MISSES", default=2, ge=1)
+    # no_banner (TCP accepted, sshd silent) mostly recovers by itself: one retry with this timeout first,
+    # then this many misses in a row (~10 min at the default interval)
+    RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS: float = Field(
+        env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
+    )
+    RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
     # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
     # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
     # stores such a report as evidence only (lium-platform) is deployed:
