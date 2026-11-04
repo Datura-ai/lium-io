@@ -66,6 +66,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.4.0` — `LockPodGpuClocksRequest` (backend → validator) and its answer `PodGpuClocksResult` with `GpuClockOutcome`; `GpuResetErrorCode.ClockLockNotSupported` (a renter locks their pod's GPU clocks with `nvidia-smi -i <uuid> -lgc`, clamped to the supported clocks, or resets them with `-rgc`; the pod's delete resets them).
 - `1.18.0` — `ContainerCreateRequest.whole_host` (optional): False when the backend rents the pod part of its host. The validator then hands it no host-wide devices even if every GPU the host shows is in the request. An older validator ignores it.
 - `2.5.0` — `ResumedCreatesReport` (`pod_ids`): sent once by a validator connector after its start sweep, first on its first authenticated socket; the creates the previous connector was running when it was cut off. The validator stores no create request: the backend sends each listed create again from its own records. The backend fails at once a create it sent before that socket authenticated, still waiting and not listed. An older validator never sends it.
+- `2.6.0` — `ExecutorSpecRequest.host_runtime_fault` (optional): this cycle's DinD test container started on the host and its sshd never answered, so the host's container runtime is failing. False for a refused `docker run` or an error on the validator's side; None from an older validator.
 - `1.0.0` — first release.
 
 ## Tests

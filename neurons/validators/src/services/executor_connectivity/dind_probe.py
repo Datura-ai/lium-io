@@ -261,6 +261,7 @@ class DindVerifier:
                 sysbox_runtime=sysbox,
                 port=port,
                 error=error,
+                sshd_never_answered=created and not sshd_answered and isinstance(e, _NODE_SIDE_ERRORS),
             )
         finally:
             # One removal on every way out — ok, failed, raised, and cancelled (the validation

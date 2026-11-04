@@ -120,6 +120,7 @@ class DummyConnectivityService:
         dind_error: DindLogCause | None = None,
         port_ranges: tuple[PortRangeResult, ...] = (),
         sysbox_measured: bool | None = None,
+        host_runtime_fault: bool = False,
     ):
         """
         Args:
@@ -131,6 +132,7 @@ class DummyConnectivityService:
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
         self.dind_error = dind_error
+        self.host_runtime_fault = host_runtime_fault
         self.sysbox_measured = sysbox_measured
         self.port_ranges = port_ranges
         self.success = success
@@ -191,6 +193,7 @@ class DummyConnectivityService:
             dind_error=self.dind_error,
             port_ranges=self.port_ranges,
             sysbox_measured=self.sysbox_measured,
+            host_runtime_fault=self.host_runtime_fault,
         )
 
 
@@ -1695,21 +1698,15 @@ async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("dind_ok", "verified_port_count", "fault"),
-    [(False, 100, True), (True, 100, False), (False, 0, False)],
-    ids=["dind_refused", "dind_answered", "no_probe_ran"],
-)
-async def test_host_runtime_fault_is_a_dind_probe_that_ran_and_failed(
-    context_factory, dind_ok, verified_port_count, fault
-):
-    """DAH-5651: the state says the host's container runtime failed only when the DinD test container was
-    started on a port and never answered; no port to probe is no reading."""
+@pytest.mark.parametrize("fault", [True, False])
+async def test_host_runtime_fault_is_the_dind_probes_own_reading(context_factory, fault):
+    """DAH-5651: the state carries the DinD probe's reading (DindVerifier: the container started and its sshd
+    never answered), not a guess from dind_ok, which a refused `docker run` or our own error also clears."""
     services = build_services(
         redis=DummyRedis(),
         backend=DummyBackendService(),
         connectivity=DummyConnectivityService(
-            success=True, sysbox_runtime=False, verified_port_count=verified_port_count, dind_ok=dind_ok
+            success=True, sysbox_runtime=False, verified_port_count=100, dind_ok=False, host_runtime_fault=fault
         ),
     )
     ctx = context_factory(

@@ -121,6 +121,56 @@ async def test_dind_start_is_killed_on_the_node_before_the_container_is_removed(
     assert "docker rm -fv container_x_9000" in commands[-1]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_exit", "connect_error", "fault"),
+    [
+        (0, ConnectionRefusedError(), True),  # started, sshd never answered
+        (0, TimeoutError(), True),
+        (125, None, False),  # dockerd refused the run
+        (0, RuntimeError("ours"), False),  # the validator's own error
+        (0, None, False),  # sshd answered
+    ],
+    ids=["sshd_refused", "sshd_timeout", "run_refused", "validator_error", "ok"],
+)
+async def test_host_runtime_fault_only_when_the_started_container_never_answers(
+    mocker, run_exit, connect_error, fault
+):
+    # DAH-5651 review: a refused `docker run` or our own error is not a failing host runtime
+    from contextlib import asynccontextmanager
+
+    from services.executor_connectivity import dind_probe
+
+    async def run(cmd):
+        return mocker.Mock(exit_status=run_exit if "docker run" in cmd else 0, stdout="", stderr="")
+
+    @asynccontextmanager
+    async def answered():
+        yield mocker.Mock()
+
+    async def connect(*args, **kwargs):
+        if connect_error is not None:
+            raise connect_error
+        return answered()
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
+    mocker.patch.object(dind_probe.asyncssh, "import_private_key")
+    verifier = dind_probe.DindVerifier(ssh_service)
+    mocker.patch.object(verifier, "_connect_retrying_until_sshd_answers", side_effect=connect)
+
+    result = await verifier.verify(
+        PortPair(9000, 9000),
+        ssh_client=mocker.Mock(run=run),
+        host="1.2.3.4",
+        container_name_prefix="container_x",
+        sysbox=False,
+    )
+
+    assert result.success is (connect_error is None and run_exit == 0)
+    assert result.sshd_never_answered is fault
+
+
 def _batch_verifier(mocker, test_many, external=None):
     from services.executor_connectivity.port_verifiers import BatchVerifier
 

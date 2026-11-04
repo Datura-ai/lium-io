@@ -216,8 +216,7 @@ class PortConnectivityCheck:
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
             externally_unreachable=result.status == "externally_unreachable",
-            # dind_port is None when no probe ran (no free port, an error on our side)
-            host_runtime_fault=result.dind_port is not None and not result.dind_ok,
+            host_runtime_fault=result.host_runtime_fault,
         )
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
