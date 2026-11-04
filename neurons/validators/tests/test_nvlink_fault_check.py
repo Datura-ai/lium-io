@@ -215,22 +215,25 @@ def sxm_board(name="NVIDIA H100 80GB HBM3", count=8, nvlink=False):
 
 @pytest.mark.asyncio
 async def test_a_full_sxm_board_without_nvlink_fails_without_probing(context_factory):
-    result, runner = await run_check(context_factory, sxm_board())
+    result, runner = await run_check(context_factory, sxm_board(name="NVIDIA H200"))
 
     assert result.passed is False
     assert result.event.reason_code == "NVLINK_MISSING"
     assert result.event.severity == "error"
-    assert result.event.what_we_saw["gpu_name"] == "NVIDIA H100 80GB HBM3"
+    assert result.event.what_we_saw["gpu_name"] == "NVIDIA H200"
     assert result.event.what_we_saw["gpu_count"] == 8
     assert runner.calls == []
 
 
 @pytest.mark.asyncio
-async def test_a_raw_tesla_h100_name_is_matched_after_normalization(context_factory):
-    result, _ = await run_check(context_factory, sxm_board(name="Tesla H100 80GB HBM3"))
+async def test_h100_sxm_without_nvlink_is_an_adapter_build_and_passes(context_factory):
+    # DAH-5677: H100 SXM modules on PCIe adapter boards are listed as H100 PCIe, at any GPU count
+    for specs in (sxm_board(), sxm_board(name="Tesla H100 80GB HBM3"), sxm_board(count=2)):
+        result, runner = await run_check(context_factory, specs)
 
-    assert result.passed is False
-    assert result.event.reason_code == "NVLINK_MISSING"
+        assert result.passed is True
+        assert result.event.reason_code == Msg.SKIPPED.reason
+        assert runner.calls == []
 
 
 @pytest.mark.asyncio
@@ -250,3 +253,27 @@ async def test_boards_that_may_lack_nvlink_are_skipped(context_factory, specs):
     assert result.passed is True
     assert result.event.reason_code == Msg.SKIPPED.reason
     assert runner.calls == []
+
+
+def test_an_adapter_build_is_listed_and_published_as_h100_pcie():
+    from neurons.validators.src.services.gpu_spec_table import (
+        is_sxm_on_pcie_adapter,
+        list_sxm_on_pcie_adapter_as_pcie,
+    )
+    from neurons.validators.src.services.task.result_handler import _canonicalize_published_gpu_names
+
+    adapter = sxm_board(name="Tesla H100 80GB HBM3")
+    assert is_sxm_on_pcie_adapter(adapter)
+    assert {gpu["name"] for gpu in _canonicalize_published_gpu_names(adapter)["gpu"]["details"]} == {
+        "NVIDIA H100 PCIe"
+    }
+    # an HGX board, one GPU (nvlink None), another SXM-only model and an old executor keep their name
+    for specs in (
+        sxm_board(nvlink=True),
+        {**sxm_board(count=1), "interconnect": {"nvlink": None}},
+        sxm_board(name="NVIDIA H200"),
+        {"gpu": sxm_board()["gpu"]},
+    ):
+        assert not is_sxm_on_pcie_adapter(specs)
+        details = specs["gpu"]["details"]
+        assert list_sxm_on_pcie_adapter_as_pcie(specs, details) is details

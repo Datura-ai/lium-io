@@ -49,6 +49,8 @@ Pre-check policy:
 
 from __future__ import annotations
 
+from typing import Any
+
 from services.const import GPU_MODEL_RATES
 from services.gpu_reference_table import pick_reference
 
@@ -228,6 +230,30 @@ def normalize_gpu_model(name: str | None) -> str:
 
 
 RTX_4090 = "NVIDIA GeForce RTX 4090"
+H100_SXM = "NVIDIA H100 80GB HBM3"
+H100_PCIE = "NVIDIA H100 PCIe"
+
+
+def is_sxm_on_pcie_adapter(specs: dict[str, Any]) -> bool:
+    """DAH-5677 (Rustam): H100 SXM modules on SXM-to-PCIe adapter boards, listed and paid as H100 PCIe.
+
+    The driver names them "H100 80GB HBM3" like an HGX board, but there is no NVLink: the scrape reads
+    `interconnect.nvlink` False (every pair on PCIe; None on one GPU or an old executor, never this).
+    No signal tells such a build from an HGX board whose fabric is down; only this one node was ever
+    caught, so both are listed as what renters get, a PCIe card with no NVLink.
+    """
+    interconnect = specs.get("interconnect")
+    if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is False):
+        return False
+    details = (specs.get("gpu") or {}).get("details") or []
+    return {normalize_gpu_model(gpu.get("name")) for gpu in details if isinstance(gpu, dict)} == {H100_SXM}
+
+
+def list_sxm_on_pcie_adapter_as_pcie(specs: dict[str, Any], gpu_details: list[Any]) -> list[Any]:
+    """gpu_details (already canonical) with the adapter build's name set to H100 PCIe, else unchanged."""
+    if not is_sxm_on_pcie_adapter(specs):
+        return gpu_details
+    return [{**gpu, "name": H100_PCIE} if isinstance(gpu, dict) and gpu.get("name") else gpu for gpu in gpu_details]
 RTX_4090_48GB = "NVIDIA GeForce RTX 4090 48GB"
 
 

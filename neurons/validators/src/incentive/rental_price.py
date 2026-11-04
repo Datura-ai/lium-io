@@ -72,6 +72,9 @@ NVIDIACTL_ROOT_UID = 0
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
 FILLER_REVENUE_PAY_FACTOR = 1.0
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
+# DAH-5677 (Rustam): idle pay of an H100 SXM-on-PCIe-adapter node (listed as H100 PCIe) per GPU-hour, as a
+# share of its GPU configuration's filler average, in place of the H100 PCIe rate. No average: no idle pay.
+SXM_ON_PCIE_ADAPTER_FILLER_PAY_FACTOR = 0.9
 # The share of the secure rental incentive that a rented spot node earns (ENABLE_SPOT_RENTAL_INCENTIVE).
 SPOT_RENTAL_INCENTIVE_FACTOR = 0.5
 
@@ -1289,6 +1292,7 @@ class RentalPriceIncentive(DefaultIncentive):
             result.filler_revenue_per_gpu_hour is None
             or not result.max_cap
             or not result.hourly_rate
+            or result.sxm_on_pcie_adapter  # already priced from the filler average, below the floor
         ):
             return diluted_rate
         return max(diluted_rate, SECURE_FILLER_REVENUE_FLOOR_FACTOR * result.filler_revenue_per_gpu_hour)
@@ -1323,6 +1327,9 @@ class RentalPriceIncentive(DefaultIncentive):
                 self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
             )
             hourly_rate = max(hourly_rate, rate_for_min)
+        # same GPU counts in the program as an H100 PCIe, at its own rate
+        if result.sxm_on_pcie_adapter and hourly_rate > 0:
+            return SXM_ON_PCIE_ADAPTER_FILLER_PAY_FACTOR * (result.filler_revenue_per_gpu_hour or 0.0)
         return hourly_rate
 
     @staticmethod
