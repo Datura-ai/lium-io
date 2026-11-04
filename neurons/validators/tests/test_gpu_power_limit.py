@@ -436,6 +436,8 @@ async def test_the_synced_marker_is_read_before_the_list(monkeypatch) -> None:
         (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), None, [0.8, 1.0], [0.8, 1.0]),
         # F-36: GPU-1 missing but scored in the 80 % tier before the rental: it starts at what the renter saw
         (AsyncMock(return_value=_power(280) | {"GPU-1": None}), (280, 280), "0.8", [0.8, 0.8], [0.8, 0.8]),
+        # F-43: GPU-1 missing, its tier cache a stale 0.8 (a lost clear); the retry reads it at stock: 1.0
+        (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (350, 350), "0.8", [1.0, 0.8], [1.0, 1.0]),
         # GPU-0 read at stock, GPU-1 missing; the host cuts GPU-0 to 80 % before the retry: it keeps 1.0
         (AsyncMock(return_value=_power(350) | {"GPU-1": None}), (280, 280), None, [1.0, 1.0], [1.0, 1.0]),
         # a scored value outside the tier proves nothing: stock

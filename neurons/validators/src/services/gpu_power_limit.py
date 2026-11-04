@@ -780,19 +780,26 @@ async def _record_rental_start_ratios(
     writes = RedisWrites()
     unreadable: list[str] = []
     for gpu_uuid, key, old, scored_raw in zip(uuids, keys, existing, scored):
-        if rental_record_pod_id(old) == pod_id:
-            continue  # a reboot or edit of the same rental keeps the limit it started on
         state = state_by_uuid.get(gpu_uuid)
-        if state is None or state.default_watts is None or state.default_watts <= 0:
+        readable = state is not None and state.default_watts is not None and state.default_watts > 0
+        same_rental = rental_record_pod_id(old) == pod_id
+        guessed = _guessed_start_ratio(old) if same_rental else None
+        if same_rental and (guessed is None or not readable):
+            continue  # a reboot or edit of the same rental keeps the limit it started on
+        if not readable:
             # the tier the renter saw, else held at 90 %; a retry keeps this start, so a later read cannot lower it
             unreadable.append(gpu_uuid)
             ratio = _scored_tier_ratio(scored_raw)
         else:
             ratio = state.current_watts / state.default_watts
+            if guessed is not None:
+                # F-43: the guess may be a stale 0.8 tier cache; a retry's real reading only raises it
+                ratio = max(ratio, guessed)
         if legacy or pod_on_host or ratio < MIN_POWER_LIMIT_RATIO:
             # raised to its default just above, or a running rental from before the records: it stays at 90 %
             ratio = 1.0
-        writes.set(key, json.dumps({"pod_id": pod_id, "ratio": round(ratio, 4)}), ex=RENTAL_START_RATIO_TTL_SECONDS)
+        record = {"pod_id": pod_id, "ratio": round(ratio, 4)} | ({"guessed": True} if not readable else {})
+        writes.set(key, json.dumps(record), ex=RENTAL_START_RATIO_TTL_SECONDS)
     try:
         # one MULTI/EXEC: a pod's GPUs are recorded together or not at all, so a retry never mixes starts
         await redis.write_atomically(writes)
@@ -800,6 +807,15 @@ async def _record_rental_start_ratios(
         raise GpuPowerRestoreStateError(f"GPU power rental-start ratios not recorded: {exc}") from exc
     if unreadable:
         raise RuntimeError(f"GPU power state of {', '.join(unreadable)} unreadable; recorded at stock, create retried")
+
+
+def _guessed_start_ratio(raw: str | bytes | None) -> float | None:
+    """The ratio of a rental-start record written for an unreadable GPU, else None."""
+    try:
+        record = json.loads(raw)
+        return float(record["ratio"]) if record.get("guessed") else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def _scored_tier_ratio(raw: str | bytes | None) -> float:
