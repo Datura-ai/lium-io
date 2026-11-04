@@ -6320,9 +6320,9 @@ class DockerService:
             if isinstance(outcome, BaseException):
                 raise outcome
         if setup_result.exit_status != 0:
-            own_failure = _VOLUME_SETUP_EXEC_FAILURES.get(setup_result.exit_status)
-            step, message = own_failure or _VOLUME_SETUP_UPLOAD_FAILURE
-            await fail_step(step, message, setup_result, exec_failed=own_failure is None)
+            script_reported_failure = _VOLUME_SETUP_EXEC_FAILURES.get(setup_result.exit_status)
+            step, message = script_reported_failure or _VOLUME_SETUP_UPLOAD_FAILURE
+            await fail_step(step, message, setup_result, exec_failed=script_reported_failure is None)
 
         # The mount is created by root, so on an image whose USER is not root the
         # renter's own workload would own nothing inside its workspace and could
