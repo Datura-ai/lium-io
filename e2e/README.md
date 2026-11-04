@@ -124,7 +124,7 @@ customer create on a node running a `filler_*` container removes the filler and 
 ## Known verdicts the suite pins
 
 - **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** The stack's executor has no `libnvidia-ml`, so
-  `miner_jobs/machine_scrape.py` returns before any GPU field and then derives its output key from `gpu_details[0]`;
+  `miner_jobs/machine_scrape.py` returns an empty GPU list and then derives its output key from `gpu_details[0]`;
   the validator sees the scrape's `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
   the current behaviour so a change to it is a visible diff (and the misleading remediation is tracked as a ticket).
 

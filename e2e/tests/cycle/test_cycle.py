@@ -6,7 +6,7 @@ build a JobResult. Nothing is mocked below the chain: the same pyarmor/PyInstall
 hop, the same checks. `publish_machine_specs` then puts the verdict on the redis channel the connector forwards to
 the platform — the message a node's "verification" state on lium.io is made from.
 
-Without a GPU (CI) the executor has no libnvidia-ml, so the scrape returns no GPU fields, fails on the executor (it keys
+Without a GPU (CI) the executor has no libnvidia-ml, so the scrape returns an empty GPU list, fails on the executor (it keys
 its output on the first GPU's fields) and the pipeline halts with SCRAPE_FAILED_ON_HOST, score 0 — the verdict a
 provider whose driver library is gone gets today. (A host whose NVML loads but lists 0 GPUs gets SCRAPE_FAILED_NO_GPU.) With
 E2E_GPU=1 the executor sees the host's GPUs and the cycle must report them.
@@ -75,7 +75,7 @@ def test_cycle_reaches_the_executor_and_returns_a_verdict(services):
     else:
         # no GPU on this host: the key was installed, the scrape was uploaded and RAN on the executor (the stderr tail
         # in the event is the scrape's own traceback), and the pipeline halted with the verdict a host without
-        # libnvidia-ml gets today — SCRAPE_FAILED_ON_HOST (machine_scrape returns before any GPU field and derives its
+        # libnvidia-ml gets today — SCRAPE_FAILED_ON_HOST (machine_scrape returns an empty GPU list and derives its
         # output key from gpu_details[0], an IndexError; see README "known verdicts").
         assert job.score == 0 and job.gpu_count == 0
         assert "SCRAPE_FAILED_ON_HOST" in job.log_text, job.log_text
