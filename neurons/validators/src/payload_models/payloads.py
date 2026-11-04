@@ -856,6 +856,7 @@ class GpuResetErrorCode(enum.Enum):
     OperationInProgress = "OperationInProgress"
     ExecutorUnreachable = "ExecutorUnreachable"
     ClockLockNotSupported = "ClockLockNotSupported"
+    GpuHung = "GpuHung"
 
 
 class GpuResetOutcome(BaseModel):
