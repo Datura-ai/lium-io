@@ -491,8 +491,17 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
+# a run that gives no verdict: the renter's GPU reset, or a pod created while the run was going
+_NO_VERDICT_REASONS = frozenset(
+    {
+        MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+        TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+    }
+)
+
+
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
-    return result.failure_reason_code == MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason
+    return result.failure_reason_code in _NO_VERDICT_REASONS
 
 
 # rental and pay flags the held result of this cycle reads fresh from the cycle's rental snapshot
