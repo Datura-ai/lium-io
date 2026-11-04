@@ -292,7 +292,10 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
 ):
     """DAH-2959 + DAH-3011 compose: with the retry flag on, the cold-sample retry is a first-pass
     probe too — the 128 GB / 5 GB write must not come back on the second sample."""
-    service = _ConfigAwareSequence(_probe(59.9), _probe(500.0))
+    retry = _probe(500.0)
+    # the adopted retry's disk reading is judged again (DiskSpaceCheck): give it one that clears the floor
+    retry.data["hard_disk"] = {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024}
+    service = _ConfigAwareSequence(_probe(59.9), retry)
 
     result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 

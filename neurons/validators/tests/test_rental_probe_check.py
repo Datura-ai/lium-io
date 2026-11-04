@@ -1509,8 +1509,7 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
     # DAH-5462: then VerifyX's cold-sample retry, in the time every other check left
     assert ids.index("IdleDiskWriteCheck") == ids.index("VerifyXColdRetryCheck") - 1
-    # then the disk floor once more on the sample the retry published (review 5766179891)
-    assert ids[ids.index("VerifyXColdRetryCheck") + 1 : ids.index("ScoreCheck")] == ["DiskSpaceCheck"]
+    assert ids.index("VerifyXColdRetryCheck") == ids.index("ScoreCheck") - 1
     assert ids.index("RentalProbeCheck") > ids.index("PortConnectivityCheck")
     assert ids.index("RentalProbeCheck") > ids.index("TenantEnforcementCheck")
     dry = [
@@ -1518,7 +1517,7 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     ]
     assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
     fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
-    assert fast[-6:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck", "DiskSpaceCheck"]
+    assert fast[-5:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
 
 
 @pytest.mark.asyncio

@@ -42,7 +42,13 @@ EXECUTOR = "executor-123"  # tests.helpers.default_executor().uuid
 def _probe(download: float | None, *, success: bool = True, upload: float | None = 40.0) -> MockVerifyXResponse:
     network = {} if download is None else {"download_speed": download, "upload_speed": upload}
     return MockVerifyXResponse(
-        data={"success": success, "ram": {"total": 64}, "hard_disk": {"total": 1000}, "network": network}
+        # a disk reading that clears the floor, as an adopted retry's is judged again (DiskSpaceCheck)
+        data={
+            "success": success,
+            "ram": {"total": 64},
+            "hard_disk": {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024},
+            "network": network,
+        },
     )
 
 
@@ -570,9 +576,9 @@ async def test_reaping_stale_runs_is_bounded_per_cycle(context_factory, monkeypa
 def test_the_cold_retry_runs_after_every_other_check_right_before_scoring(fast_path):
     checks = PipelineFactory.build_checks(fast_path=fast_path)
     names = [type(c).__name__ for c in checks]
-    assert names.index("VerifyXCheck") < names.index("VerifyXColdRetryCheck") == names.index("ScoreCheck") - 2
-    # review 5766179891: the disk floor is judged again on the published (possibly retried) sample
-    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["DiskSpaceCheck", "ScoreCheck", "FinalizeCheck"]
+    assert names.index("VerifyXCheck") < names.index("VerifyXColdRetryCheck") == names.index("ScoreCheck") - 1
+    # review 5766876557: the disk floor is judged again inside the retry check, only on an adopted retry
+    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["ScoreCheck", "FinalizeCheck"]
     assert not any(isinstance(c, ParallelStage) for c in checks[names.index("VerifyXColdRetryCheck") :])
 
 
@@ -870,7 +876,7 @@ async def test_a_used_retry_replaces_the_first_samples_judgement(context_factory
     def probe(download, disk):
         response = _probe(download)
         response.data["network"]["cloudflare_fallback"] = True
-        response.data["hard_disk"] = {"total": 1000, "write_speed": disk}
+        response.data["hard_disk"] = {**response.data["hard_disk"], "write_speed": disk}
         return response
 
     ctx = _ctx(context_factory, _ProbeSequence(probe(40.0, 100.0), probe(760.0, 900.0)), _never_measured())
@@ -891,27 +897,42 @@ GIB_KB = 1024 * 1024
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scraped", "retry_download", "used", "disk_passes"),
+    ("case", "scraped", "first_download", "retry_download", "passed", "disk_judged"),
     [
-        # the scrape omitted capacity (hard_disk_scrape_error): the used sample's disk reading is the one published
-        ({}, 760.0, "retry", False),
-        ({}, 40.0, "first", True),
-        # the scrape's capacity fields win over either sample
-        ({"utilization": 50.0, "free": 500 * GIB_KB}, 760.0, "retry", True),
-        ({"utilization": 50.0, "free": 500 * GIB_KB}, 40.0, "first", True),
+        # no retry pending (the first sample cleared the gate): the disk floor is not judged again
+        ("no_pending", {}, 760.0, 760.0, True, False),
+        # no time left to re-measure (review 5766876557): the first sample stands, no second disk check
+        ("skipped", {}, 88.0, 760.0, False, False),
+        # the retry ran but was not better: the first sample stands, no second disk check
+        ("first", {}, 88.0, 40.0, False, False),
+        # adopted retry, the scrape omitted capacity (hard_disk_scrape_error): its 94%-full reading fails
+        ("retry", {}, 88.0, 760.0, False, True),
+        # adopted retry, the scrape's capacity fields win over either sample
+        ("retry", {"utilization": 50.0, "free": 500 * GIB_KB}, 88.0, 760.0, True, True),
     ],
 )
-async def test_the_disk_floor_judges_the_sample_the_cold_retry_published(
-    context_factory, scraped, retry_download, used, disk_passes
+async def test_the_disk_floor_is_judged_again_only_on_an_adopted_retry(
+    context_factory, monkeypatch, case, scraped, first_download, retry_download, passed, disk_judged
 ):
-    from neurons.validators.src.services.task.checks.disk_space import DiskSpaceCheck
+    from neurons.validators.src.services.task.checks import disk_space
+
+    disk_runs = []
+    real_run = disk_space.DiskSpaceCheck.run
+
+    async def counted_run(self, ctx):
+        disk_runs.append(ctx.state.specs["hard_disk"])
+        return await real_run(self, ctx)
+
+    monkeypatch.setattr(disk_space.DiskSpaceCheck, "run", counted_run)
+    if case == "skipped":
+        monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 200.0)
 
     def probe(download, utilization):
         response = _probe(download)
         response.data["hard_disk"] = {"total": 1000, "utilization": utilization, "free": 120 * GIB_KB}
         return response
 
-    service = _ProbeSequence(probe(88.0, 80.0), probe(retry_download, 94.0))
+    service = _ProbeSequence(probe(first_download, 80.0), probe(retry_download, 94.0))
     ctx = context_factory(
         services=build_services(verifyx=service),
         config=build_context_config(),
@@ -919,7 +940,15 @@ async def test_the_disk_floor_judges_the_sample_the_cold_retry_published(
     )
 
     result = await _run(ctx)
-    assert result.event.what_we_saw["cold_sample_retry"]["used"] == used
-    disk = await DiskSpaceCheck().run(ctx.model_copy(update=result.updates))
 
-    assert disk.passed is disk_passes
+    assert result.passed is passed
+    assert len(disk_runs) == (1 if disk_judged else 0)
+    if case == "skipped":
+        assert result.event.what_we_saw["cold_sample_retry"] == {"skipped_task_seconds_left": 200}
+    elif case in ("first", "retry") and not (disk_judged and not passed):
+        assert result.event.what_we_saw["cold_sample_retry"]["used"] == case
+    if disk_judged and not passed:
+        # the disk failure is the result; the retry's own judgement is reported before it
+        assert result.event.check_id == "executor.validate.disk_space"
+        assert result.extra_events[-1].what_we_saw["cold_sample_retry"]["used"] == "retry"
+        assert result.updates["state"].specs["network"]["verifyx_download_speed"] == pytest.approx(760.0)

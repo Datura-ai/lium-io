@@ -28,6 +28,7 @@ from services.verifyx_validation_service import (
 
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .disk_space import DiskSpaceCheck
 from .network_ema import compute_ema
 from .task_time import task_seconds_left
 
@@ -1028,7 +1029,17 @@ class VerifyXColdRetryCheck:
         )
         if not use_retry:
             return self._first_sample_stands(ctx, pending, asdict(cold_sample_retry))
-        return self._judge_once(ctx, pending, retry, "ssh", asdict(cold_sample_retry))
+        judged = self._judge_once(ctx, pending, retry, "ssh", asdict(cold_sample_retry))
+        if not judged.passed:
+            return judged
+        # the adopted retry replaced the disk readings DiskSpaceCheck judged earlier: judge them once more,
+        # only here, so a cycle that kept its first sample never spends time on a second disk check
+        disk = await DiskSpaceCheck().run(ctx.model_copy(update=judged.updates))
+        if disk.passed:
+            return judged
+        return disk.model_copy(
+            update={"updates": judged.updates, "extra_events": [*judged.extra_events, judged.event]}
+        )
 
     def _first_sample_stands(
         self, ctx: Context, pending: ColdRetryPending, what: dict
