@@ -80,6 +80,7 @@ from services.task.availability import (
     availability_errors,
     build_executor_unreachable_by_miner_event,
     build_rented_executor_not_listed_event,
+    RunningOutageTally,
 )
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
@@ -373,6 +374,10 @@ class MinerService:
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
         # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
         self.published_gpu_uuids: dict[str, set[str]] = {}
+        # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
+        self.outage_tally: RunningOutageTally | None = None
+        # DAH-5635: executor uuid -> the availability errors this process's last cycle publish sent for it
+        self.cycle_published_availability: dict[str, list[dict]] = {}
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -1205,6 +1210,42 @@ class MinerService:
                 exc_info=True,
             )
 
+    async def publish_unreachable_early(self, job: dict | None) -> None:
+        """DAH-5635: publish an unrented node that failed with an availability error as soon as its
+        miner answers, spec-only like publish_gpu_set_changes (scored_at None), so the backend hides
+        it now and not after the slowest miner in the fleet (a node lost at 13:26 was hidden at 13:36
+        and failed a rent meanwhile). ``outage_tally`` decides what may go (RunningOutageTally); the
+        cycle's publish overwrites it. Never fails the wave."""
+        tally = self.outage_tally
+        if not job or tally is None:
+            return
+        try:
+            early = tally.add(job.get("results") or [])
+            if not early or not job.get("miner_coldkey"):
+                return
+            # recorded before the publish: a node hidden by a partial publish must be re-listable too
+            tally.published_early.update(str(result.executor_info.uuid) for result in early)
+            await self.publish_machine_specs(
+                early, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+            logger.info(
+                _m(
+                    "[sync] Unreachable nodes published ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [str(result.executor_info.uuid) for result in early],
+                        }
+                    ),
+                )
+            )
+        except Exception as exc:
+            # never costs the miner its cycle result: the cycle still publishes the node
+            logger.error(
+                _m("Early publish of unreachable nodes failed", extra=get_extra_info({"error": str(exc)})),
+                exc_info=True,
+            )
+
     async def publish_machine_specs(
         self,
         results: list[JobResult],
@@ -1242,6 +1283,12 @@ class MinerService:
             ),
         )
         batch_total = len(results) if is_whole_miner_batch else None
+        if is_whole_miner_batch:
+            for result in results:
+                if result.availability_errors is not None:
+                    self.cycle_published_availability[str(result.executor_info.uuid).lower()] = list(
+                        result.availability_errors
+                    )
         for result in results:
             try:
                 await self.redis_service.publish(

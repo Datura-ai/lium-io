@@ -25,6 +25,7 @@ from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ logger = logging.getLogger(__name__)
 SYSBOX_TEST_TIMED_OUT = "Test command timed out."
 
 VERIFIED_PORTS_MEMORY_TTL_SECONDS = 24 * 3600
+# cycle time the DinD create leaves for the checks after it (a rented node's reads take up to ~4 min), so a slow
+# create ends as a failed DinD check instead of the cycle being dropped without a result (5bf1770f, 3 Nov 23:23Z)
+CHECKS_AFTER_DIND_RESERVE_SECONDS = 240
 DISK_PRESSURE_DEFERRALS_TTL_SECONDS = 24 * 3600
 # the two snapshots, the syncfs poll cap and a margin for the sysfs walk
 DISK_PRESSURE_READ_TIMEOUT_SECONDS = SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS + 15
@@ -164,6 +168,7 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
+            dind_deadline_monotonic=time.monotonic() + task_seconds_left(ctx) - CHECKS_AFTER_DIND_RESERVE_SECONDS,
         )
         if probe_sysbox and not ctx.state.sysbox_runtime:
             # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
@@ -271,7 +276,11 @@ class PortConnectivityCheck:
         if result.failed_ports:
             msg += f" fail={len(result.failed_ports)}{fail_sample}"
 
-        if result.status != "ok":
+        # DAH-3266: the rental holds every declared port, so nothing was free to probe: not a port fault
+        declared = sum(r.declared for r in result.port_ranges)
+        all_ports_rented = result.status == "no_ports" and declared > 0 and len(rented_ports) >= declared
+
+        if result.status != "ok" and not all_ports_rented:
             # Fetch fresh rental data from backend to ensure we have latest state
             backend_client = ctx.services.backend
             fresh_rented_data = await backend_client.get_all_rented_executors()
@@ -337,7 +346,7 @@ class PortConnectivityCheck:
             )
 
         event = render_message(
-            Msg.VERIFY_OK,
+            Msg.SKIPPED_ALL_PORTS_RENTED if all_ports_rented else Msg.VERIFY_OK,
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},
