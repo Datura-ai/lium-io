@@ -1449,6 +1449,13 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    SKIPPED_ALL_PORTS_RENTED = MessageTemplate(
+        event="Port verification skipped: the rental holds every port",
+        reason="PORT_CHECK_SKIPPED_ALL_PORTS_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed; the ports are checked again once one is free",
+    )
     VERIFY_DEFERRED = MessageTemplate(
         event="Port verification deferred: the Docker filesystem is backed up with a tenant's writes",
         reason="PORT_VERIFY_DEFERRED",
