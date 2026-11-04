@@ -592,7 +592,7 @@ class ResticStorageRunner:
         if helper:
             self._remove_stopped_helpers()
             self._remove_helper_container()
-        helper_since = str(int(time.time()) - 1)
+        helper_since = f"{time.time():.6f}"
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -787,10 +787,11 @@ class ResticStorageRunner:
                 continue
             actor = event.get("Actor") if isinstance(event.get("Actor"), dict) else {}
             attributes = actor.get("Attributes") if isinstance(actor.get("Attributes"), dict) else {}
-            self._helper_id = self._helper_id or str(event.get("id") or actor.get("ID") or "")
+            event_id = str(event.get("id") or actor.get("ID") or "")
+            self._helper_id = self._helper_id or event_id
             # signal/exitCode/execDuration only: other attributes are image labels
             kept = {key: attributes[key] for key in ("signal", "exitCode", "execDuration") if key in attributes}
-            lines.append(f"{event.get('time')} {event.get('Action') or event.get('status')} {json.dumps(kept)}")
+            lines.append(f"{event.get('time')} {event_id[:12]} {event.get('Action') or event.get('status')} {json.dumps(kept)}")
         self._events.log("helper docker events: " + (" | ".join(lines) or f"none (exit {listed.returncode})"))
 
     def _killed_helper_message(self, action: str) -> str:

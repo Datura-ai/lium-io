@@ -927,6 +927,7 @@ def test_removed_helper_logs_its_docker_events_and_matches_the_kernel_by_their_i
     assert events_call[events_call.index("--filter") + 1] == f"container=lium-storage-{str(OPERATION_ID)[:12]}"
     log = output.getvalue()
     assert 'kill {\\"signal\\": \\"9\\"}' in log and "destroy {}" in log
+    assert f"{HELPER_ID[:12]} kill" in log  # the ID is logged for correlation when dmesg has no match
     assert "image" not in log.split("helper docker events")[1].split("\n")[0]
     assert "kernel: no kernel kill line for the helper" in log  # the ID from the events reached the kernel check
 
