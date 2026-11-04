@@ -535,9 +535,14 @@ class ExecutorService:
             for executor in executors
         ]
 
-        results = [
-            result for result in await asyncio.gather(*tasks, return_exceptions=True) if result
-        ]
+        # DAH-5734: answer by the deadline with the uploads that finished. Attempt 1 always gets its full 10 s, so a few
+        # dead executors could push the answer past the validator's 30 s and it then skipped the whole hotkey (4 Nov).
+        done, pending = set(), set()
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=max(0.0, deadline - time.monotonic()))
+        for task in pending:
+            task.cancel()
+        results = [task.result() for task in done if not task.exception() and task.result()]
         logger.info(
             _m( 
                 "Sent pubkey register to executors",
@@ -547,6 +552,7 @@ class ExecutorService:
                     "executor_ids": [str(executor.uuid) for executor in executors],
                     "executors": len(executors),
                     "accepted_executors": len(results),
+                    "cut_off_at_deadline": len(pending),
                 }),
             ),
         )

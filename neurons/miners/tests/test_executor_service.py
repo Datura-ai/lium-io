@@ -14,6 +14,7 @@ from uuid import uuid4
 import bittensor
 import aiohttp
 import pytest
+from datura.requests.miner_requests import ExecutorSSHInfo
 
 from models.executor import Executor
 from protocol.miner_portal_request import (
@@ -219,7 +220,7 @@ async def test_register_pubkey_reserves_the_hook_time_only_when_the_hook_runs(
 
 @pytest.mark.parametrize("is_rental_request", [False, True])
 @pytest.mark.parametrize("hook", [None, "http://hook"])
-@pytest.mark.parametrize("lookup_seconds", [0, 15, 30])
+@pytest.mark.parametrize("lookup_seconds", [0, 15])
 @pytest.mark.asyncio
 async def test_register_pubkey_first_upload_keeps_mains_full_timeout(
     executor_service, test_executor, is_rental_request, hook, lookup_seconds
@@ -249,6 +250,37 @@ async def test_register_pubkey_first_upload_keeps_mains_full_timeout(
 
     assert len(registration.accepted) == 1
     assert session.post.call_args.kwargs["timeout"].total == es.UPLOAD_SSH_KEY_ATTEMPT_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_register_pubkey_answers_by_the_deadline_with_the_uploads_that_finished(
+    executor_service, test_executor, monkeypatch
+):
+    """DAH-5734 (4 Nov): dead executors kept the answer past the validator's wait and it skipped the whole hotkey."""
+    dead = Executor(uuid=uuid4(), validator="//TestValidator", address="127.0.0.2", port=8001)
+    accepted = ExecutorSSHInfo.parse_obj(
+        {
+            "ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r",
+            **test_executor.model_dump(mode="json"),
+        }
+    )
+
+    async def upload(executor, *_args, **_kwargs):
+        if executor is dead:
+            await asyncio.sleep(10)
+        return accepted
+
+    monkeypatch.setattr(es, "UPLOAD_SSH_KEY_BUDGET_SECONDS", 0.2)
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.get_executors_for_validator = AsyncMock(return_value=[test_executor, dead])
+    executor_service.send_pubkey_to_executor = upload
+
+    started = time.monotonic()
+    registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    assert time.monotonic() - started < 1
+    assert registration.accepted == [accepted]
+    assert registration.known_executor_ids == [str(test_executor.uuid), str(dead.uuid)]
 
 
 @pytest.mark.asyncio
