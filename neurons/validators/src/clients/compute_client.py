@@ -156,6 +156,24 @@ class OutgoingMessages(list[DeliveryStamps]):
         self.appended.set()
 
 
+# DAH-5592: the backend's billing exemption for a failed reboot (lium-platform utils/reboot_fault.py PROVIDER_ERROR_CODES)
+HOST_FAULT_ERROR_CODES = frozenset(
+    {FailedContainerErrorCodes.ExecutorUnreachable.value, FailedContainerErrorCodes.InvalidExecutorId.value}
+)
+
+
+def _is_host_fault_failure(raw: str) -> bool:
+    try:
+        reply = json.loads(raw)
+    except ValueError:
+        return False
+    return (
+        reply.get("message_type") == FailedContainerRequest.model_fields["message_type"].default.value
+        and bool(reply.get("command_id"))
+        and reply.get("error_code") in HOST_FAULT_ERROR_CODES
+    )
+
+
 def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
     """Keeps the leading findings of an oversized report that fit one frame; counts the rest.
 
@@ -405,9 +423,26 @@ class ComputeClient:
             self.resumed_creates_report = None
 
         self.ws = ws
+        await self._resend_host_fault_failures()
 
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
+
+    async def _resend_host_fault_failures(self) -> None:
+        """DAH-5592: the host-fault create failures of the last HOST_FAULT_FAILURE_RESEND_SECONDS, again on this socket."""
+        try:
+            raws = await self.miner_service.redis_service.recent_host_fault_failures(
+                settings.HOST_FAULT_FAILURE_RESEND_SECONDS
+            )
+            replies = [BaseValidatorResponse.parse(raw) for raw in raws]
+        except Exception:
+            logger.exception(_m("Could not read the kept host-fault create failures", extra=self.logging_extra))
+            return
+        if not replies:
+            return
+        async with self.lock:
+            for reply in replies:
+                self.message_queue.append(reply)
 
     async def subscribe_mesages_from_redis(self):
         validator_hotkey = self.my_hotkey()
@@ -1043,6 +1078,11 @@ class ComputeClient:
                 )
             except Exception:
                 logger.exception("Failed to finish backend command: %s", command_id)
+            if any(_is_host_fault_failure(raw) for raw in responses):
+                try:
+                    await redis_service.keep_host_fault_failure(command_id, responses)
+                except Exception:
+                    logger.exception("Failed to keep a host-fault create failure: %s", command_id)
 
     async def _handle_backend_command_duplicate(
         self, job_request: BaseServerRequest, existing: BackendCommand

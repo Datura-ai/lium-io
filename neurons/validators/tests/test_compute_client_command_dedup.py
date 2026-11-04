@@ -11,6 +11,7 @@ from payload_models.payloads import (
     AddSshPublicKeyRequest,
     ContainerCreateRequest,
     ContainerCreated,
+    FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
     SshPubKeyAdded,
@@ -52,6 +53,16 @@ class FakeRedis:
             if value == claim:
                 self.refreshed.set()
 
+    async def hset(self, key, field, value):
+        self.values.setdefault(key, ({}, float("inf")))[0][field] = value
+
+    async def hgetall(self, key):
+        return dict(self.values.get(key, ({}, 0))[0])
+
+    async def hdel(self, key, *fields):
+        for field in fields:
+            self.values.get(key, ({}, 0))[0].pop(field, None)
+
     async def scan_iter(self, *, match, count):
         for key in list(self.values):
             if fnmatch(key, match):
@@ -64,6 +75,7 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "BACKEND_COMMAND_HEARTBEAT_SECONDS", 0.001)
     service = RedisService.__new__(RedisService)
     service.redis = FakeRedis()
+    service.lock = asyncio.Lock()
     client = ComputeClient.__new__(ComputeClient)
     client.message_queue = OutgoingMessages()
     client.lock = asyncio.Lock()
@@ -262,3 +274,40 @@ async def test_a_create_failure_echoes_the_create_command_id(client):
     await client.miner_driver(request("create-a"))
 
     assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["create-a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "kept"),
+    [(FailedContainerErrorCodes.ExecutorUnreachable, True), (FailedContainerErrorCodes.InvalidExecutorId, True),
+     (FailedContainerErrorCodes.UnknownError, False)],
+)
+async def test_a_host_fault_create_failure_is_sent_again_on_each_new_socket_for_two_hours(
+    client, monkeypatch, code, kept
+):
+    """DAH-5592 review 5765544241: the backend may lose this failure (its database and broker down, then a restart),
+    and only it stops the renter's billing; the validator sends it again on every new socket until it is too old."""
+    import services.redis_service as redis_module
+
+    client.miner_service.handle_container.return_value = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+        error_code=code,
+        msg="Error: Executor unreachable",
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(redis_module.time, "time", lambda: clock[0])
+    await client.miner_driver(request("reboot-a"))
+    client.message_queue.clear()
+
+    await client._resend_host_fault_failures()  # the next socket authenticated
+
+    sent = [json.loads(m.model_dump_json()) for m in client.message_queue]
+    assert [(m["command_id"], m["error_code"]) for m in sent] == ([("reboot-a", code.value)] if kept else [])
+    client.message_queue.clear()
+    clock[0] += settings.HOST_FAULT_FAILURE_RESEND_SECONDS + 1
+    await client._resend_host_fault_failures()
+    assert client.message_queue == []
+    assert await client.miner_service.redis_service.hgetall(redis_module.HOST_FAULT_FAILURES_KEY) == {}
