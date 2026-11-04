@@ -570,8 +570,9 @@ async def test_reaping_stale_runs_is_bounded_per_cycle(context_factory, monkeypa
 def test_the_cold_retry_runs_after_every_other_check_right_before_scoring(fast_path):
     checks = PipelineFactory.build_checks(fast_path=fast_path)
     names = [type(c).__name__ for c in checks]
-    assert names.index("VerifyXCheck") < names.index("VerifyXColdRetryCheck") == names.index("ScoreCheck") - 1
-    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["ScoreCheck", "FinalizeCheck"]
+    assert names.index("VerifyXCheck") < names.index("VerifyXColdRetryCheck") == names.index("ScoreCheck") - 2
+    # review 5766179891: the disk floor is judged again on the published (possibly retried) sample
+    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["DiskSpaceCheck", "ScoreCheck", "FinalizeCheck"]
     assert not any(isinstance(c, ParallelStage) for c in checks[names.index("VerifyXColdRetryCheck") :])
 
 
@@ -883,3 +884,42 @@ async def test_a_used_retry_replaces_the_first_samples_judgement(context_factory
     specs = result.updates["state"].specs
     assert specs["hard_disk"]["write_speed"] == 900.0
     assert specs["network"]["verifyx_download_speed"] == pytest.approx(760.0)
+
+
+GIB_KB = 1024 * 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scraped", "retry_download", "used", "disk_passes"),
+    [
+        # the scrape omitted capacity (hard_disk_scrape_error): the used sample's disk reading is the one published
+        ({}, 760.0, "retry", False),
+        ({}, 40.0, "first", True),
+        # the scrape's capacity fields win over either sample
+        ({"utilization": 50.0, "free": 500 * GIB_KB}, 760.0, "retry", True),
+        ({"utilization": 50.0, "free": 500 * GIB_KB}, 40.0, "first", True),
+    ],
+)
+async def test_the_disk_floor_judges_the_sample_the_cold_retry_published(
+    context_factory, scraped, retry_download, used, disk_passes
+):
+    from neurons.validators.src.services.task.checks.disk_space import DiskSpaceCheck
+
+    def probe(download, utilization):
+        response = _probe(download)
+        response.data["hard_disk"] = {"total": 1000, "utilization": utilization, "free": 120 * GIB_KB}
+        return response
+
+    service = _ProbeSequence(probe(88.0, 80.0), probe(retry_download, 94.0))
+    ctx = context_factory(
+        services=build_services(verifyx=service),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}, "hard_disk": dict(scraped)}, rented_data=_never_measured()),
+    )
+
+    result = await _run(ctx)
+    assert result.event.what_we_saw["cold_sample_retry"]["used"] == used
+    disk = await DiskSpaceCheck().run(ctx.model_copy(update=result.updates))
+
+    assert disk.passed is disk_passes

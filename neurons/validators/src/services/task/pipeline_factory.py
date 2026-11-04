@@ -446,6 +446,8 @@ class PipelineFactory:
                 IdleDiskWriteCheck(),
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
+                # the disk floor again on the sample the retry published: it can replace the disk readings judged above
+                DiskSpaceCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -570,6 +572,8 @@ class PipelineFactory:
                 IdleDiskWriteCheck(),
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
+                # the disk floor again on the sample the retry published: it can replace the disk readings judged above
+                DiskSpaceCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
