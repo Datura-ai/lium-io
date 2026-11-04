@@ -120,7 +120,7 @@ def rented(hotkey: str = "miner-hotkey", status: str | None = None) -> RentedExe
 
 
 @contextmanager
-def flags(*, read_pressure: bool = True, enforce_pressure: bool = False):
+def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachable: bool = True):
     fake = SimpleNamespace(
         RENTED_THROUGHPUT_CHECK_ENABLED=True,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
@@ -134,7 +134,7 @@ def flags(*, read_pressure: bool = True, enforce_pressure: bool = False):
     clock = Clock()
 
     async def reaches(url):
-        return True
+        return reachable
 
     with (
         patch.object(module, "settings", fake),
@@ -454,6 +454,17 @@ async def test_validator_side_fetch_errors_stay_no_verdict():
         ctx = make_ctx(snaps() + disk() + http_error)[0]
         _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "none"
+
+
+# a fetch cut mid-transfer (BusyBox wget's premature-EOF exit 1) is the node's when the validator reaches the endpoint
+@pytest.mark.parametrize("reachable, verdict", [(True, "fail"), (False, "none")])
+async def test_a_cut_fetch_fails_only_when_the_validator_reaches_it(reachable, verdict):
+    cut = RENTALS + line("pypi", 1024, 0.2, 1, "wget: connection closed prematurely")
+    cut += line("hf", CAP_BYTES, 1.0, 0)
+    with flags(reachable=reachable):
+        ctx = make_ctx(snaps() + disk() + cut)[0]
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert net == verdict
 
 
 # Owner decision (#lium-io, 26 Oct 16:23Z): a renter keeping the disk or link busy gets no verdict, never SLOW. Pod IO
