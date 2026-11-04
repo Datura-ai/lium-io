@@ -2673,7 +2673,7 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
-def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
+def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     # unlink the volume's files on the host, through the executor's view of the host root: the
     # pod's open files stay writable until its processes die, and the kernel drops an unlinked
     # file's unwritten pages at that last close instead of writing them. No `docker run`: with
@@ -2682,14 +2682,15 @@ def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
     # from the validated name and each lookup must answer, so a failed or empty answer can never
     # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
     # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
+    # Only `container_names` may mount it (docker names never hold a space).
     volume = shlex.quote(local_volume)
-    pod = shlex.quote(container_name)
+    allowed = shlex.quote(f" {' '.join(container_names)} ")
     docker = "/usr/bin/docker"
     return (
         f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
         'd=${dm%% *}; m=${dm#* }; '
         f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
-        f'for u in $users; do [ "$u" = {pod} ] || {{ echo "volume in use by $u"; exit 6; }}; done; '
+        f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
@@ -5612,6 +5613,7 @@ class DockerService:
         payload: ContainerCreateRequest,
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
+        killed_fillers: Iterable[str] = (),
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
@@ -5629,6 +5631,10 @@ class DockerService:
         re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
         there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
         at the volume step instead of short-changing the renter.
+        A filler this create just killed can still be exiting and mount its Engy cache, so dockerd refuses the
+        `volume rm` (prod 4 Nov, 8x B300): the cache's files are then unlinked on the host (_wipe_volume_cmd), only
+        while every container mounting it is one of ``killed_fillers``; the empty volume is swept later, and a
+        filler asking for it again is charged the whole download (_engy_cache_missing_gb).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -5669,11 +5675,27 @@ class DockerService:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
                 return free_now_gb >= rental_needs_free_gb
 
+            killed: tuple[str, ...] = tuple(killed_fillers)
+
+            def volume_remove(name: str) -> str:
+                # a Dolphin cache is never wiped: its readiness is not measured, so an empty one would read as ready
+                if not killed or not name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+                    return DockerCommand.volume_remove(name)
+                return (
+                    f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
+                    f"( {_wipe_volume_cmd(name, *killed)} ) || true"
+                )
+
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
             removal_failed = False
             try:
                 await evict_cache_volumes_oldest_first(
-                    ssh_client, cache_volumes, remove, rental_fits, evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX
+                    ssh_client,
+                    cache_volumes,
+                    remove,
+                    rental_fits,
+                    evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
+                    volume_remove=volume_remove,
                 )
             except asyncio.CancelledError:
                 raise
@@ -9925,6 +9947,7 @@ class DockerService:
                         payload=payload,
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
+                        killed_fillers=[name for name in removed_containers if name.startswith(FILLER_CONTAINER_PREFIX)],
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
