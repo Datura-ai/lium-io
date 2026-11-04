@@ -749,3 +749,29 @@ async def test_a_restore_whose_bring_up_hangs_ends_in_bounded_time_and_keeps_the
     svc._bring_up_existing_container.assert_awaited_once()
     assert ssh.commands[-1] == f"/usr/bin/docker rename {parked} {name}"
     assert not any(parked in c or "volume rm" in c for c in ssh.commands if "rm " in c)
+
+
+@pytest.mark.asyncio
+async def test_a_docker_ps_the_host_times_out_fails_the_edit_and_keeps_the_pod(svc, monkeypatch):
+    # review 5766107783: exit 124 with empty stdout must not read as "no container" (the sweep would remove the pod)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    inner = ssh.run
+
+    async def ps_times_out(cmd, *args, **kwargs):
+        if "docker ps -a" in cmd and "--filter name=" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=124)
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = ps_times_out
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "park_current_container"
+    assert "docker ps exited 124" in f"{result.msg} {result.detail}"
+    assert _docker(ssh.commands, "rename") == []
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    svc.clean_existing_containers.assert_not_awaited()

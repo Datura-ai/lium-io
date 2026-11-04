@@ -1773,6 +1773,9 @@ class _EditSwap:
             f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
             f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
         )
+        if listed.exit_status != 0:
+            # a host timeout (exit 124) prints nothing: read as "no container", the sweep would remove the pod
+            raise Exception(f"[park_current_container] docker ps exited {listed.exit_status}; the pod was left as it was")
         listing = [line.split() for line in (listed.stdout or "").splitlines() if line.strip()]
         names = {fields[0] for fields in listing}
         ids_by_name = {fields[0]: fields[1] for fields in listing if len(fields) > 1}
