@@ -38,6 +38,11 @@ _kept_upload_probes: dict[tuple[str, str], int] = {}
 # the missing capacity reading is fed as the 0 it is.
 MAX_PACKAGE_FALLBACK_PROBES = 8
 _package_fallback_probes: dict[tuple[str, str], int] = {}
+# DAH-5742: an idle filler-only node keeps its stored EMA for at most this many skips in a row (~24 h of
+# job cycles); then it is probed once, so a slower link than the stored figure shows up.
+# shortcut: per process, so a validator restart starts the count again; a backend-held measured-at would survive it.
+MAX_FILLER_SKIPS = 96
+_filler_skips: dict[tuple[str, str], int] = {}
 
 
 @dataclass(frozen=True)
@@ -87,8 +92,10 @@ class VerifyXCheck:
         # score 0 every cycle and stay hidden for as long as the filler runs.
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
         # filler runs, and a fresh sample is what lets it recover.
+        skip_key = (ctx.miner_hotkey, ctx.executor.uuid)
         if (
             filler_container
+            and _filler_skips.get(skip_key, 0) < MAX_FILLER_SKIPS
             and stored_ema
             and stored_ema.ema_verifyx_download_speed is not None
             and (
@@ -96,6 +103,7 @@ class VerifyXCheck:
                 or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
         ):
+            _filler_skips[skip_key] = _filler_skips.get(skip_key, 0) + 1
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -114,6 +122,7 @@ class VerifyXCheck:
                 updates={"state": replace(ctx.state, specs=updated_specs)},
             )
 
+        _filler_skips.pop(skip_key, None)
         # DAH-3011: a first, unscored verification writes less RAM/disk (the measurements are still
         # taken and published). The keyword is only passed on that path so the scored call is
         # byte-for-byte today's.
