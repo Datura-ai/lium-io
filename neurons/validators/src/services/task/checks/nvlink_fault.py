@@ -34,7 +34,8 @@ NVLINK_BASEBOARD_GPUS = frozenset(
 BASEBOARD_GPU_COUNT = 8
 # CUDA_ERROR_UNKNOWN adding a GPU to the multicast object: on a full NVLink baseboard whose GPUs all report
 # multicast support, NCCL NVLS cannot start (8x H200, 4 Nov). Elsewhere (a VM slice) it stays "could not measure".
-ADD_DEVICE_UNKNOWN_ERROR = "cuMulticastAddDevice -> CUresult 999"
+# exactly what the probe worker reports: f"{type(exc).__name__}: {exc}"
+ADD_DEVICE_UNKNOWN_ERROR = "ProbeError: cuMulticastAddDevice -> CUresult 999"
 
 
 class NvlinkFaultCheck:

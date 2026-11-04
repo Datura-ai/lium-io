@@ -6,6 +6,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedE
 from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX
 from neurons.validators.src.services.task import pipeline_factory
 from neurons.validators.src.services.task.checks.nvlink_fault import (
+    ADD_DEVICE_UNKNOWN_ERROR,
     PROBE_JSON_MARKER,
     PROBE_SOURCE,
     NvlinkFaultCheck,
@@ -311,7 +312,8 @@ async def test_an_adapter_node_verified_under_its_sxm_name_keeps_its_verificatio
         assert result.passed is passed, (previous, current)
 
 
-ADD_DEVICE_999 = report(status="error", error="cuMulticastAddDevice -> CUresult 999")
+# the exact error line the validator logged for these nodes (4 Nov)
+ADD_DEVICE_999 = report(status="error", error="ProbeError: cuMulticastAddDevice -> CUresult 999")
 
 
 def nvlink_board(name="NVIDIA H200", count=8):
@@ -336,8 +338,8 @@ async def test_add_device_999_on_a_full_nvlink_board_fails(context_factory):
         (nvlink_board(count=4), ADD_DEVICE_999),  # a VM slice: could not measure
         (nvlink_board(name="NVIDIA H100 PCIe"), ADD_DEVICE_999),
         (NVLINK_BOARD, ADD_DEVICE_999),  # no GPU details
-        (nvlink_board(), report(status="error", error="cuMulticastCreate -> CUresult 999")),
-        (nvlink_board(), report(status="error", error="cuMulticastAddDevice -> CUresult 1")),
+        (nvlink_board(), report(status="error", error="ProbeError: cuMulticastCreate -> CUresult 999")),
+        (nvlink_board(), report(status="error", error="ProbeError: cuMulticastAddDevice -> CUresult 1")),
         (nvlink_board(), report(status="error", error="probe hung")),
     ],
 )
@@ -365,3 +367,14 @@ async def test_a_healthy_full_nvlink_board_passes(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.PROBE_OK.reason
+
+
+def test_the_probe_worker_reports_add_device_999_in_the_form_the_check_matches(monkeypatch):
+    probe = load_probe()
+    sent = []
+    monkeypatch.setattr(probe["ctypes"], "CDLL", lambda name: FakeCuda(codes={"cuMulticastAddDevice": 999}))
+    monkeypatch.setattr(probe["os"], "dup2", lambda *args: None)
+
+    probe["_worker"](type("Pipe", (), {"send": lambda self, r: sent.append(r), "close": lambda self: None})())
+
+    assert sent == [{"status": "error", "error": ADD_DEVICE_UNKNOWN_ERROR}]
