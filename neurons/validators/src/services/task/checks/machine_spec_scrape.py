@@ -16,7 +16,7 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
-from services.gpu_spec_table import classify_gpu_model
+from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
@@ -528,7 +528,7 @@ class MachineSpecScrapeCheck:
             raw_gpu_details = gpu_info.get("details", []) or []
             # The native capability challenge derives its key from the raw NVML name in
             # specs. Policy and scoring use the canonicalized state fields below.
-            gpu_details = _normalize_gpu_details(raw_gpu_details)
+            gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
             gpu_model = None
             if gpu_count > 0 and gpu_details:
                 gpu_model = gpu_details[0].get("name")
