@@ -248,6 +248,29 @@ async def test_endpoint_unreachable_counts_only_when_the_validator_reaches_it():
         assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "wget: error getting response: Connection reset by peer",
+        "ssl_client: SSL_connect: unexpected eof while reading",
+        "net/http: TLS handshake timeout",
+        "wget: connection closed prematurely",
+    ],
+)
+async def test_connection_reset_counts_only_when_the_validator_reaches_it(stderr):
+    cut = RENTALS + line("pypi", 0, 0.2, 1, stderr) + line("hf", CAP_BYTES, 1.0, 0)
+    assert parse_download_speed(cut)[0].error == "connection_reset"
+    with flags(reachable=True):
+        ctx, _, _ = make_ctx(cut)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.SLOW_ONCE.reason
+    with flags(reachable=False):
+        ctx, _, redis = make_ctx(cut)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.passed and res.event.reason_code == Msg.UNMEASURED.reason
+        assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
+
+
 async def test_container_that_did_not_run_is_no_verdict():
     with flags():
         ctx, _, _ = make_ctx("docker: Error response from daemon: unknown runtime")

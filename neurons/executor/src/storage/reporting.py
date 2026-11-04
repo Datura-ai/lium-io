@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -53,6 +54,8 @@ class StorageEventReporter:
         self._state = ProgressState(stage=initial_stage)
         self._cancel_requested = False
         self._restic_failure_detail: str | None = None
+        self._restore_counts: tuple[int, int] | None = None  # (files_restored, total_files) from restic's summary
+        self._failed_items: dict[str, None] = {}  # distinct restic error items, first-seen order
         self._diagnostic_detail: str | None = None
         self._next_progress_at = self._clock()
         self._progress_failures = 0
@@ -80,6 +83,7 @@ class StorageEventReporter:
                 and self._spec.resource is ReporterResource.BACKUP
             ):
                 self._state.summary = _summary_counts(payload)
+            self._remember_restore_counts(payload)
             if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
             elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
@@ -89,7 +93,8 @@ class StorageEventReporter:
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
         if event_type == "rerun":
-            self._restic_failure_detail = self._diagnostic_detail = None
+            self._restic_failure_detail = self._diagnostic_detail = self._restore_counts = None
+            self._failed_items = {}
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
@@ -115,15 +120,17 @@ class StorageEventReporter:
                 if result_quality == "FULL":
                     self._state.processed_files = self._state.total_files
                     self._state.processed_bytes = self._state.total_bytes
+            if self._spec.resource is not ReporterResource.BACKUP and self._restore_counts is not None:
+                self._state.processed_files = self._present_counts()[0]
             payload = self._progress_payload(
                 status=status,
                 result_quality=result_quality,
                 snapshot_id=_optional_string(event.get("snapshot_id")),
                 exit_code=_optional_integer(event.get("exit_code")),
                 error_code=_optional_string(event.get("error_code")),
-                error_message=(self._restic_failure_detail or self._diagnostic_detail)
+                error_message=self._failure_message()
                 if status != "COMPLETED"
-                else None,
+                else self._partial_restore_warning(result_quality),
             )
             if status == "COMPLETED" and self._state.summary:
                 payload.update(self._state.summary)
@@ -177,6 +184,44 @@ class StorageEventReporter:
         message = _optional_string(event.get("message"))
         if message:
             self._restic_failure_detail = message[:2000]
+
+    def _remember_restore_counts(self, event: Mapping[str, object]) -> None:
+        if self._spec.resource is ReporterResource.BACKUP:
+            return
+        if event.get("message_type") in ("error", "exit_error"):
+            item = _optional_string(event.get("item"))
+            if item:
+                self._failed_items[item] = None
+        elif event.get("message_type") == "summary":
+            restored = _optional_integer(event.get("files_restored"))
+            total = _optional_integer(event.get("total_files"))
+            if restored is not None and total is not None:
+                self._restore_counts = (restored, total)
+
+    def _failure_message(self) -> str | None:
+        detail = _renter_paths(self._restic_failure_detail or self._diagnostic_detail)
+        if self._restore_counts is None:
+            return detail
+        restored = "restored {} of {} files".format(*self._present_counts())
+        return f"{detail}; {restored}"[:2000] if detail else restored.capitalize()
+
+    def _partial_restore_warning(self, result_quality: str | None) -> str | None:
+        if result_quality != "PARTIAL" or self._spec.resource is ReporterResource.BACKUP:
+            return None
+        if self._restore_counts is None or not self._failed_items:
+            return "Restored with errors; some files were not restored"
+        restored, total = self._present_counts()
+        first = _renter_paths(next(iter(self._failed_items)))
+        return (
+            f"Restored {restored} of {total} files; {len(self._failed_items)} were removed on the pod "
+            f"during the restore, first: {first}"
+        )[:2000]
+
+    def _present_counts(self) -> tuple[int, int]:
+        """(files left on the pod, snapshot files): restic's files_restored counts writes, including files that
+        failed or were removed afterwards, so the distinct failed items come off the total"""
+        restored, total = self._restore_counts or (0, 0)
+        return max(0, min(restored, total - len(self._failed_items))), total
 
     def _restore_has_started(self) -> bool:
         return bool(
@@ -317,6 +362,11 @@ def _summary_counts(summary: Mapping[str, object]) -> dict[str, int]:
 def _updated_integer(value: Mapping[str, object], current: int | None, *keys: str) -> int | None:
     updated = _first_integer(value, *keys)
     return current if updated is None else updated
+
+
+def _renter_paths(message: str | None) -> str | None:
+    # The restore writes through /proc/<pid>/root of the live container; the renter knows only the path inside it.
+    return re.sub(r"/proc/\d+/root(?=/)", "", message) if message else message
 
 
 def _optional_string(value: object) -> str | None:

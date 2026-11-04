@@ -2139,11 +2139,12 @@ class NvlinkFaultMessages:
         category="env",
         impact="Score set to 0 until NVLink works again",
         remediation=(
-            "These GPUs are SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows PCIe paths "
-            "(PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. Start "
-            "nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, same version as the "
-            "driver), check `nvidia-smi nvlink -s`, then restart the executor container "
-            "(`docker restart executor-executor-1`). If the links stay down, service the board."
+            "These GPUs ship only as SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows "
+            "PCIe paths (PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. "
+            "On an HGX board, start nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, "
+            "same version as the driver), check `nvidia-smi nvlink -s`, then restart the executor container "
+            "(`docker restart executor-executor-1`). If the links stay down, service the board. H100 "
+            "modules on SXM-to-PCIe adapter boards never get this: they are listed as H100 PCIe."
         ),
     )
     UNKNOWN = MessageTemplate(

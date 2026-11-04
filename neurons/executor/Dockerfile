@@ -121,7 +121,7 @@ RUN useradd -m -s /bin/bash liumuser && \
 RUN echo 'AcceptEnv CONTAINER_NAME' >>/etc/ssh/sshd_config && \
     printf 'Match User liumuser\n    ForceCommand bash -c '"'"'[ -n "$CONTAINER_NAME" ] && exec docker exec -it "$CONTAINER_NAME" bash || { echo "CONTAINER_NAME not set"; exit 1; }'"'"'\n' >>/etc/ssh/sshd_config
 
-# PerSourcePenalties off via /etc/ssh/sshd_config.d/lium.conf when this sshd knows the directive,
+# sshd limits (grace time, MaxStartups, per-source limits run.sh can turn off) via /etc/ssh/sshd_config.d/lium.conf,
 # then `sshd -T` must accept the whole rendered config or the build fails (sshd_setup.sh says why).
 RUN sh sshd_setup.sh
 
