@@ -90,3 +90,19 @@ async def test_port_probe_falls_through_to_fallback_when_batch_and_semi_empty(mo
     batch.verify.assert_called_once()
     semi.verify.assert_called_once()
     fallback.verify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_port_probe_stops_when_the_batch_container_did_not_start(mocker):
+    # DAH-5682: the later tiers start containers on the same Docker, so they would time out the same way
+    ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
+    batch = mocker.Mock()
+    batch.verify = mocker.AsyncMock(return_value=BatchResult([], ports, start_timed_out=True))
+    semi, fallback = mocker.Mock(), mocker.Mock()
+
+    result = await PortProbe(batch, semi, fallback).probe(ports, ssh_client=mocker.Mock(), host="127.0.0.1")
+
+    assert result.start_timed_out is True
+    assert list(result.failed) == ports and result.successful == ()
+    semi.verify.assert_not_called()
+    fallback.verify.assert_not_called()

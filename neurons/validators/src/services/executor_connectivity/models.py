@@ -21,6 +21,7 @@ class PortProbeResult:
     failed: tuple[PortPair, ...]
     tier: str = "batch"
     external: ExternalReading = None
+    start_timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,8 @@ class BatchResult:
     failed: list[PortPair]
     # DAH-4537: "blocked" when the validator reached the sampled ports but the outside prober reached none of them
     external: ExternalReading = None
+    # DAH-5682: Docker did not start the test container in time; no later tier or DinD probe can start one either
+    start_timed_out: bool = False
 
 
 @dataclass(frozen=True)

@@ -216,3 +216,40 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
     # each of the 2 attempts: one probe plus REPROBE_ROUNDS re-probes, then the attempt fails
     assert port_tester.test_many.await_count == 2 * (1 + BatchVerifier.REPROBE_ROUNDS)
     assert result.successful == [] and result.failed == ports
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external", [False, True])
+async def test_batch_stops_when_the_test_container_does_not_start_in_time(mocker, external):
+    # DAH-5682: a Docker too slow to start the container ran every tier and DinD (~307 s); one start bound is enough
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+
+    async def hang(*_args):
+        await asyncio.sleep(5)
+
+    outside = mocker.Mock() if external else None
+    verifier, port_tester = _batch_verifier(mocker, None, outside)
+    verifier.runner.run.side_effect = hang
+    mocker.patch.object(BatchVerifier, "START_TIMEOUT_SEC", 0.1)
+
+    result = await asyncio.wait_for(verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4"), 2)
+
+    assert result.start_timed_out is True
+    assert result.successful == [] and result.failed == ports
+    assert verifier.runner.run.await_count == 1  # no second attempt
+    verifier.runner.cleanup.assert_not_awaited()  # the stuck daemon would hold the removal too
+    port_tester.test_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_keeps_its_retry_when_the_container_starts_and_ports_fail(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
+    mocker.patch("services.executor_connectivity.port_verifiers.asyncio.sleep", mocker.AsyncMock())
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.start_timed_out is False
+    assert verifier.runner.run.await_count == 2

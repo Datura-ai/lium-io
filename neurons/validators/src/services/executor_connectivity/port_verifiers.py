@@ -29,6 +29,9 @@ class BatchVerifier:
 
     REPROBE_DELAY_SEC = 3
     REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
+    # DAH-5682: a Docker that cannot start this container in time cannot start the later tiers' or the DinD one,
+    # so the whole probe stops here (a slow Docker ran all tiers, ~307 s, every cycle). Under the 60 s attempt bound.
+    START_TIMEOUT_SEC = 20
 
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
@@ -68,6 +71,14 @@ class BatchVerifier:
                     timeout=timeout_sec
                 )
                 external = attempt_result.external
+                if attempt_result.start_timed_out:
+                    logger.warning(
+                        _m(
+                            f"port test container did not start within {self.START_TIMEOUT_SEC}s, stopping the port probe",
+                            extra=get_extra_info(log_ctx),
+                        )
+                    )
+                    return attempt_result
                 if attempt_result.successful:
                     logger.info(
                         _m(
@@ -118,7 +129,10 @@ class BatchVerifier:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
         sample = random.sample(ports, min(EXTERNAL_PROBE_SAMPLE, len(ports))) if self.external_probe else []
-        reached, first_round = await self._outside_reading(sample, token, ssh_client, host, log_ctx)
+        try:
+            reached, first_round = await self._outside_reading(sample, token, ssh_client, host, log_ctx)
+        except TimeoutError:
+            return BatchResult([], ports, None, start_timed_out=True)
         sampled_ok = [p for p in sample if p in (reached or []) or p in first_round]
         ports_left = [p for p in ports if p not in sampled_ok]
         external_blocked = reached == [] and all(p in first_round for p in sample)
@@ -134,7 +148,12 @@ class BatchVerifier:
             return BatchResult(sampled_ok, [], external)
 
         script = NetcatScript.batch(ports_left, token, 0)
-        start_result = await self.runner.run(ssh_client, name, script, "host", 60)
+        try:
+            start_result = await asyncio.wait_for(
+                self.runner.run(ssh_client, name, script, "host", 60), self.START_TIMEOUT_SEC
+            )
+        except TimeoutError:
+            return BatchResult([], ports, external, start_timed_out=True)
         if not start_result.ok:
             logger.debug(
                 _m(
@@ -177,12 +196,17 @@ class BatchVerifier:
         """DAH-5597: the outside prober fetches ports published with `-p`, as a renter's pod publishes them, so it
         goes through the docker DNAT/FORWARD path; a --network=host listener would test the host INPUT chain
         instead. Returns the outside reading (None: no reading) and the sampled ports the validator then reached
-        on the same listener, first try only: the prober ran before them, so a late bind refuses it too."""
+        on the same listener, first try only: the prober ran before them, so a late bind refuses it too.
+        Raises TimeoutError when the container does not start in time; it is not removed then: the stuck daemon
+        would hold the removal too, and the container ends itself (`--rm`, `timeout`)."""
         if not sample:
             return None, []
         name = f"port_test_out_{token[:8]}"
         publish_flags = " ".join(f"-p {p.internal}:{p.internal}" for p in sample)
-        start = await self.runner.run(ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30)
+        start = await asyncio.wait_for(
+            self.runner.run(ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30),
+            self.START_TIMEOUT_SEC,
+        )
         try:
             if not start.ok:
                 logger.debug(

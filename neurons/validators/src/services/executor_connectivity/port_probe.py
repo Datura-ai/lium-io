@@ -39,6 +39,8 @@ class PortProbe:
             # the other tiers probe from the validator too, so they would pass the same host. The validator's
             # ports are kept: PortConnectivityCheck decides whether this reading fails the node.
             return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
+        if batch.start_timed_out:
+            return PortProbeResult((), tuple(batch.failed), "batch", batch.external, start_timed_out=True)
         successful, failed = batch.successful, batch.failed
         tier = "batch"
 
