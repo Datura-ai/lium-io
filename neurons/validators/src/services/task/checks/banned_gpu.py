@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from ..messages import BannedGpuMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import (
