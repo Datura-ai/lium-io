@@ -53,7 +53,7 @@ Docs and the Provider Portal call a miner a **provider** and an executor a **nod
 
 Per GPU host (the full list is in the [Node Quickstart](https://docs.lium.io/providers/nodes/quickstart#requirements)):
 
-- **OS:** Ubuntu 24.04, or Ubuntu 22.04 with the HWE kernel. Sysbox needs kernel 5.19 or newer.
+- **OS:** Ubuntu 24.04 or 26.04, or Ubuntu 22.04 with the HWE kernel. Sysbox needs kernel 5.19 or newer. On 26.04 the Sysbox setup script adds an AppArmor rule so Sysbox can mount its file systems.
 - **GPU:** an NVIDIA model on the [supported list](https://docs.lium.io/providers/architecture#supported-gpus) (the validator's source of truth is `GPU_MODEL_RATES` in [`neurons/validators/src/services/const.py`](neurons/validators/src/services/const.py)), with the driver installed (`nvidia-smi` works).
 - **Docker Engine**, installed and running.
 - **Network:** a public IP and at least **100 Mbps download**, as measured by the validator.

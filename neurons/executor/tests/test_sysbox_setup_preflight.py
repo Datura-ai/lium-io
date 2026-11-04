@@ -421,6 +421,31 @@ def test_install_mode_does_not_change_the_plugin_under_a_rental(tmp_path):
 
 # ── fuse3 ───────────────────────────────────────────────────────────────────
 
+APPARMOR_RULE = "mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,"
+
+
+def test_ubuntu_2604_fusermount3_profile_without_the_sysboxfs_rule_is_a_fix(tmp_path):
+    rc, out, fixes = run_check(
+        tmp_path, "check_fusermount3_apparmor", files={"etc/apparmor.d/fusermount3": "profile fusermount3 {}\n"}
+    )
+    assert (rc, fixes) == (1, 1)
+    assert "FIX  The AppArmor profile /etc/apparmor.d/fusermount3 (Ubuntu 26.04)" in out
+    assert f"printf '%s\\n' '{APPARMOR_RULE}'" in out
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {},
+        {"etc/apparmor.d/fusermount3": "profile fusermount3 {}\n", "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"},
+    ],
+    ids=["no-profile", "rule-in-local"],
+)
+def test_fusermount3_without_a_profile_or_with_the_rule_passes(tmp_path, files):
+    rc, out, _ = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
+    assert rc == 0
+    assert "PASS fusermount3 may mount sysbox-fs" in out
+
 
 # ── the script as a provider runs it ─────────────────────────────────────────
 
