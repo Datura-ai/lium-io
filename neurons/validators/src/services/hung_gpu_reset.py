@@ -5,7 +5,7 @@ one SSH query looks for a hung pod GPU; a healthy reboot costs only that query. 
 under the same refusal rules as the renter's Reset GPU (gpu_reset.py): NVLink peers must be inside
 the pod, no MIG, no process on the GPUs (the pod's own container is stopped, so any is foreign), and
 `nvidia-smi -r` only with `-i` on the pod's GPUs, with Fabric Manager stopped around it on an NVSwitch
-pod that owns every GPU (as reset_pod_gpus does); when the driver refuses it, the DAH-2427 context
+pod that owns every GPU, all in one host systemd unit (as reset_pod_gpus does); when the driver refuses it, the DAH-2427 context
 cycle is the fallback.
 """
 
@@ -20,21 +20,24 @@ from typing import TYPE_CHECKING
 
 from payload_models.payloads import ContainerWarningCode, GpuResetErrorCode
 from services.gpu_reset import (
+    _FABRIC_STOP_FAILED_EXIT,
     _RESET_TIMEOUT_SECONDS,
     FABRIC_SERVICES,
     HOST_GPUS_COMMAND,
-    HOST_SYSTEMCTL,
     NVSWITCH_COMMAND,
     TOPOLOGY_COMMAND,
     GpuResetRefused,
     HostGpu,
     _own_cgroup,
     _processes_outside,
+    _reset_unit_gone,
+    _reset_unit_pending,
+    _restore_fabric_services,
     _run,
     _service_active,
-    _start_fabric_services,
     _tail,
     _widen_targets_to_nvlink_peers,
+    build_fabric_reset_command,
     build_reset_command,
     parse_host_gpus,
 )
@@ -120,6 +123,10 @@ async def reset_hung_pod_gpus(
 
 
 async def _reset(runner: SSHCommandRunner, hung: list[str], latched: set[str], pod_gpu_uuids: list[str]) -> HungGpuResult:
+    if await _reset_unit_pending(runner):
+        # as in reset_pod_gpus: an earlier reset that outlived its SSH timeout still holds the GPUs and the fabric
+        detail = "the GPU reset is still running on the host"
+        return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
     if set(hung) <= latched:
         # latch only: the seconds-long context cycle first, not a reset (a healthy GPU stopped a moment
         # ago can still read busy); -r below only when the cycle does not clear it
@@ -133,24 +140,27 @@ async def _reset(runner: SSHCommandRunner, hung: list[str], latched: set[str], p
         return HungGpuResult(hung, warning, refused.detail)
 
     command = build_reset_command(plan.targets, container_uuids=pod_gpu_uuids, pod_gpu_uuids=pod_gpu_uuids)
-    reset = None
-    stop_problem: str | None = None
-    stopped_services: list[str] = []
-    try:
-        # as in reset_pod_gpus: the driver refuses -r while Fabric Manager holds the GPUs (the pod owns them all)
-        for unit in plan.fabric_services:
-            stopped_services.append(unit)  # a failed stop may still have stopped it: start it regardless
-            unit_stop = await _run(runner, f"{HOST_SYSTEMCTL} stop {unit}", timeout=60)
-            if unit_stop.exit_code != 0:
-                stop_problem = f"could not stop {unit}: {_tail(unit_stop.stderr)}"
-                break
-        else:
-            reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
-    finally:
-        fabric_manager_problem = await _start_fabric_services(runner, stopped_services) if stopped_services else None
-    if reset is None or fabric_manager_problem:
-        detail = "; ".join(problem for problem in (stop_problem, fabric_manager_problem) if problem)
-        return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
+    if not plan.fabric_services:
+        reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
+    else:
+        # as in reset_pod_gpus: the driver refuses -r while Fabric Manager holds the GPUs (the pod owns them all);
+        # stop, reset and start run as one host unit that outlives the SSH session
+        reset = None
+        try:
+            reset = await _run(
+                runner, build_fabric_reset_command(plan.fabric_services, command), timeout=_RESET_TIMEOUT_SECONDS + 120
+            )
+        finally:
+            if (reset is None or reset.exit_code < 0) and not await _reset_unit_gone(runner):
+                fabric_manager_problem = "the GPU reset is still running on the host"
+            else:
+                fabric_manager_problem = await _restore_fabric_services(runner, plan.fabric_services)
+        if fabric_manager_problem:
+            return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, fabric_manager_problem)
+        if reset.exit_code == _FABRIC_STOP_FAILED_EXIT:
+            return HungGpuResult(
+                hung, ContainerWarningCode.HungGpuNotResetUnsupported, _tail(reset.stderr) or "could not stop"
+            )
     if reset.exit_code == 0:
         return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}")
     # as in reset_pod_gpus: the context cycle is the fix when it cures every target

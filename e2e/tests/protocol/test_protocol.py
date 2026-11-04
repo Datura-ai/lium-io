@@ -9,6 +9,7 @@ removed. Each step here is the real HTTP call the code makes, plus the refusals 
 import socket
 import time
 
+import asyncssh
 import pytest
 
 from tests import lib
@@ -22,7 +23,10 @@ pytestmark = pytest.mark.timeout(120)
 def test_executor_answers_version():
     r = lib.http("GET", f"{lib.EXECUTOR_URL}/version")
     assert r.status_code == 200, r.text
-    assert r.json(), "executor /version body is empty"
+    body = r.json()
+    assert body["version"] and body["version"] != "unknown", body
+    # the stack runs with EXECUTOR_LOCAL_VERIFY_ENABLED off: no extra capability is advertised
+    assert body["capabilities"] == [], body
 
 
 def test_miner_lists_the_executor_for_its_validator():
@@ -70,6 +74,8 @@ def test_validator_headers_are_accepted_and_the_executor_installs_the_key():
     body = r.json()
     assert body.get("message_type") == "AcceptSSHKeyRequest", body
     assert len(body["executors"]) == 1, body
+    # the miner also names every executor it knows, so the validator can tell "unreachable" from "not listed"
+    assert set(body["known_executor_ids"]) == {lib.EXECUTOR_UUID, lib.DEAD_EXECUTOR_UUID}, body
     ex = body["executors"][0]
     assert ex["uuid"] == lib.EXECUTOR_UUID and ex["address"] == lib.EXECUTOR_IP
     assert ex["ssh_port"] == lib.EXECUTOR_SSH_PORT and ex["ssh_username"] and ex["python_path"] and ex["root_dir"]
@@ -80,7 +86,7 @@ def test_validator_headers_are_accepted_and_the_executor_installs_the_key():
     r = lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-remove", headers=lib.validator_rest_headers(vk),
                  json={"message_type": "SSHPubKeyRemoveRequest", "public_key": pub, "validator_signature": lib.sign(vk, pub), "miner_hotkey": lib.MINER_HOTKEY}, timeout=60)
     assert r.status_code == 200, r.text
-    with pytest.raises(Exception):
+    with pytest.raises(asyncssh.PermissionDenied):
         lib.run(lib.ssh_run(ex["address"], ex["ssh_port"], ex["ssh_username"], priv, "true", timeout=15))
 
 
@@ -159,7 +165,8 @@ def test_executor_refuses_a_spoofed_validator_signature():
 def test_executor_refuses_a_spoofed_miner_signature():
     _, pub = lib.ssh_keypair()
     r = lib.http("POST", f"{lib.EXECUTOR_URL}/upload_ssh_key", json=lib.upload_ssh_key_payload(lib.stranger_keypair(), lib.validator_keypair(), pub))
-    assert r.status_code in (401, 403), r.text
+    # refused by the miner-signature middleware before the route runs
+    assert r.status_code == 401, r.text
 
 
 def test_executor_refuses_a_substituted_public_key():
@@ -170,7 +177,8 @@ def test_executor_refuses_a_substituted_public_key():
     body["public_key"] = other
     body["validator_signature"] = lib.sign(lib.validator_keypair(), other)
     r = lib.http("POST", f"{lib.EXECUTOR_URL}/upload_ssh_key", json=body)
-    assert r.status_code in (400, 401), r.text
+    # the miner signature over data_to_sign is valid, so the route's key-consistency check answers
+    assert r.status_code == 400 and "mismatch" in r.text.lower(), r.text
 
 
 # --------------------------------------------------- executor: key bound to a miner, dated nonce ------------------------

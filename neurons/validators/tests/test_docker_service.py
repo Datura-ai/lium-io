@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -21,12 +22,15 @@ from tenacity import Future, RetryError
 from core.docker_utils import DockerCommand
 import services.docker_service as docker_service_module
 from services.attestation_service import AttestationError
+from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk
+import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
     NoUsableLoopbackPluginError,
+    VolumeHostProbe,
     VolumeMinSizeError,
     _LIUM_CIPHER_MOUNT,
     _build_gocryptfs_setup_and_mount_script,
@@ -34,10 +38,12 @@ from services.docker_service import (
     _is_docker_read_timeout_error,
     _is_docker_volume_in_use_error,
     _parse_volume_size_to_bytes,
+    _pod_volume_path,
     _should_encrypt_local_volume,
 )
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerNameTakenOnRetry,
     ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
@@ -1379,6 +1385,76 @@ async def test_delete_filler_stops_with_reduced_grace(
     # DAH-2356 still restores the filler's GPU power caps after the graceful stop
     restore_filler_power.assert_awaited_once()
     assert restore_filler_power.await_args.args[2] == payload.pod_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("removal_fails", "stopped"), [(True, False), (True, True), (False, False), (False, True)]
+)
+async def test_delete_filler_restores_cap_claim_only_when_removal_fails(
+    docker_service,
+    monkeypatch,
+    removal_fails,
+    stopped,
+):
+    # Review (#1583): the claim is cleared before the stop; only if the graceful stop and the
+    # forced removal both fail may the filler still run with our cap, so only then it goes back.
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "services.docker_service.restore_filler_pod_gpu_power_limits", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        "services.docker_service.clear_filler_pod_applied_caps",
+        AsyncMock(return_value={"GPU-a": 280}),
+    )
+    restore_claims = AsyncMock()
+    monkeypatch.setattr("services.docker_service.restore_filler_pod_applied_caps", restore_claims)
+    monkeypatch.setattr(docker_service, "_stop_container_gracefully", AsyncMock(return_value=stopped))
+    if removal_fails:
+        monkeypatch.setattr(
+            docker_service, "_force_remove_or_kill", AsyncMock(side_effect=RuntimeError("remove failed"))
+        )
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        container_name="filler_claim",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted) is not removal_fails
+    if removal_fails and not stopped:
+        restore_claims.assert_awaited_once()
+        assert restore_claims.await_args.args[1] == {"GPU-a": 280}
+    else:
+        restore_claims.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -4212,6 +4288,134 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workload_kind, answers, outcome",
+    [
+        (WorkloadKind.CUSTOMER_RENTAL, True, "created"),
+        (WorkloadKind.CUSTOMER_RENTAL, False, "failed at ssh_ready"),  # F-1679: a reboot said success
+        (WorkloadKind.FILLER, False, "created, not checked"),
+        # an image our bootstrap cannot give sshd: the renter may run it without SSH (never turned away)
+        (WorkloadKind.CUSTOMER_RENTAL, False, "created, no sshd, not checked"),
+    ],
+)
+async def test_a_create_succeeds_only_once_the_pods_ssh_port_answers(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path, workload_kind, answers, outcome
+):
+    """DAH-5618: the check runs on the node's address and the port mapped to the pod's 22, only where
+    SSH is expected (our bootstrap left sshd listening)."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    monkeypatch.setattr(
+        docker_service,
+        "install_open_ssh_server_and_start_ssh_service_with_rental_docker",
+        AsyncMock(return_value="no sshd" not in outcome),
+    )
+    if not answers:
+        pod_ssh_answers_on_create_path.side_effect = RuntimeError("the pod's SSH port 20001 did not answer")
+    payload = _private_registry_create_payload().model_copy(update={"workload_kind": workload_kind})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    if outcome == "failed at ssh_ready":
+        assert isinstance(result, FailedContainerRequest)
+        assert result.failure_step == "ssh_ready" and "did not answer" in result.detail
+    else:
+        assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    if "not checked" in outcome:
+        pod_ssh_answers_on_create_path.assert_not_awaited()
+    else:
+        pod_ssh_answers_on_create_path.assert_awaited_once()
+        assert pod_ssh_answers_on_create_path.await_args.args == ("127.0.0.1", 20001)
+
+
+@pytest.mark.asyncio
+async def test_the_ssh_check_probes_the_port_a_collision_retry_moved_22_to(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """DAH-5618: a port collision on create remaps 22 in place; the check reads the port the pod got."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    real_run = docker_service._run_rental_docker_create_with_port_retry
+
+    async def run_and_remap(**kwargs):
+        container_id = await real_run(**kwargs)
+        kwargs["port_maps"][0] = (22, 20002, 20002)
+        return container_id
+
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_and_remap)
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert pod_ssh_answers_on_create_path.await_args.args == ("127.0.0.1", 20002)
+
+
+@pytest.mark.asyncio
+async def test_a_template_that_starts_its_own_sshd_is_checked_without_the_bootstrap(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """DAH-5618: a template that declares SSH (ships_sshd) skips our bootstrap; SSH is still expected."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    bootstrap = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", bootstrap)
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", AsyncMock())
+    payload = _private_registry_create_payload().model_copy(update={"ships_sshd": True})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    bootstrap.assert_not_awaited()
+    pod_ssh_answers_on_create_path.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_create_container_reports_set_environment_failure_step(
     docker_service,
     monkeypatch,
@@ -4798,17 +5002,22 @@ async def _another_create_live(pod_id: str, live: bool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "conflict_name, live_creates, expected_events",
+    "conflict_name, live_creates, status, expected_events",
     [
         # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
-        ("pod_test", 1, ["run", "rm pod_test", "run"]),
+        ("pod_test", 1, "created", ["run", "rm pod_test", "run"]),
+        ("pod_test", 1, "exited", ["run", "rm pod_test", "run"]),
+        # the earlier attempt already started the pod: a running (or unreadable) container is never removed
+        ("pod_test", 1, "running", ["run"]),
+        ("pod_test", 1, "restarting", ["run"]),
+        ("pod_test", 1, RuntimeError("inspect failed"), ["run"]),
         # the earlier attempt is still live (its start may fail later and clean up by name): touch nothing
-        ("pod_test", 2, ["run"]),
-        ("pod_other", 1, ["run"]),
+        ("pod_test", 2, "created", ["run"]),
+        ("pod_other", 1, "created", ["run"]),
     ],
 )
 async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
-    docker_service, monkeypatch, conflict_name, live_creates, expected_events,
+    docker_service, monkeypatch, conflict_name, live_creates, status, expected_events,
 ):
     events: list[str] = []
 
@@ -4821,6 +5030,11 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
                     'is already in use by container "25b3b093".")'
                 )
             return "cid"
+
+        async def container_status(self, *, container_name):
+            if isinstance(status, Exception):
+                raise status
+            return status
 
         async def remove_container(self, *, container_name, force, remove_volumes):
             events.append(f"rm {container_name}")
@@ -4848,6 +5062,66 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["other_create_registers_during_inspect", "pod_started_before_rm"])
+async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status_read(
+    docker_service, monkeypatch, race,
+):
+    events: list[str] = []
+    registry = docker_service_module.inflight_creates
+    async with contextlib.AsyncExitStack() as stack:
+
+        class FakeRentalClient:
+            async def run_container(self, spec):
+                events.append("run")
+                raise Exception(
+                    '409 Client Error: Conflict ("Conflict. The container name "/pod_test" '
+                    'is already in use by container "25b3b093".")'
+                )
+
+            async def container_status(self, *, container_name):
+                if race == "other_create_registers_during_inspect":
+                    # a separate create (not this task's context, which already holds the pod)
+                    registered, release = asyncio.Event(), asyncio.Event()
+
+                    async def other_create():
+                        with registry.track("test"):
+                            registered.set()
+                            await release.wait()
+
+                    other = asyncio.create_task(other_create(), context=contextvars.Context())
+
+                    async def finish_other():
+                        release.set()
+                        await other
+
+                    stack.push_async_callback(finish_other)
+                    await registered.wait()
+                return "created"
+
+            async def remove_container(self, *, container_name, force, remove_volumes):
+                events.append(f"rm {container_name} force={force}")
+                if race == "pod_started_before_rm":
+                    raise Exception("409 Conflict: cannot remove a running container")
+
+        monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+        with registry.track("test"):
+            with pytest.raises(docker_service_module._SameNameContainerKept):
+                await docker_service._run_rental_docker_create_with_port_retry(
+                    docker_client=FakeRentalClient(),
+                    ssh_client=Mock(),
+                    run_spec=ContainerRunSpec(image="img", name="pod_test"),
+                    container_name="pod_test",
+                    default_extra={},
+                    pod_id="test",
+                )
+    if race == "other_create_registers_during_inspect":
+        assert events == ["run"]
+    else:
+        assert events == ["run", "rm pod_test force=False"]
+    assert not registry.is_running("test")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("live_creates, removed", [(1, True), (2, False)])
 async def test_failed_create_without_container_id_removes_by_name_only_when_no_other_create_is_live(
     docker_service, monkeypatch, live_creates, removed,
@@ -4864,6 +5138,66 @@ async def test_failed_create_without_container_id_removes_by_name_only_when_no_o
                 ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
             )
     assert any("rm -fv pod_test" in str(call) for call in ssh_commands.call_args_list) is removed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", RuntimeError("inspect failed")])
+@pytest.mark.parametrize("transport_retry", [False, True])
+async def test_redelivered_create_leaves_a_running_same_name_pod_untouched(
+    docker_service, monkeypatch, status, transport_retry,
+):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    ssh_commands = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
+    pod_id = str(uuid4())
+    client = docker_service.rental_docker_client_factory.client
+    client.run_error = (
+        # the SDK's transport retry met the running flattened pod under the original image's name
+        ContainerNameTakenOnRetry(
+            f"Docker SDK run container refused after a transport retry: a container named pod_{pod_id} "
+            f"already exists with image 'lium-flattened:{pod_id}', not 'daturaai/dlph:test'"
+        )
+        if transport_retry
+        else Exception(
+            f'409 Client Error: Conflict ("Conflict. The container name "/pod_{pod_id}" '
+            'is already in use by container "25b3b093".")'
+        )
+    )
+    client.container_statuses = [status]
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+    with docker_service_module.inflight_creates.track(pod_id):
+        result = await docker_service.create_container(
+            payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="v"), private_key="encrypted",
+        )
+    assert isinstance(result, FailedContainerRequest)
+    assert not any(f"pod_{pod_id}" in str(call) for call in ssh_commands.call_args_list)
+    assert client.removed_containers == []
 
 
 @pytest.mark.asyncio
@@ -5909,6 +6243,22 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_probe", [True, False])
+async def test_resolve_volume_sizing_takes_the_free_disk_measured_under_the_flatten_lock(docker_service, with_probe):
+    # an earlier probe (or a df outside the lock) may predate an image copy; the locked measure wins
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=900 * _SIZING_GB, volume_ls_stdout="", volume_inspect_stdout="")
+    probe = VolumeHostProbe("/var/lib/docker", 900 * _SIZING_GB, [], True) if with_probe else None
+
+    result = await docker_service.resolve_volume_sizing(
+        ssh_client, payload, "tag", {}, host_probe=probe, locked_df_avail_bytes=600 * _SIZING_GB
+    )
+
+    assert result.path == "fresh"
+    assert result.df_avail_bytes == 600 * _SIZING_GB
+
+
+@pytest.mark.asyncio
 async def test_resolve_volume_sizing_fresh_caps_volume_at_ext4_file_limit(docker_service):
     # Arrange: ~28 TiB free, whole node -> 2/3 slice is ~18 TiB, above the 16 TiB ext4 file cap.
     payload = _make_sizing_payload(disk_share=1.0, storage_limit_gb=1)
@@ -6003,6 +6353,18 @@ async def test_resolve_volume_sizing_below_min_raises(docker_service):
 
 
 @pytest.mark.asyncio
+async def test_resolve_volume_sizing_failed_locked_measure_falls_back_not_on_the_probe(docker_service):
+    payload = _make_sizing_payload(disk_share=0.5, volume_limit_gb=40, storage_limit_gb=20)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=900 * _SIZING_GB)
+
+    result = await docker_service.resolve_volume_sizing(
+        ssh_client, payload, "tag", {}, locked_df_error=RuntimeError("measure failed")
+    )
+
+    assert (result.path, result.volume_limit_gb, result.storage_limit_gb) == ("fresh_fallback", 40, 20)
+
+
+@pytest.mark.asyncio
 async def test_resolve_volume_sizing_measurement_failure_falls_back(docker_service):
     # Arrange
     payload = _make_sizing_payload(disk_share=0.5, volume_limit_gb=40, storage_limit_gb=20)
@@ -6067,9 +6429,9 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     # Arrange: df_avail=900GB, existing vloopback=300GB, share=0.5 -> pool 1180GB,
     # slice 590GB (request cap 400*1.5=600GB does not bind) -> volume 393, storage 196.
     def ssh_run(command, **kwargs):
-        if "docker info" in command:
+        if "docker info" in command and "flock" not in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
-        if "df -P -B1 /hostfs" in command:
+        if "df -P -B1 /hostfs" in command:  # also the measure under the flatten lock
             return _make_ssh_command_result(
                 stdout=(
                     "Filesystem           1-blocks       Used Available Capacity Mounted on\n"
@@ -7227,7 +7589,7 @@ async def test_run_jupyter_with_encrypted_volume_installs_into_plaintext_mount(
     install = [call for call in calls if "cat > /root/run_jupyter.sh" in call.kwargs["command"]]
     assert install, commands
     install_command = install[0].kwargs["command"]
-    assert "cat /root/app/run_jupyter.sh |" in install_command
+    assert "/root/app/run_jupyter.sh | /usr/bin/docker exec" in install_command
     assert "docker exec -i -u 0 pod_test" in install_command
     # nothing is fed from the executor process: the host shell owns the pipe
     assert install[0].kwargs.get("stdin_data") is None
@@ -8769,7 +9131,7 @@ async def test_a_key_write_that_fails_in_a_running_container_keeps_the_exec_erro
     assert _failure_error_field(result).startswith("Failed to add SSH public keys inside container")
 
 
-@pytest.mark.parametrize("exit_status", [90, 91, 92, 1])
+@pytest.mark.parametrize("exit_status", [90, 91, 92])
 @pytest.mark.asyncio
 async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
     docker_service, monkeypatch, exit_status
@@ -8781,6 +9143,43 @@ async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
     assert result.failure_step == "encrypted_volume_setup"
     assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
     inspect.assert_not_awaited()
+
+
+# prod 3 Nov: a renter image exiting at start ("workspace mount required") failed the setup exec itself
+# with "OCI runtime exec failed" (exit 127/128), and the renter read only "Failed create_container".
+@pytest.mark.parametrize("exit_status", [1, 127, 128])
+@pytest.mark.asyncio
+async def test_a_setup_exec_docker_could_not_run_in_a_running_container_fails_the_encryption(
+    docker_service, monkeypatch, exit_status
+):
+    result, inspect = await _create_with_volume_setup_exit(
+        docker_service, monkeypatch, exit_status=exit_status, state=_state()
+    )
+
+    assert result.failure_step == "encrypted_volume_setup"
+    assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
+    inspect.assert_awaited()
+
+
+@pytest.mark.parametrize("exit_status", [127, 128])
+@pytest.mark.asyncio
+async def test_a_setup_exec_that_fails_on_an_exiting_image_names_the_image(
+    docker_service, monkeypatch, exit_status
+):
+    result, _ = await _create_with_volume_setup_exit(
+        docker_service,
+        monkeypatch,
+        exit_status=exit_status,
+        state=_state(status="restarting", running=True, restarting=True, exit_code=1, restart_count=1),
+    )
+
+    # the step lium-platform reads the image-exit markers at, so the renter gets the start-command hint
+    assert result.failure_step == "add_public_keys"
+    assert result.volume_encryption_status is None
+    error = _failure_error_field(result)
+    assert "is restarting" in error, error
+    assert f"image {_CUDA_IMAGE!r} has no long-running command" in error
+    assert f"exit_status={exit_status}" in error
 
 
 _OOM_STATES = {
@@ -8825,6 +9224,326 @@ async def test_a_sigkill_whose_container_is_gone_still_goes_out_as_container_van
     assert result.error_code == getattr(FailedContainerErrorCodes, error_code)
 
 
+_SYSBOX_OCI_PREFIX = (
+    "Docker SDK run container failed: 400 Client Error for http+docker://ssh/v1.56/containers/pod_x/start: "
+    'Bad Request ("failed to create task for container: failed to create shim task: OCI runtime create failed: '
+    "container_linux.go:439: starting container process caused: process_linux.go:608: container init caused: "
+    "process_linux.go:579: handleReqOp caused: rootfs_init_linux.go:410: setting up ID-mapped mount on path "
+)
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        # classic overlay2 store, Sysbox 0.7.1 (prod, 25 Oct 2026, lmsysorg/sglang:dev-muse-spark-open, 79 layers)
+        ("l/RK22RUSOMIWEQLFK45ZMFTQT2M", docker_service_module.SYSBOX_MANY_LAYERS_RENTER_SENTENCE),
+        # containerd store, Sysbox 0.6.6
+        ("206/fs", docker_service_module.SYSBOX_MANY_LAYERS_RENTER_SENTENCE),
+        # an absolute path is the data-root filesystem, not the layer count
+        ("/var/lib/docker/overlay2/abc/diff", None),
+    ],
+)
+def test_sysbox_many_layers_sentence(path, expected):
+    error = RuntimeError(
+        f"{_SYSBOX_OCI_PREFIX}{path} (likely means idmapped mounts are not supported on the filesystem at this "
+        'path ()) caused: Failed to eval symlink on : lstat l: no such file or directory")'
+    )
+    assert docker_service_module.sysbox_many_layers_sentence(error) == expected
+
+
+def test_sysbox_many_layers_sentence_reads_the_last_retry_attempt():
+    future = Future(attempt_number=1)
+    future.set_exception(RuntimeError(f"{_SYSBOX_OCI_PREFIX}l/QS7XCQKF3WO5WR6E7QMWSSPGKM (likely means ..."))
+    assert (
+        docker_service_module.sysbox_many_layers_sentence(RetryError(future))
+        == docker_service_module.SYSBOX_MANY_LAYERS_RENTER_SENTENCE
+    )
+    assert docker_service_module.sysbox_many_layers_sentence(RuntimeError("port is already allocated")) is None
+
+
+_SYSBOX_MANY_LAYERS_ERR = f"{_SYSBOX_OCI_PREFIX}l/RK22RUSOMIWEQLFK45ZMFTQT2M (likely means idmapped mounts ..."
+
+
+class _SysboxFailingRentalClient:
+    def __init__(self, fail_images):
+        self.fail_images = fail_images
+        self.events: list[str] = []
+
+    async def run_container(self, spec):
+        self.events.append(f"run {spec.image}")
+        if spec.image in self.fail_images:
+            raise Exception(_SYSBOX_MANY_LAYERS_ERR)
+        return "cid"
+
+    async def remove_container(self, *, container_name, force, remove_volumes):
+        self.events.append(f"rm {container_name}")
+
+
+def _node_ssh(writable_layers=""):
+    return Mock(run=AsyncMock(return_value=Mock(stdout=writable_layers)))
+
+
+async def _create_with_flatten(
+    docker_service, client, flatten, *, reserved_bytes=0, before_retry=None, ssh=None, beside_other_create=None
+):
+    docker_service.stream_log = AsyncMock()
+    with patch.object(docker_service_module, "flatten_image_on_host", flatten):
+        return await docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=client,
+            ssh_client=ssh or _node_ssh(),
+            run_spec=ContainerRunSpec(image="sglang", name="pod_x"),
+            container_name="pod_x",
+            default_extra={},
+            flatten_reserved_bytes=reserved_bytes,
+            before_flatten_retry=before_retry,
+            flatten_beside_other_create=beside_other_create,
+        )
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_without_a_reservation_so_fillers_keep_the_sysbox_error(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    with pytest.raises(Exception, match="ID-mapped mount"):
+        await _create_with_flatten(docker_service, client, flatten, reserved_bytes=None)
+    flatten.assert_not_awaited()
+    assert client.events == ["run sglang"]
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_the_flatten_stops_the_create_before_the_retry(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    cancelled = AsyncMock(side_effect=docker_service_module._CreateCancelledByDelete("deleted"))
+    with pytest.raises(docker_service_module._CreateCancelledByDelete):
+        await _create_with_flatten(docker_service, client, flatten, reserved_bytes=7, before_retry=cancelled)
+    assert flatten.await_args.kwargs["reserved_bytes"] == 7
+    assert client.events == ["run sglang"]  # no create or start after the delete
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_the_flatten_retry_rm_stops_the_create_before_the_run(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    # first check passes; the delete lands while the failed container is removed
+    cancelled = AsyncMock(side_effect=[None, docker_service_module._CreateCancelledByDelete("deleted")])
+    with pytest.raises(docker_service_module._CreateCancelledByDelete):
+        await _create_with_flatten(docker_service, client, flatten, before_retry=cancelled)
+    assert client.events == ["run sglang", "rm pod_x"]  # no run from the flattened copy
+
+
+_GIB = 1024**3
+
+
+def _flatten_on_disk(avail_bytes, image_bytes):
+    # the node-side check of flatten_image_on_host: image + margin + reserve must fit in df's free bytes
+    async def flatten(ssh_client, image, *, lease, reserved_bytes, sized_mark):
+        if avail_bytes < image_bytes + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES + reserved_bytes:
+            raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
+        return "lium-flattened:abc"
+
+    return AsyncMock(side_effect=flatten)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "storage_gb, volume_gb, disk_share, avail_gb, writable_layers, beside_other_create, outcome",
+    [
+        # review: 100 GiB free, two disk_share=0.5 rentals of 26 GiB preallocated volume + 13 GiB layer each;
+        # 48 GiB left and a 24 GiB copy would pass 24 + 10 + 13 = 47: a split rental never flattens
+        (13, 26, 0.5, 48, "/pod_a 13g 0\n/pod_x 13g 0\n", False, "sysbox_error"),
+        (13, 26, None, 100, "/pod_x 13g 0\n", False, "sysbox_error"),  # legacy contract: split unknown
+        # full node: own layer + sparse volume; 24 + 10 + 26 + 53 = 113
+        (26, 53, 1.0, 113, "/pod_x 26g 0\n", False, "flattened"),
+        (26, 53, 1.0, 112, "/pod_x 26g 0\n", False, "no_disk"),
+        # a container left on the node keeps its unwritten layer: 113 + 5
+        (26, 53, 1.0, 117, "/pod_old 5g 0\n/pod_x 26g 0\n", False, "no_disk"),
+        (26, 53, 1.0, 118, "/pod_old 5g 0\n/pod_x 26g 0\n", False, "flattened"),
+        # another customer create still sizing on the node: its grant is not on disk yet
+        (26, 53, 1.0, 1000, "/pod_x 26g 0\n", True, "no_disk"),
+    ],
+    ids=["review_split", "legacy", "full_node_fits", "full_node_short", "leftover_short", "leftover_fits", "in_flight"],
+)
+async def test_the_flatten_keeps_every_granted_allowance_free(
+    docker_service, storage_gb, volume_gb, disk_share, avail_gb, writable_layers, beside_other_create, outcome
+):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = _flatten_on_disk(avail_gb * _GIB, 24 * _GIB)
+    create = _create_with_flatten(
+        docker_service,
+        client,
+        flatten,
+        reserved_bytes=docker_service_module._flatten_reserved_bytes(storage_gb, volume_gb, disk_share),
+        ssh=_node_ssh(writable_layers),
+        beside_other_create=lambda: beside_other_create,
+    )
+    if outcome == "flattened":
+        assert await create == "cid"
+        assert client.events[-1] == "run lium-flattened:abc"
+        return
+    if outcome == "no_disk":
+        with pytest.raises(ImageFlattenNoDisk):
+            await create
+    else:
+        with pytest.raises(Exception, match="ID-mapped mount"):
+            await create
+        flatten.assert_not_awaited()
+    assert client.events == ["run sglang"]
+
+
+_COPY = 24 * _GIB + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "avail_gb, volume_limit_gb, min_volume_gb, copy_bytes, reused, capped_by, outcome",
+    [
+        # review: 200 GiB free gave 120 + 60 and the copy then needed 214; the copy is budgeted first
+        (200, None, None, _COPY, False, "flatten_copy", "flattened"),
+        (200, None, None, None, False, "pool", "no_disk"),  # no budget (few layers): the flatten guard refuses
+        (200, 500, None, _COPY, False, "flatten_copy", "flattened"),  # non-binding request cap
+        (200, 40, None, _COPY, False, "request_cap", "flattened"),  # binding request cap
+        # the minimum volume stays granted; a disk too small for it and the copy refuses the flatten
+        (100, None, 50, _COPY, False, "flatten_copy", "no_disk"),
+        (120, None, 50, _COPY, False, "flatten_copy", "flattened"),
+        # a reused or restored volume keeps the backend's limits as its reservation
+        (200, 120, None, _COPY, True, None, "no_disk"),
+        (220, 120, None, _COPY, True, None, "flattened"),
+    ],
+    ids=[
+        "review_full_node",
+        "unbudgeted",
+        "cap_nonbinding",
+        "cap_binding",
+        "min_volume_short",
+        "min_volume_fits",
+        "reused_short",
+        "reused_fits",
+    ],
+)
+async def test_fresh_sizing_leaves_room_for_the_flatten_it_admits(
+    docker_service, avail_gb, volume_limit_gb, min_volume_gb, copy_bytes, reused, capped_by, outcome
+):
+    if reused:
+        volume_gb, storage_gb = volume_limit_gb, volume_limit_gb // 2
+    else:
+        payload = _make_sizing_payload(
+            disk_share=1.0, storage_limit_gb=1, volume_limit_gb=volume_limit_gb, min_volume_gb=min_volume_gb
+        )
+        sizing = await docker_service.resolve_volume_sizing(
+            _make_sizing_ssh_client(df_avail_bytes=avail_gb * _GIB),
+            payload,
+            "tag",
+            {},
+            locked_df_avail_bytes=avail_gb * _GIB,
+            flatten_copy_bytes=copy_bytes,
+        )
+        assert sizing.capped_by == capped_by
+        assert min_volume_gb is None or sizing.volume_limit_gb >= min_volume_gb
+        volume_gb, storage_gb = sizing.volume_limit_gb, sizing.storage_limit_gb
+    client = _SysboxFailingRentalClient({"sglang"})
+    create = _create_with_flatten(
+        docker_service,
+        client,
+        _flatten_on_disk(avail_gb * _GIB, 24 * _GIB),
+        reserved_bytes=docker_service_module._flatten_reserved_bytes(storage_gb, volume_gb, 1.0),
+    )
+    if outcome == "flattened":
+        assert await create == "cid"
+        assert client.events[-1] == "run lium-flattened:abc"
+    else:
+        with pytest.raises(ImageFlattenNoDisk):
+            await create
+
+
+def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
+    registry = docker_service_module._CustomerCreateRegistry()
+    own, other = (Mock(miner_hotkey="hk", executor_id="ex", workload_kind=WorkloadKind.CUSTOMER_RENTAL) for _ in range(2))
+    with registry.track(own):
+        assert not registry.others_running(own)
+        with registry.track(other):
+            assert registry.others_running(own)
+        assert not registry.others_running(own)
+
+
+def test_flatten_only_on_a_full_node_keeping_free_its_layer_and_sparse_volume():
+    gib = 1024**3
+    assert docker_service_module._flatten_reserved_bytes(26, 53, 1.0) == 79 * gib
+    assert docker_service_module._flatten_reserved_bytes(26, 53, 0.5) is None  # split: no flatten
+    assert docker_service_module._flatten_reserved_bytes(26, 53, None) is None
+    assert docker_service_module._flatten_reserved_bytes(None, None, 1.0) == 0
+
+
+@pytest.mark.asyncio
+async def test_sysbox_many_layers_create_retries_once_from_a_flattened_copy_on_the_same_node(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    assert await _create_with_flatten(docker_service, client, flatten) == "cid"
+    assert client.events == ["run sglang", "rm pod_x", "run lium-flattened:abc"]
+    flatten.assert_awaited_once()
+
+
+def _released_leases(flatten, ssh) -> list[str]:
+    lease = flatten.await_args.kwargs["lease"]
+    return [c.args[0] for c in ssh.run.await_args_list if c.args[0].endswith(f"*.{lease}")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fail_images, before_retry, flatten_error",
+    [
+        ({"sglang"}, None, None),  # created: from here the container keeps the copy
+        ({"sglang", "lium-flattened:abc"}, None, None),  # the create from the copy failed
+        ({"sglang"}, AsyncMock(side_effect=docker_service_module._CreateCancelledByDelete("deleted")), None),
+        ({"sglang"}, None, RuntimeError("flatten failed: export=1 import=0")),
+    ],
+    ids=["created", "create_failed", "cancelled", "flatten_failed"],
+)
+async def test_the_flatten_lease_is_released_however_the_create_ends(
+    docker_service, fail_images, before_retry, flatten_error
+):
+    ssh = _node_ssh()
+    flatten = AsyncMock(return_value="lium-flattened:abc", side_effect=flatten_error)
+    with contextlib.suppress(Exception):
+        await _create_with_flatten(docker_service, _SysboxFailingRentalClient(fail_images), flatten, before_retry=before_retry, ssh=ssh)
+    assert len(_released_leases(flatten, ssh)) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_no_lease_release(docker_service):
+    ssh = _node_ssh()
+    assert await _create_with_flatten(docker_service, _SysboxFailingRentalClient(set()), AsyncMock(), ssh=ssh) == "cid"
+    ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sysbox_many_layers_create_flattens_at_most_once(docker_service):
+    client = _SysboxFailingRentalClient({"sglang", "lium-flattened:abc"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    with pytest.raises(Exception, match="ID-mapped mount"):
+        await _create_with_flatten(docker_service, client, flatten)
+    flatten.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_flatten_fails_the_create_with_the_sysbox_error(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(side_effect=RuntimeError("flatten failed: export=1 import=0"))
+    with pytest.raises(Exception) as exc:
+        await _create_with_flatten(docker_service, client, flatten)
+    assert docker_service_module.sysbox_many_layers_sentence(exc.value)
+    assert client.events == ["run sglang"]
+
+
+@pytest.mark.asyncio
+async def test_no_disk_for_the_flattened_copy_fails_with_the_renter_sentence(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(side_effect=ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE))
+    with pytest.raises(ImageFlattenNoDisk) as exc:
+        await _create_with_flatten(docker_service, client, flatten)
+    assert exc.value.renter_sentence.startswith("not enough free disk on this node")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("docker_run_fails", [False, True])
 async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(monkeypatch, docker_run_fails):
@@ -8855,6 +9574,34 @@ def test_no_usable_loopback_plugin_error_preserves_the_disabled_classification()
     message = str(NoUsableLoopbackPluginError("verified plugin remains disabled", "vloopback:v3", {"vloopback:v2": "absent", "vloopback": "false"}))
 
     assert "plugin vloopback" in message and "disabled" in message
+
+
+@pytest.mark.parametrize(
+    ("volumes", "existing_volume", "expected"),
+    [
+        # DAH-5426: a new volume goes where the template says, bare or host:container
+        (["/workspace"], False, "/workspace"),
+        (["/data/rental:/workspace"], False, "/workspace"),
+        (None, False, "/root"),
+        # a reboot/edit keeps the volume where it is: a bare template path was dropped before DAH-5426,
+        # so the /workspace-template pods made then sit at /root and must stay there
+        (["/workspace"], True, "/root"),
+        # the backend names an existing volume's own path as "<volume>:<path>"
+        (["volume_pod:/workspace"], True, "/workspace"),
+        (["volume_pod:/root"], True, "/root"),
+        (None, True, "/root"),
+    ],
+)
+def test_pod_volume_path(volumes, existing_volume, expected):
+    assert _pod_volume_path(volumes, existing_volume=existing_volume) == expected
+
+
+@pytest.mark.parametrize("template_volume", ["/workspace", "/workspace/", " /workspace/ "])
+@pytest.mark.parametrize(("existing_volume", "expected"), [(False, "/workspace"), (True, "/root")])
+def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_volume, existing_volume, expected):
+    volumes = CustomOptions.sanitize(CustomOptions(volumes=[template_volume])).volumes
+
+    assert _pod_volume_path(volumes, existing_volume=existing_volume) == expected
 
 
 @pytest.mark.asyncio

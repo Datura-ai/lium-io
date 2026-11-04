@@ -206,9 +206,29 @@ async def test_a_fabric_manager_pod_owning_every_gpu_stops_fm_around_the_reset()
     assert result.warning == W.HungGpuReset
     assert _resets(host) == [f"nvidia-smi -r -i {','.join(U)}"]
     assert host.active_during_reset[FM] is False and host.active[FM] is True
-    stop = host.commands.index(f"nsenter -t 1 -m -- systemctl stop {FM}")
-    start = host.commands.index(f"nsenter -t 1 -m -- systemctl start {FM}")
-    assert stop < host.commands.index(_resets(host)[0]) < start
+    # stop, reset and start run as one host unit (as in reset_pod_gpus)
+    assert ("stop", FM) in host.fm_log and ("start", FM) in host.fm_log
+    assert host.fm_log.index(("stop", FM)) < host.fm_log.index(("start", FM))
+    assert any(cmd.startswith("nsenter -t 1 -m -- systemd-run ") for cmd in host.commands)
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_reset_unit_still_running_changes_nothing():
+    host = HungHost(query=_query({U[0]: None}), device_ids=(), count=-1, fabric_manager=True)
+    host.prior_unit_procs = 2
+    result = await _reset(host, pod=U)
+    assert result.warning == W.HungGpuNotResetUnsupported and "still running" in result.detail
+    assert _resets(host) == [] and not any(c.startswith("CUDA_VISIBLE_DEVICES=") for c in host.commands)
+    assert host.fm_log == []
+
+
+@pytest.mark.asyncio
+async def test_a_hung_fabric_reset_whose_unit_stays_is_not_a_reset_and_skips_the_fallback():
+    host = HungHost(query=_query({U[0]: None}), device_ids=(), count=-1, fabric_manager=True)
+    host.reset_hangs, host.reset_unit_stuck = True, True
+    result = await _reset(host, pod=U)
+    assert result.warning == W.HungGpuNotResetUnsupported and "still running" in result.detail
+    assert not any(c.startswith("CUDA_VISIBLE_DEVICES=") for c in host.commands)
 
 
 @pytest.mark.asyncio
