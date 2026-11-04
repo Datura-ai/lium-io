@@ -1,5 +1,6 @@
 import logging
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import PortPair, PortProbeResult
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
@@ -39,10 +40,11 @@ class PortProbe:
             # the other tiers probe from the validator too, so they would pass the same host. The validator's
             # ports are kept: PortConnectivityCheck decides whether this reading fails the node.
             return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
-        if batch.start_timed_out:
-            return PortProbeResult((), tuple(batch.failed), "batch", batch.external, start_timed_out=True)
         successful, failed = batch.successful, batch.failed
         tier = "batch"
+        if batch.start_hung and settings.PORT_PROBE_SKIP_TIERS_ON_HUNG_START:
+            # DAH-5682: their containers start on the same stuck Docker; ~120 s each spent for the same verdict
+            return PortProbeResult((), tuple(failed), tier, batch.external)
 
         if not successful:
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
@@ -71,4 +73,11 @@ class PortProbe:
             )
             tier = "fallback"
 
+        if batch.start_hung:
+            logger.info(
+                _m(
+                    "port check would skip later tiers",
+                    extra=get_extra_info({**log_ctx, "later_tiers_found_ports": bool(successful), "tier": tier}),
+                )
+            )
         return PortProbeResult(tuple(successful), tuple(failed), tier, batch.external)

@@ -4,7 +4,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services.const import BATCH_PORT_VERIFICATION_SIZE
 from services.executor_connectivity.dind_probe import DindProbe
-from services.executor_connectivity.models import DindProbeResult, PortVerificationResult
+from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import (
     PortSelector,
@@ -76,18 +76,14 @@ class ConnectivityOrchestrator:
 
         dind_port = successful.pop(0) if successful else random.choice(ports)
         sysbox_requested = sysbox_runtime
-        if probe_result.start_timed_out:
-            # DAH-5682: the DinD container would not start either; this is the result its start timeout gave
-            dind_result = DindProbeResult(success=False, sysbox_runtime=sysbox_runtime, port=dind_port)
-        else:
-            dind_result = await self.dind_probe.verify(
-                dind_port,
-                ssh_client=ssh_client,
-                host=executor_info.address,
-                container_name_prefix=f"container_{miner_hotkey}",
-                sysbox_runtime=sysbox_runtime,
-                log_ctx=log_ctx,
-            )
+        dind_result = await self.dind_probe.verify(
+            dind_port,
+            ssh_client=ssh_client,
+            host=executor_info.address,
+            container_name_prefix=f"container_{miner_hotkey}",
+            sysbox_runtime=sysbox_runtime,
+            log_ctx=log_ctx,
+        )
 
         if dind_result.success:
             successful.append(dind_port)

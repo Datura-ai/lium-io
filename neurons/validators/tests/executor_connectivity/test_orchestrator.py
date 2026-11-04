@@ -247,36 +247,3 @@ async def test_orchestrator_a_timed_out_sysbox_test_measured_nothing(sample_exec
 
     assert result.dind_ok is True
     assert result.sysbox_measured is None
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_skips_dind_when_the_port_test_container_did_not_start(
-    sample_executor_info, mock_ssh_client, mocker
-):
-    # DAH-5682: same verdict as the DinD start timeout it replaces, without waiting for it
-    selected_ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
-    port_selector = mocker.Mock(spec=PortSelector)
-    port_selector.select.return_value = selected_ports
-    port_probe = mocker.Mock(spec=PortProbe)
-    port_probe.probe = mocker.AsyncMock(
-        return_value=PortProbeResult(successful=(), failed=tuple(selected_ports), start_timed_out=True)
-    )
-    dind_probe = mocker.Mock(spec=DindProbe)
-    dind_probe.verify = mocker.AsyncMock()
-
-    result = await ConnectivityOrchestrator(port_selector, port_probe, dind_probe).verify(
-        executor_info=sample_executor_info,
-        miner_hotkey="miner",
-        sysbox_runtime=True,
-        unavailable_ports=[],
-        ssh_client=mock_ssh_client,
-    )
-
-    dind_probe.verify.assert_not_called()
-    assert result.status == "no_working_ports"
-    assert (result.dind_ok, result.sysbox_runtime, result.dind_error, result.sysbox_measured) == (
-        False,
-        False,
-        None,
-        None,
-    )
