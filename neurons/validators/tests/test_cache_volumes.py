@@ -396,6 +396,38 @@ async def test_a_rental_still_short_is_clamped_only_when_a_removal_failed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("exits_after_polls", "volume_gb"), [(2, 2620), (None, 2389 - 1310)])
+async def test_the_eviction_waits_for_a_killed_filler_to_release_its_cache(
+    docker_service, monkeypatch, exits_after_polls, volume_gb
+):
+    # prod 4 Nov, 8x B300: the preempted filler was still exiting and mounting kimi-k3, so `volume rm` failed and the
+    # rental was clamped and refused at rental_disk_short. Waiting for it frees the cache; past the bound, as before.
+    monkeypatch.setattr("services.docker_service.CACHE_VOLUME_RELEASE_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr("services.docker_service._CACHE_VOLUME_RELEASE_POLL_SECONDS", 0.01)
+
+    class ExitingFillerSshClient(HostSshClient):
+        polls = 0
+
+        async def run(self, command: str, *args, **kwargs):
+            if "ps -aq --filter volume=" in command:
+                self.commands.append(command)
+                self.polls += 1
+                in_use = exits_after_polls is None or self.polls <= exits_after_polls
+                return SimpleNamespace(exit_status=0, stdout="135f7665dd2b\n" if in_use else "", stderr="")
+            if "volume rm" in command and exits_after_polls is not None and self.polls > exits_after_polls:
+                self._listing = "volume_pod"
+                self._free_bytes = 4000 * 1024**3
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = ExitingFillerSshClient([_KIMI, "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert rental.volume_limit_gb == volume_gb
+    assert _removed_volumes(ssh_client) == [_KIMI]
+
+
+@pytest.mark.asyncio
 async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(docker_service, monkeypatch):
     class HangingRemoval(HostSshClient):
         async def run(self, command: str, *args, **kwargs):

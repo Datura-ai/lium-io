@@ -529,6 +529,10 @@ RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
+# A preempted filler killed at the customer create still mounts its cache while it exits (12-60 s on 8x B300, prod
+# 4 Nov: ~45 s with 25 GB dirty), and dockerd refuses `volume rm` of a volume in use: the eviction waits this long.
+CACHE_VOLUME_RELEASE_WAIT_SECONDS = 90
+_CACHE_VOLUME_RELEASE_POLL_SECONDS = 3
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
@@ -5610,6 +5614,8 @@ class DockerService:
                     }),
                 )
             )
+            await self._wait_for_cache_volumes_released(ssh_client, cache_volumes, default_extra)
+
             async def remove(command: str) -> object:
                 return await asyncio.wait_for(
                     retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental"),
@@ -5668,6 +5674,34 @@ class DockerService:
                 exc_info=True,
             )
             return True  # the removal may have run before the failure
+
+    async def _wait_for_cache_volumes_released(
+        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str], default_extra: dict
+    ) -> None:
+        """Wait, bounded, until no container mounts ``volume_names``: a killed filler still exiting holds its cache,
+        so its `volume rm` fails and the rental is clamped and refused at rental_disk_short (DAH-5260, prod 4 Nov).
+        The users are the fillers this create removed; past the bound the eviction runs anyway, as before."""
+        command = "/usr/bin/docker ps -aq " + " ".join(f"--filter volume={shlex.quote(name)}" for name in volume_names)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CACHE_VOLUME_RELEASE_WAIT_SECONDS
+        while True:
+            try:
+                result = await ssh_client.run(command, check=False, timeout=_CACHE_VOLUME_RELEASE_POLL_SECONDS * 5)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return  # an unreadable listing never stops the eviction
+            if result.exit_status != 0 or not (result.stdout or "").strip():
+                return
+            if loop.time() >= deadline:
+                logger.warning(
+                    _m(
+                        "Filler cache volumes still in use after the wait; evicting anyway",
+                        extra=get_extra_info({**default_extra, "volumes": volume_names}),
+                    )
+                )
+                return
+            await asyncio.sleep(_CACHE_VOLUME_RELEASE_POLL_SECONDS)
 
     async def _rental_disk_fit(
         self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest
