@@ -1696,6 +1696,8 @@ _PARK_KILL_SETTLE_SECONDS = 2
 _PARK_KILL_WAIT_SECONDS = 30
 # each SSH command of the edit swap (stop -t 10 included); exit 124 when the host ends it
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
+# the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
+_RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 
 
 class _UnkillableParkedContainer(Exception):
@@ -1915,7 +1917,8 @@ class _EditSwap:
             return
         elif self.bring_up is not None:
             try:
-                await self.bring_up(self.container_name)
+                async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
+                    await self.bring_up(self.container_name)
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
         else:
