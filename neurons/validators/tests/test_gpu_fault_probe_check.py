@@ -238,7 +238,6 @@ async def test_ssh_timeout_is_unknown_not_a_fault(context_factory):
 
 
 def test_importing_the_check_does_not_read_the_probe_source():
-    # Dockerfile.preflight ships services/ without miner_jobs/: a read at import would kill the import there
     tree = ast.parse(Path(module.__file__).read_text())
     top_level = [
         node for node in tree.body if not isinstance(node, (ast.FunctionDef, ast.ClassDef))
