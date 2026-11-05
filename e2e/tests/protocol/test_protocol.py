@@ -25,8 +25,8 @@ def test_executor_answers_version():
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["version"] and body["version"] != "unknown", body
-    # the stack runs with EXECUTOR_LOCAL_VERIFY_ENABLED off: no extra capability is advertised
-    assert body["capabilities"] == [], body
+    # the executor always serves the one-call /verify (DAH-4912)
+    assert body["capabilities"] == ["local_verify/1"], body
 
 
 def test_miner_lists_the_executor_for_its_validator():

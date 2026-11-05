@@ -2580,13 +2580,6 @@ class CachedTemplateMessages:
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 
-    DISABLED = MessageTemplate(
-        event="Local verification disabled",
-        reason="LOCAL_VERIFY_DISABLED",
-        severity="info",
-        category="transport",
-        impact="None — every check runs over SSH as before",
-    )
     SKIPPED = MessageTemplate(
         event="Local verification skipped",
         reason="LOCAL_VERIFY_SKIPPED",
@@ -2600,7 +2593,7 @@ class LocalVerifyMessages:
         severity="info",
         category="transport",
         impact="None — the matmul and VerifyX run over SSH as before",
-        remediation="Update the executor image and set EXECUTOR_LOCAL_VERIFY_ENABLED=true to take the one-call path.",
+        remediation="Update the executor image to take the one-call path.",
     )
     FALLBACK = MessageTemplate(
         event="Local verification not used, SSH path taken",
