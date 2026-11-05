@@ -4698,6 +4698,8 @@ class DockerService:
           preserved for cross-miner isolation on shared physical hosts)
         - 'health_check_*' — backend executor_health_check probes (hotkey-agnostic,
           backend creates these without a hotkey segment — see DAH-1991)
+        - 'port_test_*' — the validator's port verifier (--network=host, so its host ports
+          are invisible to the listening-port probe)
 
         DAH-2272: rentals take priority over background verification. Rather than
         WAITING for a lingering probe to clear (the old max_retries/retry_delay
