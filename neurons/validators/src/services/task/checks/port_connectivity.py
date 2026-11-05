@@ -115,6 +115,26 @@ class _SysboxMemoryUpdate:
     use_last_verified: bool = False
 
 
+async def spend_disk_pressure_deferrals(ctx: Context) -> None:
+    """DAH-5851: a rented node found idle on a deferred cycle (every listed pod stale) defers once in a row, as an
+    idle node does: its streak is used up, so the next pressured cycle runs the check. Fails open (it may defer
+    again, up to DISK_PRESSURE_MAX_DEFERRALS)."""
+    try:
+        for _ in range(DISK_PRESSURE_MAX_DEFERRALS):
+            count = await ctx.services.redis.record_disk_pressure_deferral(
+                ctx.miner_hotkey,
+                ctx.executor.uuid,
+                shadow=False,
+                ttl_seconds=DISK_PRESSURE_DEFERRALS_TTL_SECONDS,
+            )
+            if count >= DISK_PRESSURE_MAX_DEFERRALS:
+                return
+    except Exception as e:  # noqa: BLE001 - never fail the run over it
+        logger.warning(
+            _m("disk pressure streak not spent", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+        )
+
+
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
 

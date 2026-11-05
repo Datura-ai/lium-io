@@ -279,6 +279,7 @@ class TenantEnforcementCheck:
                     }
                     if ctx.state.port_check_deferred and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
                         # DAH-5851: idle now, on a deferred port check: withheld, as PortCountCheck withholds an idle node
+                        await port_connectivity.spend_disk_pressure_deferrals(ctx)
                         return with_pod_states(
                             CheckResult(
                                 passed=False,

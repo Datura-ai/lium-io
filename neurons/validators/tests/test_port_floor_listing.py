@@ -304,7 +304,8 @@ async def test_stale_pod_fails_insufficient_ports_with_the_enforcement_flag(cont
 
 @pytest.mark.asyncio
 async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(context_factory, monkeypatch):
-    """DAH-5851: every listed pod stale makes the node idle, and an idle node's deferred cycle is withheld."""
+    """DAH-5851: every listed pod stale makes the node idle: its deferred cycle is withheld and, like an idle
+    node's, is the only one in a row."""
     from dataclasses import replace
 
     monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
@@ -319,11 +320,14 @@ async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(contex
     _, ctx = await apply(ctx, PortConnectivityCheck())
     _, ctx = await apply(ctx, PortCountCheck())
     ctx = ctx.model_copy(update={"state": replace(ctx.state, port_check_deferred=True)})
+    ctx.services.redis.record_disk_pressure_deferral.side_effect = [1, 2, 3]
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
     assert tenant_result.passed is False
     assert tenant_result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
     assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-1"
+    # idle now, so it defers once in a row: the streak is spent and the next pressured cycle runs the check
+    assert ctx.services.redis.record_disk_pressure_deferral.await_count == 3
 
 
 @pytest.mark.asyncio
