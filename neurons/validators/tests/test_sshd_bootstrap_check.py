@@ -8,18 +8,19 @@ from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutor
 
 from core.config import settings
 from services.docker_service import DockerService
-from services.redis_service import SSHD_BOOTSTRAP_FAILED_PREFIX, SSHD_BOOTSTRAP_FAILED_TTL_SECONDS
+from services.redis_service import SSHD_BOOTSTRAP_FAILED_TTL_SECONDS, sshd_bootstrap_failed_key
 from services.task.checks.sshd_bootstrap import SshdBootstrapCheck
 from services.task.messages import SshdBootstrapMessages as Msg
 from tests.helpers import FakeRedis, build_services, build_state
 
 EXECUTOR = "executor-123"
-KEY = f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{EXECUTOR}"
+# make_context's default miner
+KEY = sshd_bootstrap_failed_key("miner-hotkey", EXECUTOR)
 FILLER = "filler_run-1"
 FAILED_RUN = "sshd verification failed after 15s\n(running=yes, listening=no)\n"
 
 
-def _ctx(context_factory, redis, rented=False, filler_owner=None, ssh=None, backend=None):
+def _ctx(context_factory, redis, rented=False, filler_owner=None, ssh=None, backend=None, rental_port="22"):
     filler_fields = (
         {
             "all_filler_containers_by_executor": {EXECUTOR: [FILLER]},
@@ -34,7 +35,7 @@ def _ctx(context_factory, redis, rented=False, filler_owner=None, ssh=None, back
             EXECUTOR: RentedExecutor(
                 miner_hotkey="m",
                 executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
+                executor_ip_port=rental_port,
                 pods=[RentedPod(pod_id="p", container_name="c")],
             )
         }
@@ -136,7 +137,7 @@ def _service(redis) -> DockerService:
     return service
 
 
-async def _bootstrap(service, run_result, executor_uuid=EXECUTOR):
+async def _bootstrap(service, run_result, key=KEY):
     ok = SimpleNamespace(exit_status=0, stdout="", stderr="")
     with patch(
         "services.docker_service.exec_logged_rental_docker_sdk_operation",
@@ -147,7 +148,7 @@ async def _bootstrap(service, run_result, executor_uuid=EXECUTOR):
             container_name="filler_x",
             log_tag="t",
             log_extra={},
-            sshd_verdict_executor_uuid=executor_uuid,
+            sshd_verdict_key=key,
         )
 
 
@@ -182,7 +183,7 @@ async def test_other_failures_and_renter_creates_stamp_nothing():
         await _bootstrap(
             service,
             SimpleNamespace(exit_status=1, stdout="sshd verification failed", stderr=""),
-            executor_uuid=None,
+            key=None,
         )
         is False
     )
@@ -309,3 +310,37 @@ def test_the_probe_reruns_the_bootstrap_only_past_the_grace(tmp_path):
         assert subprocess.run(["sh", "-c", probe], timeout=10, env=env).returncode == want
         assert fed.exists() is (want == 0)
     assert fed.read_bytes() == _BOOTSTRAP_SCRIPT.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_node_under_another_miners_rental_on_a_different_endpoint_fails(context_factory):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental. ("m" is not the validated miner.)
+    redis = FakeRedis()
+    redis.store[KEY] = "1"
+    result = await SshdBootstrapCheck().run(_ctx(context_factory, redis, rented=True, rental_port="2222"))
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FAILED.reason
+
+
+@pytest.mark.asyncio
+async def test_a_node_copying_the_uuid_cannot_stamp_the_owner(context_factory):
+    redis = FakeRedis()
+    failed = SimpleNamespace(exit_status=1, stdout="sshd verification failed after 30s\n", stderr="")
+    # the copycat's filler create fails sshd under its own hotkey
+    assert await _bootstrap(_service(redis), failed, key=sshd_bootstrap_failed_key("copycat-hotkey", EXECUTOR)) is False
+
+    result = await SshdBootstrapCheck().run(_ctx(context_factory, redis))
+
+    assert result.passed is True
+    assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_saved_under_the_uuid_alone_is_ignored(context_factory):
+    redis = FakeRedis()
+    redis.store[f"sshd_bootstrap_failed:{EXECUTOR}"] = "1"
+
+    result = await SshdBootstrapCheck().run(_ctx(context_factory, redis))
+
+    assert result.passed is True
+    assert KEY not in redis.store

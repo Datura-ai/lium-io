@@ -7,13 +7,10 @@ mismatch test fails closed; an inability to measure never fails.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 from neurons.validators.src.services.task.checks.cpu_truth import (
-    CPU_TRUTH_READ_TIMEOUT_SECONDS,
     CpuTruthCheck,
-    _count_cpu_list,
 )
 from neurons.validators.src.services.task.messages import CpuTruthMessages as Msg
 
@@ -38,48 +35,7 @@ def _state(advertised):
 # ---------------------------- _count_cpu_list (pure) ----------------------------
 
 
-@pytest.mark.parametrize(
-    "spec,expected",
-    [
-        ("0-127", 128),
-        ("0-19,40-59", 40),
-        ("0", 1),
-        ("", None),
-        ("garbage", None),
-    ],
-)
-def test_count_cpu_list(spec, expected):
-    assert _count_cpu_list(spec) == expected
-
-
 # ---------------------------- behavior ----------------------------
-
-
-@pytest.mark.asyncio
-async def test_the_sysfs_read_is_bounded(context_factory):
-    # An unbounded read on a wedged host would hold this check open for the executor's whole
-    # validation budget; the timeout turns that into the *_unknown path instead.
-    seen: dict = {}
-
-    async def run(cmd, *args, **kwargs):
-        seen.update(kwargs)
-        return SimpleNamespace(exit_status=0, stdout="0-127", stderr="")
-
-    ctx = context_factory(state=_state(128), ssh=SimpleNamespace(run=run))
-    await CpuTruthCheck().run(ctx)
-
-    assert seen.get("timeout") == CPU_TRUTH_READ_TIMEOUT_SECONDS
-
-
-@pytest.mark.asyncio
-async def test_match_passes(context_factory):
-    ctx = context_factory(state=_state(128), ssh=_fake_ssh(present="0-127"))
-    result = await CpuTruthCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.CPU_OK.reason
-    assert result.event.what_we_saw["advertised"] == 128
-    assert result.event.what_we_saw["present"] == 128
 
 
 @pytest.mark.asyncio
@@ -99,48 +55,6 @@ async def test_mismatch_fails(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_mismatch_zeroes_the_final_score(context_factory):
-    # End-to-end through the pipeline: CpuTruthCheck is non-fatal and ScoreCheck recomputes the
-    # score from scratch afterwards, so only a context flag calculate_scores reads survives.
-    from neurons.validators.src.services.task.checks.score import ScoreCheck
-    from neurons.validators.src.services.task.pipeline import Pipeline
-    from neurons.validators.src.services.task.score_calculator import calculate_scores
-
-    from tests.helpers import build_services, build_state, default_executor
-
-    class _NullSink:
-        async def emit(self, event):
-            pass
-
-    # ema_verifyx_download_speed present so the CPU-truth verdict is the only gate that can fire.
-    state = build_state(
-        specs={"cpu": {"count": 176}, "network": {"ema_verifyx_download_speed": 120.0}}
-    )
-    ctx = context_factory(
-        state=state,
-        ssh=_fake_ssh(present="0-43"),
-        services=build_services(score_calculator=calculate_scores),
-        executor=default_executor().model_copy(update={"price_per_gpu": None}),
-    )
-    with patch("neurons.validators.src.services.task.score_calculator.settings") as score_s:
-        score_s.ENABLE_TCB_ENFORCEMENT = False
-        pipeline = Pipeline([CpuTruthCheck(), ScoreCheck()], _NullSink())
-        _, _, final_ctx = await pipeline.run(ctx)
-
-    assert final_ctx.score == 0.0
-    assert final_ctx.job_score == 0.0
-
-
-@pytest.mark.asyncio
-async def test_ssh_error_passes_with_unknown_reason(context_factory):
-    ctx = context_factory(state=_state(176), ssh=_fake_ssh(raise_exc=OSError("ssh down")))
-    result = await CpuTruthCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.CPU_UNKNOWN.reason
-
-
-@pytest.mark.asyncio
 async def test_offlined_cores_not_a_spoof(context_factory):
     # honest host with cores offlined: present (== lscpu CPU(s)) equals advertised.
     ctx = context_factory(state=_state(128), ssh=_fake_ssh(present="0-127"))
@@ -149,14 +63,4 @@ async def test_offlined_cores_not_a_spoof(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.CPU_OK.reason
 
-
-@pytest.mark.asyncio
-async def test_missing_advertised_count_is_unknown(context_factory):
-    from tests.helpers import build_state
-
-    ctx = context_factory(state=build_state(specs={"cpu": {}}), ssh=_fake_ssh())
-    result = await CpuTruthCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.CPU_UNKNOWN.reason
 

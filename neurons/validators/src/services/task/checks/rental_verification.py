@@ -18,11 +18,17 @@ from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
 )
 
-from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
+from ...const import (
+    FILLER_CONTAINER_PREFIX,
+    FILLER_LIVENESS_GRACE_MINUTES,
+    LEGACY_LOOPBACK_PLUGIN_ALIAS,
+)
+from ...loopback_plugin_setup import current_loopback_plugin_alias
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
+from .rental_owner import rental_of_this_node
 
 
 @dataclass(frozen=True)
@@ -70,9 +76,11 @@ def _was_deliberately_stopped_on_the_host(diagnostics: ContainerDeathDiagnostics
     Fillers run with `restart: unless-stopped`, so anything that merely killed the process would be
     back up by the next probe; a container still sitting in `exited` after an external signal was
     stopped on purpose. An out-of-memory kill carries the same exit code but is the kernel
-    reclaiming memory, not a choice the host made, so it is excluded.
+    reclaiming memory, not a choice the host made, so it is excluded. So is a container docker tried to
+    restart and could not (State.Error set, e.g. a GPU device gone after a VM reboot): docker never
+    restarts one stopped on purpose.
     """
-    if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL:
+    if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL or diagnostics.error:
         return False
     return not diagnostics.oom_killed
 
@@ -110,7 +118,7 @@ class RentalVerificationCheck:
             CheckResult with verification status
         """
         rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
         has_customer_rental = bool(rented_executor and rented_executor.pods)
         # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
@@ -188,7 +196,7 @@ class RentalVerificationCheck:
         # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
         # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
         # rent skips `--cpus` there too) and when the count is unreadable.
-        cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+        cpu_count = advertised_cpu_count(ctx) if not ctx.executor.tdx_quote else None
 
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
@@ -203,6 +211,9 @@ class RentalVerificationCheck:
                 rental_in_progress=has_customer_rental,
                 gpu_uuids=gpu_uuids,
                 cpu_count=cpu_count,
+                loopback_plugin=current_loopback_plugin_alias()
+                if settings.LOOPBACK_PLUGIN_V2_ENABLED
+                else LEGACY_LOOPBACK_PLUGIN_ALIAS,
             )
 
             # Handle API failure (None response) - fail this executor
@@ -269,6 +280,24 @@ class RentalVerificationCheck:
                         "clear_verified_job_info": True,
                     },
                 )
+            elif (response.error or "").endswith("visible: []"):
+                # an empty kernel list means the container's /proc view is stale, not that the cards changed
+                event = render_message(
+                    Msg.GPU_LIST_EMPTY,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "verified": False,
+                        "executor_uuid": executor.uuid,
+                        "error": response.error,
+                        "details": response.details or {},
+                    },
+                )
+                return CheckResult(
+                    passed=False,  # Fatal check - halt validation
+                    event=event,
+                    updates={},
+                )
             else:
                 # Verification failed - this is fatal
                 event = render_message(
@@ -315,20 +344,16 @@ class RentalVerificationCheck:
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
 
-        Shadow (enforcement off) logs the verdict as a warning and keeps passed=True so scoring is
-        unchanged; enforcement zeroes the score. DAH-2742: unlike the GPU runtime quarantine, the
+        The verdict zeroes the score. DAH-2742: unlike the GPU runtime quarantine, the
         previous verification is kept — a host that really overstates its cores fails every cycle
         and the stale-executor sweep deactivates it without an instant flip.
         """
-        enforce = settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED
         details = response.details or {}
         stderr = details.get("docker_stderr") or response.error
         event = render_message(
             Msg.CPU_QUOTA_EXCEEDS_HOST,
             ctx=ctx,
             check_id=self.check_id,
-            severity=None if enforce else "warning",
-            impact=None if enforce else "Shadow observation only: score was NOT changed",
             what={
                 "verified": False,
                 "executor_uuid": ctx.executor.uuid,
@@ -336,20 +361,16 @@ class RentalVerificationCheck:
                 "reason_code": response.reason_code,
                 "advertised_cpu_count": advertised_cpu_count(ctx),
                 "stderr": stderr,
-                "enforced": enforce,
+                "enforced": True,
                 "details": details,
             },
         )
-        updates = (
-            {
-                "score": 0.0,
-                "job_score": 0.0,
-                "score_warning": "Advertised CPU cores exceed the host's physical cores",
-            }
-            if enforce
-            else {}
-        )
-        return CheckResult(passed=not enforce, event=event, updates=updates)
+        updates = {
+            "score": 0.0,
+            "job_score": 0.0,
+            "score_warning": "Advertised CPU cores exceed the host's physical cores",
+        }
+        return CheckResult(passed=False, event=event, updates=updates)
 
     async def _verify_every_filler_alive(
         self, ctx: Context, filler_containers: list[str]

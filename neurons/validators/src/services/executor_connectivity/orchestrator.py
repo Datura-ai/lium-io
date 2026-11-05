@@ -35,6 +35,7 @@ class ConnectivityOrchestrator:
         unavailable_ports: list[int] | None,
         ssh_client,
         log_ctx: dict | None = None,
+        dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         log_ctx = {
             **(log_ctx or {}),
@@ -83,6 +84,7 @@ class ConnectivityOrchestrator:
             container_name_prefix=f"container_{miner_hotkey}",
             sysbox_runtime=sysbox_runtime,
             log_ctx=log_ctx,
+            deadline_monotonic=dind_deadline_monotonic,
         )
 
         if dind_result.success:
@@ -92,17 +94,8 @@ class ConnectivityOrchestrator:
             failed.append(dind_port)
             sysbox_runtime = False
 
-        externally_unreachable = probe_result.tier == "external_blocked"
-        if externally_unreachable:
-            # DAH-4537: renters cannot reach the host, so no port counts, whatever the validator reached
-            failed, successful = failed + successful, []
-
         port_ranges = tally_port_ranges(declared, ports, successful)
-
-        if externally_unreachable:
-            status = "externally_unreachable"
-        else:
-            status = "ok" if successful else "no_working_ports"
+        status = "ok" if successful else "no_working_ports"
         return PortVerificationResult(
             selected_ports=tuple(ports),
             successful_ports=tuple(successful),
@@ -113,7 +106,10 @@ class ConnectivityOrchestrator:
             status=status,
             dind_error=dind_result.error,
             probe_tier=probe_result.tier,
+            external_probe=probe_result.external,
             declared_port_count=declared_port_count,
             port_ranges=port_ranges,
-            sysbox_measured=dind_result.sysbox_runtime if dind_result.success and sysbox_requested else None,
+            sysbox_measured=dind_result.sysbox_runtime
+            if dind_result.success and sysbox_requested and not dind_result.sysbox_timed_out
+            else None,
         )

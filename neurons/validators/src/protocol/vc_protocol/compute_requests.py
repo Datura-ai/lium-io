@@ -15,8 +15,7 @@ GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
 GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
 # DAH-2671: the rental-verification container was created with `--cpus=<advertised>` and the host's
 # Docker daemon rejected the count — the machine has fewer physical cores than the miner reported.
-# Unlike the two GPU faults above this is spec fraud, not a broken runtime, and it is rolled out
-# shadow-first (see RENTAL_CPU_LIMIT_* in core/config.py).
+# Unlike the two GPU faults above this is spec fraud, not a broken runtime; it zeroes the score.
 CPU_QUOTA_EXCEEDS_HOST_REASON = "CPU_QUOTA_EXCEEDS_HOST"
 
 
@@ -94,6 +93,9 @@ class RentedExecutor(BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-5244 (protocol 2.1.0): a pod on the node has an open rental contracted as a self-rent. A backend
+    # before 2.1.0 omits it, so every rental reads as a third party's - today's behaviour.
+    self_rent: bool = False
 
     def get_rented_ports(self) -> list[int]:
         """Aggregate rented ports from all pods."""
@@ -139,6 +141,10 @@ class ManualRentalInfo(BaseModel):
     gpu_count: int
 
 
+# the window the backend takes each filler average over
+FILLER_REVENUE_WINDOW_HOURS = 24
+
+
 class FillerRevenueByGpuConfig(BaseModel):
     """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
     over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
@@ -147,6 +153,13 @@ class FillerRevenueByGpuConfig(BaseModel):
     gpu_count: int
     usd_per_gpu_hour: float
     gpu_hours: float  # the filler GPU-hours the average was taken over
+
+
+class MaintenanceWindow(BaseModel):
+    """A provider maintenance window, UTC, half-open: [starting_at, expiring_at)."""
+
+    starting_at: datetime
+    expiring_at: datetime
 
 
 class RentedExecutorsResponse(BaseModel):
@@ -186,9 +199,12 @@ class RentedExecutorsResponse(BaseModel):
     # and rentals are untouched. A held new node is also absent from the Discord list above.
     # Additive with an empty default: an older backend names nobody.
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters in the
-    # backend's report window (DAH-4482): each owes a post-rental GPU recheck. Additive with an empty default.
-    renter_hardware_fault_executor_ids: list[str] = []
+    # executor_ids inside a running provider maintenance window (DAH-4709): no incentive from either pool,
+    # rented or not. Additive with an empty default: an older backend names nobody.
+    maintenance_executor_ids: list[str] = []
+    # executor_id → its maintenance window (DAH-4709): a node whose cycle started inside it fails
+    # PROVIDER_MAINTENANCE. Additive with an empty default: an older backend names no window.
+    maintenance_windows_by_executor: dict[str, MaintenanceWindow] = {}
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).
     default_job_owner_by_executor: dict[str, str] = {}
@@ -205,6 +221,10 @@ class RentedExecutorsResponse(BaseModel):
     # executor_ids of the nodes of banned pool accounts, listed as soon as a node is added, so a node
     # added after an account ban fails the ban check in its first cycle. An older backend bans none.
     banned_executor_ids: list[str] = []
+    # DAH-5510: old containers of pods moved off a down node, which the backend keeps on that node until their
+    # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
+    # and its volume_<pod_id>. An older backend names none.
+    retained_container_names: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
@@ -222,6 +242,22 @@ class RentedExecutorsResponse(BaseModel):
                 return None
             return entry.usd_per_gpu_hour
         return None
+
+    def get_filler_revenue_usd_per_hour(self, base_model: str | None, min_gpu_hours: float) -> float | None:
+        """What Lium's fillers earned per hour in total on a GPU model, over every configuration with a
+        usable sample (the trailing 24 hours of each average); None when there is none."""
+        if not base_model:
+            return None
+        totals: list[float] = [
+            entry.usd_per_gpu_hour * entry.gpu_hours / FILLER_REVENUE_WINDOW_HOURS
+            for entry in self.filler_revenue_by_gpu_config
+            if entry.base_model == base_model
+            and entry.gpu_hours >= min_gpu_hours
+            and entry.usd_per_gpu_hour > 0
+            and math.isfinite(entry.usd_per_gpu_hour)
+            and math.isfinite(entry.gpu_hours)
+        ]
+        return sum(totals) if totals else None
 
     def is_provider_banned(
         self,

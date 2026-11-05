@@ -680,9 +680,15 @@ DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 # let a scrape round hang on it.
 DOCKER_API_TIMEOUT_SECONDS = 20
 VLOOPBACK_DRIVER_PREFIX = "vloopback"
-# DAH-5014: the persistent filler model caches (services/const.py FILLER_CACHE_VOLUME_PREFIXES). The
-# validator evicts them before a rental or the listing floor needs the room, so they read as free disk.
-FILLER_CACHE_VOLUME_PREFIXES = ("dphn_cache_", "engy_cache_")
+# the v2 and v3 plugins' DATA_DIRs on the host, under DockerRootDir: loopback_plugin_setup.py uses
+# the same names (v3 = direct I/O; v2 stays for the volumes made on it)
+VLOOPBACK_HOST_DATA_DIR_NAMES = ("vloopback-v2", "vloopback-v3")
+# DAH-5045: the Engy checkpoint cache, reported for its download progress. DAH-5260: unlike the Dolphin cache
+# it reads as free disk, since a customer create removes it when the renter needs the space.
+ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
+# the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
+FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
+FILLER_VOLUME_LABEL_VALUE = "filler"
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -712,9 +718,22 @@ def docker_api_get(path):
         conn.close()
 
 
-def get_vloopback_volume_bytes(docker_root_dir):
+def get_executor_pid_mode():
+    # PidMode of the executor's own container (hostname = container id): "host", or "" when private.
+    # A missing or non-string value raises, so the scrape reports unknown instead of a failing mode.
+    inspection = docker_api_get(f"/containers/{socket.gethostname()}/json")
+    host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
+    pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
+    if not isinstance(pid_mode, str):
+        raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
+    return pid_mode
+
+
+def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
+    # filler_only: just the volumes a filler create labelled as its own (pass it positionally: the
+    # obfuscator renames arguments, not call keywords). sizes: a dict to fill with bytes per volume.
     volumes = (docker_api_get("/volumes") or {}).get("Volumes") or []
     names = [
         volume.get("Name")
@@ -722,6 +741,7 @@ def get_vloopback_volume_bytes(docker_root_dir):
         if (volume.get("Driver") or "").startswith(VLOOPBACK_DRIVER_PREFIX)
         and volume.get("Name")
         and "/" not in volume.get("Name")
+        and (not filler_only or (volume.get("Labels") or {}).get(FILLER_VOLUME_LABEL_KEY) == FILLER_VOLUME_LABEL_VALUE)
     ]
     if not names:
         return 0
@@ -731,21 +751,90 @@ def get_vloopback_volume_bytes(docker_root_dir):
     data_dirs = glob.glob(
         f"/proc/1/root{docker_root_dir}/plugins/*/rootfs{docker_root_dir}/loopback"
     )
+    # the v2 and v3 plugins write their DATA_DIR on the host itself, outside any plugin rootfs
+    for host_data_dir_name in VLOOPBACK_HOST_DATA_DIR_NAMES:
+        host_data_dir = f"/proc/1/root{docker_root_dir}/{host_data_dir_name}"
+        if os.path.isdir(host_data_dir):
+            data_dirs.append(host_data_dir)
     if not data_dirs:
         # every volume would be counted as 0 and the breakdown would silently under-report by
         # terabytes; fail like the rest of the docker half so the miss lands in an error key
         raise RuntimeError(f"no vloopback plugin data dir under {docker_root_dir} for {len(names)} volumes")
 
     total = 0
+    mount_points = None
     for name in names:
         for data_dir in data_dirs:
             try:
                 # st_blocks, not st_size: a preallocated volume takes its whole declared size on
                 # disk while holding nothing, a sparse one takes only what it wrote.
-                total += os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                size = os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                total += size
+                if sizes is not None:
+                    # the pod's share is what its filesystem holds: a preallocated file is its full
+                    # size from the start, a sparse one keeps the blocks of deleted data
+                    if mount_points is None:
+                        mount_points = host_mount_points()
+                    used = None
+                    for mount in glob.glob(f"/proc/1/root{docker_root_dir}/plugins/*/propagated-mount/{name}"):
+                        used = mounted_fs_used_bytes(mount[len("/proc/1/root"):], mount_points)
+                        if used is not None:
+                            break
+                    sizes[name] = size if used is None else used
                 break
             except OSError:
                 continue
+    return total
+
+
+def host_mount_points():
+    # the host's mount points, from its own mount table: os.path.ismount under /proc/1/root resolves the
+    # parent with realpath into this container's filesystem, so a host mount reads as a plain dir
+    try:
+        with open("/proc/1/mountinfo") as mountinfo:
+            fields = [line.split() for line in mountinfo]
+    except (OSError, ValueError):
+        return set()
+    # the kernel escapes only space, tab, newline and backslash (as \ooo); backslash last. No lambda
+    # or re callback: the obfuscator renames a lambda's body but not its argument (F-5)
+    mount_points = set()
+    for f in fields:
+        if len(f) > 4:
+            mount_points.add(f[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\"))
+    return mount_points
+
+
+def mounted_fs_used_bytes(host_path, mount_points):
+    # bytes in use on the filesystem mounted at host_path; None when nothing is mounted there (a stopped pod)
+    if host_path not in mount_points:
+        return None
+    try:
+        stat = os.statvfs(f"/proc/1/root{host_path}")
+    except OSError:
+        return None
+    return (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+
+
+def get_dmcrypt_volume_bytes(docker_root_dir, sizes):
+    # DAH-5487 dm-crypt pod volumes: `local` volumes of type ext4 over /dev/mapper/lium-<pod id>, which
+    # /system/df skips (a volume with mount options). On disk they hold their loop file under lium-crypt.
+    total = 0
+    mount_points = None
+    for volume in (docker_api_get("/volumes") or {}).get("Volumes") or []:
+        device = str((volume.get("Options") or {}).get("device") or "")
+        match = re.fullmatch(r"/dev/mapper/lium-([0-9a-f-]{36})", device)
+        if volume.get("Driver") != "local" or not match or not volume.get("Name"):
+            continue
+        try:
+            size = os.stat(f"/proc/1/root{docker_root_dir}/lium-crypt/{match.group(1)}.img").st_blocks * 512
+        except OSError:
+            continue
+        total += size
+        mountpoint = volume.get("Mountpoint")
+        if mount_points is None:
+            mount_points = host_mount_points()
+        used = mounted_fs_used_bytes(mountpoint, mount_points) if mountpoint else None
+        sizes[volume["Name"]] = size if used is None else used
     return total
 
 
@@ -781,6 +870,15 @@ def get_host_disk_usage():
     return shutil.disk_usage("/")
 
 
+def cache_volume_bytes(df, prefixes):
+    # local-driver volumes: /system/df walks each one's _data, so this is what the files really hold
+    return sum(
+        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
+        if str(volume.get("Name") or "").startswith(prefixes)
+    )
+
+
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
     df = docker_api_get("/system/df")
@@ -791,14 +889,22 @@ def get_docker_disk_usage():
         max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
         for volume in df.get("Volumes") or []
     )
-    filler_cache = sum(
-        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
-        for volume in df.get("Volumes") or []
-        if str(volume.get("Name") or "").startswith(FILLER_CACHE_VOLUME_PREFIXES)
-    )
-    volumes -= filler_cache
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
-    volumes += get_vloopback_volume_bytes(docker_root_dir)
+    # A filler's own run volume is preallocated to its full size, but any rental removes the filler
+    # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
+    # renters were shown half of an idle node's disk. DAH-5260: so does the Engy checkpoint cache
+    # (1561 GB on an 8x B300), which a customer create removes when the renter needs the space.
+    # The Dolphin cache (~40 GB) stays used.
+    engy_cache = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX)
+    filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
+    by_volume = {
+        str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
+        if volume.get("Name")
+    }
+    volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
+    volumes -= engy_cache
+    volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
@@ -807,19 +913,37 @@ def get_docker_disk_usage():
         max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
     )
 
+    # DAH-5059: each pod's own share, so the pod page can show used against its limits: the writable
+    # layer per container name, plus the anonymous volumes it mounts (a dind image's VOLUME
+    # /var/lib/docker has no name the backend knows); named volumes stand alone under their name.
+    by_container = {}
+    for container in df.get("Containers") or []:
+        name = str((container.get("Names") or [""])[0]).lstrip("/")
+        if not name:
+            continue
+        by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(
+            by_volume.get(str(mount.get("Name")), 0)
+            for mount in container.get("Mounts") or []
+            if mount.get("Type") == "volume" and re.fullmatch(r"[0-9a-f]{64}", str(mount.get("Name")))
+        )
+
     return {
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_cache_kb": filler_cache // 1024,
+        "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
+        # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
+        "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
+        "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
+        "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
     }
 
 
 def release_filler_cache(hard_disk):
-    # DAH-5014: report the filler model cache as free disk, so the listing floor, the disk a renter is
-    # offered and the filler fit checks all see it as the reclaimable space it is. The key is dropped:
-    # it is not part of the reported hard_disk block.
-    cache_kb = hard_disk.pop("filler_cache_kb", 0)
+    # DAH-5192: report the filler run volumes and the Engy cache as free disk (a rental removes them), so the
+    # listing floor, the disk a renter is offered and the filler fit checks see that space. The Dolphin cache
+    # is not in it: it stays used. The key is dropped: not part of the reported block.
+    cache_kb = hard_disk.pop("filler_released_kb", 0)
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)
@@ -1002,6 +1126,26 @@ def get_gpu_processes(pids: set, containers: list[dict]):
     return processes
 
 
+# literal: the validator's stale-container cleanup removes leftovers by this prefix
+CAPABILITY_CHECK_NAME_PREFIX = "lium_capability_check_"
+
+
+def run_capability_check(command):
+    # Named and removed after: `--rm` only fires once the container has run, so a run cut off by its
+    # timeout, or refused by the NVIDIA hook at start, used to leave a Created container behind.
+    name = f"{CAPABILITY_CHECK_NAME_PREFIX}{os.getpid()}_{os.urandom(3).hex()}"
+    try:
+        return subprocess.run(
+            command[:3] + ["--name", name] + command[3:],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+    finally:
+        run_storage_probe(["docker", "rm", "-f", name], VLOOPBACK_CLEANUP_TIMEOUT_SECONDS)
+
+
 def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
@@ -1013,13 +1157,7 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
     test_command = COMMANDS["CHECK_SYSBOX_COMPATIBILITY"]
 
     try:
-        result = subprocess.run(
-            test_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30
-        )
+        result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Sysbox runtime supports GPU access."
@@ -1160,7 +1298,26 @@ def check_vloopback_volume_ability(runtime):
         remove_error = remove_storage_check(name)
     if verdict[0] == "pass" and remove_error:
         return "fail", "VLOOPBACK_VOLUME_REMOVE_FAILED", remove_error
+    if verdict[0] == "pass":
+        loop_device = docker_root_loop_without_dio(docker_root_dir)
+        if loop_device:
+            return "pass", "DOCKER_ROOT_LOOP_NO_DIO", f"data-root {docker_root_dir} is on {loop_device} with dio=0"
     return verdict
+
+
+def docker_root_loop_without_dio(docker_root_dir):
+    # the loop device under docker's data root when it runs buffered (no direct I/O), else "":
+    # heavy container writes then stall Docker itself
+    try:
+        with open(HOST_MOUNTS_PATH, errors="surrogateescape") as mounts_file:
+            mounts_text = mounts_file.read()
+    except OSError:
+        return ""
+    device = block_device_holding(mounts_text, docker_root_dir)
+    disk = whole_disk_of(device) if device else ""
+    if disk.startswith("loop") and read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/loop/dio") == "0":
+        return disk
+    return ""
 
 
 def vloopback_check_payload(storage_opt_supported, sysbox_supported):
@@ -1214,13 +1371,7 @@ def check_storage_limit_ability() -> tuple[bool, str]:
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
-        result = subprocess.run(
-            test_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30
-        )
+        result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Storage limit is supported."
@@ -1397,6 +1548,7 @@ class InfinibandPort:
         sm_lid: str,
         pkey: str,
         gids: list[str],
+        driver: str,
     ) -> None:
         self.device = device
         self.port = port
@@ -1410,6 +1562,7 @@ class InfinibandPort:
         self.sm_lid = sm_lid
         self.pkey = pkey
         self.gids = gids
+        self.driver = driver
 
     def as_payload(self) -> dict[str, str | list[str]]:
         return {
@@ -1425,7 +1578,17 @@ class InfinibandPort:
             "ib_sm_lid": self.sm_lid,
             "ib_pkey": self.pkey,
             "ib_gids": self.gids,
+            "ib_driver": self.driver,
         }
+
+
+def read_driver_name(device_path: str) -> str:
+    # The kernel driver behind an RDMA device ("mlx5_core", "efa", ...). AWS EFA reports no
+    # Ethernet or InfiniBand link layer, so the driver is the one fact that names it. "" if unreadable.
+    try:
+        return os.path.basename(os.readlink(f"{device_path}/device/driver"))
+    except Exception:
+        return ""
 
 
 def read_infiniband_port(
@@ -1451,6 +1614,7 @@ def read_infiniband_port(
         read_sysfs_value(f"{port_path}/sm_lid"),
         read_sysfs_value(f"{port_path}/pkeys/0"),
         [gid for gid in gids if gid],
+        read_driver_name(device_path),
     )
 
 
@@ -2043,37 +2207,12 @@ def get_disk_health() -> DiskHealthObservation:
     return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
 
 
-def get_machine_specs():
-    """Get Specs of miner machine."""
-    data = {}
-
-    if os.environ.get('LD_PRELOAD'):
-        return data
-
-    data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
-    gpu_process_ids = set()
-
-    libnvidia_path = get_libnvidia_ml_path()
-    if not libnvidia_path:
-        return data
-
-    nvmlLib_content = get_file_content(libnvidia_path)
-    docker_content = get_file_content("/usr/bin/docker")
-    nvidia_smi_content = get_file_content('/usr/bin/nvidia-smi')
-
-    try:
-        nvmlInit(nvmlLib_content)
-
-        device_count = nvmlDeviceGetCount()
-
-        data["data_gpu"] = {
-            "gpu_count": device_count,
-            "gpu_driver": nvmlSystemGetDriverVersion(),
-            "gpu_cuda_driver": nvmlSystemGetCudaDriverVersion(),
-            "gpu_details": []
-        }
-
-        for i in range(device_count):
+def read_gpu_details(device_count, gpu_process_ids):
+    """The detail rows of every card NVML can read, and the first per-card error (repr) or None."""
+    gpu_details = []
+    first_error = None
+    for i in range(device_count):
+        try:
             handle = nvmlDeviceGetHandleByIndex(i)
             cuda_compute_capability = nvmlDeviceGetCudaComputeCapability(handle)
             major = cuda_compute_capability[0]
@@ -2083,7 +2222,7 @@ def get_machine_specs():
             utilization = nvmlDeviceGetUtilizationRates(handle)
             memory_info = nvmlDeviceGetMemoryInfo(handle)
 
-            data["data_gpu"]["gpu_details"].append(
+            gpu_details.append(
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
@@ -2129,6 +2268,47 @@ def get_machine_specs():
             # Collect process IDs
             for proc in processes:
                 gpu_process_ids.add(proc.c_nvmlProcessInfo_v2_t_pid)
+        except Exception as exc:
+            # one hung card (e.g. NVML 999) must not hide the cards after it: skip it, read the rest
+            first_error = first_error or repr(exc)
+    return gpu_details, first_error
+
+
+def get_machine_specs():
+    """Get Specs of miner machine."""
+    data = {}
+
+    if os.environ.get('LD_PRELOAD'):
+        return data
+
+    data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
+    gpu_process_ids = set()
+
+    libnvidia_path = get_libnvidia_ml_path()
+    if not libnvidia_path:
+        return data
+
+    nvmlLib_content = get_file_content(libnvidia_path)
+    docker_content = get_file_content("/usr/bin/docker")
+    nvidia_smi_content = get_file_content('/usr/bin/nvidia-smi')
+
+    try:
+        nvmlInit(nvmlLib_content)
+
+        device_count = nvmlDeviceGetCount()
+
+        data["data_gpu"] = {
+            "gpu_count": device_count,
+            "gpu_driver": nvmlSystemGetDriverVersion(),
+            "gpu_cuda_driver": nvmlSystemGetCudaDriverVersion(),
+            "gpu_details": []
+        }
+
+        gpu_details, gpu_error = read_gpu_details(device_count, gpu_process_ids)
+        data["data_gpu"]["gpu_details"] = gpu_details
+        if gpu_error:
+            # same field and repr as a whole-scrape NVML failure, so the checks read the NVML code alike
+            data["gpu_scrape_error"] = gpu_error
 
         nvmlShutdown()
     except Exception as exc:
@@ -2260,6 +2440,13 @@ def get_machine_specs():
     except Exception as exc:
         data["data_disk_health_scrape_error"] = repr(exc)
 
+    # DAH: the executor's PID namespace mode, read from its own container (hostname = container id).
+    # "host" is required: backups read /proc/<rental pid> of the host. Missing key = unknown, never fails.
+    try:
+        data["data_executor_pid_mode"] = get_executor_pid_mode()
+    except Exception as exc:
+        data["data_executor_pid_mode_scrape_error"] = repr(exc)
+
     data["data_os"] = ""
     try:
         data["data_os"] = run_cmd('lsb_release -d | grep -Po "Description:\\s*\\K.*"').strip()
@@ -2275,6 +2462,10 @@ def get_machine_specs():
         data["kernel_scrape_error"] = repr(exc)
 
     
+    # aarch64 (GB300 Grace) ships a different libnvidia-ml; the validator picks its digest list by this
+    # os.uname(), not platform.machine(): the obfuscator renames the bare name `platform` (never its import)
+    data["data_machine_arch"] = os.uname().machine
+
     data["data_network"] = {}
 
     data["data_md5_checksums"] = {
