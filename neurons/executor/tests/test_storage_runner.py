@@ -1875,7 +1875,7 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     if passes:
         validate()
     else:
-        with pytest.raises(WorkspaceResolutionError):
+        with pytest.raises(WorkspaceResolutionError, match=str(target)):  # the ls -ld output names what is there
             validate()
 
 
@@ -1884,6 +1884,8 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     ("returncode", "stderr", "message"),
     [
         (20, "", "backup source is not a directory: /root"),
+        (20, "-rw-r--r-- 1 0 0 0 Nov  5 04:01 /proc/123/root/root\n",
+         "backup source is not a directory: /root: -rw-r--r-- 1 0 0 0 Nov  5 04:01 /proc/123/root/root"),
         (1, "nsenter: cannot open /proc/123/ns/user: No such file\n",
          "could not check backup path /root: exit 1: nsenter: cannot open /proc/123/ns/user: No such file"),
     ],
