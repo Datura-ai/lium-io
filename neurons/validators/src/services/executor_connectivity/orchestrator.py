@@ -36,6 +36,7 @@ class ConnectivityOrchestrator:
         ssh_client,
         log_ctx: dict | None = None,
         min_ports: int = MIN_PORT_COUNT,
+        dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         log_ctx = {
             **(log_ctx or {}),
@@ -85,6 +86,7 @@ class ConnectivityOrchestrator:
             container_name_prefix=f"container_{miner_hotkey}",
             sysbox_runtime=sysbox_runtime,
             log_ctx=log_ctx,
+            deadline_monotonic=dind_deadline_monotonic,
         )
 
         if dind_result.success:

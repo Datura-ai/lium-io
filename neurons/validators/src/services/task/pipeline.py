@@ -145,7 +145,7 @@ class ContextState:
     gpu_uuids: Optional[str] = None
     # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
     # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
-    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # attempted once per cycle. Bans match against these too.
     kernel_gpu_uuids: list[str] | None = None
     kernel_gpu_uuids_read_attempted: bool = False
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
@@ -298,6 +298,9 @@ class Context(BaseModel):
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True
+    # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
+    # non-fatal on a live rental, so the score gate lives in calculate_scores.
+    kernel_gpu_view_passed: bool = True
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True

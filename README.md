@@ -53,7 +53,7 @@ Docs and the Provider Portal call a miner a **provider** and an executor a **nod
 
 Per GPU host (the full list is in the [Node Quickstart](https://docs.lium.io/providers/nodes/quickstart#requirements)):
 
-- **OS:** Ubuntu 24.04, or Ubuntu 22.04 with the HWE kernel. Sysbox needs kernel 5.19 or newer.
+- **OS:** Ubuntu 24.04 or 26.04, or Ubuntu 22.04 with the HWE kernel. Sysbox needs kernel 5.19 or newer. On 26.04 the Sysbox setup script adds an AppArmor rule so Sysbox can mount its file systems.
 - **GPU:** an NVIDIA model on the [supported list](https://docs.lium.io/providers/architecture#supported-gpus) (the validator's source of truth is `GPU_MODEL_RATES` in [`neurons/validators/src/services/const.py`](neurons/validators/src/services/const.py)), with the driver installed (`nvidia-smi` works).
 - **Docker Engine**, installed and running.
 - **Network:** a public IP and at least **100 Mbps download**, as measured by the validator.
@@ -167,7 +167,7 @@ A provider earns in two ways. The rates move with the market, so the [rewards ca
 2. **Subnet emission.** Each cycle the validator scores every node and sets weights on chain, and Bittensor pays alpha to provider hotkeys every tempo. The validator splits the emission three ways:
    - **Rented pool:** nodes that are rented right now, scored by GPU model and count.
    - **Unrented pool:** idle nodes of an eligible GPU model, paid by what that GPU earns when rented. Among the conditions: the node passes validation, its price is at or below the market soft limit, its disk is at least 1.5× its VRAM, its container can set a GPU power limit, and its GPU count has a priced tier. An 8× H200, B200 or B300 node must also offer GPU splitting, GPU profiling or an attested confidential VM. On a partly rented split node, the free GPUs are paid for one minimum-size split per free open port (at least 3 free ports in all): 8 free 1-GPU splits need 8 free ports.
-   - **H100 SXM modules on PCIe adapter boards** (no NVLink between the GPUs) are listed as `H100 PCIe`. Their idle pay per GPU-hour is 90% of what Lium's fillers earn per GPU-hour on that H100 configuration, not the H100 PCIe rate.
+   - **H100 SXM modules on PCIe adapter boards** (no NVLink between the GPUs) are listed as `H100 PCIe` and paid the fixed H100 PCIe idle rate, like any H100 PCIe node.
    - **Burn:** the rest. The validator reads the ceiling for the unrented and burn pools from the platform's shared config (`total_burn_emission` at [lium.io/api/v1/shared-config](https://lium.io/api/v1/shared-config)) at the start of every cycle.
 
 A node that fails validation, or runs the provider's own default job, earns nothing that cycle. Every reason a node can earn 0, with the exact message the provider sees, is listed in [`incentive/miner_incentive_log.py`](neurons/validators/src/incentive/miner_incentive_log.py). The pool logic is in [`incentive/rental_price.py`](neurons/validators/src/incentive/rental_price.py). The full explanation is in [Subnet emission](https://docs.lium.io/providers/rewards/emission) and [Penalties](https://docs.lium.io/providers/rewards/penalties).

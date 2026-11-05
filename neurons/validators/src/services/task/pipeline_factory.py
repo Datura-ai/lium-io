@@ -38,6 +38,7 @@ from .checks import (
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
+    SplitDiskCheck,
     DuplicateExecutorCheck,
     ExecutorImageCheck,
     FinalizeCheck,
@@ -72,6 +73,7 @@ from .checks import (
     RentalVerificationCheck,
     RentedGpuDropCheck,
     RentedPodNetworkCheck,
+    RentedPodOwnershipCheck,
     RentedPodResourcesCheck,
     RentedThroughputCheck,
     ScoreCheck,
@@ -319,6 +321,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
                 # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
                 # the published specs had no tdx_host_supported key and the backend stored false,
@@ -404,6 +408,7 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
@@ -503,6 +508,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
@@ -532,6 +539,7 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
@@ -597,6 +605,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
                 GpuCountCheck(),
@@ -613,6 +623,7 @@ class PipelineFactory:
                 # DAH-4564: read-only docker inspect + /proc read — safe in dry run.
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),

@@ -292,9 +292,6 @@ class Settings(BaseSettings):
     # Off: an outside failure is logged ("log-only"), never failed, so prod can count the nodes it would fail
     # (the shadow step). On: a node fails on its second outside failure in a row.
     EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
-    # DAH-5682: both batch attempts ran out of time inside the test container's start (a stuck Docker), so the
-    # semi-batch and fallback tiers are skipped; the DinD probe still runs. Off: the skip is only logged.
-    PORT_PROBE_SKIP_TIERS_ON_HUNG_START: bool = Field(env="PORT_PROBE_SKIP_TIERS_ON_HUNG_START", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -328,10 +325,8 @@ class Settings(BaseSettings):
     # channel of the pipeline's SSH session to the executor's loopback port (`/version` names it);
     # the executor refuses any other peer. Any refusal, timeout, mismatch or local failure falls
     # back to the SSH path for that step (logged per outcome, `[local_verify]`).
-    # Off by default; the SSH path is unchanged either way.
-    VALIDATOR_LOCAL_VERIFY_ENABLED: bool = Field(env="VALIDATOR_LOCAL_VERIFY_ENABLED", default=False)
-    # Whole-call budget for `POST /verify` (seconds). Sized for the first pass; a full-size VerifyX
-    # may take longer and then falls back, so keep this above VERIFYX first-pass p90 (90 s) + matmul.
+    # Whole-call budget for `POST /verify` (seconds). Only the first pass calls it (a full-size VerifyX
+    # stays on SSH), so keep this above VERIFYX first-pass p90 (90 s) + matmul.
     # The executor is told to stop 30 s earlier (`deadline_s` = this − 30, min 5) so a cut answer
     # with finished steps inside still arrives inside the budget.
     LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)
@@ -370,11 +365,10 @@ class Settings(BaseSettings):
     #
     # Item 1 — surface the kernel (procfs) GPU verdict the validator already computes and throws
     # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
-    # DAH-2662 — match provider/GPU bans against the kernel's GPU UUIDs (/proc/driver/nvidia) as well
-    # as the host-reported ones. Shadow by default: the kernel list is read, recorded on specs and
-    # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
-    # matched on the reported list until this is flipped from a week of clean fleet data.
-    KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
+    # DAH-4891: fail a node whose kernel GPU list is read through a foreign mount over
+    # /proc/driver/nvidia/gpus (KERNEL_GPU_VIEW_OVERLAID). Off: the finding is only recorded on the
+    # banned_provider event (kernel_gpu_foreign_mounts). On only once the honest mount patterns are excluded.
+    KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED", default=False)
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count); a kernel list that is

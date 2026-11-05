@@ -152,6 +152,7 @@ class DummyConnectivityService:
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
         min_ports: int = 3,
+        dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with
@@ -1761,3 +1762,40 @@ async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
     assert await service.redis.ttl("disk_pressure_deferrals:hk:ex") > 3000
     await service.clear_disk_pressure_deferrals("hk", "ex", shadow=False)
     assert await service.disk_pressure_deferrals("hk", "ex", shadow=False) == 0
+
+
+class CountingBackendService(DummyBackendService):
+    calls = 0
+
+    async def get_all_rented_executors(self):
+        self.calls += 1
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "declared,expected_pass,expected_reason",
+    [(2, True, Msg.SKIPPED_ALL_PORTS_RENTED.reason), (3, False, Msg.VERIFY_FAILED.reason)],
+)
+async def test_a_rental_holding_every_port_is_an_info_verdict_not_a_port_failure(
+    context_factory, declared, expected_pass, expected_reason
+):
+    # DAH-3266: _rented_state's pod holds 2 ports; a 2-port range has nothing left to probe, a 3-port one does
+    backend = CountingBackendService()
+    services = build_services(
+        redis=DummyRedis(),
+        backend=backend,
+        connectivity=DummyConnectivityService(
+            success=False,
+            status="no_ports",
+            port_ranges=(PortRangeResult(first=40010, last=40009 + declared, declared=declared, probed=0, answered=0),),
+        ),
+    )
+    config = build_context_config(job_batch_id="batch-123")
+    ctx = context_factory(services=services, config=config, state=_rented_state())
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    assert result.event.reason_code == expected_reason
+    assert backend.calls == (0 if expected_pass else 1)

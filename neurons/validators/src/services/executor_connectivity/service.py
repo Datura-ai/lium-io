@@ -35,6 +35,7 @@ class ExecutorConnectivityService:
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
         min_ports: int = MIN_PORT_COUNT,
+        dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability."""
         log_ctx = log_ctx or {}
@@ -51,6 +52,7 @@ class ExecutorConnectivityService:
                 unavailable_ports=(rented_ports or []) + (filler_ports or []),
                 log_ctx=log_ctx,
                 min_ports=min_ports,
+                dind_deadline_monotonic=dind_deadline_monotonic,
             )
             sysbox_result = verification.sysbox_runtime
             if not sysbox_result and rented_ports and sysbox_runtime:
