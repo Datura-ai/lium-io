@@ -375,16 +375,19 @@ class RedisService:
         pod first. A lock with another token (the rental probe's, or another pod's create) is left alone.
         """
         key = _executor_create_lock_key(executor_id)
-        async with self.redis.pipeline(transaction=True) as pipe:
-            try:
+        try:
+            async with self.redis.pipeline(transaction=True) as pipe:
                 await pipe.watch(key)
                 if await pipe.get(key) != _renter_create_lock_token(pod_id).encode():
                     return
                 pipe.multi()
                 pipe.delete(key)
                 await pipe.execute()
-            except redis.exceptions.WatchError:
-                pass  # released or taken by someone else meanwhile: no longer the cut-off create's
+        except redis.exceptions.WatchError:
+            pass  # released or taken by someone else meanwhile: no longer the cut-off create's
+        except Exception as e:
+            # the lock lapses at its TTL as before; the re-send only waits longer
+            logger.warning(_m("Could not release a cut-off create's lock", extra={"pod_id": pod_id, "error": str(e)}))
 
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""

@@ -1212,13 +1212,7 @@ class ComputeClient:
                 continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
-            try:
-                await redis_service.release_cut_off_create_lock(create.executor_id, pod_id)
-            except Exception as e:
-                # the lock lapses at its TTL as before; the re-send only waits longer
-                logger.warning(
-                    _m("Could not release a cut-off create's lock", extra={"pod_id": pod_id, "error": str(e)})
-                )
+            await redis_service.release_cut_off_create_lock(create.executor_id, pod_id)
             if create.resumes < MAX_CREATE_RESUMES:
                 # the count survives another restart before the backend's re-send arrives
                 await redis_service.add_inflight_backend_create(
