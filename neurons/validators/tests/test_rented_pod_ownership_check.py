@@ -106,7 +106,41 @@ async def test_malformed_ssh_output_is_unread_and_does_not_raise(context_factory
     result = await RentedPodOwnershipCheck().run(_ctx(context_factory, SimpleNamespace(run=run)))
     assert result.passed is True
     assert result.event.reason_code == Msg.UNREAD.reason
-    assert result.event.what_we_saw["unread"] == ["pod_1"]
+    assert result.event.what_we_saw["unread"] == ["pod_1", "pod_2"]
+
+
+@pytest.mark.asyncio
+async def test_a_rental_missing_from_inspect_is_unread_not_ok(context_factory, tmp_path):
+    # pod_2 disappeared: docker inspect prints only pod_1 and exits 1; pod_1 reads healthy
+    _proc(tmp_path, 4242, f"         0     {os.getuid()}      65536\n")
+    real = _ssh(str(tmp_path)).run
+
+    async def run(cmd, check=False):
+        if cmd.startswith("/usr/bin/docker inspect"):
+            return SimpleNamespace(exit_status=1, stdout="/pod_1 4242\n", stderr="No such object")
+        return await real(cmd, check)
+
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, SimpleNamespace(run=run)))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UNREAD.reason
+    assert result.event.what_we_saw["unread"] == ["pod_2"]
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_number_is_unread_and_does_not_raise(context_factory):
+    huge = "9" * 5000  # past int()'s digit limit
+
+    async def run(cmd, check=False):
+        if cmd.startswith("/usr/bin/docker inspect"):
+            return SimpleNamespace(exit_status=0, stdout=f"/pod_1 4242\n/pod_2 {huge}\n", stderr="")
+        return SimpleNamespace(
+            exit_status=0, stdout=f"{huge}|0 100000 65536|0|0\n4242|0 {huge} 65536|1|1\n", stderr=""
+        )
+
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, SimpleNamespace(run=run)))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UNREAD.reason
+    assert result.event.what_we_saw["unread"] == ["pod_1", "pod_2"]
 
 
 def test_read_command_reports_a_missing_pid_without_failing(tmp_path):

@@ -25,8 +25,9 @@ def read_command(pids: list[int], proc: str = "/proc") -> str:
 
 def _num(text: str) -> int | None:
     # the provider controls the SSH endpoint: accept only plain ASCII digits ("²".isdigit() is True, int() fails)
+    # of at most 10 (a uid or pid fits in 32 bits; a huge string hits int()'s digit limit and raises)
     text = text.strip()
-    return int(text) if text.isascii() and text.isdigit() else None
+    return int(text) if len(text) <= 10 and text.isascii() and text.isdigit() else None
 
 
 def judge(line: str) -> dict | None:
@@ -107,8 +108,9 @@ class RentedPodOwnershipCheck:
             pod = judge(line)
             if pod and pod["pid"] in name_by_pid:
                 pods[pod["pid"]] = {"container": name_by_pid[pod["pid"]], **pod}
-        # a pod not read back (restarted between inspect and the read, or a garbled line) is unknown, not healthy
-        unread = sorted(name for pid, name in name_by_pid.items() if pid not in pods)
+        # a requested pod not read back (missing from inspect, restarted before the read, or a garbled line)
+        # is unknown, not healthy
+        unread = sorted(set(names) - {p["container"] for p in pods.values()})
         what = {"pods": list(pods.values())}
         if any(p["outside_namespace"] for p in pods.values()):
             template = Msg.SHIFTED
