@@ -1073,6 +1073,23 @@ async def test_the_fourth_pressured_cycle_runs_the_check_and_ends_the_streak(con
 
 
 @pytest.mark.asyncio
+async def test_an_idle_node_defers_once_in_a_row(context_factory, monkeypatch):
+    """DAH-5851 review: an idle node's deferred cycle is withheld, so a second one in a row runs the check
+    before the backend's 45-minute sweep could drop the unpublished row."""
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    deferred = []
+    for _ in range(4):
+        ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED)
+        if not redis_service.verified_ports:
+            _remember(redis_service, ctx)
+        result = await PortConnectivityCheck().run(ctx)
+        deferred.append(connectivity.called_with is None)
+        assert result.passed
+    assert deferred == [True, False, True, False]
+
+
+@pytest.mark.asyncio
 async def test_a_replayed_memory_keeps_the_listing_but_never_pays_free_gpus_across_the_deferral_cadence(context_factory, monkeypatch):
     """Review on #1964: three deferrals then one briefly healthy forced check, repeated. Only the forced
     check's own measurement reaches the free GPUs' idle pay; the rental stays, and so does the listing (DAH-5851)."""
