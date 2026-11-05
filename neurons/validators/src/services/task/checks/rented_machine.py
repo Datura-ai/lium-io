@@ -336,6 +336,12 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
                             )
                         )
+                    if await _another_listed_pod_running(ctx, rented_pods, state_by_pod_id, pod_index):
+                        # a split node with another rental still running: this pod's rental closed, the node is
+                        # still rented, so it must not go on as unrented to the checks that load every card
+                        extra.setdefault("stale_pods", []).append(pod_id)
+                        ssh_pub_keys = []
+                        continue
                     impact = None
                     if port_count_below_floor is not None:
                         stale_what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
@@ -881,6 +887,25 @@ async def _reprobe_split_shortfall(
         _, updates = published(fresh.get_filler_ports(ctx.executor.uuid))
         return None, {**updates, "rented_data": fresh.model_copy(update={"executors": executors})}
     return published(fresh.get_filler_ports(ctx.executor.uuid))
+
+
+async def _another_listed_pod_running(
+    ctx: Context, rented_pods: list[RentedPod], state_by_pod_id: dict[str, ContainerState], stale_pod_index: int
+) -> bool:
+    """True when a listed pod other than the stale one has its container running (aa801f3e, 31 Oct-3 Nov: a
+    sibling rental closing sent a node with a live rental on as unrented). A pod that cannot be read is not."""
+    if any(state_by_pod_id.get(pod.pod_id) == ContainerState.RUNNING for pod in rented_pods[:stale_pod_index]):
+        return True
+    for other in rented_pods[stale_pod_index + 1 :]:
+        try:
+            other_state = await _check_pod_running_and_read_authorized_keys(
+                ctx.ssh, other.docker_container_name, ctx.default_extra
+            )
+        except (asyncssh.Error, OSError):
+            continue
+        if other_state.running:
+            return True
+    return False
 
 
 async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:
