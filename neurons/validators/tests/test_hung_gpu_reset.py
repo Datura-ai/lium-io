@@ -88,8 +88,8 @@ async def test_a_latched_gpu_gets_the_context_cycle_before_any_reset(cure_ok):
     assert any(cmd.startswith("CUDA_VISIBLE_DEVICES=") for cmd in host.commands)
     assert _resets(host) == ([] if cure_ok else [f"nvidia-smi -r -i {U[0]}"])
     assert result.hung_uuids == [U[0]]
-    # a latch clear is never reported as a reset
-    assert result.warning == (W.HungGpuNotResetUnsupported if cure_ok else W.HungGpuReset)
+    # a latch clear that fixed the GPU tells the renter nothing, and is never reported as a reset
+    assert result.warning == (None if cure_ok else W.HungGpuReset)
 
 
 @pytest.mark.asyncio

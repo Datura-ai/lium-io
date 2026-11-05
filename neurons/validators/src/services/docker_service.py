@@ -12951,7 +12951,11 @@ class DockerService:
             # as _reset_leftover_clock_locks_before_create: a renter's Reset GPU or clock lock never overlaps it
             async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
                 if not held:
-                    logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
+                    # best-effort: skipping it is safe, running it beside the other GPU operation is not
+                    logger.warning(
+                        _m("A GPU operation on the pod outlasted its wait: no hung GPU reset", extra=get_extra_info(default_extra))
+                    )
+                    return None
                 # a reboot its delete cancelled resets no GPU the backend may have rented again
                 if inflight_creates.is_cancelled(payload.pod_id):
                     logger.info(_m("Cancelled by its delete: no hung GPU reset", extra=get_extra_info(default_extra)))

@@ -394,7 +394,8 @@ async def _precheck(
     # both ownership sources: a `--gpus all` container may see more GPUs than the backend gave the pod
     owns_host = set(ordered) == set(host_by_uuid) == set(pod_gpu_uuids)
     if owns_host:
-        host_services, holder_containers, owns_host = await plan_host_holders(runner, fabric_services, container_id)
+        holders = await plan_host_holders(runner, fabric_services, container_id)
+        host_services, holder_containers, owns_host = holders.host_services, holders.holder_containers, holders.owns_host
     return _Plan(
         container_id,
         ordered,
@@ -407,9 +408,16 @@ async def _precheck(
     )
 
 
+@dataclass(frozen=True)
+class HostHolders:
+    host_services: list[str]
+    holder_containers: list[str]
+    owns_host: bool
+
+
 async def plan_host_holders(
     runner: SSHCommandRunner, fabric_services: list[str], container_id: str | None
-) -> tuple[list[str], list[str], bool]:
+) -> HostHolders:
     """For a pod that owns every host GPU: the host services and holder containers to stop around its reset, and
     whether the reset runs in the host unit (False only on a host proven without systemd with nothing to stop)."""
     host_services = [
@@ -431,8 +439,8 @@ async def plan_host_holders(
     if not host_services and not holder_containers:
         # a host proven without systemd and with nothing to stop resets directly, as before the host unit
         probe = await _run(runner, HOST_SYSTEMD_PROBE)
-        return [], [], not (probe.exit_code == 0 and (probe.stdout or "").strip() == "no-systemd")
-    return host_services, holder_containers, True
+        return HostHolders([], [], not (probe.exit_code == 0 and (probe.stdout or "").strip() == "no-systemd"))
+    return HostHolders(host_services, holder_containers, True)
 
 
 async def _service_active(runner: SSHCommandRunner, unit: str) -> bool:

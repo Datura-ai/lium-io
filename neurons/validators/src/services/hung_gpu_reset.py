@@ -76,7 +76,7 @@ _NOT_RESET_WARNING = {
 @dataclass
 class HungGpuResult:
     hung_uuids: list[str] = field(default_factory=list)
-    # None: no pod GPU hung, nothing changed
+    # None: nothing to tell the renter (no pod GPU hung, or the latch clear alone fixed it)
     warning: ContainerWarningCode | None = None
     detail: str | None = None
 
@@ -140,7 +140,8 @@ async def _reset(
         # ago can still read busy); -r below only when the cycle does not clear it
         cures = await cure_wedged_gpus(runner, hung)
         if cures and all(cure.cured for cure in cures):
-            return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, f"only the latch clear ran on {hung}")
+            # the GPUs work again: nothing to tell the renter, and no reset to report either
+            return HungGpuResult(hung, None, f"only the latch clear ran on {hung}")
     try:
         plan = await _reset_targets_or_refuse(runner, hung, pod_gpu_uuids)
     except GpuResetRefused as refused:
@@ -213,8 +214,8 @@ async def _reset_targets_or_refuse(
     if {gpu.uuid for gpu in host_gpus} != set(pod_gpu_uuids):
         return _ResetPlan(targets)
     # the pod's own container is parked and stopped, so no running container is the pod's
-    host_services, holder_containers, owns_host = await plan_host_holders(runner, fabric_services, None)
-    return _ResetPlan(targets, host_services, holder_containers, owns_host)
+    holders = await plan_host_holders(runner, fabric_services, None)
+    return _ResetPlan(targets, holders.host_services, holders.holder_containers, holders.owns_host)
 
 
 async def _has_nvlink(runner: SSHCommandRunner) -> bool:

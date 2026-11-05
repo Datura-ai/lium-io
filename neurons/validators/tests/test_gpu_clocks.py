@@ -730,6 +730,22 @@ async def test_a_reboots_hung_gpu_reset_waits_for_a_gpu_operation_in_flight(monk
 
 
 @pytest.mark.asyncio
+async def test_a_reboot_whose_lock_wait_runs_out_runs_no_hung_gpu_reset(monkeypatch):
+    import services.docker_service as ds
+
+    service, _gates, _started = _service_with_gated_steps([])
+    service.redis_service = None
+    reset = AsyncMock()
+    monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
+    monkeypatch.setattr(ds, "POD_GPU_OPERATION_DEADLINE_SECONDS", 0)
+
+    async with ds.pod_gpu_operation_locks.hold("pod1", 0):  # another GPU operation holds the pod
+        assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) is None
+
+    reset.assert_not_awaited()  # never beside the other operation
+
+
+@pytest.mark.asyncio
 async def test_a_reboot_its_delete_cancelled_runs_no_hung_gpu_reset(monkeypatch):
     import services.docker_service as ds
 
