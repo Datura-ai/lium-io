@@ -26,6 +26,7 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
+from .messages import RentalVerificationMessages, TenantEnforcementMessages
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -559,6 +560,14 @@ async def _session_dropped(ssh: asyncssh.SSHClientConnection) -> bool:
     return ssh.is_closed() is True
 
 
+_TRANSPORT_REASONS = frozenset(
+    {
+        TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason,
+        RentalVerificationMessages.FILLER_TRANSPORT_UNREACHABLE.reason,
+    }
+)
+
+
 def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
     # a check that starts named containers or recovers a pod on the host leaves state a replay would trip over
     checks = step.checks if isinstance(step, ParallelStage) else [step]
@@ -684,6 +693,8 @@ class Pipeline:
             error is None
             and self.reconnect is not None
             and any(not r.result.passed for r in ran)
+            # a check that already names the dead session keeps its own event and check_id
+            and not any(r.result.event.reason_code in _TRANSPORT_REASONS for r in ran)
             and await _session_dropped(ctx.ssh)
         ):
             # a failure the check returned on a session that died is the transport's, not the node's

@@ -105,12 +105,11 @@ class _FailsOnDrop(_Check):
         return CheckResult(passed=True, event=_event("PORTS_OK"))
 
 
-@pytest.mark.parametrize("check_cls", [_Check, _FailsOnDrop])
-async def test_a_failed_reconnect_raises_the_transport_failure(check_cls):
+async def test_a_failed_reconnect_raises_the_transport_failure():
     reconnect, calls = _reconnect([OSError("connection refused")])
 
     with pytest.raises(asyncssh.ConnectionLost):
-        await Pipeline([check_cls(drops=1)], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+        await Pipeline([_FailsOnDrop(drops=1)], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
     assert len(calls) == 1
 
 
@@ -124,11 +123,11 @@ async def test_a_second_drop_keeps_the_transport_failure_and_there_is_no_third_t
 
 
 async def test_a_run_reconnects_at_most_once():
-    class _Observe(_Check):
+    class _Observe(_FailsOnDrop):
         fatal = False
         check_id = "host.observe.a"
 
-    class _Later(_Check):
+    class _Later(_FailsOnDrop):
         check_id = "host.observe.b"
 
     first, later = _Observe(drops=2), _Later(drops=1)
@@ -140,7 +139,7 @@ async def test_a_run_reconnects_at_most_once():
 
 
 async def test_a_check_that_leaves_host_state_is_not_replayed():
-    class _StartsContainers(_Check):
+    class _StartsContainers(_FailsOnDrop):
         replays_after_session_drop = False
 
     check = _StartsContainers(drops=1)
@@ -174,3 +173,16 @@ async def test_a_failure_on_a_session_that_stayed_open_stands():
 async def test_without_a_reconnect_a_dropped_session_ends_the_run_as_before():
     with pytest.raises(asyncssh.ChannelOpenError):
         await Pipeline([_Check(drops=1, raises=True)], _NullSink()).run(_ctx(_session()))
+
+
+async def test_a_check_that_already_reports_the_dead_session_keeps_its_own_event():
+    class _PortCheck(_Check):
+        replays_after_session_drop = False
+
+    reconnect, calls = _reconnect([_session()])
+
+    ok, events, _ = await Pipeline([_PortCheck(drops=1)], _NullSink(), reconnect=reconnect).run(
+        _ctx(_session())
+    )
+
+    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE" and not calls
