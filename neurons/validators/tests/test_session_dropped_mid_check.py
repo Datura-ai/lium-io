@@ -11,14 +11,26 @@ from unittest.mock import MagicMock
 
 import asyncssh
 import pytest
+from services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
 from services.task.checks.port_connectivity import PortConnectivityCheck
 from services.task.checks.rental_probe import RentalProbeCheck
+from services.task.checks.rented_gpu_drop import RentedGpuDropCheck
 from services.task.checks.rented_machine import TenantEnforcementCheck
 from services.task.models import ValidationEvent
 from services.task.pipeline import CheckResult, Context, Pipeline
 
+from tests.helpers import make_context
+
 pytestmark = pytest.mark.asyncio
+
+
+TRANSPORT = "EXECUTOR_TRANSPORT_UNREACHABLE"
+
+
+def _ends_on_the_dead_session(ok, events, own: str = "GPU_VERIFICATION_FAILED"):
+    # the check's own event stays, then the run ends on the transport failure
+    assert not ok and [e.reason_code for e in events[-2:]] == [own, TRANSPORT]
 
 
 class _NullSink:
@@ -67,7 +79,7 @@ class _Check:
 
 
 def _ctx(ssh: MagicMock) -> Context:
-    return Context.model_construct(ssh=ssh, runner=None, default_extra={})
+    return make_context(ssh=ssh)
 
 
 def _reconnect(sessions: list[MagicMock]):
@@ -106,11 +118,12 @@ class _FailsOnDrop(_Check):
         return CheckResult(passed=True, event=_event("PORTS_OK"))
 
 
-async def test_a_failed_reconnect_raises_the_transport_failure():
+async def test_a_failed_reconnect_ends_the_run_on_the_transport_failure():
     reconnect, calls = _reconnect([OSError("connection refused")])
 
-    with pytest.raises(asyncssh.ConnectionLost):
-        await Pipeline([_FailsOnDrop(drops=1)], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    _ends_on_the_dead_session(
+        *(await Pipeline([_FailsOnDrop(drops=1)], _NullSink(), reconnect=reconnect).run(_ctx(_session())))[:2]
+    )
     assert len(calls) == 1
 
 
@@ -118,8 +131,7 @@ async def test_a_second_drop_keeps_the_transport_failure_and_there_is_no_third_t
     check = _FailsOnDrop(drops=2)
     reconnect, calls = _reconnect([_session(), _session()])
 
-    with pytest.raises(asyncssh.ConnectionLost):
-        await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    _ends_on_the_dead_session(*(await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session())))[:2])
     assert len(calls) == 1 and len(check.sessions) == 2
 
 
@@ -134,8 +146,8 @@ async def test_a_run_reconnects_at_most_once():
     first, later = _Observe(drops=2), _Later(drops=1)
     reconnect, calls = _reconnect([_session(), _session()])
 
-    with pytest.raises(asyncssh.ConnectionLost):
-        await Pipeline([first, later], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    ok, events, _ = await Pipeline([first, later], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    _ends_on_the_dead_session(ok, events)
     assert len(calls) == 1 and len(later.sessions) == 0
 
 
@@ -146,13 +158,19 @@ async def test_a_check_that_leaves_host_state_is_not_replayed():
     check = _StartsContainers(drops=1)
     reconnect, calls = _reconnect([_session()])
 
-    with pytest.raises(asyncssh.ConnectionLost):
-        await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    _ends_on_the_dead_session(*(await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session())))[:2])
     assert not calls and len(check.sessions) == 1
 
 
 def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
-    for check in (PortConnectivityCheck, RentalProbeCheck, TenantEnforcementCheck, GpuMemoryHealthCheck):
+    for check in (
+        PortConnectivityCheck,
+        RentalProbeCheck,
+        TenantEnforcementCheck,
+        GpuMemoryHealthCheck,
+        GpuLossHoldCheck,
+        RentedGpuDropCheck,
+    ):
         assert check.replays_after_session_drop is False
 
 

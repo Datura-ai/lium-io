@@ -337,10 +337,42 @@ async def test_a_dropped_session_counts_a_reset_required_cycle_once(
             pass
 
     run = Pipeline([GpuMemoryHealthCheck()], _Sink(), reconnect=reconnect).run(ctx)
+    _, events, _ = await run
     if outcome == "transport failure":
-        with pytest.raises(asyncssh.ConnectionLost):
-            await run
+        # the fault it read is kept; the run ends on the dead session
+        assert [e.reason_code for e in events] == [Msg.FAILED.reason, "EXECUTOR_TRANSPORT_UNREACHABLE"]
     else:
-        _, events, _ = await run
         assert events[-1].reason_code == outcome
     assert gpu_memory_health._reset_required_streak[key] == streak_after
+
+
+@pytest.mark.asyncio
+async def test_a_fault_read_before_the_session_drops_in_its_marker_write_is_kept(context_factory, monkeypatch):
+    # review r4481978351: the flagged reading finished, the session died while the recheck marker was saved
+    import asyncssh
+    from neurons.validators.src.services.task.checks import gpu_memory_health
+
+    session = MagicMock(spec=asyncssh.SSHClientConnection)
+    session.is_closed.return_value = False
+    ctx = make_ctx(context_factory, FakeRunner(_report("flagged", flags=FLAGS)), rented_data=_live_rental())
+    ctx = ctx.model_copy(update={"ssh": session})
+
+    async def drops_while_saving(*args, **kwargs):
+        session.is_closed.return_value = True
+
+    monkeypatch.setattr(gpu_memory_health, "record_marker", drops_while_saving)
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    reconnect = AsyncMock()
+    ok, events, last = await Pipeline([GpuMemoryHealthCheck()], _Sink(), reconnect=reconnect).run(ctx)
+
+    assert not ok and not reconnect.called
+    assert [e.reason_code for e in events] == [Msg.FAILED.reason, "EXECUTOR_TRANSPORT_UNREACHABLE"]
+    assert events[-1].check_id == GpuMemoryHealthCheck.check_id
+    # the finding and its verification reset are published, not dropped with the run
+    [entry] = availability_errors(events)
+    assert entry.reason_code == AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED
+    assert last.clear_verified_job_info is True

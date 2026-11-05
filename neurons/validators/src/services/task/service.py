@@ -272,13 +272,11 @@ class TaskService:
                     error.model_dump(mode="json")
                     for error in availability_errors([*events, failed] if failed else events)
                 ]
-                if (
-                    last_event.check_id == PortConnectivityCheck.check_id
-                    and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
-                ):
-                    # DAH-5718: the checks after the port check never ran, so [] would clear holds only they re-read
-                    # (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones alone
-                    result.session_lost_in_port_check = True
+                if not ok and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason:
+                    # DAH-5718: the checks after the one whose session died never ran, so [] would clear holds only
+                    # they re-read (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones
+                    # alone. DAH-5792: any check, not only the port check (the pipeline ends a dead session the same way)
+                    result.session_lost_in_port_check = last_event.check_id == PortConnectivityCheck.check_id
                     if any(event.reason_code == GpuLossHoldMessages.CLEAN_AGAIN.reason for event in events):
                         # review 4469609761: this scrape ended a GPU-loss hold but its load test never ran, so the
                         # hold is published from here, not from the last published list a restart has emptied

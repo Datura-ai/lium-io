@@ -26,7 +26,7 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
-from .messages import RentalVerificationMessages, TenantEnforcementMessages
+from .messages import RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -515,6 +515,8 @@ class _RanCheck:
     before_state: ContextState
     started: float
     finished: float
+    # False for the run's end on a dead session, which reuses the check's id and took no time of its own
+    in_steps: bool = True
 
 
 def merge_state(current: ContextState, before: ContextState, after: ContextState) -> ContextState:
@@ -571,6 +573,22 @@ _TRANSPORT_REASONS = frozenset(
         RentalVerificationMessages.FILLER_TRANSPORT_UNREACHABLE.reason,
     }
 )
+
+
+def _not_terminal(ran: _RanCheck) -> _RanCheck:
+    return replace(ran, result=ran.result.model_copy(update={"fatal": False, "halt": False}))
+
+
+def _session_lost(ran: list[_RanCheck], ctx: Context) -> _RanCheck:
+    failed = next(r for r in ran if not r.result.passed)
+    event = render_message(
+        TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE,
+        ctx=ctx,
+        check_id=failed.check.check_id,
+        what={"executor_uuid": ctx.executor.uuid, "transport_error": "SSH session closed under the check"},
+    )
+    result = CheckResult(passed=False, event=event, fatal=True)
+    return _RanCheck(failed.check, result, failed.before_state, failed.finished, failed.finished, in_steps=False)
 
 
 def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
@@ -665,9 +683,10 @@ class Pipeline:
 
         Whatever the step returned or raised, the session decides: still open, the step stands as it ran. Closed,
         it runs once more on a fresh session and that run stands. A failure on a session that is closed at the end
-        (the reconnect failed, the rerun dropped too, or the step is not replayable) is raised as the transport
-        failure it is, whatever the check returned, which the executor-image rollout window withholds while a
-        release recreates containers. A connect that fails at the start of the run never gets here."""
+        (the reconnect failed, the rerun dropped too, or the step is not replayable) ends the run as the transport
+        failure it is (EXECUTOR_TRANSPORT_UNREACHABLE, which the executor-image rollout window withholds while a
+        release recreates containers); the check's own events and updates stay, so a fault it finished reading
+        is still published. A connect that fails at the start of the run never gets here."""
         ran, error = await self._attempt(step, ctx)
         if (
             self.reconnect is not None
@@ -702,8 +721,9 @@ class Pipeline:
             and not any(r.result.event.reason_code in _TRANSPORT_REASONS for r in ran)
             and await _session_dropped(ctx.ssh)
         ):
-            # a failure the check returned on a session that died is the transport's, not the node's
-            error = asyncssh.ConnectionLost("SSH session closed under the check")
+            # a failure the check returned on a session that died is the transport's, not the node's: the run ends
+            # on the dead session, and what the check finished (a fault it read, its updates) stays in the result
+            ran = [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx)]
         if error is not None:
             raise error
         return ran, ctx
@@ -737,7 +757,8 @@ class Pipeline:
                 chk, res = ran.check, ran.result
                 # Only emitted checks enter the summary: a sibling lane's checks completed before
                 # the cancel ran, but the run does not report them.
-                steps.append((chk.check_id, res.event.context["execution_time_ms"]))
+                if ran.in_steps:
+                    steps.append((chk.check_id, res.event.context["execution_time_ms"]))
                 elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
                 failed = not res.passed and (
                     res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
