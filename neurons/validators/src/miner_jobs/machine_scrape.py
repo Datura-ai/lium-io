@@ -1548,6 +1548,7 @@ class InfinibandPort:
         sm_lid: str,
         pkey: str,
         gids: list[str],
+        driver: str,
     ) -> None:
         self.device = device
         self.port = port
@@ -1561,6 +1562,7 @@ class InfinibandPort:
         self.sm_lid = sm_lid
         self.pkey = pkey
         self.gids = gids
+        self.driver = driver
 
     def as_payload(self) -> dict[str, str | list[str]]:
         return {
@@ -1576,7 +1578,17 @@ class InfinibandPort:
             "ib_sm_lid": self.sm_lid,
             "ib_pkey": self.pkey,
             "ib_gids": self.gids,
+            "ib_driver": self.driver,
         }
+
+
+def read_driver_name(device_path: str) -> str:
+    # The kernel driver behind an RDMA device ("mlx5_core", "efa", ...). AWS EFA reports no
+    # Ethernet or InfiniBand link layer, so the driver is the one fact that names it. "" if unreadable.
+    try:
+        return os.path.basename(os.readlink(f"{device_path}/device/driver"))
+    except Exception:
+        return ""
 
 
 def read_infiniband_port(
@@ -1602,6 +1614,7 @@ def read_infiniband_port(
         read_sysfs_value(f"{port_path}/sm_lid"),
         read_sysfs_value(f"{port_path}/pkeys/0"),
         [gid for gid in gids if gid],
+        read_driver_name(device_path),
     )
 
 

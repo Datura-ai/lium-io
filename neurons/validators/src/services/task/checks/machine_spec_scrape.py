@@ -522,6 +522,8 @@ class MachineSpecScrapeCheck:
             specs = _deobfuscate(raw, obfuscation_keys)
             # DAH-3698: PortConnectivityCheck's grace marker is validator-owned; a provider must never report it
             specs.pop("port_verify_first_miss", None)
+            # the disk check writes the split disk sizing; a provider must never report it
+            specs.pop("split_disk", None)
 
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
