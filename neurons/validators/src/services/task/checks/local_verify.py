@@ -17,10 +17,11 @@ that step to the SSH path, so the new transport can only save time, never change
 own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
 matmul path and a consumed local pass must not skip it). Nothing is sent outside the first pass
-(`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's budget and then run again
-over SSH, past `JOB_TIME_OUT`; the check is skipped and both steps stay on SSH. The call's budget is
-at most half the time the job has left, so a slow `/verify` still leaves the SSH fallback room. Every outcome is one
-`[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
+(`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's timeout and then run
+again over SSH, past `JOB_TIME_OUT`; the check is skipped and both steps stay on SSH. The call's
+timeout is at most half the time the job has left, so a slow `/verify` still leaves the SSH
+fallback room. Every outcome is one `[local_verify] outcome` log line with `outcome`, `step` and
+`reason` (the per-outcome metric).
 """
 
 from __future__ import annotations
@@ -139,7 +140,7 @@ class LocalVerifyCheck:
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
         if not ctx.config.first_pass:
-            # a full-size VerifyX can time out on /verify and then run again over SSH, past JOB_TIME_OUT
+            # a full-size VerifyX can time out on /verify, then run again over SSH past JOB_TIME_OUT
             return self._skipped(ctx, "not the first pass")
         if ctx.config.validator_keypair is None:
             return self._fallback(
@@ -148,7 +149,7 @@ class LocalVerifyCheck:
 
         matmul_ssh_reason = _matmul_ssh_reason()
         client = self._client_factory(ctx)
-        # half the time the job has left: a /verify that runs out still leaves the SSH fallback as much
+        # half the time the job has left: a /verify that runs out leaves the SSH fallback as much
         client.timeout_s = max(1, min(client.timeout_s, int(task_seconds_left(ctx) / 2)))
         advertised = await client.advertised(ctx.executor)
         if CAPABILITY not in advertised.capabilities:

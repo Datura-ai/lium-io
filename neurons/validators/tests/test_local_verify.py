@@ -864,7 +864,9 @@ async def test_every_refusal_or_mismatch_falls_back_to_ssh(
 
 
 @pytest.mark.asyncio
-async def test_timeout_falls_back_to_ssh(keypair, monkeypatch, short_local_verify_timeouts, verifyx_service):
+async def test_timeout_falls_back_to_ssh(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
     monkeypatch.setattr(settings, "LOCAL_VERIFY_TIMEOUT_SECONDS", 1)
     validation = matmul_service(monkeypatch)
     validation.validate_gpu_model_and_process_job = AsyncMock(
@@ -1152,7 +1154,7 @@ async def test_intent_carries_the_shortened_deadline(
 
 
 @pytest.mark.asyncio
-async def test_the_call_budget_is_capped_by_half_the_time_the_job_has_left(
+async def test_the_verify_timeout_is_capped_at_half_the_time_the_job_has_left(
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
     # a slow /verify plus the SSH fallback must still end before the task is cancelled
@@ -1419,7 +1421,9 @@ async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
 
 
 @pytest.mark.asyncio
-async def test_a_scored_cycle_sends_no_verify_call(keypair, monkeypatch, short_local_verify_timeouts, verifyx_service):
+async def test_a_scored_cycle_sends_no_verify_call(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
     """Not the first pass: VerifyX is full size and can time out on /verify, then run again over SSH
     past JOB_TIME_OUT. No call is made; both steps run over SSH."""
     validation = matmul_service(monkeypatch)
