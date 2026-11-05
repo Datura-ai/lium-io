@@ -644,3 +644,52 @@ async def test_a_fresh_sized_rental_fits_only_under_the_df_guard_too(docker_serv
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
     assert _removed_volumes(ssh_client) == removed
+
+
+class ImageHostSshClient(HostSshClient):
+    """Also keeps the host's image store: the idle-filler-image removal (image ls | xargs image rm) deletes
+    every listed image whose repository a `--filter reference=` names."""
+
+    def __init__(self, listed_volumes: list[str], free_gb: float, images: list[str]):
+        super().__init__(listed_volumes, free_gb)
+        self.images = set(images)
+
+    async def run(self, command: str, *args, **kwargs):
+        if "image ls" in command and "image rm" in command:
+            self.commands.append(command)
+            repositories = {part.split("=", 1)[1] for part in command.split() if part.startswith("reference=")}
+            self.images = {image for image in self.images if image.rsplit(":", 1)[0] not in repositories}
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        return await super().run(command, *args, **kwargs)
+
+
+_ENGY_IMAGE = "ghcr.io/hanlinai/engy-golden-serve:0.8.9"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("renter_image", [_ENGY_IMAGE, "img:tag"])
+async def test_the_reclaim_never_removes_the_image_the_rental_is_about_to_run(docker_service, renter_image):
+    # prod 4 Nov: a renter rented the Engy image; it was pulled, the reclaim's idle-filler-image removal deleted
+    # it (no container used it yet), and docker run failed "No such image". Order: pull -> reclaim -> run.
+    ssh_client = ImageHostSshClient([_KIMI, "volume_pod"], free_gb=2389, images=[_ENGY_IMAGE, "daturaai/dolphin:1"])
+    rental = _rental(2620, 1310)
+    rental.docker_image = renter_image
+    ssh_client.images.add(renter_image)  # the pull
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+
+    assert renter_image in ssh_client.images  # docker run finds it
+    assert "daturaai/dolphin:1" not in ssh_client.images  # other idle filler images still go
+    assert (_ENGY_IMAGE in ssh_client.images) is (renter_image == _ENGY_IMAGE)
+    assert _removed_volumes(ssh_client) == [_KIMI]
+
+
+@pytest.mark.asyncio
+async def test_the_reclaim_keeps_a_cache_volume_the_rental_mounts(docker_service):
+    ssh_client = HostSshClient([_KIMI, "dphn_cache_hf_x", "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+    rental.cache_volumes = [CacheVolume(name=_KIMI, target="/root/models")]
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {})
+
+    assert _removed_volumes(ssh_client) == ["dphn_cache_hf_x"]

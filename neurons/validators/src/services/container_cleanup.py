@@ -76,11 +76,27 @@ REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NA
 # The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
 # `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
 FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
-REMOVE_IDLE_FILLER_IMAGES = (
-    "/usr/bin/docker image ls "
-    + " ".join(f"--filter reference={repository}" for repository in FILLER_IMAGE_REPOSITORIES)
-    + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
-)
+
+
+def _image_repository(image: str) -> str:
+    reference = image.split("@", 1)[0]
+    name, _, tag = reference.rpartition(":")
+    repository = name if name and "/" not in tag else reference
+    return repository.removeprefix("docker.io/")
+
+
+def remove_idle_filler_images(keep_image: str | None = None) -> str:
+    """The idle filler images' removal; `keep_image` is the image a create is about to run, whose repository
+    is left alone: a renter may rent the Engy image itself, and it has no container until docker run."""
+    keep = _image_repository(keep_image) if keep_image else None
+    repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
+    if not repositories:  # `docker image ls` without a filter would list every image
+        return "true"
+    return (
+        "/usr/bin/docker image ls "
+        + " ".join(f"--filter reference={repository}" for repository in repositories)
+        + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
+    )
 
 
 async def evict_cache_volumes_oldest_first(
@@ -90,6 +106,7 @@ async def evict_cache_volumes_oldest_first(
     has_room: Callable[[], Awaitable[bool]],
     evict_first_prefix: str | None = None,
     volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
+    keep_image: str | None = None,
 ) -> None:
     """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
 
@@ -111,7 +128,7 @@ async def evict_cache_volumes_oldest_first(
     except Exception:
         pass
     # the image first: a pull brings it back far faster than a checkpoint download
-    await run_removal(REMOVE_IDLE_FILLER_IMAGES)
+    await run_removal(remove_idle_filler_images(keep_image))
     if await has_room():
         return
     # DAH-5260: a rental passes the Engy prefix, the cache its listing offered as free disk
