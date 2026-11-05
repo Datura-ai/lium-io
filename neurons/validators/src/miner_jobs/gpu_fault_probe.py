@@ -841,6 +841,10 @@ def nvml_snapshot_forked(mp) -> dict:
 
 
 def nvml_faults(before: dict, after: dict) -> list[str]:
+    # an after-snapshot that hung or died has no cards in it: that says nothing about them, and reading it
+    # as "every card missing" failed honest nodes (8x H200, 2 Nov); the CUDA workers' verdicts still stand
+    if after.get("available") is False:
+        return []
     faults = []
     before_gpus, after_gpus = before.get("gpus", []), after.get("gpus", [])
     # the UUID names the card; when any read of it failed (an old binding, one card) both snapshots fall
