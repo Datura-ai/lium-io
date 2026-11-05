@@ -67,8 +67,10 @@ class FakeHost:
         systemd=True,
         docker_start_ok=True,
         container_state="true false",
+        gpus_result=None,
     ):
         self.commands: list[str] = []
+        self.gpus_result = gpus_result
         self.stopped = False
         request = {"Driver": "", "Count": count or 0, "DeviceIDs": list(device_ids) or None, "Capabilities": [["gpu"]]}
         self.inspect = json.dumps(
@@ -116,7 +118,7 @@ class FakeHost:
             self.stopped = self.stop_exit == 0
             return make_command_result(self.stop_exit == 0, stderr="boom", exit_code=self.stop_exit)
         if cmd.startswith("nvidia-smi --query-gpu="):
-            return make_command_result(True, self.gpus)
+            return make_command_result(True, self.gpus) if self.gpus_result is None else self.gpus_result
         if cmd.startswith("nvidia-smi --query-compute-apps="):
             apps = self.apps_after_stop if self.stopped else self.apps
             return make_command_result(True, "\n".join(f"{pid}, {uuid}" for pid, uuid in apps))
@@ -275,6 +277,13 @@ async def test_a_whole_host_rental_resolves_gpus_all_on_the_host():
             {"encrypted_volume_mount": "/lium-cipher"},
             GpuResetErrorCode.ResetNotSupported,
         ),
+        (FakeHost(gpus_result=make_command_result(False, exit_code=255)), {}, GpuResetErrorCode.GpusLostOnHost),
+        (
+            FakeHost(gpus_result=make_command_result(False, exit_code=-1, error_type="timeout")),
+            {},
+            GpuResetErrorCode.GpusLostOnHost,
+        ),
+        (FakeHost(gpus_result=make_command_result(True, "")), {}, GpuResetErrorCode.GpusLostOnHost),
         (FakeHost(inspect_exit=1), {}, GpuResetErrorCode.ContainerNotFound),
         (FakeHost(device_ids=(U[0],)), {}, GpuResetErrorCode.GpuNotInContainer),  # backend's U[1] not given
         (FakeHost(), {"indices": [2]}, GpuResetErrorCode.GpuNotInContainer),

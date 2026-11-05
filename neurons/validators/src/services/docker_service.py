@@ -213,6 +213,7 @@ from services.storage_operations import (
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
+from services.task.checks.rented_gpu_drop import report_gpus_lost_on_reset
 from services.task.checks.rented_pod_ssh import tcp_connect_fault
 from protocol.vc_protocol.validator_requests import PodSshResult
 from tenacity import RetryError
@@ -13001,6 +13002,16 @@ class DockerService:
             except Exception as exc:
                 logger.warning(
                     _m("Reset pod GPUs: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+            # still under the pending mark, so a concurrent RentedGpuDropCheck cycle cannot race on the drop mark
+            if report is not None and report.error_code == GpuResetErrorCode.GpusLostOnHost and self.backend_client:
+                await report_gpus_lost_on_reset(
+                    self.redis_service,
+                    self.backend_client,
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    default_extra=default_extra,
                 )
 
         async def operate(runner: SSHCommandRunner, private_key: str, known_hosts_policy, default_extra: dict):

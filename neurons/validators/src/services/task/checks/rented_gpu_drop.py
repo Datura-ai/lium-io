@@ -51,12 +51,15 @@ on Redis.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
+import weakref
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import redis.exceptions
@@ -74,7 +77,7 @@ from core.utils import _m, get_extra_info
 
 from ..messages import RentedGpuDropMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
 from .gpu_fingerprint import split_uuids
 from .gpu_memory_health import flagged_uuids, read_memory_health
 
@@ -119,6 +122,9 @@ _NOT_RECORDED_DELIVERIES = frozenset({GPU_DROP_DELIVERY_DISABLED, GPU_DROP_DELIV
 
 # key -> (mark, monotonic expiry): the marks as this process last wrote them, read when Redis cannot be.
 _LOCAL_MARKS: dict[str, tuple[DropMark, float]] = {}
+# One incident transition per pod at a time: the cycle and a renter's reset both write the mark, and a recovery
+# whose reply lands after a renewed fault was saved would delete that fault.
+_POD_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 @dataclass(frozen=True)
@@ -239,6 +245,8 @@ class DropMark:
     ecc: bool = False
     # when the clean cycle that owes the recovery was seen: a retried recovery reports this, not its retry time
     observed_at: str | None = None
+    # latest fault observation: first_seen_at stays the incident's identity, so it cannot fence a renewed loss
+    fault_seen_at: str | None = None
 
     @classmethod
     def load(cls, raw: object) -> DropMark | None:
@@ -391,13 +399,15 @@ class RentedGpuDropCheck:
             broken_uuids=broken_uuids or [],
         )
 
-        now_iso = datetime.now(UTC).isoformat()
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        cycle_started_iso = (now - timedelta(seconds=time.monotonic() - ctx.started_at_monotonic)).isoformat()
         # A dry run shares Redis with the live validator, so it leaves the live incidents alone.
         outcomes: list[dict[str, Any]] = []
         if not settings.DRY_RUN:
             for pod in pods:
                 outcome = await self._track_pod(
-                    ctx, pod, drop, rented_total, nvml_count, now_iso, broken_uuids is None
+                    ctx, pod, drop, rented_total, nvml_count, now_iso, cycle_started_iso, broken_uuids is None
                 )
                 if outcome is not None:
                     outcomes.append(outcome)
@@ -453,61 +463,66 @@ class RentedGpuDropCheck:
         rented_total: int | None,
         nvml_count: int,
         now_iso: str,
+        cycle_started_iso: str,
         memory_unread: bool = False,
     ) -> dict[str, Any] | None:
-        key = _key(pod.pod_id)
-        redis_ok = True
-        stored = None
-        try:
-            stored = DropMark.load(await ctx.services.redis.get(key))
-        except GPU_DROP_REDIS_ERRORS:
-            redis_ok = False
-            self._log_redis_unavailable(ctx, pod.pod_id, "read")
-        # This process's own last write is never older than Redis: a write or delete that failed leaves Redis behind.
-        mark = _local_mark(key) or stored
+        async with _POD_LOCKS.setdefault(pod.pod_id, asyncio.Lock()):
+            key = _key(pod.pod_id)
+            redis_ok = True
+            stored = None
+            try:
+                stored = DropMark.load(await ctx.services.redis.get(key))
+            except GPU_DROP_REDIS_ERRORS:
+                redis_ok = False
+                self._log_redis_unavailable(ctx, pod.pod_id, "read")
+            # This process's own last write is never older than Redis: a write or delete that failed leaves Redis behind.
+            mark = _local_mark(key) or stored
 
-        if drop is None:
+            if drop is None:
+                if mark is None:
+                    return None
+                if (mark.fault_seen_at or mark.first_seen_at) > cycle_started_iso:
+                    # a renter's reset reported this fault after this cycle began: its clean listing may predate the fault
+                    return None
+                if memory_unread and mark.ecc:
+                    # no memory reading is no proof the broken card healed: keep the incident open, and its
+                    # mark alive past the TTL
+                    await self._save(ctx, pod.pod_id, mark, redis_ok)
+                    return None
+                return await self._recover(ctx, pod, mark, rented_total, nvml_count, redis_ok, now_iso)
+
             if mark is None:
-                return None
-            if memory_unread and mark.ecc:
-                # no memory reading is no proof the broken card healed: keep the incident open, and its
-                # mark alive past the TTL
-                await self._save(ctx, pod.pod_id, mark, redis_ok)
-                return None
-            return await self._recover(ctx, pod, mark, rented_total, nvml_count, redis_ok, now_iso)
-
-        if mark is None:
-            mark = DropMark(now_iso)
-        elif mark.recovering:
-            # A recovery the backend has not acknowledged is still owed: a held fault posts nothing, so the
-            # next clean cycle must still find it.
-            mark = DropMark(now_iso, recorded=mark.recorded, unanswered=mark.unanswered)
-        else:
-            mark = replace(mark, consecutive_cycles=mark.consecutive_cycles + 1)
-        mark = replace(mark, ecc=mark.ecc or FAULT_ECC_UNCORRECTED in drop.faults)
-        answer: RentedGpuDropResponse | None = None
-        posted = False
-        held = drop.confirm_first and mark.consecutive_cycles < 2
-        evidence = drop.evidence(rented_total, pod.gpu_count)
-        due = not mark.reported or mark.evidence != evidence
-        if due and not held:
-            answer = await self._post(
-                ctx, pod, STATE_FAULT, mark, drop, rented_total, nvml_count, now_iso
-            )
-            posted = True
-            mark = mark.after_answer(answer, evidence)
-        await self._save(ctx, pod.pod_id, mark, redis_ok)
-        return {
-            "pod_id": pod.pod_id,
-            "state": STATE_FAULT,
-            "first_seen_at": mark.first_seen_at,
-            "consecutive_cycles": mark.consecutive_cycles,
-            "posted": posted,
-            "delivery": answer.delivery if answer else None,
-            "reported": mark.reported,
-            "gpu_count": pod.gpu_count,
-            "held": held,
-        }
+                mark = DropMark(now_iso)
+            elif mark.recovering:
+                # A recovery the backend has not acknowledged is still owed: a held fault posts nothing, so the
+                # next clean cycle must still find it.
+                mark = DropMark(now_iso, recorded=mark.recorded, unanswered=mark.unanswered)
+            else:
+                mark = replace(mark, consecutive_cycles=mark.consecutive_cycles + 1)
+            mark = replace(mark, ecc=mark.ecc or FAULT_ECC_UNCORRECTED in drop.faults, fault_seen_at=now_iso)
+            answer: RentedGpuDropResponse | None = None
+            posted = False
+            held = drop.confirm_first and mark.consecutive_cycles < 2
+            evidence = drop.evidence(rented_total, pod.gpu_count)
+            due = not mark.reported or mark.evidence != evidence
+            if due and not held:
+                answer = await self._post(
+                    ctx, pod, STATE_FAULT, mark, drop, rented_total, nvml_count, now_iso
+                )
+                posted = True
+                mark = mark.after_answer(answer, evidence)
+            await self._save(ctx, pod.pod_id, mark, redis_ok)
+            return {
+                "pod_id": pod.pod_id,
+                "state": STATE_FAULT,
+                "first_seen_at": mark.first_seen_at,
+                "consecutive_cycles": mark.consecutive_cycles,
+                "posted": posted,
+                "delivery": answer.delivery if answer else None,
+                "reported": mark.reported,
+                "gpu_count": pod.gpu_count,
+                "held": held,
+            }
 
     async def _recover(
         self,
@@ -629,3 +644,45 @@ class RentedGpuDropCheck:
             ),
             exc_info=True,
         )
+
+
+async def report_gpus_lost_on_reset(
+    redis, backend, *, miner_hotkey: str, executor_id: str, pod_id: str, default_extra: dict[str, Any]
+) -> None:
+    # The check's own mark, so its next clean cycle posts the recovery. Only this pod: the scrape judges the others.
+    if settings.DRY_RUN:
+        return
+    failed = _m("RENTED_GPU_DROP_REPORT_FAILED", extra=get_extra_info({**default_extra, "state": STATE_FAULT}))
+    # awaited from the reset's `finally` before its pending mark is removed: a raise here would lose the answer
+    try:
+        rented = await backend.get_rented_executors_now()
+        if rented is None:
+            logger.warning(failed)
+            return
+        executor = rented.executors.get(executor_id)
+        if executor is None or executor.miner_hotkey != miner_hotkey:
+            return
+        pod = next((p for p in executor.pods if p.pod_id == pod_id and p.status in _RENTED_POD_STATUSES), None)
+        if pod is None:
+            return
+        drop = judge_rented_gpus(
+            rented_gpu_count=pod.gpu_count,
+            anchor_uuids=[],
+            nvml_count=0,
+            listed_uuids=[],
+            listed_count=0,
+            scrape_error=None,
+        )
+        # the fault path reads only these fields of a pipeline Context
+        ctx = SimpleNamespace(
+            services=SimpleNamespace(redis=redis, backend=backend),
+            executor=SimpleNamespace(uuid=executor_id),
+            default_extra=default_extra,
+            state=ContextState(),
+        )
+        now_iso = datetime.now(UTC).isoformat()
+        await RentedGpuDropCheck()._track_pod(
+            ctx, pod, drop, _rented_gpu_count(list(executor.pods)), 0, now_iso, now_iso
+        )
+    except Exception:
+        logger.warning(failed, exc_info=True)
