@@ -2,9 +2,9 @@
   "schema": "liumd.pr-artifact/1",
   "source_repo": "Datura-ai/lium-platform",
   "source_pr": 2222,
-  "source_head_sha": "c85e86b4a4aa0d5d007da28cab3388d365fe44ae",
-  "source_merge_sha": "f4fbaa9d987c10bb69e781b4314c0ccc6eedb81e",
-  "source_run": "local ci/static_build.sh; cloud snapshot unavailable",
+  "source_head_sha": "698c7bf26facb47b75b434ebf6e60a1fd83caf6f",
+  "source_merge_sha": "2a213566629d8c51af029c6edb9dcb9fecb956d7",
+  "source_run": "https://github.com/Datura-ai/lium-platform/actions/runs/42020290731",
   "target": "x86_64-unknown-linux-gnu",
-  "build_sha": "c85e86b4a4aa"
+  "build_sha": "2a213566629d"
 }
