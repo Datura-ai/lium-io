@@ -550,6 +550,14 @@ class ExpressLane:
                 )
             )
             return
+        if not passed:
+            # DAH-5723: attempts used up, the cycle owns it. Not recorded as validated, or
+            # publish_new_executors_at_pass would skip its wave pass and it would wait for the
+            # cycle's end (6-7 min); the cycle's publish records it.
+            self._left_to_cycle.add(executor_id)
+            self._pending.pop(executor_id, None)
+            self._log_published(pending, result, passed, extra, started)
+            return
         try:
             await self.redis_service.mark_executors_validated([executor_id])
         except Exception as exc:

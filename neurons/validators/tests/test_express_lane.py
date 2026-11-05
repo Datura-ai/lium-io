@@ -578,6 +578,29 @@ async def test_a_session_lost_after_snapshot_misses_used_max_attempts_keeps_the_
     assert (pending.attempts, pending.lost_sessions) == (MAX_ATTEMPTS, 2)
 
 
+@pytest.mark.asyncio
+async def test_a_node_that_used_up_its_express_runs_is_left_to_the_cycle_unvalidated(monkeypatch, wallet):
+    """DAH-5723: recorded as validated, its wave pass skipped publish_new_executors_at_pass and waited
+    for the cycle's end (6-7 min)."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED", False)  # one run is the last
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.job_for = lambda payload, executor_id: {
+        "miner_hotkey": "miner-a",
+        "miner_coldkey": "c",
+        "results": [_job_result(executor_id, score=0.0)],
+    }
+
+    assert await harness.tick_and_settle() == 1
+
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert await harness.redis_service.get_validated_executors() == set()
+    assert new_node in harness.lane._left_to_cycle and new_node not in harness.lane._pending
+    assert await harness.tick_and_settle() == 0  # the lane does not run it again
+
+
 # --- Redis seed and portal auth -------------------------------------------------------------
 
 
