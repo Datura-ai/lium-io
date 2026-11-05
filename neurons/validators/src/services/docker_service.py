@@ -2522,6 +2522,10 @@ _STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC = 30
 _STOPPED_BY_RECOVERY_CLEAR_RETRY_MAX_SEC = 300
 # pod_id -> its pending retry, cancelled by the pod's next mark write so it never deletes a later recovery's mark
 _RECOVERY_MARK_CLEANUPS: dict[str, asyncio.Task] = {}
+# pods this process parked as <name>__stopped because the stop's mark could not be written: the trusted half of
+# that attribution, since a container name on the provider's daemon is forgeable (lio#1827 review)
+# shortcut: lost on a validator restart, so a restart during a Redis outage falls back to POD_NOT_RUNNING
+_UNMARKED_RECOVERY_STOPS: set[str] = set()
 
 
 def _cancel_recovery_mark_cleanup(pod_id: str) -> None:
@@ -12026,8 +12030,9 @@ class DockerService:
         only a stale-mount start error keeps the name, for the stale-mount recovery to take it.
         ``stopped_by_recovery`` (the pod's STOPPED_BY_RECOVERY mark): a lone stopped ``<name>`` is
         started as well, since a recovery of ours stopped it or renamed it back without an answer.
-        A lone ``<name>__stopped`` (a stop whose mark could not be written) gets its STOPPED mark
-        before the rename, so the attribution outlives a start that fails and parks it again.
+        A lone ``<name>__stopped`` this process parked (a stop whose mark could not be written) gets its
+        STOPPED mark before the rename, so the attribution outlives a start that fails and parks it again;
+        one it has no record of is treated as any parked pod, since the name alone is forgeable.
         """
         parked = f"{container_name}{EDIT_PARKED_SUFFIX}"
         stopped_anchor = f"{container_name}{RECOVERY_STOPPED_SUFFIX}"
@@ -12079,9 +12084,14 @@ class DockerService:
                 ) != STOPPED_BY_RECOVERY_STOPPED:
                     await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_RENAMING)
             elif current_name == stopped_anchor:
-                # the name is the only attribution: carried into the mark before it is given up, else kept
+                # only our own record of the park attributes it (the name is forgeable): carried into the mark
+                # before it is given up, else kept; an anchor we have no record of is renamed back like a __prev
                 try:
-                    await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_STOPPED)
+                    if pod_id in _UNMARKED_RECOVERY_STOPS:
+                        await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_STOPPED)
+                        _UNMARKED_RECOVERY_STOPS.discard(pod_id)
+                    else:
+                        await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_RENAMING)
                 except Exception:
                     return False
         except TimeoutError:
@@ -12150,8 +12160,21 @@ class DockerService:
         await self._clear_stopped_by_recovery(pod_id)
         return True
 
+    async def unmarked_stop_parked(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
+    ) -> bool:
+        """True while a pod this process stopped without its mark is still parked, stopped, as <name>__stopped."""
+        if pod_id not in _UNMARKED_RECOVERY_STOPS:
+            return False
+        anchor = await ssh_client.run(
+            f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(container_name + RECOVERY_STOPPED_SUFFIX)}",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        return anchor.exit_status == 0 and (anchor.stdout or "").strip() == "false"
+
     async def _clear_stopped_by_recovery(self, pod_id: str) -> None:
         """Delete the mark, bounded like its write; a failed delete is retried in the background."""
+        _UNMARKED_RECOVERY_STOPS.discard(pod_id)
         key = f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"
 
         async def delete() -> bool:
@@ -12324,6 +12347,7 @@ class DockerService:
         parked = f"{container_name}{RECOVERY_STOPPED_SUFFIX}"
         if not marked and await self._park_by_id(ssh_client, container_name, parked):
             container_name = parked
+            _UNMARKED_RECOVERY_STOPS.add(pod_id)
         outcome = await self._stop_outcome(ssh_client, container_name)
         if outcome == "failed" and marked:
             # docker said it did not stop: the pod still runs, and the mark must not restart a later provider stop

@@ -1269,6 +1269,36 @@ async def test_tenant_enforcement_mount_probe_comes_out_of_the_cycle_budget(cont
     assert docker.encrypted_volume_mount_missing.await_count == (1 if probe_fits else 0)
 
 
+@pytest.mark.asyncio
+async def test_tenant_enforcement_defers_a_pod_its_own_restore_stopped_to_the_next_cycle(context_factory):
+    # F-17: a cut restore's cleanup already spent the reserve; recovering the pod it just stopped in the same cycle
+    # (a fresh 240 s deadline) would outlive the task, so the result would be dropped
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = True
+
+    async def cut_restore_then_stop(**kwargs):
+        ssh.pod_running = False
+        return False
+
+    docker.restore_volume_mount_of_running_container.side_effect = cut_restore_then_stop
+    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    ctx = build_recovery_context(
+        context_factory,
+        ssh,
+        docker,
+        backend=DummyBackendClient(active=True, local_volume_path="/workspace"),
+        redis=_recovery_redis(lock, {"stopped_by_recovery:pod-1": "stopped"}),
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed, result.event
+    docker.recover_parked_pod_container.assert_not_awaited()
+    assert result.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
+    assert _pod_states(result)["pod-1"] == "exited"
+
+
 def _recovery_redis(lock, marks: dict[str, str]) -> Mock:
     return Mock(
         backend_create_inflight=AsyncMock(return_value=False),
@@ -1397,6 +1427,7 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
         "parked",
         "stopped_anchor",
         "anchor_without_mark",
+        "forged_anchor",
         "stopped_canonical",
         "lock_busy",
         "create_in_flight",
@@ -1417,6 +1448,7 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
         "parked": "pod_pod-1__prev",
         "stopped_anchor": "pod_pod-1__stopped",
         "anchor_without_mark": "pod_pod-1__stopped",
+        "forged_anchor": "pod_pod-1__stopped",
         "stopped_canonical": "pod_pod-1",
     }.get(state)
 
@@ -1429,7 +1461,9 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
 
     ssh.run = run
     # anchor_without_mark (review 5785846085): the stop's mark write failed, so only the __stopped name attributes it
-    marks = {} if state == "anchor_without_mark" else {"stopped_by_recovery:pod-1": "stopped"}
+    # forged_anchor (lio#1827 review): the provider made the __stopped container; no record of our own park, no pass
+    unmarked = state in ("anchor_without_mark", "forged_anchor")
+    marks = {} if unmarked else {"stopped_by_recovery:pod-1": "stopped"}
     lock = Mock(acquire=AsyncMock(return_value=state != "lock_busy"), release=AsyncMock())
     redis = _recovery_redis(lock, marks)
     redis.backend_create_inflight = AsyncMock(return_value=state == "create_in_flight")
@@ -1447,6 +1481,7 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
     docker.recover_parked_pod_container.return_value = False  # a failed recovery: nothing renamed back
     docker.recover_pod_after_stale_vloopback_mount.return_value = False
     docker.encrypted_volume_mount_missing.return_value = False
+    docker.unmarked_stop_parked.return_value = state == "anchor_without_mark"
 
     async def missing(*args, **kwargs):
         return {"container_missing": True}
@@ -1457,15 +1492,15 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
     if state == "delete_hangs":
         result = await TenantEnforcementCheck().run(ctx)
 
-    if state in ("both_gone", "delete_fails", "delete_hangs"):
+    if state in ("both_gone", "delete_fails", "delete_hangs", "forged_anchor"):
         assert not result.passed
         assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
         assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
-        assert marks == ({} if state == "both_gone" else {"stopped_by_recovery:pod-1": "stopped"})
+        assert marks == ({} if state in ("both_gone", "forged_anchor") else {"stopped_by_recovery:pod-1": "stopped"})
     else:
         assert result.passed
         assert "clear_verified_job_reason" not in result.updates
-        assert marks == ({} if state == "anchor_without_mark" else {"stopped_by_recovery:pod-1": "stopped"})
+        assert marks == ({} if unmarked else {"stopped_by_recovery:pod-1": "stopped"})
         assert result.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
 
 

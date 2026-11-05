@@ -23,7 +23,6 @@ from protocol.vc_protocol.validator_requests import (
 
 from ...const import (
     PARKED_SUFFIXES,
-    RECOVERY_STOPPED_SUFFIX,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     POD_CONTAINER_NAME_GRACE_MINUTES,
@@ -267,6 +266,13 @@ class TenantEnforcementCheck:
                             extra=extra,
                         )
                     )
+                if not pod_running:
+                    # stopped by this cycle's own restore: a second recovery now would eat the result's reserve,
+                    # so the next cycle restarts it (lio#1827 review F-17)
+                    state_by_pod_id[pod_id] = ContainerState.EXITED
+                    extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
+                    ssh_pub_keys = []
+                    continue
             if pod_running:
                 state_by_pod_id[pod_id] = ContainerState.RUNNING
                 if self.recover_stale_pods:
@@ -563,12 +569,12 @@ class TenantEnforcementCheck:
             mark = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}")
             stopped_by_validator = (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED
         if not stopped_by_validator and diagnostics.get("container_missing") is True:
-            # a stop whose mark could not be written parked the pod under <name>__stopped: the name is the attribution
+            # a stop whose mark could not be written parked the pod under <name>__stopped; the name alone is
+            # forgeable on the provider's daemon, so only this validator's own record of that park attributes it
             with contextlib.suppress(Exception):
-                anchor = await ctx.ssh.run(
-                    f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(container_name + RECOVERY_STOPPED_SUFFIX)}"
+                stopped_by_validator = (
+                    await ctx.services.pod_recovery.unmarked_stop_parked(ctx.ssh, container_name, pod_id) is True
                 )
-                stopped_by_validator = anchor.exit_status == 0 and (anchor.stdout or "").strip() == "false"
         if stopped_by_validator and diagnostics.get("container_missing") is True:
             # the container we stopped is gone (provider rm, reinstall): passing it would keep billing a pod that no
             # longer exists, since only the POD_NOT_RUNNING reset stops billing. Report it down only once neither

@@ -8236,10 +8236,12 @@ async def test_recover_parked_carries_the_stopped_anchor_into_the_stop_mark(dock
         docker_service, monkeypatch, "c0ffee pod_pod-1__stopped\n", start=AsyncMock(side_effect=RuntimeError("broken"))
     )
     marks = docker_service.redis_service.marks
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", {"pod-1"})
 
     assert await docker_service.recover_parked_pod_container(**kwargs) is False
 
     assert marks == {"stopped_by_recovery:pod-1": "stopped"}
+    assert docker_service_module._UNMARKED_RECOVERY_STOPS == set()  # carried into the mark
     assert _renames(ssh_client) == ["/usr/bin/docker rename c0ffee pod_pod-1", "/usr/bin/docker rename c0ffee pod_pod-1__prev"]
     start.assert_awaited_once()
 
@@ -8248,6 +8250,21 @@ async def test_recover_parked_carries_the_stopped_anchor_into_the_stop_mark(dock
     docker_service.redis_service.set = AsyncMock(side_effect=ConnectionError("Redis down"))
     assert await docker_service.recover_parked_pod_container(**kwargs) is False
     assert _renames(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_parked_never_trusts_an_anchor_it_did_not_park(docker_service, monkeypatch):
+    # lio#1827 review: a provider can create a failing <name>__stopped itself; with no record of our own park it is
+    # renamed back like any parked pod, and never becomes a stop mark that would exempt it from POD_NOT_RUNNING
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__stopped\n", start=AsyncMock(side_effect=RuntimeError("broken"))
+    )
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+
+    assert await docker_service.recover_parked_pod_container(**kwargs) is False
+
+    assert docker_service.redis_service.marks == {"stopped_by_recovery:pod-1": "renaming"}
+    assert not await docker_service.unmarked_stop_parked(ssh_client, "pod_pod-1", "pod-1")
 
 
 @pytest.mark.asyncio
@@ -8548,6 +8565,9 @@ async def test_mark_and_stop_unmounted_pod_leaves_a_retry_anchor(
     assert host["name"] == expected_name
     # a refused stop leaves the pod running, so its mark goes: a later provider stop is never ours to undo
     assert marks == ({} if mark_error or refused else {"stopped_by_recovery:pod-1": "stopped"})
+    # the park without a mark is recorded in this process: the name alone attributes nothing
+    assert ("pod-1" in docker_service_module._UNMARKED_RECOVERY_STOPS) is (expected_name == "pod_pod-1__stopped")
+    docker_service_module._UNMARKED_RECOVERY_STOPS.discard("pod-1")
 
 
 @pytest.mark.asyncio
