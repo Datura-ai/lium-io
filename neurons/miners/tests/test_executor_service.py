@@ -284,6 +284,28 @@ async def test_register_pubkey_answers_by_the_deadline_with_the_uploads_that_fin
 
 
 @pytest.mark.asyncio
+async def test_register_pubkey_counts_the_deadline_from_the_validators_signed_timestamp(
+    executor_service, test_executor, monkeypatch
+):
+    """DAH-5734 (4 Nov 14:16Z): picked up 6 s after the validator signed, the answer left as its 30 s ran out."""
+    dead = Executor(uuid=uuid4(), validator="//TestValidator", address="127.0.0.2", port=8001)
+
+    async def upload(executor, *_args, **_kwargs):
+        if executor is dead:
+            await asyncio.sleep(10)
+        return None
+
+    monkeypatch.setattr(es, "UPLOAD_SSH_KEY_BUDGET_SECONDS", 5.0)
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.get_executors_for_validator = AsyncMock(return_value=[test_executor, dead])
+    executor_service.send_pubkey_to_executor = upload
+
+    started = time.monotonic()
+    await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa", requested_at=time.time() - 4.8)
+
+    assert time.monotonic() - started < 1
+
+@pytest.mark.asyncio
 async def test_send_pubkey_does_not_retry_when_the_delay_overran_the_deadline(executor_service, test_executor):
     """A retry delay that ended past the deadline gives up instead of starting an attempt the validator cannot wait for."""
     clock = [100.0]
