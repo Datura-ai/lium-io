@@ -297,6 +297,7 @@ class ResultHandler:
             # DAH-3338: the whole list; MinerService.publish_machine_specs bounds the spec's copy
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
+            host_runtime_fault=context.state.host_runtime_fault,
         )
 
     @staticmethod
