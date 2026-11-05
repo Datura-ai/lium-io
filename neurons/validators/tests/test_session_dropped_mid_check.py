@@ -2,7 +2,8 @@
 
 An executor image release makes providers' auto-updaters recreate the executor container, which closes every
 open validator session at once. The check that was running then reports the dead session, not the node: the
-pipeline reconnects once and runs it again; a failed reconnect or a second drop is no verdict, never a 0.
+pipeline reconnects once per run and runs it again. A failed reconnect, a second drop or a check that leaves
+host state behind keeps today's transport failure, which the bounded image-rollout window withholds.
 """
 
 from datetime import UTC, datetime
@@ -10,15 +11,13 @@ from unittest.mock import MagicMock
 
 import asyncssh
 import pytest
-from datura.requests.miner_requests import ExecutorSSHInfo
-from services.executor_rollout import withhold_renter_gpu_reset_verdicts
-from services.task.messages import TenantEnforcementMessages
-from services.task.models import JobResult, ValidationEvent
-from services.task.pipeline import CheckResult, Context, Pipeline, SessionDroppedMidCheck
+from services.task.checks.port_connectivity import PortConnectivityCheck
+from services.task.checks.rental_probe import RentalProbeCheck
+from services.task.checks.rented_machine import TenantEnforcementCheck
+from services.task.models import ValidationEvent
+from services.task.pipeline import CheckResult, Context, Pipeline
 
 pytestmark = pytest.mark.asyncio
-
-DROPPED = TenantEnforcementMessages.SESSION_DROPPED_MID_CHECK.reason
 
 
 class _NullSink:
@@ -95,20 +94,60 @@ async def test_a_check_whose_session_dropped_runs_again_on_a_new_session(raises)
     assert len(calls) == 1 and check.sessions[1] is fresh
 
 
-async def test_a_failed_reconnect_is_no_verdict():
-    reconnect, _ = _reconnect([OSError("connection refused")])
+async def test_a_failed_reconnect_keeps_the_transport_failure():
+    reconnect, calls = _reconnect([OSError("connection refused")])
 
-    with pytest.raises(SessionDroppedMidCheck):
-        await Pipeline([_Check(drops=1)], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    ok, events, _ = await Pipeline([_Check(drops=1)], _NullSink(), reconnect=reconnect).run(
+        _ctx(_session())
+    )
+
+    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE" and len(calls) == 1
 
 
-async def test_a_second_drop_is_no_verdict_and_there_is_no_third_try():
+async def test_a_second_drop_keeps_the_transport_failure_and_there_is_no_third_try():
     check = _Check(drops=2)
     reconnect, calls = _reconnect([_session(), _session()])
 
-    with pytest.raises(SessionDroppedMidCheck):
-        await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    ok, events, _ = await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+
+    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
     assert len(calls) == 1 and len(check.sessions) == 2
+
+
+async def test_a_run_reconnects_at_most_once():
+    class _Observe(_Check):
+        fatal = False
+        check_id = "host.observe.a"
+
+    class _Later(_Check):
+        check_id = "host.observe.b"
+
+    first, later = _Observe(drops=2), _Later(drops=1)
+    reconnect, calls = _reconnect([_session(), _session()])
+
+    ok, _, _ = await Pipeline([first, later], _NullSink(), reconnect=reconnect).run(
+        _ctx(_session())
+    )
+
+    assert not ok and len(calls) == 1 and len(later.sessions) == 1
+
+
+async def test_a_check_that_leaves_host_state_is_not_replayed():
+    class _StartsContainers(_Check):
+        replays_after_session_drop = False
+
+    check = _StartsContainers(drops=1)
+    reconnect, calls = _reconnect([_session()])
+
+    ok, events, _ = await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+
+    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
+    assert not calls and len(check.sessions) == 1
+
+
+def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
+    for check in (PortConnectivityCheck, RentalProbeCheck, TenantEnforcementCheck):
+        assert check.replays_after_session_drop is False
 
 
 async def test_a_failure_on_a_session_that_stayed_open_stands():
@@ -129,28 +168,3 @@ async def test_a_failure_on_a_session_that_stayed_open_stands():
 async def test_without_a_reconnect_a_dropped_session_ends_the_run_as_before():
     with pytest.raises(asyncssh.ChannelOpenError):
         await Pipeline([_Check(drops=1, raises=True)], _NullSink()).run(_ctx(_session()))
-
-
-async def test_the_cycle_withholds_a_session_dropped_result():
-    executor = ExecutorSSHInfo(
-        uuid="e1",
-        address="h",
-        port=1,
-        ssh_username="root",
-        ssh_port=22,
-        python_path="p",
-        root_dir="/r",
-    )
-    dropped = JobResult(
-        executor_info=executor,
-        score=0,
-        job_score=0,
-        job_batch_id="b",
-        log_status="error",
-        log_text="",
-        failure_reason_code=DROPPED,
-    )
-
-    standing, withheld = withhold_renter_gpu_reset_verdicts({"hk": [dropped]})
-
-    assert standing == {"hk": []} and [w.result for w in withheld] == [dropped]

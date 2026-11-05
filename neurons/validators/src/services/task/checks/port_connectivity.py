@@ -120,6 +120,8 @@ class PortConnectivityCheck:
     """
 
     check_id = "executor.validate.port_connectivity"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:

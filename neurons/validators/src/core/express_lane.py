@@ -35,7 +35,6 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
-from services.task.messages import TenantEnforcementMessages
 from services.task_service import JobResult
 
 from core.config import settings
@@ -43,8 +42,6 @@ from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
 
-# A run whose SSH session dropped mid-check twice has no verdict: deferred, never published.
-SESSION_DROPPED_MID_CHECK = TenantEnforcementMessages.SESSION_DROPPED_MID_CHECK.reason
 # One line per express verification; its registration_to_publish_s is the deploy metric.
 EXPRESS_PUBLISHED_EVENT = "[express] Executor verified and published ahead of the cycle"
 # Same line for a first pass that ran to a failed result (published so the provider sees why).
@@ -528,10 +525,6 @@ class ExpressLane:
             ]
             if not results:
                 self._defer(pending, MINER_DID_NOT_RETURN_EXECUTOR)
-                return
-            if results[0].failure_reason_code == SESSION_DROPPED_MID_CHECK:
-                # no verdict on the node: publish nothing, run it again later
-                self._defer(pending, SESSION_DROPPED_MID_CHECK)
                 return
             await self._publish(pending, miner, results, extra, started)
         except Exception as exc:

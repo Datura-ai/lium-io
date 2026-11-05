@@ -1293,17 +1293,6 @@ class TenantEnforcementMessages:
             "Persistent unreachability is handled by the stale-executor sweep."
         ),
     )
-    SESSION_DROPPED_MID_CHECK = MessageTemplate(
-        event="SSH session dropped mid-check",
-        reason="EXECUTOR_SESSION_DROPPED_MID_CHECK",
-        severity="warning",
-        category="transport",
-        impact="No verdict for this cycle - previous state kept",
-        remediation=(
-            "The open SSH session closed during a check and again after one reconnect, as when the executor "
-            "container is recreated by an image update. Nothing to do unless it repeats every cycle."
-        ),
-    )
     GPU_OUTSIDE_TENANT = MessageTemplate(
         event="Provider is using the GPU",
         reason="GPU_USAGE_OUTSIDE_TENANT",

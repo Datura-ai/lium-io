@@ -553,26 +553,16 @@ def _ended(events: list[ValidationEvent], ctx: Context) -> Tuple[bool, list[Vali
     return False, events, ctx.model_copy(update={"rented": False, "score": 0.0, "job_score": 0.0, "success": False})
 
 
-class SessionDroppedMidCheck(Exception):
-    """The run's open SSH session died under a check and did not survive one reconnect and rerun.
-
-    An executor container recreated under the validator (an image release its auto-updater pulls) closes every
-    open session at once; that says nothing about the node, so the run gets no verdict instead of a failure."""
-
-    def __init__(self, check_id: str, error: BaseException | None):
-        super().__init__(f"SSH session dropped during {check_id}: {error!r}")
-        self.check_id = check_id
-        self.error = error
-
-
 async def _session_dropped(ssh: asyncssh.SSHClientConnection) -> bool:
     # asyncssh marks a lost connection closed one loop tick after the drop
     await asyncio.sleep(0)
     return ssh.is_closed() is True
 
 
-def _step_id(step: "Check | ParallelStage") -> str:
-    return step.checks[0].check_id if isinstance(step, ParallelStage) else step.check_id
+def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
+    # a check that starts named containers or recovers a pod on the host leaves state a replay would trip over
+    checks = step.checks if isinstance(step, ParallelStage) else [step]
+    return all(getattr(chk, "replays_after_session_drop", True) for chk in checks)
 
 
 class Pipeline:
@@ -586,6 +576,8 @@ class Pipeline:
         self.checks = checks
         self.sink = sink
         self.reconnect = reconnect
+        # one reconnect per run: a session that drops again stands as the transport failure it is
+        self.reconnected = False
 
     async def _run_check(self, chk: Check, ctx: Context) -> _RanCheck:
         started = time.perf_counter()
@@ -658,27 +650,36 @@ class Pipeline:
         """Run the step; if the open session died under it, reconnect once and run the step again on the new one.
 
         Whatever the step returned or raised, the session decides: still open, the step stands as it ran. Closed,
-        its result says nothing about the node. A failed reconnect or a second drop raises SessionDroppedMidCheck,
-        which the task reports as no verdict. A run that cannot connect at all never gets here."""
+        it runs once more on a fresh session and that run stands, a second drop included, as does the first run
+        when the reconnect fails or the step is not replayable: a transport failure, which the executor-image
+        rollout window withholds while a release recreates containers. A connect that fails at the start of the
+        run never gets here."""
         ran, error = await self._attempt(step, ctx)
-        if self.reconnect is None or not await _session_dropped(ctx.ssh):
-            if error is not None:
-                raise error
-            return ran, ctx
-        try:
-            fresh = await self.reconnect()
-        except (asyncssh.Error, OSError) as exc:
-            raise SessionDroppedMidCheck(_step_id(step), exc) from exc
-        logger.warning(
-            _m(
-                "SSH session dropped mid-check; reconnected, running the check again",
-                extra={**ctx.default_extra, "check_id": _step_id(step), "error": repr(error)[:300]},
-            )
-        )
-        ctx = ctx.model_copy(update={"ssh": fresh, "runner": SSHCommandRunner(fresh, max_retries=1)})
-        ran, error = await self._attempt(step, ctx)
-        if await _session_dropped(ctx.ssh):
-            raise SessionDroppedMidCheck(_step_id(step), error)
+        if (
+            self.reconnect is not None
+            and not self.reconnected
+            and _replays_after_session_drop(step)
+            and await _session_dropped(ctx.ssh)
+        ):
+            self.reconnected = True
+            try:
+                fresh = await self.reconnect()
+            except (asyncssh.Error, OSError) as exc:
+                logger.warning(
+                    _m(
+                        "SSH session dropped mid-check; reconnect failed",
+                        extra={**ctx.default_extra, "error": repr(exc)[:300]},
+                    )
+                )
+            else:
+                logger.warning(
+                    _m(
+                        "SSH session dropped mid-check; reconnected, running the check again",
+                        extra={**ctx.default_extra, "error": repr(error)[:300]},
+                    )
+                )
+                ctx = ctx.model_copy(update={"ssh": fresh, "runner": SSHCommandRunner(fresh, max_retries=1)})
+                ran, error = await self._attempt(step, ctx)
         if error is not None:
             raise error
         return ran, ctx
