@@ -27,6 +27,7 @@ from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
+from .node_account import NodeAccountCheck
 from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
 from .pinned_memory_probe import PinnedMemoryProbeCheck
@@ -40,6 +41,7 @@ from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_pod_network import RentedPodNetworkCheck
+from .rented_pod_ownership import RentedPodOwnershipCheck
 from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
@@ -88,11 +90,13 @@ __all__ = [
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
     "RentedPodNetworkCheck",
+    "RentedPodOwnershipCheck",
     "RentedPodResourcesCheck",
     "RentedThroughputCheck",
     "SshdAuthLogCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
+    "NodeAccountCheck",
     "NvlinkFaultCheck",
     "NvmlDigestCheck",
     "PinnedMemoryProbeCheck",

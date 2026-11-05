@@ -223,7 +223,8 @@
         "ForcedValidationCycleRequest",
         "GetEstimateRequest",
         "ResetPodGpuRequest",
-        "LockPodGpuClocksRequest"
+        "LockPodGpuClocksRequest",
+        "RecheckExecutorRequest"
       ],
       "title": "BackendMessageType",
       "type": "string"
@@ -1727,7 +1728,12 @@
     "ContainerWarningCode": {
       "enum": [
         "ExternalVolumeFailed",
-        "DockerInDockerDisabled"
+        "DockerInDockerDisabled",
+        "HungGpuReset",
+        "HungGpuNotResetMig",
+        "HungGpuNotResetNvlinkShared",
+        "HungGpuNotResetInUse",
+        "HungGpuNotResetUnsupported"
       ],
       "title": "ContainerWarningCode",
       "type": "string"
@@ -5023,6 +5029,24 @@
       "title": "PodStatesReport",
       "type": "object"
     },
+    "RecheckExecutorRequest": {
+      "description": "2.6.0: validate one node now, outside the cycle (a provider's \"Recheck now\" in the portal). A validator that\ndoes not list the node ignores it; an older validator ignores the message.",
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "RecheckExecutorRequest"
+        }
+      },
+      "required": [
+        "executor_id"
+      ],
+      "title": "RecheckExecutorRequest",
+      "type": "object"
+    },
     "RemoveSshPublicKeysRequest": {
       "properties": {
         "command_id": {
@@ -6516,6 +6540,9 @@
     "LockPodGpuClocksRequest": {
       "$ref": "#/$defs/LockPodGpuClocksRequest"
     },
+    "RecheckExecutorRequest": {
+      "$ref": "#/$defs/RecheckExecutorRequest"
+    },
     "RemoveSshPublicKeysRequest": {
       "$ref": "#/$defs/RemoveSshPublicKeysRequest"
     },
@@ -6558,7 +6585,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.5.0",
+  "protocol_version": "2.9.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
