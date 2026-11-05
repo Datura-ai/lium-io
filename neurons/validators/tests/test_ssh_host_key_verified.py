@@ -115,15 +115,13 @@ def test_container_start_skipped_names_why_no_test_container_started() -> None:
 
 
 def test_our_side_skip_reasons_are_classified_explicitly() -> None:
-    """Our own gap (no default image for the GPU/driver, an unreadable input, the cycle budget) must not hold a
+    """Our own gap (no default image for the GPU/driver, an unreadable input) must not hold a
     start pause; a provider-side reason (image not pulled) or a rental keeps it."""
     from services.task.checks.rental_probe import is_our_side_skip
 
     for ours in (
         "no default renter image for this GPU and driver",
         "interval state unreadable",
-        "too little cycle time left",
-        "too little cycle time left for the create",
         "validator has no GPU UUIDs for this executor",
         "could not confirm the node is idle",
         "the idleness re-read overran its budget",
@@ -134,6 +132,9 @@ def test_our_side_skip_reasons_are_classified_explicitly() -> None:
         "could not read the node's image list",
         "rented",
         "could not take the node's create lock",
+        # a paused node whose checks overran the cycle has not shown it can start a container
+        "too little cycle time left",
+        "too little cycle time left for the create",
     ):
         assert not is_our_side_skip(theirs), theirs
     assert not is_our_side_skip(None)
