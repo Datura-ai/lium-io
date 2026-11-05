@@ -12960,13 +12960,24 @@ class DockerService:
                 if inflight_creates.is_cancelled(payload.pod_id):
                     logger.info(_m("Cancelled by its delete: no hung GPU reset", extra=get_extra_info(default_extra)))
                     return None
+                shadow = not settings.HUNG_GPU_RESET_ON_REBOOT_ENABLED
                 result = await reset_hung_pod_gpus(
                     SSHCommandRunner(ssh_client, max_retries=0),
                     list(payload.gpu_uuids),
                     resetting=lambda: self._hold_gpu_reset_pending_mark(payload, default_extra),
+                    shadow=shadow,
                 )
         except Exception as exc:
             logger.warning(_m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)})))
+            return None
+        if shadow:
+            if result.hung_uuids:
+                logger.warning(
+                    _m(
+                        "Hung pod GPU found on reboot (shadow: no reset)",
+                        extra=get_extra_info({**default_extra, "hung": result.hung_uuids, "detail": result.detail}),
+                    )
+                )
             return None
         if result.warning is None:
             return None

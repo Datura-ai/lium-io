@@ -306,6 +306,26 @@ async def test_the_pending_mark_is_held_from_before_the_reset_until_it_is_done()
     assert host.commands[-1].startswith("CUDA_VISIBLE_DEVICES=")
 
 
+@pytest.mark.parametrize("latch", [False, True])
+@pytest.mark.asyncio
+async def test_shadow_reads_the_host_and_changes_nothing(latch):
+    # HUNG_GPU_RESET_ON_REBOOT_ENABLED off: what would happen goes in the detail, nothing runs
+    host = HungHost(query=_query({U[0]: f"{U[0]}, 100, 0" if latch else None}))
+    hold = _Hold(host)
+    result = await reset_hung_pod_gpus(host, POD, resetting=hold, shadow=True)
+    assert result.hung_uuids == [U[0]] and result.warning is None
+    assert f"reset [{U[0]!r}]" in result.detail and ("latch clear first" in result.detail) == latch
+    assert _resets(host) == [] and not any(cmd.startswith("CUDA_VISIBLE_DEVICES=") for cmd in host.commands)
+    assert hold.entered is None  # no pending mark
+
+
+@pytest.mark.asyncio
+async def test_shadow_says_why_it_would_refuse():
+    host = HungHost(query=_query({U[0]: None}), apps=[(77, U[0])])  # a process outside the pod holds the GPU
+    result = await reset_hung_pod_gpus(host, POD, shadow=True)
+    assert result.warning is None and "refuse the reset" in result.detail and _resets(host) == []
+
+
 @pytest.mark.asyncio
 async def test_a_healthy_reboot_never_takes_the_pending_mark():
     host = HungHost()
