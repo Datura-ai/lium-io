@@ -22,7 +22,7 @@ from services.executor_rollout import (
     session_kept_hotkeys,
     withhold_rollout_verdicts,
 )
-from protocol.vc_protocol.validator_requests import PodSshObservation, PodSshResult
+from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState, PodSshObservation, PodSshResult
 from services.miner_service import MinerService
 from services.task.models import JobResult
 
@@ -321,6 +321,26 @@ async def test_a_session_lost_with_no_finding_still_publishes_the_pod_ssh_observ
     assert lost.pod_ssh == observations
     assert lost.availability_errors is None  # None leaves the backend's stored reasons alone
     assert lost.scored_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_with_only_a_reaped_pod_state_still_publishes_it():
+    """Review 4482976707: the stale cleanup ran before the port check and reaped a container; with no finding and
+    no pod SSH observation that state was dropped, so the backend never learnt the container is gone."""
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = _miner_service({})
+    lost = _session_lost("node-1", None)
+    reaped = PodContainerState(pod_id="orphan-1", container_state=ContainerState.REAPED, observed_at=datetime.now(UTC))
+    lost.pod_states = [reaped]
+
+    await validator_process.publish_session_lost_findings(
+        [WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"}
+    )
+
+    validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
+        [lost], "5Miner", "5Cold", is_whole_miner_batch=False
+    )
+    assert lost.pod_states == [reaped] and lost.availability_errors is None
 
 
 @pytest.mark.asyncio

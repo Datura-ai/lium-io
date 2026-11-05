@@ -572,7 +572,7 @@ class ExpressLane:
         if result.session_lost_in_port_check:
             # The run has no verdict: its findings still go out, and it is retried without spending one of
             # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
-            if result.availability_errors:
+            if result.availability_errors or result.pod_states:
                 await self.miner_service.publish_machine_specs(
                     results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
                 )

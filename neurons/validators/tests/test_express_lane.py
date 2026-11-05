@@ -545,8 +545,26 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
     harness.miner_service.publish_machine_specs.assert_not_awaited()
     assert (pending.failed_runs, pending.attempts, pending.lost_sessions) == (0, 0, 2)
 
+    # review 4482976707: no finding but a container the stale cleanup reaped: its state is published
+    from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
+
+    reaped = PodContainerState(pod_id="orphan-1", container_state=ContainerState.REAPED, observed_at=datetime.now(UTC))
+
+    def lost_with_reaped(payload, executor_id):
+        job = lost(payload, executor_id, None)
+        job["results"][0].pod_states = [reaped]
+        return job
+
+    harness.job_for = lost_with_reaped
+    pending.not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    (results, *_), _ = harness.miner_service.publish_machine_specs.await_args
+    assert results[0].pod_states == [reaped]
+    harness.miner_service.publish_machine_specs.reset_mock()
+    harness.job_for = lambda payload, executor_id: lost(payload, executor_id, None)
+
     # more lost sessions than MAX_ATTEMPTS keep the node queued, up to SESSION_LOST_MAX_RUNS
-    for _ in range(SESSION_LOST_MAX_RUNS - 3):
+    for _ in range(SESSION_LOST_MAX_RUNS - 4):
         pending.not_before = 0.0
         assert await harness.tick_and_settle() == 1
     assert harness.lane._pending[new_node] is pending and pending.attempts == 0

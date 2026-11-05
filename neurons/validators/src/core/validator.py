@@ -1603,7 +1603,8 @@ class Validator:
                 )
             # else review 4472994399: the earlier list is unknown; the finding still goes out alone, and the backend
             # merges a session-lost report by reason code, so the stored codes it did not re-check (GPU_LOST) stay
-            if not result.availability_errors and not result.pod_ssh:
+            # review 4482976707: a reaped container's state (StaleContainerCleanupCheck) goes out too
+            if not result.availability_errors and not result.pod_ssh and not result.pod_states:
                 continue
             await self.miner_service.publish_machine_specs(
                 [result], withheld.miner_hotkey, miner_coldkey, is_whole_miner_batch=False
