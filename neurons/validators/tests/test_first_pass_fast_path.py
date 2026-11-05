@@ -6,6 +6,8 @@ VerifyX writes less RAM/disk, and a cold bandwidth sample is published but not e
 never sets `first_pass`, so a scored verification is byte-for-byte today's.
 """
 
+import platform
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,7 +21,7 @@ from neurons.validators.src.services.task.messages import CapabilityMessages as 
 from neurons.validators.src.services.task.messages import VerifyXMessages as VxMsg
 from neurons.validators.src.services.task import pipeline_factory as pipeline_factory_module
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
-from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
+from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService, VerifyXValidator
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
 from tests.helpers import build_context_config, build_services, build_state
@@ -407,3 +409,21 @@ def test_first_pass_network_waits_are_sized_from_the_acceptance_floor():
     assert config["network_floor_mbps"] <= settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS
     assert config["network_min_timeout_seconds"] == settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS == 45
     assert "network_timeout_seconds" not in config
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="the vendored libverifyx.so is the x86_64 build")
+def test_vendored_library_sizes_the_waits_from_the_first_pass_config():
+    """The vendored libverifyx.so (lium-platform#2518) acts on the first-pass keys: the sized waits
+    ride in the challenge, so it grows; a library without sizing ignores the keys (same length)."""
+    lib = str(Path(__file__).resolve().parents[1] / "libverifyx.so")
+    base = {
+        "memory_allocation_percentage": 80, "memory_min_test_gb": 1, "memory_max_test_gb": 16,
+        "storage_min_available_gb": 10, "storage_throughput_test_gb": 1, "network_timeout_seconds": 120,
+        "enable_xet_challenge": True,
+    }
+    machine_info = {"uuids": "GPU-x", "gpu_count": 1, "gpu_model": "H100"}
+
+    def cipher(config):
+        return VerifyXValidator(lib, 7).generate_challenge({"seed": 7, "machine_info": machine_info, "config": config})
+
+    assert len(cipher({**base, **_first_pass_challenge_config()})) > len(cipher(base))
