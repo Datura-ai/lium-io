@@ -99,22 +99,39 @@ def _public(key: asyncssh.SSHKey) -> str:
     return key.export_public_key("openssh").decode().strip()
 
 
-async def test_any_recorded_host_key_matches(tmp_path):
-    # the portal records every key the node presented; this validator session negotiates the rsa one
-    volume = tmp_path / "a-volume"
-    rsa_key = _executor_container_start(tmp_path / "a-container", volume, "rsa")
-    other = _executor_container_start(tmp_path / "b-container", tmp_path / "b-volume", "rsa")
-    recorded = f"{_public(asyncssh.read_private_key(volume / 'ssh_host_ed25519_key'))}\n\n{_public(rsa_key)}\n"
-    server_a = await asyncssh.listen(IP_A, 0, server_host_keys=[rsa_key], server_factory=_OpenServer)
-    port = server_a.sockets[0].getsockname()[1]
-    server_b = await asyncssh.listen(IP_B, port, server_host_keys=[other], server_factory=_OpenServer)
+async def _check_against(key: asyncssh.SSHKey, recorded: str):
+    """NodeAccountCheck over a real handshake with a server that presents only `key`."""
+    server = await asyncssh.listen(IP_A, 0, server_host_keys=[key], server_factory=_OpenServer)
     try:
+        port = server.sockets[0].getsockname()[1]
         async with asyncssh.connect(IP_A, port, known_hosts=None, username="root") as conn:
-            result = await NodeAccountCheck().run(_ctx("node.example.com", conn, recorded))
-            assert result.passed and result.event.reason_code == "NODE_ACCOUNT_OK"
-        async with asyncssh.connect(IP_B, port, known_hosts=None, username="root") as conn:
-            result = await NodeAccountCheck().run(_ctx("node.example.com", conn, recorded))
-            assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+            return await NodeAccountCheck().run(_ctx("node.example.com", conn, recorded))
     finally:
-        server_a.close()
-        server_b.close()
+        server.close()
+
+
+KEY_TYPES = ["ed25519", "ecdsa", "rsa"]
+
+
+@pytest.fixture
+def recorded_machine(tmp_path):
+    """The node's host keys by type, and the portal's record of them: sorted `<type> <base64>` lines."""
+    _executor_container_start(tmp_path / "container", tmp_path / "volume")
+    keys = {t: asyncssh.read_private_key(tmp_path / "volume" / f"ssh_host_{t}_key") for t in KEY_TYPES}
+    return keys, "\n".join(sorted(_public(k) for k in keys.values()))
+
+
+@pytest.mark.parametrize("key_type", KEY_TYPES)
+async def test_every_recorded_host_key_passes(recorded_machine, key_type):
+    keys, recorded = recorded_machine
+    result = await _check_against(keys[key_type], recorded)
+    assert result.passed
+    assert result.event.reason_code == "NODE_ACCOUNT_OK"
+
+
+async def test_unrecorded_host_key_fails(recorded_machine, tmp_path):
+    _, recorded = recorded_machine
+    other = _executor_container_start(tmp_path / "other-container", tmp_path / "other-volume")
+    result = await _check_against(other, recorded)
+    assert not result.passed
+    assert result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
