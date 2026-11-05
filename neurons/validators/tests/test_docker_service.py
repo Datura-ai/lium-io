@@ -8715,6 +8715,79 @@ def test_orphaned_shim_kill_spares_a_replacement_shim_started_in_between(tmp_pat
                 os.kill(int(pid_file.read_text()), 9)
 
 
+_CGROUP_BUSY_ERROR = (
+    "OCI runtime create failed: runc create failed: unable to start container process: "
+    "write /sys/fs/cgroup/system.slice/docker-x.scope/cgroup.procs: device or resource busy"
+)
+
+
+@pytest.mark.parametrize(
+    "cgroup_result, expected_recovered, starts",
+    [
+        pytest.param("removed", True, 2, id="leftover_cgroup_removed_then_started"),
+        pytest.param("busy", False, 1, id="cgroup_still_holds_a_process"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_clears_a_leftover_cgroup_and_starts_once_more(
+    docker_service, monkeypatch, cgroup_result, expected_recovered, starts
+):
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    start_existing_container = AsyncMock(side_effect=[RuntimeError(_CGROUP_BUSY_ERROR), None])
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    async def run(command, *_args, **_kwargs):
+        if "--format '{{.Id}}'" in command:
+            return _make_ssh_command_result(stdout=f"{_ORPHANED_TASK_ID}\n")
+        if "cgroup.procs" not in command and "/sys/fs/cgroup" in command:
+            return _make_ssh_command_result(stdout=f"{cgroup_result}\n")
+        if ".Destination" in command:
+            return _make_ssh_command_result(stdout="/root\n")
+        return _make_ssh_command_result(stdout="volume_pod-1\n")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    assert start_existing_container.await_count == starts
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert DockerCommand.remove_stale_container_cgroup(_ORPHANED_TASK_ID) in commands
+
+
+@pytest.mark.parametrize(
+    "status, holds_process, expected",
+    [
+        ("exited", False, "removed"),
+        ("exited", True, "busy"),
+        ("running", False, "skipped state=running"),
+    ],
+)
+def test_remove_stale_container_cgroup_removes_only_empty_cgroups(tmp_path, status, holds_process, expected):
+    scope = tmp_path / "system.slice" / f"docker-{_ORPHANED_TASK_ID}.scope"
+    (scope / "init.scope").mkdir(parents=True)
+    (scope / "docker" / "inner").mkdir(parents=True)
+    if holds_process:  # a plain file stands in for a process: rmdir of a non-empty dir fails like EBUSY
+        (scope / "docker" / "inner" / "pid").write_text("1")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f"#!/bin/sh\necho {status}\n")
+    fake_docker.chmod(0o755)
+    command = (
+        DockerCommand.remove_stale_container_cgroup(_ORPHANED_TASK_ID)
+        .replace("[ /proc/1/root/ -ef / ]", "false")
+        .replace("/proc/1/root/sys/fs/cgroup", str(tmp_path))
+        .replace("/usr/bin/docker", str(fake_docker))
+    )
+
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=30).stdout.strip()
+
+    assert out == expected
+    assert scope.exists() is (expected != "removed")
+
+
 @pytest.mark.asyncio
 async def test_recover_pod_runs_once_at_a_time_per_pod(docker_service, monkeypatch):
     # two overlapping check cycles on the same stale verdict: only the first one recovers

@@ -2508,6 +2508,11 @@ def _orphaned_task_id(error_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _is_stale_container_cgroup_error(error_text: str) -> bool:
+    # `docker start` after a host dockerd restart: runc cannot join the old run's leftover cgroup
+    return "cgroup.procs" in error_text and "device or resource busy" in error_text
+
+
 def _is_safe_docker_volume_name(volume_name: str) -> bool:
     return bool(_DOCKER_VOLUME_NAME_RE.fullmatch(volume_name))
 
@@ -11890,16 +11895,27 @@ class DockerService:
                 log_extra,
             )
             require_rental_docker_ssh_host_key(executor_info)
+            start = partial(
+                self.start_existing_container,
+                executor_info=executor_info,
+                private_key=private_key,
+                known_hosts_policy=known_hosts_policy,
+                container_name=container_name,
+                local_volume_path=local_volume_path,
+                pod_id=pod_id,
+                default_extra=log_extra,
+            )
             with node_owner(miner_hotkey):  # a hostname node's DNS counts against its miner
-                await self.start_existing_container(
-                    executor_info=executor_info,
-                    private_key=private_key,
-                    known_hosts_policy=known_hosts_policy,
-                    container_name=container_name,
-                    local_volume_path=local_volume_path,
-                    pod_id=pod_id,
-                    default_extra=log_extra,
-                )
+                try:
+                    await start()
+                except Exception as exc:
+                    # 5 Nov: after a host Docker restart both pods' starts failed on the old run's
+                    # leftover cgroup until a reboot recreated them; clear it and start once more
+                    if not _is_stale_container_cgroup_error(str(exc)) or not await self._remove_stale_container_cgroup(
+                        ssh_client, container_name, log_extra
+                    ):
+                        raise
+                    await start()
         except asyncio.CancelledError:
             # the whole check runs under an outer timeout, so a cancellation can land between
             # `docker start` and the gocryptfs remount and leave the container up with its
@@ -11952,6 +11968,32 @@ class DockerService:
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
         )
         return True
+
+    async def _remove_stale_container_cgroup(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        log_extra: dict[str, Any],
+    ) -> bool:
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect {shlex.quote(container_name)} --format '{{{{.Id}}}}'",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        container_id = (inspect_result.stdout or "").strip()
+        if getattr(inspect_result, "exit_status", 0) != 0 or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            return False
+        removed = await ssh_client.run(
+            DockerCommand.remove_stale_container_cgroup(container_id),
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        result = (removed.stdout or "").strip()
+        logger.info(
+            _m(
+                "POD_STALE_CGROUP_REMOVED" if result == "removed" else "POD_STALE_CGROUP_RECOVERY_SKIPPED",
+                extra=get_extra_info({**log_extra, "result": result}),
+            )
+        )
+        return result == "removed"
 
     async def _kill_orphaned_task_shim(
         self,
