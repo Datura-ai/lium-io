@@ -120,6 +120,9 @@ class JobResult(BaseModel):
     # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
     # from; scored like the cycle it came from, never published
     carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
+    # DAH-5718: the validator's own SSH session died in the port check; no verdict this cycle (withheld at cycle end),
+    # only the findings of the checks that finished are published
+    session_lost_in_port_check: bool = Field(default=False, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic

@@ -23,14 +23,24 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
+from .checks.port_connectivity import PortConnectivityCheck
+from .checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from .availability import (
     MAX_PEER_TEXT_LENGTH,
+    ReachSource,
+    ReachTarget,
     availability_errors,
     build_ssh_unreachable_event,
     failed_check_event,
 )
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
-from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
+from .messages import (
+    REASON_CODE_DOCS_URL,
+    GpuLossHoldMessages,
+    PostRentalGpuRecheckMessages,
+    TenantEnforcementMessages,
+    render_message,
+)
 from .models import JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
@@ -262,6 +272,31 @@ class TaskService:
                     error.model_dump(mode="json")
                     for error in availability_errors([*events, failed] if failed else events)
                 ]
+                if (
+                    last_event.check_id == PortConnectivityCheck.check_id
+                    and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+                ):
+                    # DAH-5718: the checks after the port check never ran, so [] would clear holds only they re-read
+                    # (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones alone
+                    result.session_lost_in_port_check = True
+                    if any(event.reason_code == GpuLossHoldMessages.CLEAN_AGAIN.reason for event in events):
+                        # review 4469609761: this scrape ended a GPU-loss hold but its load test never ran, so the
+                        # hold is published from here, not from the last published list a restart has emptied
+                        waiting = render_message(
+                            PostRentalGpuRecheckMessages.WAITING_AFTER_GPU_LOSS,
+                            ctx=last_context,
+                            check_id=PostRentalGpuRecheckCheck.check_id,
+                            what={
+                                "reach_source": str(ReachSource.VALIDATOR),
+                                "reach_target": str(ReachTarget.GPU),
+                                "executor_uuid": executor_info.uuid,
+                                "load_test": "not run: the SSH session closed during the port check",
+                            },
+                        )
+                        result.availability_errors += [
+                            error.model_dump(mode="json") for error in availability_errors([waiting])
+                        ]
+                    result.availability_errors = result.availability_errors or None
                 # DAH-3405: the last event is the one that ended the run — the failed fatal check,
                 # the finalize event of a run that completed without a score, or the rented halt
                 # (success=True, score 0 when the image is OUTDATED).
