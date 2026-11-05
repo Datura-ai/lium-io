@@ -120,6 +120,7 @@ class DummyConnectivityService:
         dind_error: DindLogCause | None = None,
         port_ranges: tuple[PortRangeResult, ...] = (),
         sysbox_measured: bool | None = None,
+        host_runtime_fault: bool = False,
     ):
         """
         Args:
@@ -131,6 +132,7 @@ class DummyConnectivityService:
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
         self.dind_error = dind_error
+        self.host_runtime_fault = host_runtime_fault
         self.sysbox_measured = sysbox_measured
         self.port_ranges = port_ranges
         self.success = success
@@ -195,6 +197,7 @@ class DummyConnectivityService:
             dind_error=self.dind_error,
             port_ranges=self.port_ranges,
             sysbox_measured=self.sysbox_measured,
+            host_runtime_fault=self.host_runtime_fault,
         )
 
 
@@ -1799,3 +1802,24 @@ async def test_a_rental_holding_every_port_is_an_info_verdict_not_a_port_failure
     assert result.passed is expected_pass
     assert result.event.reason_code == expected_reason
     assert backend.calls == (0 if expected_pass else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [True, False])
+async def test_host_runtime_fault_is_the_dind_probes_own_reading(context_factory, fault):
+    """DAH-5651: the state carries the DinD probe's reading (DindVerifier: the container started and its sshd
+    never answered), not a guess from dind_ok, which a refused `docker run` or our own error also clears."""
+    services = build_services(
+        redis=DummyRedis(),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=False, verified_port_count=100, dind_ok=False, host_runtime_fault=fault
+        ),
+    )
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=_rented_state()
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].host_runtime_fault is fault

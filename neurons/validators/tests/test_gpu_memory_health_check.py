@@ -15,7 +15,7 @@ from neurons.validators.src.services.task.availability import (
 )
 from neurons.validators.src.services.task.checks.gpu_fault_probe import (
     PROBE_JSON_MARKER,
-    PROBE_SOURCE,
+    probe_source,
 )
 from neurons.validators.src.services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
 from neurons.validators.src.services.task.messages import GpuMemoryHealthMessages as Msg
@@ -26,6 +26,8 @@ from core.config import settings
 from services.task.models import JobResult
 from tests.helpers import default_executor
 from tests.test_gpu_fault_probe_check import FakeRunner, _probe_namespace, make_ctx
+
+PROBE_SOURCE = probe_source()
 
 # a card seen on a rented 8x RTX PRO 6000 node, 14 Oct: 1 uncorrectable DRAM ECC error, a pending
 # row remap and "Drain and Reset" as the recovery action

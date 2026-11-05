@@ -2367,6 +2367,18 @@
           "default": null,
           "title": "Gpu Attestation Passed"
         },
+        "host_runtime_fault": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host Runtime Fault"
+        },
         "incentive": {
           "anyOf": [
             {

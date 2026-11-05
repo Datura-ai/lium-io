@@ -324,6 +324,9 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None = the
     # publisher does not probe; [] = it probed and the node has no pod to probe.
     pod_ssh: list[PodSshObservation] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
+    # This cycle's DinD test container started on the host and its sshd never answered (a failing container
+    # runtime). None from a publisher that predates the field.
+    host_runtime_fault: bool | None = None
 
 
 @VALIDATOR_MESSAGES.register
