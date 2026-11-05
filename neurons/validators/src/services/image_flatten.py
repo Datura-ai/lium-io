@@ -167,7 +167,8 @@ def _flatten_command(
     import, tag the result only when both sides succeeded, and always remove the container and its
     volumes. With `export_factor`, a counting export first refuses when the disk cannot also hold
     `export_factor` times the bytes the export really produces plus `fixed_bytes`: Size counts allocated
-    blocks, so a sparse file can report far less than the export and the import write. Plain sh: no pipefail."""
+    blocks, so a sparse file can report far less than the export and the import write. The count and the copy
+    share one FLATTEN_TIMEOUT_SECONDS deadline, the bound the lock waiters allow for. Plain sh: no pipefail."""
     t = FLATTEN_TIMEOUT_SECONDS
     change_args = " ".join(f"--change {shlex.quote(c)}" for c in changes)
     # an empty volume per VOLUME path: create would otherwise copy the image's files there (extra disk)
@@ -199,10 +200,13 @@ def _flatten_command(
         f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
         # the ID, not the tag: a pull may move the tag after inspect and the copy would not match its name
         f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {mounts} {shlex.quote(image_id)}) || exit 97; "
+        f"end=$(( $(date +%s) + {t} )); "
         + (_export_count_check(export_factor, fixed_bytes) if export_factor else "")
-        +         'st=$(mktemp); '
-        f'iid=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") '
-        f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
+        # what the count left of the one deadline (timeout 0 would mean no limit)
+        + 'left=$(( end - $(date +%s) )); [ "$left" -gt 0 ] || { /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; '
+        'echo "flatten failed: out of time after counting" >&2; exit 98; }; st=$(mktemp); '
+        'iid=$( (timeout "$left" /usr/bin/docker export "$cid"; echo $? > "$st") '
+        f'| timeout "$left" /usr/bin/docker import {change_args} -); irc=$?; '
         'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; rrc=$?; '
         # a left-over container or volume fails the flatten untagged, so the next rental retries the cleanup
         f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag, lease)} 2>/dev/null; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
@@ -356,6 +360,31 @@ def containerd_daemons_command() -> str:
     return f"/usr/bin/docker run --rm --pid=host {ALPINE_HELPER_IMAGE} sh -c {shlex.quote(each)}"
 
 
+# the running daemon's plugins and the roots they export: containerd reads its config only at startup
+CONTAINERD_PLUGINS_COMMAND = "/usr/bin/ctr plugins ls -d"
+
+
+def containerd_running_roots(listing: str) -> dict[str, str]:
+    """The `root` each plugin of the running containerd exports, keyed `<type>.<id>` (its directory name), from
+    `ctr plugins ls -d`."""
+    roots: dict[str, str] = {}
+    kind = ident = ""
+    for words in (line.split() for line in listing.splitlines()):
+        if words[:1] == ["Type:"]:
+            kind = words[1] if len(words) == 2 else ""
+        elif words[:1] == ["ID:"]:
+            ident = words[1] if len(words) == 2 else ""
+        elif len(words) == 2 and words[0] == "root" and kind and ident:
+            roots[f"{kind}.{ident}"] = words[1]
+    return roots
+
+
+def containerd_runs_on_root(listing: str, root: str) -> bool:
+    """The running overlayfs snapshotter and content store export exactly their directories under `root`."""
+    roots = containerd_running_roots(listing)
+    return all(roots.get(d) == f"{root.rstrip('/')}/{d}" for d in _CONTAINERD_DATA_DIRS if "/" not in d)
+
+
 _CONTAINERD_CONFIG_ARGS = ([], ["--config", "/etc/containerd/config.toml"], ["-c", "/etc/containerd/config.toml"],
                            ["--config=/etc/containerd/config.toml"])
 
@@ -422,6 +451,10 @@ async def containerd_store_on_data_root(ssh_client: asyncssh.SSHClientConnection
         return False
     root = containerd_root(str(read.stdout) if read.exit_status == 0 else None)
     if root is None:
+        return False
+    # a config rewritten since the daemon started names a root it does not use
+    plugins = await ssh_client.run(CONTAINERD_PLUGINS_COMMAND, check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
+    if plugins.exit_status != 0 or not containerd_runs_on_root(str(plugins.stdout), root):
         return False
     same = await ssh_client.run(
         same_filesystem_as_data_root_command(root), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS

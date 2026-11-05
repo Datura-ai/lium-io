@@ -66,6 +66,8 @@ def _ssh(
             return Mock(exit_status=0, stdout=f"{docker_version}\n")
         if "--pid=host" in command:
             return Mock(exit_status=0, stdout="/usr/bin/containerd \n")
+        if command == image_flatten.CONTAINERD_PLUGINS_COMMAND:
+            return Mock(exit_status=0, stdout=_plugins("/var/lib/containerd"))
         if command.startswith("/usr/bin/docker info --format '{{json .DriverStatus}}'"):
             return Mock(exit_status=same_disk_rc, stdout="version = 3\n")
         if command.startswith("root=$(/usr/bin/docker info --format '{{.DockerRootDir}}')"):
@@ -152,8 +154,18 @@ async def test_containerd_store_flattens_when_its_root_shares_the_measured_disk(
     assert await flatten_image_on_host(ssh, "model:dev", lease="r1") == _TAG
 
 
+def _plugins(root) -> str:
+    """`ctr plugins ls -d` of a daemon running on `root`."""
+    return "".join(
+        f"Type:          {kind}\nID:            {ident}\nPlatforms:     linux/amd64\nExports:\n"
+        f"               root      {root}/{kind}.{ident}\n\n"
+        for kind, ident in (("io.containerd.content.v1", "content"), ("io.containerd.snapshotter.v1", "overlayfs"))
+    )
+
+
 def _same_disk_rc(
-    tmp_path, *, driver_status: str, config: str | None, daemons: str = "/usr/bin/containerd \n", link=None
+    tmp_path, *, driver_status: str, config: str | None, daemons: str = "/usr/bin/containerd \n", link=None,
+    running_root=None,
 ) -> int:
     """The real check line against a fake docker whose `run` maps each --mount dst to its src locally."""
     data_root = tmp_path / "docker"
@@ -185,6 +197,9 @@ def _same_disk_rc(
     )
     fake.chmod(0o755)
     async def run(command, check=False, timeout=None):
+        if command == image_flatten.CONTAINERD_PLUGINS_COMMAND:
+            live = running_root or image_flatten.containerd_root(config)
+            return Mock(exit_status=0 if live != "unavailable" else 1, stdout=_plugins(live))
         done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", str(fake))], capture_output=True, text=True)
         return Mock(exit_status=done.returncode, stdout=done.stdout)
 
@@ -308,6 +323,15 @@ def test_a_symlinked_containerd_config_is_refused_never_read_as_missing(tmp_path
     assert _same_disk_rc(tmp_path, driver_status=_STORE, config=config, link=link) == 1
 
 
+@pytest.mark.parametrize("running, expected", [("same", True), ("other", False), ("unavailable", False)])
+def test_a_config_rewritten_without_a_containerd_restart_is_refused(tmp_path, running, expected):
+    # the daemon started on another disk, then the config was edited to a root on the measured disk
+    _ctrd(tmp_path / "ctrd")
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    live = {"same": str(tmp_path / "ctrd"), "other": "/mnt/b/containerd", "unavailable": "unavailable"}[running]
+    assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config, running_root=live) == 0) is expected
+
+
 def test_a_snapshotter_root_path_elsewhere_refuses_the_flatten():
     v2 = "version = 2\n[plugins.'io.containerd.snapshotter.v1.overlayfs']\n  root_path = '/mnt/b/snap'\n"
     v3 = "version = 3\n[plugins]\n  [plugins.'io.containerd.snapshotter.v1.overlayfs']\n    root_path = '/mnt/b'\n"
@@ -373,6 +397,7 @@ def _flatten_script(
     export_bytes=3,
     export_factor=0,
     fixed_bytes=0,
+    export_sleep=0,
 ) -> list[str]:
     """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
@@ -385,7 +410,7 @@ def _flatten_script(
         f"  run) printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 {avail} 1%% /hostfs\\n' ;;\n"
         f'  image) if [ "$2" = ls ]; then cat {tmp_path}/copies 2>/dev/null; else [ -e {tmp_path}/tagged ]; fi ;;\n'
         "  create) echo cid1 ;;\n"
-        f"  export) head -c {export_bytes} /dev/zero; exit {export_rc} ;;\n"
+        f"  export) sleep {export_sleep}; head -c {export_bytes} /dev/zero; exit {export_rc} ;;\n"
         f"  import) cat >/dev/null; sleep {import_sleep}; echo sha256:new; exit {import_rc} ;;\n"
         f"  rm) exit {rm_rc} ;;\n"
         f"  tag) touch {tmp_path}/tagged ;;\n"
@@ -570,7 +595,22 @@ def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):
 
 def test_timeout_bounds_both_sides_of_the_copy():
     script = _flatten_command("img", "t", [], [], 0, "r1")
-    assert script.count(f"timeout {image_flatten.FLATTEN_TIMEOUT_SECONDS} ") == 2
+    assert script.count('timeout "$left" ') == 2
+
+
+@pytest.mark.parametrize("export_factor", [0, 2])
+def test_counting_and_copying_share_one_deadline(tmp_path, monkeypatch, export_factor):
+    # scaled: each export pass takes 3/4 of the limit; two passes in a row must not hold the lock past the
+    # limit the waiters (flatten lock wait, flatten_wait_command) allow for
+    monkeypatch.setattr(image_flatten, "FLATTEN_TIMEOUT_SECONDS", 2)
+    argv = _flatten_script(tmp_path, export_sleep=1.5, export_factor=export_factor)
+    start = time.monotonic()
+    rc = subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.7
+    # one pass fits; the count plus the copy does not
+    assert rc == (98 if export_factor else 0)
+    assert "rm -fv cid1" in _calls(tmp_path)
 
 
 @pytest.mark.asyncio
