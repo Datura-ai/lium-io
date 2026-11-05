@@ -64,6 +64,8 @@ def _ssh(
     async def run(command, check=False, timeout=None):
         if command.startswith("/usr/bin/docker version"):
             return Mock(exit_status=0, stdout=f"{docker_version}\n")
+        if "--pid=host" in command:
+            return Mock(exit_status=0, stdout="/usr/bin/containerd \n")
         if command.startswith("/usr/bin/docker info --format '{{json .DriverStatus}}'"):
             return Mock(exit_status=same_disk_rc, stdout="version = 3\n")
         if command.startswith("root=$(/usr/bin/docker info --format '{{.DockerRootDir}}')"):
@@ -115,7 +117,7 @@ async def test_no_flatten_on_a_store_off_the_measured_disk():
     ssh = _ssh(exists=False, driver="overlayfs", same_disk_rc=1)
     with pytest.raises(RuntimeError, match="storage driver"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
-    assert ssh.run.await_count == 3
+    assert ssh.run.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -141,13 +143,17 @@ async def test_containerd_store_flattens_when_its_root_shares_the_measured_disk(
     assert await flatten_image_on_host(ssh, "model:dev", lease="r1") == _TAG
 
 
-def _same_disk_rc(tmp_path, *, driver_status: str, config: str | None) -> int:
+def _same_disk_rc(
+    tmp_path, *, driver_status: str, config: str | None, daemons: str = "/usr/bin/containerd \n", link=None
+) -> int:
     """The real check line against a fake docker whose `run` maps each --mount dst to its src locally."""
     data_root = tmp_path / "docker"
     data_root.mkdir()
     (tmp_path / "etc" / "containerd").mkdir(parents=True)
     if config is not None:
         (tmp_path / "etc" / "containerd" / "config.toml").write_text(config)
+    if link is not None:
+        link(tmp_path / "etc")
     fake = tmp_path / "fake-docker"
     fake.write_text(
         f"#!{sys.executable}\n"
@@ -155,6 +161,7 @@ def _same_disk_rc(tmp_path, *, driver_status: str, config: str | None) -> int:
         "a = sys.argv[1:]\n"
         "if a[0] == 'version':\n"
         "    print('29.8.0'); sys.exit(0)\n"
+        f"if '--pid=host' in a:\n    print({daemons!r}, end=''); sys.exit(0)\n"
         "if a[0] == 'info':\n"
         f"    print({driver_status!r} if 'DriverStatus' in a[2] else {str(data_root)!r}); sys.exit(0)\n"
         "mounts, i = {}, 2\n"
@@ -217,6 +224,49 @@ def test_containerd_root_comes_from_the_config_or_the_check_refuses(tmp_path, co
         config = config.format(same=tmp_path / "ctrd", other="/proc")
     rc = _same_disk_rc(tmp_path, driver_status=_STORE, config=config)
     assert (rc == 0) is expected
+
+
+@pytest.mark.parametrize(
+    "daemons, expected",
+    [
+        ("/usr/bin/containerd \n", True),
+        ("/usr/bin/containerd --config /etc/containerd/config.toml \n", True),
+        ("/usr/bin/containerd --root /mnt/b/containerd \n", False),  # the flag overrides the file's root
+        ("/usr/bin/containerd --config /srv/containerd.toml \n", False),  # another file entirely
+        ("/usr/bin/containerd \ncontainerd --config /var/run/docker/containerd/containerd.toml \n", False),
+        ("", False),  # no containerd seen: the daemon serving Docker is unknown
+    ],
+)
+def test_containerd_store_check_requires_one_daemon_reading_the_etc_config(tmp_path, daemons, expected):
+    (tmp_path / "ctrd").mkdir()
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config, daemons=daemons) == 0) is expected
+
+
+def _link_config(etc):
+    target = etc.parent / "srv-containerd.toml"
+    (etc / "containerd" / "config.toml").rename(target)
+    (etc / "containerd" / "config.toml").symlink_to(target)
+
+
+def _link_dir(etc):
+    (etc / "containerd").rename(etc.parent / "srv-containerd")
+    (etc / "containerd").symlink_to(etc.parent / "srv-containerd")
+
+
+@pytest.mark.parametrize("link", [_link_config, _link_dir])
+def test_a_symlinked_containerd_config_is_refused_never_read_as_missing(tmp_path, link):
+    (tmp_path / "ctrd").mkdir()
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    assert _same_disk_rc(tmp_path, driver_status=_STORE, config=config, link=link) == 1
+
+
+def test_a_snapshotter_root_path_elsewhere_refuses_the_flatten():
+    v2 = "version = 2\n[plugins.'io.containerd.snapshotter.v1.overlayfs']\n  root_path = '/mnt/b/snap'\n"
+    v3 = "version = 3\n[plugins]\n  [plugins.'io.containerd.snapshotter.v1.overlayfs']\n    root_path = '/mnt/b'\n"
+    assert image_flatten.containerd_root(v2) is None
+    assert image_flatten.containerd_root(v3) is None
+    assert image_flatten.containerd_root("version = 2\n[plugins.'io.containerd.snapshotter.v1.overlayfs']\n  root_path = ''\n") == "/var/lib/containerd"
 
 
 def test_the_default_root_is_used_only_without_a_config_file():

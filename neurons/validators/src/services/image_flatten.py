@@ -280,7 +280,11 @@ _CONTAINERD_NO_CONFIG_EXIT = 3
 def containerd_config_command() -> str:
     """Prints /etc/containerd/config.toml on Docker's containerd image store; exits
     _CONTAINERD_NO_CONFIG_EXIT when there is none, any other non-zero when not on that store or unreadable."""
-    read = f"[ -e /e/containerd/config.toml ] || exit {_CONTAINERD_NO_CONFIG_EXIT}; cat /e/containerd/config.toml"
+    # a symlink here would resolve inside the helper, not on the node, so it is refused rather than followed
+    read = (
+        "[ -L /e/containerd ] || [ -L /e/containerd/config.toml ] && exit 1; "
+        f"[ -e /e/containerd/config.toml ] || exit {_CONTAINERD_NO_CONFIG_EXIT}; cat /e/containerd/config.toml"
+    )
     return (
         "/usr/bin/docker info --format '{{json .DriverStatus}}' | grep -q io.containerd.snapshotter || exit 1; "
         f"/usr/bin/docker run --rm --mount type=bind,src=/etc,dst=/e,readonly {ALPINE_HELPER_IMAGE} "
@@ -300,11 +304,33 @@ def containerd_root(config: str | None) -> str | None:
     # shortcut: an imported file may set root too; refuse rather than read the imports
     if doc.get("imports"):
         return None
+    # a plugin's own root_path (e.g. the overlayfs snapshotter's) puts its data on a disk this check never reads
+    if any(isinstance(p, dict) and p.get("root_path") for p in (doc.get("plugins") or {}).values()):
+        return None
     root = doc.get("root", _CONTAINERD_DEFAULT_ROOT)
     # a comma would split the --mount option the same-disk check binds it with
     if not isinstance(root, str) or not root.startswith("/") or "," in root:
         return None
     return root
+
+
+def containerd_daemons_command() -> str:
+    """Prints the arguments of every process named containerd on the node, one process per line."""
+    each = 'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = containerd ] || continue; ' \
+        'tr "\\0" " " < "$p/cmdline" && echo; done'
+    return f"/usr/bin/docker run --rm --pid=host {ALPINE_HELPER_IMAGE} sh -c {shlex.quote(each)}"
+
+
+_CONTAINERD_CONFIG_ARGS = ([], ["--config", "/etc/containerd/config.toml"], ["-c", "/etc/containerd/config.toml"],
+                           ["--config=/etc/containerd/config.toml"])
+
+
+def containerd_daemon_reads_etc_config(daemons: str) -> bool:
+    """The node runs exactly one containerd and it takes its root from /etc/containerd/config.toml: no
+    --root, no other --config. A second containerd (e.g. one dockerd started itself) or any other flag
+    leaves the daemon serving Docker or its root unknown."""
+    lines = [line.split() for line in daemons.splitlines() if line.strip()]
+    return len(lines) == 1 and lines[0][1:] in _CONTAINERD_CONFIG_ARGS
 
 
 def same_filesystem_as_data_root_command(path: str) -> str:
@@ -340,8 +366,9 @@ async def containerd_store_on_data_root(ssh_client: asyncssh.SSHClientConnection
     )
     if version.exit_status != 0 or not docker_counts_unpacked_size(str(version.stdout)):
         return False
-    # shortcut: reads /etc/containerd/config.toml only (no snapshotter root_path); a node that moves its
-    # images elsewhere that way gets a disk check of the wrong disk
+    daemons = await ssh_client.run(containerd_daemons_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
+    if daemons.exit_status != 0 or not containerd_daemon_reads_etc_config(str(daemons.stdout)):
+        return False
     read = await ssh_client.run(containerd_config_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
     if read.exit_status not in (0, _CONTAINERD_NO_CONFIG_EXIT):
         return False
