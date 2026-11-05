@@ -181,7 +181,8 @@ class WorkspaceResolver:
     ) -> None:
         if action is StorageAction.BACKUP:
             # DAH-2002: an absent path passes, so BACKUP_SOURCE_SCRIPT turns it into an EMPTY no-op; a file still fails
-            check_script = '[ ! -e "$1" ] || [ -d "$1" ] || exit 20'
+            # ls -ld shows what the path actually is (type or stat errno) in the failure, to prove the cause
+            check_script = '[ ! -e "$1" ] || [ -d "$1" ] || { ls -ld "$1" >&2; exit 20; }'
             error = f"backup source is not a directory: {requested_path}"
             codes: tuple[int, ...] = (20,)
         elif overwrite_fresh_target:
@@ -348,7 +349,7 @@ def _raise_check_failure(
     # Only the script's own exit codes mean a bad shape; anything else is docker/nsenter failing (DAH-5691)
     if result.returncode == 0:
         return
-    if result.returncode in codes:
-        raise WorkspaceResolutionError(error)
     stderr = (result.stderr or "")[-300:].strip()
+    if result.returncode in codes:
+        raise WorkspaceResolutionError(f"{error}: {stderr}" if stderr else error)
     raise WorkspaceResolutionError(f"could not check {action} path {path}: exit {result.returncode}: {stderr}")
