@@ -872,6 +872,40 @@ async def test_clearing_a_gpu_reset_mark_keeps_the_pods_create_and_its_saved_rep
     assert "pod-1" in await redis_service.unacked_container_created()
 
 
+@pytest.mark.parametrize("first_done", ["a", "b"])
+@pytest.mark.asyncio
+async def test_a_late_success_of_an_older_dispatch_keeps_the_newer_ones_saved_report(first_done: str) -> None:
+    # dispatches A then B overlap on one pod; B's frame is lost, so its saved report is the only way back
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-b")
+    created = {
+        name: ContainerCreated(
+            miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1",
+            container_name="c-1", volume_name="v-1", port_maps=[(22, port)], command_id=f"cmd-{name}",
+        )
+        for name, port in [("a", 40022), ("b", 40023)]
+    }
+
+    for name in ([first_done, "b" if first_done == "a" else "a"]):
+        await client._keep_until_rent_finished(created[name])
+
+    assert json.loads((await redis_service.unacked_container_created())["pod-1"])["command_id"] == "cmd-b"
+
+
+@pytest.mark.parametrize(("holder", "released"), [("create:pod-1", True), ("create:pod-1:abc", True), ("create:pod-10", False), ("probe-token", False)])
+@pytest.mark.asyncio
+async def test_a_restart_releases_a_cut_off_creates_lock_in_either_token_form(holder: str, released: bool) -> None:
+    # create:pod-1 is what a connector before unique tokens (lium-io#2051) wrote
+    redis_service = _fakeredis_service()
+    await redis_service.redis.set("lock:executor-create:exec-1", holder)
+
+    await redis_service.release_cut_off_create_lock("exec-1", "pod-1")
+
+    assert (await redis_service.redis.get("lock:executor-create:exec-1") is None) == released
+
+
 class _PipelineOnADownRedis:
     async def __aenter__(self):
         return self

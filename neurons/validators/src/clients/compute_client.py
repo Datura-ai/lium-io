@@ -1190,7 +1190,9 @@ class ComputeClient:
         try:
             # a filler's flag is already cleared here: the backend sends it no rent-finished
             if await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, created.pod_id):
-                await redis_service.add_unacked_container_created(created.pod_id, created.model_dump_json())
+                await redis_service.save_container_created_of_current_dispatch(
+                    created.miner_hotkey, created.executor_id, created.pod_id, created.command_id, created.model_dump_json()
+                )
         except Exception as exc:  # best-effort: losing it only loses the resend
             self._log_unacked_container_created_error(created.pod_id, exc)
 

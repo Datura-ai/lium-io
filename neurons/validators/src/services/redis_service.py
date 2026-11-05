@@ -403,7 +403,10 @@ class RedisService:
         try:
             async with self.redis.pipeline(transaction=True) as pipe:
                 await pipe.watch(key)
-                if not (await pipe.get(key) or b"").startswith(_renter_create_lock_token_prefix(pod_id).encode()):
+                holder = await pipe.get(key) or b""
+                # a connector before this token form (lium-io#2051) wrote the bare create:<pod_id>
+                prefix = _renter_create_lock_token_prefix(pod_id).encode()
+                if not (holder.startswith(prefix) or holder == prefix[:-1]):
                     return
                 pipe.multi()
                 pipe.delete(key)
@@ -922,6 +925,33 @@ class RedisService:
 
     async def add_unacked_container_created(self, pod_id: str, message_json: str) -> None:
         await self.hset(UNACKED_CONTAINER_CREATED_KEY, pod_id, message_json)
+
+    async def save_container_created_of_current_dispatch(
+        self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str, message_json: str
+    ) -> bool:
+        """Saves a create's success unless the pod's newest create mark names another dispatch: a late success of an
+        older dispatch must not overwrite the newer one's only saved report. WATCHed with the pending list, so a
+        dispatch added meanwhile reruns the check (lium-io#1952)."""
+        field = f"{miner_hotkey}:{executor_id}"
+        async with self.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(PENDING_PODS_PREFIX)
+                    creates = [
+                        item
+                        for item in _parse_pending_pods(await pipe.hget(PENDING_PODS_PREFIX, field))
+                        if item.get("pod_id", "") == pod_id and not item.get("kind")
+                    ]
+                    newest = creates[-1].get("command_id", "") if creates else ""
+                    if command_id and newest and newest != command_id:
+                        await pipe.reset()
+                        return False
+                    pipe.multi()
+                    pipe.hset(UNACKED_CONTAINER_CREATED_KEY, pod_id, message_json)
+                    await pipe.execute()
+                    return True
+                except redis.exceptions.WatchError:
+                    continue
 
     async def remove_unacked_container_created(self, pod_id: str, saved: str | bytes) -> None:
         """Deletes the pod's saved report only while it is still `saved`, the one the caller read: a newer
