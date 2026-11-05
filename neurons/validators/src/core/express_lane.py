@@ -325,7 +325,8 @@ class ExpressLane:
         """Track this validator's never-validated executors; return the ones to launch now.
 
         An executor in rechecks (DAH-5716: its provider asked for a check) is taken even when
-        validated before. Oldest registration first, under the two in-flight caps.
+        validated before. Oldest registration first, under the global in-flight cap and, for a
+        self-hosted miner, the per-miner cap.
         """
         in_flight = self.miner_service.in_flight
         my_hotkey = self._hotkey()
@@ -380,11 +381,18 @@ class ExpressLane:
             self._pending[e].miner_hotkey for e in express_in_flight if e in self._pending
         )
         per_miner.update(self._rechecks_in_flight.values())
+        # The per-miner cap guards a self-hosted miner's one process. A hotkey routed through the
+        # central miner can carry many providers' nodes on a shared service; only the global cap
+        # bounds it (5 of the 10 longest first-pass waits on 5 Nov sat behind its 2 slots).
+        central = self.subtensor_client.hotkeys_routed_via_central_miner
         chosen: list[_Pending] = []
         for pending in candidates:
             if room <= 0:
                 break
-            if per_miner[pending.miner_hotkey] >= settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER:
+            if (
+                pending.miner_hotkey not in central
+                and per_miner[pending.miner_hotkey] >= settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER
+            ):
                 continue
             chosen.append(pending)
             per_miner[pending.miner_hotkey] += 1

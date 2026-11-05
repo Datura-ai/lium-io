@@ -685,6 +685,35 @@ async def test_a_requested_validated_executor_is_rechecked_once_under_the_caps(m
 
 
 @pytest.mark.asyncio
+async def test_a_central_miner_hotkey_runs_past_the_per_miner_cap_under_the_global_cap(monkeypatch, wallet):
+    central = [str(uuid4()) for _ in range(6)]
+    self_hosted = [str(uuid4()) for _ in range(3)]
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-central": [_portal_executor(n) for n in central],
+            "miner-a": [_portal_executor(n, registered_seconds_ago=60) for n in self_hosted],
+        },
+        [_Neuron("miner-central"), _Neuron("miner-a")],
+    )
+    harness.lane.subtensor_client.hotkeys_routed_via_central_miner = frozenset({"miner-central"})
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_MAX_IN_FLIGHT", 7)
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", 2)
+    harness.release.clear()
+
+    # The self-hosted nodes are older: 2 of them (its cap), then 5 central ones fill the global 7.
+    assert await harness.lane.tick() == 7
+    running = set(harness.miner_service.in_flight)
+    assert len(running & set(self_hosted)) == 2
+    assert len(running & set(central)) == 5
+    assert await harness.lane.tick() == 0  # the global cap still holds
+
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+    assert await harness.tick_and_settle() == 2  # the rest: one central, one self-hosted
+
+
+@pytest.mark.asyncio
 async def test_a_recheck_never_overlaps_the_next_wave(monkeypatch, wallet):
     import core.express_lane as express_lane
 

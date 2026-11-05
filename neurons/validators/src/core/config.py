@@ -827,8 +827,10 @@ class Settings(BaseSettings):
     # no incentive ledger row); the next cycle scores and overwrites it as today.
     EXPRESS_LANE_TICK_SECONDS: int = Field(env="EXPRESS_LANE_TICK_SECONDS", default=30)
     # Hard bound on the extra load a registration flood can add: at most this many express
-    # verifications in flight at once (so also per tick), and per miner.
-    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=4)
+    # verifications in flight at once (so also per tick), and per self-hosted miner (a hotkey
+    # routed through the central miner is bounded by the global cap only). A wave runs every
+    # executor at once, so 8 is small beside it; at 4 a few nodes added together queued minutes.
+    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=8)
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
