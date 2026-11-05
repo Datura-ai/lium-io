@@ -30,6 +30,9 @@ class ContainerStartWatch:
     """DAH-5682: whether `docker run` of an attempt's test container has not returned yet."""
 
     in_progress: bool = False
+    # DAH-5868: the attempt's probe result once the probe finished, so a cleanup that runs out the attempt's time
+    # does not throw away ports that already answered
+    verified: BatchResult | None = None
 
 
 class BatchVerifier:
@@ -96,6 +99,16 @@ class BatchVerifier:
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
+                if start_watch.verified is not None:
+                    # DAH-5868: the probe had finished; only its container cleanup ran out the time
+                    await self.runner.cleanup(ssh_client, container_name)
+                    logger.info(
+                        _m(
+                            f"complete: {len(start_watch.verified.successful)}/{len(ports)} verified",
+                            extra=get_extra_info(log_ctx),
+                        )
+                    )
+                    return start_watch.verified
                 start_hung += start_watch.in_progress
                 logger.debug(
                     _m(
@@ -180,15 +193,15 @@ class BatchVerifier:
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
+                if successful:
+                    answered = set(sampled_ok + successful)
+                    start_watch.verified = BatchResult([p for p in ports if p in answered], failed, external)
         finally:
             await self.runner.cleanup(ssh_client, name)
 
-        if not successful:
-            # DAH-5597: only the host listener decides this tier; a host that drops INPUT but forwards published
-            # ports answers the published sample, and must still reach the semi-batch tier
-            return BatchResult([], ports, external)
-        answered = set(sampled_ok + successful)
-        return BatchResult([p for p in ports if p in answered], failed, external)
+        # DAH-5597: only the host listener decides this tier; a host that drops INPUT but forwards published
+        # ports answers the published sample, and must still reach the semi-batch tier
+        return start_watch.verified or BatchResult([], ports, external)
 
     async def _start_container(
         self,
