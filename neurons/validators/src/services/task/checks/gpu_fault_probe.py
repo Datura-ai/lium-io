@@ -157,14 +157,16 @@ class GpuFaultProbeCheck:
             )
             return self._fault_verdict(ctx, what, error=error or "fault", report=report)
         what["error"] = _cap(report.get("error")) or f"probe status {_cap(status)!r}"
-        return self._no_verdict(ctx, what, counted=not _only_busy_vram(report))
+        return self._no_verdict(ctx, what, counts_toward_streak=not _only_busy_vram(report))
 
-    def _no_verdict(self, ctx: Context, what: dict[str, Any], counted: bool = True) -> CheckResult:
+    def _no_verdict(
+        self, ctx: Context, what: dict[str, Any], counts_toward_streak: bool = True
+    ) -> CheckResult:
         """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is logged, and under
         GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. An enforce run is a
-        second probe in the same cycle, and a card too busy to probe (counted=False) is not a silent one,
-        so neither counts: the streak is left as it was."""
-        if self.enforce or not counted:
+        second probe in the same cycle, and a card too busy to probe (counts_toward_streak=False) is not
+        a silent one, so neither counts: the streak is left as it was."""
+        if self.enforce or not counts_toward_streak:
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
@@ -213,16 +215,16 @@ def _only_busy_vram(report: dict[str, Any]) -> bool:
     """True when every card that gave no verdict could not get the memory to start (a busy card): a healthy
     node under a 3-day split rental ran 4 cycles of that (aa801f3e, 31 Oct-3 Nov)."""
     devices = report.get("devices")
-    errors = (
+    cards_without_verdict = (
         [d for d in devices if isinstance(d, dict) and d.get("status") != "ok"]
         if isinstance(devices, list)
         else []
     )
-    return bool(errors) and all(
+    return bool(cards_without_verdict) and all(
         d.get("status") == "error"
         and isinstance(d.get("error"), str)
         and d["error"].startswith(BUSY_VRAM_ERROR_PREFIX)
-        for d in errors
+        for d in cards_without_verdict
     )
 
 
