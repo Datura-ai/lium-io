@@ -19,7 +19,3 @@ manifest, signature, or verification step at build or runtime; the image digest 
 trust boundary.
 
 Refresh both binaries and both metadata pairs from the same lium-platform CI run.
-
-A staging deploy does not use these bytes: `lium-io-deployment` builds liumd from the source head
-in `provenance-amd64.json` with the staging validator hotkeys and overwrites both binaries in the
-checkout before the image build, so the staging image trusts the staging validator.
