@@ -102,6 +102,8 @@ class PodRecoverer(Protocol):
         default_extra: dict[str, Any],
     ) -> bool: ...
 
+    async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
+
 
 @dataclass(frozen=True)
 class ContextServices:

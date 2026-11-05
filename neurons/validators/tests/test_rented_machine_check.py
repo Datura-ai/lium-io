@@ -1299,6 +1299,39 @@ async def test_tenant_enforcement_defers_a_pod_its_own_restore_stopped_to_the_ne
     assert _pod_states(result)["pod-1"] == "exited"
 
 
+@pytest.mark.parametrize("stop_outcome", ["failed", "unknown"])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_defers_only_a_confirmed_stop_of_an_unmounted_pod(context_factory, stop_outcome):
+    # lio#1827 review: docker refusing the stop leaves the pod running without its mount, so the host fails the check;
+    # a stop it could not confirm is judged next cycle, never counted as the validator's
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = True
+    docker.restore_volume_mount_of_running_container.return_value = False
+    docker.unmounted_stop_outcome.return_value = stop_outcome
+    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    ctx = build_recovery_context(
+        context_factory,
+        ssh,
+        docker,
+        backend=DummyBackendClient(active=True, local_volume_path="/workspace"),
+        redis=_recovery_redis(lock, {}),
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    docker.recover_parked_pod_container.assert_not_awaited()
+    assert "pods_stopped_by_validator" not in result.updates["default_extra"]
+    if stop_outcome == "failed":
+        assert not result.passed
+        assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+        assert result.updates["clear_verified_job_info"] is True
+        assert result.updates["default_extra"]["pods_stop_refused"] == ["pod-1"]
+    else:
+        assert result.passed, result.event
+        assert _pod_states(result)["pod-1"] == "unknown"
+
+
 def _recovery_redis(lock, marks: dict[str, str]) -> Mock:
     return Mock(
         backend_create_inflight=AsyncMock(return_value=False),

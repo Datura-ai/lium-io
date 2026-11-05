@@ -8268,6 +8268,22 @@ async def test_recover_parked_never_trusts_an_anchor_it_did_not_park(docker_serv
 
 
 @pytest.mark.asyncio
+async def test_recover_parked_trusts_an_anchor_whose_stop_mark_landed_after_a_restart(docker_service, monkeypatch):
+    # lio#1827 review: the park's in-process record is gone after a validator restart, but the stop's mark, retried
+    # in the background until Redis took it, still attributes the anchor: a start the renter breaks keeps it ours
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__stopped\n", start=AsyncMock(side_effect=RuntimeError("broken"))
+    )
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    docker_service.redis_service.marks["stopped_by_recovery:pod-1"] = "stopped"
+
+    assert await docker_service.recover_parked_pod_container(**kwargs) is False
+
+    assert docker_service.redis_service.marks == {"stopped_by_recovery:pod-1": "stopped"}
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_recover_parked_stops_the_container_when_cancelled_mid_start(docker_service, monkeypatch):
     kwargs, ssh_client, _start, stop, _repair = _parked_recovery(
         docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", start=AsyncMock(side_effect=asyncio.CancelledError)
@@ -8568,6 +8584,37 @@ async def test_mark_and_stop_unmounted_pod_leaves_a_retry_anchor(
     # the park without a mark is recorded in this process: the name alone attributes nothing
     assert ("pod-1" in docker_service_module._UNMARKED_RECOVERY_STOPS) is (expected_name == "pod_pod-1__stopped")
     docker_service_module._UNMARKED_RECOVERY_STOPS.discard("pod-1")
+    # the check reads the stop's outcome: only a confirmed stop is deferred as ours
+    expected_outcome = "stopped" if stop_reply_error in (None, "signalled") else "failed" if refused else "unknown"
+    assert await docker_service.unmounted_stop_outcome("pod-1") == expected_outcome
+    # a mark that could not be written is retried in the background, so the attribution outlives a restart
+    retry = docker_service_module._RECOVERY_MARK_CLEANUPS.pop("pod-1", None)
+    assert (retry is not None) is bool(mark_error)
+    if retry:
+        retry.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_stop_mark_is_written_in_the_background_once_redis_is_back(docker_service, monkeypatch):
+    marks: dict[str, str] = {}
+    redis_up = False
+
+    async def set_mark(key, value, ex=None):
+        if not redis_up:
+            raise ConnectionError("Redis down")
+        marks[key] = value
+
+    docker_service.redis_service.set = AsyncMock(side_effect=set_mark)
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC", 0)
+    monkeypatch.setattr(docker_service, "_park_by_id", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_stop_outcome", AsyncMock(return_value="stopped"))
+
+    assert await docker_service._mark_and_stop_unmounted_pod(AsyncMock(), "pod_pod-1", "pod-1") is True
+    redis_up = True
+    await asyncio.gather(*docker_service_module._RECOVERY_MARK_CLEANUPS.values())
+    assert marks == {"stopped_by_recovery:pod-1": "stopped"}
+    docker_service_module._UNMARKED_RECOVERY_STOPS.discard("pod-1")
+    docker_service_module._UNMOUNTED_STOP_OUTCOMES.pop("pod-1", None)
 
 
 @pytest.mark.asyncio

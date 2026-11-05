@@ -267,10 +267,24 @@ class TenantEnforcementCheck:
                         )
                     )
                 if not pod_running:
+                    stop_outcome = await ctx.services.pod_recovery.unmounted_stop_outcome(pod_id)
+                    if stop_outcome == "failed":
+                        # docker refused the stop: the pod still runs without its mount, taking the renter's writes
+                        # unencrypted onto the host disk, so the host fails the check (lio#1827 review)
+                        extra.setdefault("pods_stop_refused", []).append(pod_id)
+                        diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
+                        state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
+                        return with_pod_states(
+                            self._pod_not_running_failure(ctx, pod_container_name, pod_id, diagnostics, extra)
+                        )
                     # stopped by this cycle's own restore: a second recovery now would eat the result's reserve,
-                    # so the next cycle restarts it (lio#1827 review F-17)
-                    state_by_pod_id[pod_id] = ContainerState.EXITED
-                    extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
+                    # so the next cycle restarts it (lio#1827 review F-17); a stop it could not confirm is judged
+                    # then as well, not counted as ours
+                    if stop_outcome == "unknown":
+                        state_by_pod_id[pod_id] = ContainerState.UNKNOWN
+                    else:
+                        state_by_pod_id[pod_id] = ContainerState.EXITED
+                        extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
                     ssh_pub_keys = []
                     continue
             if pod_running:
@@ -585,6 +599,15 @@ class TenantEnforcementCheck:
         if stopped_by_validator:
             extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
             return _DownedPodOutcome(failure=None, ssh_pub_keys=[], container_state=container_state)
+        return _DownedPodOutcome(
+            failure=self._pod_not_running_failure(ctx, container_name, pod_id, diagnostics, extra),
+            ssh_pub_keys=[],
+            container_state=container_state,
+        )
+
+    def _pod_not_running_failure(
+        self, ctx: Context, container_name: str, pod_id: str, diagnostics: dict[str, object], extra: dict[str, Any]
+    ) -> CheckResult:
         event = render_message(
             Msg.POD_NOT_RUNNING,
             ctx=ctx,
@@ -598,27 +621,23 @@ class TenantEnforcementCheck:
             },
             extra=extra,
         )
-        return _DownedPodOutcome(
-            failure=CheckResult(
-                passed=False,
-                event=event,
-                updates={
-                    "default_extra": extra,
-                    "clear_verified_job_info": True,
-                    "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
-                    # DAH-3386: the backend's penalty row shows why the container was not running — a renter's
-                    # entrypoint exiting with its own code and a host that lost the container look different here.
-                    "clear_verified_job_evidence": {
-                        "reason_code": event.reason_code,
-                        "check_id": self.check_id,
-                        "pod_id": pod_id,
-                        "container_name": container_name,
-                        "container": _penalty_evidence_from_diagnostics(diagnostics),
-                    },
+        return CheckResult(
+            passed=False,
+            event=event,
+            updates={
+                "default_extra": extra,
+                "clear_verified_job_info": True,
+                "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
+                # DAH-3386: the backend's penalty row shows why the container was not running — a renter's
+                # entrypoint exiting with its own code and a host that lost the container look different here.
+                "clear_verified_job_evidence": {
+                    "reason_code": event.reason_code,
+                    "check_id": self.check_id,
+                    "pod_id": pod_id,
+                    "container_name": container_name,
+                    "container": _penalty_evidence_from_diagnostics(diagnostics),
                 },
-            ),
-            ssh_pub_keys=[],
-            container_state=container_state,
+            },
         )
 
     def _reboot_failed_host_fault_result(
