@@ -394,9 +394,8 @@ class MinerLogLine(BaseModel):
             message = (
                 f"No unrented incentive: this executor's disk could not be measured, because the validator could not "
                 f"find where Docker's containerd image store keeps containers. An idle executor must have at least "
-                f"{measured.rate}x its {measured.vram_gb} GB of GPU VRAM ({required_disk_gb} GB) in total disk. Turn "
-                f'off the containerd image store ("features": {{"containerd-snapshotter": false}} in '
-                f"/etc/docker/daemon.json) or run one containerd with a readable config, or rent it out to earn."
+                f"{measured.rate}x its {measured.vram_gb} GB of GPU VRAM ({required_disk_gb} GB) in total disk. Run "
+                "one containerd with a readable config, or rent it out to earn."
             )
         else:
             message = (

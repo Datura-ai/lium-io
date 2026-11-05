@@ -1093,12 +1093,12 @@ def host_realpath(path):
     return resolved or "/"
 
 
-def cache_volume_bytes(df, prefixes):
+def cache_volume_bytes(df, prefixes, skip=()):
     # local-driver volumes: /system/df walks each one's _data, so this is what the files really hold
     return sum(
         max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
         for volume in df.get("Volumes") or []
-        if str(volume.get("Name") or "").startswith(prefixes)
+        if str(volume.get("Name") or "").startswith(prefixes) and volume.get("Name") not in skip
     )
 
 
@@ -1119,6 +1119,14 @@ def get_docker_disk_usage():
     # (1561 GB on an 8x B300), which a customer create removes when the renter needs the space.
     # The Dolphin cache (~40 GB) stays used.
     engy_cache = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX)
+    # a customer create cannot remove a cache volume another container still mounts, so that one stays used
+    held = {
+        mount.get("Name")
+        for container in df.get("Containers") or []
+        if not all(str(name).lstrip("/").startswith(FILLER_CONTAINER_PREFIX) for name in container.get("Names") or [""])
+        for mount in container.get("Mounts") or []
+    }
+    engy_released = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX, held)
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
     by_volume = {
         str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
@@ -1126,7 +1134,7 @@ def get_docker_disk_usage():
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
-    volumes -= engy_cache
+    volumes -= engy_released
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
@@ -1154,7 +1162,7 @@ def get_docker_disk_usage():
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
+        "filler_released_kb": (filler_run_volumes + engy_released) // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
         "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},

@@ -987,6 +987,30 @@ def test_the_engy_cache_is_reported_as_free_disk_and_the_dolphin_cache_stays_use
     }
 
 
+def test_an_engy_cache_a_non_filler_container_mounts_stays_used(scrape: dict) -> None:
+    # Arrange — an engy_cache_* volume mounted by a container that is not a filler: a customer create cannot remove it
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {
+                "LayersSize": 0,
+                "Containers": [{"Names": ["/provider_app"], "Mounts": [{"Type": "volume", "Name": "engy_cache_x"}]}],
+                "Volumes": [{"Name": "engy_cache_x", "UsageData": {"Size": 1500 * 1024**3}}],
+            },
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": []},
+        },
+    )
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert — not released, still a used volume, and the checkpoint progress still reads it
+    assert usage["filler_released_kb"] == 0
+    assert usage["hard_disk_volumes"] == 1500 * 1024**2
+    assert usage["hard_disk_engy_cache_used_gb"] == 1500 * 1024**3 // 10**9
+
+
 def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeypatch) -> None:
     # Arrange — an idle node running our filler: its preallocated 1900 GB run volume (labelled by the
     # filler create) and a renter-style volume without the label
