@@ -42,6 +42,9 @@ PROBE_JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
 # tell a transport stall from a hung host and is scored UNKNOWN, like the other no-report outcomes.
 PROBE_TIMEOUT_SECONDS = 195
 PROBE_SECONDS = 4
+# the probe's setup error for a card whose memory is taken (miner_jobs/gpu_fault_probe.py): the card is busy, a
+# renter's pod on a split node or another process, so the probe never started on it; not a silent card
+BUSY_VRAM_ERROR_PREFIX = "not enough free VRAM"
 OUTPUT_TAIL_CHARS = 800
 # the report is executor-controlled: bound what is copied into the event
 MAX_FAULT_LINES = 16
@@ -155,13 +158,14 @@ class GpuFaultProbeCheck:
             )
             return self._fault_verdict(ctx, what, error=error or "fault", report=report)
         what["error"] = _cap(report.get("error")) or f"probe status {_cap(status)!r}"
-        return self._no_verdict(ctx, what)
+        return self._no_verdict(ctx, what, counted=not _only_busy_vram(report))
 
-    def _no_verdict(self, ctx: Context, what: dict[str, Any]) -> CheckResult:
+    def _no_verdict(self, ctx: Context, what: dict[str, Any], counted: bool = True) -> CheckResult:
         """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is logged, and under
         GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. An enforce run is a
-        second probe in the same cycle, so it does not count."""
-        if self.enforce:
+        second probe in the same cycle, and a card too busy to probe (counted=False) is not a silent one,
+        so neither counts: the streak is left as it was."""
+        if self.enforce or not counted:
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
@@ -204,6 +208,23 @@ class GpuFaultProbeCheck:
             what=what,
         )
         return CheckResult(passed=not enforce, event=event)
+
+
+def _only_busy_vram(report: dict[str, Any]) -> bool:
+    """True when every card that gave no verdict could not get the memory to start (a busy card): a healthy
+    node under a 3-day split rental ran 4 cycles of that (aa801f3e, 31 Oct-3 Nov)."""
+    devices = report.get("devices")
+    errors = (
+        [d for d in devices if isinstance(d, dict) and d.get("status") != "ok"]
+        if isinstance(devices, list)
+        else []
+    )
+    return bool(errors) and all(
+        d.get("status") == "error"
+        and isinstance(d.get("error"), str)
+        and d["error"].startswith(BUSY_VRAM_ERROR_PREFIX)
+        for d in errors
+    )
 
 
 def _parse_report(stdout: str) -> dict[str, Any] | None:

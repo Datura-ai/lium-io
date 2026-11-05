@@ -1024,7 +1024,7 @@ def drain_workers(
         code = _exit_code(pending[index]["process"])
         no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}", "fault")
 
-    def read(index: int) -> None:
+    def read_one_message(index: int) -> None:
         try:
             message = pending[index]["conn"].recv()
         except EOFError:  # the pipe closed without a report: the worker is gone
@@ -1044,12 +1044,12 @@ def drain_workers(
     while pending and time.perf_counter() < deadline:
         by_conn = {worker["conn"]: index for index, worker in pending.items()}
         for conn in multiprocessing.connection.wait(list(by_conn), timeout=0.2):
-            read(by_conn[conn])
+            read_one_message(by_conn[conn])
         reap_dead()
     # every message that landed as the deadline passed: a phase change and the report behind it
     for index in list(pending):
         while index in pending and pending[index]["conn"].poll(0):
-            read(index)
+            read_one_message(index)
     reap_dead()
     # out of time is no verdict even in the kernels: honest idle nodes ran out of it under GPU contention
     # (1-4 Nov); a worker that died in its kernels is still the card's fault
