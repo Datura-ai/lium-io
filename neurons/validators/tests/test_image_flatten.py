@@ -57,8 +57,13 @@ def test_changes_refuse_an_env_value_with_a_line_break():
         image_flatten_changes({"Env": ["A=1\n2"]})
 
 
-def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0):
+def _ssh(
+    *, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0,
+    docker_version: str = "29.8.0",
+):
     async def run(command, check=False, timeout=None):
+        if command.startswith("/usr/bin/docker version"):
+            return Mock(exit_status=0, stdout=f"{docker_version}\n")
         if command.startswith("/usr/bin/docker info --format '{{json .DriverStatus}}'"):
             return Mock(exit_status=same_disk_rc, stdout="version = 3\n")
         if command.startswith("root=$(/usr/bin/docker info --format '{{.DockerRootDir}}')"):
@@ -110,7 +115,24 @@ async def test_no_flatten_on_a_store_off_the_measured_disk():
     ssh = _ssh(exists=False, driver="overlayfs", same_disk_rc=1)
     with pytest.raises(RuntimeError, match="storage driver"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
+    assert ssh.run.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_on_the_containerd_store_of_a_docker_that_undercounts_image_size():
+    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.7.2")
+    with pytest.raises(RuntimeError, match="storage driver"):
+        await flatten_image_on_host(ssh, "model:dev", lease="r1")
     assert ssh.run.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "version, counts",
+    [("29.8.0", True), ("29.10.1", True), ("30.0.0-rc.1", True), ("29.7.9", False), ("28.5.2", False), ("", False),
+     ("dev", False)],
+)
+def test_only_a_docker_whose_containerd_size_counts_unpacked_snapshots(version, counts):
+    assert image_flatten.docker_counts_unpacked_size(version) is counts
 
 
 @pytest.mark.asyncio
@@ -131,6 +153,8 @@ def _same_disk_rc(tmp_path, *, driver_status: str, config: str | None) -> int:
         f"#!{sys.executable}\n"
         "import subprocess, sys\n"
         "a = sys.argv[1:]\n"
+        "if a[0] == 'version':\n"
+        "    print('29.8.0'); sys.exit(0)\n"
         "if a[0] == 'info':\n"
         f"    print({driver_status!r} if 'DriverStatus' in a[2] else {str(data_root)!r}); sys.exit(0)\n"
         "mounts, i = {}, 2\n"

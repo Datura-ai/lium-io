@@ -11,6 +11,7 @@ shell-form health check instead) and ONBUILD (build-time only) are not carried o
 """
 
 import json
+import re
 import shlex
 import tomllib
 
@@ -319,9 +320,26 @@ def same_filesystem_as_data_root_command(path: str) -> str:
     )
 
 
+# Before Docker 29.8.0 `image inspect` Size on the containerd store leaves out the unpacked snapshots, so
+# the copy's disk budget would be too small (moby/moby, Docker 29.8.0 release notes)
+_CONTAINERD_SIZE_MIN_DOCKER = (29, 8, 0)
+
+
+def docker_counts_unpacked_size(server_version: str) -> bool:
+    """Docker's server version is one whose containerd-store image Size includes the unpacked snapshots."""
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", server_version.strip())
+    return bool(match) and tuple(map(int, match.groups())) >= _CONTAINERD_SIZE_MIN_DOCKER
+
+
 async def containerd_store_on_data_root(ssh_client: asyncssh.SSHClientConnection) -> bool:
-    """Docker's containerd image store with containerd's root on the filesystem of Docker's data root.
-    False whenever the root cannot be determined, so a flatten never measures the wrong disk."""
+    """Docker's containerd image store with containerd's root on the filesystem of Docker's data root, on a
+    Docker whose image Size counts the unpacked snapshots. False whenever either cannot be determined, so a
+    flatten never measures the wrong disk or budgets too little of it."""
+    version = await ssh_client.run(
+        "/usr/bin/docker version --format '{{.Server.Version}}'", check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
+    )
+    if version.exit_status != 0 or not docker_counts_unpacked_size(str(version.stdout)):
+        return False
     # shortcut: reads /etc/containerd/config.toml only (no snapshotter root_path); a node that moves its
     # images elsewhere that way gets a disk check of the wrong disk
     read = await ssh_client.run(containerd_config_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
