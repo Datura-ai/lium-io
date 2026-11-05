@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from typing import Annotated, Optional, Union
@@ -110,6 +111,25 @@ UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS = 1.0
 UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS = 3.0
 # the validator's clock starts when it signs the request; a request queued longer than this is read as clock skew
 MAX_REQUEST_PICKUP_LAG_SECONDS = 10.0
+# an executor's SSH-key answer is ~2 KB (more with attestation evidence); the miner serves every
+# provider from one process, so it reads no more than this from any executor
+MAX_EXECUTOR_ANSWER_BYTES = 4 * 1024 * 1024
+
+
+class ExecutorAnswerTooLarge(Exception):
+    pass
+
+
+async def _read_capped(response: aiohttp.ClientResponse, limit: int = MAX_EXECUTOR_ANSWER_BYTES) -> bytes:
+    """The response body, or ExecutorAnswerTooLarge once it passes `limit` (counted after decompression)."""
+    if (response.content_length or 0) > limit:
+        raise ExecutorAnswerTooLarge(f"answer of {response.content_length} bytes, limit {limit}")
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        body += chunk
+        if len(body) > limit:
+            raise ExecutorAnswerTooLarge(f"answer over {limit} bytes")
+    return bytes(body)
 
 
 class PubkeyRegistration(pydantic.BaseModel):
@@ -394,8 +414,9 @@ class ExecutorService:
                 timeout = aiohttp.ClientTimeout(total=total)
                 try:
                     async with session.post(url, json=payload, timeout=timeout) as response:
+                        body = await _read_capped(response)
                         if response.status != 200:
-                            text = await response.text()
+                            text = body.decode(errors="replace")
                             logger.error(
                                 _m(
                                     "API request failed to register SSH key - HTTP error",
@@ -403,7 +424,7 @@ class ExecutorService:
                                 ),
                             )
                             return None
-                        response_obj: dict = await response.json()
+                        response_obj: dict = json.loads(body)
                         logger.info(
                             _m(
                                 "Received response from executor",

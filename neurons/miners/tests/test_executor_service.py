@@ -75,11 +75,25 @@ def test_executor():
     )
 
 
+_SSH_ANSWER = json.dumps({"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r"}).encode()
+
+
+def _response(status: int = 200, body: bytes = b"", error: Exception | None = None, content_length: int | None = None):
+    """A mock aiohttp response whose body streams as one chunk, or raises `error` while reading."""
+    response = MagicMock(status=status, content_length=content_length)
+
+    async def chunks(_size):
+        if error is not None:
+            raise error
+        yield body
+
+    response.content.iter_chunked = chunks
+    return response
+
+
 def _make_mock_session(response_status: int = 500):
     """Return a mock aiohttp.ClientSession that captures the POST payload."""
-    mock_response = MagicMock()
-    mock_response.status = response_status
-    mock_response.text = AsyncMock(return_value="test error")
+    mock_response = _response(response_status, b"test error")
 
     mock_post_ctx = MagicMock()
     mock_post_ctx.__aenter__ = AsyncMock(return_value=mock_response)
@@ -151,14 +165,12 @@ async def test_send_pubkey_to_executor_retries_an_executor_that_did_not_answer(
 ):
     """A timed-out or cut-off upload is asked again, so one dropped request does not leave the node out of
     the answer; a complete bad answer is not; a node that never answers gives up inside the deadline."""
-    answered = MagicMock(status=200)
-    answered.json = AsyncMock(return_value={"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r"})
+    answered = _response(200, _SSH_ANSWER)
     if status is None:
         first = asyncio.TimeoutError()
     else:
-        first = MagicMock(status=status)
-        first.json = AsyncMock(side_effect=body_error)
-        first.text = AsyncMock(return_value="unavailable")
+        bad_json = isinstance(body_error, json.JSONDecodeError)
+        first = _response(status, b"{" if bad_json else b"unavailable", None if bad_json else body_error)
     post_ctx = MagicMock()
     post_ctx.__aenter__ = AsyncMock(side_effect=[first, answered])
     post_ctx.__aexit__ = AsyncMock(return_value=None)
@@ -183,6 +195,29 @@ async def test_send_pubkey_to_executor_retries_an_executor_that_did_not_answer(
         ) is None
         assert session.post.call_count == 1
 
+
+
+@pytest.mark.parametrize("content_length", [None, es.MAX_EXECUTOR_ANSWER_BYTES + 1])
+@pytest.mark.asyncio
+async def test_send_pubkey_reads_no_more_than_the_answer_limit(executor_service, test_executor, content_length):
+    """An oversized answer, declared or streamed, is refused without reading it whole or asking again."""
+    read = []
+
+    async def endless(_size):
+        while True:
+            read.append(1)
+            yield b"x" * 65536
+
+    answer = _response(200, content_length=content_length)
+    answer.content.iter_chunked = endless
+    session = _make_mock_session()
+    session.post.return_value.__aenter__ = AsyncMock(return_value=answer)
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session):
+        assert await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa") is None
+
+    assert session.post.call_count == 1
+    assert len(read) <= es.MAX_EXECUTOR_ANSWER_BYTES // 65536 + 1
 
 
 @pytest.mark.parametrize(
@@ -232,8 +267,7 @@ async def test_register_pubkey_first_upload_keeps_mains_full_timeout(
         clock[0] += lookup_seconds
         return [test_executor]
 
-    answered = MagicMock(status=200)
-    answered.json = AsyncMock(return_value={"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r"})
+    answered = _response(200, _SSH_ANSWER)
     post_ctx = MagicMock()
     post_ctx.__aenter__ = AsyncMock(return_value=answered)
     post_ctx.__aexit__ = AsyncMock(return_value=None)
@@ -313,8 +347,7 @@ async def test_send_pubkey_does_not_retry_when_the_delay_overran_the_deadline(ex
     async def late_sleep(_seconds):
         clock[0] += 30  # the event loop was busy: the 1 s retry delay ended well after the deadline
 
-    answered = MagicMock(status=200)
-    answered.json = AsyncMock(return_value={"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r"})
+    answered = _response(200, _SSH_ANSWER)
     post_ctx = MagicMock()
     post_ctx.__aenter__ = AsyncMock(side_effect=[asyncio.TimeoutError(), answered])
     post_ctx.__aexit__ = AsyncMock(return_value=None)
