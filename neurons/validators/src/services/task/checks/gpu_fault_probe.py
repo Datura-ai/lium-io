@@ -20,8 +20,7 @@ from .capability import get_filler_only_container
 PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "gpu_fault_probe.py"
 
 
-# read on first use, not at import: an image that ships services/ without miner_jobs/ (Dockerfile.preflight)
-# must still be able to import the checks package
+# read on first use, not at import
 @functools.cache
 def probe_source() -> str:
     return PROBE_SOURCE_PATH.read_text()
