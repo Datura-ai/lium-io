@@ -359,7 +359,20 @@ def test_changes_refuse_a_health_check_they_cannot_carry():
 
 
 def _flatten_script(
-    tmp_path, *, lease="r1", export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=(), sized_mark=""
+    tmp_path,
+    *,
+    lease="r1",
+    export_rc=0,
+    import_rc=0,
+    rm_rc=0,
+    avail=10**12,
+    import_sleep=0,
+    volumes=(),
+    sized_mark="",
+    need_bytes=100,
+    export_bytes=3,
+    export_factor=0,
+    fixed_bytes=0,
 ) -> list[str]:
     """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
@@ -372,14 +385,17 @@ def _flatten_script(
         f"  run) printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 {avail} 1%% /hostfs\\n' ;;\n"
         f'  image) if [ "$2" = ls ]; then cat {tmp_path}/copies 2>/dev/null; else [ -e {tmp_path}/tagged ]; fi ;;\n'
         "  create) echo cid1 ;;\n"
-        f"  export) echo tar; exit {export_rc} ;;\n"
+        f"  export) head -c {export_bytes} /dev/zero; exit {export_rc} ;;\n"
         f"  import) cat >/dev/null; sleep {import_sleep}; echo sha256:new; exit {import_rc} ;;\n"
         f"  rm) exit {rm_rc} ;;\n"
         f"  tag) touch {tmp_path}/tagged ;;\n"
         "esac\n"
     )
     fake.chmod(0o755)
-    script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100, lease, sized_mark)
+    script = _flatten_command(
+        "sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), need_bytes, lease, sized_mark,
+        export_factor=export_factor, fixed_bytes=fixed_bytes,
+    )
     for real, local in (
         ("/usr/bin/docker", fake),
         (FLATTEN_LOCK_PATH, tmp_path / "lock"),
@@ -417,6 +433,31 @@ def test_flatten_script_tags_only_a_complete_copy_and_always_removes_the_contain
     assert sorted(c.split()[0] for c in calls) == sorted(expected_calls)  # export and import run concurrently
     if "rm" in expected_calls:
         assert "rm -fv cid1" in calls  # -v: the container's anonymous volumes go with it
+
+
+@pytest.mark.parametrize(
+    "size, export_bytes, export_rc, expected_rc, expected_calls",
+    [
+        # dense, and snapshots-only (Size ~ its unpacked data): the export matches Size, the copy runs
+        (40, 40, 0, 0, ["image", "image", "info", "run", "create", "export", "export", "import", "rm", "tag"]),
+        (40, 38, 0, 0, ["image", "image", "info", "run", "create", "export", "export", "import", "rm", "tag"]),
+        # sparse: Size counts allocated blocks, the export expands the holes; refused before any import
+        (4, 60, 0, FLATTEN_NO_DISK_EXIT, ["image", "image", "info", "run", "create", "export", "rm"]),
+        # the counting export failed: no copy
+        (40, 40, 1, 98, ["image", "image", "info", "run", "create", "export", "rm"]),
+    ],
+)
+def test_the_containerd_disk_check_budgets_the_bytes_the_export_really_writes(
+    tmp_path, size, export_bytes, export_rc, expected_rc, expected_calls
+):
+    # 100 free, 10 kept: the import writes the export twice, so at most 45 bytes of export fit
+    argv = _flatten_script(
+        tmp_path, avail=100, need_bytes=2 * size + 10, export_bytes=export_bytes, export_rc=export_rc,
+        export_factor=2, fixed_bytes=10,
+    )
+    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == expected_rc
+    assert sorted(c.split()[0] for c in _calls(tmp_path)) == sorted(expected_calls)
+    assert "rm -fv cid1" in _calls(tmp_path)
 
 
 def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(tmp_path):
@@ -673,3 +714,5 @@ async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(d
     await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=79 * 1024**3)
     command = ssh.run.await_args_list[-1].args[0]
     assert f"-ge {copies * 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
+    # containerd also counts the real export bytes (a sparse file reports a small Size); overlay2's Size does not under-count
+    assert ("head -c" in command) == (copies == 2)

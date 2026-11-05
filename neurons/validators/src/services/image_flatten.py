@@ -149,7 +149,15 @@ def _reuse_command(tag: str, lease: str) -> str:
 
 
 def _flatten_command(
-    image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int, lease: str, sized_mark: str = ""
+    image_id: str,
+    tag: str,
+    changes: list[str],
+    volumes: list[str],
+    need_bytes: int,
+    lease: str,
+    sized_mark: str = "",
+    export_factor: int = 0,
+    fixed_bytes: int = 0,
 ) -> str:
     """Under a node-wide lock: reuse a copy another flatten finished meanwhile, refuse a new copy while
     FLATTEN_MAX_LEASES other rentals still wait on theirs, remove every earlier copy
@@ -157,7 +165,9 @@ def _flatten_command(
     disk with copies, and a rental never loses its copy before its create), check the Docker disk
     holds `need_bytes` and no create sized its disk since `sized_mark` (flatten_sized_mark_command), create (never start) a container from the image ID, pipe its export into an
     import, tag the result only when both sides succeeded, and always remove the container and its
-    volumes. Plain sh: no pipefail."""
+    volumes. With `export_factor`, a counting export first refuses when the disk cannot also hold
+    `export_factor` times the bytes the export really produces plus `fixed_bytes`: Size counts allocated
+    blocks, so a sparse file can report far less than the export and the import write. Plain sh: no pipefail."""
     t = FLATTEN_TIMEOUT_SECONDS
     change_args = " ".join(f"--change {shlex.quote(c)}" for c in changes)
     # an empty volume per VOLUME path: create would otherwise copy the image's files there (extra disk)
@@ -189,7 +199,8 @@ def _flatten_command(
         f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
         # the ID, not the tag: a pull may move the tag after inspect and the copy would not match its name
         f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {mounts} {shlex.quote(image_id)}) || exit 97; "
-        'st=$(mktemp); '
+        + (_export_count_check(export_factor, fixed_bytes) if export_factor else "")
+        +         'st=$(mktemp); '
         f'iid=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") '
         f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
         'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; rrc=$?; '
@@ -197,6 +208,20 @@ def _flatten_command(
         f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag, lease)} 2>/dev/null; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
         'else [ -n "$iid" ] && /usr/bin/docker rmi -f "$iid" >/dev/null 2>&1; '
         'echo "flatten failed: export=$erc import=$irc rm=$rrc" >&2; exit 98; fi'
+    )
+
+
+def _export_count_check(factor: int, fixed_bytes: int) -> str:
+    """Count the export, stopping one byte past what the free disk allows; refuse (container removed) past it."""
+    t = FLATTEN_TIMEOUT_SECONDS
+    gone = '/usr/bin/docker rm -fv "$cid" >/dev/null 2>&1'
+    return (
+        f'cap=$(( (avail - {int(fixed_bytes)}) / {int(factor)} )); st=$(mktemp); '
+        f'eb=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") | head -c $((cap + 1)) | wc -c); '
+        'erc=$(cat "$st"); rm -f "$st"; '
+        # a wc output test cannot read refuses too
+        f'[ "$eb" -le "$cap" ] 2>/dev/null || {{ {gone}; echo "flatten refused: the export is larger than the free disk allows" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
+        f'[ "$erc" = 0 ] || {{ {gone}; echo "flatten failed: counting export=$erc" >&2; exit 98; }}; '
     )
 
 
@@ -446,14 +471,19 @@ async def flatten_image_on_host(
     if existing.exit_status == 0:
         return tag
     config = info.get("Config") or {}
+    driver_name = str(driver.stdout).strip()
+    fixed = FLATTEN_DISK_MARGIN_BYTES + reserved_bytes
     command = _flatten_command(
         info["Id"],
         tag,
         image_flatten_changes(config),
         sorted(config.get("Volumes") or ()),
-        _copy_bytes(int(info.get("Size") or 0), str(driver.stdout).strip()) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
+        _copy_bytes(int(info.get("Size") or 0), driver_name) + fixed,
         lease,
         sized_mark,
+        # overlay2's Size sums apparent file sizes (sparse files at full length), so only containerd needs the count
+        export_factor=0 if driver_name == "overlay2" else 2,
+        fixed_bytes=fixed,
     )
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
