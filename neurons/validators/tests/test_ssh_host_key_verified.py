@@ -24,7 +24,7 @@ class _Shell:
         return False
 
 
-def _service(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK") -> TaskService:
+def _service(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK", events: list | None = None) -> TaskService:
     service = TaskService.__new__(TaskService)
     service.redis_service = MagicMock()
     service.ssh_service = MagicMock()
@@ -37,14 +37,14 @@ def _service(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK") -> 
         event="Validation finished", reason=reason, severity="info", impact="none"
     )
     pipeline = MagicMock()
-    pipeline.run = AsyncMock(return_value=(True, [event], MagicMock(success=True)))
+    pipeline.run = AsyncMock(return_value=(True, events or [event], MagicMock(success=True)))
     service.pipeline_factory = MagicMock()
     service.pipeline_factory.build_context = AsyncMock(return_value=MagicMock(verified=None))
     service.pipeline_factory.build_pipeline = MagicMock(return_value=pipeline)
     return service
 
 
-async def _run(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK") -> JobResult:
+async def _run(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK", events: list | None = None) -> JobResult:
     executor = ExecutorSSHInfo(
         uuid="node-9", address="10.0.0.5", port=8080, ssh_username="root", ssh_port=2200,
         python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=HOST_KEY,
@@ -65,7 +65,7 @@ async def _run(known_hosts: asyncssh.SSHKnownHosts | None, reason: str = "OK") -
         patch("services.task.service.settings") as settings,
     ):
         settings.DRY_RUN = True
-        return await _service(known_hosts, reason).create_task(
+        return await _service(known_hosts, reason, events).create_task(
             miner_info=miner, executor_info=executor, keypair=MagicMock(ss58_address="5Val"),
             private_key="key", public_key="pub", encrypted_files=MagicMock(),
             rented_data=MagicMock(), default_docker_image_digests={},
@@ -110,5 +110,45 @@ def test_container_start_skipped_names_why_no_test_container_started() -> None:
     image = event(Msg.SKIPPED, {"reason": "default renter image is not pulled on the node"})
     assert container_start_skipped([image]) == "default renter image is not pulled on the node"
     carried = event(Msg.PROBE_FAILED, {"no_verdict_this_cycle": "skipped: rented"})
-    assert container_start_skipped([carried]) == "skipped: rented"
+    assert container_start_skipped([carried]) == "rented"
     assert container_start_skipped([event(Msg.PROBE_FAILED, {"failed_step": "container_start"})]) is None
+
+
+def test_our_side_skip_reasons_are_classified_explicitly() -> None:
+    """Our own gap (no default image for the GPU/driver, an unreadable input, the cycle budget) must not hold a
+    start pause; a provider-side reason (image not pulled) or a rental keeps it."""
+    from services.task.checks.rental_probe import is_our_side_skip
+
+    for ours in (
+        "no default renter image for this GPU and driver",
+        "could not read the node's image list",
+        "interval state unreadable",
+        "too little cycle time left",
+        "too little cycle time left for the create",
+        "validator has no GPU UUIDs for this executor",
+        "could not confirm the node is idle",
+        "the idleness re-read overran its budget",
+    ):
+        assert is_our_side_skip(ours), ours
+    for theirs in ("default renter image is not pulled on the node", "rented", "could not take the node's create lock"):
+        assert not is_our_side_skip(theirs), theirs
+    assert not is_our_side_skip(None)
+
+
+@pytest.mark.asyncio
+async def test_an_our_side_skip_sends_no_container_start_verdict() -> None:
+    """An our-side skip sends container_start_ok None (the backend's pre-check rules: a clean pass lifts the pause);
+    a provider-side skip still sends False with its reason."""
+    from services.task.messages import RentalProbeMessages as Msg
+
+    def run(reason):
+        event = build_msg(event=Msg.INCONCLUSIVE.event, reason=Msg.INCONCLUSIVE.reason, severity="info",
+                          impact="none", what={"reason": reason})
+        return _run(None, events=[event])
+
+    ours = await run("no default renter image for this GPU and driver")
+    assert (ours.container_start_ok, ours.container_start_skipped) == (
+        None, "no default renter image for this GPU and driver"
+    )
+    theirs = await run("default renter image is not pulled on the node")
+    assert theirs.container_start_ok is False

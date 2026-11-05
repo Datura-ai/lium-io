@@ -29,6 +29,7 @@ from .availability import (
     build_ssh_unreachable_event,
     failed_check_event,
 )
+from .checks.rental_probe import is_our_side_skip
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import REASON_CODE_DOCS_URL, RentalProbeMessages, TenantEnforcementMessages
 from .models import JobResult, ValidationEvent, build_msg
@@ -254,6 +255,9 @@ class TaskService:
                     event.reason_code == RentalProbeMessages.PROBE_OK.reason for event in events
                 )
                 result.container_start_skipped = container_start_skipped(events)
+                if is_our_side_skip(result.container_start_skipped):
+                    # the validator's own gap is no verdict on the node: no start result, so it cannot hold a pause
+                    result.container_start_ok = None
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
                 # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
@@ -358,5 +362,6 @@ def container_start_skipped(events: list) -> str | None:
         ):
             return str(what.get("reason") or "") or None
         if event.reason_code == RentalProbeMessages.PROBE_FAILED.reason and what.get("no_verdict_this_cycle"):
-            return str(what["no_verdict_this_cycle"])
+            # carried as "skipped: <reason>" / "inconclusive: <reason>"
+            return str(what["no_verdict_this_cycle"]).split(": ", 1)[-1]
     return None

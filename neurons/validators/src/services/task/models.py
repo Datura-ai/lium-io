@@ -98,7 +98,8 @@ class JobResult(BaseModel):
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False
     # DAH-5672: this cycle's rental probe started its container and passed (RENTAL_PROBE_OK)
-    container_start_ok: bool = False
+    # None when the probe gave no verdict for a reason of the validator's own (is_our_side_skip)
+    container_start_ok: bool | None = False
     # why this cycle's probe started no container (e.g. the default renter image is not pulled); None when it ran
     container_start_skipped: str | None = None
 

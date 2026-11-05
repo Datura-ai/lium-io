@@ -557,6 +557,25 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
     return None, {}
 
 
+# Skip/inconclusive reasons that are the validator's own (its inputs, reads or cycle budget), not the node's: a node
+# paused for a failed start must not stay paused on them, so the report sends no container-start verdict instead.
+# Any other reason (image not pulled, rented, a renter's create in flight) keeps the pause.
+OUR_SIDE_SKIP_REASONS = frozenset(
+    {
+        "no default renter image for this GPU and driver",
+        "could not read the node's image list",
+        "interval state unreadable",
+        "could not confirm the node is idle",
+        "the idleness re-read overran its budget",
+    }
+)
+OUR_SIDE_SKIP_PREFIXES = ("too little cycle time left", "validator has no ")
+
+
+def is_our_side_skip(reason: str | None) -> bool:
+    return bool(reason) and (reason in OUR_SIDE_SKIP_REASONS or reason.startswith(OUR_SIDE_SKIP_PREFIXES))
+
+
 def _start_paused(ctx: Context) -> bool:
     rented_data = ctx.state.rented_data
     paused = rented_data.container_start_paused_executor_ids if rented_data else []
