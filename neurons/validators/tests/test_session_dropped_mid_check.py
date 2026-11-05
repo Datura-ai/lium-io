@@ -7,19 +7,24 @@ host state behind keeps today's transport failure, which the bounded image-rollo
 """
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import asyncssh
 import pytest
 from services.task.checks.gpu_fault_probe import GpuFaultProbeCheck
 from services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
+from services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
+from services.task.checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
+from services.task.checks.rented_throughput import RentedThroughputCheck
+from services.task.checks.verifyx import VerifyXCheck
 from services.task.checks.inspector import InspectorRentedCheck
 from services.task.checks.port_connectivity import PortConnectivityCheck
 from services.task.checks.rental_probe import RentalProbeCheck
 from services.task.checks.rented_gpu_drop import RentedGpuDropCheck
 from services.task.checks.rented_machine import TenantEnforcementCheck
-from services.task.models import ValidationEvent
+from services.task.availability import REASONS_THAT_HIDE_AT_ONCE, failed_check_event
+from services.task.models import AVAILABILITY_CATEGORY, ValidationEvent
 from services.task.pipeline import CheckResult, Context, Pipeline
 
 from tests.helpers import make_context
@@ -174,6 +179,10 @@ def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
         RentedGpuDropCheck,
         GpuFaultProbeCheck,
         InspectorRentedCheck,
+        MachineSpecScrapeCheck,
+        VerifyXCheck,
+        PostRentalGpuRecheckCheck,
+        RentedThroughputCheck,
     ):
         assert check.replays_after_session_drop is False
 
@@ -209,3 +218,39 @@ async def test_a_check_that_already_reports_the_dead_session_keeps_its_own_event
     )
 
     assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE" and not calls
+
+
+@pytest.mark.parametrize("dropped", [True, False])
+@pytest.mark.parametrize("reason", sorted(REASONS_THAT_HIDE_AT_ONCE))
+async def test_a_fault_that_hides_the_node_stays_the_verdict_when_the_session_drops(reason, dropped):
+    # review r4483525738: the hide is read off the run's last event, so the transport failure must not follow it
+    class _ReadsAFault:
+        check_id = "gpu.validate.nvlink_fault"
+        fatal = True
+        replays_after_session_drop = False
+
+        async def run(self, ctx: Context) -> CheckResult:
+            ctx.ssh.is_closed.return_value = dropped
+            return CheckResult(passed=False, event=_event(reason), fatal=True)
+
+    ok, events, _ = await Pipeline([_ReadsAFault()], _NullSink(), reconnect=AsyncMock()).run(_ctx(_session()))
+
+    assert not ok and [e.reason_code for e in events] == [reason]
+    assert failed_check_event(ok, events).what_we_saw["failed_reason"] == reason
+
+
+async def test_an_availability_finding_stays_the_verdict_when_the_session_drops():
+    # review r4483525753: a GPU loss read before the drop ends the run as itself, so no rollout window withholds it
+    class _LosesAGpu:
+        check_id = "gpu.validate.loss_hold"
+        fatal = True
+        replays_after_session_drop = False
+
+        async def run(self, ctx: Context) -> CheckResult:
+            ctx.ssh.is_closed.return_value = True
+            event = _event("GPU_LOST").model_copy(update={"category": AVAILABILITY_CATEGORY})
+            return CheckResult(passed=False, event=event, fatal=True)
+
+    ok, events, _ = await Pipeline([_LosesAGpu()], _NullSink(), reconnect=AsyncMock()).run(_ctx(_session()))
+
+    assert not ok and [e.reason_code for e in events] == ["GPU_LOST"]

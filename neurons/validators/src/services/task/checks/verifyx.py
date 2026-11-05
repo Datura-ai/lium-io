@@ -74,6 +74,8 @@ class VerifyXCheck:
     """
 
     check_id = "gpu.validate.verifyx"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     def _extract_errors(self, result) -> str | list | None:

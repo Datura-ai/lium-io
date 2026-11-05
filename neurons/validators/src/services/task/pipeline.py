@@ -26,6 +26,7 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
+from .availability import REASONS_THAT_HIDE_AT_ONCE
 from .messages import RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
@@ -579,6 +580,12 @@ def _not_terminal(ran: _RanCheck) -> _RanCheck:
     return replace(ran, result=ran.result.model_copy(update={"fatal": False, "halt": False}))
 
 
+def _a_finding(ran: _RanCheck) -> bool:
+    # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event
+    event = ran.result.event
+    return event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE
+
+
 def _session_lost(ran: list[_RanCheck], ctx: Context) -> _RanCheck:
     failed = next(r for r in ran if not r.result.passed)
     event = render_message(
@@ -721,9 +728,17 @@ class Pipeline:
             and not any(r.result.event.reason_code in _TRANSPORT_REASONS for r in ran)
             and await _session_dropped(ctx.ssh)
         ):
-            # a failure the check returned on a session that died is the transport's, not the node's: the run ends
-            # on the dead session, and what the check finished (a fault it read, its updates) stays in the result
-            ran = [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx)]
+            findings = [r for r in ran if not r.result.passed and _a_finding(r)]
+            if findings:
+                # a fault the check finished reading ends the run as itself: the hide, its publication and the
+                # rollout window all read the last event
+                fault = findings[-1]
+                fatal = replace(fault, result=fault.result.model_copy(update={"fatal": True}))
+                ran = [*(_not_terminal(r) for r in ran if r is not fault), fatal]
+            else:
+                # any other failure the check returned on a session that died is the transport's, not the node's:
+                # the run ends on the dead session, and what the check finished (its updates) stays in the result
+                ran = [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx)]
         if error is not None:
             raise error
         return ran, ctx

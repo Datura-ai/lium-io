@@ -301,7 +301,8 @@ async def test_a_recovery_action_still_required_cycles_in_a_row_fails_the_rented
         # the check is not replayed: a cycle whose session drops counts once
         (0, False, 1, Msg.RESET_ADVISED.reason),
         (1, False, 2, Msg.RESET_ADVISED.reason),
-        (2, False, 3, "transport failure"),
+        # the fault it read stands as the run's verdict on the dead session
+        (2, False, 3, Msg.FAILED.reason),
         # were it replayed, the one cycle would count twice and fail the node a cycle early
         (0, True, 2, Msg.RESET_ADVISED.reason),
         (1, True, 3, Msg.FAILED.reason),
@@ -338,11 +339,7 @@ async def test_a_dropped_session_counts_a_reset_required_cycle_once(
 
     run = Pipeline([GpuMemoryHealthCheck()], _Sink(), reconnect=reconnect).run(ctx)
     _, events, _ = await run
-    if outcome == "transport failure":
-        # the fault it read is kept; the run ends on the dead session
-        assert [e.reason_code for e in events] == [Msg.FAILED.reason, "EXECUTOR_TRANSPORT_UNREACHABLE"]
-    else:
-        assert events[-1].reason_code == outcome
+    assert events[-1].reason_code == outcome
     assert gpu_memory_health._reset_required_streak[key] == streak_after
 
 
@@ -370,8 +367,8 @@ async def test_a_fault_read_before_the_session_drops_in_its_marker_write_is_kept
     ok, events, last = await Pipeline([GpuMemoryHealthCheck()], _Sink(), reconnect=reconnect).run(ctx)
 
     assert not ok and not reconnect.called
-    assert [e.reason_code for e in events] == [Msg.FAILED.reason, "EXECUTOR_TRANSPORT_UNREACHABLE"]
-    assert events[-1].check_id == GpuMemoryHealthCheck.check_id
+    # the fault stays the last event: the availability entry and the rollout window both read that one
+    assert [e.reason_code for e in events] == [Msg.FAILED.reason]
     # the finding and its verification reset are published, not dropped with the run
     [entry] = availability_errors(events)
     assert entry.reason_code == AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED
