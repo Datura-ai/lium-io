@@ -220,6 +220,32 @@ async def test_send_pubkey_reads_no_more_than_the_answer_limit(executor_service,
     assert len(read) <= es.MAX_EXECUTOR_ANSWER_BYTES // 65536 + 1
 
 
+@pytest.mark.parametrize("content_length", [None, es.MAX_POD_LOGS_ANSWER_BYTES + 1])
+@pytest.mark.asyncio
+async def test_get_pod_logs_reads_no_more_than_its_limit(executor_service, test_executor, content_length):
+    """The /pod_logs answer is bounded too, at its own larger limit; a normal answer still parses."""
+    read = []
+
+    async def endless(_size):
+        while True:
+            read.append(1)
+            yield b"x" * 65536
+
+    answer = _response(200, content_length=content_length)
+    answer.content.iter_chunked = endless
+    session = _make_mock_session()
+    session.post.return_value.__aenter__ = AsyncMock(return_value=answer)
+    executor_service.get_executors_for_validator = AsyncMock(return_value=[test_executor])
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session):
+        with pytest.raises(es.ExecutorAnswerTooLarge):
+            await executor_service.get_pod_logs("v", "m", str(test_executor.uuid), "c")
+        assert len(read) <= es.MAX_POD_LOGS_ANSWER_BYTES // 65536 + 1
+
+        session.post.return_value.__aenter__ = AsyncMock(return_value=_response(200, b"[]"))
+        assert await executor_service.get_pod_logs("v", "m", str(test_executor.uuid), "c") == []
+
+
 @pytest.mark.parametrize(
     "is_rental_request, hook, lookup_seconds, expected_left",
     [

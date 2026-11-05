@@ -114,6 +114,8 @@ MAX_REQUEST_PICKUP_LAG_SECONDS = 10.0
 # an executor's SSH-key answer is ~2 KB (more with attestation evidence); the miner serves every
 # provider from one process, so it reads no more than this from any executor
 MAX_EXECUTOR_ANSWER_BYTES = 4 * 1024 * 1024
+# /pod_logs returns one container's events from the executor's log file, which it keeps under 50 MiB
+MAX_POD_LOGS_ANSWER_BYTES = 64 * 1024 * 1024
 
 
 class ExecutorAnswerTooLarge(Exception):
@@ -636,6 +638,6 @@ class ExecutorService:
                 if response.status != 200:
                     raise Exception('[get_pod_logs] Error: API request failed')
 
-                response_obj: list[dict] = await response.json()
+                response_obj: list[dict] = json.loads(await _read_capped(response, MAX_POD_LOGS_ANSWER_BYTES))
                 pod_logs = [PodLog.parse_obj(item) for item in response_obj]
                 return pod_logs
