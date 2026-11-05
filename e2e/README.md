@@ -9,7 +9,8 @@ throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else i
 
 CI runs it on every approved PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
 **`e2e-gate`**, routed by `.github/actions/changed-packages`; it starts with the approving review and reruns on each
-push after it); a PR that touches none of those, or only a neuron's own `tests/`, skips it, and
+push after it; with the repository variable `E2E_IN_MERGE_QUEUE` set to `"true"` once the merge queue is on, it runs once, in
+the queue, on the tree that lands); a PR that touches none of those, or only a neuron's own `tests/`, skips it, and
 `tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
 stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
 container on the provider's host.
