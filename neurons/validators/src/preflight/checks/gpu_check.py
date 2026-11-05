@@ -88,15 +88,17 @@ class GPUCheck(PreflightCheck):
                 ]
 
                 # A card driving a display with no compute processes is idle: its memory
-                # utilization is the screen refresh, not a workload (ticket-0996).
-                display_only = detail.get("display_active") and detail.get("compute_processes") == 0
+                # utilization is the screen refresh, not a workload (ticket-0996). The process
+                # count is read with each sample, so a process starting mid-window is seen.
+                procs = detail.get("compute_process_samples") or [None] * len(samples)
+                display_active = detail.get("display_active")
 
                 # Idle only if one whole sample passes; independent minima would let
                 # alternating busy reads (6,0),(0,6) pass.
                 if not any(
                     gpu_util < gpu_utilization_limit
-                    and (mem_util <= gpu_memory_utilization_limit or display_only)
-                    for gpu_util, mem_util in samples
+                    and (mem_util <= gpu_memory_utilization_limit or (display_active and n_procs == 0))
+                    for (gpu_util, mem_util), n_procs in zip(samples, procs)
                 ):
                     high_util_gpus.append({"gpu_index": idx, "samples": samples})
 

@@ -53,19 +53,28 @@ def _sample_utilization(pynvml, gpu_details: list, samples: int = UTILIZATION_SA
     The first read right after nvmlInit in a fresh container can report a spike on an idle
     GPU (driver/context init when persistence mode is off), so a single sample refused idle
     hosts (ticket-0996, RTX 3090). Reads stay paired: the check needs one whole idle sample.
-    A failed read counts as 0, as before.
+    A failed utilization read counts as 0, as before; a failed process-list read
+    keeps the strict memory check for that sample.
     """
     for detail in gpu_details:
         detail["utilization_samples"] = []
+        detail["compute_process_samples"] = []
     for n in range(samples):
         if n:
             time.sleep(interval_s)
         for detail in gpu_details:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(detail["index"])
             try:
-                rates = pynvml.nvmlDeviceGetUtilizationRates(pynvml.nvmlDeviceGetHandleByIndex(detail["index"]))
+                rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
                 detail["utilization_samples"].append((rates.gpu, rates.memory))
             except Exception:
                 detail["utilization_samples"].append((0, 0))
+            # Read after the utilization read: the process list changes over time, so a compute
+            # process starting mid-window must void the display exemption for that sample.
+            try:
+                detail["compute_process_samples"].append(len(pynvml.nvmlDeviceGetComputeRunningProcesses(handle)))
+            except Exception:
+                detail["compute_process_samples"].append(None)
     for detail in gpu_details:
         logger.debug(f"GPU {detail['index']} utilization samples (gpu, memory): {detail['utilization_samples']}")
 
@@ -128,10 +137,6 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
                     display_active = pynvml.nvmlDeviceGetDisplayActive(handle) == 1
                 except Exception:
                     display_active = False
-                try:
-                    compute_processes = len(pynvml.nvmlDeviceGetComputeRunningProcesses(handle))
-                except Exception:
-                    compute_processes = None
 
                 gpu_details.append({
                     "index": i,
@@ -141,7 +146,6 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
                     "memory_utilization": 0,
                     "memory_total_mb": memory_total,
                     "display_active": display_active,
-                    "compute_processes": compute_processes,
                 })
 
         if include_utilization:

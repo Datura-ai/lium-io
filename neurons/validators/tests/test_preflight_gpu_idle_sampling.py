@@ -65,7 +65,9 @@ def test_unreadable_utilization_counts_as_idle():
 def _run_display(display_active, compute_processes, reads):
     nvml = _fake_nvml([reads])
     nvml.nvmlDeviceGetDisplayActive = lambda h: 1 if display_active else 0
-    nvml.nvmlDeviceGetComputeRunningProcesses = lambda h: [object()] * compute_processes
+    # an int is a constant process count; a list is the count seen at each sample
+    counts = iter(compute_processes if isinstance(compute_processes, list) else [compute_processes] * len(reads))
+    nvml.nvmlDeviceGetComputeRunningProcesses = lambda h: [object()] * next(counts)
     with patch.dict(sys.modules, {"pynvml": nvml}), patch.object(utils.time, "sleep"):
         return asyncio.run(GPUCheck().run({"gpu": {
             "max_gpu_count": 8, "gpu_utilization_limit": 5, "gpu_memory_utilization_limit": 5,
@@ -81,6 +83,12 @@ def test_idle_card_driving_a_monitor_passes():
 def test_display_card_with_compute_process_still_judged_on_memory():
     result = _run_display(True, 1, [(1, 13), (0, 6), (1, 9), (0, 7), (1, 11)])
     assert result.status == CheckStatus.FAILED
+
+
+def test_display_card_compute_process_starting_mid_window_fails():
+    # startup spike, then a compute process starts and memory runs high: no sample is idle
+    result = _run_display(True, [0, 1, 1, 1, 1], [(100, 40), (1, 99), (1, 99), (1, 99), (1, 99)])
+    assert result.status == CheckStatus.FAILED, result.message
 
 
 def test_display_card_busy_gpu_still_fails():
