@@ -480,11 +480,13 @@ def _one_eighth_rental(monkeypatch, docker_service, volume_gb: int, storage_gb: 
     return rental
 
 
-# the two 4 Nov creates: free and needed GiB from the logs; the Dolphin set's on-disk size there was not
+# the 4 Nov creates: free and needed GiB from the logs; the Dolphin set's on-disk size there was not
 # logged, so each wipe frees half the gap plus a little (illustrative)
 _DOLPHIN_CASES = [
     pytest.param("filler_killed_a", 271, 135, 587 * 10**9, 2466.1, id="14:51Z"),
     pytest.param("filler_killed_b", 358, 179, int(1596.3 * 1024**3), 2324.0, id="18:37Z"),
+    # 1/8 slice, 79 + 39 GB ordered beside 540 GB of pod volumes: needs 461.1 GiB free, 412.9 free
+    pytest.param("filler_killed_c", 79, 39, 540 * 10**9, 412.9, id="20:04Z"),
 ]
 
 
