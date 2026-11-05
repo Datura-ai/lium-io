@@ -243,18 +243,25 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int
 FLATTEN_BUDGET_MIN_LAYERS = 30
 
 
+def _copy_bytes(size: int, driver: str) -> int:
+    """The disk a new one-layer copy of an image of `size` writes on the storage `driver`, before the margin. On the
+    containerd store (any driver but overlay2) the import stores a compressed blob and unpacks a snapshot, so twice
+    Size: a snapshots-only image (compressed blobs gone) passes the store checks with Size ~ its unpacked data."""
+    return size if driver == "overlay2" else 2 * size
+
+
 async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: str) -> int | None:
-    """The disk a one-layer copy of the local `image` would take (its size plus FLATTEN_DISK_MARGIN_BYTES), for
+    """The disk a one-layer copy of the local `image` would take (`_copy_bytes` plus FLATTEN_DISK_MARGIN_BYTES), for
     the sizing to keep free; None when the image has too few layers to need one, its copy is already on the
     node (a flatten reuses it, writing nothing), or it cannot be read."""
     try:
         result = await ssh_client.run(
             "/usr/bin/docker image inspect --format '{{.Size}} {{len .RootFS.Layers}} {{.Id}}' "
-            f"{shlex.quote(image)}",
+            f"{shlex.quote(image)} && /usr/bin/docker info --format '{{{{.Driver}}}}'",
             check=True,
             timeout=_DOCKER_READ_TIMEOUT_SECONDS,
         )
-        size_word, layers_word, image_id = str(result.stdout).split()
+        size_word, layers_word, image_id, driver = str(result.stdout).split()
         size, layers = int(size_word), int(layers_word)
     except Exception:
         return None
@@ -270,7 +277,7 @@ async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: st
     except Exception:
         copy = None  # unknown: keep the room for a new copy
     # shortcut: the copy may be removed before the flatten reuses it; the flatten's own disk check then refuses
-    return None if copy is not None and copy.exit_status == 0 else size + FLATTEN_DISK_MARGIN_BYTES
+    return None if copy is not None and copy.exit_status == 0 else _copy_bytes(size, driver) + FLATTEN_DISK_MARGIN_BYTES
 
 
 _CONTAINERD_DEFAULT_ROOT = "/var/lib/containerd"
@@ -444,7 +451,7 @@ async def flatten_image_on_host(
         tag,
         image_flatten_changes(config),
         sorted(config.get("Volumes") or ()),
-        int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
+        _copy_bytes(int(info.get("Size") or 0), str(driver.stdout).strip()) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
         lease,
         sized_mark,
     )

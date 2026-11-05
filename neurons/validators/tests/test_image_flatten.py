@@ -632,17 +632,24 @@ def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_oth
     assert subprocess.run(_flatten_script(tmp_path, sized_mark=mark.stdout.strip()), env=env).returncode == 0
 
 
+_GIB24 = 24 * 1024**3
+_MANY = image_flatten.FLATTEN_BUDGET_MIN_LAYERS
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "stdout, copy_exit, expected",
     [
         # uncached many-layer image: the sizing keeps room for the new copy
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", 1, 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
-        # its copy is already on the node: the flatten reuses it, so no extra room is kept
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", 0, None),
+        (f"{_GIB24} {_MANY} sha256:abc\noverlay2\n", 1, _GIB24 + FLATTEN_DISK_MARGIN_BYTES),
+        # containerd store, complete or snapshots-only image: the import writes a compressed blob and unpacks a snapshot
+        (f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n", 1, 2 * _GIB24 + FLATTEN_DISK_MARGIN_BYTES),
+        # its copy is already on the node: the flatten reuses it, so no extra room is kept, on either store
+        (f"{_GIB24} {_MANY} sha256:abc\noverlay2\n", 0, None),
+        (f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n", 0, None),
         # the copy cannot be looked up: keep the room
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", RuntimeError("ssh"), 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS - 1} sha256:abc\n", 1, None),  # starts as is: no copy
+        (f"{_GIB24} {_MANY} sha256:abc\noverlay2\n", RuntimeError("ssh"), _GIB24 + FLATTEN_DISK_MARGIN_BYTES),
+        (f"{_GIB24} {_MANY - 1} sha256:abc\noverlay2\n", 1, None),  # starts as is: no copy
         ("garbage\n", 1, None),
     ],
 )
@@ -656,3 +663,13 @@ async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, cop
         return Mock(exit_status=copy_exit)
 
     assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver, copies", [("overlay2", 1), ("overlayfs", 2)])
+async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(driver, copies):
+    # a snapshots-only image (compressed blobs gone) still has Size ~ its unpacked data; the import writes both again
+    ssh = _ssh(exists=False, driver=driver)
+    await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=79 * 1024**3)
+    command = ssh.run.await_args_list[-1].args[0]
+    assert f"-ge {copies * 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
