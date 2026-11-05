@@ -9,12 +9,15 @@ import pytest
 from helpers import FakeRedis as SharedFakeRedis
 from neurons.validators.src.services.gpu_power_limit import (
     POWER_STATE_CMD,
+    GpuPowerCapResult,
     GpuPowerRestoreRecord,
     GpuPowerRestoreStateError,
     _pod_index_key,
     _restore_key,
+    apply_filler_gpu_power_limits,
     restore_filler_pod_gpu_power_limits,
 )
+from payload_models.payloads import GpuPowerLimit
 
 
 def _record(gpu_uuid: str, watts: int, executor_id: str = "executor-1") -> str:
@@ -497,3 +500,37 @@ async def test_repeated_partial_reads_keep_failing_the_create_until_a_real_readi
     await _rental_start(monkeypatch, redis, _power(350, final_watts))
     assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": kept}
     assert _ratio(redis, "GPU-0")["ratio"] == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (None, GpuPowerCapResult.APPLIED),
+        ("nonzero", GpuPowerCapResult.HOST_REFUSED),
+        ("not_stuck", GpuPowerCapResult.HOST_REFUSED),
+        ("timeout", GpuPowerCapResult.FAILED),
+        ("redis", GpuPowerCapResult.FAILED),
+    ],
+)
+async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
+    # Arrange: one GPU to cap at 200 W; the host's -pl fails or does not stick, or our SSH or Redis fails.
+    redis = FakeRedis()
+    if failure == "redis":
+        redis.set = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout=STATE_CSV)
+        if " -pl 200" in command:
+            if failure == "timeout":
+                raise TimeoutError("hung")
+            return FakeRun(exit_status=1 if failure == "nonzero" else 0)
+        return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    # Act / Assert: only the host's own refusal reads HOST_REFUSED.
+    result = await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=200)], redis, POD_ID, "executor-1"
+    )
+    assert result is expected

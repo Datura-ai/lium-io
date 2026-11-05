@@ -230,6 +230,7 @@ class PortConnectivityCheck:
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
             externally_unreachable=result.status == "externally_unreachable",
+            host_runtime_fault=result.host_runtime_fault,
             external_probe_blocked=result.external_probe == "blocked",
         )
 

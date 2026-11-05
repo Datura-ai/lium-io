@@ -28,7 +28,7 @@ unloads once the GPU goes idle and silently reverts ``-pl`` — nvidia-smi still
 So each set first enables persistence mode (``-pm 1``, best-effort: keeps the driver loaded so the
 limit survives) and then READS BACK ``power.limit``; a mismatch counts as a failed set. The readback
 is the hard gate — a cap that cannot be observed on the GPU does not exist.
-**Apply is fail-closed for the filler**: ``apply_filler_gpu_power_limits`` returns ``False`` if the
+**Apply is fail-closed for the filler**: ``apply_filler_gpu_power_limits`` returns anything but ``APPLIED`` if the
 cap could not be fully applied, after undoing whatever it already capped or stored; the caller then
 REFUSES to start the PEARL filler (running the miner uncapped defeats the whole point).
 **Restore stays best-effort**: teardown must never be blocked by a power-limit hiccup; a record
@@ -48,6 +48,7 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, TypeVar
 
 import asyncssh
@@ -236,6 +237,18 @@ class PowerLimitSetOutcome:
 
     failure: str | None
     persistence_enabled: bool | None
+    # The host's nvidia-smi ran and refused the limit, or the limit did not stick: the node's fault, not ours.
+    host_refused: bool = False
+
+
+class GpuPowerCapResult(StrEnum):
+    """What ``apply_filler_gpu_power_limits`` did; anything but APPLIED means do not start the filler."""
+
+    APPLIED = "applied"
+    # The host refused the cap (``PowerLimitSetOutcome.host_refused``).
+    HOST_REFUSED = "host_refused"
+    # Our own side failed (Redis, SSH, the state query, a GPU missing from it): not the node's fault.
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -417,6 +430,7 @@ async def _set_power_limit(
         return PowerLimitSetOutcome(
             failure=f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}",
             persistence_enabled=None,
+            host_refused=True,
         )
     readback = await _read_back_power_state(ssh, uuid)
     if readback.watts is None:
@@ -431,6 +445,7 @@ async def _set_power_limit(
                 f"readback {readback.watts}W != target {watts}W (persistence mode unavailable?)"
             ),
             persistence_enabled=readback.persistence_enabled,
+            host_refused=True,
         )
     return PowerLimitSetOutcome(failure=None, persistence_enabled=readback.persistence_enabled)
 
@@ -1287,16 +1302,17 @@ async def apply_filler_gpu_power_limits(
     pod_id: str,
     executor_id: str,
     log_extra: dict[str, object] | None = None,
-) -> bool:
+) -> GpuPowerCapResult:
     """Record each GPU's pre-cap limit (frozen), then cap it at the target watts (clamped to hw [min, max]).
 
-    Fail-closed: returns True only when EVERY requested GPU was capped; on failure any partial work
-    (records, pod index, already-capped GPUs) is undone first. False means the caller must NOT start
-    the filler. Every failure path logs an error so it is diagnosable/alertable — no silent skips.
+    Fail-closed: returns APPLIED only when EVERY requested GPU was capped; on failure any partial work
+    (records, pod index, already-capped GPUs) is undone first. Anything else means the caller must NOT
+    start the filler: HOST_REFUSED when the host refused a GPU's cap, FAILED when our own side failed.
+    Every failure path logs an error so it is diagnosable/alertable — no silent skips.
     """
     planned: PlannedGpuCaps | None = await _plan_gpu_caps(ssh, gpu_power_limits, log_extra)
     if planned is None:
-        return False
+        return GpuPowerCapResult.FAILED
     target_uuids = [target.gpu_uuid for target in gpu_power_limits]
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
     for target in gpu_power_limits:
@@ -1306,14 +1322,15 @@ async def apply_filler_gpu_power_limits(
         )
         if not restore_record_stored:
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
-            return False
+            return GpuPowerCapResult.FAILED
     try:
         await redis.set(_pod_index_key(pod_id), json.dumps(target_uuids))
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: could not persist pod index for {pod_id}: {exc}", {}, log_extra)
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
-        return False
+        return GpuPowerCapResult.FAILED
     all_set = True
+    host_refused = False
     gpu_uuids_capped_with_persistence: list[str] = []
     for target in gpu_power_limits:
         state = planned.state_by_uuid[target.gpu_uuid]
@@ -1329,11 +1346,12 @@ async def apply_filler_gpu_power_limits(
         )
         if cap_outcome.failure is not None:
             all_set = False
+            host_refused = host_refused or cap_outcome.host_refused
         elif cap_outcome.persistence_enabled:
             gpu_uuids_capped_with_persistence.append(target.gpu_uuid)
     if not all_set:
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
-        return False
+        return GpuPowerCapResult.HOST_REFUSED if host_refused else GpuPowerCapResult.FAILED
     # Only a cap that landed AND holds is attributable to the host later. Without persistence
     # mode the driver unloads on an idle GPU and the stock limit comes back on its own
     # (DAH-2702), which at teardown is indistinguishable from a provider raising it — so those
@@ -1346,4 +1364,4 @@ async def apply_filler_gpu_power_limits(
             CappingJob(executor_id=executor_id, pod_id=pod_id),
             log_extra,
         )
-    return True
+    return GpuPowerCapResult.APPLIED
