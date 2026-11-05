@@ -291,7 +291,7 @@ def _tail(text: str | None) -> str:
     return (text or "").strip()[-_DETAIL_TAIL_CHARS:]
 
 
-def _query_refused(result: SSHCommandResult, detail: str) -> GpuResetRefused:
+def _refusal_for_failed_query(result: SSHCommandResult, detail: str) -> GpuResetRefused:
     """A refused nvidia-smi query; one that timed out is a hung GPU, not a node without GPUs (DAH-5736)."""
     if result.error_type == "timeout":
         return GpuResetRefused(GpuResetErrorCode.GpuHung, f"nvidia-smi did not answer in {_QUERY_TIMEOUT_SECONDS} s")
@@ -378,7 +378,7 @@ async def _precheck(
     host_gpus_result = await _run(runner, HOST_GPUS_COMMAND)
     host_gpus = parse_host_gpus(host_gpus_result.stdout or "")
     if host_gpus_result.exit_code != 0 or not host_gpus:
-        raise _query_refused(host_gpus_result, "nvidia-smi listed no GPU on the host")
+        raise _refusal_for_failed_query(host_gpus_result, "nvidia-smi listed no GPU on the host")
     host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
     gpus = pod_gpus(device_requests, host_gpus, pod_gpu_uuids, gpu_indices)
     ordered, requested, index_by_uuid = gpus.ordered, gpus.requested, gpus.index_by_uuid
@@ -457,7 +457,7 @@ async def _widen_targets_to_nvlink_peers(
         return list(ordered), fabric_services
     topology = await _run(runner, TOPOLOGY_COMMAND)
     if topology.exit_code != 0:
-        raise _query_refused(topology, "could not read the GPU topology")
+        raise _refusal_for_failed_query(topology, "could not read the GPU topology")
     peers = parse_nvlink_peers(topology.stdout or "", host_gpus)
     targets = set(requested)
     frontier = list(requested)
@@ -620,7 +620,7 @@ async def _processes_outside(
     PIDs in ignore_cgroup (the validator's own session) do not count."""
     apps = await _run(runner, COMPUTE_APPS_COMMAND)
     if apps.exit_code != 0:
-        raise _query_refused(apps, "could not list the GPU processes")
+        raise _refusal_for_failed_query(apps, "could not list the GPU processes")
     pids = sorted({pid for pid, uuid in parse_compute_apps(apps.stdout or "") if uuid in targets})
     if container_id is None and ignore_cgroup is None:
         return pids

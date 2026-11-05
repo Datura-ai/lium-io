@@ -288,19 +288,19 @@ async def test_every_precheck_refusal_changes_nothing(host, kwargs, code):
 
 
 @pytest.mark.parametrize(
-    "query", ["nvidia-smi --query-gpu=", "nvidia-smi topo -m", "nvidia-smi --query-compute-apps="]
+    "command_prefix", ["nvidia-smi --query-gpu=", "nvidia-smi topo -m", "nvidia-smi --query-compute-apps="]
 )
 @pytest.mark.asyncio
-async def test_a_timed_out_nvidia_smi_query_is_a_hung_gpu(query):
+async def test_a_timed_out_nvidia_smi_query_is_a_hung_gpu(command_prefix):
     # DAH-5736: a hung GPU makes nvidia-smi time out with empty output; that is not "no GPU on the host"
     host = FakeHost()
-    answer = host.run
+    real_run = host.run
 
     async def run(cmd: str, **kwargs):
-        if cmd.startswith(query):
+        if cmd.startswith(command_prefix):
             host.commands.append(cmd)
             return make_command_result(False, exit_code=-1, error_type="timeout")
-        return await answer(cmd, **kwargs)
+        return await real_run(cmd, **kwargs)
 
     host.run = run
     report, start = await _reset(host)
