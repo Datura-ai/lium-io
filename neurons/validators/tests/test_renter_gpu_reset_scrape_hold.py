@@ -588,7 +588,8 @@ async def test_a_reset_that_never_stopped_the_pod_leaves_no_recent_mark():
     assert await renter_gpu_reset_recent(service, RENTAL_OWNER, EXECUTOR, POD_ID) is False
 
 
-GPUS_LOST = GpuResetReport(ok=False, error_code=GpuResetErrorCode.GpusLostOnHost, detail="gone")
+GPUS_LOST_DETAIL = "The GPUs stopped responding on the host. The provider has to reboot it before they can be used again."
+GPUS_LOST = GpuResetReport(ok=False, error_code=GpuResetErrorCode.GpusLostOnHost, detail=GPUS_LOST_DETAIL)
 SPLIT_NODE = RentedExecutorsResponse(
     executors={
         EXECUTOR: RentedExecutor(
@@ -609,7 +610,7 @@ async def _reset_with_gpus_lost(service, backend):
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=GPUS_LOST)):
         result = await _run_reset(service, backend, return_value=connection)
     assert (result.ok, result.error_code, result.detail, result.container_restarted, result.gpus) == (
-        False, GpuResetErrorCode.GpusLostOnHost, "gone", False, []
+        False, GpuResetErrorCode.ResetNotSupported, GPUS_LOST_DETAIL, False, []
     )
 
 

@@ -13206,7 +13206,13 @@ class DockerService:
             workload_kind=payload.workload_kind,
             request_id=payload.request_id,
             ok=report.ok,
-            error_code=report.error_code,
+            # a backend below lium-protocol 2.11.0 drops the whole frame on an unknown error_code and the renter's reset
+            # hangs until timeout; a separate task removes this once the backend vendors lium-protocol-v2.11.0
+            error_code=(
+                GpuResetErrorCode.ResetNotSupported
+                if report.error_code == GpuResetErrorCode.GpusLostOnHost
+                else report.error_code
+            ),
             container_restarted=report.container_restarted,
             gpus=report.gpus,
             detail=report.detail,
