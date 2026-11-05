@@ -307,6 +307,9 @@ def containerd_root(config: str | None) -> str | None:
     # a plugin's own root_path (e.g. the overlayfs snapshotter's) puts its data on a disk this check never reads
     if any(isinstance(p, dict) and p.get("root_path") for p in (doc.get("plugins") or {}).values()):
         return None
+    # shortcut: a proxy snapshotter (e.g. stargz) keeps its data under its own process's root; refuse until read
+    if doc.get("proxy_plugins"):
+        return None
     root = doc.get("root", _CONTAINERD_DEFAULT_ROOT)
     # a comma would split the --mount option the same-disk check binds it with
     if not isinstance(root, str) or not root.startswith("/") or "," in root:
@@ -333,15 +336,21 @@ def containerd_daemon_reads_etc_config(daemons: str) -> bool:
     return len(lines) == 1 and lines[0][1:] in _CONTAINERD_CONFIG_ARGS
 
 
+# where containerd writes an image's data under its root: the overlayfs snapshots and the content store.
+# Either can be its own mount (or a symlink to one), so each is checked, not just the root.
+_CONTAINERD_DATA_DIRS = ("io.containerd.snapshotter.v1.overlayfs", "io.containerd.content.v1.content")
+
+
 def same_filesystem_as_data_root_command(path: str) -> str:
-    """Exit 0 only when `path` is on the filesystem of Docker's data root, the disk every flatten check
-    measures. Docker resolves both bind sources on the node, so a symlink counts where it points; a missing
-    path fails the mount and so the check."""
-    same_fs = '[ "$(stat -c %d /d/.)" = "$(stat -c %d /c/.)" ]'
+    """Exit 0 only when `path` and its snapshot and content directories are on the filesystem of Docker's data
+    root, the disk every flatten check measures. Each is its own bind source, which Docker resolves on the node,
+    so a symlink counts where it points; a missing path fails the mount and so the check."""
+    dirs = [path, *(f"{path.rstrip('/')}/{sub}" for sub in _CONTAINERD_DATA_DIRS)]
+    mounts = " ".join(f"--mount {shlex.quote(f'type=bind,src={d},dst=/c{i},readonly')}" for i, d in enumerate(dirs))
+    same_fs = " && ".join(f'[ "$(stat -c %d /d/.)" = "$(stat -c %d /c{i}/.)" ]' for i in range(len(dirs)))
     return (
         "root=$(/usr/bin/docker info --format '{{.DockerRootDir}}') || exit 1; "
-        '/usr/bin/docker run --rm --mount "type=bind,src=$root,dst=/d,readonly" '
-        f"--mount {shlex.quote(f'type=bind,src={path},dst=/c,readonly')} "
+        f'/usr/bin/docker run --rm --mount "type=bind,src=$root,dst=/d,readonly" {mounts} '
         f"{ALPINE_HELPER_IMAGE} sh -c {shlex.quote(same_fs)}"
     )
 
@@ -405,7 +414,8 @@ async def flatten_image_on_host(
     )
     # the containerd store reports its snapshotter (e.g. overlayfs) and keeps images outside DockerRootDir
     if str(driver.stdout).strip() != "overlay2":
-        if not await containerd_store_on_data_root(ssh_client):
+        # only the overlayfs snapshotter's directory is checked; any other snapshotter writes where nothing measures
+        if str(driver.stdout).strip() != "overlayfs" or not await containerd_store_on_data_root(ssh_client):
             raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
     inspect = await ssh_client.run(
         f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}",

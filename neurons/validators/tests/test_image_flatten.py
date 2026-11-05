@@ -138,6 +138,15 @@ def test_only_a_docker_whose_containerd_size_counts_unpacked_snapshots(version, 
 
 
 @pytest.mark.asyncio
+async def test_no_flatten_on_a_containerd_snapshotter_other_than_overlayfs():
+    # only the overlayfs snapshotter's directory is measured: stargz, native or zfs write elsewhere
+    ssh = _ssh(exists=False, driver="stargz")
+    with pytest.raises(RuntimeError, match="storage driver"):
+        await flatten_image_on_host(ssh, "model:dev", lease="r1")
+    assert ssh.run.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_containerd_store_flattens_when_its_root_shares_the_measured_disk():
     ssh = _ssh(exists=False, driver="overlayfs")
     assert await flatten_image_on_host(ssh, "model:dev", lease="r1") == _TAG
@@ -187,6 +196,39 @@ def _same_disk_rc(
 _STORE = '[["driver-type","io.containerd.snapshotter.v1"]]'
 
 
+def _ctrd(root, **elsewhere):
+    """A containerd root with its snapshot and content directories; `elsewhere` links one to another filesystem."""
+    for sub in image_flatten._CONTAINERD_DATA_DIRS:
+        (root / sub).parent.mkdir(parents=True, exist_ok=True)
+        if sub in elsewhere:
+            (root / sub).symlink_to(elsewhere[sub])
+        else:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+
+
+@pytest.mark.parametrize(
+    "sub, target, expected",
+    [
+        (None, None, True),  # ordinary directories on the data root's disk
+        ("io.containerd.snapshotter.v1.overlayfs", "/proc", False),  # snapshots on another filesystem
+        ("io.containerd.content.v1.content", "/proc", False),  # the content store on another filesystem
+        ("io.containerd.snapshotter.v1.overlayfs", "/nonexistent", False),  # a dangling link fails the mount
+    ],
+)
+def test_the_snapshot_and_content_dirs_must_share_the_data_root_filesystem(tmp_path, sub, target, expected):
+    _ctrd(tmp_path / "ctrd", **({sub: target} if sub else {}))
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config) == 0) is expected
+
+
+def test_a_proxy_snapshotter_refuses_the_flatten():
+    stargz = (
+        "version = 2\n[proxy_plugins]\n  [proxy_plugins.stargz]\n    type = 'snapshot'\n"
+        "    address = '/run/containerd-stargz-grpc/containerd-stargz-grpc.sock'\n"
+    )
+    assert image_flatten.containerd_root(stargz) is None
+
+
 @pytest.mark.parametrize(
     "driver_status, root, expected_same",
     [
@@ -201,7 +243,7 @@ def test_containerd_store_check_requires_its_root_on_the_data_root_filesystem(
 ):
     path = {"same": tmp_path / "ctrd", "other": "/proc", "missing": tmp_path / "nope"}[root]
     if root == "same":
-        path.mkdir()
+        _ctrd(path)
     config = f'version = 2\nroot = "{path}"\n[plugins]\n  root = "/ignored"\n'
     assert (_same_disk_rc(tmp_path, driver_status=driver_status, config=config) == 0) is expected_same
 
@@ -219,7 +261,7 @@ def test_containerd_store_check_requires_its_root_on_the_data_root_filesystem(
     ],
 )
 def test_containerd_root_comes_from_the_config_or_the_check_refuses(tmp_path, config, expected):
-    (tmp_path / "ctrd").mkdir()
+    _ctrd(tmp_path / "ctrd")
     if config is not None:
         config = config.format(same=tmp_path / "ctrd", other="/proc")
     rc = _same_disk_rc(tmp_path, driver_status=_STORE, config=config)
@@ -238,7 +280,7 @@ def test_containerd_root_comes_from_the_config_or_the_check_refuses(tmp_path, co
     ],
 )
 def test_containerd_store_check_requires_one_daemon_reading_the_etc_config(tmp_path, daemons, expected):
-    (tmp_path / "ctrd").mkdir()
+    _ctrd(tmp_path / "ctrd")
     config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
     assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config, daemons=daemons) == 0) is expected
 
@@ -256,7 +298,7 @@ def _link_dir(etc):
 
 @pytest.mark.parametrize("link", [_link_config, _link_dir])
 def test_a_symlinked_containerd_config_is_refused_never_read_as_missing(tmp_path, link):
-    (tmp_path / "ctrd").mkdir()
+    _ctrd(tmp_path / "ctrd")
     config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
     assert _same_disk_rc(tmp_path, driver_status=_STORE, config=config, link=link) == 1
 
