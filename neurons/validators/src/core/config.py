@@ -292,9 +292,6 @@ class Settings(BaseSettings):
     # Off: an outside failure is logged ("log-only"), never failed, so prod can count the nodes it would fail
     # (the shadow step). On: a node fails on its second outside failure in a row.
     EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
-    # DAH-5682: both batch attempts ran out of time inside the test container's start (a stuck Docker), so the
-    # semi-batch and fallback tiers are skipped; the DinD probe still runs. Off: the skip is only logged.
-    PORT_PROBE_SKIP_TIERS_ON_HUNG_START: bool = Field(env="PORT_PROBE_SKIP_TIERS_ON_HUNG_START", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -328,10 +325,8 @@ class Settings(BaseSettings):
     # channel of the pipeline's SSH session to the executor's loopback port (`/version` names it);
     # the executor refuses any other peer. Any refusal, timeout, mismatch or local failure falls
     # back to the SSH path for that step (logged per outcome, `[local_verify]`).
-    # Off by default; the SSH path is unchanged either way.
-    VALIDATOR_LOCAL_VERIFY_ENABLED: bool = Field(env="VALIDATOR_LOCAL_VERIFY_ENABLED", default=False)
-    # Whole-call budget for `POST /verify` (seconds). Sized for the first pass; a full-size VerifyX
-    # may take longer and then falls back, so keep this above VERIFYX first-pass p90 (90 s) + matmul.
+    # Whole-call budget for `POST /verify` (seconds). Only the first pass calls it (a full-size VerifyX
+    # stays on SSH), so keep this above VERIFYX first-pass p90 (90 s) + matmul.
     # The executor is told to stop 30 s earlier (`deadline_s` = this − 30, min 5) so a cut answer
     # with finished steps inside still arrives inside the budget.
     LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)

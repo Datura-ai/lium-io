@@ -2524,7 +2524,7 @@ class MinerService:
                         ),
                     )
                     # DAH-3436 (review): shared with the rental probe's create, see executor_create_exclusion
-                    async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                    async with self.redis_service.executor_create_exclusion(payload.executor_id, payload.pod_id):
                         customer_creates.reached_create_container(payload)
                         result = await docker_service.create_container(
                             payload,
