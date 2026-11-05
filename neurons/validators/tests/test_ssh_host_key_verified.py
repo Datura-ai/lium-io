@@ -121,7 +121,6 @@ def test_our_side_skip_reasons_are_classified_explicitly() -> None:
 
     for ours in (
         "no default renter image for this GPU and driver",
-        "could not read the node's image list",
         "interval state unreadable",
         "too little cycle time left",
         "too little cycle time left for the create",
@@ -130,7 +129,12 @@ def test_our_side_skip_reasons_are_classified_explicitly() -> None:
         "the idleness re-read overran its budget",
     ):
         assert is_our_side_skip(ours), ours
-    for theirs in ("default renter image is not pulled on the node", "rented", "could not take the node's create lock"):
+    for theirs in (
+        "default renter image is not pulled on the node",
+        "could not read the node's image list",
+        "rented",
+        "could not take the node's create lock",
+    ):
         assert not is_our_side_skip(theirs), theirs
     assert not is_our_side_skip(None)
 
