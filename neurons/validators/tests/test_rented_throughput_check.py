@@ -299,6 +299,20 @@ async def test_a_failure_from_hours_ago_starts_no_streak():
         assert (await check.run(ctx)).event.reason_code == Msg.SLOW.reason
 
 
+# a confirmed SLOW does not expire when later cycles are too short to measure: only a passing reading clears it
+async def test_a_standing_slow_verdict_does_not_expire_with_time():
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_NET, SLOW_NET)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW.reason
+        clock.now += 2 * 3600
+        with patch.object(module, "task_seconds_left", lambda ctx: 0):
+            late = await check.run(ctx)
+        assert not late.passed and late.event.reason_code == Msg.SLOW.reason and len(runner.commands) == 2
+
+
 # the host NICs busy either way (inconclusive), or their counters unreadable (no verdict): no strike, the streak stays
 @pytest.mark.parametrize("busy", [BUSY_NET, BUSY_UPLOAD, NO_COUNTERS])
 async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
