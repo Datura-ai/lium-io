@@ -1049,9 +1049,9 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
                 if "*" not in pattern:
                     pending.append(pattern)  # literal: containerd opens it, a missing one fails
                     continue
-                # the directory before the first wildcard is resolved on the host (conf.d may be an absolute link
-                # elsewhere); matches keep the logical directory, which relative imports resolve against
-                base = pattern.partition("*")[0].rsplit("/", 1)[0]
+                # the directory before the first glob character (*, ? or [) is resolved on the host (conf.d may be an
+                # absolute link elsewhere); matches keep the logical directory, which relative imports resolve against
+                base = re.split(r"[*?[]", pattern, maxsplit=1)[0].rsplit("/", 1)[0]
                 host_base = f"/proc/1/root{host_realpath(base or '/').rstrip('/')}"
                 matches = glob.glob(host_base + pattern[len(base):])
                 # a later file overrides an earlier one, in the order containerd merges them

@@ -9,6 +9,7 @@ test_scrape_encryption_key_order.py parses rather than imports.
 """
 
 import ast
+import fnmatch
 import glob
 import http.client
 import io
@@ -782,6 +783,19 @@ def test_a_glob_import_through_a_symlinked_directory_is_followed_on_the_host(scr
 
     assert scrape["containerd_root"]() == "/data/containerd"
 
+
+
+@pytest.mark.parametrize("directory", ["conf.?", "conf[.]d"])
+def test_a_glob_character_in_a_directory_before_the_first_star_is_expanded(scrape: dict, monkeypatch, directory) -> None:
+    # containerd globs the whole pattern once it has a *, so ? and [...] in a directory are expanded too
+    files = {CONTAINERD_DEFAULT: f'version = 2\nimports = ["/etc/containerd/{directory}/*.toml"]\n',
+             "/etc/containerd/conf.d/10-root.toml": 'root = "/data/containerd"\n'}
+    _stub_containerd_config(scrape, monkeypatch, files)
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(
+        glob=lambda pattern: sorted(f"/proc/1/root{f}" for f in files if fnmatch.fnmatchcase(f"/proc/1/root{f}", pattern))))
+    _stub_filesystem(scrape, monkeypatch, host_dirs={"/proc/1/root/data/containerd", "/proc/1/root/var/lib/containerd"}, usage_by_path={})
+
+    assert scrape["containerd_root"]() == "/data/containerd"
 
 _MANAGED_CONFIG = "/var/run/docker/containerd/containerd.toml"
 _MANAGED = ["containerd", "--config", _MANAGED_CONFIG, "--log-level", "info"]
