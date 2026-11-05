@@ -97,7 +97,16 @@ class GPUCheck(PreflightCheck):
                 return CheckResult(
                     name=self.name,
                     status=CheckStatus.FAILED,
-                    message=f"GPUs must be idle. {len(high_util_gpus)} GPU(s) have high utilization (>={gpu_utilization_limit}%). Stop running processes"
+                    message=(
+                        f"GPUs must be idle. {len(high_util_gpus)} GPU(s) have high utilization "
+                        f"(GPU >={gpu_utilization_limit}% or memory >{gpu_memory_utilization_limit}%, "
+                        f"lowest of several samples): "
+                        + "; ".join(
+                            f"GPU {g['gpu_index']}: GPU {g['gpu_utilization']}%, memory {g['memory_utilization']}%"
+                            for g in high_util_gpus
+                        )
+                        + ". Stop running processes"
+                    )
                 )
 
             # Check 4: GPU UUIDs (uniqueness)
