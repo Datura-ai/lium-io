@@ -2,24 +2,27 @@ import ast
 import json
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX
+from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX, MAX_GPU_COUNT
 from neurons.validators.src.services.task import pipeline_factory
 from neurons.validators.src.services.task.checks import gpu_fault_probe as module
 from neurons.validators.src.services.task.checks.gpu_fault_probe import (
     PROBE_JSON_MARKER,
     PROBE_SECONDS,
-    PROBE_SOURCE,
     PROBE_TIMEOUT_SECONDS,
     GpuFaultProbeCheck,
+    probe_source,
 )
 from neurons.validators.src.services.task.messages import GpuFaultProbeMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
 from tests.helpers import build_context_config, build_services, build_state, default_executor
+
+PROBE_SOURCE = probe_source()
 
 
 @contextmanager
@@ -233,8 +236,22 @@ async def test_ssh_timeout_is_unknown_not_a_fault(context_factory):
     assert f"{PROBE_TIMEOUT_SECONDS}s" in result.event.what_we_saw["error"]
 
 
+def test_importing_the_check_does_not_read_the_probe_source():
+    # Dockerfile.preflight ships services/ without miner_jobs/: a read at import would kill the import there
+    tree = ast.parse(Path(module.__file__).read_text())
+    top_level = [
+        node for node in tree.body if not isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    ]
+    assert not any(
+        isinstance(call, ast.Call) and getattr(call.func, "attr", None) == "read_text"
+        for node in top_level
+        for call in ast.walk(node)
+    )
+    assert probe_source() == module.PROBE_SOURCE_PATH.read_text()
+
+
 def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
-    # otherwise the SSH timeout fires first and a hung 8th GPU is never reported as a fault by the probe.
+    # otherwise the SSH timeout fires first and the largest nodes (MAX_GPU_COUNT) never get the probe's verdict.
     # The whole worst path counts, not the drain alone: eight workers hung once their kernels run, killed and
     # still held by the driver, then the reap grace, the NVML snapshot fork hanging on the wedged card (before
     # and after), and two dmesg reads at their timeout.
@@ -248,15 +265,16 @@ def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
     drain = (
         PROBE_SECONDS
         + namespace["WORKER_GRACE_SECONDS"]
-        + namespace["WORKER_GRACE_PER_GPU_SECONDS"] * 7
+        + namespace["WORKER_GRACE_PER_GPU_SECONDS"] * (MAX_GPU_COUNT - 1)
     )
+    device_count = namespace["WORKER_GRACE_SECONDS"]  # the enumeration fork's poll
     nvml_fork = namespace["NVML_GRACE_SECONDS"] + 1 + 5  # poll, join(1), kill + join(5)
     tail = (
         namespace["WORKER_REAP_AFTER_KILL_SECONDS"]
         + 2 * nvml_fork
         + 2 * namespace["DMESG_TIMEOUT_SECONDS"]
     )
-    assert PROBE_TIMEOUT_SECONDS > drain + tail + 5
+    assert PROBE_TIMEOUT_SECONDS > device_count + drain + tail + 5
 
 
 @pytest.mark.asyncio
@@ -704,7 +722,8 @@ def test_a_hung_worker_does_not_swallow_the_verdicts_of_the_others():
     elapsed = time.perf_counter() - started
 
     assert [r["index"] for r in reports] == [0, 1, 2, 3, 4]
-    assert reports[0]["status"] == "fault" and "hung in kernels" in reports[0]["error"]
+    # out of time in the kernels is no verdict (UNKNOWN), not a fault (taiberium on lium-io-deployment#127)
+    assert reports[0]["status"] == "error" and "hung in kernels" in reports[0]["error"]
     assert reports[1] == {"index": 1, "status": "fault", "error": "Xid 79"}
     assert reports[2]["status"] == "ok"
     assert (

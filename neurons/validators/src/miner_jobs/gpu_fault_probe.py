@@ -622,7 +622,7 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     )
     d_in, d_idx, d_out, d_aux = device_buffers
     if on_phase is not None:
-        on_phase("kernels")  # from here on a hang or a crash is the card's
+        on_phase("kernels")  # from here on a crash is the card's
 
     def launch(kernel: str, *args) -> None:
         _launch(cuda, funcs[kernel], stream, n, *args)
@@ -699,7 +699,7 @@ def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
     started = time.perf_counter()
 
     def on_phase(phase: str) -> None:
-        # the parent classifies a worker that never answers by the phase it reached: setup -> error, kernels -> fault
+        # the parent classifies a worker that dies by the phase it reached: setup -> error, kernels -> fault
         conn.send({"phase": phase})
 
     try:
@@ -1000,8 +1000,8 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
 
     Every worker gets the whole budget: a card that hangs does not eat the time of the ones after it, and a
     report a worker has already sent (a fault on GPU 3 while GPU 0 hangs) is read, not discarded. A worker
-    still in setup at the deadline did not get to measure anything: the host, the driver or the container's
-    limits kept it from starting, which is an error; once its kernels run, a hang or a crash is the card's.
+    still running at the deadline, in setup or in its kernels, has no verdict, which is an error (UNKNOWN); a
+    worker that dies once its kernels run is the card's fault.
     """
     pending = {
         index: {"process": process, "conn": conn, "phase": "setup"}
@@ -1009,11 +1009,11 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
     }
     reports: dict[int, dict] = {}
 
-    def no_verdict(index: int, describe) -> None:
+    def no_verdict(index: int, describe, kernels_status: str = "fault") -> None:
         worker = pending.pop(index)
         reports[index] = {
             "index": index,
-            "status": "fault" if worker["phase"] == "kernels" else "error",
+            "status": kernels_status if worker["phase"] == "kernels" else "error",
             "error": describe(worker["phase"]),
         }
 
@@ -1045,7 +1045,11 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
         poll_worker_pipes(0)  # a message that landed as the deadline passed
     for index in list(pending):
         pending[index]["process"].kill()
-        no_verdict(index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s")
+        # out of time is no verdict even in the kernels: honest idle nodes ran out of it under GPU contention
+        # (1-4 Nov); a worker that died in its kernels is still the card's fault
+        no_verdict(
+            index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s", "error"
+        )
     # one reap grace for all of them, not 5 s each: a killed worker the driver still holds must not push
     # the verdict past the validator's SSH cap on an 8-GPU host
     reap_by = time.perf_counter() + WORKER_REAP_AFTER_KILL_SECONDS

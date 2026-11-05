@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import shlex
@@ -17,19 +18,28 @@ from .capability import get_filler_only_container
 # The probe runs on the executor's own interpreter, standard library only, and ships over stdin the way
 # the scrape source does (DAH-2794): nothing to upload, nothing the miner has to update.
 PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "gpu_fault_probe.py"
-PROBE_SOURCE = PROBE_SOURCE_PATH.read_text()
+
+
+# read on first use, not at import: an image that ships services/ without miner_jobs/ (Dockerfile.preflight)
+# must still be able to import the checks package
+@functools.cache
+def probe_source() -> str:
+    return PROBE_SOURCE_PATH.read_text()
+
+
 PROBE_JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
 # Measured on a healthy 1x RTX 4090 (driver 580): 5.3 s in-script, 6.6 s over SSH, 7 rounds on a 2 GB
 # working set. A hung card is caught INSIDE the probe: the workers share one wall-clock budget (--seconds
 # + 30 s + 5 s per extra GPU) and are drained together, so every card gets the whole budget and a verdict —
-# a hang in setup is an error (scored UNKNOWN), a hang in the kernels is a fault. This cap sits above the
-# largest budget (8 GPUs: 4 + 65 s) plus the parent's bounded tail after the drain (one reap grace, two NVML
-# snapshots in a fork with their own deadline, two dmesg reads: 47 s when everything hangs at once) —
+# a worker still running at the deadline is an error (scored UNKNOWN), one that crashes in its kernels is a
+# fault. This cap sits above the device count's fork (up to 30 s), the largest budget (MAX_GPU_COUNT = 14
+# GPUs: 4 + 95 s) and the parent's bounded tail after the drain (one reap grace, two NVML snapshots in a fork
+# with their own deadline, two dmesg reads: 47 s when everything hangs at once): 176 s —
 # test_the_ssh_cap_sits_above_the_probes_own_largest_deadline adds it up — and only catches
 # an interpreter that never printed or an SSH channel that stalled;
 # the runner sets error_type "timeout" for any asyncio.TimeoutError around ssh.run, so that path cannot
 # tell a transport stall from a hung host and is scored UNKNOWN, like the other no-report outcomes.
-PROBE_TIMEOUT_SECONDS = 150
+PROBE_TIMEOUT_SECONDS = 185
 PROBE_SECONDS = 4
 OUTPUT_TAIL_CHARS = 800
 # the report is executor-controlled: bound what is copied into the event
@@ -95,7 +105,7 @@ class GpuFaultProbeCheck:
 
         command = f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS}"
         run = await ctx.runner.run(
-            command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=PROBE_SOURCE
+            command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
         )
         report = _parse_report(run.stdout)
         what: dict[str, Any] = {
