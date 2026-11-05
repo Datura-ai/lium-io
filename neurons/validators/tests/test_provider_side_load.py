@@ -162,7 +162,6 @@ def _rented_state(specs: dict[str, object]) -> ContextState:
 
 @contextmanager
 def provider_load_gate(*, stack_cap: bool = False):
-    """DAH-2734 ships shadow-first, like every other money-withholding gate."""
     with patch("neurons.validators.src.services.task.checks.provider_side_load.settings") as s:
         s.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CORES = 8.0
         s.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED = stack_cap
