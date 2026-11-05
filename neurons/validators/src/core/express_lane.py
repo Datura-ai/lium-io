@@ -123,6 +123,8 @@ class _Pending:
     executor: PortalExecutor
     miner_hotkey: str
     first_seen_at: datetime
+    # first_seen_at replaced by the stamp in Redis, which outlives a validator restart
+    first_seen_restored: bool = False
     attempts: int = 0
     not_before: float = 0.0  # monotonic
     # First passes that ran to a failed result; counted apart from attempts, which the miner's
@@ -235,6 +237,7 @@ class ExpressLane:
         if recheck_deadline - time.monotonic() < RECHECK_MIN_SECONDS:
             rechecks = set()  # left in Redis: they run once the next wave has listed their miners
         chosen = self._select(snapshot, validated, inputs.fleet_known_since, rechecks)
+        await self._restore_first_seen()
         for pending in chosen:
             pending.requested = pending.executor.id in rechecks
             pending.recheck_deadline = (
@@ -243,6 +246,20 @@ class ExpressLane:
         if not chosen:
             return 0
         return await self._launch(chosen)
+
+    async def _restore_first_seen(self) -> None:
+        """Newly queued executors take their first sighting from Redis (written now when there is none),
+        so a restart neither resets first_seen_to_publish_s nor the logged discovery wait."""
+        new = [p for p in self._pending.values() if not p.first_seen_restored]
+        if not new:
+            return
+        stored = await self.redis_service.express_first_seen(
+            [p.executor.id for p in new], datetime.now(UTC).timestamp()
+        )
+        for pending in new:
+            pending.first_seen_restored = True
+            if pending.executor.id in stored:
+                pending.first_seen_at = datetime.fromtimestamp(stored[pending.executor.id], UTC)
 
     def _start_self_hosted_listing(self) -> None:
         """Every SELF_HOSTED_LIST_SECONDS, in the background so a slow miner never holds a tick."""

@@ -290,6 +290,31 @@ async def test_a_never_validated_executor_is_verified_alone_and_published_spec_o
     assert extra["first_seen_to_publish_s"] >= 0 and extra["verification_s"] >= 0
 
 
+@pytest.mark.asyncio
+async def test_a_restart_keeps_the_first_sighting_from_redis(monkeypatch, wallet, caplog):
+    """Regression: first_seen_at lived in memory only, so every validator rollout re-stamped it and
+    the logged discovery wait (registration to first sighting) grew by the whole restart."""
+    new_node = str(uuid4())
+    snapshot = {"miner-a": [_portal_executor(new_node, registered_seconds_ago=40)]}
+    before = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])
+    before.release.clear()  # the first process is cut off mid-run, before it publishes
+    assert await before.lane.tick() == 1
+    first_seen = before.lane._pending[new_node].first_seen_at
+    for task in before.lane._tasks:
+        task.cancel()
+    await asyncio.gather(*before.lane._tasks, return_exceptions=True)
+
+    after = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])
+    after.redis_service = before.redis_service  # the same Redis outlives the pod
+    after.lane.redis_service = before.redis_service
+    with caplog.at_level(logging.INFO):
+        assert await after.tick_and_settle() == 1
+
+    assert after.lane._pending.get(new_node) is None
+    published = [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
+    assert published[0].msg.extra["first_seen_at"] == first_seen.isoformat()
+
+
 # --- Self-hosted miners: their new nodes are not in the portal snapshot --------------------
 
 

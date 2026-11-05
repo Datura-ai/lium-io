@@ -132,6 +132,10 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# When the express lane first saw a never-validated executor (epoch s), kept across validator restarts:
+# an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
+EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
+EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -469,6 +473,21 @@ class RedisService:
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def express_first_seen(self, executor_ids: list[str], now: float) -> dict[str, float]:
+        """When the express lane first saw each executor (epoch s): SET NX keeps the first sighting,
+        so a restarted validator reads the stamp the previous process wrote. One round trip."""
+        keys = [f"{EXPRESS_LANE_FIRST_SEEN_PREFIX}:{executor_id}" for executor_id in executor_ids]
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.set(key, repr(now), ex=EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS, nx=True)
+            pipe.mget(keys)
+            *_, values = await pipe.execute()
+        return {
+            executor_id: float(value)
+            for executor_id, value in zip(executor_ids, values, strict=True)
+            if value is not None
+        }
 
     async def pop_executor_recheck_request(self, executor_id: str) -> None:
         await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
