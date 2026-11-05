@@ -157,10 +157,11 @@ class PortCountCheck:
         # The probe skips our idle filler's ports, but a rental removes the filler (create-time
         # cleanup) and frees them, so they join both the count and verified_ports, the set the
         # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
-        # a deferred cycle's ports are the last completed check's, not this cycle's: never listed or paid
-        # from (an idle node's verdict is withheld in run, a rental keeps its exemption)
+        # a deferred cycle's ports are the last completed check's, not this cycle's (DAH-5851): an idle node's
+        # verdict is withheld in run; a rented node's free GPUs stay listed on them but are idle-paid only
+        # from its filler ports (`deferred_idle_pay_port_count`, read by RentalPriceIncentive)
         deferred = ctx.state.port_check_deferred
-        probed = [] if deferred else list((ctx.state.specs or {}).get("verified_ports") or [])
+        probed = list((ctx.state.specs or {}).get("verified_ports") or [])
         held = (
             rented_data.get_filler_ports(ctx.executor.uuid)
             if rented_data and not uuid_listed_under_another_miner(ctx, rented_data)
@@ -174,7 +175,7 @@ class PortCountCheck:
 
         filler_ports = sorted(set(held) - set(probed))
         verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
-        port_count = (0 if deferred else ctx.state.verified_port_count) + len(filler_ports)
+        port_count = ctx.state.verified_port_count + len(filler_ports)
 
         updated_state = replace(
             ctx.state,
@@ -184,6 +185,7 @@ class PortCountCheck:
                 "verified_ports": verified_ports,
                 "port_range": ctx.executor.port_range,
                 "port_mappings": ctx.executor.port_mappings,
+                **({"deferred_idle_pay_port_count": len(filler_ports)} if deferred else {}),
             },
         )
         return port_count, is_rented, updated_state

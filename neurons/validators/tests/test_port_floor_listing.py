@@ -303,6 +303,30 @@ async def test_stale_pod_fails_insufficient_ports_with_the_enforcement_flag(cont
 
 
 @pytest.mark.asyncio
+async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(context_factory, monkeypatch):
+    """DAH-5851: every listed pod stale makes the node idle, and an idle node's deferred cycle is withheld."""
+    from dataclasses import replace
+
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_one_pod(),
+        ssh=DummySSHClient(pod_running=False),
+        backend=DummyBackendClient(active=False),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, port_check_deferred=True)})
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-1"
+
+
+@pytest.mark.asyncio
 async def test_stale_pod_with_enough_ports_is_unchanged(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
     ctx = run_context(

@@ -1073,9 +1073,9 @@ async def test_the_fourth_pressured_cycle_runs_the_check_and_ends_the_streak(con
 
 
 @pytest.mark.asyncio
-async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferral_cadence(context_factory, monkeypatch):
+async def test_a_replayed_memory_keeps_the_listing_but_never_pays_free_gpus_across_the_deferral_cadence(context_factory, monkeypatch):
     """Review on #1964: three deferrals then one briefly healthy forced check, repeated. Only the forced
-    check's own measurement reaches the published ports and the free GPUs' idle pay; the rental stays."""
+    check's own measurement reaches the free GPUs' idle pay; the rental stays, and so does the listing (DAH-5851)."""
     from incentive.rental_price import RentalPriceIncentive
 
     from neurons.validators.src.services.task.checks.port_count import PortCountCheck
@@ -1083,7 +1083,7 @@ async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferr
 
     monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
     redis_service = DummyRedis()
-    unpaid, deferred = [], []
+    unpaid, deferred, listed = [], [], []
     for _ in range(8):
         ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
         if not redis_service.verified_ports:
@@ -1091,6 +1091,7 @@ async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferr
         connected = await PortConnectivityCheck().run(ctx)
         counted = await PortCountCheck().run(ctx.model_copy(update=connected.updates))
         assert counted.passed  # the renter's pod keeps the node rented
+        listed.append(counted.updates["state"].specs["available_port_count"])
         deferred.append(connectivity.called_with is None)
         incentive = _build_incentive(
             _make_job(spec=counted.updates["state"].specs, gpu_count=8, rented_gpu_count=1, is_rented=True)
@@ -1101,6 +1102,8 @@ async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferr
 
     assert deferred == [True, True, True, False] * 2
     assert unpaid == [7, 7, 7, 0] * 2  # 7 free one-GPU splits: paid only on the measured cycle
+    # DAH-5851: the free GPUs stay listed on the last completed check's ports (24 remembered, then the forced 100)
+    assert listed == [24, 24, 24, 100, 100, 100, 100, 100]
 
 
 @pytest.mark.asyncio
