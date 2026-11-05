@@ -162,6 +162,7 @@ async def test_probe_source_goes_over_stdin_to_the_executor_interpreter(context_
     assert call["stdin_text"] == PROBE_SOURCE
     assert call["timeout"] == PROBE_TIMEOUT_SECONDS
     assert call["retryable"] is False
+    assert "--hang-in-kernels-is-fault" not in call["cmd"]
     probe = result.event.what_we_saw["probe"]
     assert probe["status"] == "ok"
     assert probe["devices"][0]["rounds"] == 7
@@ -267,14 +268,15 @@ def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
         + namespace["WORKER_GRACE_SECONDS"]
         + namespace["WORKER_GRACE_PER_GPU_SECONDS"] * (MAX_GPU_COUNT - 1)
     )
-    device_count = namespace["WORKER_GRACE_SECONDS"]  # the enumeration fork's poll
+    # the enumeration fork's poll, join(5), then kill + join(5)
+    device_count_wait_seconds = namespace["WORKER_GRACE_SECONDS"] + 5 + 5
     nvml_fork = namespace["NVML_GRACE_SECONDS"] + 1 + 5  # poll, join(1), kill + join(5)
     tail = (
         namespace["WORKER_REAP_AFTER_KILL_SECONDS"]
         + 2 * nvml_fork
         + 2 * namespace["DMESG_TIMEOUT_SECONDS"]
     )
-    assert PROBE_TIMEOUT_SECONDS > device_count + drain + tail + 5
+    assert PROBE_TIMEOUT_SECONDS > device_count_wait_seconds + drain + tail + 5
 
 
 @pytest.mark.asyncio
@@ -631,7 +633,7 @@ def test_a_hung_nvml_after_snapshot_makes_the_run_an_error_not_ok(capsys, monkey
     ns["_device_count"] = lambda mp: 1
     ns["nvml_snapshot_forked"] = lambda mp: next(snapshots)
     ns["xid_lines"] = lambda: {"available": False}
-    ns["drain_workers"] = lambda workers, deadline, budget: [
+    ns["drain_workers"] = lambda workers, deadline, budget, hang_in_kernels_is_fault: [
         {"index": 0, "status": "ok", "pci_bus_id": "00000000:01:00.0"}
     ]
 
@@ -733,6 +735,42 @@ def test_a_hung_worker_does_not_swallow_the_verdicts_of_the_others():
     assert reports[4]["status"] == "error" and "hung in setup" in reports[4]["error"]
     assert 3.0 <= elapsed < 10.0  # the two hangs cost one budget, not one budget each
     assert not any(process.is_alive() for _, process, _ in workers)
+
+
+def test_on_the_recheck_a_hang_in_the_kernels_is_a_fault():
+    # taiberium on #2085: a card that hangs its kernels every cycle must not list again after a rental
+    import multiprocessing
+    import time
+
+    namespace = _probe_namespace("drain_workers", "_exit_code", "WORKER_REAP_AFTER_KILL_SECONDS")
+    namespace["multiprocessing"] = multiprocessing
+    namespace["time"] = time
+    mp = multiprocessing.get_context("fork")
+    workers = []
+    for index, behaviour in enumerate(["hang-in-kernels", "hang-in-setup"]):
+        parent_conn, child_conn = mp.Pipe(duplex=False)
+        process = mp.Process(target=_fake_worker, args=(index, behaviour, child_conn))
+        process.start()
+        child_conn.close()
+        workers.append((index, process, parent_conn))
+
+    started = time.perf_counter()
+    reports = namespace["drain_workers"](workers, started + 2.0, 2.0, hang_in_kernels_is_fault=True)
+
+    assert reports[0]["status"] == "fault" and "hung in kernels" in reports[0]["error"]
+    assert reports[1]["status"] == "error" and "hung in setup" in reports[1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_recheck_asks_the_probe_to_fail_a_hang_in_the_kernels(context_factory):
+    runner = FakeRunner(probe_stdout("ok"))
+    ctx = make_ctx(context_factory, runner)
+
+    with probe_gate():
+        await GpuFaultProbeCheck(enforce=True).run(ctx)
+
+    (call,) = runner.calls
+    assert call["cmd"].endswith(" --hang-in-kernels-is-fault")
 
 
 def test_setup_calls_in_the_probe_are_errors_not_faults():

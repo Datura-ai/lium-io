@@ -995,13 +995,16 @@ def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list
     return faults, other
 
 
-def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]:
+def drain_workers(
+    workers: list, deadline: float, budget_s: float, hang_in_kernels_is_fault: bool = False
+) -> list[dict]:
     """One report per worker, every pipe polled together until the deadline.
 
     Every worker gets the whole budget: a card that hangs does not eat the time of the ones after it, and a
     report a worker has already sent (a fault on GPU 3 while GPU 0 hangs) is read, not discarded. A worker
     still running at the deadline, in setup or in its kernels, has no verdict, which is an error (UNKNOWN); a
-    worker that dies once its kernels run is the card's fault.
+    worker that dies once its kernels run is the card's fault. hang_in_kernels_is_fault (the post-rental
+    recheck) makes a hang in the kernels a fault too, so a card that hangs every cycle cannot list again.
     """
     pending = {
         index: {"process": process, "conn": conn, "phase": "setup"}
@@ -1009,46 +1012,52 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
     }
     reports: dict[int, dict] = {}
 
-    def no_verdict(index: int, describe, kernels_status: str = "fault") -> None:
+    def no_verdict(index: int, describe, status_if_in_kernels: str) -> None:
         worker = pending.pop(index)
         reports[index] = {
             "index": index,
-            "status": kernels_status if worker["phase"] == "kernels" else "error",
+            "status": status_if_in_kernels if worker["phase"] == "kernels" else "error",
             "error": describe(worker["phase"]),
         }
 
     def died(index: int) -> None:
         code = _exit_code(pending[index]["process"])
-        no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}")
+        no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}", "fault")
 
-    def poll_worker_pipes(timeout: float) -> None:
-        by_conn = {worker["conn"]: index for index, worker in pending.items()}
-        for conn in multiprocessing.connection.wait(list(by_conn), timeout=timeout):
-            index = by_conn[conn]
-            try:
-                message = conn.recv()
-            except EOFError:  # the pipe closed without a report: the worker is gone
-                died(index)
-                continue
-            if "phase" in message:
-                pending[index]["phase"] = message["phase"]
-            else:
-                reports[index] = message
-                del pending[index]
+    def read(index: int) -> None:
+        try:
+            message = pending[index]["conn"].recv()
+        except EOFError:  # the pipe closed without a report: the worker is gone
+            died(index)
+            return
+        if "phase" in message:
+            pending[index]["phase"] = message["phase"]
+        else:
+            reports[index] = message
+            del pending[index]
+
+    def reap_dead() -> None:
         for index, worker in list(pending.items()):
             if not worker["process"].is_alive() and not worker["conn"].poll(0):
                 died(index)
 
     while pending and time.perf_counter() < deadline:
-        poll_worker_pipes(0.2)
-    if pending:
-        poll_worker_pipes(0)  # a message that landed as the deadline passed
+        by_conn = {worker["conn"]: index for index, worker in pending.items()}
+        for conn in multiprocessing.connection.wait(list(by_conn), timeout=0.2):
+            read(by_conn[conn])
+        reap_dead()
+    # every message that landed as the deadline passed: a phase change and the report behind it
+    for index in list(pending):
+        while index in pending and pending[index]["conn"].poll(0):
+            read(index)
+    reap_dead()
+    # out of time is no verdict even in the kernels: honest idle nodes ran out of it under GPU contention
+    # (1-4 Nov); a worker that died in its kernels is still the card's fault
+    hang_status = "fault" if hang_in_kernels_is_fault else "error"
     for index in list(pending):
         pending[index]["process"].kill()
-        # out of time is no verdict even in the kernels: honest idle nodes ran out of it under GPU contention
-        # (1-4 Nov); a worker that died in its kernels is still the card's fault
         no_verdict(
-            index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s", "error"
+            index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s", hang_status
         )
     # one reap grace for all of them, not 5 s each: a killed worker the driver still holds must not push
     # the verdict past the validator's SSH cap on an 8-GPU host
@@ -1088,6 +1097,11 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="read the cards' standing memory health from NVML; no CUDA, safe beside a rental",
     )
+    parser.add_argument(
+        "--hang-in-kernels-is-fault",
+        action="store_true",
+        help="a worker still in its kernels at the deadline is a fault, not an error (post-rental recheck)",
+    )
     args = parser.parse_args(argv)
 
     started = time.perf_counter()
@@ -1124,7 +1138,9 @@ def main(argv: list[str]) -> int:
     # interpreters forking, JIT-compiling and allocating at once on a loaded host take longer than one
     grace = WORKER_GRACE_SECONDS + WORKER_GRACE_PER_GPU_SECONDS * (len(workers) - 1)
     budget = args.seconds + grace
-    result["devices"] = drain_workers(workers, time.perf_counter() + budget, budget)
+    result["devices"] = drain_workers(
+        workers, time.perf_counter() + budget, budget, args.hang_in_kernels_is_fault
+    )
 
     result["nvml_after"] = nvml_snapshot_forked(mp)
     xid_after = xid_lines()

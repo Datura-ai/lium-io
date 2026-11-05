@@ -32,14 +32,15 @@ PROBE_JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
 # working set. A hung card is caught INSIDE the probe: the workers share one wall-clock budget (--seconds
 # + 30 s + 5 s per extra GPU) and are drained together, so every card gets the whole budget and a verdict —
 # a worker still running at the deadline is an error (scored UNKNOWN), one that crashes in its kernels is a
-# fault. This cap sits above the device count's fork (up to 30 s), the largest budget (MAX_GPU_COUNT = 14
+# fault (on the post-rental recheck a hang in the kernels is a fault too). This cap sits above the device
+# count's fork (30 s poll + two 5 s joins), the largest budget (MAX_GPU_COUNT = 14
 # GPUs: 4 + 95 s) and the parent's bounded tail after the drain (one reap grace, two NVML snapshots in a fork
-# with their own deadline, two dmesg reads: 47 s when everything hangs at once): 176 s —
+# with their own deadline, two dmesg reads: 47 s when everything hangs at once): 186 s —
 # test_the_ssh_cap_sits_above_the_probes_own_largest_deadline adds it up — and only catches
 # an interpreter that never printed or an SSH channel that stalled;
 # the runner sets error_type "timeout" for any asyncio.TimeoutError around ssh.run, so that path cannot
 # tell a transport stall from a hung host and is scored UNKNOWN, like the other no-report outcomes.
-PROBE_TIMEOUT_SECONDS = 185
+PROBE_TIMEOUT_SECONDS = 195
 PROBE_SECONDS = 4
 OUTPUT_TAIL_CHARS = 800
 # the report is executor-controlled: bound what is copied into the event
@@ -104,6 +105,9 @@ class GpuFaultProbeCheck:
             return CheckResult(passed=True, event=event)
 
         command = f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS}"
+        if self.enforce:
+            # the recheck after a rental: a card that hangs its kernels every cycle must not list again
+            command += " --hang-in-kernels-is-fault"
         run = await ctx.runner.run(
             command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
         )
