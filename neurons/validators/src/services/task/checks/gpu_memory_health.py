@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from typing import Any
+
+import redis.exceptions
 
 from core.config import settings
 
@@ -25,17 +28,64 @@ _FLAG_UUID = re.compile(r"^gpu \S+ \(([^()]+)\): ")
 RESET_REQUIRED_STREAK_LIMIT = 3
 _reset_required_streak: dict[tuple[str, str], int] = {}
 
+# DAH-5869: per executor, the kernel-log Xid lines already judged and the last read's card suspects
+# (hardware slowdown, PCIe downgrade), so only new Xids count and a suspect needs two reads in a row
+CARD_HEALTH_KEY_PREFIX = "gpu_card_health"
+CARD_HEALTH_TTL_SECONDS = 86400
+_REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
+
+
+def _card_health_key(ctx: Context) -> str:
+    return f"{CARD_HEALTH_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
+async def _load_card_health(ctx: Context) -> dict[str, Any]:
+    try:
+        stored = json.loads(await ctx.services.redis.get(_card_health_key(ctx)) or "{}")
+    except (*_REDIS_ERRORS, TypeError, ValueError):
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
+async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: dict[str, Any]) -> None:
+    """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids, and a
+    suspect also read on the previous cycle; then keep the state for the next read. A dry run shares Redis
+    with the live validator, so it writes nothing."""
+    if report.get("status") not in ("ok", "flagged"):
+        return  # no NVML reading: the state stays as it was
+    suspects = [s for s in report.get("card_suspects") or [] if isinstance(s, str)]
+    xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
+    previous = before.get("suspects") or []
+    report["card_faults"] = xid_faults + [s for s in suspects if s in previous]
+    xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
+    seen = xid.get("count") if xid.get("available") else before.get("xid_seen")
+    if settings.DRY_RUN:
+        return
+    try:
+        await ctx.services.redis.set(
+            _card_health_key(ctx),
+            json.dumps({"xid_seen": seen, "suspects": suspects}),
+            ex=CARD_HEALTH_TTL_SECONDS,
+        )
+    except _REDIS_ERRORS:
+        pass  # the next read judges against the older state: a suspect waits a cycle longer
+
 
 async def read_memory_health(ctx: Context) -> MemoryHealthRead:
     """The NVML-only probe's run and report, read once per cycle: RentedGpuDropCheck reads it first
     on a rented node (and keeps it in `ctx.state.memory_health`), and GpuMemoryHealthCheck reuses it."""
     if ctx.state.memory_health is not None:
         return ctx.state.memory_health
+    before = await _load_card_health(ctx)
     command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
+    if type(before.get("xid_seen")) is int:
+        command += f" --xid-seen {before['xid_seen']}"
     run = await ctx.runner.run(
         command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
     )
-    return MemoryHealthRead(run=run, report=_parse_report(run.stdout) or {})
+    report = _parse_report(run.stdout) or {}
+    await _judge_card_faults(ctx, report, before)
+    return MemoryHealthRead(run=run, report=report)
 
 
 def flagged_uuids(report: dict[str, Any]) -> list[str]:
@@ -43,6 +93,13 @@ def flagged_uuids(report: dict[str, Any]) -> list[str]:
     if report.get("status") != "flagged" or not isinstance(report.get("flags"), list):
         return []
     found = (_FLAG_UUID.match(flag) for flag in report["flags"] if isinstance(flag, str))
+    return sorted({match.group(1) for match in found if match and match.group(1) != "None"})
+
+
+def card_fault_uuids(report: dict[str, Any]) -> list[str]:
+    """The UUIDs of the cards with a hardware fault this cycle (`report["card_faults"]`): a new Xid, or a
+    hardware slowdown or PCIe downgrade read twice in a row."""
+    found = (_FLAG_UUID.match(f) for f in report.get("card_faults") or [] if isinstance(f, str))
     return sorted({match.group(1) for match in found if match and match.group(1) != "None"})
 
 

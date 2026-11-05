@@ -18,7 +18,8 @@ from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 from .gpu_loss_hold import GpuLossHoldCheck
-from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
+from .rental_owner import rental_of_this_node
+from .rented_gpu_drop import GPU_DROP_REDIS_ERRORS, RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -283,6 +284,42 @@ async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> list[V
         return []
 
 
+# DAH-5869: a rented node whose scrape times out this many cycles in a row has its renter's GPUs unverified,
+# and the renter's incident says so (RentedGpuDropCheck's gpu_unverified) instead of nothing
+SCRAPE_TIMEOUT_CYCLES = 3
+SCRAPE_TIMEOUT_KEY_PREFIX = "rented_scrape_timeouts"
+
+
+async def _track_rented_scrape_timeout(ctx: Context, timed_out: bool) -> None:
+    """Count a rented node's scrape timeouts in a row (Redis); from the SCRAPE_TIMEOUT_CYCLES-th on, post
+    the renter's gpu_unverified incident. Any other outcome ends the run. Never fatal, and the pod is left
+    alone; a dry run shares Redis with the live validator, so it does nothing."""
+    if settings.DRY_RUN:
+        return
+    key = f"{SCRAPE_TIMEOUT_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+    try:
+        if not timed_out:
+            await ctx.services.redis.delete(key)
+            return
+        rental = rental_of_this_node(ctx)
+        if rental is None or not rental.pods:
+            return
+        raw = await ctx.services.redis.get(key)
+        try:
+            streak = int(raw) + 1
+        except (TypeError, ValueError):
+            streak = 1
+        await ctx.services.redis.set(key, str(streak), ex=settings.RENTED_GPU_DROP_STATE_TTL_SECONDS)
+        if streak >= SCRAPE_TIMEOUT_CYCLES:
+            await RentedGpuDropCheck(unverified=True).run(ctx)
+    except GPU_DROP_REDIS_ERRORS:
+        logger.warning(_m("RENTED_SCRAPE_TIMEOUT_REDIS_UNAVAILABLE", extra=get_extra_info(ctx.default_extra)))
+    except Exception:
+        logger.warning(
+            _m("RENTED_SCRAPE_TIMEOUT_REPORT_ERROR", extra=get_extra_info(ctx.default_extra)), exc_info=True
+        )
+
+
 @dataclass(frozen=True)
 class StdinAttempt:
     """Why the stdin delivery failed, carried into the event of the binary retry.
@@ -375,8 +412,11 @@ class MachineSpecScrapeCheck:
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
         if ctx.config.machine_scrape_source:
-            return await self._scrape_from_source(ctx, timeout)
-        return await self._scrape_uploaded_binary(ctx, timeout)
+            result = await self._scrape_from_source(ctx, timeout)
+        else:
+            result = await self._scrape_uploaded_binary(ctx, timeout)
+        await _track_rented_scrape_timeout(ctx, result.event.reason_code == Msg.SCRAPE_TIMEOUT.reason)
+        return result
 
     async def _scrape_from_source(self, ctx: Context, timeout: int) -> CheckResult:
         # pipe the obfuscated source into the executor's own interpreter; binary on failure
