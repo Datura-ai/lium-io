@@ -518,3 +518,33 @@ async def test_an_unreadable_power_limit_under_a_lium_filler_passes(context_fact
     result = await GpuPowerLimitCheck().run(ctx)
 
     assert result.passed is True
+
+
+@pytest.mark.parametrize(
+    ("owner", "recorded_watts", "expected_host"),
+    [
+        ("lium", 350, 350),  # Pearl over a stock host limit
+        ("lium", 280, 280),  # Pearl over an 80 % tier host limit
+        ("lium", None, None),  # no restore record: no field, the backend keeps today's verdict
+        (None, 280, None),  # no filler: the live limit is the host's, no field
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_host_limit_under_our_pearl_cap_reaches_the_specs(
+    context_factory, read_records_mock, owner, recorded_watts, expected_host
+) -> None:
+    # lio#1924 r4477687011: the badge judges the limit the renter gets back, not Pearl's live cap
+    live = 245 if owner else 280
+    state = _state(current_limit=live, default_limit=350, default_job_owner=owner)
+    state = ContextState(**{**state.__dict__, "specs": {"gpu": {"details": [dict(d) for d in state.gpu_details]}}})
+    if recorded_watts is not None:
+        read_records_mock.return_value = _read_result(
+            _restore_record().model_copy(update={"watts": recorded_watts}),
+            _restore_record(gpu_uuid="GPU-abc", executor_id="other-executor"),
+        )
+    result = await GpuPowerLimitCheck().run(context_factory(state=state))
+    assert result.passed is True
+    specs = result.updates["state"].specs if "state" in (result.updates or {}) else state.specs
+    (detail,) = specs["gpu"]["details"]
+    assert detail.get("power_host_limit") == expected_host
+    assert detail["power_limit"] == live  # Pearl's guard still reads the live cap

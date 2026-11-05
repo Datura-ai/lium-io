@@ -1057,6 +1057,8 @@ async def _record_rental_start_ratios(
         same_rental = rental_record_pod_id(old) == pod_id
         guessed = _guessed_start_ratio(old) if same_rental else None
         if same_rental and (guessed is None or not readable):
+            if guessed is not None:
+                unreadable.append(gpu_uuid)  # still a guess: the create retries until a real reading
             continue  # a reboot or edit of the same rental keeps the limit it started on
         if not readable:
             # the tier the renter saw, else held at 90 %; a retry keeps this start, so a later read cannot lower it

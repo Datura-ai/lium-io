@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
+from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel
@@ -52,6 +53,23 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _with_host_limits(ctx: Context, records: list[GpuPowerRestoreRecord]) -> dict[str, Any]:
+    """Specs with ``power_host_limit`` (watts) on each GPU under our live Pearl cap: the host's own limit,
+    recorded before the cap and restored when the filler stops. The backend's Reduced power limit badge
+    judges it while ``power_limit`` stays the live cap (DAH-5302). No record = no field."""
+    host_watts = {record.gpu_uuid: record.watts for record in records}
+    gpu = (ctx.state.specs or {}).get("gpu")
+    if not host_watts or not isinstance(gpu, dict) or not isinstance(gpu.get("details"), list):
+        return {}
+    details = [
+        {**detail, "power_host_limit": host_watts[detail["uuid"]]}
+        if isinstance(detail, dict) and detail.get("uuid") in host_watts
+        else detail
+        for detail in gpu["details"]
+    ]
+    return {"state": replace(ctx.state, specs={**ctx.state.specs, "gpu": {**gpu, "details": details}})}
+
+
 def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str, Any]]:
     return [measurement.model_dump() for measurement in measurements]
 
@@ -80,14 +98,14 @@ class GpuPowerLimitCheck:
             # DAH-2786: this is the only moment we can tell a host that raises our cap back
             # WHILE our job runs from one that merely resets the limit after the job ends. The
             # first kills the job it is paid to host; the second harms nothing.
-            await self._record_reverts_of_our_live_cap(ctx)
+            records = await self._record_reverts_of_our_live_cap(ctx)
             event = render_message(
                 Msg.SKIPPED_ACTIVE_LIUM_FILLER,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"executor_uuid": ctx.executor.uuid},
             )
-            return CheckResult(passed=True, event=event)
+            return CheckResult(passed=True, event=event, updates=_with_host_limits(ctx, records))
 
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
@@ -272,16 +290,14 @@ class GpuPowerLimitCheck:
                         pass  # marked on a later cycle
         return floors
 
-    async def _record_reverts_of_our_live_cap(self, ctx: Context) -> None:
+    async def _record_reverts_of_our_live_cap(self, ctx: Context) -> list[GpuPowerRestoreRecord]:
         """Note every GPU of this executor whose live limit sits above the cap we applied and
         verified for the Lium job running right now (DAH-2786).
 
         Read-only towards the host: it changes no limit, it only records what it saw, so the
         filler keeps running either way. The unrented incentive gate counts these later.
+        Returns this executor's restore records (the host's own limits under the cap).
         """
-        # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
-        if not self.restore_stale_caps:
-            return
         live_watts_by_uuid: dict[str, GpuPowerMeasurement] = {
             str(detail.get("uuid")): GpuPowerMeasurement(
                 index=index,
@@ -295,15 +311,17 @@ class GpuPowerLimitCheck:
             if detail.get("uuid")
         }
         if not live_watts_by_uuid:
-            return
+            return []
         read_result = await read_gpu_power_restore_records(
             ctx.services.redis, list(live_watts_by_uuid), log_extra=ctx.default_extra
         )
+        records = [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
+        # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
+        if not self.restore_stale_caps:
+            return records
         observed_at = time.time()
         reverts: list[GpuPowerCapRevert] = []
-        for record in read_result.records:
-            if record.executor_id != ctx.executor.uuid:
-                continue
+        for record in records:
             measurement = live_watts_by_uuid.get(record.gpu_uuid)
             if measurement is None or measurement.power_limit is None:
                 continue
@@ -316,6 +334,7 @@ class GpuPowerLimitCheck:
             await record_cap_reverts(
                 ctx.services.redis, ctx.executor.uuid, reverts, ctx.default_extra
             )
+        return records
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]

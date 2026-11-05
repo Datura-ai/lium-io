@@ -470,3 +470,30 @@ async def test_an_unreadable_rental_start_fails_the_create_and_a_retry_cannot_lo
     assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == kept
     await _rental_start(monkeypatch, redis, _power(*retry_watts))  # a reboot keeps the start
     assert [_ratio(redis, g)["ratio"] for g in ("GPU-0", "GPU-1")] == kept
+
+
+@pytest.mark.parametrize(
+    ("scored", "final_watts", "kept"),
+    [
+        (None, 350, 1.0),  # never scored in the tier: stock guess, a stock reading keeps it
+        (None, 280, 1.0),  # stock guess: a later tier reading cannot lower it
+        ("0.8", 280, 0.8),  # scored in the tier and read there: the tier
+        ("0.8", 350, 1.0),  # stale tier cache, read at stock: stock (F-43)
+    ],
+)
+@pytest.mark.asyncio
+async def test_repeated_partial_reads_keep_failing_the_create_until_a_real_reading(
+    monkeypatch, scored, final_watts, kept
+) -> None:
+    # lio#1924 r4477687020: a second miss must not let the rental start on the guess
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    redis = SharedFakeRedis()
+    if scored:
+        await redis.set(gpl.scored_tier_ratio_key("ex-1", "GPU-1"), scored)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="GPU-1"):
+            await _rental_start(monkeypatch, redis, _power(350) | {"GPU-1": None})
+        assert _ratio(redis, "GPU-1")["guessed"] is True
+    await _rental_start(monkeypatch, redis, _power(350, final_watts))
+    assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": kept}
+    assert _ratio(redis, "GPU-0")["ratio"] == 1.0
