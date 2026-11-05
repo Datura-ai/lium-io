@@ -1692,3 +1692,76 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
     finally:
         connected["sock"].close()
         listener.close()
+
+
+# DAH-5833: exact daemon texts from the 4-5 Nov B300 failures (connector Loki)
+CONTAINERD_RENAME_RACE = (
+    'failed commit on ref "index-sha256:cb94": commit failed: rename '
+    "/var/lib/containerd/io.containerd.content.v1.content/ingest/69b1/data "
+    "/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/cb94: no such file or directory"
+)
+CONTAINERD_LEASE_RACE = 'failed commit on ref "manifest-sha256:ab12": lease does not exist: not found'
+REGISTRY_RESET = (
+    'failed to do request: Head "https://registry-1.docker.io/v2/nvidia/cuda/manifests/13.0.3": '
+    "read tcp [240e::1]:49940->[2600::2]:443: read: connection reset by peer"
+)
+
+
+class FlakyPullApiClient(PullApiClient):
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = list(errors)
+
+    def _stream_helper(self, response, *, decode=False):
+        if self.errors:
+            return [{"errorDetail": {"message": self.errors.pop(0)}}]
+        return self.pull_events
+
+
+@pytest.fixture
+def no_pull_backoff(monkeypatch):
+    monkeypatch.setattr(rental_docker_sdk, "_PULL_TRANSIENT_RETRY_DELAYS_SECONDS", (0, 0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", [CONTAINERD_RENAME_RACE, CONTAINERD_LEASE_RACE, REGISTRY_RESET])
+async def test_pull_retries_a_containerd_race_or_registry_reset(no_pull_backoff, first):
+    api_client = FlakyPullApiClient([first, REGISTRY_RESET])
+    api_client.missing_images.add("daturaai/pytorch:dind")
+    client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
+
+    await client.pull(image="daturaai/pytorch:dind")
+
+    assert len(api_client.post_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_pull_race_skips_the_retry_when_the_other_puller_landed_the_image(no_pull_backoff):
+    api_client = FlakyPullApiClient([CONTAINERD_LEASE_RACE])
+    client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
+
+    await client.pull(image="daturaai/pytorch:dind")
+
+    assert len(api_client.post_calls) == 1
+    assert api_client.inspected_images == ["daturaai/pytorch:dind"]
+
+
+@pytest.mark.asyncio
+async def test_pull_gives_up_after_two_retries(no_pull_backoff):
+    api_client = FlakyPullApiClient([CONTAINERD_RENAME_RACE] * 3)
+    api_client.missing_images.add("daturaai/pytorch:dind")
+    client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
+
+    with pytest.raises(RentalDockerOperationError, match="failed commit on ref"):
+        await client.pull(image="daturaai/pytorch:dind")
+    assert len(api_client.post_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_pull_does_not_retry_other_daemon_errors(no_pull_backoff):
+    api_client = FlakyPullApiClient(["manifest unknown"])
+    client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
+
+    with pytest.raises(RentalDockerOperationError, match="manifest unknown"):
+        await client.pull(image="registry.example/missing:tag")
+    assert len(api_client.post_calls) == 1

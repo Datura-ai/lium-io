@@ -623,6 +623,11 @@ def pull_keeper_start_command(pod_id: str, image: str) -> str:
     )
 
 
+def pull_keeper_wait_command(pod_id: str) -> str:
+    """Block until this pod's keeper exits (at once when there is none)."""
+    return f"while {_pull_keeper_alive(pod_id)}; do sleep 1; done"
+
+
 def pull_keeper_stop_command(pod_id: str) -> str:
     return f'{_pull_keeper_alive(pod_id)} && kill "$p"; rm -f {_pull_keeper_pidfile(pod_id)}; true'
 
@@ -9810,6 +9815,24 @@ class DockerService:
                                         pull_keeper_stop_command(payload.pod_id), check=False, timeout=30
                                     )
 
+                        async def _watched_pull() -> None:
+                            if keeper:
+                                # attach to the keeper, not race it: two concurrent pulls of one image on the
+                                # containerd store fail "failed commit on ref". The SDK pull after it is then a
+                                # no-op, or the real pull (and its error) when the keeper failed.
+                                waited_from = time.monotonic()
+                                with contextlib.suppress(Exception):
+                                    await ssh_client.run(
+                                        pull_keeper_wait_command(payload.pod_id),
+                                        check=False,
+                                        timeout=int(_DOCKER_PULL_TIMEOUT_SECONDS) + 30,
+                                    )
+                                if time.monotonic() - waited_from >= _DOCKER_PULL_TIMEOUT_SECONDS:
+                                    raise RentalDockerOperationError(
+                                        f"Docker SDK pull timed out after {int(_DOCKER_PULL_TIMEOUT_SECONDS)} seconds"
+                                    )
+                            await docker_client.pull(image=payload.docker_image)
+
                         async def _cancel_pull() -> None:
                             with contextlib.suppress(Exception):
                                 await docker_client.aclose()
@@ -9823,7 +9846,7 @@ class DockerService:
                                 run_logged_rental_docker_sdk_operation(
                                     operation="pull",
                                     log_extra=default_extra,
-                                    call=lambda: docker_client.pull(image=payload.docker_image),
+                                    call=_watched_pull,
                                     image=payload.docker_image,
                                 ),
                                 on_cancel=_cancel_pull,

@@ -18,6 +18,7 @@ from services.docker_service import (
     inflight_creates,
     pull_keeper_start_command,
     pull_keeper_stop_command,
+    pull_keeper_wait_command,
 )
 from test_deploy_optimizations import _docker_client, _patch_happy, _payload, _run, _ssh_client
 
@@ -93,9 +94,27 @@ async def test_a_pull_starts_the_keeper_and_stops_it_when_done(svc, monkeypatch)
         await _run(svc, payload)
 
     cmds = _commands(ssh)
-    assert cmds.index(pull_keeper_start_command(payload.pod_id, payload.docker_image)) < cmds.index(
-        pull_keeper_stop_command(payload.pod_id)
+    assert (
+        cmds.index(pull_keeper_start_command(payload.pod_id, payload.docker_image))
+        < cmds.index(pull_keeper_wait_command(payload.pod_id))
+        < cmds.index(pull_keeper_stop_command(payload.pod_id))
     )
+
+
+def test_the_wait_returns_when_the_keeper_exits_and_at_once_without_one(tmp_path):
+    # the watched pull attaches to the keeper instead of a second concurrent pull (containerd commit race)
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text("#!/bin/sh\nexec sleep 2\n")
+    fake_docker.chmod(0o755)
+    pod_id = str(uuid.uuid4())
+    _sh(pull_keeper_wait_command(pod_id))  # no keeper: returns at once
+
+    _sh(pull_keeper_start_command(pod_id, "ghcr.io/org/img:1").replace("/usr/bin/docker", str(fake_docker)))
+    keeper = _pid(pod_id)
+    assert _alive(keeper)
+    _sh(pull_keeper_wait_command(pod_id))
+    assert not _alive(keeper)
+    _sh(pull_keeper_stop_command(pod_id))
 
 
 @pytest.mark.asyncio
