@@ -48,29 +48,26 @@ UTILIZATION_SAMPLE_INTERVAL_S = 1.0
 
 def _sample_utilization(pynvml, gpu_details: list, samples: int = UTILIZATION_SAMPLES,
                         interval_s: float = UTILIZATION_SAMPLE_INTERVAL_S) -> None:
-    """Set each GPU's utilization/memory_utilization to the lowest of several NVML reads.
+    """Store several paired (gpu, memory) NVML utilization reads per GPU in utilization_samples.
 
     The first read right after nvmlInit in a fresh container can report a spike on an idle
     GPU (driver/context init when persistence mode is off), so a single sample refused idle
-    hosts (ticket-0996, RTX 3090). A GPU that is really busy stays high on every sample.
+    hosts (ticket-0996, RTX 3090). Reads stay paired: the check needs one whole idle sample.
     A failed read counts as 0, as before.
     """
-    per_gpu = [([], []) for _ in gpu_details]
+    for detail in gpu_details:
+        detail["utilization_samples"] = []
     for n in range(samples):
         if n:
             time.sleep(interval_s)
-        for detail, (gpu_vals, mem_vals) in zip(gpu_details, per_gpu):
+        for detail in gpu_details:
             try:
                 rates = pynvml.nvmlDeviceGetUtilizationRates(pynvml.nvmlDeviceGetHandleByIndex(detail["index"]))
-                gpu_vals.append(rates.gpu)
-                mem_vals.append(rates.memory)
+                detail["utilization_samples"].append((rates.gpu, rates.memory))
             except Exception:
-                gpu_vals.append(0)
-                mem_vals.append(0)
-    for detail, (gpu_vals, mem_vals) in zip(gpu_details, per_gpu):
-        detail["utilization"] = min(gpu_vals)
-        detail["memory_utilization"] = min(mem_vals)
-        logger.debug(f"GPU {detail['index']} utilization samples: gpu={gpu_vals} memory={mem_vals}")
+                detail["utilization_samples"].append((0, 0))
+    for detail in gpu_details:
+        logger.debug(f"GPU {detail['index']} utilization samples (gpu, memory): {detail['utilization_samples']}")
 
 
 def get_gpu_info(include_utilization: bool = False, include_memory: bool = False) -> Optional[dict]:

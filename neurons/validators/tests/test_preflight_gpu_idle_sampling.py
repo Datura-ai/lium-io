@@ -5,6 +5,8 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from preflight import utils
 from preflight.base import CheckStatus
 from preflight.checks.gpu_check import GPUCheck
@@ -45,7 +47,7 @@ def test_first_sample_spike_on_idle_gpu_passes():
 def test_busy_gpu_fails_with_measured_values():
     result = _run([[(0, 0)] * 5, [(97, 30), (95, 31), (99, 29), (96, 30), (98, 30)]])
     assert result.status == CheckStatus.FAILED
-    assert "GPU 1: GPU 95%, memory 29%" in result.message
+    assert "GPU 1: GPU 97% memory 30%, GPU 95% memory 31%" in result.message
     assert "GPU 0" not in result.message
 
 
@@ -57,7 +59,7 @@ def test_unreadable_utilization_counts_as_idle():
     nvml.nvmlDeviceGetUtilizationRates = not_supported
     with patch.dict(sys.modules, {"pynvml": nvml}), patch.object(utils.time, "sleep"):
         info = utils.get_gpu_info(include_utilization=True)
-    assert info["gpu_details"][0]["utilization"] == 0
+    assert info["gpu_details"][0]["utilization_samples"] == [(0, 0)] * 5
 
 
 def _run_display(display_active, compute_processes, reads):
@@ -89,3 +91,17 @@ def test_display_card_busy_gpu_still_fails():
 def test_headless_card_memory_busy_still_fails():
     result = _run_display(False, 0, [(1, 13)] * 5)
     assert result.status == CheckStatus.FAILED
+
+
+@pytest.mark.parametrize("reads, status", [
+    ([(6, 0), (0, 6), (6, 0), (0, 6), (6, 0)], CheckStatus.FAILED),  # alternating busy: no whole idle sample
+    ([(6, 0), (0, 6), (2, 3), (0, 6), (6, 0)], CheckStatus.PASSED),  # one real idle pair
+    ([(90, 40)] * 5, CheckStatus.FAILED),  # sustained load
+    ([(5, 0)] * 5, CheckStatus.FAILED),  # gpu at the limit is busy (>=)
+    ([(4, 0)] * 5, CheckStatus.PASSED),
+    ([(0, 5)] * 5, CheckStatus.PASSED),  # memory at the limit is idle (>)
+    ([(0, 6)] * 5, CheckStatus.FAILED),
+])
+def test_idle_needs_one_whole_idle_sample(reads, status):
+    result = _run([reads])
+    assert result.status == status, result.message

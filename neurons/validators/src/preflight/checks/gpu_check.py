@@ -83,20 +83,22 @@ class GPUCheck(PreflightCheck):
             # Check 3: GPU utilization (must be idle)
             high_util_gpus = []
             for idx, detail in enumerate(gpu_details):
-                gpu_util = detail.get("utilization", 0)
-                mem_util = detail.get("memory_utilization", 0)
+                samples = detail.get("utilization_samples") or [
+                    (detail.get("utilization", 0), detail.get("memory_utilization", 0))
+                ]
 
                 # A card driving a display with no compute processes is idle: its memory
                 # utilization is the screen refresh, not a workload (ticket-0996).
                 display_only = detail.get("display_active") and detail.get("compute_processes") == 0
-                mem_busy = mem_util > gpu_memory_utilization_limit and not display_only
 
-                if gpu_util >= gpu_utilization_limit or mem_busy:
-                    high_util_gpus.append({
-                        "gpu_index": idx,
-                        "gpu_utilization": gpu_util,
-                        "memory_utilization": mem_util
-                    })
+                # Idle only if one whole sample passes; independent minima would let
+                # alternating busy reads (6,0),(0,6) pass.
+                if not any(
+                    gpu_util < gpu_utilization_limit
+                    and (mem_util <= gpu_memory_utilization_limit or display_only)
+                    for gpu_util, mem_util in samples
+                ):
+                    high_util_gpus.append({"gpu_index": idx, "samples": samples})
 
             if high_util_gpus:
                 return CheckResult(
@@ -104,10 +106,11 @@ class GPUCheck(PreflightCheck):
                     status=CheckStatus.FAILED,
                     message=(
                         f"GPUs must be idle. {len(high_util_gpus)} GPU(s) have high utilization "
-                        f"(GPU >={gpu_utilization_limit}% or memory >{gpu_memory_utilization_limit}%, "
-                        f"lowest of several samples): "
+                        f"(GPU >={gpu_utilization_limit}% or memory >{gpu_memory_utilization_limit}% "
+                        f"in every sample): "
                         + "; ".join(
-                            f"GPU {g['gpu_index']}: GPU {g['gpu_utilization']}%, memory {g['memory_utilization']}%"
+                            f"GPU {g['gpu_index']}: "
+                            + ", ".join(f"GPU {gu}% memory {mu}%" for gu, mu in g["samples"])
                             for g in high_util_gpus
                         )
                         + ". Stop running processes"
