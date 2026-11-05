@@ -22,7 +22,8 @@ from protocol.vc_protocol.validator_requests import (
 )
 
 from ...const import (
-    EDIT_PARKED_SUFFIX,
+    PARKED_SUFFIXES,
+    RECOVERY_STOPPED_SUFFIX,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     POD_CONTAINER_NAME_GRACE_MINUTES,
@@ -561,6 +562,13 @@ class TenantEnforcementCheck:
         with contextlib.suppress(Exception):
             mark = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}")
             stopped_by_validator = (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED
+        if not stopped_by_validator and diagnostics.get("container_missing") is True:
+            # a stop whose mark could not be written parked the pod under <name>__stopped: the name is the attribution
+            with contextlib.suppress(Exception):
+                anchor = await ctx.ssh.run(
+                    f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(container_name + RECOVERY_STOPPED_SUFFIX)}"
+                )
+                stopped_by_validator = anchor.exit_status == 0 and (anchor.stdout or "").strip() == "false"
         if stopped_by_validator and diagnostics.get("container_missing") is True:
             # the container we stopped is gone (provider rm, reinstall): passing it would keep billing a pod that no
             # longer exists, since only the POD_NOT_RUNNING reset stops billing. Report it down only once neither
@@ -858,6 +866,10 @@ _RECOVERY_POD_STATUSES = (None, "RUNNING", REBOOT_FAILED_POD_STATUS)
 # create can never take the lock while a recovery is still mutating the pod's containers
 _RECOVERY_DEADLINE_SEC = EXECUTOR_CREATE_LOCK_TIMEOUT - 120
 _RECOVERY_MARK_CLEAR_TIMEOUT_SEC = 5
+# the running-pod mount probe: the backend's path lookup (10 s) and the docker probe (30 s)
+_MOUNT_PROBE_SECONDS = 40
+# a restore cut by the deadline still marks, parks and stops the pod (5 s + three 30 s commands)
+_MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 100
 
 
 @contextlib.asynccontextmanager
@@ -954,7 +966,7 @@ async def _clear_leftover_recovery_mark(
     # the mark means something only while the pod is stopped: one a lost delete left on a running pod would restart a
     # later provider stop, and one left on a removed container would pass a billed pod forever (container_gone).
     # Bounded and best-effort; the next cycle retries. Returns True only for container_gone once neither <name> nor
-    # <name>__prev exists under the create lock, whether or not the mark's delete then lands.
+    # a parked twin of it exists under the create lock, whether or not the mark's delete then lands.
     key = f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"
     absence_confirmed = False  # survives a mark delete that outlives the deadline
 
@@ -978,9 +990,12 @@ async def _clear_leftover_recovery_mark(
                 if (inspect_result.stdout or "").strip() == "true":
                     await ctx.services.redis.delete(key)
                 return False
-            # a failed recovery can leave the stopped original parked as <name>__prev: still the renter's pod
-            if not (absent(inspect_result) and absent(await inspect(f"{container_name}{EDIT_PARKED_SUFFIX}"))):
+            # a failed recovery can leave the stopped original parked (<name>__prev, <name>__stopped): still the renter's pod
+            if not absent(inspect_result):
                 return False
+            for suffix in PARKED_SUFFIXES:
+                if not absent(await inspect(f"{container_name}{suffix}")):
+                    return False
             absence_confirmed = True
             with contextlib.suppress(Exception):
                 await ctx.services.redis.delete(key)
@@ -1035,16 +1050,20 @@ async def _restore_missing_volume_mount(
         default_extra=ctx.default_extra,
     )
     running = True
+    # the whole step comes out of the cycle's time, keeping the result's reserve and a cut restore's stop
+    budget = task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS - _MOUNT_RESTORE_CLEANUP_RESERVE_SEC
+    if budget < _MOUNT_PROBE_SECONDS:
+        return True  # it cannot fit: left as it is, the next cycle probes it
     try:
-        # the mount must be the rental's own, at its path: another gocryptfs mount in the pod does not count
-        local_volume_path = await _plaintext_volume_path(ctx, pod_id)
-        if not await recovery.encrypted_volume_mount_missing(ctx.ssh, container_name, local_volume_path):
-            return True
-        async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
-            if not clear:
+        async with asyncio.timeout(min(_RECOVERY_DEADLINE_SEC, budget)):
+            # the mount must be the rental's own, at its path: another gocryptfs mount in the pod does not count
+            local_volume_path = await _plaintext_volume_path(ctx, pod_id)
+            if not await recovery.encrypted_volume_mount_missing(ctx.ssh, container_name, local_volume_path):
                 return True
-            running = False  # from here every failure has stopped the pod
-            async with asyncio.timeout(_RECOVERY_DEADLINE_SEC):
+            async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
+                if not clear:
+                    return True
+                running = False  # from here every failure has stopped the pod
                 running = await restore(local_volume_path=local_volume_path)
     except TimeoutError as exc:  # before OSError: a missed deadline is not a dead transport
         _log_recovery_failed("POD_VOLUME_MOUNT_RESTORE_FAILED", ctx, container_name, pod_id, exc)

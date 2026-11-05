@@ -7807,6 +7807,33 @@ def test_volume_setup_exec_runs_the_setup_script_under_the_exec_default_umask(tm
     assert completed.stdout.decode("utf-8").strip() in ("0022", "022")
 
 
+@pytest.mark.parametrize(
+    ("mounts", "mounted"),
+    [
+        ("", False),  # missing
+        ("/lium-cipher /workspace fuse.gocryptfs rw 0 0\n", True),  # the rental's own
+        ("/another-cipher /workspace fuse.gocryptfs rw 0 0\n", False),  # foreign source at the path
+        ("/lium-cipher /elsewhere fuse.gocryptfs rw 0 0\n", False),  # own source, wrong destination
+        ("/lium-cipher /workspace ext4 rw 0 0\n", False),  # not gocryptfs
+    ],
+)
+def test_gocryptfs_mount_check_counts_only_the_rentals_own_mount(tmp_path, mounts, mounted):
+    # both the setup script and the setup exec skip/accept the mount on this check
+    mounts_file = tmp_path / "mounts"
+    mounts_file.write_text(mounts)
+    check = docker_service_module._gocryptfs_mount_check("/workspace", str(mounts_file))
+    assert (subprocess.run(["sh", "-c", check], check=False).returncode == 0) is mounted
+    for script in (
+        _build_gocryptfs_setup_and_mount_script(
+            "/workspace", pad_hex="00", wrapped_hex="00", pad_var="a", wrapped_var="b", passfile_path="/p"
+        ),
+        docker_service_module._build_volume_setup_exec_script(
+            "/workspace", setup_script_path="/s", passfile_path="/p", setup_script_size=1, with_authorized_keys=False
+        ),
+    ):
+        assert docker_service_module._gocryptfs_mount_check("/workspace") in script
+
+
 def _run_gocryptfs_setup_script_in_sandbox(script: str) -> tuple[int, str, str]:
     workdir = tempfile.mkdtemp()
     stub_bin = os.path.join(workdir, "stub_bin")
@@ -8202,6 +8229,28 @@ async def test_recover_parked_keeps_the_stop_mark_while_the_renter_breaks_every_
 
 
 @pytest.mark.asyncio
+async def test_recover_parked_carries_the_stopped_anchor_into_the_stop_mark(docker_service, monkeypatch):
+    # review 5785846085: a stop whose mark failed parks as <name>__stopped; the rename-back writes the stop's mark
+    # first, so a start the renter breaks parks it again still attributed to the validator (never "renaming")
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__stopped\n", start=AsyncMock(side_effect=RuntimeError("broken"))
+    )
+    marks = docker_service.redis_service.marks
+
+    assert await docker_service.recover_parked_pod_container(**kwargs) is False
+
+    assert marks == {"stopped_by_recovery:pod-1": "stopped"}
+    assert _renames(ssh_client) == ["/usr/bin/docker rename c0ffee pod_pod-1", "/usr/bin/docker rename c0ffee pod_pod-1__prev"]
+    start.assert_awaited_once()
+
+    # Redis still down: the anchor keeps its name, the only attribution left
+    ssh_client.run.reset_mock()
+    docker_service.redis_service.set = AsyncMock(side_effect=ConnectionError("Redis down"))
+    assert await docker_service.recover_parked_pod_container(**kwargs) is False
+    assert _renames(ssh_client) == []
+
+
+@pytest.mark.asyncio
 async def test_recover_parked_stops_the_container_when_cancelled_mid_start(docker_service, monkeypatch):
     kwargs, ssh_client, _start, stop, _repair = _parked_recovery(
         docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", start=AsyncMock(side_effect=asyncio.CancelledError)
@@ -8425,12 +8474,12 @@ async def test_restore_volume_mount_of_running_container_remounts_or_stops_the_p
     "mark_error, stop_reply_error, expected_name",
     [
         pytest.param(None, None, "pod_pod-1", id="marked_keeps_its_name"),
-        pytest.param(ConnectionError("temporary Redis failure"), None, "pod_pod-1__prev", id="failed_mark_parks_it"),
-        pytest.param("hang", None, "pod_pod-1__prev", id="stalled_mark_parks_it"),
+        pytest.param(ConnectionError("temporary Redis failure"), None, "pod_pod-1__stopped", id="failed_mark_parks_it"),
+        pytest.param("hang", None, "pod_pod-1__stopped", id="stalled_mark_parks_it"),
         pytest.param(
             ConnectionError("temporary Redis failure"),
             ConnectionError("SSH lost after the stop"),
-            "pod_pod-1__prev",
+            "pod_pod-1__stopped",
             id="failed_mark_and_stop_reply_lost_still_parked",
         ),
         pytest.param(None, ConnectionError("SSH lost after the stop"), "pod_pod-1", id="stop_applied_reply_lost"),

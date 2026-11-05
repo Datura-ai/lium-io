@@ -1249,6 +1249,26 @@ async def test_tenant_enforcement_remounts_a_running_pods_missing_encrypted_volu
         docker.restore_volume_mount_of_running_container.assert_not_awaited()
 
 
+@pytest.mark.parametrize("probe_fits", [False, True])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_mount_probe_comes_out_of_the_cycle_budget(context_factory, monkeypatch, probe_fits):
+    # review 5785846085: the probe must not eat the result's reserve, or the task is dropped without a verdict
+    from neurons.validators.src.services.task.checks import rented_machine
+
+    floor = rented_machine.POD_READ_RESERVE_SECONDS + rented_machine._MOUNT_RESTORE_CLEANUP_RESERVE_SEC
+    left = floor + rented_machine._MOUNT_PROBE_SECONDS + (1 if probe_fits else -1)
+    monkeypatch.setattr(rented_machine, "task_seconds_left", lambda _ctx: left)
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    ctx = build_recovery_context(context_factory, ssh, docker, backend=DummyBackendClient(active=True))
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True, result.event
+    assert docker.encrypted_volume_mount_missing.await_count == (1 if probe_fits else 0)
+
+
 def _recovery_redis(lock, marks: dict[str, str]) -> Mock:
     return Mock(
         backend_create_inflight=AsyncMock(return_value=False),
@@ -1372,7 +1392,17 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
 
 @pytest.mark.parametrize(
     "state",
-    ["both_gone", "parked", "stopped_canonical", "lock_busy", "create_in_flight", "delete_fails", "delete_hangs"],
+    [
+        "both_gone",
+        "parked",
+        "stopped_anchor",
+        "anchor_without_mark",
+        "stopped_canonical",
+        "lock_busy",
+        "create_in_flight",
+        "delete_fails",
+        "delete_hangs",
+    ],
 )
 @pytest.mark.asyncio
 async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_container_is_gone(
@@ -1383,7 +1413,12 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
     # longer exists; a parked original (failed recovery) or an unconfirmed check keeps the pass (lio#1827 review)
     ssh = DummySSHClient(pod_running=False)
     real_run = ssh.run
-    present = {"parked": "pod_pod-1__prev", "stopped_canonical": "pod_pod-1"}.get(state)
+    present = {
+        "parked": "pod_pod-1__prev",
+        "stopped_anchor": "pod_pod-1__stopped",
+        "anchor_without_mark": "pod_pod-1__stopped",
+        "stopped_canonical": "pod_pod-1",
+    }.get(state)
 
     async def run(command):
         if "{{.State.Running}}" not in command:
@@ -1393,7 +1428,8 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
         return Mock(stdout="", stderr="Error: No such object", exit_status=1)
 
     ssh.run = run
-    marks = {"stopped_by_recovery:pod-1": "stopped"}
+    # anchor_without_mark (review 5785846085): the stop's mark write failed, so only the __stopped name attributes it
+    marks = {} if state == "anchor_without_mark" else {"stopped_by_recovery:pod-1": "stopped"}
     lock = Mock(acquire=AsyncMock(return_value=state != "lock_busy"), release=AsyncMock())
     redis = _recovery_redis(lock, marks)
     redis.backend_create_inflight = AsyncMock(return_value=state == "create_in_flight")
@@ -1429,7 +1465,8 @@ async def test_tenant_enforcement_reports_a_pod_it_stopped_down_once_its_contain
     else:
         assert result.passed
         assert "clear_verified_job_reason" not in result.updates
-        assert marks == {"stopped_by_recovery:pod-1": "stopped"}
+        assert marks == ({} if state == "anchor_without_mark" else {"stopped_by_recovery:pod-1": "stopped"})
+        assert result.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
 
 
 @pytest.mark.asyncio

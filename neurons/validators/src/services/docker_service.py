@@ -80,6 +80,9 @@ from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
     EDIT_PARKED_SUFFIX,
+    PARKED_SUFFIXES,
+    RECOVERY_STOPPED_SUFFIX,
+    unparked_name,
     LIUM_POD_ID_LABEL,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
@@ -2220,7 +2223,7 @@ def _refuse_filler_beside_unlisted_pod(payload: ContainerCreateRequest, containe
     if payload.workload_kind != WorkloadKind.FILLER:
         return
     listed = set(payload.active_container_names or [])
-    listed |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in listed}
+    listed |= {f"{name}{suffix}" for name in listed for suffix in PARKED_SUFFIXES}
     unlisted = sorted({name for name in container_names if name.startswith(POD_CONTAINER_PREFIX)} - listed)
     if unlisted:
         raise _FillerRefusedBesideUnlistedPod(
@@ -2853,6 +2856,16 @@ def _shell_branch_when_gocryptfs_config_missing(allow_init: bool) -> str:
     )
 
 
+def _gocryptfs_mount_check(plaintext_path: str, mounts_file: str = "/proc/mounts") -> str:
+    # the rental's own mount only: /lium-cipher at the path, never another gocryptfs mount there (as
+    # encrypted_volume_mount_missing reads it), or a repair would count a foreign mount as the volume
+    return (
+        f"awk -v target={shlex.quote(plaintext_path)} -v source={_LIUM_CIPHER_MOUNT} "
+        "'$1 == source && $2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' "
+        f"{shlex.quote(mounts_file)}"
+    )
+
+
 def _build_gocryptfs_setup_and_mount_script(
     plaintext_path: str,
     *,
@@ -2873,10 +2886,7 @@ def _build_gocryptfs_setup_and_mount_script(
     # mount writes the ciphertext, so the kept cache cannot go stale.
     plaintext = shlex.quote(plaintext_path)
     passfile = shlex.quote(passfile_path)
-    mount_check = (
-        f"awk -v target={plaintext} "
-        "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
-    )
+    mount_check = _gocryptfs_mount_check(plaintext_path)
     # Random pad XOR'd into the script as hex. Opaque names. The script itself reads nothing from
     # its stdin (no `read -r`); the caller delivers it over the SSH channel's stdin onto tmpfs.
     # ${v%${v#??}} / ${v#??} is portable sh for take/drop first two hex chars.
@@ -2933,10 +2943,7 @@ def _build_volume_setup_exec_script(
     # busybox's reads a whole buffer from the pipe and swallows the keys.
     script = shlex.quote(setup_script_path)
     passfile = shlex.quote(passfile_path)
-    mount_check = (
-        f"awk -v target={shlex.quote(plaintext_path)} "
-        "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
-    )
+    mount_check = _gocryptfs_mount_check(plaintext_path)
     lines = [
         f'trap "rm -f {script} {passfile}" EXIT',
         # 0600 from the first byte, and only for the upload: the script's mkdir -p of a volume
@@ -4965,7 +4972,9 @@ class DockerService:
                 active_set = {name for name in active_set if not name.startswith(FILLER_CONTAINER_PREFIX)}
             # DAH-2740: a sibling create on the same host sweeps while an edit's parked container is
             # the customer's only copy; the parked twin of every active pod name is protected too
-            active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
+            active_set |= {
+                f"{name}{suffix}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX) for suffix in PARKED_SUFFIXES
+            }
             active_volume_set = set(active_volume_names) if active_volume_names else set()
             removed_id_by_filler_name = removed_at_ssh_connect or {}
             pod_containers = [
@@ -5043,7 +5052,7 @@ class DockerService:
 
         async def closed(name: str) -> bool:
             nonlocal lookups, skipped
-            pod_id = name.removeprefix(POD_CONTAINER_PREFIX).removesuffix(EDIT_PARKED_SUFFIX)
+            pod_id = unparked_name(name).removeprefix(POD_CONTAINER_PREFIX)
             try:
                 UUID(pod_id)
             except ValueError:
@@ -12012,18 +12021,21 @@ class DockerService:
         only a stale-mount start error keeps the name, for the stale-mount recovery to take it.
         ``stopped_by_recovery`` (the pod's STOPPED_BY_RECOVERY mark): a lone stopped ``<name>`` is
         started as well, since a recovery of ours stopped it or renamed it back without an answer.
+        A lone ``<name>__stopped`` (a stop whose mark could not be written) gets its STOPPED mark
+        before the rename, so the attribution outlives a start that fails and parks it again.
         """
         parked = f"{container_name}{EDIT_PARKED_SUFFIX}"
+        stopped_anchor = f"{container_name}{RECOVERY_STOPPED_SUFFIX}"
         q_name, q_parked = shlex.quote(container_name), shlex.quote(parked)
         log_extra = {**default_extra, "container_name": container_name, "parked": parked}
         try:
             listed = await ssh_client.run(
                 f'/usr/bin/docker ps -a --format "{{{{.ID}}}} {{{{.Names}}}}" '
-                f"--filter name=^{q_name}$ --filter name=^{q_parked}$",
+                f"--filter name=^{q_name}$ --filter name=^{q_parked}$ --filter name=^{shlex.quote(stopped_anchor)}$",
                 timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
             )
             rows = [line.split() for line in (listed.stdout or "").splitlines() if line.strip()]
-            expected = [[[parked]], [[container_name]]] if stopped_by_recovery else [[[parked]]]
+            expected = [[[parked]], [[stopped_anchor]]] + ([[[container_name]]] if stopped_by_recovery else [])
             if listed.exit_status != 0 or [row[1:] for row in rows] not in expected:
                 return False
             container_id, current_name = rows[0][0], rows[0][1]
@@ -12061,10 +12073,16 @@ class DockerService:
                     mark.decode() if isinstance(mark, bytes) else mark
                 ) != STOPPED_BY_RECOVERY_STOPPED:
                     await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_RENAMING)
+            elif current_name == stopped_anchor:
+                # the name is the only attribution: carried into the mark before it is given up, else kept
+                try:
+                    await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_STOPPED)
+                except Exception:
+                    return False
         except TimeoutError:
             logger.warning(_m("POD_PARKED_CONTAINER_RECOVERY_TIMED_OUT", extra=get_extra_info(log_extra)))
             return False
-        if current_name == parked:
+        if current_name != container_name:
             try:
                 renamed = await ssh_client.run(
                     f"/usr/bin/docker rename {shlex.quote(container_id)} {q_name}",
@@ -12237,7 +12255,7 @@ class DockerService:
         ``start_existing_container`` adds after a start. True once remounted. Anything else stops the
         container, a cancellation (the recovery deadline) included: left up without its mount, the
         pod takes the renter's writes unencrypted onto the host disk. The stop is marked first
-        (STOPPED_BY_RECOVERY, or parked as ``<name>__prev`` when the mark cannot be written), so the
+        (STOPPED_BY_RECOVERY, or parked as ``<name>__stopped`` when the mark cannot be written), so the
         next cycle's ``recover_parked_pod_container`` starts the pod with its mount once the
         plaintext path is known."""
         try:
@@ -12297,7 +12315,8 @@ class DockerService:
             marked = True
         except Exception:
             marked = False
-        parked = f"{container_name}{EDIT_PARKED_SUFFIX}"
+        # parked under the recovery's own suffix, not an edit's __prev: without the mark, the name is what says we stopped it
+        parked = f"{container_name}{RECOVERY_STOPPED_SUFFIX}"
         if not marked and await self._park_by_id(ssh_client, container_name, parked):
             container_name = parked
         outcome = await self._stop_outcome(ssh_client, container_name)
