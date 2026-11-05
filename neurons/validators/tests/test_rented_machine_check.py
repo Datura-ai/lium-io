@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
@@ -704,6 +705,40 @@ async def test_tenant_enforcement_emits_transport_unreachable_on_ssh_failure(
     assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
     assert "clear_verified_job_info" not in result.updates
     assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_reports_unreachable_when_a_pod_read_outlasts_the_cycle(context_factory, monkeypatch):
+    """5bad1f5a 4 Nov: a pod read hung on a dead shell until the cycle was dropped without a result. The read is
+    bounded by the cycle time budget and the hang ends as the transport-unreachable result."""
+    from neurons.validators.src.services.task.checks import rented_machine
+
+    class HangingSSH(DummySSHClient):
+        async def run(self, command: str):
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(rented_machine, "task_seconds_left", lambda _ctx: rented_machine.POD_READ_RESERVE_SECONDS)
+    rented_data = build_rented_data(
+        "executor-123", {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False}
+    )
+    ctx = context_factory(
+        services=build_services(
+            score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+            container_cleanup=MockContainerCleanup(),
+            backend=DummyBackendClient(active=True),
+        ),
+        config=build_context_config(),
+        state=build_state(gpu_processes=[], gpu_details=[], gpu_model="NVIDIA RTX 4090", rented_data=rented_data),
+        ssh=HangingSSH(),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await asyncio.wait_for(TenantEnforcementCheck().run(ctx), 5)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
 
 
 @pytest.mark.asyncio

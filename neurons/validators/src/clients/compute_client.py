@@ -6,7 +6,7 @@ import time
 from contextlib import suppress
 from contextvars import ContextVar
 from typing import NoReturn
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aiohttp
 import bittensor
@@ -41,6 +41,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
     ForcedValidationCycleRequest,
+    RecheckExecutorRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
@@ -938,6 +939,14 @@ class ComputeClient:
             return
 
         try:
+            recheck = pydantic.TypeAdapter(RecheckExecutorRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_recheck_executor(recheck)
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = "Invalid message received from backend"
@@ -1038,6 +1047,17 @@ class ComputeClient:
             return
 
         await self.miner_service.request_validation_cycle_now()
+
+    async def handle_recheck_executor(self, req: RecheckExecutorRequest) -> None:
+        """Queue a single-node check of one executor; the express lane picks it up."""
+        extra = {**self.logging_extra, "executor_uuid": req.executor_id}
+        try:
+            executor_id = str(UUID(req.executor_id))
+        except ValueError:
+            logger.warning(_m("Recheck request with an invalid executor id", extra=get_extra_info(extra)))
+            return
+        await self.miner_service.redis_service.request_executor_recheck(executor_id)
+        logger.info(_m("Executor recheck queued", extra=get_extra_info(extra)))
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)
@@ -1334,6 +1354,7 @@ class ComputeClient:
                 continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
+            await redis_service.release_cut_off_create_lock(create.executor_id, pod_id)
             if create.resumes < MAX_CREATE_RESUMES:
                 # the count survives another restart before the backend's re-send arrives
                 await redis_service.add_inflight_backend_create(

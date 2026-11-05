@@ -80,12 +80,12 @@ class PublishedPorts:
 
 
 class DindOk:
-    async def verify(self, port, *, ssh_client, host, container_name_prefix, sysbox_runtime, log_ctx=None):
+    async def verify(self, port, *, ssh_client, host, container_name_prefix, sysbox_runtime, log_ctx=None, **_):
         return DindProbeResult(success=True, sysbox_runtime=True, port=port)
 
 
 class DindFails:
-    async def verify(self, port, *, ssh_client, host, container_name_prefix, sysbox_runtime, log_ctx=None):
+    async def verify(self, port, *, ssh_client, host, container_name_prefix, sysbox_runtime, log_ctx=None, **_):
         return DindProbeResult(success=False, sysbox_runtime=False, port=port)
 
 

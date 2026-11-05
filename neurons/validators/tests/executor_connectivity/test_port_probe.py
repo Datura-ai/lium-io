@@ -90,3 +90,26 @@ async def test_port_probe_falls_through_to_fallback_when_batch_and_semi_empty(mo
     batch.verify.assert_called_once()
     semi.verify.assert_called_once()
     fallback.verify.assert_called_once()
+
+
+def _hung_probe(mocker, ports):
+    batch = mocker.Mock()
+    batch.verify = mocker.AsyncMock(return_value=BatchResult([], ports, start_hung=True))
+    semi = mocker.Mock()
+    semi.verify = mocker.AsyncMock(return_value=([], ports))
+    fallback = mocker.Mock()
+    fallback.verify = mocker.AsyncMock(return_value=([], ports))
+    return PortProbe(batch, semi, fallback), semi, fallback
+
+
+@pytest.mark.asyncio
+async def test_port_probe_skips_later_tiers_after_a_hung_start(mocker):
+    ports = [PortPair(9000, 9000)]
+    probe, semi, fallback = _hung_probe(mocker, ports)
+
+    result = await probe.probe(ports, ssh_client=mocker.Mock(), host="127.0.0.1")
+
+    assert list(result.failed) == ports
+    assert result.tier == "batch"
+    semi.verify.assert_not_called()
+    fallback.verify.assert_not_called()
