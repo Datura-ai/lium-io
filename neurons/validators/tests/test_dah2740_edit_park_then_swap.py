@@ -22,7 +22,7 @@ from core.utils import retry_ssh_command
 from services.docker_service import (
     EDIT_PARKED_SUFFIX,
     DockerService,
-    _volume_unmounted_check,
+    _layer_data_check,
     create_steps_after_reply,
     inflight_creates,
 )
@@ -78,6 +78,8 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             names = [n for n in names if not n.startswith("kept_unmounted_")]
             present = kept + [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
             return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
+        if "/usr/bin/docker diff" in cmd:  # the park's layer read: no renter files under the volume path
+            return _ssh_result(stdout="drop\n")
         if cmd == HUNG_GPU_QUERY_COMMAND:  # DAH-5301: the pod's GPU is healthy
             return _ssh_result(stdout="GPU-test, 0, 0\n--compute-apps--\n")
         if "docker stop" in cmd:
@@ -175,8 +177,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
         f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{parked}$ '
         f"--filter name=^kept_unmounted_{payload.pod_id}_",
-        # the volume-mount read of the running container: an unmounted encrypted volume keeps it after the edit
-        _volume_unmounted_check(name),
+        # the layer read: renter files under the volume path keep it after the edit
+        _layer_data_check(name, "/root"),
         f"/usr/bin/docker rename {name} {parked}",
         f"/usr/bin/docker stop -t 10 {parked}",
         # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted
@@ -421,7 +423,7 @@ async def test_a_kill_without_an_exit_event_falls_back_to_killing_the_processes(
         if cmd.startswith("/usr/bin/docker kill"):
             ssh.commands.append(cmd)
             return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
-        if "{{.State.Pid}}" in cmd and "/proc/$p/mounts" not in cmd:  # not the park's volume-mount read
+        if "{{.State.Pid}}" in cmd:
             killed_directly.append(cmd)
         if "docker inspect -f '{{.State.Running}}'" in cmd and killed_directly:
             return _ssh_result(stdout="false\n" if direct_kill_stops else "true\n")
@@ -946,9 +948,9 @@ def _report_unmounted(ssh, unmounted: bool = True):
     answer = ssh.run.side_effect
 
     def _side(cmd, *args, **kwargs):
-        if "{{.State.Pid}}" in cmd and "/proc/$p/mounts" in cmd:
+        if "/usr/bin/docker diff" in cmd:
             ssh.commands.append(cmd)
-            return _ssh_result(stdout="volume-unmounted\n" if unmounted else "")
+            return _ssh_result(stdout="" if unmounted else "drop\n")
         return answer(cmd, *args, **kwargs)
 
     ssh.run.side_effect = _side
@@ -1014,7 +1016,7 @@ def _kept_stop_wedged(ssh):
         if cmd.startswith("/usr/bin/docker stop -t 10 kept_unmounted_") or cmd.startswith("/usr/bin/docker kill kept_unmounted_"):
             ssh.commands.append(cmd)
             return _ssh_result(exit_status=1, stderr=f"cannot stop container: tried to kill container, but {wedged}")
-        if "{{.State.Pid}}" in cmd and "kept_unmounted_" in cmd and "/proc/$p/mounts" not in cmd:
+        if "{{.State.Pid}}" in cmd and "kept_unmounted_" in cmd:
             killed_directly.append(cmd)
             ssh.commands.append(cmd)
             return _ssh_result()
@@ -1042,7 +1044,7 @@ def _kept_stop_wedged(ssh):
 async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
     svc, monkeypatch, start_error, status, renamed_back, stop_wedged
 ):
-    # the remount would hide its layer files, and the retry would then read it as mounted and remove it
+    # the remount would hide its layer files from the renter
     monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
     monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
     payload = _edit_payload()
@@ -1127,24 +1129,31 @@ async def test_a_kept_container_left_by_a_crashed_edit_is_the_pod_and_stays_kept
 
 
 @pytest.mark.parametrize(
-    ("mounts", "kept"),
+    ("mounts", "diff", "kept"),
     [
-        ("/dev/loop1 /lium-cipher ext4 rw 0 0\n", True),  # the ciphertext volume without its plaintext mount
-        ("/dev/loop1 /lium-cipher ext4 rw 0 0\n/lium-cipher /root fuse.gocryptfs rw 0 0\n", False),
-        ("overlay / overlay rw 0 0\n", False),  # no encrypted volume at all
-        (  # a renter's own gocryptfs dataset is not the rental's plaintext mount
-            "/dev/loop1 /lium-cipher ext4 rw 0 0\n"
-            "/data/private-cipher /mnt/private fuse.gocryptfs rw 0 0\n",
-            True,
-        ),
+        # written while the volume was unmounted, since remounted: the layer still holds it, whatever is mounted now
+        ("/lium-cipher\n", "C /\nA /workspace\nA /workspace/data.bin\n", True),
+        ("/lium-cipher\n", "C /root\nC /root/.bashrc\n", False),  # nothing under the volume path
+        ("/lium-cipher\n", "A /workspace\nC /etc\nA /workspace2/x\n", False),  # the path itself, a sibling
+        ("/lium-cipher\n", "D /workspace/old\n", False),  # a deletion holds no renter data
+        ("/lium-cipher\n", None, True),  # docker diff failed: kept
+        ("/workspace\n", "A /workspace/data.bin\n", False),  # no encrypted volume: nothing hidden in the layer
+        (None, "", True),  # docker inspect failed: kept
     ],
 )
-def test_the_volume_mount_read_runs_in_a_real_shell(tmp_path, mounts, kept):
+def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
     import subprocess
 
-    command = _volume_unmounted_check("x").replace(
-        "p=$(/usr/bin/docker inspect -f '{{.State.Pid}}' x)", "p=7"
-    ).replace("/proc/$p/mounts", f"{tmp_path}/$p")
-    (tmp_path / "7").write_text(mounts)
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'[ "$1" = inspect ] && {{ {"exit 1" if mounts is None else "cat " + str(tmp_path / "mounts")}; exit; }}\n'
+        f'[ "$1" = diff ] && {{ {"exit 1" if diff is None else "cat " + str(tmp_path / "diff")}; exit; }}\n'
+        "exit 2\n"
+    )
+    docker.chmod(0o755)
+    (tmp_path / "mounts").write_text(mounts or "")
+    (tmp_path / "diff").write_text(diff or "")
+    command = _layer_data_check("pod_x", "/workspace").replace("/usr/bin/docker", str(docker))
     out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
-    assert out == ("volume-unmounted\n" if kept else "")
+    assert (out.strip() != "drop") is kept

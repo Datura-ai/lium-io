@@ -1716,25 +1716,28 @@ _PARK_KILL_WAIT_SECONDS = 30
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
-# A parked container whose encrypted volume was not mounted at park time holds the renter's writes to the
-# volume path in its own layer (dockerd restarted it by itself, without the gocryptfs mount). It is kept
-# under this prefix after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+# A parked container with renter files in its own layer under the encrypted volume's plaintext path (written
+# while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
+# after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
 KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
-_KEEP_MARK = "volume-unmounted"
+_DROP_MARK = "drop"
 
 
-def _volume_unmounted_check(container_name: str) -> str:
-    """Prints _KEEP_MARK when the container has its ciphertext volume but no gocryptfs plaintext mount.
+def _layer_data_check(container_name: str, plaintext_path: str) -> str:
+    """Prints _DROP_MARK only when the container is safe to remove: no encrypted volume, or no file its layer
+    added or changed under the plaintext path (``docker diff``). Any other output, an error included, keeps it.
 
-    Read from the host (/proc/<init pid>/mounts), so it needs nothing from the renter's image."""
+    The layer is read, not the mounts: files written while unmounted stay in the layer after a remount."""
+    name = shlex.quote(container_name)
+    under = shlex.quote(f"{plaintext_path.rstrip('/')}/")
     awk = (
-        # only the rental's own gocryptfs mount (source /lium-cipher) counts: a renter's other gocryptfs dataset is not it
-        f"$2 == \"{_LIUM_CIPHER_MOUNT}\" {{c=1}} $1 == \"{_LIUM_CIPHER_MOUNT}\" && $3 == \"fuse.gocryptfs\" {{g=1}} "
-        f"END {{if (c && !g) print \"{_KEEP_MARK}\"}}"
+        '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
+        f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
     )
     return (
-        f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_name)}) "
-        f"&& [ \"$p\" -gt 0 ] && awk {shlex.quote(awk)} /proc/$p/mounts"
+        f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
+        f"printf '%s\\n' \"$m\" | grep -qxF {_LIUM_CIPHER_MOUNT} || {{ echo {_DROP_MARK}; exit 0; }}; "
+        f"{{ /usr/bin/docker diff {name} || echo diff-failed; }} | awk -v p={under} {shlex.quote(awk)}"
     )
 
 
@@ -1786,7 +1789,9 @@ class _EditSwap:
         self.replacement_id: str | None = None
         # set when `docker kill` got no exit event and killing the processes directly did not stop it either
         self.unkillable = False
-        # the parked container ran without its encrypted volume mounted: kept, never removed, after a successful edit
+        # the pod's plaintext volume path, set with bring_up: the keep check reads the layer under it
+        self.plaintext_path: str | None = None
+        # the parked container's layer holds renter files under the plaintext path: kept, never removed, after a successful edit
         self.keep_parked = False
 
     async def __aenter__(self) -> "_EditSwap":
@@ -1860,19 +1865,24 @@ class _EditSwap:
             # the leftover parked one is stale and must not block the rename.
             await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
         if recover_kept:
-            # it is stopped, so its mounts cannot be read again: it was kept, so it stays kept
+            # it was kept, so it stays kept
             self.keep_parked = True
             kept.remove(recover_kept)
         else:
-            # read while it still runs: a stopped container has no mounts to read
-            unmounted = await self._run(_volume_unmounted_check(self.container_name))
-            self.keep_parked = _KEEP_MARK in (unmounted.stdout or "")
+            # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
+            # Unknown path or an unreadable diff keeps it.
+            checked = (
+                await self._run(_layer_data_check(self.container_name, self.plaintext_path))
+                if self.plaintext_path
+                else None
+            )
+            self.keep_parked = checked is None or (checked.stdout or "").strip() != _DROP_MARK
         if self.keep_parked:
             if kept:
                 # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
                 raise Exception(
                     f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
-                    "and the encrypted volume is unmounted again; the pod was left as it was"
+                    "and this one holds renter files under the volume path too; the pod was left as it was"
                 )
             # parked straight under the kept name, so no later rename can fail and leave it to a sweep or the next edit
             parked = recover_kept or f"{kept_prefix}{int(time.time())}"
@@ -1988,7 +1998,7 @@ class _EditSwap:
         error: str | None = None
         if self.keep_parked and start:
             # a kept one comes back as dockerd had it, unmounted (the remount would hide its files), and keeps
-            # its kept name until it runs: stopped under the pod name, the next edit could not read it and would remove it
+            # its kept name until it runs: stopped, it keeps the kept name's protection
             try:
                 if self.bring_up is not None:
                     async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
@@ -9950,6 +9960,7 @@ class DockerService:
                         default_extra=default_extra,
                         remount=remount,
                     )
+                    edit_swap.plaintext_path = local_volume_path
                     current_step = "park_current_container"
                     # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
                     # its removal of the container it parked, by that one's ID (never the one this edit parks)
