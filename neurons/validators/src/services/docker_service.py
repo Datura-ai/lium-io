@@ -487,6 +487,7 @@ def _parse_listening_ports(output: str) -> set[int]:
     return ports
 
 
+_DPHN_CACHE_EMPTY_KB = 1024
 _ENGY_CACHE_SIZE_IN_NAME = re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}hf_(\d+)gb_")
 
 
@@ -5664,10 +5665,10 @@ class DockerService:
         re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
         there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
         at the volume step instead of short-changing the renter.
-        A filler this create just killed can still be exiting and mount its Engy cache, so dockerd refuses the
-        `volume rm` (prod 4 Nov, 8x B300): the cache's files are then unlinked on the host (_wipe_volume_cmd), only
-        while every container mounting it is one of ``killed_fillers``; the empty volume is swept later, and a
-        filler asking for it again is charged the whole download (_engy_cache_missing_gb).
+        A filler this create just killed can still be exiting and mount its cache, so dockerd refuses the
+        `volume rm` (prod 4 Nov, 8x B300 Engy and Dolphin): the cache's files are then unlinked on the host
+        (_wipe_volume_cmd), only while every container mounting it is one of ``killed_fillers``; the empty volume
+        is swept later, and a filler asking for it again is charged the whole download (_cache_missing_gb).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -5711,8 +5712,7 @@ class DockerService:
             killed: tuple[str, ...] = tuple(killed_fillers)
 
             def volume_remove(name: str) -> str:
-                # a Dolphin cache is never wiped: its readiness is not measured, so an empty one would read as ready
-                if not killed or not name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+                if not killed:
                     return DockerCommand.volume_remove(name)
                 return (
                     f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
@@ -5847,9 +5847,7 @@ class DockerService:
         )
         # DAH-5192: a partial checkpoint (an interrupted download) is not "present": what it still lacks is charged.
         missing_gb: dict[str, float] = {
-            name: await self._engy_cache_missing_gb(ssh_client, name, default_extra)
-            for name in existing
-            if name.startswith(ENGY_CACHE_VOLUME_PREFIX)
+            name: await self._cache_missing_gb(ssh_client, name, default_extra) for name in existing
         }
         present: list[CacheVolume] = [
             volume for volume in payload.cache_volumes if volume.name in existing and not missing_gb.get(volume.name)
@@ -5909,18 +5907,24 @@ class DockerService:
             return present
         return list(payload.cache_volumes)
 
-    async def _engy_cache_missing_gb(
+    async def _cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
     ) -> float:
         """GB an existing Engy cache still lacks of the checkpoint size in its name; 0 when complete or unknown.
 
+        A Dolphin volume's own size is not known (DPHN_CACHE_SIZE_GB is the whole set), so it is not ready only
+        when empty, as the reclaim's wipe leaves it (DAH-5664): then the set's whole download is charged.
+
         Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
         container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
-        `du` is quick. Unmeasurable reads as complete: mounting what exists costs nothing, as before.
+        `du` is quick. An unmeasurable Engy cache reads as complete: mounting what exists costs nothing, as before.
         """
         expected_gb: float = _cache_download_gb(volume_name)
         if math.isinf(expected_gb):
             return 0
+        is_dphn_cache: bool = volume_name.startswith(DPHN_CACHE_VOLUME_PREFIX)
+        # an unmeasured Dolphin volume can be one the reclaim wiped, so its download is charged
+        unmeasured_missing_gb: float = expected_gb if is_dphn_cache else 0
         try:
             result = await ssh_client.run(
                 f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
@@ -5930,11 +5934,14 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception:
-            return 0
+            return unmeasured_missing_gb
         used_kb: str = ((result.stdout or "").split() or [""])[0]
         if not used_kb.isdigit():
-            return 0
+            return unmeasured_missing_gb
         held_gb: float = int(used_kb) * 1024 / 10**9
+        if is_dphn_cache:
+            # du of an empty directory is a few KB
+            return expected_gb if int(used_kb) < _DPHN_CACHE_EMPTY_KB else 0
         if held_gb >= expected_gb * ENGY_CACHE_COMPLETE_SHARE:
             return 0
         logger.info(
