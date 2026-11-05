@@ -1986,6 +1986,9 @@ class _EditSwap:
                     raise RuntimeError(f"docker rename: {(renamed.stderr or '').strip()}")
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
+                # left running under its kept name, nothing would ever stop it or free the pod's GPUs: stopped,
+                # the next edit recovers it as the crashed-edit kept copy
+                await self._run(f"/usr/bin/docker stop -t 10 {q_parked} 2>/dev/null || true")
         elif not self.keep_parked and (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
             error = f"docker rename: {(renamed.stderr or '').strip()}"
         elif not start:

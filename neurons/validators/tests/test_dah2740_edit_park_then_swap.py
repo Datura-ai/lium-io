@@ -842,6 +842,18 @@ def _kept_not_running(ssh, status):
     ssh.run.side_effect = _side
 
 
+def _kept_rename_fails(ssh):
+    answer = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if "docker rename kept_unmounted_" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="name is already in use")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "start_error, status, renamed_back",
@@ -850,6 +862,7 @@ def _kept_not_running(ssh, status):
         ("Docker SDK start failed: 500 no such device", "running", False),  # start failed: stays kept
         (None, "exited", False),  # start returned but the entrypoint already exited: stays kept
         (None, "restarting", False),  # restart backoff (.State.Running still true): stays kept
+        (None, "running", False),  # running, but the rename to the pod name failed: stopped, stays kept
     ],
 )
 async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch, start_error, status, renamed_back):
@@ -859,6 +872,8 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeyp
     _report_unmounted(ssh)
     if status != "running":
         _kept_not_running(ssh, status)
+    elif not renamed_back and not start_error:
+        _kept_rename_fails(ssh)
     _patch_happy(svc, monkeypatch, ssh)
     docker_client = svc.rental_docker_client_factory.client
     docker_client.start = AsyncMock(side_effect=RuntimeError(start_error) if start_error else None)
@@ -883,8 +898,9 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeyp
     if renamed_back:
         assert ssh.commands[-2:] == [f"/usr/bin/docker inspect -f '{{{{.State.Status}}}}' {kept}", f"/usr/bin/docker rename {kept} {name}"]
         return
-    # not running: it stays stopped under its kept name, and the next (successful) edit keeps it
-    assert _docker(ssh.commands, "rename") == [_docker(ssh.commands, "rename")[0]]
+    # not running (or not renamed): it is stopped under its kept name, and the next (successful) edit keeps it
+    assert _docker(ssh.commands, "rename")[1:] == ([f"/usr/bin/docker rename {kept} {name}"] if status == "running" and not start_error else [])
+    assert ssh.commands[-1] == f"/usr/bin/docker stop -t 10 {kept} 2>/dev/null || true"
     retry = _ssh_recording(container_present=False)
     retry.kept = [kept]
     _patch_happy(svc, monkeypatch, retry)
