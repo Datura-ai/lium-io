@@ -66,14 +66,14 @@ class GpuFaultProbeCheck:
     check_id = "gpu.validate.fault_probe"
     fatal = True
 
-    def __init__(self, enforce: bool = False):
-        # enforce: probe even beside an active filler (the post-rental recheck, DAH-4482)
-        self.enforce = enforce
+    def __init__(self, is_post_rental_recheck: bool = False):
+        # is_post_rental_recheck: probe even beside an active filler (the post-rental recheck, DAH-4482)
+        self.is_post_rental_recheck = is_post_rental_recheck
 
     async def run(self, ctx: Context) -> CheckResult:
         filler_container = get_filler_only_container(ctx)
-        # enforce: the recheck only probes beside a filler after it removed the node's Lium fillers
-        if filler_container and not self.enforce:
+        # the recheck only probes beside a filler after it removed the node's Lium fillers
+        if filler_container and not self.is_post_rental_recheck:
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -134,9 +134,9 @@ class GpuFaultProbeCheck:
 
     def _no_verdict(self, ctx: Context, what: dict[str, Any]) -> CheckResult:
         """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is logged, and under
-        GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. An enforce run is a
+        GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. A post-rental recheck is a
         second probe in the same cycle, so it does not count."""
-        if self.enforce:
+        if self.is_post_rental_recheck:
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),

@@ -62,12 +62,6 @@ def _idle_ctx(context_factory, runner, validation, *, marker=MARKER, gpu_count=2
     )
 
 
-@pytest.fixture
-def probe_flags_off():
-    # no GPU fault probe flags are left to patch; kept so the tests below read unchanged
-    yield
-
-
 # --- the marker, set on a rented cycle ----------------------------------------------------------------------
 
 
@@ -116,7 +110,7 @@ async def test_an_idle_flagged_or_a_clean_rented_read_records_nothing(context_fa
 
 
 @pytest.mark.asyncio
-async def test_no_marker_runs_nothing(context_factory, probe_flags_off):
+async def test_no_marker_runs_nothing(context_factory):
     runner, validation = FakeRunner(), FakeValidation()
 
     result = await PostRentalGpuRecheckCheck().run(
@@ -128,7 +122,7 @@ async def test_no_marker_runs_nothing(context_factory, probe_flags_off):
 
 
 @pytest.mark.asyncio
-async def test_on_a_fault_fails_the_node_and_keeps_the_marker(context_factory, probe_flags_off):
+async def test_on_a_fault_fails_the_node_and_keeps_the_marker(context_factory):
     runner = FakeRunner(probe_stdout("fault", faults=["gpu 1: wrong result in gather"]))
     validation = FakeValidation(_all_cards("", ""))
     ctx = _idle_ctx(context_factory, runner, validation)
@@ -144,7 +138,7 @@ async def test_on_a_fault_fails_the_node_and_keeps_the_marker(context_factory, p
 
 
 @pytest.mark.asyncio
-async def test_on_a_failed_all_cards_matmul_fails_the_node(context_factory, probe_flags_off):
+async def test_on_a_failed_all_cards_matmul_fails_the_node(context_factory):
     runner = FakeRunner(probe_stdout("ok"))
     validation = FakeValidation(_all_cards("", "exit_status=1"))
     ctx = _idle_ctx(context_factory, runner, validation)
@@ -157,7 +151,7 @@ async def test_on_a_failed_all_cards_matmul_fails_the_node(context_factory, prob
 
 
 @pytest.mark.asyncio
-async def test_on_a_pass_clears_the_marker(context_factory, probe_flags_off, caplog):
+async def test_on_a_pass_clears_the_marker(context_factory, caplog):
     runner = FakeRunner(probe_stdout("ok"))
     validation = FakeValidation(_all_cards("", ""))
     ctx = _idle_ctx(context_factory, runner, validation)
@@ -171,9 +165,7 @@ async def test_on_a_pass_clears_the_marker(context_factory, probe_flags_off, cap
 
 
 @pytest.mark.asyncio
-async def test_on_a_probe_without_a_verdict_keeps_the_marker_and_skips_the_streak(
-    context_factory, probe_flags_off
-):
+async def test_on_a_probe_without_a_verdict_keeps_the_marker_and_skips_the_streak(context_factory):
     runner = FakeRunner("python: not found", exit_code=127)
     ctx = _idle_ctx(context_factory, runner, FakeValidation())
     probe_module._unknown_streak.clear()
@@ -190,7 +182,7 @@ async def test_on_a_probe_without_a_verdict_keeps_the_marker_and_skips_the_strea
 @pytest.mark.parametrize(("gpu_count", "cleared"), [(2, False), (1, True)])
 @pytest.mark.asyncio
 async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
-    context_factory, probe_flags_off, gpu_count, cleared
+    context_factory, gpu_count, cleared
 ):
     runner = FakeRunner(probe_stdout("ok"))
     ctx = _idle_ctx(context_factory, runner, FakeValidation(None), gpu_count=gpu_count)
@@ -211,9 +203,7 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
     ],
 )
 @pytest.mark.asyncio
-async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(
-    context_factory, probe_flags_off, all_cards
-):
+async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(context_factory, all_cards):
     ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
 
     result = await PostRentalGpuRecheckCheck().run(ctx)
@@ -223,7 +213,7 @@ async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(
 
 
 @pytest.mark.asyncio
-async def test_a_filler_cycle_renews_the_marker(context_factory, probe_flags_off):
+async def test_a_filler_cycle_renews_the_marker(context_factory):
     runner, validation = FakeRunner(), FakeValidation()
     ctx = _idle_ctx(context_factory, runner, validation)
 
@@ -237,9 +227,7 @@ async def test_a_filler_cycle_renews_the_marker(context_factory, probe_flags_off
 
 
 @pytest.mark.asyncio
-async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
-    context_factory, probe_flags_off
-):
+async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(context_factory):
     filler = "filler_run-1"
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))
     ssh = AsyncMock()
@@ -271,9 +259,8 @@ async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
     assert KEY not in ctx.services.redis.store
 
 
-
 @pytest.mark.asyncio
-async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(context_factory, probe_flags_off):
+async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(context_factory):
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))
     services = build_services(validation=validation)
     services.redis.store[KEY] = json.dumps({**MARKER, "filler_skips": module.FILLER_SKIP_LIMIT})
@@ -298,6 +285,7 @@ async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(con
     assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert runner.calls == [] and validation.calls == 0
     assert KEY in ctx.services.redis.store
+
 
 # --- placement ----------------------------------------------------------------------------------------------
 
@@ -379,7 +367,7 @@ def _reported_ctx(context_factory, runner, validation, *, owner="miner-hotkey"):
 
 
 @pytest.mark.asyncio
-async def test_a_geforce_node_flagged_only_by_renters_gets_the_marker(context_factory, probe_flags_off):
+async def test_a_geforce_node_flagged_only_by_renters_gets_the_marker(context_factory):
     runner = FakeRunner(probe_stdout("fault", faults=["gpu 0: wrong result in gather"]))
     ctx = _reported_ctx(context_factory, runner, FakeValidation(None))
 
@@ -402,7 +390,7 @@ async def test_a_report_on_a_node_listed_under_another_hotkey_marks_nothing(cont
 
 
 @pytest.mark.asyncio
-async def test_a_reported_node_that_just_passed_is_not_re_marked(context_factory, probe_flags_off):
+async def test_a_reported_node_that_just_passed_is_not_re_marked(context_factory):
     ctx = _reported_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(None))
 
     first = await PostRentalGpuRecheckCheck().run(ctx)

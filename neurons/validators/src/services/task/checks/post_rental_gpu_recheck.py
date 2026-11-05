@@ -172,7 +172,9 @@ class PostRentalGpuRecheckCheck:
                 self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
                 return CheckResult(
                     passed=True,
-                    event=render_message(Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what),
+                    event=render_message(
+                        Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what
+                    ),
                 )
 
         probes = await self._run_every_card_probes(ctx, what)
@@ -297,7 +299,7 @@ class PostRentalGpuRecheckCheck:
                 inconclusive = True
             else:
                 failures.append(f"all-cards matmul: {all_cards_probe.failure_reason}")
-        probe = await GpuFaultProbeCheck(enforce=True).run(ctx)
+        probe = await GpuFaultProbeCheck(is_post_rental_recheck=True).run(ctx)
         what["fault_probe"] = {
             "reason": probe.event.reason_code,
             "error": probe.event.what_we_saw.get("error"),
