@@ -80,8 +80,6 @@ class JobResult(BaseModel):
     # DAH-5128: what Lium's fillers earn per hour in total on the node's GPU model; the most all its
     # idle spot nodes are paid together. None = no usable sample
     filler_revenue_usd_per_hour: float | None = None
-    # DAH-5677: H100 SXM modules on PCIe adapter boards, listed as H100 PCIe; idle pay comes from filler earnings
-    sxm_on_pcie_adapter: bool = False
 
     # tdx attestation relevant fields
     attestation_digest: str | None = None
@@ -96,6 +94,8 @@ class JobResult(BaseModel):
     # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
     # None when the node has no rented pod with an ssh_port or the probe did not run.
     pod_ssh: list[PodSshObservation] | None = None
+    # DAH-5651: ContextState.host_runtime_fault, this cycle's DinD test container on the host never answered
+    host_runtime_fault: bool = False
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False

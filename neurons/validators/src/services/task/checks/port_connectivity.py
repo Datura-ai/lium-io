@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import TypedDict
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
-from services.const import DEFAULT_JOB_OWNER_LIUM, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
+from services.const import DEFAULT_JOB_OWNER_LIUM, MIN_PORT_COUNT, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
 from services.redis_service import VerifiedPortsMemory
 
@@ -142,6 +142,11 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        # imported here: port_count also imports from this module, so a top-level import is circular
+        from .port_count import split_port_requirement
+
+        split_need = split_port_requirement(ctx.state)
+
         gate = await self._disk_pressure_gate(ctx, rented_data, rented_executor, filler_ports)
         if gate.deferred:
             return await self._deferred(ctx, gate, extra, busy_ports=set(rented_ports) | set(filler_ports))
@@ -168,6 +173,10 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
+            # a rented node is exempt from the split requirement (PortCountCheck), so only the floor applies;
+            # one whose every listed pod is stale is re-probed to its split target by TenantEnforcementCheck
+            min_ports=split_need[1] if split_need and not (rented_executor and rented_executor.pods)
+            else MIN_PORT_COUNT,
             dind_deadline_monotonic=time.monotonic() + task_seconds_left(ctx) - CHECKS_AFTER_DIND_RESERVE_SECONDS,
         )
         if probe_sysbox and not ctx.state.sysbox_runtime:
@@ -221,6 +230,8 @@ class PortConnectivityCheck:
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
             externally_unreachable=result.status == "externally_unreachable",
+            host_runtime_fault=result.host_runtime_fault,
+            external_probe_blocked=result.external_probe == "blocked",
         )
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
@@ -276,7 +287,11 @@ class PortConnectivityCheck:
         if result.failed_ports:
             msg += f" fail={len(result.failed_ports)}{fail_sample}"
 
-        if result.status != "ok":
+        # DAH-3266: the rental holds every declared port, so nothing was free to probe: not a port fault
+        declared = sum(r.declared for r in result.port_ranges)
+        all_ports_rented = result.status == "no_ports" and declared > 0 and len(rented_ports) >= declared
+
+        if result.status != "ok" and not all_ports_rented:
             # Fetch fresh rental data from backend to ensure we have latest state
             backend_client = ctx.services.backend
             fresh_rented_data = await backend_client.get_all_rented_executors()
@@ -342,7 +357,7 @@ class PortConnectivityCheck:
             )
 
         event = render_message(
-            Msg.VERIFY_OK,
+            Msg.SKIPPED_ALL_PORTS_RENTED if all_ports_rented else Msg.VERIFY_OK,
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},

@@ -176,6 +176,11 @@ class ContextState:
     dind_probe_error: DindLogCause | None = None
     # the outside prober could not reach the ports: our filler's ports are behind the same firewall
     externally_unreachable: bool = False
+    # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
+    # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
+    host_runtime_fault: bool = False
+    # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
+    external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
@@ -198,6 +203,8 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
+    verifyx_cold_retry: Any = None
 
 
 class CheckResult(BaseModel):
@@ -651,9 +658,13 @@ class Pipeline:
                 )
                 last_of_run = index == last_index and position == len(ran_checks) - 1
                 if failed or res.halt or last_of_run:
+                    # the failed event's own check: a composite check (the cold retry's disk judgement) fails
+                    # with another check's event, and the provider timeline names the step from this
                     res.event.what_we_saw.update(
                         summarize_steps(
-                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                            steps,
+                            elapsed_time_ms,
+                            failed_check_id=(res.event.check_id or chk.check_id) if failed else None,
                         )
                     )
 
