@@ -440,7 +440,7 @@ async def test_a_kill_without_an_exit_event_falls_back_to_killing_the_processes(
         if cmd.startswith("/usr/bin/docker kill"):
             ssh.commands.append(cmd)
             return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
-        if "{{.State.Pid}}" in cmd:
+        if "{{.State.Pid}}" in cmd and "docker diff" not in cmd:  # not the layer read
             killed_directly.append(cmd)
         if "docker inspect -f '{{.State.Running}}'" in cmd and killed_directly:
             return _ssh_result(stdout="false\n" if direct_kill_stops else "true\n")
@@ -1028,6 +1028,30 @@ async def test_a_write_between_the_layer_read_and_the_stop_keeps_the_parked_cont
 
 
 @pytest.mark.asyncio
+async def test_the_stopped_layer_read_reuses_the_upper_dir_the_running_read_found(svc, monkeypatch):
+    # the containerd store names the upper dir only in a running container's mounts
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    answer = ssh.run.side_effect
+    name = _pod_name(payload)
+
+    def _side(cmd, *args, **kwargs):
+        if cmd == _layer_data_check(name, "/root"):
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="upper /var/lib/docker/x/fs\ndrop\n")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert _layer_data_check(f"id-{name}", "/root", "/var/lib/docker/x/fs") in ssh.commands
+    assert _docker(ssh.commands, "rm -fv id-") == [f"/usr/bin/docker rm -fv id-{name}"]
+
+
+@pytest.mark.asyncio
 async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_the_edit_before_the_replacement(svc, monkeypatch):
     # the one-kept limit holds for a write seen only on the stopped layer: the edit fails and the pod comes back
     payload = _edit_payload()
@@ -1105,7 +1129,7 @@ def _kept_stop_wedged(ssh):
         if cmd.startswith("/usr/bin/docker stop -t 10 kept_unmounted_") or cmd.startswith("/usr/bin/docker kill kept_unmounted_"):
             ssh.commands.append(cmd)
             return _ssh_result(exit_status=1, stderr=f"cannot stop container: tried to kill container, but {wedged}")
-        if "{{.State.Pid}}" in cmd and "kept_unmounted_" in cmd:
+        if "{{.State.Pid}}" in cmd and "kept_unmounted_" in cmd and "docker diff" not in cmd:
             killed_directly.append(cmd)
             ssh.commands.append(cmd)
             return _ssh_result()
@@ -1251,34 +1275,50 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
 
 
 @pytest.mark.parametrize(
-    ("created_ago", "startup_shortcut", "kept"),
+    ("created_ago", "store", "kept"),
     [
-        (0, True, False),  # written by the image's startup, before the first mount: not the renter's
-        (3600, True, True),  # written an hour after creation: an unmounted restart, the renter's
-        (0, False, True),  # a copy already kept: the age bound never releases it, only docker diff decides
+        (0, "overlay2", False),  # written by the image's startup, before the first mount: not the renter's
+        (3600, "overlay2", True),  # written an hour after creation: an unmounted restart, the renter's
+        (0, "containerd", False),  # no UpperDir in inspect: the running container's root mount names it
+        (3600, "containerd", True),
+        (0, "given", False),  # stopped on the containerd store: the upper dir the running read used
+        (0, "none", True),  # no upper dir anywhere: docker diff decides, and lists the startup file
     ],
 )
-def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, startup_shortcut, kept):
+def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, store, kept):
+    # the SSH session is the executor's container: the host's files are only under /proc/1/root
     import subprocess
     import time
 
-    upper = tmp_path / "upper"
+    host_upper = "/var/lib/docker/x/diff"
+    proc = tmp_path / "proc"
+    upper = proc / "1" / "root" / host_upper.lstrip("/")
     (upper / "root" / ".jupyter").mkdir(parents=True)
     (upper / "root" / ".jupyter" / "lab.json").write_text("{}")
+    (proc / "4242").mkdir()
+    (proc / "4242" / "mountinfo").write_text(
+        "1 0 0:1 / /proc rw - proc proc rw\n"
+        f"2 0 0:2 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
+    )
     created = time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - created_ago))
+    inspect = {"overlay2": f"{created} 4242 {host_upper}", "containerd": f"{created} 4242 <no value>"}.get(
+        store, f"{created} 0 <no value>"
+    )
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        f'case "$3" in *Created*) echo "{created} {upper}"; exit;; esac\n'
+        f'case "$3" in *Created*) echo "{inspect}"; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         # docker diff lists the same file: only the upper-dir read can tell it is startup noise
         '[ "$1" = diff ] && { printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }\n'
         "exit 2\n"
     )
     docker.chmod(0o755)
-    command = _layer_data_check("pod_x", "/root", startup_shortcut).replace("/usr/bin/docker", str(docker))
-    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
-    assert (out.strip() != "drop") is kept
+    command = _layer_data_check("pod_x", "/root", host_upper if store == "given" else None)
+    command = command.replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout.strip().splitlines()
+    assert (out[-1:] != ["drop"]) is kept
+    assert (f"upper {host_upper}" in out) is (store != "none")
 
 
 @pytest.mark.asyncio
@@ -1295,9 +1335,8 @@ async def test_a_clean_kept_leftover_next_to_the_pod_is_removed_before_parking(s
     assert isinstance(result, ContainerCreated)
     removed = ssh.commands.index(f"/usr/bin/docker rm -fv id-{old}")
     assert removed < ssh.commands.index(f"/usr/bin/docker rename {_pod_name(payload)} {_kept(payload)}")
-    # an already-kept copy is released by docker diff alone, never by the startup-age bound
-    leftover_read = next(c for c in ssh.commands if "/usr/bin/docker diff" in c and f"id-{old}" in c)
-    assert "-newerct" not in leftover_read
+    # the same read as any container: a validator restart's clean copy is released, not kept for good
+    assert _layer_data_check(f"id-{old}", "/root") in ssh.commands
 
 
 @pytest.mark.asyncio
