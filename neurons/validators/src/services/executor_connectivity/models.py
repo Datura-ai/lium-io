@@ -29,6 +29,8 @@ class BatchResult:
     failed: list[PortPair]
     # DAH-4537: "blocked" when the validator reached the sampled ports but the outside prober reached none of them
     external: ExternalReading = None
+    # DAH-5682: every attempt ran out of time while `docker run` of its test container had not returned
+    start_hung: bool = False
 
 
 @dataclass(frozen=True)

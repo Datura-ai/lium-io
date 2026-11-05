@@ -1388,6 +1388,76 @@ async def test_delete_filler_stops_with_reduced_grace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("removal_fails", "stopped"), [(True, False), (True, True), (False, False), (False, True)]
+)
+async def test_delete_filler_restores_cap_claim_only_when_removal_fails(
+    docker_service,
+    monkeypatch,
+    removal_fails,
+    stopped,
+):
+    # Review (#1583): the claim is cleared before the stop; only if the graceful stop and the
+    # forced removal both fail may the filler still run with our cap, so only then it goes back.
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "services.docker_service.restore_filler_pod_gpu_power_limits", AsyncMock(return_value=0)
+    )
+    clear_claims = AsyncMock(return_value={"GPU-a": 280})
+    monkeypatch.setattr("services.docker_service.clear_filler_pod_applied_caps", clear_claims)
+    restore_claims = AsyncMock()
+    monkeypatch.setattr("services.docker_service.restore_filler_pod_applied_caps", restore_claims)
+    monkeypatch.setattr(docker_service, "_stop_container_gracefully", AsyncMock(return_value=stopped))
+    if removal_fails:
+        monkeypatch.setattr(
+            docker_service, "_force_remove_or_kill", AsyncMock(side_effect=RuntimeError("remove failed"))
+        )
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        container_name="filler_claim",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted) is not removal_fails
+    if removal_fails and not stopped:
+        restore_claims.assert_awaited_once()
+        assert restore_claims.await_args.args[1] == {"GPU-a": 280}
+    else:
+        restore_claims.assert_not_awaited()
+    # Review (#1924): once the container is gone the claim is cleared again
+    assert clear_claims.await_count == (1 if removal_fails else 2)
+
+
+@pytest.mark.asyncio
 async def test_delete_container_redis_failures_still_deleted(
     docker_service,
     retry_ssh_mock,
@@ -2388,6 +2458,12 @@ async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service)
 def _patch_create_container_happy_path(docker_service, monkeypatch):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+
+    # the edit swap's bounded commands open with create_process; answer them through run, as a test sets it
+    async def create_process(command: str):
+        return Mock(wait=lambda: ssh_client.run(command), wait_closed=AsyncMock())
+
+    ssh_client.create_process = create_process
     monkeypatch.setattr(
         "services.docker_service.asyncssh.connect",
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
@@ -4215,6 +4291,134 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
 
     assert isinstance(result, ContainerCreated)
     assert docker_client.pulled_images == [payload.docker_image]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workload_kind, answers, outcome",
+    [
+        (WorkloadKind.CUSTOMER_RENTAL, True, "created"),
+        (WorkloadKind.CUSTOMER_RENTAL, False, "failed at ssh_ready"),  # F-1679: a reboot said success
+        (WorkloadKind.FILLER, False, "created, not checked"),
+        # an image our bootstrap cannot give sshd: the renter may run it without SSH (never turned away)
+        (WorkloadKind.CUSTOMER_RENTAL, False, "created, no sshd, not checked"),
+    ],
+)
+async def test_a_create_succeeds_only_once_the_pods_ssh_port_answers(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path, workload_kind, answers, outcome
+):
+    """DAH-5618: the check runs on the node's address and the port mapped to the pod's 22, only where
+    SSH is expected (our bootstrap left sshd listening)."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    monkeypatch.setattr(
+        docker_service,
+        "install_open_ssh_server_and_start_ssh_service_with_rental_docker",
+        AsyncMock(return_value="no sshd" not in outcome),
+    )
+    if not answers:
+        pod_ssh_answers_on_create_path.side_effect = RuntimeError("the pod's SSH port 20001 did not answer")
+    payload = _private_registry_create_payload().model_copy(update={"workload_kind": workload_kind})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    if outcome == "failed at ssh_ready":
+        assert isinstance(result, FailedContainerRequest)
+        assert result.failure_step == "ssh_ready" and "did not answer" in result.detail
+    else:
+        assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    if "not checked" in outcome:
+        pod_ssh_answers_on_create_path.assert_not_awaited()
+    else:
+        pod_ssh_answers_on_create_path.assert_awaited_once()
+        assert pod_ssh_answers_on_create_path.await_args.args == ("127.0.0.1", 20001)
+
+
+@pytest.mark.asyncio
+async def test_the_ssh_check_probes_the_port_a_collision_retry_moved_22_to(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """DAH-5618: a port collision on create remaps 22 in place; the check reads the port the pod got."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    real_run = docker_service._run_rental_docker_create_with_port_retry
+
+    async def run_and_remap(**kwargs):
+        container_id = await real_run(**kwargs)
+        kwargs["port_maps"][0] = (22, 20002, 20002)
+        return container_id
+
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_and_remap)
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert pod_ssh_answers_on_create_path.await_args.args == ("127.0.0.1", 20002)
+
+
+@pytest.mark.asyncio
+async def test_a_template_that_starts_its_own_sshd_is_checked_without_the_bootstrap(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """DAH-5618: a template that declares SSH (ships_sshd) skips our bootstrap; SSH is still expected."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    bootstrap = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", bootstrap)
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", AsyncMock())
+    payload = _private_registry_create_payload().model_copy(update={"ships_sshd": True})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    bootstrap.assert_not_awaited()
+    pod_ssh_answers_on_create_path.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -8933,7 +9137,7 @@ async def test_a_key_write_that_fails_in_a_running_container_keeps_the_exec_erro
     assert _failure_error_field(result).startswith("Failed to add SSH public keys inside container")
 
 
-@pytest.mark.parametrize("exit_status", [90, 91, 92, 1])
+@pytest.mark.parametrize("exit_status", [90, 91, 92])
 @pytest.mark.asyncio
 async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
     docker_service, monkeypatch, exit_status
@@ -8945,6 +9149,43 @@ async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
     assert result.failure_step == "encrypted_volume_setup"
     assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
     inspect.assert_not_awaited()
+
+
+# prod 3 Nov: a renter image exiting at start ("workspace mount required") failed the setup exec itself
+# with "OCI runtime exec failed" (exit 127/128), and the renter read only "Failed create_container".
+@pytest.mark.parametrize("exit_status", [1, 127, 128])
+@pytest.mark.asyncio
+async def test_a_setup_exec_docker_could_not_run_in_a_running_container_fails_the_encryption(
+    docker_service, monkeypatch, exit_status
+):
+    result, inspect = await _create_with_volume_setup_exit(
+        docker_service, monkeypatch, exit_status=exit_status, state=_state()
+    )
+
+    assert result.failure_step == "encrypted_volume_setup"
+    assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
+    inspect.assert_awaited()
+
+
+@pytest.mark.parametrize("exit_status", [127, 128])
+@pytest.mark.asyncio
+async def test_a_setup_exec_that_fails_on_an_exiting_image_names_the_image(
+    docker_service, monkeypatch, exit_status
+):
+    result, _ = await _create_with_volume_setup_exit(
+        docker_service,
+        monkeypatch,
+        exit_status=exit_status,
+        state=_state(status="restarting", running=True, restarting=True, exit_code=1, restart_count=1),
+    )
+
+    # the step lium-platform reads the image-exit markers at, so the renter gets the start-command hint
+    assert result.failure_step == "add_public_keys"
+    assert result.volume_encryption_status is None
+    error = _failure_error_field(result)
+    assert "is restarting" in error, error
+    assert f"image {_CUDA_IMAGE!r} has no long-running command" in error
+    assert f"exit_status={exit_status}" in error
 
 
 _OOM_STATES = {

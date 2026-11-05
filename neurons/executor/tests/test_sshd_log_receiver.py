@@ -120,3 +120,45 @@ def test_a_full_spool_drops_logins_with_a_marker_then_a_count(tmp_path, monkeypa
     assert lines[0].endswith("3 logins dropped while the spool was full") and lines[1].endswith(
         ACCEPTED
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "shared"),
+    [
+        ("203.0.113.9", False),
+        ("172.17.0.1", True),  # Docker gateway
+        ("10.0.2.2", True),  # QEMU slirp
+        ("192.168.1.20", True),
+        ("100.64.3.4", True),  # CGNAT
+        ("127.0.0.1", True),
+        ("::ffff:10.1.2.3", True),
+        ("2001:db8::1", False),
+    ],
+)
+def test_a_login_from_a_shared_address_turns_the_per_source_limits_off(tmp_path, monkeypatch, source, shared):
+    # PR review, 3 Nov: behind NAT every client is one private address, so the limits would lock out the validator
+    off = tmp_path / "lium-source-limits-off.conf"
+    off.write_text("PerSourceMaxStartups none\nPerSourcePenalties no\n")
+    off_in = tmp_path / "00-lium-source-limits-off.conf"
+    pid_file = tmp_path / "sshd.pid"
+    pid_file.write_text("4242\n")
+    monkeypatch.setattr(sshd_log_receiver, "SOURCE_OFF", str(off))
+    monkeypatch.setattr(sshd_log_receiver, "SOURCE_OFF_IN", str(off_in))
+    monkeypatch.setattr(sshd_log_receiver, "SSHD_PID_FILE", str(pid_file))
+    signals = []
+    monkeypatch.setattr(sshd_log_receiver.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    line = ACCEPTED.replace("203.0.113.9", source)
+    assert sshd_log_receiver.shared_source(line) is shared
+    # PR review, 3 Nov: the connection line, before authentication, so scanners cannot fill PerSourceMaxStartups first
+    connection = f"<38>Oct 18 06:27:29 sshd-session[811]: Connection from {source} port 51022 on 172.17.0.2 port 22"
+    assert sshd_log_receiver.shared_source(connection) is shared
+    # a client-chosen user name cannot pose as one
+    assert not sshd_log_receiver.shared_source(
+        f"<38>Oct 18 06:27:32 sshd[815]: Invalid user x Connection from {source} port 1 from 198.51.100.4 port 4023"
+    )
+    if shared:
+        sshd_log_receiver.turn_off_source_limits()
+        sshd_log_receiver.turn_off_source_limits()  # once in place, no second reload
+        assert off_in.read_text() == off.read_text()
+        assert signals == [(4242, sshd_log_receiver.signal.SIGHUP)]

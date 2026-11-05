@@ -873,7 +873,7 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
 
     assert str(raised.value) == f"{action}{message}"
     assert session.puts[-1]["json"]["error_message"] == f"{action}{message}"
-    assert [c for c in calls if c[0] != "dmesg"][-1][1:3] == ["rm", "--force"]
+    assert [c for c in calls if c[0] != "dmesg" and c[1] != "events"][-1][1:3] == ["rm", "--force"]
     # detached runs delete stderr, so the state line must reach the reported operation logs
     log = "\n".join(session.puts[-1]["json"]["logs"] or [])
     assert ("docker state" in log) is (oom_killed is not True)
@@ -889,6 +889,47 @@ def test_killed_helper_reports_oom_only_when_docker_or_the_kernel_says_so(
         assert OOM_KILL_DMESG.splitlines()[1] not in log
 
 
+
+
+def test_removed_helper_logs_its_docker_events_and_matches_the_kernel_by_their_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events_out = "\n".join(
+        json.dumps({"id": HELPER_ID, "Action": action, "time": 1000 + i, "Actor": {"ID": HELPER_ID, "Attributes": attrs}})
+        for i, (action, attrs) in enumerate(
+            [("kill", {"signal": "9", "image": "x"}), ("die", {"exitCode": "137"}), ("destroy", {})]
+        )
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        if "inspect" in command:
+            return SimpleNamespace(returncode=1, stdout="", stderr="Error: No such container: x")
+        if "events" in command:
+            return SimpleNamespace(returncode=0, stdout=events_out + "\nnot json\n", stderr="")
+        if command[0] == "dmesg":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps([{"id": SNAPSHOT_ID}]), stderr="")
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)
+    monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
+    monkeypatch.setattr("storage.restic.subprocess.Popen", _KilledPopen)
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="backup"))
+    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
+    output = io.StringIO()
+    runner = ResticStorageRunner(operation, workspace, event_writer=JsonEventWriter(str(OPERATION_ID), 0, output=output))
+
+    with pytest.raises(ResticOperationError, match="removed while running"):
+        runner.run()
+
+    events_call = next(c for c in calls if "events" in c)
+    assert events_call[events_call.index("--filter") + 1] == f"container=lium-storage-{str(OPERATION_ID)[:12]}"
+    log = output.getvalue()
+    assert 'kill {\\"signal\\": \\"9\\"}' in log and "destroy {}" in log
+    assert f"{HELPER_ID[:12]} kill" in log  # the ID is logged for correlation when dmesg has no match
+    assert "image" not in log.split("helper docker events")[1].split("\n")[0]
+    assert "kernel: no kernel kill line for the helper" in log  # the ID from the events reached the kernel check
 
 
 def test_kernel_kill_lines_match_the_helper_container_only() -> None:
@@ -1838,6 +1879,33 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
             validate()
 
 
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "message"),
+    [
+        (20, "", "backup source is not a directory: /root"),
+        (1, "nsenter: cannot open /proc/123/ns/user: No such file\n",
+         "could not check backup path /root: exit 1: nsenter: cannot open /proc/123/ns/user: No such file"),
+    ],
+)
+def test_encrypted_path_check_reports_the_real_failure(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stderr: str, message: str
+) -> None:
+    """DAH-5691: only the script's own exit code means "not a directory"; docker/nsenter errors surface as-is"""
+    monkeypatch.setattr(
+        "storage.workspace.subprocess.run",
+        lambda command, **kwargs: SimpleNamespace(returncode=returncode, stdout="", stderr=stderr),
+    )
+    with pytest.raises(WorkspaceResolutionError) as raised:
+        WorkspaceResolver(docker_binary="docker")._validate_encrypted_path(
+            image="executor:test",
+            pid=123,
+            visible_path=PurePosixPath("/proc/123/root/root"),
+            requested_path=PurePosixPath("/root"),
+            action=StorageAction.BACKUP,
+        )
+    assert str(raised.value) == message
+
 EXPIRED_LINE = "Save(<data/1234>) returned error, retrying after 1s: ExpiredToken: The provided token has expired.\n"
 
 
@@ -2143,3 +2211,33 @@ def test_partial_restore_counts_files_left_on_the_pod() -> None:
     final = session.requests[-1]["json"]
     assert final["error_message"].startswith("Restored 398 of 403 files; 5 were removed")
     assert final["processed_files"] == 398
+
+
+def test_real_restic_finds_the_parent_when_the_backup_path_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restic_binary: str
+) -> None:
+    """An encrypted pod's /proc/<pid>/root path changes on restart: the second backup must still find its parent."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for index in range(20):
+        (workspace / f"file{index}").write_text(str(index))
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(workspace))
+    commands = []
+    monkeypatch.setattr(runner, "_stream", lambda command, **kwargs: commands.append(command) or (0, {"snapshot_id": SNAPSHOT_ID}))
+    runner._backup()
+    env = {**os.environ, "RESTIC_REPOSITORY": str(tmp_path / "repo"), "RESTIC_PASSWORD": "test"}
+    subprocess.run([restic_binary, "init"], env=env, check=True, capture_output=True)
+
+    summaries = []
+    for name in ("before-restart", "after-restart"):
+        path = tmp_path / name
+        path.symlink_to(workspace)
+        # restic reads the backup path from PWD, as the shell's cd leaves it
+        result = subprocess.run(
+            [restic_binary, *commands[0]], cwd=path, env={**env, "PWD": str(path)}, check=True, capture_output=True, text=True
+        )
+        summaries.append(next(m for m in map(json.loads, result.stdout.splitlines()) if m.get("message_type") == "summary"))
+
+    assert summaries[0]["files_new"] == 20
+    assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
+
