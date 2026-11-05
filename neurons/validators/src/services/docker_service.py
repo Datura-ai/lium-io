@@ -1891,7 +1891,13 @@ class _EditSwap:
         for leftover in list(kept):
             # every edit parks under the kept name, so a clean one is an earlier edit's copy whose removal failed
             if await self._layer_safe_to_remove(ids_by_name.get(leftover) or leftover, already_kept=True):
-                await self._run(f"/usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)} 2>/dev/null || true")
+                removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)}")
+                if removed.exit_status != 0:
+                    # a clean copy Docker will not remove: parking another under a new name would pile them up
+                    raise Exception(
+                        f"[park_current_container] a clean container from an earlier edit ({leftover}) could not be "
+                        f"removed: {(removed.stderr or '').strip() or f'exit {removed.exit_status}'}; the pod was left as it was"
+                    )
                 kept.remove(leftover)
         # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
         # Unknown path or an unreadable diff keeps it.
@@ -2006,7 +2012,7 @@ class _EditSwap:
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(
-                            "Parked container could not be removed after edit; left for the stale sweep",
+                            "Parked container could not be removed after edit; the next edit removes it or stops",
                             extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": (removed.stderr or "").strip()}),
                         )
                     )

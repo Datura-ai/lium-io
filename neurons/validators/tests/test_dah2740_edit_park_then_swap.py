@@ -1293,8 +1293,32 @@ async def test_a_clean_kept_leftover_next_to_the_pod_is_removed_before_parking(s
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    removed = ssh.commands.index(f"/usr/bin/docker rm -fv id-{old} 2>/dev/null || true")
+    removed = ssh.commands.index(f"/usr/bin/docker rm -fv id-{old}")
     assert removed < ssh.commands.index(f"/usr/bin/docker rename {_pod_name(payload)} {_kept(payload)}")
     # an already-kept copy is released by docker diff alone, never by the startup-age bound
     leftover_read = next(c for c in ssh.commands if "/usr/bin/docker diff" in c and f"id-{old}" in c)
     assert "-newerct" not in leftover_read
+
+
+@pytest.mark.asyncio
+async def test_a_clean_kept_leftover_docker_will_not_remove_fails_the_edit_before_parking(svc, monkeypatch):
+    # counting it as gone would park another copy under a new name each edit, and they would pile up
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _patch_happy(svc, monkeypatch, ssh)
+    side = ssh.run.side_effect
+
+    def _rm_fails(cmd, *args, **kwargs):
+        if cmd == f"/usr/bin/docker rm -fv id-{old}":
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="device or resource busy")
+        return side(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _rm_fails
+
+    result = await _run(svc, payload)
+
+    assert not isinstance(result, ContainerCreated)
+    assert not any(c.startswith(f"/usr/bin/docker rename {_pod_name(payload)} ") for c in ssh.commands)
