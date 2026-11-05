@@ -21,5 +21,7 @@ COPY . .
 
 ENV ENV=prod
 ENV PYTHONUNBUFFERED=1
+# a crash in native code prints the Python stack instead of a bare exit code
+ENV PYTHONFAULTHANDLER=1
 
 CMD ["bash", "run.sh"]
