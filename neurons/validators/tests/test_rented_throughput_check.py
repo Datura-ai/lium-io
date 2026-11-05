@@ -313,6 +313,51 @@ async def test_a_standing_slow_verdict_does_not_expire_with_time():
         assert not late.passed and late.event.reason_code == Msg.SLOW.reason and len(runner.commands) == 2
 
 
+# a lone strike past STREAK_GAP_SECONDS keeps its 30-min retry: the overdue reading runs (the strike expires only then)
+# and late cycles still count toward NOT_RUN
+@pytest.mark.parametrize("gap_minutes, reason", [(89, Msg.SLOW.reason), (91, Msg.SLOW_ONCE.reason), (300, Msg.SLOW_ONCE.reason)])
+async def test_an_overdue_retry_still_measures_and_expires_the_strike_only_then(gap_minutes, reason):
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_NET, SLOW_NET)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += gap_minutes * 60
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        for skips in range(1, module.LATE_SKIPS_BEFORE_VERDICT):
+            assert (await check.run(late)).event.reason_code == Msg.SKIPPED.reason
+            assert stored(ctx)["late_skips"] == skips
+        assert (await check.run(late)).event.reason_code == Msg.NOT_RUN.reason
+        assert (await check.run(ctx)).event.reason_code == reason and len(runner.commands) == 2
+
+
+SLOW_BOTH = snaps() + disk(secs=30.0) + SLOW
+
+
+# each side's lone strike expires on its own; a confirmed side's streak stays (net, disk counts after the reading)
+@pytest.mark.parametrize(
+    "before, after, counts, reason",
+    [
+        ([SLOW_NET, SLOW_BOTH], SLOW_DISK, (0, 1), Msg.SLOW_ONCE.reason),  # stale disk strike gone, net passed
+        ([SLOW_DISK, SLOW_BOTH], SLOW_NET, (1, 0), Msg.SLOW_ONCE.reason),  # stale net strike gone, disk passed
+        ([SLOW_NET, SLOW_BOTH], SLOW_BOTH, (3, 1), Msg.SLOW.reason),  # confirmed net kept, disk restarts
+        ([SLOW_DISK, SLOW_BOTH], SLOW_BOTH, (1, 3), Msg.SLOW.reason),  # confirmed disk kept, net restarts
+        ([SLOW_BOTH], SLOW_BOTH, (1, 1), Msg.SLOW_ONCE.reason),
+    ],
+    ids=["stale-disk", "stale-net", "confirmed-net", "confirmed-disk", "both-stale"],
+)
+async def test_stale_strikes_expire_per_side(before, after, counts, reason):
+    with flags() as clock:
+        ctx, _ = make_ctx(*before, after)
+        check = RentedThroughputCheck()
+        for _ in before:
+            await check.run(ctx)
+            clock.now += 31 * 60
+        clock.now += 5 * 3600
+        assert (await check.run(ctx)).event.reason_code == reason
+        assert (stored(ctx)["net_failures"], stored(ctx)["disk_failures"]) == counts
+        assert stored(ctx)["failures_in_a_row"] == max(counts)
+
+
 # the host NICs busy either way (inconclusive), or their counters unreadable (no verdict): no strike, the streak stays
 @pytest.mark.parametrize("busy", [BUSY_NET, BUSY_UPLOAD, NO_COUNTERS])
 async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):

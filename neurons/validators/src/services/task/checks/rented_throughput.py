@@ -422,7 +422,7 @@ class RentedThroughputCheck:
     cannot be read makes it inconclusive; an unsure measurement stays inconclusive. Incomplete pod counters (a pod stopped, restarted or unreadable) make a
     failing side inconclusive too. Inconclusive = no strike and no pass however many in a row (owner decision: IO that
     cannot be attributed never fails a node), re-probed after RETRY_SECONDS.
-    READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart; a single failure older than
+    READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart; a side's lone failure older than
     STREAK_GAP_SECONDS starts no streak) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading; so do LATE_SKIPS_BEFORE_VERDICT due readings in a row
     skipped for too little cycle time (RENTED_THROUGHPUT_NOT_RUN), until a reading completes. Non-fatal: the rental keeps running.
@@ -464,9 +464,6 @@ class RentedThroughputCheck:
         ):
             state = unsaved
         now = time.time()
-        # only a strike short of a verdict expires: a standing SLOW stays until a reading passes
-        if state is not None and 0 < state.failures_in_a_row < READINGS_BEFORE_VERDICT and now - state.at > STREAK_GAP_SECONDS:
-            state = replace(state, failures_in_a_row=0, net_failures=0, disk_failures=0)
         if state is None:
             state = _State(at=now - phase_offset_seconds(ctx.executor.uuid))
             # kept even unsaved, else each cycle recreates it and the first reading never comes due
@@ -486,10 +483,11 @@ class RentedThroughputCheck:
         skip_under_pressure = await self._reserve_probe_skip(ctx, key, state)
         reading, net, disk = await self._measure_and_judge(ctx, skip_under_pressure=skip_under_pressure)
         reading["inconclusive"] = "inconclusive" in (net, disk)
-        net_failures, disk_failures = (
-            _step(state.net_failures, net),
-            _step(state.disk_failures, disk),
-        )
+        net_failures, disk_failures = state.net_failures, state.disk_failures
+        if now - state.at > STREAK_GAP_SECONDS:
+            # per side, only a strike short of a verdict expires: a standing SLOW stays until a reading passes
+            net_failures, disk_failures = (n if n >= READINGS_BEFORE_VERDICT else 0 for n in (net_failures, disk_failures))
+        net_failures, disk_failures = _step(net_failures, net), _step(disk_failures, disk)
         failures = max(net_failures, disk_failures)
         state = _State(
             at=now,
