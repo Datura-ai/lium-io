@@ -7741,7 +7741,7 @@ class DockerService:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
-        still fits beside it, never below `payload.min_volume_gb`.
+        still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
 
         `locked_df_avail_bytes` (wait_for_node_flatten) replaces any other free-disk measure;
         `locked_df_error` (that measure failed) takes the measurement-failure fallback below.
@@ -7835,8 +7835,10 @@ class DockerService:
             )
         )
         if flatten_copy_bytes is not None:
-            # the flatten keeps this grant free on top of the copy: leave the copy room before granting
-            min_slice_bytes = (payload.min_volume_gb or 0) * _FRESH_SIZING_GB_BYTES * 1.5
+            # the flatten keeps this grant free on top of the copy: leave the copy room before granting, but never
+            # below the ordered volume (the renter gets the disk they rent; a copy that no longer fits is refused)
+            floor_gb = max(payload.min_volume_gb or 0, payload.volume_limit_gb or 0)
+            min_slice_bytes = floor_gb * _FRESH_SIZING_GB_BYTES * 1.5
             slice_candidates.append(
                 (
                     "flatten_copy",
