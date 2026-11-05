@@ -248,6 +248,23 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
 
 
 @pytest.mark.asyncio
+async def test_batch_reprobes_past_the_floor_up_to_the_ports_a_split_node_needs(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
+    calls = []
+
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return (probed[:20], probed[20:]) if len(calls) == 1 else (probed, [])
+
+    verifier, _ = _batch_verifier(mocker, late_listeners)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=24)
+
+    assert calls == [ports, ports[20:]]
+    assert len(result.successful) == 24
+
+
+@pytest.mark.asyncio
 async def test_batch_is_start_hung_only_when_every_attempt_times_out_inside_the_container_start(mocker):
     # DAH-5682: a stuck Docker never returns `docker run`; both 60 s attempts end there
     from services.executor_connectivity.port_verifiers import BatchVerifier

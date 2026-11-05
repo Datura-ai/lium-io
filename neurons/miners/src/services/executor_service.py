@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from typing import Annotated, Optional, Union
@@ -110,6 +111,27 @@ UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS = 1.0
 UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS = 3.0
 # the validator's clock starts when it signs the request; a request queued longer than this is read as clock skew
 MAX_REQUEST_PICKUP_LAG_SECONDS = 10.0
+# an executor's SSH-key answer is ~2 KB (more with attestation evidence); the miner serves every
+# provider from one process, so it reads no more than this from any executor
+MAX_EXECUTOR_ANSWER_BYTES = 4 * 1024 * 1024
+# /pod_logs returns one container's events from the executor's log file, which it keeps under 50 MiB
+MAX_POD_LOGS_ANSWER_BYTES = 64 * 1024 * 1024
+
+
+class ExecutorAnswerTooLarge(Exception):
+    pass
+
+
+async def _read_capped(response: aiohttp.ClientResponse, limit: int = MAX_EXECUTOR_ANSWER_BYTES) -> bytes:
+    """The response body, or ExecutorAnswerTooLarge once it passes `limit` (counted after decompression)."""
+    if (response.content_length or 0) > limit:
+        raise ExecutorAnswerTooLarge(f"answer of {response.content_length} bytes, limit {limit}")
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        body += chunk
+        if len(body) > limit:
+            raise ExecutorAnswerTooLarge(f"answer over {limit} bytes")
+    return bytes(body)
 
 
 class PubkeyRegistration(pydantic.BaseModel):
@@ -291,7 +313,12 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    async def get_executors_for_validator(self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None)  -> list[Executor]:
+    async def get_executors_for_validator(
+        self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None,
+        host_keys: dict[str, str] | None = None,
+    ) -> list[Executor]:
+        """`host_keys`, when given, is filled (central mode) with each node's SSH host key as the portal recorded it
+        at registration, by executor id, from the same portal read as the list (DAH-5729)."""
         # Standard mode: use local DB, in Standard mode
         if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
@@ -315,9 +342,12 @@ class ExecutorService:
                 if item.get("validator_hotkey") != validator_hotkey:
                     continue
 
+                uuid = UUID(item.get("id"))
+                if host_keys is not None and item.get("ssh_host_key"):
+                    host_keys[str(uuid)] = item["ssh_host_key"]
                 result.append(
                     Executor(
-                        uuid=UUID(item.get("id")),
+                        uuid=uuid,
                         validator=item.get("validator_hotkey"),
                         address=item.get("executor_ip_address"),
                         port=int(item.get("executor_ip_port")),
@@ -394,8 +424,9 @@ class ExecutorService:
                 timeout = aiohttp.ClientTimeout(total=total)
                 try:
                     async with session.post(url, json=payload, timeout=timeout) as response:
+                        body = await _read_capped(response)
                         if response.status != 200:
-                            text = await response.text()
+                            text = body.decode(errors="replace")
                             logger.error(
                                 _m(
                                     "API request failed to register SSH key - HTTP error",
@@ -403,7 +434,7 @@ class ExecutorService:
                                 ),
                             )
                             return None
-                        response_obj: dict = await response.json()
+                        response_obj: dict = json.loads(body)
                         logger.info(
                             _m(
                                 "Received response from executor",
@@ -530,7 +561,10 @@ class ExecutorService:
             # DAH-5734: in a wave of ~200 requests the pickup came 2-7 s late and the answer still missed the 30 s
             budget -= min(max(0.0, time.time() - requested_at), MAX_REQUEST_PICKUP_LAG_SECONDS)
         deadline = time.monotonic() + budget
-        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
+        host_keys: dict[str, str] = {}
+        executors = await self.get_executors_for_validator(
+            validator_hotkey, miner_hotkey, executor_id, host_keys=host_keys
+        )
         tasks = [
             asyncio.create_task(
                 self.send_pubkey_to_executor(
@@ -551,6 +585,10 @@ class ExecutorService:
         for task in pending:
             task.cancel()
         results = [task.result() for task in done if not task.exception() and task.result()]
+        for info in results:
+            # no portal read here: the uploads can outlast the snapshot cache, and the reply must meet its deadline
+            if isinstance(info, ExecutorSSHInfo):
+                info.expected_ssh_host_key = host_keys.get(str(info.uuid))
         logger.info(
             _m( 
                 "Sent pubkey register to executors",
@@ -615,6 +653,6 @@ class ExecutorService:
                 if response.status != 200:
                     raise Exception('[get_pod_logs] Error: API request failed')
 
-                response_obj: list[dict] = await response.json()
+                response_obj: list[dict] = json.loads(await _read_capped(response, MAX_POD_LOGS_ANSWER_BYTES))
                 pod_logs = [PodLog.parse_obj(item) for item in response_obj]
                 return pod_logs

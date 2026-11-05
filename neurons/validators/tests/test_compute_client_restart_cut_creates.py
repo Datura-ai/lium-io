@@ -4,6 +4,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import redis
 
 from clients.compute_client import (
     CREATE_CUT_OFF_BY_RESTART_STEP,
@@ -652,3 +653,61 @@ async def test_a_report_whose_send_fails_is_kept_for_the_next_socket() -> None:
             await client.handle_connection(_SocketFailingAfterAuth())
 
     assert client.resumed_creates_report is not None
+
+
+def _fakeredis_service() -> RedisService:
+    from fakeredis.aioredis import FakeRedis
+
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis()
+    service.lock = asyncio.Lock()
+    return service
+
+
+@pytest.mark.asyncio
+async def test_a_restart_releases_the_create_lock_its_cut_off_create_held() -> None:
+    redis_service = _fakeredis_service()
+    # the dead connector's create took the executor's lock and never released it
+    assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+
+    await _client(redis_service).fail_creates_cut_off_by_restart()
+
+    # the backend's re-send takes the lock at once instead of waiting out its TTL
+    assert await redis_service.executor_create_lock("exec-1").acquire(blocking=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("holder", ["probe", "other-pod"])
+async def test_a_restart_keeps_a_create_lock_held_by_another_create(holder: str) -> None:
+    redis_service = _fakeredis_service()
+    lock = redis_service.executor_create_lock("exec-1")
+    if holder == "probe":
+        assert await lock.acquire(blocking=False)
+    else:
+        assert await redis_service.executor_create_exclusion("exec-1", "pod-2").__aenter__()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+
+    await _client(redis_service).fail_creates_cut_off_by_restart()
+
+    assert not await redis_service.executor_create_lock("exec-1").acquire(blocking=False)
+
+
+class _PipelineOnADownRedis:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def watch(self, *keys):
+        raise redis.exceptions.ConnectionError("Redis is down")
+
+
+@pytest.mark.asyncio
+async def test_a_cut_off_create_lock_release_that_redis_fails_is_logged_not_raised() -> None:
+    # the restart sweep goes on to the next create; the lock lapses at its TTL
+    redis_service = _fakeredis_service()
+    redis_service.redis.pipeline = lambda **_: _PipelineOnADownRedis()
+
+    await redis_service.release_cut_off_create_lock("exec-1", "pod-1")
