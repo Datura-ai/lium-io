@@ -4,7 +4,7 @@ action) fails the node like a GPU ban, on rented and idle nodes alike; a live re
 import json
 import subprocess
 import sys
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from neurons.validators.src.services.task import pipeline_factory
@@ -290,3 +290,55 @@ async def test_a_recovery_action_still_required_cycles_in_a_row_fails_the_rented
     remap = _report("ok", flags=[], warnings=["gpu 1 (GPU-1): row remap pending"])
     for _ in range(limit + 1):
         assert (await check.run(ctx(remap))).event.reason_code == Msg.RESET_ADVISED.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start, replays, streak_after, outcome",
+    [
+        # the check is not replayed: a cycle whose session drops counts once
+        (0, False, 1, Msg.RESET_ADVISED.reason),
+        (1, False, 2, Msg.RESET_ADVISED.reason),
+        (2, False, 3, "transport failure"),
+        # were it replayed, the one cycle would count twice and fail the node a cycle early
+        (0, True, 2, Msg.RESET_ADVISED.reason),
+        (1, True, 3, Msg.FAILED.reason),
+        (2, True, 4, Msg.FAILED.reason),
+    ],
+)
+async def test_a_dropped_session_counts_a_reset_required_cycle_once(
+    context_factory, monkeypatch, start, replays, streak_after, outcome
+):
+    import asyncssh
+    from neurons.validators.src.services.task import pipeline
+    from neurons.validators.src.services.task.checks import gpu_memory_health
+
+    runner = FakeRunner(_report("ok", flags=[], warnings=RESET_REQUIRED))
+    dropped = MagicMock(spec=asyncssh.SSHClientConnection)
+    dropped.is_closed.return_value = True
+    ctx = make_ctx(context_factory, runner, rented_data=_live_rental())
+    ctx = ctx.model_copy(update={"ssh": dropped})
+    key = (ctx.miner_hotkey, ctx.executor.uuid)
+    gpu_memory_health._reset_required_streak.clear()
+    if start:
+        gpu_memory_health._reset_required_streak[key] = start
+    monkeypatch.setattr(GpuMemoryHealthCheck, "replays_after_session_drop", replays)
+    monkeypatch.setattr(pipeline, "SSHCommandRunner", lambda *a, **k: runner)
+
+    async def reconnect():
+        fresh = MagicMock(spec=asyncssh.SSHClientConnection)
+        fresh.is_closed.return_value = False
+        return fresh
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    run = Pipeline([GpuMemoryHealthCheck()], _Sink(), reconnect=reconnect).run(ctx)
+    if outcome == "transport failure":
+        with pytest.raises(asyncssh.ConnectionLost):
+            await run
+    else:
+        _, events, _ = await run
+        assert events[-1].reason_code == outcome
+    assert gpu_memory_health._reset_required_streak[key] == streak_after
