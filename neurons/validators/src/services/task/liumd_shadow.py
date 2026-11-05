@@ -51,6 +51,7 @@ from core.utils import _m, get_extra_info
 
 from .checks.capability import CapabilityCheck
 from .checks.local_verify import _step_reason
+from .checks.provider_side_load import docker_containers
 from .checks.verifyx import (
     MAX_KEPT_UPLOAD_PROBES,
     MAX_PACKAGE_FALLBACK_PROBES,
@@ -445,19 +446,20 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
 
     docker = answer.step("docker")
     data = docker.data if docker.status == "ok" and isinstance(docker.data, dict) else None
-    if data:
-        # `specs["sysbox_runtime"]` is the GPU compatibility probe, not the runtime list that
-        # liumd's docker step reports, so the two are not comparable.
-        if isinstance(data.get("containers"), list) and isinstance(specs.get("docker_containers"), list):
-            liumd_names = sorted(
-                c.get("name") for c in data["containers"] if isinstance(c, dict) and c.get("name")
-            )
-            python_names = sorted(
-                c.get("each_name")
-                for c in specs["docker_containers"]
-                if isinstance(c, dict) and c.get("each_name")
-            )
-            check("docker.container_names", liumd_names, python_names)
+    if (
+        data
+        and isinstance(data.get("containers"), list)
+        and isinstance(specs.get("docker"), dict)
+    ):
+        # liumd lists every container; today's scrape lists the running ones, and `specs` is the
+        # miner's raw machine JSON, so read it through the check that owns that shape.
+        liumd_names = sorted(
+            c["name"]
+            for c in data["containers"]
+            if isinstance(c, dict) and c.get("name") and c.get("status") == "running"
+        )
+        python_names = sorted(row.name for row in docker_containers(specs) if row.name)
+        check("docker.container_names", liumd_names, python_names)
 
     ports = answer.step("ports")
     data = ports.data if ports.status == "ok" and isinstance(ports.data, dict) else None

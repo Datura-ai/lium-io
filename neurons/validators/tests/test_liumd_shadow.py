@@ -288,13 +288,18 @@ async def test_gpu_steps_are_off_by_default(keypair, monkeypatch, verifyx_servic
 
 @pytest.mark.asyncio
 async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch, verifyx_service):
-    specs = {**SPECS, "sysbox_runtime": True, "docker_containers": [{"each_name": "filler"}]}
+    specs = {**SPECS, "docker": {"containers": [{"name": "filler", "container_id": "c1"}]}}
     state = build_state(specs=specs)
     ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
     fake = FakeLiumd(
         facts={
             "docker": {
-                "data": {"sysbox_runtime": True, "containers": [{"name": "filler"}]},
+                "data": {
+                    "containers": [
+                        {"name": "filler", "status": "running"},
+                        {"name": "gone", "status": "exited"},
+                    ]
+                },
             },
             "ports": {"data": {"port_range": None, "port_mappings": None}},
         }
