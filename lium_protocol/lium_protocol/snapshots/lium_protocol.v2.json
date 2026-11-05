@@ -1728,7 +1728,12 @@
     "ContainerWarningCode": {
       "enum": [
         "ExternalVolumeFailed",
-        "DockerInDockerDisabled"
+        "DockerInDockerDisabled",
+        "HungGpuReset",
+        "HungGpuNotResetMig",
+        "HungGpuNotResetNvlinkShared",
+        "HungGpuNotResetInUse",
+        "HungGpuNotResetUnsupported"
       ],
       "title": "ContainerWarningCode",
       "type": "string"
@@ -6592,7 +6597,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.7.0",
+  "protocol_version": "2.10.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

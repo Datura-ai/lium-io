@@ -565,6 +565,64 @@ def test_nvml_snapshots_are_paired_by_uuid_not_by_position():
     ) == ["gpu 0: uncorrected ECC errors 0 -> 1"]
 
 
+def test_an_unavailable_after_snapshot_is_no_nvml_fault():
+    # a hung or dead NVML child after the run must not write every card up as missing
+    nvml_faults = _probe_namespace("nvml_faults")["nvml_faults"]
+    before = {
+        "available": True,
+        "gpus": [{"index": i, "uuid": f"GPU-{i}", "ecc_uncorrected": 0} for i in range(8)],
+    }
+
+    assert nvml_faults(before, {"available": False, "error": "NVML snapshot hung for 10s"}) == []
+    # a card really gone from an available snapshot is still a fault
+    assert nvml_faults(before, {"available": True, "gpus": before["gpus"][1:]}) == [
+        "gpu 0 (GPU-0): missing from the NVML snapshot after the run"
+    ]
+
+
+def test_a_hung_nvml_after_snapshot_makes_the_run_an_error_not_ok(capsys, monkeypatch):
+    # no post-run counters is no verdict (UNKNOWN): an "ok" would clear a pending post-rental recheck
+    import sys
+    import types
+
+    module = types.ModuleType("gpu_fault_probe_main")
+    monkeypatch.setitem(sys.modules, module.__name__, module)  # its dataclasses look the module up
+    exec(compile(PROBE_SOURCE, "probe", "exec"), module.__dict__)
+    ns = module.__dict__
+    snapshots = iter(
+        [
+            {"available": True, "gpus": [{"index": 0, "uuid": "GPU-0", "ecc_uncorrected": 0}]},
+            {"available": False, "error": "NVML snapshot hung for 10s"},
+        ]
+    )
+
+    class FakeProcess:
+        def __init__(self, target, args):
+            pass
+
+        def start(self):
+            pass
+
+    class FakeMp:
+        Pipe = staticmethod(
+            lambda duplex=False: (None, type("C", (), {"close": lambda self: None})())
+        )
+        Process = FakeProcess
+
+    ns["multiprocessing"] = type("M", (), {"get_context": staticmethod(lambda kind: FakeMp)})
+    ns["_device_count"] = lambda mp: 1
+    ns["nvml_snapshot_forked"] = lambda mp: next(snapshots)
+    ns["xid_lines"] = lambda: {"available": False}
+    ns["drain_workers"] = lambda workers, deadline, budget: [
+        {"index": 0, "status": "ok", "pci_bus_id": "00000000:01:00.0"}
+    ]
+
+    assert ns["main"]([]) == 2
+    report = json.loads(capsys.readouterr().out.split(ns["JSON_MARKER"], 1)[1])
+    assert report["status"] == "error" and report["faults"] == []
+    assert report["error"] == "NVML after the run: NVML snapshot hung for 10s"
+
+
 def test_a_dead_nvml_child_is_an_unavailable_snapshot_not_a_crash():
     # the child closes its pipe without sending (a driver call aborted the process): recv() raises EOFError
     # and the probe must still print its verdict

@@ -1050,6 +1050,31 @@ class CollateralStatusMessages:
     )
 
 
+class NodeAccountMessages:
+    MATCH = MessageTemplate(
+        event="Node is the one its account registered",
+        reason="NODE_ACCOUNT_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Node account check not applicable",
+        reason="NODE_ACCOUNT_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Node at this address is not the one its account registered",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Verification failed; verification cleared",
+        remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
+    )
+
+
 class StaleContainerCleanupMessages:
     CLEANED = MessageTemplate(
         event="Stale container cleanup complete",
@@ -2580,13 +2605,6 @@ class CachedTemplateMessages:
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 
-    DISABLED = MessageTemplate(
-        event="Local verification disabled",
-        reason="LOCAL_VERIFY_DISABLED",
-        severity="info",
-        category="transport",
-        impact="None — every check runs over SSH as before",
-    )
     SKIPPED = MessageTemplate(
         event="Local verification skipped",
         reason="LOCAL_VERIFY_SKIPPED",

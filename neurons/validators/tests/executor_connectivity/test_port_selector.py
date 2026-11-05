@@ -134,3 +134,31 @@ async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
 
     assert result.status == "no_ports"
     assert result.port_ranges == (PortRangeResult(first=9000, last=9001, declared=2, probed=0, answered=0),)
+
+
+def test_declared_ports_counts_one_pair_per_external_port():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    info = _executor_info(port_mappings=str([[9000, 40000]] * 8 + [[9001, 40000], [9002, 40001]]))
+
+    assert declared_ports(info) == [PortPair(9000, 40000), PortPair(9002, 40001)]
+
+
+def test_declared_ports_counts_one_pair_per_internal_port():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    # 24 distinct external aliases onto three host ports: a rental can bind only three of them
+    info = _executor_info(port_mappings=str([[9000 + i % 3, 40000 + i] for i in range(24)]))
+
+    assert declared_ports(info) == [PortPair(9000, 40000), PortPair(9001, 40001), PortPair(9002, 40002)]
+
+
+def test_declared_ports_keep_the_internal_port_a_rental_binds():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    # 40001 rents onto 9000 (its first mapping), which 40000 already holds; 40003 rents onto 9004
+    mappings = [[9000, 40000], [9000, 40001], [9001, 40001], [9002, 40002], [9004, 40003], [9003, 40003]]
+    info = _executor_info(port_mappings=str(mappings))
+
+    expected = [PortPair(9000, 40000), PortPair(9002, 40002), PortPair(9004, 40003)]
+    assert declared_ports(info) == expected
