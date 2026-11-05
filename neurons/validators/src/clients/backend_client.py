@@ -457,8 +457,9 @@ class BackendClient:
         )
 
     async def get_rented_pod_targets(self) -> RentedExecutorsResponse | None:
-        """The watch's per-minute read: only pod_id, ip, port and status (`?light=true`), shaped as the
-        rented list the probe takes. A 4xx (a backend without the parameter) falls back to the full list."""
+        """The watch's per-minute read: only pod_id, ip, miner_hotkey, port and status
+        (`?light=true`), shaped as the rented list the probe takes. A 4xx (a backend without the
+        parameter) falls back to the full list."""
         try:
             answer = await self._request(
                 "GET", "/internal/executors/rented?light=true", RentedPodTargets, timeout=30, raise_on_4xx=True
@@ -470,7 +471,7 @@ class BackendClient:
         return RentedExecutorsResponse(
             executors={
                 row.pod_id: RentedExecutor(
-                    miner_hotkey="",
+                    miner_hotkey=row.miner_hotkey,
                     executor_ip_address=row.ip,
                     executor_ip_port="",
                     pods=[RentedPod(pod_id=row.pod_id, container_name="", ssh_port=row.port, status=row.status)],

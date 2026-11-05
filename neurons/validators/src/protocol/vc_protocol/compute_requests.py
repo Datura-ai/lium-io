@@ -403,6 +403,7 @@ class RentedPodTarget(BaseModel):
     """One row of `GET /internal/executors/rented?light=true` (DAH-5215 watch): only what the SSH probe dials."""
     pod_id: str
     ip: str
+    miner_hotkey: str = ""  # the probe's per-miner DNS quota; "" from an older backend
     port: int | None = None  # the pod's mapped SSH port
     status: str | None = None
 

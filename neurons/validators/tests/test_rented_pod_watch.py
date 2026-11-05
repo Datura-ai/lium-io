@@ -387,11 +387,20 @@ async def test_the_light_list_becomes_probe_targets_and_a_4xx_falls_back(monkeyp
     monkeypatch.setattr(BackendClient, "get_rented_executors_now", fake_full)
     client = object.__new__(BackendClient)
 
-    client.light = [{"pod_id": "p1", "ip": "198.51.100.7", "port": 40022, "status": "RUNNING"}]
+    client.light = [
+        {
+            "pod_id": "p1",
+            "ip": "198.51.100.7",
+            "miner_hotkey": "hk1",
+            "port": 40022,
+            "status": "RUNNING",
+        }
+    ]
     rented = await client.get_rented_pod_targets()
     assert calls == ["/internal/executors/rented?light=true"]
     (pod,) = rented.executors["p1"].pods
     assert rented.executors["p1"].executor_ip_address == "198.51.100.7"
+    assert rented.executors["p1"].miner_hotkey == "hk1"
     assert (pod.pod_id, pod.ssh_port, pod.status) == ("p1", 40022, "RUNNING")
 
     client.light = full.model_dump()  # a backend that ignores the parameter answers the full list
