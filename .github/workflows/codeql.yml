@@ -13,7 +13,7 @@
 # switched off this workflow runs only its preflight job and skips the analysis (DAH-5201: default setup already
 # analyses the same commits, so analysing here too was a duplicate that could not upload). Once this
 # file is on main, the loop runs tools/codeql_cutover.sh (disable default setup → dispatch this workflow on main →
-# verify); by hand: Settings → Advanced Security → CodeQL analysis → ⋯ → "Switch to advanced", then Actions → CodeQL →
+# verify → set the repository variable CODEQL_ADVANCED=true, without which PR and push runs skip every job); by hand: Settings → Advanced Security → CodeQL analysis → ⋯ → "Switch to advanced", then Actions → CodeQL →
 # "Run workflow" on main with force-upload ticked (a plain re-run still sees default setup's last analysis and skips the upload).
 name: CodeQL
 
@@ -45,7 +45,10 @@ jobs:
   preflight:
     name: Preflight (default setup still enabled?)
     # `edited` also fires on title/body edits; only a base-branch change needs a new analysis.
-    if: github.event.action != 'edited' || github.event.changes.base != null
+    # DAH-5832: while default setup is on, this job only ever answered "skip" (~900 one-minute runs a week). It now runs
+    # on a PR, push or schedule only once the repository variable CODEQL_ADVANCED is "true" (set it at the cut-over);
+    # a manual run (the cut-over dispatch) always runs it.
+    if: (vars.CODEQL_ADVANCED == 'true' || github.event_name == 'workflow_dispatch') && (github.event.action != 'edited' || github.event.changes.base != null)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
