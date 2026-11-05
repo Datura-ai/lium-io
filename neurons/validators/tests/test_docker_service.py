@@ -8685,13 +8685,34 @@ async def test_an_unmarked_stop_needs_its_db_record_before_the_park(docker_servi
     stop = AsyncMock(return_value="stopped")
     monkeypatch.setattr(docker_service, "_park_by_id", park)
     monkeypatch.setattr(docker_service, "_stop_outcome", stop)
+    host = {"running": True, "paused": False}
 
-    assert await docker_service._mark_and_stop_unmounted_pod(AsyncMock(), "pod_pod-1", "pod-1") is False
+    async def run(cmd, **kwargs):
+        verb = cmd.split()[1]
+        if verb in ("pause", "unpause"):
+            host["paused"] = verb == "pause"
+        return Mock(exit_status=0, stdout="", stderr="")
+
+    ssh_client = AsyncMock()
+    ssh_client.run.side_effect = run
+
+    assert await docker_service._mark_and_stop_unmounted_pod(ssh_client, "pod_pod-1", "pod-1") is False
 
     park.assert_not_awaited()
     stop.assert_not_awaited()
+    # lio#1827 review 4484821331: not left taking the renter's writes unencrypted: paused instead
+    assert not host["running"] or host["paused"]
     assert await docker_service.unmounted_stop_outcome("pod-1") == "unknown"
     assert "pod-1" not in docker_service_module._RECOVERY_MARK_CLEANUPS
+
+    # while Redis is down it stays paused; once the mark can be written it is resumed for the remount
+    assert await docker_service.resume_paused_unmounted_pod(ssh_client, "pod_pod-1", "pod-1") is False
+    assert host["paused"]
+    marks: dict[str, str] = {}
+    docker_service.redis_service.set = AsyncMock(side_effect=lambda key, value: marks.__setitem__(key, value))
+    assert await docker_service.resume_paused_unmounted_pod(ssh_client, "pod_pod-1", "pod-1") is True
+    assert not host["paused"] and marks == {"stopped_by_recovery:pod-1": "stopped"}
+    docker_service_module._UNMOUNTED_STOP_OUTCOMES.pop("pod-1", None)
 
 
 @pytest.mark.asyncio

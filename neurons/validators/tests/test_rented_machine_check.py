@@ -1262,6 +1262,41 @@ async def test_tenant_enforcement_remounts_a_running_pods_missing_encrypted_volu
         docker.restore_volume_mount_of_running_container.assert_not_awaited()
 
 
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_resumes_a_paused_unmounted_pod_only_once_its_stop_can_be_marked(context_factory, resumed):
+    # lio#1827 review 4484821331: a pod paused because no store could record its stop refuses the mount probe's exec;
+    # it is resumed under the create lock once the mark is written, then remounted (or stopped, marked)
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = True
+    docker.resume_paused_unmounted_pod.return_value = resumed
+    docker.unmounted_stop_outcome.return_value = "unknown"
+    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    redis = Mock(
+        backend_create_inflight=AsyncMock(return_value=False),
+        renting_in_progress=AsyncMock(return_value=False),
+        executor_create_lock=Mock(return_value=lock),
+    )
+    ctx = build_recovery_context(
+        context_factory, ssh, docker, backend=DummyBackendClient(active=True, local_volume_path="/workspace"), redis=redis
+    )
+    docker.container_paused.return_value = True
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True, result.event
+    docker.resume_paused_unmounted_pod.assert_awaited_once()
+    lock.release.assert_awaited_once()
+    if resumed:
+        assert docker.restore_volume_mount_of_running_container.await_args.kwargs["local_volume_path"] == "/workspace"
+    else:
+        # still paused: no probe, no restore, judged next cycle
+        docker.encrypted_volume_mount_missing.assert_not_awaited()
+        docker.restore_volume_mount_of_running_container.assert_not_awaited()
+        assert _pod_states(result)["pod-1"] == "unknown"
+
+
 @pytest.mark.parametrize("probe_fits", [False, True])
 @pytest.mark.asyncio
 async def test_tenant_enforcement_mount_probe_comes_out_of_the_cycle_budget(context_factory, monkeypatch, probe_fits):

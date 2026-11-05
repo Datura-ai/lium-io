@@ -12475,11 +12475,20 @@ class DockerService:
         is_parked = False
         if not marked:
             # recorded in the validator DB before the park: with neither the mark nor that record, a validator restart
-            # would lose the attribution and the stop would fail the host, so the pod is left running for the next
-            # cycle (lio#1827 review F-31)
+            # would lose the attribution and the stop would fail the host (lio#1827 review F-31). The pod is paused
+            # instead, so the renter's writes stop landing unencrypted; a later cycle resumes it through
+            # resume_paused_unmounted_pod once the mark can be written
             if not await _record_unmarked_recovery_stop(pod_id):
                 _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
-                logger.error(_m("POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD", extra=get_extra_info({"pod_id": pod_id})))
+                paused = await ssh_client.run(
+                    f"/usr/bin/docker pause {shlex.quote(container_name)}", timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
+                )
+                logger.error(
+                    _m(
+                        "POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD",
+                        extra=get_extra_info({"pod_id": pod_id, "paused": getattr(paused, "exit_status", 1) == 0}),
+                    )
+                )
                 return False
             is_parked = await self._park_by_id(ssh_client, container_name, parked)
             if is_parked:
@@ -12498,6 +12507,32 @@ class DockerService:
         elif not marked:
             self._retry_stopped_mark_in_background(pod_id)
         return outcome == "stopped"
+
+    async def container_paused(self, ssh_client: asyncssh.SSHClientConnection, container_name: str) -> bool:
+        probed = await ssh_client.run(
+            f"/usr/bin/docker inspect -f '{{{{.State.Paused}}}}' {shlex.quote(container_name)}",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        return getattr(probed, "exit_status", 1) == 0 and (probed.stdout or "").strip() == "true"
+
+    async def resume_paused_unmounted_pod(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
+    ) -> bool:
+        """Unpause a pod paused because no store could record its stop, once the stop mark is written: True when it
+        runs again (the caller re-probes the mount and remounts or stops it, marked). False leaves it paused."""
+        try:
+            await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_STOPPED)
+        except Exception:
+            _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
+            return False
+        unpaused = await ssh_client.run(
+            f"/usr/bin/docker unpause {shlex.quote(container_name)}", timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
+        )
+        if getattr(unpaused, "exit_status", 1) != 0:
+            await self._clear_stopped_by_recovery(pod_id)  # still paused: nothing was stopped
+            _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
+            return False
+        return True
 
     async def _kill_orphaned_task_shim(
         self,
