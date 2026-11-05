@@ -11646,17 +11646,27 @@ class DockerService:
             private_key=private_key,
         ) as docker_client:
             # the start goes through the docker SDK; the SSH session is opened only once it
-            # succeeded, for the remount (no shell fallback for a failed start)
-            await run_logged_rental_docker_sdk_operation(
-                operation="start_container",
-                log_extra=default_extra,
-                # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
-                # every `docker start`; start moves it onto the rental network
-                call=lambda: docker_client.start(
-                    container_name=container_name, network=RENTAL_NETWORK_NAME
-                ),
-                container_name=container_name,
-            )
+            # succeeded, for the remount (no shell fallback for a failed start), or for the
+            # stale-mountpoint repair below
+            async def _start() -> None:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="start_container",
+                    log_extra=default_extra,
+                    # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
+                    # every `docker start`; start moves it onto the rental network
+                    call=lambda: docker_client.start(
+                        container_name=container_name, network=RENTAL_NETWORK_NAME
+                    ),
+                    container_name=container_name,
+                )
+
+            stale_mount_error: Exception | None = None
+            try:
+                await _start()
+            except Exception as exc:
+                if not _is_stale_vloopback_mountpoint_error(str(exc)):
+                    raise
+                stale_mount_error = exc
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
@@ -11665,6 +11675,15 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
+                if stale_mount_error is not None:
+                    # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
+                    # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
+                    # mountpoint, then start once more
+                    if not await self._repair_stale_mountpoint_of_container_volume(
+                        ssh_client, container_name, default_extra
+                    ):
+                        raise stale_mount_error
+                    await _start()
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
