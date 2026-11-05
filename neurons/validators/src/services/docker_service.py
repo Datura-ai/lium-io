@@ -135,6 +135,7 @@ from services.gpu_clocks import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
@@ -486,6 +487,7 @@ def _parse_listening_ports(output: str) -> set[int]:
     return ports
 
 
+_DPHN_CACHE_EMPTY_KB = 1024
 _ENGY_CACHE_SIZE_IN_NAME = re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}hf_(\d+)gb_")
 
 
@@ -5663,10 +5665,10 @@ class DockerService:
         re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
         there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
         at the volume step instead of short-changing the renter.
-        A filler this create just killed can still be exiting and mount its Engy cache, so dockerd refuses the
-        `volume rm` (prod 4 Nov, 8x B300): the cache's files are then unlinked on the host (_wipe_volume_cmd), only
-        while every container mounting it is one of ``killed_fillers``; the empty volume is swept later, and a
-        filler asking for it again is charged the whole download (_engy_cache_missing_gb).
+        A filler this create just killed can still be exiting and mount its cache, so dockerd refuses the
+        `volume rm` (prod 4 Nov, 8x B300 Engy and Dolphin): the cache's files are then unlinked on the host
+        (_wipe_volume_cmd), only while every container mounting it is one of ``killed_fillers``; the empty volume
+        is swept later, and a filler asking for it again is charged the whole download (_cache_missing_gb).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -5710,8 +5712,7 @@ class DockerService:
             killed: tuple[str, ...] = tuple(killed_fillers)
 
             def volume_remove(name: str) -> str:
-                # a Dolphin cache is never wiped: its readiness is not measured, so an empty one would read as ready
-                if not killed or not name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+                if not killed:
                     return DockerCommand.volume_remove(name)
                 return (
                     f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
@@ -5846,9 +5847,7 @@ class DockerService:
         )
         # DAH-5192: a partial checkpoint (an interrupted download) is not "present": what it still lacks is charged.
         missing_gb: dict[str, float] = {
-            name: await self._engy_cache_missing_gb(ssh_client, name, default_extra)
-            for name in existing
-            if name.startswith(ENGY_CACHE_VOLUME_PREFIX)
+            name: await self._cache_missing_gb(ssh_client, name, default_extra) for name in existing
         }
         present: list[CacheVolume] = [
             volume for volume in payload.cache_volumes if volume.name in existing and not missing_gb.get(volume.name)
@@ -5908,18 +5907,24 @@ class DockerService:
             return present
         return list(payload.cache_volumes)
 
-    async def _engy_cache_missing_gb(
+    async def _cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
     ) -> float:
         """GB an existing Engy cache still lacks of the checkpoint size in its name; 0 when complete or unknown.
 
+        A Dolphin volume's own size is not known (DPHN_CACHE_SIZE_GB is the whole set), so it is not ready only
+        when empty, as the reclaim's wipe leaves it (DAH-5664): then the set's whole download is charged.
+
         Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
         container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
-        `du` is quick. Unmeasurable reads as complete: mounting what exists costs nothing, as before.
+        `du` is quick. An unmeasurable Engy cache reads as complete: mounting what exists costs nothing, as before.
         """
         expected_gb: float = _cache_download_gb(volume_name)
         if math.isinf(expected_gb):
             return 0
+        is_dphn_cache: bool = volume_name.startswith(DPHN_CACHE_VOLUME_PREFIX)
+        # an unmeasured Dolphin volume can be one the reclaim wiped, so its download is charged
+        unmeasured_missing_gb: float = expected_gb if is_dphn_cache else 0
         try:
             result = await ssh_client.run(
                 f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
@@ -5929,11 +5934,14 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception:
-            return 0
+            return unmeasured_missing_gb
         used_kb: str = ((result.stdout or "").split() or [""])[0]
         if not used_kb.isdigit():
-            return 0
+            return unmeasured_missing_gb
         held_gb: float = int(used_kb) * 1024 / 10**9
+        if is_dphn_cache:
+            # du of an empty directory is a few KB
+            return expected_gb if int(used_kb) < _DPHN_CACHE_EMPTY_KB else 0
         if held_gb >= expected_gb * ENGY_CACHE_COMPLETE_SHARE:
             return 0
         logger.info(
@@ -10324,6 +10332,13 @@ class DockerService:
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, prev_timestamp))
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
+                # DAH-5301: a reboot re-creates the pod; while its old container is parked and stopped,
+                # reset a pod GPU that hung. Best-effort: the reboot goes on as before whatever happens.
+                if edit_swap.parked_name and payload.gpu_uuids and not executor_info.tdx_quote:
+                    hung_gpu_warning = await self._reset_hung_gpus_before_run(ssh_client, payload, default_extra)
+                    if hung_gpu_warning is not None:
+                        warnings.append(hung_gpu_warning)
+
                 # GPU options. --gpus injects userspace libs (libnvidia-ml.so, nvidia-smi);
                 # explicit --device entries persist the device cgroup across systemd
                 # daemon-reload (cgroup v2 + systemd cgroup driver wipe the transient
@@ -12896,6 +12911,95 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=str(log_text),
             )
+
+    @contextlib.asynccontextmanager
+    async def _hold_gpu_reset_pending_mark(self, payload: ContainerCreateRequest, default_extra: dict):
+        """DAH-5301: the gpu_reset pending-pod mark, as for a renter's Reset GPU: the rented checks skip the
+        node while its GPUs reset. Yields the holder reset_hung_pod_gpus puts its result in; a GPU it reset
+        gets the recent-reset mark before the pending mark goes."""
+        await self.redis_service.add_pending_pod(
+            payload.miner_hotkey,
+            payload.executor_id,
+            payload.pod_id,
+            kind=GPU_RESET_PENDING_KIND,
+            gpu_uuids=payload.gpu_uuids,
+        )
+        reset_result_holder: list[HungGpuResult] = []
+        try:
+            yield reset_result_holder
+        finally:
+            if reset_result_holder and reset_result_holder[0].warning == ContainerWarningCode.HungGpuReset:
+                # the reset cards drop out for a moment: the checks after the reboot must not blame the provider
+                try:
+                    await self.redis_service.mark_gpu_reset_recent(
+                        payload.miner_hotkey,
+                        payload.executor_id,
+                        payload.pod_id,
+                        payload.gpu_uuids,
+                        RECENT_RENTER_GPU_RESET_SECONDS,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        _m("Hung GPU reset: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                    )
+            try:
+                # only this mark: the create's own pending mark for the pod stays
+                await self.redis_service.remove_pending_pod(
+                    payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=GPU_RESET_PENDING_KIND
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m("Hung GPU reset: pending mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+
+    async def _reset_hung_gpus_before_run(
+        self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest, default_extra: dict
+    ) -> ContainerWarningCode | None:
+        """DAH-5301: reset a hung pod GPU while a reboot has the pod's old container parked and stopped.
+        Never raises: any error is logged and the reboot goes on as before (None)."""
+        try:
+            # as _reset_leftover_clock_locks_before_create: a renter's Reset GPU or clock lock never overlaps it
+            async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+                if not held:
+                    # best-effort: skipping it is safe, running it beside the other GPU operation is not
+                    logger.warning(
+                        _m("A GPU operation on the pod outlasted its wait: no hung GPU reset", extra=get_extra_info(default_extra))
+                    )
+                    return None
+                # a reboot its delete cancelled resets no GPU the backend may have rented again
+                if inflight_creates.is_cancelled(payload.pod_id):
+                    logger.info(_m("Cancelled by its delete: no hung GPU reset", extra=get_extra_info(default_extra)))
+                    return None
+                shadow = not settings.HUNG_GPU_RESET_ON_REBOOT_ENABLED
+                result = await reset_hung_pod_gpus(
+                    SSHCommandRunner(ssh_client, max_retries=0),
+                    list(payload.gpu_uuids),
+                    resetting=lambda: self._hold_gpu_reset_pending_mark(payload, default_extra),
+                    shadow=shadow,
+                )
+        except Exception as exc:
+            logger.warning(_m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)})))
+            return None
+        if shadow:
+            if result.hung_uuids:
+                logger.warning(
+                    _m(
+                        "Hung pod GPU found on reboot (shadow: no reset)",
+                        extra=get_extra_info({**default_extra, "hung": result.hung_uuids, "detail": result.detail}),
+                    )
+                )
+            return None
+        if result.warning is None:
+            return None
+        logger.warning(
+            _m(
+                "Hung pod GPU found on reboot",
+                extra=get_extra_info(
+                    {**default_extra, "hung": result.hung_uuids, "result": result.warning.value, "detail": result.detail}
+                ),
+            )
+        )
+        return result.warning
 
     async def _pod_gpu_operation(
         self,

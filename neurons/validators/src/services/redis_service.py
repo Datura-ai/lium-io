@@ -800,9 +800,12 @@ class RedisService:
             # replayed while this one runs, the backend would complete this one with the old container's ports
             await self._remove_unacked_container_created_unless(pod_id, lambda saved_id: saved_id == command_id)
 
-    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str = ""):
-        """command_id given (a rent-finished bound to one dispatch): only that dispatch's flag and saved report go, and
-        ones that carry no id (written before ids); a reboot's own create keeps its flag and report"""
+    async def remove_pending_pod(
+        self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str = "", kind: str | None = None
+    ):
+        """Every pending mark of the pod, or only its marks of `kind` when given. command_id given (a rent-finished
+        bound to one dispatch): only that dispatch's flag and saved report go, and ones that carry no id (written
+        before ids); a reboot's own create keeps its flag and report"""
 
         def other_dispatch(item_command_id: str) -> bool:
             return bool(command_id and item_command_id and item_command_id != command_id)
@@ -813,13 +816,15 @@ class RedisService:
                 item.get("pod_id", "") != pod_id
                 or other_dispatch(item.get("command_id", ""))
                 or bool(command_id and item.get("kind"))
+                or (kind is not None and item.get("kind") != kind)
             )
 
         await self._update_pending_pods(
             miner_hotkey, executor_id, lambda pending_pods: [item for item in pending_pods if keep(item)]
         )
-        # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
-        await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
+        if kind is None:  # clearing one kind of mark (a GPU reset's) is no create's receipt
+            # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
+            await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
 
     async def _update_pending_pods(
         self, miner_hotkey: str, executor_id: str, change: Callable[[list[dict]], list[dict]]

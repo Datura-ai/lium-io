@@ -858,6 +858,20 @@ async def test_a_create_outliving_its_lock_ttl_cannot_release_the_re_sends_lock(
     assert await redis_service.redis.get(key) != slow_token
 
 
+@pytest.mark.asyncio
+async def test_clearing_a_gpu_reset_mark_keeps_the_pods_create_and_its_saved_report() -> None:
+    redis_service = _fakeredis_service()
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-1")
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", kind="gpu_reset")
+    await redis_service.add_unacked_container_created("pod-1", '{"command_id": "cmd-1"}')
+
+    await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1", kind="gpu_reset")
+
+    pending = await redis_service.get_pending_pods("miner-hk", "exec-1", max_age_seconds=None)
+    assert [(item["pod_id"], item.get("kind")) for item in pending] == [("pod-1", None)]
+    assert "pod-1" in await redis_service.unacked_container_created()
+
+
 class _PipelineOnADownRedis:
     async def __aenter__(self):
         return self

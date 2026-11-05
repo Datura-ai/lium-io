@@ -419,7 +419,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ExecutorRentFinished
-    # lium_protocol 2.8.0: the create this receipt answers (not command_id, which miner_driver dedupes on)
+    # lium_protocol 2.11.0: the create this receipt answers (not command_id, which miner_driver dedupes on)
     create_command_id: str = ""
 
 
@@ -580,6 +580,14 @@ class BaseValidatorResponse(BaseRequest, DeliveryStamps):
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    # DAH-5301: a reboot found a pod GPU hung and reset it before the new container started
+    HungGpuReset = "HungGpuReset"
+    # ...or found one hung and could not reset it: MIG, an NVLink peer outside the pod, a process
+    # outside the pod on it, or the driver refused the reset
+    HungGpuNotResetMig = "HungGpuNotResetMig"
+    HungGpuNotResetNvlinkShared = "HungGpuNotResetNvlinkShared"
+    HungGpuNotResetInUse = "HungGpuNotResetInUse"
+    HungGpuNotResetUnsupported = "HungGpuNotResetUnsupported"
 
 
 class VolumeEncryptionStatus(str, enum.Enum):
@@ -735,7 +743,7 @@ class ContainerCreated(ContainerBaseResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
-    # protocol 2.8.0: the ContainerCreateRequest's command_id, so the backend can tell which dispatch this completes
+    # protocol 2.11.0: the ContainerCreateRequest's command_id, so the backend can tell which dispatch this completes
     command_id: str = ""
 
 
