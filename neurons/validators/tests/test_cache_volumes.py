@@ -453,6 +453,81 @@ async def test_an_emptied_cache_left_behind_is_swept_and_never_mounted_as_ready(
     assert await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {}) == []
 
 
+_DPHN = ["dphn_cache_dp_runtime-1a2b3c4d", "dphn_cache_hf_auto-5e6f7a8b"]
+
+
+class KilledFillerDolphinHost(HostSshClient):
+    """prod 4 Nov, 8x B300: the killed filler is still exiting (rm timed out, D state) and mounts both Dolphin
+    volumes, so `volume rm` fails; each wipe frees `wiped_gb` when every user is in its allowed list."""
+
+    def __init__(self, users: list[str], wiped_gb: float, **kwargs):
+        super().__init__([*_DPHN, "volume_pod"], **kwargs)
+        self.users = users
+        self.wiped_gb = wiped_gb
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command and "/proc/1/root" in command:
+            allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
+            if all(user in allowed for user in self.users):
+                self._free_bytes += int(self.wiped_gb * 1024**3)
+        return await super().run(command, *args, **kwargs)
+
+
+def _one_eighth_rental(monkeypatch, docker_service, volume_gb: int, storage_gb: int, existing_bytes: int):
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=existing_bytes))
+    rental = _rental(volume_gb, storage_gb)
+    rental.disk_share = 0.125
+    return rental
+
+
+# the two 4 Nov creates: free and needed GiB from the logs; the Dolphin set's on-disk size there was not
+# logged, so each wipe frees half the gap plus a little (illustrative)
+_DOLPHIN_CASES = [
+    pytest.param("filler_killed_a", 271, 135, 587 * 10**9, 2466.1, id="14:51Z"),
+    pytest.param("filler_killed_b", 358, 179, int(1596.3 * 1024**3), 2324.0, id="18:37Z"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("filler", "volume_gb", "storage_gb", "existing_bytes", "free_gb"), _DOLPHIN_CASES)
+async def test_dolphin_caches_the_killed_filler_still_mounts_are_wiped_and_the_order_keeps_its_size(
+    docker_service, monkeypatch, filler, volume_gb, storage_gb, existing_bytes, free_gb
+):
+    rental = _one_eighth_rental(monkeypatch, docker_service, volume_gb, storage_gb, existing_bytes)
+    gap_gb = (await docker_service._rental_disk_fit(None, rental)).needs_free_gb - free_gb
+    ssh_client = KilledFillerDolphinHost([filler], wiped_gb=gap_gb / 2 + 1, free_gb=free_gb)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=[filler]) is True
+    assert _removed_volumes(ssh_client) == _DPHN
+    assert any("/proc/1/root" in command and _DPHN[0] in command for command in ssh_client.commands)
+    assert rental.volume_limit_gb == volume_gb
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("filler", "volume_gb", "storage_gb", "existing_bytes", "free_gb"), _DOLPHIN_CASES)
+async def test_dolphin_caches_a_live_filler_mounts_are_not_wiped_and_the_order_clamps(
+    docker_service, monkeypatch, filler, volume_gb, storage_gb, existing_bytes, free_gb
+):
+    rental = _one_eighth_rental(monkeypatch, docker_service, volume_gb, storage_gb, existing_bytes)
+    ssh_client = KilledFillerDolphinHost([filler, "filler_live"], wiped_gb=500, free_gb=free_gb)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=[filler]) is True
+    assert rental.volume_limit_gb < volume_gb
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("held_gb", "free_gb", "granted"), [(0, 100, False), (0, 400, True), (12, 100, True)])
+async def test_an_emptied_dolphin_cache_is_charged_its_download_and_a_filled_one_mounts_as_before(
+    docker_service, held_gb, free_gb, granted
+):
+    # the wipe leaves the volume empty: mounting it is a 40 GB download again, refused under the floor + margin
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=_DPHN[1], target="/c")])
+    payload.volume_limit_gb = 40
+    ssh_client = DuHostSshClient([_DPHN[1]], free_gb=free_gb, du_stdout=_kb(held_gb))
+
+    assert bool(await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})) is granted
+
+
 @pytest.mark.asyncio
 async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(docker_service, monkeypatch):
     class HangingRemoval(HostSshClient):
