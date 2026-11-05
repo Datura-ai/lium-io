@@ -90,6 +90,7 @@ from .checks import (
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
+    VerifyXColdRetryCheck,
 )
 from .pipeline import (
     Check,
@@ -451,6 +452,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -578,6 +581,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],

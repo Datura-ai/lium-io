@@ -9129,7 +9129,9 @@ class DockerService:
         private_key: str,
         *,
         beside_fillers: bool = False,
+        synthetic_probe: bool = False,
     ):
+        # synthetic_probe: the validator's own rental probe (see RedisService.add_pending_pod)
         # beside_fillers: the rental probe on a node running a Lium filler. The filler keeps running
         # (the validator cannot end its run in the backend, so removing it reads as the provider
         # killing it), so this create removes no filler_*, lifts no GPU power cap (DAH-2356: an
@@ -9326,7 +9328,9 @@ class DockerService:
 
             # add executor in pending status dict
             current_step = "pending_pod"
-            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            await self.redis_service.add_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, synthetic_probe=synthetic_probe
+            )
 
             current_step = "ssh_key_import"
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
