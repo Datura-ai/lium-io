@@ -1419,18 +1419,12 @@ async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
 
 
 @pytest.mark.asyncio
-async def test_a_scored_cycle_runs_both_steps_in_one_call_one_after_the_other(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
-):
-    """Not the first pass: the full-size steps go in one call, but never side by side (a full-size
-    VerifyX beside the matmul runs out of RAM). Both passing steps are consumed."""
+async def test_a_scored_cycle_sends_no_verify_call(keypair, monkeypatch, short_local_verify_timeouts, verifyx_service):
+    """Not the first pass: VerifyX is full size and can time out on /verify, then run again over SSH
+    past JOB_TIME_OUT. No call is made; both steps run over SSH."""
     validation = matmul_service(monkeypatch)
-    validation.validate_gpu_model_and_process_job = AsyncMock(
-        side_effect=AssertionError("matmul ran over SSH")
-    )
-    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
-        side_effect=AssertionError("VerifyX ran over SSH")
-    )
+    ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
+    validation.validate_gpu_model_and_process_job = ssh_matmul
     async with FakeExecutor(keypair) as executor:
         ctx = context(
             keypair,
@@ -1442,10 +1436,11 @@ async def test_a_scored_cycle_runs_both_steps_in_one_call_one_after_the_other(
         local, verifyx, capability = await run_local_then_consumers(
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
         )
-    assert executor.intents[0]["parallel_gpu"] is False
-    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
-    assert capability.event.what_we_saw["transport"] == "local_verify"
-    assert verifyx.event.what_we_saw["transport"] == "local_verify"
+    assert executor.intents == []
+    assert local.event.what_we_saw["why"] == "not the first pass"
+    assert capability.event.what_we_saw["transport"] == "ssh"
+    ssh_matmul.assert_awaited_once()
+    assert verifyx.event.what_we_saw.get("transport") != "local_verify"
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():
