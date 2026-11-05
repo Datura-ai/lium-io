@@ -121,6 +121,35 @@ async def test_dind_start_is_killed_on_the_node_before_the_container_is_removed(
     assert "docker rm -fv container_x_9000" in commands[-1]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_to_deadline, expected", [(60.5, 60), (-100, 30), (1000, 180)])
+async def test_dind_start_ends_within_the_cycle_time_budget(mocker, seconds_to_deadline, expected):
+    # 5bf1770f 3 Nov: a 180 s create after the port fallback left the cycle no time to report, so it was dropped
+    import time
+
+    from services.executor_connectivity import dind_probe
+
+    commands = []
+
+    async def run(cmd):
+        commands.append(cmd)
+        return mocker.Mock(exit_status=137 if "docker run" in cmd else 0, stdout="", stderr="")
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
+
+    await dind_probe.DindVerifier(ssh_service).verify(
+        PortPair(9000, 9000),
+        ssh_client=mocker.Mock(run=run),
+        host="1.2.3.4",
+        container_name_prefix="container_x",
+        sysbox=False,
+        deadline_monotonic=time.monotonic() + seconds_to_deadline,
+    )
+
+    assert commands[0].startswith(f"timeout -s KILL {expected} /usr/bin/docker run ")
+
+
 def _batch_verifier(mocker, test_many, external=None):
     from services.executor_connectivity.port_verifiers import BatchVerifier
 

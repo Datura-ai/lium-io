@@ -4,9 +4,10 @@ The create path parks the pod's old container (stopped) before it runs the new o
 one SSH query looks for a hung pod GPU; a healthy reboot costs only that query. A hung GPU is reset
 under the same refusal rules as the renter's Reset GPU (gpu_reset.py): NVLink peers must be inside
 the pod, no MIG, no process on the GPUs (the pod's own container is stopped, so any is foreign), and
-`nvidia-smi -r` only with `-i` on the pod's GPUs, with Fabric Manager stopped around it on an NVSwitch
-pod that owns every GPU, all in one host systemd unit (as reset_pod_gpus does); when the driver refuses it, the DAH-2427 context
-cycle is the fallback.
+`nvidia-smi -r` only with `-i` on the pod's GPUs, with every host GPU holder (Fabric Manager, DCGM, a
+dcgm-exporter container, IMEX, nvidia-persistenced) stopped around it on a pod that owns every GPU, all in one
+host systemd unit (the same plan as reset_pod_gpus); when the driver refuses it, the DAH-2427 context cycle is the
+fallback. A latch clear is never reported as a reset (HungGpuNotResetUnsupported, as reset_pod_gpus reports it not ok).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from payload_models.payloads import ContainerWarningCode, GpuResetErrorCode
 from services.gpu_reset import (
+    _FABRIC_START_FAILED_EXIT,
     _FABRIC_STOP_FAILED_EXIT,
     _RESET_TIMEOUT_SECONDS,
     FABRIC_SERVICES,
@@ -40,6 +42,7 @@ from services.gpu_reset import (
     build_fabric_reset_command,
     build_reset_command,
     parse_host_gpus,
+    plan_host_holders,
 )
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -81,8 +84,10 @@ class HungGpuResult:
 @dataclass(frozen=True)
 class _ResetPlan:
     targets: list[str]
-    # stopped around `nvidia-smi -r` and started again (an NVSwitch pod owning every GPU)
-    fabric_services: list[str]
+    # as gpu_reset._Plan: stopped around `nvidia-smi -r` and started again (a pod owning every host GPU)
+    host_services: list[str] = field(default_factory=list)
+    holder_containers: list[str] = field(default_factory=list)
+    owns_host: bool = False
 
 
 def parse_hung_pod_gpus(gpu_csv: str, latched: set[str], pod_gpu_uuids: list[str]) -> list[str]:
@@ -100,6 +105,7 @@ async def reset_hung_pod_gpus(
     pod_gpu_uuids: list[str],
     *,
     resetting: Callable[[], AbstractAsyncContextManager[list[HungGpuResult] | None]] = contextlib.nullcontext,
+    settle_seconds: float = 2.0,
 ) -> HungGpuResult:
     """Call with the pod's container stopped. Changes nothing unless a pod GPU is hung.
 
@@ -116,13 +122,15 @@ async def reset_hung_pod_gpus(
     if not hung:
         return HungGpuResult()
     async with resetting() as reset_result_holder:
-        result = await _reset(runner, hung, latched, pod_gpu_uuids)
+        result = await _reset(runner, hung, latched, pod_gpu_uuids, settle_seconds)
         if reset_result_holder is not None:
             reset_result_holder.append(result)  # the caller acts on it while still holding its mark
     return result
 
 
-async def _reset(runner: SSHCommandRunner, hung: list[str], latched: set[str], pod_gpu_uuids: list[str]) -> HungGpuResult:
+async def _reset(
+    runner: SSHCommandRunner, hung: list[str], latched: set[str], pod_gpu_uuids: list[str], settle_seconds: float
+) -> HungGpuResult:
     if await _reset_unit_pending(runner):
         # as in reset_pod_gpus: an earlier reset that outlived its SSH timeout still holds the GPUs and the fabric
         detail = "the GPU reset is still running on the host"
@@ -132,7 +140,7 @@ async def _reset(runner: SSHCommandRunner, hung: list[str], latched: set[str], p
         # ago can still read busy); -r below only when the cycle does not clear it
         cures = await cure_wedged_gpus(runner, hung)
         if cures and all(cure.cured for cure in cures):
-            return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"latch cleared on {hung}")
+            return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, f"only the latch clear ran on {hung}")
     try:
         plan = await _reset_targets_or_refuse(runner, hung, pod_gpu_uuids)
     except GpuResetRefused as refused:
@@ -140,34 +148,40 @@ async def _reset(runner: SSHCommandRunner, hung: list[str], latched: set[str], p
         return HungGpuResult(hung, warning, refused.detail)
 
     command = build_reset_command(plan.targets, container_uuids=pod_gpu_uuids, pod_gpu_uuids=pod_gpu_uuids)
-    if not plan.fabric_services:
+    if not plan.owns_host:
         reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
     else:
-        # as in reset_pod_gpus: the driver refuses -r while Fabric Manager holds the GPUs (the pod owns them all);
-        # stop, reset and start run as one host unit that outlives the SSH session
+        # as in reset_pod_gpus: the driver refuses -r while Fabric Manager or another host client holds the GPUs
+        # (the pod owns them all); stop, reset and start run as one host unit that outlives the SSH session
         reset = None
         try:
             reset = await _run(
-                runner, build_fabric_reset_command(plan.fabric_services, command), timeout=_RESET_TIMEOUT_SECONDS + 120
+                runner,
+                build_fabric_reset_command(plan.host_services, command, plan.holder_containers),
+                timeout=_RESET_TIMEOUT_SECONDS + 120,
             )
         finally:
             if (reset is None or reset.exit_code < 0) and not await _reset_unit_gone(runner):
                 fabric_manager_problem = "the GPU reset is still running on the host"
             else:
-                fabric_manager_problem = await _restore_fabric_services(runner, plan.fabric_services)
+                fabric_manager_problem = await _restore_fabric_services(
+                    runner, plan.host_services, plan.holder_containers, settle_seconds
+                )
         if fabric_manager_problem:
             return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, fabric_manager_problem)
-        if reset.exit_code == _FABRIC_STOP_FAILED_EXIT:
+        if reset.exit_code in (_FABRIC_STOP_FAILED_EXIT, _FABRIC_START_FAILED_EXIT):
             return HungGpuResult(
-                hung, ContainerWarningCode.HungGpuNotResetUnsupported, _tail(reset.stderr) or "could not stop"
+                hung,
+                ContainerWarningCode.HungGpuNotResetUnsupported,
+                _tail(reset.stderr) or "a host GPU holder did not stop or start",
             )
     if reset.exit_code == 0:
         return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}")
-    # as in reset_pod_gpus: the context cycle is the fix when it cures every target
+    # as in reset_pod_gpus: the context cycle at least clears the latch, but it is no reset
     cures = await cure_wedged_gpus(runner, plan.targets)
-    detail = f"nvidia-smi -r refused: {_tail(reset.stdout or reset.stderr)}"
+    detail = f"nvidia-smi -r refused, the GPUs were not reset: {_tail(reset.stdout or reset.stderr)}"
     if cures and all(cure.cured for cure in cures):
-        return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"{detail}; latch cleared on {plan.targets}")
+        detail += f"; only the latch clear ran on {plan.targets}"
     return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
 
 
@@ -196,7 +210,11 @@ async def _reset_targets_or_refuse(
     outside = await _processes_outside(runner, targets, None, ignore_cgroup=await _own_cgroup(runner))
     if outside:
         raise GpuResetRefused(GpuResetErrorCode.GpuInUseOutsidePod, f"processes use the GPUs: {outside}")
-    return _ResetPlan(targets, fabric_services)
+    if {gpu.uuid for gpu in host_gpus} != set(pod_gpu_uuids):
+        return _ResetPlan(targets)
+    # the pod's own container is parked and stopped, so no running container is the pod's
+    host_services, holder_containers, owns_host = await plan_host_holders(runner, fabric_services, None)
+    return _ResetPlan(targets, host_services, holder_containers, owns_host)
 
 
 async def _has_nvlink(runner: SSHCommandRunner) -> bool:

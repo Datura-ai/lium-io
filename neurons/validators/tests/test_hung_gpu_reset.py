@@ -8,6 +8,7 @@ import contextlib
 
 import pytest
 from payload_models.payloads import ContainerWarningCode as W
+from services import gpu_reset
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, reset_hung_pod_gpus
 from services.redis_service import GPU_RESET_PENDING_KIND
 from tests.test_gpu_reset import TOPO_PAIR01, TOPO_PAIR02, U, FakeHost, PendingRedis
@@ -87,6 +88,8 @@ async def test_a_latched_gpu_gets_the_context_cycle_before_any_reset(cure_ok):
     assert any(cmd.startswith("CUDA_VISIBLE_DEVICES=") for cmd in host.commands)
     assert _resets(host) == ([] if cure_ok else [f"nvidia-smi -r -i {U[0]}"])
     assert result.hung_uuids == [U[0]]
+    # a latch clear is never reported as a reset
+    assert result.warning == (W.HungGpuNotResetUnsupported if cure_ok else W.HungGpuReset)
 
 
 @pytest.mark.asyncio
@@ -142,15 +145,17 @@ async def test_an_nvswitch_pod_that_owns_every_gpu_resets_all_of_them():
     assert _resets(host) == [f"nvidia-smi -r -i {','.join(U)}"]
 
 
-@pytest.mark.parametrize(("cure_ok", "warning"), [(True, W.HungGpuReset), (False, W.HungGpuNotResetUnsupported)])
+@pytest.mark.parametrize("cure_ok", [True, False])
 @pytest.mark.asyncio
-async def test_a_refused_reset_falls_back_to_the_context_cycle_on_the_pod_gpus(cure_ok, warning):
+async def test_a_refused_reset_falls_back_to_the_context_cycle_on_the_pod_gpus(cure_ok):
     host = HungHost(query=_query({U[1]: None}), reset_exit=1, cure_ok=cure_ok)
     result = await _reset(host)
     assert [c.split()[0] for c in host.commands if c.startswith("CUDA_VISIBLE_DEVICES=")] == [
         f"CUDA_VISIBLE_DEVICES={U[1]}"
     ]
-    assert result.warning == warning
+    # as reset_pod_gpus: a latch clear after a refused -r is no reset
+    assert result.warning == W.HungGpuNotResetUnsupported and "were not reset" in result.detail
+    assert ("only the latch clear ran" in result.detail) == cure_ok
 
 
 @pytest.mark.asyncio
@@ -295,7 +300,7 @@ class _Hold:
 async def test_the_pending_mark_is_held_from_before_the_reset_until_it_is_done():
     host = HungHost(query=_query({U[0]: None}), reset_exit=1)  # -r refused: the context cycle runs too
     hold = _Hold(host)
-    assert (await reset_hung_pod_gpus(host, POD, resetting=hold)).warning == W.HungGpuReset
+    assert (await reset_hung_pod_gpus(host, POD, resetting=hold)).warning == W.HungGpuNotResetUnsupported
     reset_at = host.commands.index(f"nvidia-smi -r -i {U[0]}")
     assert hold.entered <= reset_at and hold.exited == len(host.commands)
     assert host.commands[-1].startswith("CUDA_VISIBLE_DEVICES=")
@@ -335,3 +340,54 @@ async def test_the_result_is_handed_to_the_hold_before_it_is_let_go(reset_exit):
     result = await reset_hung_pod_gpus(host, POD, resetting=hold)
     assert seen_on_exit == [[result]]
     assert result.warning == (W.HungGpuReset if reset_exit == 0 else W.HungGpuNotResetUnsupported)
+
+
+DCGM, PERSISTENCED, NVLSM = "nvidia-dcgm", "nvidia-persistenced", "nvidia-nvlsm"
+EXPORTER = "e" * 64
+
+
+def _whole_host(**kwargs) -> HungHost:
+    # as test_gpu_reset._b300, with the pod's container parked: only the dcgm-exporter container runs
+    return HungHost(
+        query=_query({U[0]: None}),
+        fabric_manager=True,
+        holders={DCGM: True, PERSISTENCED: True},
+        ps=f"{EXPORTER} false nvcr.io/nvidia/k8s/dcgm-exporter:4.2.3\n",
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_whole_host_pod_stops_every_host_gpu_holder_around_the_reset():
+    host = _whole_host()
+    result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)
+    assert result.warning == W.HungGpuReset
+    assert host.active_during_reset == {FM: False, NVLSM: False, DCGM: False, PERSISTENCED: False, EXPORTER: False}
+    stopped = [entry for entry in host.fm_log if entry[0] in ("stop", "docker stop")]
+    assert stopped == [("docker stop", EXPORTER), ("stop", DCGM), ("stop", FM), ("stop", PERSISTENCED)]
+    assert all(host.active[u] for u in (FM, DCGM, PERSISTENCED, EXPORTER))
+
+
+@pytest.mark.asyncio
+async def test_a_whole_host_pod_whose_exporter_does_not_come_back_is_not_a_reset():
+    host = _whole_host(container_state="false false")
+    result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)
+    assert result.warning == W.HungGpuNotResetUnsupported and "is not running again" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reset_on_a_whole_host_pod_cured_by_the_cycle_is_not_a_reset():
+    host = _whole_host(reset_exit=1)
+    result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)
+    assert result.warning == W.HungGpuNotResetUnsupported and "only the latch clear ran" in result.detail
+    assert all(host.active[u] for u in (FM, DCGM, PERSISTENCED, EXPORTER))
+    # the cycle runs once every holder is back (CUDA on an NVSwitch node needs Fabric Manager)
+    assert host.active_during_cure[FM] and host.active_during_cure[DCGM]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_sharing_the_host_never_stops_the_host_gpu_holders():
+    host = HungHost(query=_query({U[0]: None}), holders={DCGM: True, PERSISTENCED: True}, ps=f"{EXPORTER} false dcgm-exporter\n")
+    assert (await _reset(host)).warning == W.HungGpuReset
+    assert not any(entry[0] in ("stop", "docker stop") for entry in host.fm_log)
+    assert gpu_reset.DOCKER_PS_COMMAND not in host.commands

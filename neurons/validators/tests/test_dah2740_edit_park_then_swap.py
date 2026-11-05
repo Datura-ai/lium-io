@@ -10,6 +10,7 @@ name, and a failure renames the old one back and starts it.
 from __future__ import annotations
 
 import asyncio
+import shlex
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -70,6 +71,14 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
         return _ssh_result(exit_status=0)
 
     client.run = AsyncMock(side_effect=_side)
+
+    # the swap's commands are host-bounded (`timeout ... sh -c '<cmd>'`) and open with create_process;
+    # hand the inner command to run so it is recorded and answered as written
+    async def _create_process(command: str):
+        inner = shlex.split(command)[-1] if command.startswith("timeout ") else command
+        return Mock(wait=lambda: client.run(inner), wait_closed=AsyncMock())
+
+    client.create_process = _create_process
     return client
 
 
@@ -796,3 +805,113 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
         svc._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh, "pod_abc", {})
     else:
         svc._repair_stale_mountpoint_of_container_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_docker_stop_that_never_returns_fails_the_edit_in_bounded_time_and_keeps_the_pod(svc, monkeypatch):
+    # a reboot hung in park: `docker stop` over SSH never returned and nothing bounded it
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
+    monkeypatch.setattr("services.docker_service._PARK_COMMAND_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("services.docker_service._HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    inner = ssh.run
+
+    async def stop_and_kill_hang(cmd, *args, **kwargs):
+        if cmd.startswith(("/usr/bin/docker stop", "/usr/bin/docker kill")):
+            ssh.commands.append(cmd)
+            await asyncio.Event().wait()
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = stop_and_kill_hang
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await asyncio.wait_for(_run(svc, payload), 10)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "park_current_container"
+    # the parked container gets its name back and nothing of the renter's is removed
+    assert ssh.commands[-1] == f"/usr/bin/docker rename {parked} {name}"
+    assert not any(parked in c for c in _docker(ssh.commands, "rm"))
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_and_kill_the_host_times_out_rename_the_pod_back(svc, monkeypatch):
+    # the host's `timeout` ends a wedged stop and kill (exit 124): the pod still runs, so it gets its name back
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    inner = ssh.run
+
+    async def host_times_out(cmd, *args, **kwargs):
+        if cmd.startswith(("/usr/bin/docker stop", "/usr/bin/docker kill")):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=124)
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = host_times_out
+    _patch_happy(svc, monkeypatch, ssh)
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "park_current_container"
+    assert "exit 124" in f"{result.msg} {result.detail}"
+    assert _docker(ssh.commands, "kill") == [f"/usr/bin/docker kill {parked}"]
+    assert _docker(ssh.commands, "rename")[-1] == f"/usr/bin/docker rename {parked} {name}"
+    assert not any(parked in c for c in _docker(ssh.commands, "rm"))
+
+
+@pytest.mark.asyncio
+async def test_a_restore_whose_bring_up_hangs_ends_in_bounded_time_and_keeps_the_pod(svc, monkeypatch):
+    # the undo's start/remount/sshd can wedge on the same node: it gives up, the container keeps its name and volume
+    monkeypatch.setattr("services.docker_service._RESTORE_BRING_UP_TIMEOUT_SECONDS", 0.05)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+
+    async def hangs(**kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock(side_effect=hangs))
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("docker run failed")))
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await asyncio.wait_for(_run(svc, payload), 10)
+
+    assert isinstance(result, FailedContainerRequest)
+    svc._bring_up_existing_container.assert_awaited_once()
+    assert ssh.commands[-1] == f"/usr/bin/docker rename {parked} {name}"
+    assert not any(parked in c or "volume rm" in c for c in ssh.commands if "rm " in c)
+
+
+@pytest.mark.asyncio
+async def test_a_docker_ps_the_host_times_out_fails_the_edit_and_keeps_the_pod(svc, monkeypatch):
+    # review 5766107783: exit 124 with empty stdout must not read as "no container" (the sweep would remove the pod)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    inner = ssh.run
+
+    async def ps_times_out(cmd, *args, **kwargs):
+        if "docker ps -a" in cmd and "--filter name=" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=124)
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = ps_times_out
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "park_current_container"
+    assert "docker ps exited 124" in f"{result.msg} {result.detail}"
+    assert _docker(ssh.commands, "rename") == []
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    svc.clean_existing_containers.assert_not_awaited()
