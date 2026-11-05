@@ -771,6 +771,18 @@ def test_a_bracket_glob_import_is_followed_when_the_dump_cannot_run(scrape: dict
     assert scrape["containerd_root"]() == "/data/containerd"
 
 
+def test_a_glob_import_through_a_symlinked_directory_is_followed_on_the_host(scrape: dict, monkeypatch) -> None:
+    # conf.d is an absolute link on the host: globbed through /proc/1/root it would land in this container, match
+    # nothing and leave the abandoned default root
+    files = {CONTAINERD_DEFAULT: 'version = 2\nimports = ["/etc/containerd/conf.d/*.toml"]\n',
+             "/data/containerd-config/10-root.toml": 'root = "/data/containerd"\n'}
+    _stub_containerd_config(scrape, monkeypatch, files)
+    _stub_filesystem(scrape, monkeypatch, host_dirs={"/proc/1/root/data/containerd", "/proc/1/root/var/lib/containerd"},
+                     usage_by_path={}, links={"/proc/1/root/etc/containerd/conf.d": "/data/containerd-config"})
+
+    assert scrape["containerd_root"]() == "/data/containerd"
+
+
 _MANAGED_CONFIG = "/var/run/docker/containerd/containerd.toml"
 _MANAGED = ["containerd", "--config", _MANAGED_CONFIG, "--log-level", "info"]
 _MANAGED_TOML = 'version = 2\nroot = "/data/docker/containerd/daemon"\n[grpc]\n  address = "/var/run/docker/containerd/containerd.sock"\n'

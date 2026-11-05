@@ -363,6 +363,29 @@ def test_disk_follows_the_data_root_without_the_containerd_image_store(tmp_path)
     assert "containerd" not in out
 
 
+# the validator reports the tighter of the containerd store and data-root (rental volumes stay in data-root):
+# preflight must fail whichever filesystem is the limiting one, for the total and for the free space
+TIGHTER_STORE_CASES = [
+    # (check, store df kB, data-root df kB, expected rc, limiting dir suffix)
+    ("check_total_disk_for_vram", 436 * 1024**2, 14 * 1024**3, 1, "/var/lib/containerd"),
+    ("check_total_disk_for_vram", 14 * 1024**3, 436 * 1024**2, 1, "/var/lib/docker"),
+    ("check_total_disk_for_vram", 14 * 1024**3, 14 * 1024**3, 0, None),
+    ("check_free_disk_for_node", 50 * 1024**2, 14 * 1024**3, 1, "/var/lib/containerd"),
+    ("check_free_disk_for_node", 14 * 1024**3, 50 * 1024**2, 1, "/var/lib/docker"),
+    ("check_free_disk_for_node", 14 * 1024**3, 14 * 1024**3, 0, None),
+]
+
+
+@pytest.mark.parametrize("check, store_kb, data_root_kb, expected_rc, limiting", TIGHTER_STORE_CASES)
+def test_disk_checks_measure_the_tighter_of_the_store_and_data_root(tmp_path, check, store_kb, data_root_kb, expected_rc, limiting):
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": str(store_kb), "STUB_DF_AVAIL_KB": str(store_kb),
+           "STUB_DATA_DF_TOTAL_KB": str(data_root_kb)}
+    rc, out, _ = run_check(tmp_path, check, env=env, files={"var/lib/containerd/.keep": ""})
+    assert rc == expected_rc, out
+    if limiting:
+        assert f"{limiting} is below" in out, out
+
+
 @pytest.mark.parametrize("quote", ['"', "'"])
 def test_free_disk_reads_containerds_configured_root(tmp_path, quote):
     ctrd = tmp_path / "root" / "nvme" / "containerd"

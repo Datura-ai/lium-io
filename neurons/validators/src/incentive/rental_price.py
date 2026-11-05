@@ -378,9 +378,10 @@ class RentalPriceIncentive(DefaultIncentive):
             if log_if_cannot_measure:
                 self._log_insufficient_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
             return None
-        if vram_gb > 0 and disk_gb <= 0 and "containerd root unknown" in str(spec.get("hard_disk_scrape_error") or ""):
+        if vram_gb > 0 and "containerd root unknown" in str(spec.get("hard_disk_scrape_error") or ""):
             # the scrape could not find where Docker's containerd store keeps containers: fail closed,
-            # or hiding the store's root would pass the gate (machine_scrape CONTAINERD_ROOT_UNKNOWN)
+            # or hiding the store's root would pass the gate (machine_scrape CONTAINERD_ROOT_UNKNOWN).
+            # The marker wins over any total: VerifyX later fills totals from another filesystem
             return InsufficientDisk(
                 vram_gb=round(vram_gb, 1), disk_gb=0.0, rate=MIN_DISK_TO_VRAM_RATE, disk_unknown=True
             )

@@ -512,11 +512,13 @@ resolve_disk_dir() {
     # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
     # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
     # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd or its root cannot be told.
+    # DATA_ROOT: Docker's data-root, where rental volumes stay whatever store keeps the containers.
     local ctrd_root plugin root_path config data_root where
     DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
     [ -d "$DISK_DIR" ] || DISK_DIR=/
     data_root=$DISK_DIR
+    DATA_ROOT=$DISK_DIR
     SNAPSHOTTER_FIX=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
     docker_containerd || return 1
@@ -558,6 +560,21 @@ resolve_disk_dir() {
     SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root ($where, or the snapshotter's \"root_path\") to the big disk."
 }
 
+tighter_df_kb() {
+    # "<kB> <dir>": df column $1 (2 total, 4 available) of DISK_DIR or DATA_ROOT, whichever is smaller. The validator
+    # reports the tighter of the two filesystems (machine_scrape report_tighter_store); empty when DISK_DIR is unreadable
+    local dir kb best="" where=""
+    for dir in "$DISK_DIR" "$DATA_ROOT"; do
+        kb=$(df -Pk "$dir" 2>/dev/null | awk -v c="$1" 'NR == 2 {print $c}')
+        if ! [ "${kb:-0}" -gt 0 ] 2>/dev/null; then
+            [ -n "$best" ] && continue
+            return 0
+        fi
+        if [ -z "$best" ] || [ "$kb" -lt "$best" ]; then best=$kb where=$dir; fi
+    done
+    echo "$best $where"
+}
+
 check_total_disk_for_vram() {
     # The validators compare the TOTAL size of the filesystem the executor sees as / (its
     # rootfs lives under DISK_DIR) with total GPU VRAM; free space is not the rule.
@@ -566,9 +583,8 @@ check_total_disk_for_vram() {
     vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
     resolve_disk_dir || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — $CTRD_UNKNOWN"; return 0; }
-    data_root=$DISK_DIR
-    total_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $2}')
-    [ "${total_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — cannot read the filesystem size of $data_root."; return 0; }
+    read -r total_kb data_root <<<"$(tighter_df_kb 2)"
+    [ "${total_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — cannot read the filesystem size of $DISK_DIR."; return 0; }
     vram_gb=$(awk -v m="$vram_mib" 'BEGIN {printf "%.1f", m / 1024}')
     total_gb=$(awk -v k="$total_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
     needed_gb=$(awk -v v="$vram_gb" -v r="$MIN_DISK_TO_VRAM_RATE" 'BEGIN {printf "%.1f", v * r}')
@@ -607,9 +623,8 @@ check_free_disk_for_node() {
     # still have to come out of the same free space
     local data_root free_kb free_gb needed_gb
     resolve_disk_dir || { pf_skip "Free disk for the node — $CTRD_UNKNOWN"; return 0; }
-    data_root=$DISK_DIR
-    free_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $4}')
-    [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $data_root."; return 0; }
+    read -r free_kb data_root <<<"$(tighter_df_kb 4)"
+    [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $DISK_DIR."; return 0; }
     free_gb=$(awk -v k="$free_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
     needed_gb=$MIN_FREE_STORAGE_GB
     docker image inspect "$VERIFY_IMAGE" &>/dev/null || needed_gb=$((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB))

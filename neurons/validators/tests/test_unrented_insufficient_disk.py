@@ -171,3 +171,20 @@ def test_an_unknown_containerd_root_fails_the_gate_closed():
     assert line.fields["total_disk_gb"] is None
     # switching image stores hides the node's existing containers, so the line never suggests it
     assert "containerd-snapshotter" not in line.message
+
+
+def test_an_unknown_containerd_root_stays_closed_after_verifyx_fills_the_totals():
+    # VerifyX merges its own df totals under the scrape's ({**verifyx, **scraped}): the scrape
+    # omitted totals, so a big other filesystem lands in hard_disk. The unknown-root marker still wins
+    scraped_hard_disk: dict = {}
+    verifyx_hard_disk = {"total": 14 * 1024 * KB_PER_GB, "free": 13 * 1024 * KB_PER_GB}
+    spec = {
+        "gpu": {"details": [{"capacity": 141 * MB_PER_GB} for _ in range(8)]},
+        "hard_disk": {**verifyx_hard_disk, **scraped_hard_disk},
+        "hard_disk_scrape_error": "RuntimeError(\"containerd root unknown: '/gone' is not on the host\")",
+    }
+
+    measured = _build_incentive()._insufficient_disk(_make_job(spec=spec))
+
+    assert measured is not None
+    assert (measured.disk_gb, measured.disk_unknown) == (0.0, True)
