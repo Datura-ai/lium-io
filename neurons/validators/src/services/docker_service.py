@@ -1722,15 +1722,22 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 # after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
 KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 _DROP_MARK = "drop"
+# The image's entrypoint writes under the plaintext path before the first gocryptfs mount: those layer files
+# carry an inode change time within this long of the container's creation and are not the renter's.
+# shortcut: a fixed bound, not the recorded first-mount time; a create whose mount came later keeps the container.
+_STARTUP_WRITE_SECONDS = 300
 
 
 def _layer_data_check(container_name: str, plaintext_path: str) -> str:
     """Prints _DROP_MARK only when the container is safe to remove: no encrypted volume, or no file its layer
     added or changed under the plaintext path (``docker diff``). Any other output, an error included, keeps it.
 
-    The layer is read, not the mounts: files written while unmounted stay in the layer after a remount."""
+    The layer is read, not the mounts: files written while unmounted stay in the layer after a remount.
+    When the host can read the overlay2 upper dir, only files changed later than _STARTUP_WRITE_SECONDS after
+    the container was created count (ctime, which a renter cannot set back); otherwise ``docker diff`` decides."""
     name = shlex.quote(container_name)
     under = shlex.quote(f"{plaintext_path.rstrip('/')}/")
+    upper_under = shlex.quote(plaintext_path.rstrip("/"))
     awk = (
         '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
         f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
@@ -1738,6 +1745,10 @@ def _layer_data_check(container_name: str, plaintext_path: str) -> str:
     return (
         f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
         f"printf '%s\\n' \"$m\" | grep -qxF {_LIUM_CIPHER_MOUNT} || {{ echo {_DROP_MARK}; exit 0; }}; "
+        f"c=$(/usr/bin/docker inspect -f '{{{{.Created}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
+        f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && u=\"${{c#* }}\"{upper_under} && [ -d \"$u\" ] "
+        f"&& f=$(find \"$u\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
+        "-print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
         f"{{ /usr/bin/docker diff {name} || echo diff-failed; }} | awk -v p={under} {shlex.quote(awk)}"
     )
 

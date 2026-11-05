@@ -1157,3 +1157,33 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
     command = _layer_data_check("pod_x", "/workspace").replace("/usr/bin/docker", str(docker))
     out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
     assert (out.strip() != "drop") is kept
+
+
+@pytest.mark.parametrize(
+    ("created_ago", "kept"),
+    [
+        (0, False),  # written by the image's startup, before the first mount: not the renter's
+        (3600, True),  # written an hour after creation: an unmounted restart, the renter's
+    ],
+)
+def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, kept):
+    import subprocess
+    import time
+
+    upper = tmp_path / "upper"
+    (upper / "root" / ".jupyter").mkdir(parents=True)
+    (upper / "root" / ".jupyter" / "lab.json").write_text("{}")
+    created = time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - created_ago))
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'case "$3" in *Created*) echo "{created} {upper}"; exit;; esac\n'
+        '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
+        # docker diff lists the same file: only the upper-dir read can tell it is startup noise
+        '[ "$1" = diff ] && { printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }\n'
+        "exit 2\n"
+    )
+    docker.chmod(0o755)
+    command = _layer_data_check("pod_x", "/root").replace("/usr/bin/docker", str(docker))
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
+    assert (out.strip() != "drop") is kept
