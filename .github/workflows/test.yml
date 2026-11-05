@@ -21,9 +21,11 @@ permissions:
   pull-requests: read
 
 # a merge-group run is never cancelled: each group has its own ref, and cancelling one would drop its
-# PRs from the queue.
+# PRs from the queue. A push to main gets a group per commit: a group shared by main's pushes holds one
+# pending run and cancels it when the next push queues, and since a push tests only before..after
+# (changed-packages), the cancelled commit's changes then never ran on main (DAH-5586).
 concurrency:
-  group: tests-${{ github.event.pull_request.number || github.ref }}
+  group: tests-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

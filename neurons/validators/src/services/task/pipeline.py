@@ -145,7 +145,7 @@ class ContextState:
     gpu_uuids: Optional[str] = None
     # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
     # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
-    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # attempted once per cycle. Bans match against these too.
     kernel_gpu_uuids: list[str] | None = None
     kernel_gpu_uuids_read_attempted: bool = False
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
@@ -176,6 +176,11 @@ class ContextState:
     dind_probe_error: DindLogCause | None = None
     # the outside prober could not reach the ports: our filler's ports are behind the same firewall
     externally_unreachable: bool = False
+    # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
+    # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
+    host_runtime_fault: bool = False
+    # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
+    external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
@@ -296,6 +301,9 @@ class Context(BaseModel):
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True
+    # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
+    # non-fatal on a live rental, so the score gate lives in calculate_scores.
+    kernel_gpu_view_passed: bool = True
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True

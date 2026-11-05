@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -18,10 +19,12 @@ from services.verifyx_validation_service import (
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS = 10.0
 _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 # A host can bring on a real Cloudflare 429 by flooding speed.cloudflare.com from its own IP just
@@ -36,7 +39,17 @@ _kept_upload_probes: dict[tuple[str, str], int] = {}
 # gated on the package reading are counted the same way; past this many each one is logged, and
 # the missing capacity reading is fed as the 0 it is.
 MAX_PACKAGE_FALLBACK_PROBES = 8
+# DAH-5723: what the checks after VerifyX need of the task's time; a cold-sample retry that would eat it is skipped
+# (a slow first run plus its retry overran the task timeout and the node got no report at all).
+COLD_RETRY_RESERVE_SECONDS = 150
 _package_fallback_probes: dict[tuple[str, str], int] = {}
+# DAH-5742: an idle filler-only node keeps its stored EMA for at most this many skips in a row (~24 h of
+# job cycles); then it is probed once, so a slower link than the stored figure shows up.
+# shortcut: per process, so a validator restart starts the count again; a backend-held measured-at would survive it.
+MAX_FILLER_SKIPS = 96
+# (skips, the stored EMA they reused): the count restarts only once the backend stores a new reading, so a failed
+# day-probe (stored only on a passing cycle) probes again next cycle instead of skipping another day on the old speed
+_filler_skips: dict[tuple[str, str], tuple[int, tuple]] = {}
 
 
 @dataclass(frozen=True)
@@ -56,7 +69,8 @@ class VerifyXCheck:
 
     The check blocks on the probe's success. It always runs (DAH-4328 removed the
     ENABLE_VERIFYX setting, on everywhere since Sep 2025); only an idle filler-only node
-    with a stored EMA skips it, keeping that EMA.
+    with a stored download EMA and an upload EMA that is absent or at the floor skips it,
+    keeping that EMA.
     """
 
     check_id = "gpu.validate.verifyx"
@@ -83,7 +97,28 @@ class VerifyXCheck:
         stored_ema = _stored_network_ema(ctx)
         # A never-measured node is probed even under a filler: with no EMA to reuse it would
         # score 0 every cycle and stay hidden for as long as the filler runs.
-        if filler_container and stored_ema and stored_ema.ema_verifyx_download_speed is not None:
+        # A stored upload EMA below the floor is probed too: skipping would pass it while the
+        # filler runs, and a fresh sample is what lets it recover.
+        skip_key = (ctx.miner_hotkey, ctx.executor.uuid)
+        stored = (
+            (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if stored_ema else None
+        )
+        skips, skipped_on = _filler_skips.get(skip_key, (0, stored))
+        if skipped_on != stored:
+            skips = 0
+        reusable = (
+            filler_container
+            and stored_ema
+            and stored_ema.ema_verifyx_download_speed is not None
+            and (
+                stored_ema.ema_verifyx_upload_speed is None
+                or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
+            )
+        )
+        # a day of reuse is up: this probe refreshes the network reading only (r4472607210)
+        filler_refresh = bool(reusable) and skips >= MAX_FILLER_SKIPS
+        if reusable and not filler_refresh:
+            _filler_skips[skip_key] = (skips + 1, stored)
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -108,6 +143,8 @@ class VerifyXCheck:
         sizing = (
             {"challenge_config_overrides": _first_pass_challenge_config()}
             if ctx.config.first_pass
+            else {"challenge_config_overrides": FILLER_REFRESH_CHALLENGE_CONFIG}
+            if filler_refresh
             else {}
         )
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
@@ -116,6 +153,7 @@ class VerifyXCheck:
         # over SSH exactly as before.
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
+        first_run_started = time.monotonic()
         if local is not None and local.verifyx is not None:
             result = local.verifyx
             transport = "local_verify"
@@ -135,7 +173,17 @@ class VerifyXCheck:
         )
 
         cold_sample_retry: ColdSampleRetry | None = None
-        if _is_cold_sample_below_gate(ctx, result, prev_ema):
+        # the retry runs over SSH and is expected to take as long as an SSH first run did
+        # shortcut: a consumed local answer took ~0 s here, so only the reserve is checked; time LocalVerifyCheck if that overruns
+        retry_fits = task_seconds_left(ctx) > time.monotonic() - first_run_started + COLD_RETRY_RESERVE_SECONDS
+        if _is_cold_sample_below_gate(ctx, result, prev_ema) and not retry_fits:
+            logger.info(
+                _m(
+                    "VerifyX cold first sample below the gate, no time left to re-measure",
+                    extra=get_extra_info({**ctx.default_extra, "task_seconds_left": int(task_seconds_left(ctx))}),
+                )
+            )
+        elif _is_cold_sample_below_gate(ctx, result, prev_ema):
             # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
             # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
             # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps
@@ -213,14 +261,19 @@ class VerifyXCheck:
                 unavailable_readings,
                 keep_previous_on_none=package_gated,
             )
-            _feed_ema(
+            upload_reading = _fallback_upload_reading(
+                verifyx_network.get("upload_speed"), upload_blocked
+            )
+            prev_upload = prev_ema.ema_verifyx_upload_speed if prev_ema else None
+            # A missing reading on a never-measured upload leaves it unseeded, not a synthetic 0.0.
+            ema_upload = _feed_ema(
                 ctx,
                 updated_specs["network"],
                 "upload",
-                _fallback_upload_reading(verifyx_network.get("upload_speed"), upload_blocked),
-                prev_ema.ema_verifyx_upload_speed if prev_ema else None,
+                upload_reading,
+                _upload_ema_base(prev_upload, upload_reading),
                 unavailable_readings,
-                keep_previous_on_none=upload_blocked,
+                keep_previous_on_none=upload_blocked or prev_upload is None,
             )
 
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
@@ -258,7 +311,7 @@ class VerifyXCheck:
                 event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
             if unavailable_readings:
                 event.what_we_saw["unavailable_speed_readings"] = unavailable_readings
-            network_gate = _network_gate(verifyx_network, prev_ema, ema_download)
+            network_gate = _network_gate(verifyx_network, prev_ema, ema_download, ema_upload)
             if network_gate is not None:
                 event.what_we_saw["network_gate"] = network_gate
                 NETWORK_GATE_TALLY.record(
@@ -298,12 +351,30 @@ class VerifyXCheck:
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
+                        "direction": "download",
                         "ema_verifyx_download_speed": ema_download,
                         "min_download_speed_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
                     },
                 )
                 if cold_sample_retry is not None:
                     slow_event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
+                if network_gate is not None:
+                    slow_event.what_we_saw["network_gate"] = network_gate
+                return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
+
+            if upload_too_slow(
+                ema_upload, upload_reading, prev_ema, first_pass=ctx.config.first_pass
+            ):
+                slow_event = render_message(
+                    Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "direction": "upload",
+                        "ema_verifyx_upload_speed": ema_upload,
+                        "min_upload_speed_mbps": MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS,
+                    },
+                )
                 if network_gate is not None:
                     slow_event.what_we_saw["network_gate"] = network_gate
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
@@ -342,6 +413,16 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EXECUTOR_CRASH": Msg.VERIFY_FAILED_EXECUTOR_CRASH,
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
+}
+
+
+# DAH-5742 (r4472607210): the RAM and disk a filler holds are ours (lium-platform keeps a 50 GiB disk and 4 GiB RAM
+# reserve beside it), so the day's refresh tests them at 1 GB and keeps the network legs and the EMA gates as they are
+FILLER_REFRESH_CHALLENGE_CONFIG = {
+    "memory_min_test_gb": 1,
+    "memory_max_test_gb": 1,
+    "storage_min_available_gb": 1,
+    "storage_throughput_test_gb": 1,
 }
 
 
@@ -431,6 +512,23 @@ def download_gate(
     return "too_slow"
 
 
+def upload_too_slow(
+    ema_upload: float | None,
+    upload_reading: object,
+    prev_ema: NetworkEMA | None,
+    *,
+    first_pass: bool,
+) -> bool:
+    """The upload-EMA floor. A 0.0 is a judged sample (a host can block its own upload), and a
+    missing, malformed or Cloudflare-429 reading judges the EMA it leaves, so an established
+    below-floor upload keeps failing. Only a never-measured upload with no usable sample, or on a
+    first pass, is not judged."""
+    if ema_upload is None or ema_upload >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS:
+        return False
+    never_measured = prev_ema is None or prev_ema.ema_verifyx_upload_speed is None
+    return not (never_measured and (first_pass or not _is_speed_reading(upload_reading)))
+
+
 def verifyx_verdict(
     result_data: dict | None, prev_ema: NetworkEMA | None, *, first_pass: bool
 ) -> bool:
@@ -441,7 +539,26 @@ def verifyx_verdict(
         return False
     network = result_data.get("network") or {}
     ema_download = gated_download_ema(network, prev_ema)
-    return download_gate(ema_download, prev_ema, first_pass=first_pass) != "too_slow"
+    if download_gate(ema_download, prev_ema, first_pass=first_pass) == "too_slow":
+        return False
+    # The verdict holds no count: a 429 is read as within MAX_KEPT_UPLOAD_PROBES, and the shadow
+    # skips the probes past it (liumd_shadow "upload_fallback_cap").
+    upload_fallback = bool(network.get("cloudflare_upload_fallback"))
+    upload = _fallback_upload_reading(network.get("upload_speed"), upload_fallback)
+    prev_upload = prev_ema.ema_verifyx_upload_speed if prev_ema else None
+    kept = upload is None and (upload_fallback or prev_upload is None)
+    ema_upload = prev_upload if kept else _ema_if_gated(_upload_ema_base(prev_upload, upload), upload)
+    return not upload_too_slow(ema_upload, upload, prev_ema, first_pass=first_pass)
+
+
+def _upload_ema_base(prev_upload: float | None, reading: object) -> float | None:
+    """The stored upload EMA a measured reading averages with. The backend stores a node's specs only
+    on a passing cycle, so a stored upload EMA below the floor predates it (or can never be raised by
+    a failing cycle: 2 Mbps stays 2, and a steady 12 Mbps computes 7 every cycle, review 5704509865).
+    Such an EMA is dropped and the reading judged alone; any stored EMA at the floor is kept."""
+    if prev_upload is not None and prev_upload < MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS and _is_speed_reading(reading):
+        return None
+    return prev_upload
 
 
 def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:
@@ -502,7 +619,9 @@ def _ema_if_gated(prev: float | None, reading: object) -> float | None:
     return compute_ema(prev, reading if reading is not None else 0.0)
 
 
-def _network_gate(verifyx_network: dict, prev_ema, ema_gated: float | None) -> dict:
+def _network_gate(
+    verifyx_network: dict, prev_ema, ema_gated: float | None, ema_upload: float | None
+) -> dict:
     """DAH-2774 record: the floor read against the package and the capacity reading."""
     prev = prev_ema.ema_verifyx_download_speed if prev_ema else None
     package = verifyx_network.get("package_download_speed")
@@ -514,6 +633,9 @@ def _network_gate(verifyx_network: dict, prev_ema, ema_gated: float | None) -> d
         "ema_package": _ema_if_gated(prev, package),
         "ema_capacity": ema_gated,
         "cloudflare_fallback": bool(verifyx_network.get("cloudflare_fallback")),
+        "upload_floor_mbps": MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS,
+        "upload_speed": verifyx_network.get("upload_speed"),
+        "ema_upload": ema_upload,
     }
 
 

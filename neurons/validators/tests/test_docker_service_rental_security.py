@@ -253,8 +253,8 @@ def _base_create_payload(**overrides) -> ContainerCreateRequest:
             startup_commands=HOSTILE_STARTUP_COMMAND,
             shm_size="1g",
         ),
-        "volume_limit_gb": 100,
-        "storage_limit_gb": 50,
+        "volume_limit_gb": 44,
+        "storage_limit_gb": 22,
         "available_ports": [
             PayloadPortMapping(internal_port=22, external_port=30022),
             PayloadPortMapping(internal_port=20000, external_port=30000),
@@ -442,6 +442,30 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     assert len(env_specs) == 1
     assert env_specs[0].argv == ("sh", "-c", "cat >> /etc/environment")
     assert "ENV_NEWLINE_MARKER" in env_specs[0].stdin
+
+
+@pytest.mark.asyncio
+async def test_create_container_mounts_a_new_volume_at_a_bare_template_path(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    # DAH-5426: a bare "/workspace" is the container side of the pod's own named volume, not a bind mount
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    payload = _base_create_payload(custom_options=CustomOptions(volumes=["/workspace"]))
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
+    assert [(v.source, v.target) for v in run_spec.volumes] == [(f"volume_{payload.pod_id}", "/workspace")]
+    assert result.local_volume_path == "/workspace"
 
 
 @pytest.mark.asyncio
@@ -913,7 +937,8 @@ async def test_create_container_emits_secret_safe_sdk_operation_logs(
     assert run_extra["container_name"] == "pod_00000000-0000-0000-0000-0000000000aa"
     assert run_extra["pod_id"] == payload.pod_id
     assert run_extra["image"] == HOSTILE_IMAGE
-    assert run_extra["command_argv"] == ["sh", "/tmp/Jtd7.sh"]
+    assert run_extra["command_argc"] == 2
+    assert "Jtd7" not in str(sdk_extras)
     assert sorted(run_extra["environment_keys"]) == [
         "APP_MODE",
         "HOSTILE_ENV",
@@ -1294,3 +1319,14 @@ async def test_a_refused_create_drops_the_s3fs_plugin_only_once_its_volume_is_go
 
     assert any("docker volume rm celium-volume-safe" in c for c in ssh_client.commands)
     assert any("docker plugin rm s3fs-celium-volume-safe" in c for c in ssh_client.commands) is plugin_removed
+
+
+def test_create_request_str_leaves_out_renter_supplied_values():
+    # every create logs str(payload); renter-supplied env, commands, Dockerfile and password stay out
+    payload = _base_create_payload(dockerfile_content="FROM scratch\nDOCKERFILE_MARKER")
+    logged = str(payload)
+    # markers, not whole values: repr escapes the newlines in the startup command
+    for marker in ("ENV_MARKER", "Jtd7", "mney", "DOCKERFILE_MARKER"):
+        assert marker not in logged
+    assert payload.custom_options.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
+    assert "HOSTILE_ENV" in payload.model_dump_json()

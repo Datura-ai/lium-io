@@ -832,7 +832,7 @@ class BannedProviderMessages:
         impact="Proceed",
     )
     # DAH-2662: a mount that is not procfs sits on /proc/driver/nvidia/gpus, so the kernel's GPU
-    # list cannot be read (the 2026-08-19 kit). Emitted only when KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # list cannot be read (the 2026-08-19 kit).
     KERNEL_GPU_VIEW_OVERLAID = MessageTemplate(
         event="A foreign mount covers the kernel's GPU list",
         reason="KERNEL_GPU_VIEW_OVERLAID",
@@ -1047,6 +1047,31 @@ class CollateralStatusMessages:
         severity="info",
         category="policy",
         impact="None; the last known collateral status is reported, or none deposited when there is none",
+    )
+
+
+class NodeAccountMessages:
+    MATCH = MessageTemplate(
+        event="Node is the one its account registered",
+        reason="NODE_ACCOUNT_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Node account check not applicable",
+        reason="NODE_ACCOUNT_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Node at this address is not the one its account registered",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Verification failed; verification cleared",
+        remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
     )
 
 
@@ -1449,6 +1474,13 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    SKIPPED_ALL_PORTS_RENTED = MessageTemplate(
+        event="Port verification skipped: the rental holds every port",
+        reason="PORT_CHECK_SKIPPED_ALL_PORTS_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed; the ports are checked again once one is free",
+    )
     VERIFY_DEFERRED = MessageTemplate(
         event="Port verification deferred: the Docker filesystem is backed up with a tenant's writes",
         reason="PORT_VERIFY_DEFERRED",
@@ -1491,6 +1523,13 @@ class DiskSpaceMessages:
         impact="Score set to 0",
         remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
         "longer need, or grow the disk. The next validation reads the disk again.",
+    )
+    SPLIT_DISK = MessageTemplate(
+        event="Disk space per free split inspected",
+        reason="SPLIT_DISK_SIZED",
+        severity="info",
+        category="env",
+        impact="Proceed",
     )
 
 
@@ -1815,7 +1854,8 @@ class VerifyXMessages:
         label="network speed too slow",
         reason_suffix="NETWORK_SPEED_TOO_SLOW",
         remediation=(
-            "EMA download speed is below the minimum threshold. "
+            "EMA download speed (100 Mbps) or upload speed (10 Mbps) is below the minimum "
+            "threshold. "
             "Improve the executor's network connection or wait for the EMA to recover "
             "once speeds improve."
         ),
@@ -2138,11 +2178,12 @@ class NvlinkFaultMessages:
         category="env",
         impact="Score set to 0 until NVLink works again",
         remediation=(
-            "These GPUs are SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows PCIe paths "
-            "(PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. Start "
-            "nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, same version as the "
-            "driver), check `nvidia-smi nvlink -s`, then restart the executor container "
-            "(`docker restart executor-executor-1`). If the links stay down, service the board."
+            "These GPUs ship only as SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows "
+            "PCIe paths (PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. "
+            "On an HGX board, start nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, "
+            "same version as the driver), check `nvidia-smi nvlink -s`, then restart the executor container "
+            "(`docker restart executor-executor-1`). If the links stay down, service the board. H100 "
+            "modules on SXM-to-PCIe adapter boards never get this: they are listed as H100 PCIe."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2564,13 +2605,6 @@ class CachedTemplateMessages:
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 
-    DISABLED = MessageTemplate(
-        event="Local verification disabled",
-        reason="LOCAL_VERIFY_DISABLED",
-        severity="info",
-        category="transport",
-        impact="None — every check runs over SSH as before",
-    )
     SKIPPED = MessageTemplate(
         event="Local verification skipped",
         reason="LOCAL_VERIFY_SKIPPED",
@@ -2584,7 +2618,7 @@ class LocalVerifyMessages:
         severity="info",
         category="transport",
         impact="None — the matmul and VerifyX run over SSH as before",
-        remediation="Update the executor image and set EXECUTOR_LOCAL_VERIFY_ENABLED=true to take the one-call path.",
+        remediation="Update the executor image to take the one-call path.",
     )
     FALLBACK = MessageTemplate(
         event="Local verification not used, SSH path taken",
@@ -2674,6 +2708,42 @@ class RentedPodNetworkMessages:
     NOT_RENTED = MessageTemplate(
         event="Rented pod network summary skipped: no running rental",
         reason="RENTED_POD_NETWORK_NOT_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class RentedPodOwnershipMessages:
+    OK = MessageTemplate(
+        event="Rented pod files are owned inside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SHIFTED = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; root login and sudo fail inside the pod until its files are repaired",
+        remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
+        "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
+        "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
+        "(only ids inside the old range; keep setuid bits and file capabilities). Shut the host down "
+        "cleanly to avoid this.",
+    )
+    UNREAD = MessageTemplate(
+        event="Rented pod file ownership not read",
+        reason="RENTED_POD_OWNERSHIP_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented pod file ownership skipped: no running rental",
+        reason="RENTED_POD_OWNERSHIP_NOT_RENTED",
         severity="info",
         category="runtime",
         impact="Proceed",
