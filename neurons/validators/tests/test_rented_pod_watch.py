@@ -402,3 +402,17 @@ async def test_the_light_list_becomes_probe_targets_and_a_4xx_falls_back(monkeyp
     assert await client.get_rented_pod_targets() == full
     assert calls == ["/internal/executors/rented?light=true", "full"]
     assert RentedPodTargets.model_validate([]).root == []
+
+
+@pytest.mark.asyncio
+async def test_a_pod_down_on_the_first_tick_after_a_restart_still_gets_its_reachable():
+    backend, probe = FakeBackend(_rented(p1="RUNNING")), FakeProbe()
+    watch = _watch(backend, probe)
+    probe.results = {"p1": PodSshResult.REFUSED}
+    await watch.tick()
+
+    probe.results = {"p1": PodSshResult.BANNER}
+    await watch.tick()
+    await watch.tick()
+
+    assert _states(backend) == ["reachable"]

@@ -47,7 +47,7 @@ class _PodState:
     answered: bool = False
     misses: int = 0
     first_miss_at: datetime | None = None
-    # a reachable is owed: an unreachable was posted (or the process just started) and none landed since
+    # a reachable is owed: an unreachable was posted (or it is the pod's first banner), none landed
     posted: bool = False
 
 
@@ -57,7 +57,6 @@ class RentedPodWatch:
         self.probe = probe
         self._pods: dict[str, _PodState] = {}
         self._route_missing_logged = False
-        self._reconciled = False
 
     async def run(self, should_exit: Callable[[], bool]) -> None:
         loop = asyncio.get_running_loop()
@@ -113,8 +112,8 @@ class RentedPodWatch:
         for observation in watched:
             state = self._pods.setdefault(observation.pod_id, _PodState())
             if observation.result is PodSshResult.BANNER:
+                state.posted = state.posted or not state.answered
                 state.answered, state.misses, state.first_miss_at = True, 0, None
-                state.posted = state.posted or not self._reconciled
                 if state.posted:
                     reports.append(
                         (state, self._post(observation, REACHABLE, probed_at, probed_at))
@@ -135,7 +134,6 @@ class RentedPodWatch:
                 reports.append(
                     (None, self._post(observation, UNREACHABLE, state.first_miss_at, probed_at))
                 )
-        self._reconciled = True
 
         failed = await self._send(reports)
         logger.info(
