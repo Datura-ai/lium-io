@@ -8,7 +8,9 @@ list. Only a pod that has sent a banner since this process started counts misses
 never alarms). A RUNNING pod that misses RENTED_POD_WATCH_MISSES probes in a row (``refused`` or
 ``timeout``) is reported ``unreachable`` (since = its first missed probe) every tick while it stays
 down, and ``reachable`` once when its banner comes back. A ``no_banner`` is re-probed once with
-RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS first and needs RENTED_POD_WATCH_NO_BANNER_MISSES.
+RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS first and needs RENTED_POD_WATCH_NO_BANNER_MISSES;
+the other outcomes are counted and reported while those retries run, and a retry that no longer fits
+in the tick waits for the next one.
 A tick whose fleet is not ok is our own outage and changes nothing.
 
 Observe only: nothing here touches a score, a verdict, a cycle result or the per-cycle probe. State
@@ -39,6 +41,8 @@ REACHABLE = "reachable"
 
 # all of a tick's reports must land within this, so a slow backend never stretches the minute
 REPORTS_DEADLINE_SECONDS = 30
+# kept free at the end of a tick for the reports of the no_banner retries
+RETRY_REPORTS_RESERVE_SECONDS = 5
 
 
 @dataclass
@@ -51,6 +55,8 @@ class _PodState:
     posted: bool = False
     # an unreachable was posted and no banner since: repost on every miss, whatever its threshold
     announced: bool = False
+    # when its no_banner was last re-probed: retries left out of a tick go first in the next one
+    retried_at: datetime | None = None
 
 
 class RentedPodWatch:
@@ -76,6 +82,7 @@ class RentedPodWatch:
             await asyncio.sleep(max(0.0, started + interval - loop.time()))
 
     async def tick(self) -> None:
+        started = asyncio.get_running_loop().time()
         rented = await self.backend_client.get_rented_pod_targets()
         if rented is None:
             return  # no list is no news: keep every counter
@@ -107,11 +114,48 @@ class RentedPodWatch:
         ]
         if not all(observation.fleet_ok for observation in watched):
             return  # our own outage: says nothing about the pods
-        watched = await self._retry_no_banner(rented, watched)
+        loop = asyncio.get_running_loop()
+        # the tick's budget: run() cancels a tick that outlives the interval, with all its results
+        ends = started + settings.RENTED_POD_WATCH_INTERVAL_SECONDS
+        retry = {
+            o.pod_id
+            for o in watched
+            if o.result is PodSshResult.NO_BANNER and self._pods.get(o.pod_id, _PodState()).answered
+        }
+        # the short outcomes are counted and reported while the long no_banner retries run
+        no_banner = [o for o in watched if o.pod_id in retry]
+        retrying = asyncio.ensure_future(
+            self._retry_no_banner(rented, no_banner, ends, probed_at)
+        )
+        try:
+            short = [o for o in watched if o.pod_id not in retry]
+            reports, misses = self._observe(short, probed_at)
+            failed = await self._send(reports)
+            retried = await retrying
+        finally:
+            retrying.cancel()
+        late, late_misses = self._observe(retried, probed_at)
+        failed += await self._send(late, max(0.0, ends - loop.time()))
+        logger.info(
+            _m(
+                "[pod-watch] rented pod SSH watch tick",
+                extra=get_extra_info(
+                    {
+                        "pods": len(watched),
+                        "misses": misses + late_misses,
+                        "posted": len(reports) + len(late),
+                        "failed": failed,
+                        "retry_deferred": len(retry) - len(retried),
+                    }
+                ),
+            )
+        )
 
+    def _observe(self, observations: list[PodSshObservation], probed_at: datetime):
+        """Counts each observation into its pod's state; returns the reports owed and the misses."""
         reports = []  # (state, report coroutine)
         misses = 0
-        for observation in watched:
+        for observation in observations:
             state = self._pods.setdefault(observation.pod_id, _PodState())
             if observation.result is PodSshResult.BANNER:
                 state.posted = state.posted or not state.answered
@@ -137,61 +181,53 @@ class RentedPodWatch:
                 reports.append(
                     (None, self._post(observation, UNREACHABLE, state.first_miss_at, probed_at))
                 )
-
-        failed = await self._send(reports)
-        logger.info(
-            _m(
-                "[pod-watch] rented pod SSH watch tick",
-                extra=get_extra_info(
-                    {
-                        "pods": len(watched),
-                        "misses": misses,
-                        "posted": len(reports),
-                        "failed": failed,
-                    }
-                ),
-            )
-        )
+        return reports, misses
 
     async def _retry_no_banner(
-        self, rented, watched: list[PodSshObservation]
+        self, rented, first: list[PodSshObservation], ends: float, probed_at: datetime
     ) -> list[PodSshObservation]:
-        """A no_banner from a pod that answered before gets one more probe with the long timeout."""
-        retry = {
-            o.pod_id
-            for o in watched
-            if o.result is PodSshResult.NO_BANNER and self._pods.get(o.pod_id, _PodState()).answered
-        }
-        if not retry:
-            return watched
-        subset = rented.model_copy(
-            update={
-                "executors": {
-                    uuid: executor.model_copy(
-                        update={"pods": [p for p in executor.pods if p.pod_id in retry]}
-                    )
-                    for uuid, executor in rented.executors.items()
-                    if any(p.pod_id in retry for p in executor.pods)
+        """Re-probes each no_banner once with the long timeout, one probe batch at a time, while a
+        whole batch still fits before ``ends`` less RETRY_REPORTS_RESERVE_SECONDS. A pod left out
+        changes nothing this tick and goes first next tick (least recently retried first)."""
+        loop = asyncio.get_running_loop()
+        timeout = settings.RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS
+        batch_size = settings.RENTED_POD_SSH_PROBE_CONCURRENCY
+        never = datetime.min.replace(tzinfo=UTC)
+        first.sort(key=lambda o: self._pods[o.pod_id].retried_at or never)
+        retried: list[PodSshObservation] = []
+        for i in range(0, len(first), batch_size):
+            if loop.time() + timeout > ends - RETRY_REPORTS_RESERVE_SECONDS:
+                break
+            batch = first[i : i + batch_size]
+            ids = {o.pod_id for o in batch}
+            subset = rented.model_copy(
+                update={
+                    "executors": {
+                        uuid: executor.model_copy(
+                            update={"pods": [p for p in executor.pods if p.pod_id in ids]}
+                        )
+                        for uuid, executor in rented.executors.items()
+                        if any(p.pod_id in ids for p in executor.pods)
+                    }
                 }
-            }
-        )
-        again = await self.probe(
-            subset,
-            timeout=settings.RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS,
-            concurrency=settings.RENTED_POD_SSH_PROBE_CONCURRENCY,
-            job_batch_id="pod-watch-retry",
-        )
-        second = {o.pod_id: o for node in again.values() for o in node}
-        return [second.get(o.pod_id, o) if o.pod_id in retry else o for o in watched]
+            )
+            again = await self.probe(
+                subset, timeout=timeout, concurrency=batch_size, job_batch_id="pod-watch-retry"
+            )
+            second = {o.pod_id: o for node in again.values() for o in node}
+            for o in batch:
+                self._pods[o.pod_id].retried_at = probed_at
+                retried.append(second.get(o.pod_id, o))
+        return retried
 
-    async def _send(self, reports) -> int:
-        """Posts every report at once, within REPORTS_DEADLINE_SECONDS; returns how many did not land.
+    async def _send(self, reports, deadline: float = REPORTS_DEADLINE_SECONDS) -> int:
+        """Posts every report at once, within ``deadline`` seconds; returns how many did not land.
         A reachable that did not land stays owed and goes again next tick."""
         if not reports:
             return 0
         tasks = [asyncio.ensure_future(coro) for _, coro in reports]
         try:
-            done, _ = await asyncio.wait(tasks, timeout=REPORTS_DEADLINE_SECONDS)
+            done, _ = await asyncio.wait(tasks, timeout=min(deadline, REPORTS_DEADLINE_SECONDS))
         finally:
             for task in tasks:
                 task.cancel()  # no-op on the finished ones; also when the tick deadline cancels us

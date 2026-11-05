@@ -443,3 +443,49 @@ async def test_an_announced_outage_keeps_reposting_when_refused_turns_into_no_ba
     await watch.tick()
 
     assert _states(backend) == ["unreachable", "unreachable", "reachable"]
+
+
+class SlowRetryProbe(FakeProbe):
+    """The long no_banner retry takes its whole timeout; records the pods each batch dialled."""
+
+    def __init__(self):
+        super().__init__()
+        self.retry_batches: list[set[str]] = []
+
+    async def __call__(self, rented, *, timeout, concurrency, job_batch_id):
+        if job_batch_id == "pod-watch-retry":
+            self.retry_batches.append({p.pod_id for e in rented.executors.values() for p in e.pods})
+            await asyncio.sleep(timeout)
+        return await super().__call__(
+            rented, timeout=timeout, concurrency=concurrency, job_batch_id=job_batch_id
+        )
+
+
+@pytest.mark.asyncio
+async def test_retries_that_outgrow_the_tick_keep_the_short_outcomes_and_go_first_next_tick(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "RENTED_POD_WATCH_INTERVAL_SECONDS", 1)
+    monkeypatch.setattr(settings, "RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(settings, "RENTED_POD_SSH_PROBE_CONCURRENCY", 2)
+    monkeypatch.setattr(watch_module, "RETRY_REPORTS_RESERVE_SECONDS", 0.1)
+    slow = [f"n{i}" for i in range(10)]
+    backend = FakeBackend(_rented(r1="RUNNING", **{p: "RUNNING" for p in slow}))
+    probe = SlowRetryProbe()
+    watch = await _answered(backend, probe, "r1", *slow)
+    probe.results = {"r1": PodSshResult.REFUSED, **{p: PodSshResult.NO_BANNER for p in slow}}
+
+    started = asyncio.get_running_loop().time()
+    await watch.tick()
+    took = asyncio.get_running_loop().time() - started
+
+    assert took < 1
+    assert watch._pods["r1"].misses == 1  # counted although the retries did not all fit
+    first = set().union(*probe.retry_batches)
+    assert 0 < len(first) < len(slow)
+    # a pod left out of the retries changes nothing this tick
+    assert all(watch._pods[p].misses == (p in first) for p in slow)
+
+    probe.retry_batches.clear()
+    await watch.tick()
+    assert probe.retry_batches[0] <= set(slow) - first
