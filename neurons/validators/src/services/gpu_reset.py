@@ -59,6 +59,9 @@ HOST_SYSTEMCTL = "nsenter -t 1 -m -- systemctl"
 # the NVSwitch fabric's host services, in stop order (started again in reverse): Fabric Manager, then the
 # NVLink subnet manager it uses on HGX Blackwell
 FABRIC_SERVICES = ("nvidia-fabricmanager", "nvidia-nvlsm")
+# DAH-5301 (H200 run): DCGM's host engine holds every GPU, so the driver refuses -r while it runs; it stops first and
+# starts last around the reset, like the fabric services (it is no sign of an NVSwitch fabric)
+MONITORING_SERVICES = ("nvidia-dcgm", "dcgm")
 # a fabric reset runs as one host systemd unit, so a dropped SSH session cannot leave Fabric Manager down
 # named, so a reset that outlives its SSH timeout can be stopped (one per host: it owns every host GPU)
 FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
@@ -349,7 +352,7 @@ async def _widen_targets_to_nvlink_peers(
                 "NVSwitch node shared with other pods: its GPUs reset only together, so the provider must "
                 "reset them on the host",
             )
-        return list(ordered), fabric_services
+        return list(ordered), await _monitoring_services(runner) + fabric_services
     topology = await _run(runner, TOPOLOGY_COMMAND)
     if topology.exit_code != 0:
         raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "could not read the GPU topology")
@@ -365,7 +368,11 @@ async def _widen_targets_to_nvlink_peers(
             if peer not in targets:
                 targets.add(peer)
                 frontier.append(peer)
-    return [uuid for uuid in ordered if uuid in targets], []
+    return [uuid for uuid in ordered if uuid in targets], await _monitoring_services(runner)
+
+
+async def _monitoring_services(runner: SSHCommandRunner) -> list[str]:
+    return [unit for unit in MONITORING_SERVICES if await _service_active(runner, unit)]
 
 
 def build_fabric_reset_command(units: list[str], reset_command: str) -> str:

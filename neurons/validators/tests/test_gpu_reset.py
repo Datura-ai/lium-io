@@ -62,6 +62,7 @@ class FakeHost:
         fabric_manager=False,
         nvlsm=False,
         fm_start_ok=True,
+        dcgm=False,
     ):
         self.commands: list[str] = []
         self.stopped = False
@@ -78,6 +79,8 @@ class FakeHost:
         self.reset_exit, self.inspect_exit, self.stop_exit = reset_exit, inspect_exit, stop_exit
         self.own_cgroup = own_cgroup
         self.active = {"nvidia-fabricmanager": fabric_manager, "nvidia-nvlsm": nvlsm}
+        if dcgm:
+            self.active["nvidia-dcgm"] = True
         self.fm_start_ok = fm_start_ok
         self.active_during_reset: dict[str, bool] | None = None
         self.reset_raises = False
@@ -158,7 +161,9 @@ class FakeHost:
                     return make_command_result(False, state, exit_code=0 if self.reset_unit_stuck else 3)
                 return make_command_result(not self.reset_unit_stuck, exit_code=0 if not self.reset_unit_stuck else 1)
             if verb == "is-active":
-                up = self.active[unit]
+                up = self.active.get(unit, False)
+                if unit in gpu_reset.MONITORING_SERVICES and not up:
+                    self.fm_log.pop()  # the probe for a monitoring service the host does not run
                 return make_command_result(up, "active" if up else "inactive", exit_code=0 if up else 3)
             ok = verb == "stop" or unit != "nvidia-fabricmanager" or self.fm_start_ok
             self.active[unit] = verb == "start" and ok
@@ -869,3 +874,17 @@ async def test_a_stopped_encrypted_pod_without_its_plaintext_path_is_refused_bef
     assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
     assert not report.container_restarted
     _no_change(host, start)
+
+
+@pytest.mark.parametrize("nvswitch", [False, True])
+@pytest.mark.asyncio
+async def test_dcgm_is_stopped_first_and_started_last_around_the_reset(nvswitch):
+    # DAH-5301 (real H200 run): the driver refuses -r while DCGM's host engine holds the GPUs
+    host = FakeHost(dcgm=True, nvswitch=nvswitch, fabric_manager=nvswitch, device_ids=tuple(U) if nvswitch else (U[0], U[1]))
+    report, _ = await _reset(host, backend=tuple(U) if nvswitch else (U[0], U[1]))
+    assert report.ok
+    assert host.active_during_reset["nvidia-dcgm"] is False
+    assert host.active["nvidia-dcgm"] is True
+    stops = [unit for verb, unit in host.fm_log if verb == "stop"]
+    starts = [unit for verb, unit in host.fm_log if verb == "start"]
+    assert stops[0] == "nvidia-dcgm" and starts[-1] == "nvidia-dcgm"
