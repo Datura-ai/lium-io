@@ -1008,12 +1008,13 @@ async def _clear_leftover_recovery_mark(
 
     async def clear() -> bool:
         nonlocal absence_confirmed
-        if not container_gone:
-            # running again: a pending retry of a stop mark that never landed, or the park record, is stale and would
-            # attribute a later provider stop to the recovery, even with no mark in Redis (lio#1827 review)
-            await ctx.services.pod_recovery.forget_recovery_stop(pod_id)
-            if await ctx.services.redis.get(key) is None:
-                return False
+        # a pending retry of a stop mark that never landed, or the park record, counts even with no mark in Redis
+        if (
+            not container_gone
+            and await ctx.services.redis.get(key) is None
+            and not await ctx.services.pod_recovery.recovery_stop_pending(pod_id)
+        ):
+            return False
         # under the create lock every mark write and its stop run under: never between a recovery's mark and its stop
         async with _no_create_in_flight(ctx, pod_id, pod_status) as clear_to_delete:
             if not clear_to_delete:
@@ -1022,6 +1023,10 @@ async def _clear_leftover_recovery_mark(
             inspect_result = await inspect(container_name)
             if not container_gone:
                 if (inspect_result.stdout or "").strip() == "true":
+                    # running again by this read under the lock, never an earlier one a concurrent recovery's stop
+                    # followed: its stale pending mark write or park record would attribute a later provider stop
+                    # to the recovery (lio#1827 review)
+                    await ctx.services.pod_recovery.forget_recovery_stop(pod_id)
                     await ctx.services.redis.delete(key)
                 return False
             # a failed recovery can leave the stopped original parked (<name>__prev, <name>__stopped): still the renter's pod

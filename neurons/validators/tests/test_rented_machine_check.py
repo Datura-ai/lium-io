@@ -1346,18 +1346,42 @@ async def test_tenant_enforcement_defers_only_a_confirmed_stop_of_an_unmounted_p
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_forgets_a_pending_recovery_stop_of_a_running_pod(context_factory):
-    # lio#1827 review: with no mark in Redis yet, a pending stop-mark retry of a pod running again is still dropped
+@pytest.mark.parametrize("running_under_lock", [True, False])
+async def test_tenant_enforcement_forgets_a_pending_recovery_stop_of_a_running_pod(context_factory, running_under_lock):
+    # lio#1827 review: with no mark in Redis yet, a pending stop-mark retry of a pod running again is still dropped,
+    # but only from a read under the create lock: a recovery that stopped the pod after the cycle's earlier read
+    # keeps its retry and park record
     ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
     lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
     docker = AsyncMock()
     docker.encrypted_volume_mount_missing.return_value = False
+    docker.recovery_stop_pending.return_value = True
+    redis = _recovery_redis(lock, {})
+    if not running_under_lock:
+        lock.acquire.side_effect = lambda *a, **k: setattr(ssh, "pod_running", False) or True
+
+    await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, redis=redis))
+
+    lock.acquire.assert_awaited()
+    if running_under_lock:
+        docker.forget_recovery_stop.assert_awaited_once_with("pod-1")
+    else:
+        docker.forget_recovery_stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_takes_no_lock_for_a_running_pod_without_a_recovery_stop(context_factory):
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    docker.recovery_stop_pending.return_value = False
     redis = _recovery_redis(lock, {})
 
     assert (await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, redis=redis))).passed
 
-    docker.forget_recovery_stop.assert_awaited_once_with("pod-1")
     lock.acquire.assert_not_awaited()
+    docker.forget_recovery_stop.assert_not_awaited()
 
 
 def _recovery_redis(lock, marks: dict[str, str]) -> Mock:

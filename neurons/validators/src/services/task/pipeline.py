@@ -106,6 +106,8 @@ class PodRecoverer(Protocol):
 
     async def forget_recovery_stop(self, pod_id: str) -> None: ...
 
+    async def recovery_stop_pending(self, pod_id: str) -> bool: ...
+
 
 @dataclass(frozen=True)
 class ContextServices:

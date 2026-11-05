@@ -76,6 +76,7 @@ from payload_models.payloads import (
     WorkloadKind,
     now_ms,
 )
+from daos.recovery_stop import UnmarkedRecoveryStopDao
 from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
@@ -2525,10 +2526,14 @@ _STOPPED_BY_RECOVERY_WRITE_RETRY_SEC = 1
 # pod_id -> its pending retry, cancelled by the pod's next mark write so it never deletes a later recovery's mark
 _RECOVERY_MARK_CLEANUPS: dict[str, asyncio.Task] = {}
 # pods this process parked as <name>__stopped because the stop's mark could not be written: the trusted half of
-# that attribution, since a container name on the provider's daemon is forgeable (lio#1827 review)
-# The mark itself is retried in the background until it lands, so the attribution outlives a validator restart.
-# shortcut: a restart before Redis is back drops both, and that pod falls back to POD_NOT_RUNNING
+# that attribution, since a container name on the provider's daemon is forgeable (lio#1827 review). Written through
+# to the validator DB and loaded from it on first use, so a validator restart before Redis is back keeps it (F-26);
+# the mark itself is still retried in the background until it lands.
 _UNMARKED_RECOVERY_STOPS: set[str] = set()
+_UNMARKED_RECOVERY_STOPS_LOADED = False
+_unmarked_recovery_stop_dao = UnmarkedRecoveryStopDao()
+# each DB read or write of that record; past it the in-process record stands alone
+_UNMARKED_RECOVERY_STOP_DB_TIMEOUT_SEC = 5
 # pod_id -> outcome of its last unmounted-pod stop, popped by the rented-machine check: only a confirmed stop defers
 _UNMOUNTED_STOP_OUTCOMES: dict[str, str] = {}
 
@@ -2537,6 +2542,55 @@ def _cancel_recovery_mark_cleanup(pod_id: str) -> None:
     task = _RECOVERY_MARK_CLEANUPS.pop(pod_id, None)
     if task:
         task.cancel()
+
+
+async def _cancel_recovery_mark_cleanup_and_wait(pod_id: str) -> None:
+    # awaited, so a retry's Redis write already under way ends before the caller reads or deletes the mark (F-28)
+    task = _RECOVERY_MARK_CLEANUPS.pop(pod_id, None)
+    if task:
+        task.cancel()
+        await asyncio.wait([task])
+
+
+async def _unmarked_recovery_stop_db(operation: Awaitable, pod_id: str):
+    try:
+        return await asyncio.wait_for(operation, timeout=_UNMARKED_RECOVERY_STOP_DB_TIMEOUT_SEC)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            _m("POD_UNMARKED_RECOVERY_STOP_DB_FAILED", extra=get_extra_info({"pod_id": pod_id, "error": repr(exc)}))
+        )
+        return None
+
+
+async def _load_unmarked_recovery_stops() -> None:
+    global _UNMARKED_RECOVERY_STOPS_LOADED
+    if _UNMARKED_RECOVERY_STOPS_LOADED:
+        return
+    stored = await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.all_pod_ids(), "")
+    if stored is not None:
+        _UNMARKED_RECOVERY_STOPS.update(stored)
+        _UNMARKED_RECOVERY_STOPS_LOADED = True
+
+
+async def _record_unmarked_recovery_stop(pod_id: str) -> None:
+    await _load_unmarked_recovery_stops()
+    _UNMARKED_RECOVERY_STOPS.add(pod_id)
+    await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.add(pod_id), pod_id)
+
+
+async def _drop_unmarked_recovery_stop(pod_id: str) -> None:
+    await _load_unmarked_recovery_stops()
+    # unloaded, the DB may still hold it
+    if pod_id in _UNMARKED_RECOVERY_STOPS or not _UNMARKED_RECOVERY_STOPS_LOADED:
+        _UNMARKED_RECOVERY_STOPS.discard(pod_id)
+        await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.remove(pod_id), pod_id)
+
+
+async def _unmarked_recovery_stop_known(pod_id: str) -> bool:
+    await _load_unmarked_recovery_stops()
+    return pod_id in _UNMARKED_RECOVERY_STOPS
 
 
 def _retry_recovery_mark_in_background(
@@ -12123,13 +12177,13 @@ class DockerService:
                         self.redis_service.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"),
                         timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
                     )
-                    ours = pod_id in _UNMARKED_RECOVERY_STOPS or (
+                    ours = await _unmarked_recovery_stop_known(pod_id) or (
                         mark.decode() if isinstance(mark, bytes) else mark
                     ) == STOPPED_BY_RECOVERY_STOPPED
                     await self._mark_stopped_by_recovery(
                         pod_id, STOPPED_BY_RECOVERY_STOPPED if ours else STOPPED_BY_RECOVERY_RENAMING
                     )
-                    _UNMARKED_RECOVERY_STOPS.discard(pod_id)
+                    await _drop_unmarked_recovery_stop(pod_id)
                 except Exception:
                     return False
         except TimeoutError:
@@ -12202,7 +12256,7 @@ class DockerService:
         self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
     ) -> bool:
         """True while a pod this process stopped without its mark is still parked, stopped, as <name>__stopped."""
-        if pod_id not in _UNMARKED_RECOVERY_STOPS:
+        if not await _unmarked_recovery_stop_known(pod_id):
             return False
         anchor = await ssh_client.run(
             f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(container_name + RECOVERY_STOPPED_SUFFIX)}",
@@ -12212,8 +12266,8 @@ class DockerService:
 
     async def _clear_stopped_by_recovery(self, pod_id: str) -> None:
         """Delete the mark, bounded like its write; a failed delete is retried in the background."""
-        _UNMARKED_RECOVERY_STOPS.discard(pod_id)
-        _cancel_recovery_mark_cleanup(pod_id)  # a pending write retry must not re-mark a pod started since
+        await _drop_unmarked_recovery_stop(pod_id)
+        await _cancel_recovery_mark_cleanup_and_wait(pod_id)  # a pending write retry must not re-mark a pod started since
         key = f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"
 
         async def delete() -> bool:
@@ -12249,9 +12303,14 @@ class DockerService:
 
     async def forget_recovery_stop(self, pod_id: str) -> None:
         """Drop this process's pending mark retry and park record of a pod seen running again or gone: either,
-        left behind, would attribute a later provider stop to the recovery (lio#1827 review)."""
-        _cancel_recovery_mark_cleanup(pod_id)
-        _UNMARKED_RECOVERY_STOPS.discard(pod_id)
+        left behind, would attribute a later provider stop to the recovery (lio#1827 review). The caller holds the
+        pod's create lock and saw it under that lock, so no recovery of the pod runs between that read and this."""
+        await _cancel_recovery_mark_cleanup_and_wait(pod_id)
+        await _drop_unmarked_recovery_stop(pod_id)
+
+    async def recovery_stop_pending(self, pod_id: str) -> bool:
+        """True while this validator holds a pending mark retry or a park record of the pod."""
+        return pod_id in _RECOVERY_MARK_CLEANUPS or await _unmarked_recovery_stop_known(pod_id)
 
     async def unmounted_stop_outcome(self, pod_id: str) -> str | None:
         """Pop the outcome of this pod's last unmounted-pod stop: "stopped", "failed" (docker refused) or "unknown"."""
@@ -12402,7 +12461,7 @@ class DockerService:
         parked = f"{container_name}{RECOVERY_STOPPED_SUFFIX}"
         if not marked and await self._park_by_id(ssh_client, container_name, parked):
             container_name = parked
-            _UNMARKED_RECOVERY_STOPS.add(pod_id)
+            await _record_unmarked_recovery_stop(pod_id)
         outcome = await self._stop_outcome(ssh_client, container_name)
         _UNMOUNTED_STOP_OUTCOMES[pod_id] = outcome
         if outcome == "failed":
@@ -12410,7 +12469,7 @@ class DockerService:
             # or excuse a later provider stop
             if marked:
                 await self._clear_stopped_by_recovery(pod_id)
-            _UNMARKED_RECOVERY_STOPS.discard(pod_id)
+            await _drop_unmarked_recovery_stop(pod_id)
         elif not marked:
             self._retry_stopped_mark_in_background(pod_id)
         return outcome == "stopped"

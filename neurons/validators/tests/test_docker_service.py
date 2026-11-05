@@ -8646,6 +8646,59 @@ async def test_a_pod_seen_running_drops_a_pending_stop_mark_write(docker_service
 
 
 @pytest.mark.asyncio
+async def test_an_unmarked_park_survives_a_validator_restart_while_redis_is_down(
+    docker_service, monkeypatch, unmarked_recovery_stop_db
+):
+    # lio#1827 review 4483463076 (F-26): the park record is written to the validator DB, so a restart before Redis
+    # is back still attributes the stopped anchor to the validator; a pod seen running drops it there too
+    docker_service.redis_service.set = AsyncMock(side_effect=ConnectionError("Redis down"))
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC", 60)
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    monkeypatch.setattr(docker_service, "_park_by_id", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_stop_outcome", AsyncMock(return_value="stopped"))
+    assert await docker_service._mark_and_stop_unmounted_pod(AsyncMock(), "pod_pod-1", "pod-1") is True
+    docker_service_module._RECOVERY_MARK_CLEANUPS.pop("pod-1").cancel()
+    docker_service_module._UNMOUNTED_STOP_OUTCOMES.pop("pod-1", None)
+    assert unmarked_recovery_stop_db.pod_ids == {"pod-1"}
+
+    # restart: the process's record and retry are gone, the DB row is not
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS_LOADED", False)
+    ssh_client = AsyncMock()
+    ssh_client.run.return_value = Mock(exit_status=0, stdout="false\n")
+    assert await docker_service.unmarked_stop_parked(ssh_client, "pod_pod-1", "pod-1")
+    assert await docker_service.recovery_stop_pending("pod-1")
+
+    await docker_service.forget_recovery_stop("pod-1")
+    assert unmarked_recovery_stop_db.pod_ids == set()
+    assert not await docker_service.unmarked_stop_parked(ssh_client, "pod_pod-1", "pod-1")
+
+
+@pytest.mark.asyncio
+async def test_forgetting_a_recovery_stop_waits_out_a_mark_write_under_way(docker_service, monkeypatch):
+    # lio#1827 review (F-28): the cancelled retry is awaited, so a SET already sent ends before the caller's delete
+    write_started, write_may_finish = asyncio.Event(), asyncio.Event()
+    finished: list[str] = []
+
+    async def write() -> bool:
+        write_started.set()
+        try:
+            await write_may_finish.wait()
+        finally:
+            finished.append("write")
+        return True
+
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC", 0)
+    docker_service_module._retry_recovery_mark_in_background("pod-1", write, "POD_RECOVERY_MARK_WRITE_FAILED")
+    await write_started.wait()
+
+    await docker_service.forget_recovery_stop("pod-1")
+
+    assert finished == ["write"]
+    assert "pod-1" not in docker_service_module._RECOVERY_MARK_CLEANUPS
+
+
+@pytest.mark.asyncio
 async def test_a_failed_mark_delete_is_retried_in_the_background(docker_service, monkeypatch):
     marks = {"stopped_by_recovery:pod-1": "1"}
     attempts = []
