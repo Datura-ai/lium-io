@@ -12,6 +12,7 @@ from services.nvidia_devices import (
     read_kernel_gpu_view,
 )
 
+from ..availability import ReachSource, ReachTarget
 from ..messages import GpuKernelCountMessages as Msg
 from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
@@ -193,7 +194,9 @@ class GpuKernelCountCheck:
     A kernel list that is missing (unreadable, empty, read failed, withheld behind a foreign
     mount) is never a failure: the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED. One exception
     (DAH-5519): behind a foreign mount, a reported card the create step cannot attach fails like a
-    short list (verdict unattachable), since no renter can start a container on it.
+    short list (verdict unattachable), since no renter can start a container on it. That failure is
+    also a GPU_KERNEL_UNATTACHABLE availability entry, so the backend hides the node and refuses new
+    rentals while a rental already on it runs on: a split node with a live pod kept its dead free card listed.
     """
 
     check_id = "gpu.validate.kernel_count"
@@ -248,6 +251,9 @@ class GpuKernelCountCheck:
             if unattachable:
                 verdict = kernel_check_fields["kernel_verdict"] = "unattachable"
                 kernel_check_fields["unattachable_uuids"] = unattachable
+                # also an availability entry: on a split node with a live pod the free card stayed listed
+                kernel_check_fields["reach_source"] = str(ReachSource.VALIDATOR)
+                kernel_check_fields["reach_target"] = str(ReachTarget.GPU)
         would_fail = verdict in ("count_lower", "unattachable")
         kernel_check_fields.update(
             {
