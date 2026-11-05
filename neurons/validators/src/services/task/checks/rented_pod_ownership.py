@@ -40,12 +40,12 @@ def judge(line: str) -> dict | None:
     base, length = fields[1], fields[2]
     if base == 0:
         return {"pid": pid_num, "uid_map_base": 0, "host_owners": {}, "outside_namespace": []}
-    if _num(root_uid) is None:
-        return None
-    owners = {"/": _num(root_uid)}
-    if _num(home_uid) is not None:
-        owners["/root"] = _num(home_uid)
+    read = {"/": _num(root_uid), "/root": _num(home_uid)}
+    owners = {path: uid for path, uid in read.items() if uid is not None}
     shifted = sorted(path for path, uid in owners.items() if not base <= uid < base + length)
+    # one shifted path proves the fault; without one, an unread path is unknown, not healthy
+    if not shifted and len(owners) < len(read):
+        return None
     return {
         "pid": pid_num,
         "uid_map_base": base,
