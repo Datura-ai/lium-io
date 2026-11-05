@@ -841,6 +841,10 @@ def nvml_snapshot_forked(mp) -> dict:
 
 
 def nvml_faults(before: dict, after: dict) -> list[str]:
+    # an after-snapshot that hung or died has no cards in it: that says nothing about them, and reading it
+    # as "every card missing" failed honest nodes (8x H200, 2 Nov); the CUDA workers' verdicts still stand
+    if after.get("available") is False:
+        return []
     faults = []
     before_gpus, after_gpus = before.get("gpus", []), after.get("gpus", [])
     # the UUID names the card; when any read of it failed (an old binding, one card) both snapshots fall
@@ -1141,6 +1145,10 @@ def main(argv: list[str]) -> int:
     elif errors:
         result["status"] = "error"
         result["error"] = "; ".join(f"gpu {r['index']}: {r['error']}" for r in errors)
+    elif result["nvml_before"].get("available") and not result["nvml_after"].get("available"):
+        # the post-run counters were never read: no verdict (UNKNOWN), so a pending recheck is not cleared as ok
+        result["status"] = "error"
+        result["error"] = f"NVML after the run: {result['nvml_after'].get('error', 'unavailable')}"
     result["elapsed_s"] = round(time.perf_counter() - started, 2)
     print(JSON_MARKER, json.dumps(result, sort_keys=True))
     return {"ok": 0, "fault": 1, "error": 2}[result["status"]]

@@ -110,6 +110,14 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     # the external volume is attached, nested Docker is turned off for it on this node
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    # DAH-5301: a reboot found a pod GPU hung and reset it before the new container started
+    HungGpuReset = "HungGpuReset"
+    # ...or found one hung and could not reset it: MIG, an NVLink peer outside the pod, a process
+    # outside the pod on it, or the driver refused the reset
+    HungGpuNotResetMig = "HungGpuNotResetMig"
+    HungGpuNotResetNvlinkShared = "HungGpuNotResetNvlinkShared"
+    HungGpuNotResetInUse = "HungGpuNotResetInUse"
+    HungGpuNotResetUnsupported = "HungGpuNotResetUnsupported"
 
 
 class ValidatorMessage(Message, DeliveryStamps):
@@ -552,7 +560,7 @@ class GpuResetErrorCode(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
     ClockLockNotSupported = "ClockLockNotSupported"
-    # 2.6.0: the host's GPU listing failed, timed out or was empty; the provider has to reboot the host
+    # 2.10.0: the host's GPU listing failed, timed out or was empty; the provider has to reboot the host
     GpusLostOnHost = "GpusLostOnHost"
 
 
