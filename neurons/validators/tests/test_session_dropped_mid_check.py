@@ -11,8 +11,10 @@ from unittest.mock import MagicMock
 
 import asyncssh
 import pytest
+from services.task.checks.gpu_fault_probe import GpuFaultProbeCheck
 from services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
+from services.task.checks.inspector import InspectorRentedCheck
 from services.task.checks.port_connectivity import PortConnectivityCheck
 from services.task.checks.rental_probe import RentalProbeCheck
 from services.task.checks.rented_gpu_drop import RentedGpuDropCheck
@@ -170,6 +172,8 @@ def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
         GpuMemoryHealthCheck,
         GpuLossHoldCheck,
         RentedGpuDropCheck,
+        GpuFaultProbeCheck,
+        InspectorRentedCheck,
     ):
         assert check.replays_after_session_drop is False
 
