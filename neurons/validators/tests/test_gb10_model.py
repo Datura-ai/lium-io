@@ -74,7 +74,8 @@ def test_gb10_is_its_own_model_and_idle_tier():
     assert BASE_GPU_MAP[GB10] == "GB10"
     assert MAX_UNRENTED_GPUS_BY_TYPE["GB10"] == {1: 10, 8: 64}
     # the RTX 5090's listing price (the backend's, in the reference table), as the other added types
-    assert RENTAL_PRICES_PER_HOUR[GB10] == GPU_REFERENCE_TABLE["NVIDIA GeForce RTX 5090"][0] == 0.40
+    assert RENTAL_PRICES_PER_HOUR[GB10] == 0.25
+    assert GB10 not in GPU_REFERENCE_TABLE
     assert reference_gpu_model(GB10, HOST_RAM_BYTES / 1024**2) == GB10
 
 

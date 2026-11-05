@@ -51,10 +51,9 @@ RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM
 # DAH-5508: the RTX 4090 48GB, its own model and idle tier; only reachable with RTX_4090_48GB_MODEL_ENABLED on.
 # Anchor = the backend's MACHINE_PRICES: RTX 4090 0.30 x the same-chip Quadro RTX 8000/6000 ratio (0.21/0.13), 0.48.
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.48
-# DAH-5863: `NVIDIA GB10` (DGX Spark), its own model and idle tier. No market data yet: priced as the RTX 5090
-# (0.40 per GPU in services/gpu_reference_table), the single Blackwell GPU of the same box price; GB10 has more
-# memory but less compute and memory bandwidth.
-RENTAL_PRICES_PER_HOUR["NVIDIA GB10"] = 0.40
+# DAH-5863: `NVIDIA GB10` (DGX Spark), its own model and idle tier. Anchor = the backend's MACHINE_PRICES (DAH-5864):
+# 0.25, the 5 Nov Vast median 0.376 x the median Lium/Vast ratio 0.668.
+RENTAL_PRICES_PER_HOUR["NVIDIA GB10"] = 0.25
 
 # Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
 # price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.

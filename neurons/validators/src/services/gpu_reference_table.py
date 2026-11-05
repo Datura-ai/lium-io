@@ -23,7 +23,6 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
     "NVIDIA B300 SXM6 AC": (8.0, (288,)),
     "NVIDIA B300 SXM6 PC": (8.0, (288,)),
     "NVIDIA CMP 170HX": (0.3, (8, 40, 64)),
-    "NVIDIA GB10": (0.4, (128,)),
     "NVIDIA GB300": (8.0, (288,)),
     "NVIDIA GeForce GTX 1060": (0.09, (3, 6)),
     "NVIDIA GeForce GTX 1070": (0.37, (8,)),

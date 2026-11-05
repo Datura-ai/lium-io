@@ -34,7 +34,7 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "d3ad958b814d1cc2b938fc59c9d9cd70c45d121d5139c4c8243624edc0676e64"
+GPU_REFERENCE_TABLE_SHA256 = "611722db5617a2f4a9fb58b8ecd32f8eabf59e6fc0c8d0400e8d757e785b9537"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = list(GPU_REFERENCE_TABLE)
 
@@ -52,7 +52,8 @@ def test_every_candidate_is_a_scored_model_with_the_registry_sizes():
     for model, (_, sizes_gb) in GPU_REFERENCE_TABLE.items():
         assert model in GPU_MODEL_RATES
         assert sorted(size * 1024 for size in sizes_gb) == sorted(GPU_VRAM_SIZES_MB[model])
-    assert set(GPU_MODEL_RATES) <= set(GPU_REFERENCE_TABLE)
+    # DAH-5863: the GB10 is scored but never a reference: its unified memory says nothing about a discrete card's
+    assert set(GPU_MODEL_RATES) - set(GPU_REFERENCE_TABLE) == {"NVIDIA GB10"}
 
 
 @pytest.mark.parametrize("vram_mb", [8000, 15352, 23028, 46068, 81559, 140000, 183359, 275040])
@@ -78,7 +79,7 @@ PARITY_CASES = [
     (49140, "NVIDIA Quadro RTX 8000"),
     (81559, "NVIDIA A800 80GB PCIe"),
     (97871, "NVIDIA H800 NVL"),
-    (143771, "NVIDIA GB10"),  # DAH-5863: the 128 GB GB10 is the cheapest model in band
+    (143771, "NVIDIA H200 NVL"),
     (183359, "NVIDIA B200"),
     (409600, "NVIDIA B300 SXM6 AC"),
 ]
