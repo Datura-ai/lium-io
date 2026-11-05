@@ -191,6 +191,27 @@ async def test_a_gpu_missing_from_the_listing_is_refused_on_an_nvlink_host_unles
     assert bool(_resets(host)) == (warning == W.HungGpuReset)
 
 
+class FailedListingHost(HungHost):
+    """The host listing fails part way: it names only the pod's GPUs and exits non-zero."""
+
+    async def run(self, cmd: str, *, timeout: int = 60, retryable: bool = True, **_):
+        if cmd.startswith("nvidia-smi --query-gpu=index"):
+            self.commands.append(cmd)
+            lines = [line for line in self.gpus.splitlines() if any(uuid in line for uuid in POD)]
+            return make_command_result(False, "\n".join(lines), exit_code=1)
+        return await super().run(cmd, timeout=timeout, retryable=retryable)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_host_listing_is_refused_so_a_shared_nvswitch_node_never_looks_like_the_pods():
+    # DAH-5301 (review), as reset_pod_gpus: the partial list would make the pod own "every" GPU and stop Fabric Manager
+    host = FailedListingHost(query=_query({U[0]: None}), nvswitch=True, fabric_manager=True)
+    result = await _reset(host)
+    assert _resets(host) == []
+    assert not any("fabricmanager" in cmd and "stop" in cmd for cmd in host.commands)
+    assert result.warning == W.HungGpuNotResetUnsupported
+
+
 def test_both_nvidia_smi_calls_are_killed_if_they_ignore_the_timeout():
     assert HUNG_GPU_QUERY_COMMAND.count("timeout -k 5 20 nvidia-smi") == 2
 

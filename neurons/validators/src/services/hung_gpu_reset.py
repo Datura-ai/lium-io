@@ -176,8 +176,10 @@ async def _reset_targets_or_refuse(
 ) -> _ResetPlan:
     """The hung GPUs widened to their NVLink peers, and the fabric services to stop around the reset,
     after Reset GPU's refusal rules."""
-    host_gpus = parse_host_gpus((await _run(runner, HOST_GPUS_COMMAND)).stdout or "")
-    if not host_gpus:
+    host_gpus_result = await _run(runner, HOST_GPUS_COMMAND)
+    host_gpus = parse_host_gpus(host_gpus_result.stdout or "")
+    # as in reset_pod_gpus: a failed listing may be partial, and a partial one can make a shared host look like the pod's
+    if host_gpus_result.exit_code != 0 or not host_gpus:
         raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "nvidia-smi listed no GPU on the host")
     listed = {gpu.uuid for gpu in host_gpus}
     unlisted = [uuid for uuid in pod_gpu_uuids if uuid not in listed]
