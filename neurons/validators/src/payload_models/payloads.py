@@ -227,6 +227,13 @@ class ForcedValidationCycleRequest(BaseModel):
     message_type: Literal["ForcedValidationCycleRequest"]
 
 
+class RecheckExecutorRequest(BaseModel):
+    """Ask the validator to queue a single-node check of one executor (the provider asked)."""
+
+    message_type: Literal["RecheckExecutorRequest"]
+    executor_id: str
+
+
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"
