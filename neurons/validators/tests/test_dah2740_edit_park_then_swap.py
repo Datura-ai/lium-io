@@ -828,12 +828,26 @@ async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volu
         assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
 
 
+def _start_exits(ssh, exit_status: int):
+    answer = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if "docker start" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=exit_status, stderr="stale vloopback mountpoint")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
+
+
 @pytest.mark.asyncio
-async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch):
+@pytest.mark.parametrize("restore_start_exit", [0, 1])
+async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch, restore_start_exit):
     # the remount would hide its layer files, and the retry would then read it as mounted and remove it
     payload = _edit_payload()
     ssh = _ssh_recording()
     _report_unmounted(ssh)
+    _start_exits(ssh, restore_start_exit)
     _patch_happy(svc, monkeypatch, ssh)
     monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
     monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("port clash")))
@@ -843,8 +857,20 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeyp
 
     assert isinstance(result, FailedContainerRequest)
     kept = _docker(ssh.commands, "rename")[0].split()[3]
-    assert ssh.commands[-2:] == [f"/usr/bin/docker rename {kept} {name}", f"/usr/bin/docker start {name}"]
     svc._bring_up_existing_container.assert_not_awaited()
+    if restore_start_exit == 0:
+        # started under its kept name, and given the pod name only once it runs
+        assert ssh.commands[-2:] == [f"/usr/bin/docker start {kept}", f"/usr/bin/docker rename {kept} {name}"]
+        return
+    # the start failed: it stays stopped under its kept name, and the next (successful) edit keeps it
+    assert ssh.commands[-1] == f"/usr/bin/docker start {kept}"
+    retry = _ssh_recording(container_present=False)
+    retry.kept = [kept]
+    _patch_happy(svc, monkeypatch, retry)
+
+    assert isinstance(await _run(svc, payload), ContainerCreated)
+    assert _docker(retry.commands, "rename") == []
+    assert _docker(retry.commands, "rm -fv id-") == []
 
 
 @pytest.mark.asyncio
@@ -870,14 +896,13 @@ async def test_a_kept_container_left_by_a_crashed_edit_is_the_pod_and_stays_kept
     old = f"kept_unmounted_{payload.pod_id}_1700000000"
     ssh.kept = [old]
     _patch_happy(svc, monkeypatch, ssh)
-    name = _pod_name(payload)
 
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    renames = _docker(ssh.commands, "rename")
-    assert renames[0] == f"/usr/bin/docker rename {old} {name}"  # recovered
-    assert renames[1].split()[3].startswith(f"kept_unmounted_{payload.pod_id}_")  # parked again, still kept
+    # reused under its kept name, never renamed: no rename can fail and leave it unprotected for the next edit
+    assert _docker(ssh.commands, "rename") == []
+    assert _docker(ssh.commands, "stop") == [f"/usr/bin/docker stop -t 10 {old}"]
     assert _docker(ssh.commands, "rm -fv id-") == []
 
 

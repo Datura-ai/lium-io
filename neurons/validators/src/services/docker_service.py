@@ -1817,15 +1817,17 @@ class _EditSwap:
         if self.container_name not in names:
             if parked in names or recover_kept:
                 # An earlier edit crashed between park and restore: the parked container is the
-                # customer's only copy. Give it its name back and carry on; never remove it.
-                renamed = await self._run(
-                    f"/usr/bin/docker rename {shlex.quote(recover_kept or parked)} {shlex.quote(self.container_name)}"
-                )
-                if renamed.exit_status != 0:
-                    raise Exception(
-                        f"[park_current_container] a parked container from an earlier edit could not be "
-                        f"renamed back: {(renamed.stderr or '').strip()}"
+                # customer's only copy; never remove it. A kept one is reused under its kept name,
+                # so it is never without protection; a __prev one gets its name back.
+                if not recover_kept:
+                    renamed = await self._run(
+                        f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                     )
+                    if renamed.exit_status != 0:
+                        raise Exception(
+                            f"[park_current_container] a parked container from an earlier edit could not be "
+                            f"renamed back: {(renamed.stderr or '').strip()}"
+                        )
                 logger.warning(
                     _m(
                         "Recovered a parked container from an earlier edit",
@@ -1854,12 +1856,13 @@ class _EditSwap:
                     "and the encrypted volume is unmounted again; the pod was left as it was"
                 )
             # parked straight under the kept name, so no later rename can fail and leave it to a sweep or the next edit
-            parked = f"{kept_prefix}{int(time.time())}"
-        renamed = await self._run(
-            f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
-        )
-        if renamed.exit_status != 0:
-            raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
+            parked = recover_kept or f"{kept_prefix}{int(time.time())}"
+        if not recover_kept:
+            renamed = await self._run(
+                f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
+            )
+            if renamed.exit_status != 0:
+                raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
         self.parked_name = parked
         self.parked_id = container_id
         stopped = await self._run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
@@ -1958,15 +1961,23 @@ class _EditSwap:
         ``docker start`` would hand the customer ciphertext in the workspace.
 
         ``start=False``: the pod's GPUs are no longer on the node and its device request names the old
-        cards, so it cannot start; the container gets its name back, stopped."""
+        cards, so it cannot start; the container gets its name back, stopped. A kept one (``keep_parked``)
+        is started without the remount and takes the pod name only once it runs."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
         q_replacement = shlex.quote(self.replacement_id) if self.replacement_id else q_name
         await self._run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
-        renamed = await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")
         error: str | None = None
-        if renamed.exit_status != 0:
+        if self.keep_parked and start:
+            # a kept one comes back as dockerd had it, unmounted (the remount would hide its files), and keeps
+            # its kept name until it runs: stopped under the pod name, the next edit could not read it and would remove it
+            started = await self._run(f"/usr/bin/docker start {q_parked}")
+            renamed = started if started.exit_status != 0 else await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")
+            if renamed.exit_status != 0:
+                error = f"docker {'start' if renamed is started else 'rename'}: {(renamed.stderr or '').strip()}"
+        elif not self.keep_parked and (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
             error = f"docker rename: {(renamed.stderr or '').strip()}"
         elif not start:
+            # a kept one stays stopped under its kept name, out of every sweep
             logger.warning(
                 _m(
                     "Edit failed; restore skipped: pod GPUs no longer on node",
@@ -1974,8 +1985,7 @@ class _EditSwap:
                 )
             )
             return
-        elif self.bring_up is not None and not self.keep_parked:
-            # a kept one comes back as dockerd had it, unmounted: the remount would hide its files and the next edit would remove them
+        elif self.bring_up is not None:
             try:
                 async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
                     await self.bring_up(self.container_name)
