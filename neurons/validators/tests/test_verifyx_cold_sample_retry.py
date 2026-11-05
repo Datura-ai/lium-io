@@ -183,3 +183,25 @@ async def test_a_cold_sample_is_not_re_measured_when_the_retry_would_outrun_the_
     assert service.calls == 1
     assert result.passed is False
     assert "cold_sample_retry" not in result.event.what_we_saw
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_local_cold_sample_counts_its_verify_round_trip_against_the_retry(
+    context_factory, monkeypatch
+):
+    # a consumed /verify answer took ~0 s inside VerifyXCheck; its round trip is the run's real time
+    from dataclasses import replace
+
+    from neurons.validators.src.services.task.checks import verifyx
+    from services.local_verify_client import LocalVerifyOutcome
+
+    monkeypatch.setattr(verifyx, "task_seconds_left", lambda ctx: verifyx.COLD_RETRY_RESERVE_SECONDS + 100)
+    service = _ProbeSequence(_probe(760.0))
+    ctx = _ctx(context_factory, service, _never_measured())
+    local = LocalVerifyOutcome(verifyx=_probe(40.0), round_trip_ms=200_000)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, local_verify=local)})
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert service.calls == 0
+    assert "cold_sample_retry" not in result.event.what_we_saw

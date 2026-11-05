@@ -173,9 +173,14 @@ class VerifyXCheck:
         )
 
         cold_sample_retry: ColdSampleRetry | None = None
-        # the retry runs over SSH and is expected to take as long as an SSH first run did
-        # shortcut: a consumed local answer took ~0 s here, so only the reserve is checked; time LocalVerifyCheck if that overruns
-        retry_fits = task_seconds_left(ctx) > time.monotonic() - first_run_started + COLD_RETRY_RESERVE_SECONDS
+        # the retry runs over SSH and is expected to take as long as the first run did; a consumed
+        # local answer took ~0 s here, so its /verify round trip stands in for it
+        first_run_s = (
+            local.round_trip_ms / 1000
+            if transport == "local_verify"
+            else time.monotonic() - first_run_started
+        )
+        retry_fits = task_seconds_left(ctx) > first_run_s + COLD_RETRY_RESERVE_SECONDS
         if _is_cold_sample_below_gate(ctx, result, prev_ema) and not retry_fits:
             logger.info(
                 _m(

@@ -30,6 +30,10 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.local_verify import (
+    SSH_TAIL_KEY,
+    SSH_TAIL_TTL_SECONDS,
+    record_ssh_tail,
+    ssh_tail_seconds,
     ROUND_TRIP_CAP_MS_BY_STEP,
     LocalVerifyCheck,
 )
@@ -345,6 +349,7 @@ def context(
     first_pass=True,
     state=None,
     ssh=None,
+    ssh_tail=None,
 ):
     return make_context(
         executor=executor_info,
@@ -352,7 +357,10 @@ def context(
         services=build_services(
             validation=validation,
             verifyx=verifyx,
-            redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
+            redis=SimpleNamespace(
+                renting_in_progress=AsyncMock(return_value=False),
+                get=AsyncMock(return_value=ssh_tail),
+            ),
         ),
         config=build_context_config(
             validator_keypair=keypair, first_pass=first_pass
@@ -1421,11 +1429,16 @@ async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
 
 
 @pytest.mark.asyncio
-async def test_a_scored_cycle_sends_no_verify_call(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+@pytest.mark.parametrize(
+    ("ssh_tail", "why"),
+    [(None, "no measured SSH run yet"), (b"700", "no room for the SSH fallback")],
+)
+async def test_a_scored_cycle_without_room_for_the_ssh_rerun_sends_no_verify_call(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, ssh_tail, why
 ):
-    """Not the first pass: VerifyX is full size and can time out on /verify, then run again over SSH
-    past JOB_TIME_OUT. No call is made; both steps run over SSH."""
+    """Not the first pass: a full-size VerifyX that times out on /verify runs again over SSH. With
+    no measured SSH run of this node, or one that would not fit after the call, both steps run
+    over SSH."""
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     validation.validate_gpu_model_and_process_job = ssh_matmul
@@ -1436,15 +1449,72 @@ async def test_a_scored_cycle_sends_no_verify_call(
             validation=validation,
             verifyx=verifyx_service,
             first_pass=False,
+            ssh_tail=ssh_tail,
         )
         local, verifyx, capability = await run_local_then_consumers(
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
         )
     assert executor.intents == []
-    assert local.event.what_we_saw["why"] == "not the first pass"
+    assert local.event.what_we_saw["why"] == why
     assert capability.event.what_we_saw["transport"] == "ssh"
     ssh_matmul.assert_awaited_once()
     assert verifyx.event.what_we_saw.get("transport") != "local_verify"
+
+
+@pytest.mark.asyncio
+async def test_a_scored_cycle_sends_verifyx_only_with_room_left_for_the_ssh_rerun(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
+    """The matmul stays on SSH (its cap is the validator's own clock) and the call's timeout leaves
+    this node's measured SSH run from VerifyX to the end, with margin."""
+    validation = matmul_service(monkeypatch)
+    ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
+    validation.validate_gpu_model_and_process_job = ssh_matmul
+    seen = {}
+    factory = client_factory(keypair)
+
+    def spying_factory(ctx):
+        client = factory(ctx)
+        client.timeout_s = 10_000
+        seen["client"] = client
+        return client
+
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            first_pass=False,
+            ssh_tail=b"200",
+        )
+        left = task_seconds_left(ctx)
+        local, verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=spying_factory)
+        )
+    assert len(executor.intents) == 1
+    assert local.updates["state"].local_verify.fallbacks["matmul"] == "scored_ssh"
+    assert left - 200 * 1.25 - 31 <= seen["client"].timeout_s <= left - 200 * 1.25 - 30
+    assert capability.event.what_we_saw["transport"] == "ssh"
+    ssh_matmul.assert_awaited_once()
+
+
+def test_ssh_tail_is_measured_only_when_verifyx_ran_over_ssh():
+    steps = {"executor.local_verify": 90.0, "gpu.validate.verifyx": 80.0, "gpu.validate.capability": 40.5, "z": 0.5}
+    assert ssh_tail_seconds(steps) == 121.0
+    assert ssh_tail_seconds({**steps, "gpu.validate.verifyx": 0.002}) is None
+    assert ssh_tail_seconds({"executor.local_verify": 90.0}) is None
+
+
+@pytest.mark.asyncio
+async def test_record_ssh_tail_writes_only_a_measured_tail():
+    redis = SimpleNamespace(set=AsyncMock())
+    await record_ssh_tail(redis, "u1", {"gpu.validate.verifyx": 0.01})
+    redis.set.assert_not_awaited()
+    await record_ssh_tail(redis, "u1", {"gpu.validate.verifyx": 80.0, "x": 20.0})
+    redis.set.assert_awaited_once_with(
+        SSH_TAIL_KEY.format("u1"), "100.0", ex=SSH_TAIL_TTL_SECONDS
+    )
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():

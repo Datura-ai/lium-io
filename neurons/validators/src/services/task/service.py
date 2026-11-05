@@ -23,6 +23,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
+from .checks.local_verify import record_ssh_tail
 from .availability import (
     MAX_PEER_TEXT_LENGTH,
     availability_errors,
@@ -231,6 +232,14 @@ class TaskService:
                 # Determine log_text and success based on ok status
                 # Always use the last event for structured logging (Grafana consumption)
                 last_event = events[-1]
+                try:
+                    await record_ssh_tail(
+                        self.redis_service,
+                        executor_info.uuid,
+                        (last_event.what_we_saw or {}).get("steps") or {},
+                    )
+                except Exception as exc:  # noqa: BLE001 — a sizing hint, never the node's result
+                    logger.warning(_m("could not record the SSH tail", extra={"executor_uuid": executor_info.uuid, "error": str(exc)}))
                 log_text = _m(last_event.event, extra=last_event.model_dump())
                 success = False if not ok else last_context.success
 
