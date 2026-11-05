@@ -81,10 +81,12 @@ from services.const import MIN_PORT_COUNT
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
+        DiskLimitedRemainder,
         InsufficientDisk,
         MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
+        PowerCapReverted,
     )
     from services.task_service import JobResult
 
@@ -115,6 +117,7 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
     # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
     SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
@@ -125,6 +128,8 @@ class ZeroIncentiveReason(StrEnum):
     PROVIDER_EMAIL_NOT_CONFIRMED = "provider_email_not_confirmed"
     # Rented: in the mining pool, but the Sysbox portion zeroed the mining score
     RENTED_SYSBOX_NOT_CONFIRMED = "rented_sysbox_not_confirmed"
+    # Group B (appended): free splits of a partly rented split node without disk room for their share (DAH-4961)
+    DISK_LIMITED_REMAINDER = "disk_limited_remainder"
 
 
 # The reason code a failed run carries when no check produced one (an exception in the pipeline).
@@ -364,9 +369,10 @@ class MinerLogLine(BaseModel):
             result,
             reason=ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
             message=(
-                f"No unrented incentive: your price ${price_per_gpu}/GPU/h is above the market "
-                f"soft price limit ${soft_limit} (90th-percentile market rate ${market_p90} x "
-                f"{rate}). Lower the price to ${soft_limit} or below to earn the unrented incentive."
+                f"No unrented incentive: your price ${price_per_gpu}/GPU/h is above the "
+                f"soft price limit ${soft_limit} (configured base price for this GPU model "
+                f"${market_p90} x {rate}). Lower the price to ${soft_limit} or below to earn the "
+                "unrented incentive."
             ),
             extra_fields={
                 "price_per_gpu": price_per_gpu,
@@ -497,6 +503,30 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
+    def no_payout_because_reverts_gpu_power_cap(
+        result: JobResult, reverted: PowerCapReverted
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
+            message=(
+                f"No unrented incentive: this executor raised the GPU power limit back "
+                f"{reverted.revert_count} times in the last {reverted.window_hours} hours while a "
+                f"Lium idle job was running. Lium caps the limit for the length of that job only, "
+                f"and restores your own value when it ends. Putting the limit back kills the job, "
+                f"so the node earns the unrented incentive without doing the work. Stop the script "
+                f"or service on the host that re-runs 'nvidia-smi -pl', or rent this executor out "
+                f"to earn."
+            ),
+            extra_fields={
+                "power_cap_revert_count": reverted.revert_count,
+                "power_cap_revert_window_hours": reverted.window_hours,
+                "capped_to_watts": reverted.capped_to_watts,
+                "found_watts": reverted.found_watts,
+            },
+        )
+
+    @staticmethod
     def no_payout_because_port_limited_remainder(
         result: JobResult, port_limited: PortLimitedRemainder
     ) -> MinerLogLine:
@@ -546,6 +576,29 @@ class MinerLogLine(BaseModel):
                 "required_port_count": port_limited.required_port_count,
                 "free_split_count": port_limited.free_split_count,
                 "paid_split_count": port_limited.paid_split_count,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_disk_limited_remainder(
+        result: JobResult, disk_limited: DiskLimitedRemainder
+    ) -> MinerLogLine:
+        # `result` is the free portion; the message names the GPUs the missing disk room leaves unpaid
+        unpaid: int = disk_limited.unpaid_gpu_count
+        floor: str = f"{settings.MIN_FREE_DISK_GB} GB"
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
+            message=(
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: it has less "
+                f"than {floor} free disk, so they are not listed. The rented GPUs keep earning. Idle pay resumes "
+                f"when the node has {floor} free."
+            ),
+            extra_fields={
+                "gpu_count": unpaid,
+                "free_split_count": disk_limited.free_split_count,
+                "paid_split_count": disk_limited.paid_split_count,
+                "required_free_gb": settings.MIN_FREE_DISK_GB,
             },
         )
 

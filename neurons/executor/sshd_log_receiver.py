@@ -1,9 +1,17 @@
 """The container's /dev/log for sshd: it runs no syslog daemon, so sshd's lines would be dropped.
 
 Keeps the `Accepted ...` login lines with sshd's own envelope (time and `sshd[pid]`), prefixed by the
-time received in UTC, in SSHD_AUTH_LOG for the validator to read (it keeps its own cursor there)."""
+time received in UTC, in SSHD_AUTH_LOG for the validator to read (it keeps its own cursor there).
 
+A connection from a private address means port 2200 shows one address for every client (NAT, Docker gateway,
+tunnel): the per-source limits would refuse the validator along with the scanners, so it turns them off
+(sshd_setup.sh says why) and reloads sshd. It acts on sshd's "Connection from" line, logged before
+authentication, so scanners cannot fill PerSourceMaxStartups ahead of the validator's first login."""
+
+import ipaddress
 import os
+import shutil
+import signal
 import re
 import socket
 from datetime import UTC, datetime
@@ -25,10 +33,46 @@ MAX_SPOOL_BYTES = 2 * ROTATE_BYTES
 _dropped = 0
 # records kept while the disk refuses writes; sshd must never wait on this socket
 MAX_PENDING = 1000
+# written by sshd_setup.sh at build (absent on an sshd without per-source limits)
+SOURCE_OFF = "/etc/ssh/lium-source-limits-off.conf"
+SOURCE_OFF_IN = "/etc/ssh/sshd_config.d/00-lium-source-limits-off.conf"
+SSHD_PID_FILE = "/run/sshd.pid"
+# the client address sshd saw, from a connection (VERBOSE, before authentication) or a login, after the envelope
+SOURCE = re.compile(
+    r"^<\d+>[A-Z][a-z]{2} \d{1,2} \d\d:\d\d:\d\d sshd(?:-session)?\[\d+\]: "
+    r"(?:Connection from|Accepted \S+ for \S+ from) (\S+) port "
+)
+# the ranges sshd_setup.sh exempts from penalties (ipaddress's is_private also counts documentation ranges)
+SHARED = [
+    ipaddress.ip_network(n)
+    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "::1/128", "fc00::/7")
+]
 
 
 def is_login(message: str) -> bool:
     return bool(LOGIN.match(" ".join(message.split())))
+
+
+def shared_source(line: str) -> bool:
+    """True for a connection or login from a private, CGNAT or loopback address."""
+    match = SOURCE.match(" ".join(line.split()))
+    try:
+        ip = ipaddress.ip_address(match.group(1)) if match else None
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip is not None and any(ip in net for net in SHARED)
+
+
+def turn_off_source_limits() -> None:
+    if not os.path.exists(SOURCE_OFF) or os.path.exists(SOURCE_OFF_IN):
+        return
+    shutil.copyfile(SOURCE_OFF, SOURCE_OFF_IN)
+    try:
+        with open(SSHD_PID_FILE, encoding="utf-8") as f:
+            os.kill(int(f.read().strip()), signal.SIGHUP)  # sshd re-reads its config; sessions stay
+    except (OSError, ValueError):
+        pass  # not running yet: it reads the drop-in when it starts
 
 
 def _size(path: str) -> int:
@@ -82,6 +126,11 @@ def serve(sock: socket.socket) -> None:
             # filtered before it is kept: scanner noise during a full disk must not push a login out
             if is_login(message):
                 pending.append(message)
+            if shared_source(message):
+                try:
+                    turn_off_source_limits()
+                except OSError:
+                    pass  # a full disk: tried again on the next such connection
         except TimeoutError:
             pass
         try:

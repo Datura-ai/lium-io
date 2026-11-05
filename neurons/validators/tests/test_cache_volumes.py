@@ -1,10 +1,11 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
-from services.docker_service import DockerService, _filler_run_volume_gb
+from services.docker_service import DockerService, _filler_run_volume_gb, _wipe_volume_cmd
 
 
 @pytest.fixture
@@ -266,20 +267,70 @@ async def test_a_big_checkpoint_is_cached_only_when_the_node_still_fits_kimi_k3_
     assert bool(affordable) is granted
 
 
-def _rental(volume_limit_gb: int | None) -> ContainerCreateRequest:
+def _rental(volume_limit_gb: int | None, storage_limit_gb: int | None = None) -> ContainerCreateRequest:
     payload = _make_payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL, cache_volumes=None)
     payload.volume_limit_gb = volume_limit_gb
+    payload.storage_limit_gb = storage_limit_gb
     return payload
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("volume_limit_gb", [None, 2000])
-async def test_a_rental_that_fits_beside_the_cache_keeps_it(docker_service, volume_limit_gb):
-    # listed beside the cache: 2200 GB free covers a 2000 GB volume; no size (no --storage-opt) gets the disk beside it
+@pytest.mark.parametrize(("volume_limit_gb", "storage_limit_gb"), [(2000, None), (1300, 650)])
+async def test_a_rental_that_fits_beside_the_cache_keeps_it(docker_service, volume_limit_gb, storage_limit_gb):
+    # 2200 GB really free covers the volume and the container storage: the cache stays
     ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2200)
 
-    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(volume_limit_gb), {}) is False
+    rental = _rental(volume_limit_gb, storage_limit_gb)
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is False
     assert _removed_volumes(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_a_whole_node_rental_sized_on_the_listed_cache_evicts_it(docker_service):
+    # DAH-5260: the 8x B300 lists 3950 GB free, the 1561 GB kimi-k3 cache included. The backend sizes a whole-node
+    # rental on that (2620 GB volume + 1310 GB storage); 2389 GB really free cannot hold it, so the cache goes.
+    ssh_client = HostSshClient([_KIMI, "dphn_cache_hf_x", "volume_pod"], free_gb=2389)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(2620, 1310), {}) is True
+    assert _removed_volumes(ssh_client) == ["dphn_cache_hf_x", _KIMI]
+
+
+@pytest.mark.asyncio
+async def test_the_container_storage_counts_toward_what_the_rental_needs(docker_service):
+    # 2300 GB volume alone fits 2389 GB; with its 1150 GB storage the renter could write past the disk
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(2300, 1150), {}) is True
+    assert _removed_volumes(ssh_client) == [_KIMI]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("free_gb", [100_000, 100, 10])
+@pytest.mark.parametrize("volumes", [[_KIMI, "dphn_cache_hf_x"], [_KIMI], ["dphn_cache_hf_x"]])
+async def test_an_unsized_rental_keeps_every_cache_however_short_the_disk(docker_service, volumes, free_gb):
+    # Rustam 2 Nov: no --storage-opt means the renter did not ask for the disk, so the cache survives the rental.
+    # Evicting up front would re-download up to 1.5 TB after every such rental (the churn DAH-5014 stopped).
+    ssh_client = DuHostSshClient([*volumes, "volume_pod"], free_gb=free_gb, du_stdout=_kb(1560))
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(None), {}) is False
+    assert _removed_volumes(ssh_client) == []
+    # decided on the request alone: no df or du read on the create path
+    assert not any("df -P" in command or "du -sk" in command for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_a_cache_removal_that_never_answers_is_given_up_and_the_rent_goes_on(docker_service, monkeypatch):
+    # a wedged dockerd must not hold the create (and the node's create lock) forever
+    class HangingRemoval(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                await asyncio.sleep(3600)
+            return await super().run(command, *args, **kwargs)
+
+    monkeypatch.setattr("services.docker_service.CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS", 0.01)
+    ssh_client = HangingRemoval([_KIMI, "volume_pod"], free_gb=10)
+
+    assert await asyncio.wait_for(docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(500), {}), 5) is True
 
 
 @pytest.mark.asyncio
@@ -302,3 +353,206 @@ async def test_rental_evicts_the_oldest_cache_first_and_keeps_the_rest_once_it_f
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(500), {}) is True
     assert _removed_volumes(ssh_client) == ["engy_cache_hf_old"]
+
+
+@pytest.mark.asyncio
+async def test_a_rental_that_still_does_not_fit_after_the_eviction_is_clamped_to_the_freed_disk(docker_service):
+    # a `volume rm` that failed (it hides errors behind `|| true`) frees nothing: 2389 GB stays free, so the legacy
+    # 2620 GB volume would be preallocated on disk that was never freed and the create would fail
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert rental.volume_limit_gb == 2389 - 1310
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("removal_works", "listing_fails", "volume_gb"),
+    [(True, False, 2620), (False, False, 2389 - 1310), (True, True, 2389 - 1310)],
+)
+async def test_a_rental_still_short_is_clamped_only_when_a_removal_failed(
+    docker_service, removal_works, listing_fails, volume_gb
+):
+    # DAH-5260 review: every removal worked and the disk is still short, so the cache was not what was missing and the
+    # size stays as ordered; a removal that left its volume behind clamps, and so does a re-listing that failed
+    class RemovingSshClient(HostSshClient):
+        removed = False
+
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command and removal_works:
+                self._listing = "volume_pod"
+                self.removed = True
+            if "volume ls" in command and listing_fails and self.removed:
+                return SimpleNamespace(exit_status=1, stdout="", stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        RemovingSshClient([_KIMI, "volume_pod"], free_gb=2389), rental, {}
+    ) is True
+    assert rental.volume_limit_gb == volume_gb
+
+
+class KilledFillerHostSshClient(HostSshClient):
+    """prod 4 Nov, 8x B300: the filler the create killed is still exiting and mounts kimi-k3, so `volume rm` fails.
+    The wipe unlinks the files (disk freed) only when every user is in its allowed list; the volume stays listed."""
+
+    def __init__(self, users: list[str], **kwargs):
+        super().__init__([_KIMI, "volume_pod"], **kwargs)
+        self.users = users
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command and "/proc/1/root" in command:
+            allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
+            if all(user in allowed for user in self.users):
+                self._free_bytes += 1561 * 1024**3
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_cache_the_killed_filler_still_mounts_is_wiped_and_the_order_keeps_its_size(docker_service):
+    ssh_client = KilledFillerHostSshClient(["filler_79ba7fa2"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=["filler_79ba7fa2"]
+    ) is True
+    assert rental.volume_limit_gb == 2620
+    assert _removed_volumes(ssh_client) == [_KIMI]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("killed_fillers", [[], ["filler_79ba7fa2"]])
+async def test_a_cache_a_live_filler_mounts_is_not_wiped_and_the_order_clamps(docker_service, killed_fillers):
+    ssh_client = KilledFillerHostSshClient(["filler_79ba7fa2", "filler_live"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=killed_fillers
+    ) is True
+    assert rental.volume_limit_gb == 2389 - 1310
+
+
+def test_the_wipe_refuses_a_volume_another_container_mounts():
+    command = _wipe_volume_cmd(_KIMI, "filler_a", "filler_b")
+    assert "ok=' filler_a filler_b '" in command and "exit 6" in command
+    assert 'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} +' in command
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_cache_left_behind_is_swept_and_never_mounted_as_ready(docker_service):
+    # the wipe leaves an empty kimi-k3 volume: another model's filler sweeps it, the same model's is charged it all
+    other = _make_payload(
+        workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name="engy_cache_hf_80gb_other", target="/c")]
+    )
+    assert await docker_service.sweep_stale_cache_volumes(FakeSshClient([_KIMI, "volume_pod"]), other, {}) == [_KIMI]
+
+    ssh_client = DuHostSshClient([_KIMI], free_gb=1200, du_stdout=_kb(0))
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {}) == []
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(docker_service, monkeypatch):
+    class HangingRemoval(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                await asyncio.sleep(3600)
+            return await super().run(command, *args, **kwargs)
+
+    monkeypatch.setattr("services.docker_service.CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS", 0.01)
+    rental = _rental(500)
+
+    await asyncio.wait_for(
+        docker_service.reclaim_dphn_cache_for_rental(HangingRemoval([_KIMI, "volume_pod"], free_gb=300), rental, {}), 5
+    )
+    assert rental.volume_limit_gb == 300
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(2389, []), (1000, [_KIMI])])
+async def test_a_recreate_on_its_existing_volume_needs_only_its_storage_and_is_never_clamped(
+    docker_service, free_gb, removed
+):
+    # the pod's 2620 GB volume is already preallocated, outside df free: only the 1310 GB storage is new
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
+    rental = _rental(2620, 1310)
+    rental.local_volume = "volume_pod"
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed
+    assert rental.volume_limit_gb == 2620
+
+
+@pytest.mark.asyncio
+async def test_a_rental_takes_the_engy_cache_before_an_older_dolphin_cache(docker_service, monkeypatch):
+    # the listing offered the Engy cache as free disk, never the Dolphin one, so the Engy family goes first
+    class InspectingSshClient(FakeSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume inspect" in command:
+                self.commands.append(command)
+                body = f"{_KIMI} 2026-10-22T10:00:00Z\ndphn_cache_hf_x 2026-10-01T10:00:00Z"
+                return SimpleNamespace(exit_status=0, stdout=body, stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = InspectingSshClient([_KIMI, "dphn_cache_hf_x", "volume_pod"])
+    monkeypatch.setattr(docker_service, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
+    monkeypatch.setattr(
+        docker_service,
+        "_get_fs_available_bytes",
+        AsyncMock(side_effect=[50 * 1024**3, 60 * 1024**3] + [900 * 1024**3] * 3),
+    )
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(500), {}) is True
+    assert _removed_volumes(ssh_client) == [_KIMI]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_after_gb", "volume_gb"), [(3950, 1310), (2389, 789)])
+async def test_a_half_node_rental_evicts_the_cache_its_share_was_sized_on(
+    docker_service, monkeypatch, free_after_gb, volume_gb
+):
+    # 1310 GB volume + 655 GB storage at half the node needs 3930 GB free plus the sizing's 20 GB overhead; 2389 GB
+    # beside the cache is not enough, so the cache goes. A removal that freed nothing clamps the volume to what the
+    # sizing will give.
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
+    gb = 1024**3
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        docker_service, "_get_fs_available_bytes", AsyncMock(side_effect=[2389 * gb] * 2 + [free_after_gb * gb] * 3)
+    )
+    rental = _rental(1310, 655)
+    rental.disk_share = 0.5
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert _removed_volumes(ssh_client) == [_KIMI]
+    assert rental.volume_limit_gb == volume_gb
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(130, [_KIMI]), (150, [])])
+async def test_a_fresh_sized_rental_counts_the_sizing_overhead_in_its_fit(docker_service, monkeypatch, free_gb, removed):
+    # DAH-5260 live test: 82 + 41 GB fit 130 GB free, but resolve_volume_sizing keeps 20 GB back, so the pod got
+    # 116 GB of 123 and the cache stayed. The fit check leaves out the same 20 GB.
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=0))
+    rental = _rental(82, 41)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(105, [_KIMI]), (115, [])])
+async def test_a_fresh_sized_rental_fits_only_under_the_df_guard_too(docker_service, monkeypatch, free_gb, removed):
+    # DAH-5260 review: 500 GB of pod volumes already on the node make the pool fit, but resolve_volume_sizing's
+    # df_guard caps the volume at df free less 10 GB, so 100 GB needs 110 GB free or the cache goes
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=500 * 1024**3))
+    rental = _rental(100, 50)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed

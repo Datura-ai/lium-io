@@ -832,7 +832,7 @@ class BannedProviderMessages:
         impact="Proceed",
     )
     # DAH-2662: a mount that is not procfs sits on /proc/driver/nvidia/gpus, so the kernel's GPU
-    # list cannot be read (the 2026-08-19 kit). Emitted only when KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # list cannot be read (the 2026-08-19 kit).
     KERNEL_GPU_VIEW_OVERLAID = MessageTemplate(
         event="A foreign mount covers the kernel's GPU list",
         reason="KERNEL_GPU_VIEW_OVERLAID",
@@ -1449,6 +1449,13 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    SKIPPED_ALL_PORTS_RENTED = MessageTemplate(
+        event="Port verification skipped: the rental holds every port",
+        reason="PORT_CHECK_SKIPPED_ALL_PORTS_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed; the ports are checked again once one is free",
+    )
     VERIFY_DEFERRED = MessageTemplate(
         event="Port verification deferred: the Docker filesystem is backed up with a tenant's writes",
         reason="PORT_VERIFY_DEFERRED",
@@ -1491,6 +1498,13 @@ class DiskSpaceMessages:
         impact="Score set to 0",
         remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
         "longer need, or grow the disk. The next validation reads the disk again.",
+    )
+    SPLIT_DISK = MessageTemplate(
+        event="Disk space per free split inspected",
+        reason="SPLIT_DISK_SIZED",
+        severity="info",
+        category="env",
+        impact="Proceed",
     )
 
 
@@ -2139,11 +2153,12 @@ class NvlinkFaultMessages:
         category="env",
         impact="Score set to 0 until NVLink works again",
         remediation=(
-            "These GPUs are SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows PCIe paths "
-            "(PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. Start "
-            "nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, same version as the "
-            "driver), check `nvidia-smi nvlink -s`, then restart the executor container "
-            "(`docker restart executor-executor-1`). If the links stay down, service the board."
+            "These GPUs ship only as SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows "
+            "PCIe paths (PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. "
+            "On an HGX board, start nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, "
+            "same version as the driver), check `nvidia-smi nvlink -s`, then restart the executor container "
+            "(`docker restart executor-executor-1`). If the links stay down, service the board. H100 "
+            "modules on SXM-to-PCIe adapter boards never get this: they are listed as H100 PCIe."
         ),
     )
     UNKNOWN = MessageTemplate(

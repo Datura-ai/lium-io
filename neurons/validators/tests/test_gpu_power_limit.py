@@ -48,7 +48,7 @@ class FakeRedis:
     def __init__(self, initial: dict[str, str] | None = None):
         self.store: dict[str, str] = dict(initial or {})
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.store[key] = value
 
     async def get(self, key: str) -> str | None:
@@ -188,5 +188,7 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
 
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act / Assert: only the host's own refusal reads HOST_REFUSED.
-    result = await apply_filler_gpu_power_limits(ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=200)], redis, POD_ID, "executor-1")
+    result = await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=200)], redis, POD_ID, "executor-1"
+    )
     assert result is expected
