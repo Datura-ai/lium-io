@@ -125,13 +125,26 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
                 except:
                     memory_total = 0
 
+                # A card driving a monitor shows display memory traffic while idle (ticket-0996);
+                # unreadable values keep the strict check.
+                try:
+                    display_active = pynvml.nvmlDeviceGetDisplayActive(handle) == 1
+                except Exception:
+                    display_active = False
+                try:
+                    compute_processes = len(pynvml.nvmlDeviceGetComputeRunningProcesses(handle))
+                except Exception:
+                    compute_processes = None
+
                 gpu_details.append({
                     "index": i,
                     "name": pynvml.nvmlDeviceGetName(handle),
                     "uuid": uuid,
                     "utilization": 0,
                     "memory_utilization": 0,
-                    "memory_total_mb": memory_total
+                    "memory_total_mb": memory_total,
+                    "display_active": display_active,
+                    "compute_processes": compute_processes,
                 })
 
         if include_utilization:

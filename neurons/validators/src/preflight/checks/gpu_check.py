@@ -86,7 +86,12 @@ class GPUCheck(PreflightCheck):
                 gpu_util = detail.get("utilization", 0)
                 mem_util = detail.get("memory_utilization", 0)
 
-                if gpu_util >= gpu_utilization_limit or mem_util > gpu_memory_utilization_limit:
+                # A card driving a display with no compute processes is idle: its memory
+                # utilization is the screen refresh, not a workload (ticket-0996).
+                display_only = detail.get("display_active") and detail.get("compute_processes") == 0
+                mem_busy = mem_util > gpu_memory_utilization_limit and not display_only
+
+                if gpu_util >= gpu_utilization_limit or mem_busy:
                     high_util_gpus.append({
                         "gpu_index": idx,
                         "gpu_utilization": gpu_util,

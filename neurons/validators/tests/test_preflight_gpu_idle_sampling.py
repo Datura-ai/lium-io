@@ -58,3 +58,34 @@ def test_unreadable_utilization_counts_as_idle():
     with patch.dict(sys.modules, {"pynvml": nvml}), patch.object(utils.time, "sleep"):
         info = utils.get_gpu_info(include_utilization=True)
     assert info["gpu_details"][0]["utilization"] == 0
+
+
+def _run_display(display_active, compute_processes, reads):
+    nvml = _fake_nvml([reads])
+    nvml.nvmlDeviceGetDisplayActive = lambda h: 1 if display_active else 0
+    nvml.nvmlDeviceGetComputeRunningProcesses = lambda h: [object()] * compute_processes
+    with patch.dict(sys.modules, {"pynvml": nvml}), patch.object(utils.time, "sleep"):
+        return asyncio.run(GPUCheck().run({"gpu": {
+            "max_gpu_count": 8, "gpu_utilization_limit": 5, "gpu_memory_utilization_limit": 5,
+        }}))
+
+
+def test_idle_card_driving_a_monitor_passes():
+    # ticket-0996: Disp.A On, utilization.gpu 0-1%, utilization.memory 6-13%, no compute apps
+    result = _run_display(True, 0, [(1, 13), (0, 6), (1, 9), (0, 7), (1, 11)])
+    assert result.status == CheckStatus.PASSED, result.message
+
+
+def test_display_card_with_compute_process_still_judged_on_memory():
+    result = _run_display(True, 1, [(1, 13), (0, 6), (1, 9), (0, 7), (1, 11)])
+    assert result.status == CheckStatus.FAILED
+
+
+def test_display_card_busy_gpu_still_fails():
+    result = _run_display(True, 0, [(90, 13)] * 5)
+    assert result.status == CheckStatus.FAILED
+
+
+def test_headless_card_memory_busy_still_fails():
+    result = _run_display(False, 0, [(1, 13)] * 5)
+    assert result.status == CheckStatus.FAILED
