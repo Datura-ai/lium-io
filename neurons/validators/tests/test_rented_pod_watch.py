@@ -416,3 +416,21 @@ async def test_a_pod_down_on_the_first_tick_after_a_restart_still_gets_its_reach
     await watch.tick()
 
     assert _states(backend) == ["reachable"]
+
+
+@pytest.mark.asyncio
+async def test_an_announced_outage_keeps_reposting_when_refused_turns_into_no_banner():
+    backend, probe = FakeBackend(_rented(p1="RUNNING")), FakeProbe()
+    watch = await _answered(backend, probe, "p1")
+    probe.results = {"p1": PodSshResult.REFUSED}
+    await watch.tick()
+    await watch.tick()
+
+    probe.results = {"p1": PodSshResult.NO_BANNER}
+    await watch.tick()
+    probe.results = {"p1": PodSshResult.BANNER}
+    await watch.tick()
+    probe.results = {"p1": PodSshResult.NO_BANNER}
+    await watch.tick()
+
+    assert _states(backend) == ["unreachable", "unreachable", "reachable"]

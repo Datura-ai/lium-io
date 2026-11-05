@@ -49,6 +49,8 @@ class _PodState:
     first_miss_at: datetime | None = None
     # a reachable is owed: an unreachable was posted (or it is the pod's first banner), none landed
     posted: bool = False
+    # an unreachable was posted and no banner since: repost on every miss, whatever its threshold
+    announced: bool = False
 
 
 class RentedPodWatch:
@@ -114,6 +116,7 @@ class RentedPodWatch:
             if observation.result is PodSshResult.BANNER:
                 state.posted = state.posted or not state.answered
                 state.answered, state.misses, state.first_miss_at = True, 0, None
+                state.announced = False
                 if state.posted:
                     reports.append(
                         (state, self._post(observation, REACHABLE, probed_at, probed_at))
@@ -129,8 +132,8 @@ class RentedPodWatch:
                 if observation.result is PodSshResult.NO_BANNER
                 else settings.RENTED_POD_WATCH_MISSES
             )
-            if state.misses >= needed:
-                state.posted = True
+            if state.announced or state.misses >= needed:
+                state.announced = state.posted = True
                 reports.append(
                     (None, self._post(observation, UNREACHABLE, state.first_miss_at, probed_at))
                 )
