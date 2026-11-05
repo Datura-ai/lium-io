@@ -62,6 +62,7 @@ from .checks import (
     InspectorRentedCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
+    NodeAccountCheck,
     NvlinkFaultCheck,
     NvmlDigestCheck,
     PinnedMemoryProbeCheck,
@@ -307,6 +308,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # DAH-5729: before any work on the node, the node must be the registering account's
+                NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -502,6 +505,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # DAH-5729: before any work on the node, the node must be the registering account's
+                NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
