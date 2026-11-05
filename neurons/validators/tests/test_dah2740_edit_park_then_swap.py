@@ -56,12 +56,16 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
     client.commands: list[str] = []
 
     client.parked_present = False
+    # names of kept_unmounted_<pod id>_* containers on the host
+    client.kept: list[str] = []
 
     def _side(cmd, *args, **kwargs):
         client.commands.append(cmd)
         if "docker ps -a" in cmd and "--filter name=" in cmd:
             names = [part.split()[0].rstrip("$").strip("'") for part in cmd.split("--filter name=^")[1:]]
-            present = [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
+            kept = [k for n in names if n.startswith("kept_unmounted_") for k in client.kept if k.startswith(n)]
+            names = [n for n in names if not n.startswith("kept_unmounted_")]
+            present = kept + [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
             return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
         if "docker stop" in cmd:
             return _ssh_result(exit_status=stop_exit, stderr="tried to kill container, but did not receive an exit event")
@@ -142,7 +146,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert isinstance(result, ContainerCreated)
     host_key = next(cmd for cmd in ssh.commands if "pod_ssh_host_key" in cmd)
     assert ssh.commands == [
-        f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{parked}$',
+        f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{parked}$ '
+        f"--filter name=^kept_unmounted_{payload.pod_id}_",
         # the volume-mount read of the running container: an unmounted encrypted volume keeps it after the edit
         _volume_unmounted_check(name),
         f"/usr/bin/docker rename {name} {parked}",
@@ -785,13 +790,7 @@ async def test_a_docker_ps_the_host_times_out_fails_the_edit_and_keeps_the_pod(s
     svc.clean_existing_containers.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("unmounted", [True, False])
-async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volume(svc, monkeypatch, unmounted):
-    # dockerd restarted the pod by itself, without the gocryptfs mount: the renter's writes to the volume
-    # path are in the old container's layer only, so a successful edit keeps it out of every sweep
-    payload = _edit_payload()
-    ssh = _ssh_recording()
+def _report_unmounted(ssh, unmounted: bool = True):
     answer = ssh.run.side_effect
 
     def _side(cmd, *args, **kwargs):
@@ -801,6 +800,16 @@ async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volu
         return answer(cmd, *args, **kwargs)
 
     ssh.run.side_effect = _side
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unmounted", [True, False])
+async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volume(svc, monkeypatch, unmounted):
+    # dockerd restarted the pod by itself, without the gocryptfs mount: the renter's writes to the volume
+    # path are in the old container's layer only, so a successful edit keeps it out of every sweep
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _report_unmounted(ssh, unmounted)
     _patch_happy(svc, monkeypatch, ssh)
     name = _pod_name(payload)
 
@@ -808,14 +817,68 @@ async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volu
 
     assert isinstance(result, ContainerCreated)
     renames = _docker(ssh.commands, "rename")
+    assert len(renames) == 1
     if unmounted:
-        assert f"/usr/bin/docker rm -fv id-{name}" not in ssh.commands
-        kept = renames[-1].split()
-        assert kept[:3] == ["/usr/bin/docker", "rename", f"id-{name}"]
-        assert kept[3].startswith("kept_unmounted_") and not kept[3].startswith("pod_")
+        # parked straight under the kept name, before the stop: no later rename can fail and leave it as __prev
+        assert renames[0].split()[:3] == ["/usr/bin/docker", "rename", name]
+        assert renames[0].split()[3].startswith(f"kept_unmounted_{payload.pod_id}_")
+        assert ssh.commands.index(renames[0]) < ssh.commands.index(_docker(ssh.commands, "stop")[0])
+        assert _docker(ssh.commands, "rm -fv id-") == []
     else:
         assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
-        assert len(renames) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch):
+    # the remount would hide its layer files, and the retry would then read it as mounted and remove it
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("port clash")))
+    name = _pod_name(payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    kept = _docker(ssh.commands, "rename")[0].split()[3]
+    assert ssh.commands[-2:] == [f"/usr/bin/docker rename {kept} {name}", f"/usr/bin/docker start {name}"]
+    svc._bring_up_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_second_unmounted_edit_is_refused_while_a_kept_container_is_on_the_host(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert _docker(ssh.commands, "rename") == [] and _docker(ssh.commands, "stop") == []
+    assert _docker(ssh.commands, "rm -fv id-") == []
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_kept_container_left_by_a_crashed_edit_is_the_pod_and_stays_kept(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording(container_present=False)
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _patch_happy(svc, monkeypatch, ssh)
+    name = _pod_name(payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    renames = _docker(ssh.commands, "rename")
+    assert renames[0] == f"/usr/bin/docker rename {old} {name}"  # recovered
+    assert renames[1].split()[3].startswith(f"kept_unmounted_{payload.pod_id}_")  # parked again, still kept
+    assert _docker(ssh.commands, "rm -fv id-") == []
 
 
 @pytest.mark.parametrize(
@@ -824,6 +887,11 @@ async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volu
         ("/dev/loop1 /lium-cipher ext4 rw 0 0\n", True),  # the ciphertext volume without its plaintext mount
         ("/dev/loop1 /lium-cipher ext4 rw 0 0\n/lium-cipher /root fuse.gocryptfs rw 0 0\n", False),
         ("overlay / overlay rw 0 0\n", False),  # no encrypted volume at all
+        (  # a renter's own gocryptfs dataset is not the rental's plaintext mount
+            "/dev/loop1 /lium-cipher ext4 rw 0 0\n"
+            "/data/private-cipher /mnt/private fuse.gocryptfs rw 0 0\n",
+            True,
+        ),
     ],
 )
 def test_the_volume_mount_read_runs_in_a_real_shell(tmp_path, mounts, kept):

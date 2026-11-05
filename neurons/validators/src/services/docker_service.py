@@ -1710,7 +1710,8 @@ def _volume_unmounted_check(container_name: str) -> str:
 
     Read from the host (/proc/<init pid>/mounts), so it needs nothing from the renter's image."""
     awk = (
-        f"$2 == \"{_LIUM_CIPHER_MOUNT}\" {{c=1}} $3 == \"fuse.gocryptfs\" {{g=1}} "
+        # only the rental's own gocryptfs mount (source /lium-cipher) counts: a renter's other gocryptfs dataset is not it
+        f"$2 == \"{_LIUM_CIPHER_MOUNT}\" {{c=1}} $1 == \"{_LIUM_CIPHER_MOUNT}\" && $3 == \"fuse.gocryptfs\" {{g=1}} "
         f"END {{if (c && !g) print \"{_KEEP_MARK}\"}}"
     )
     return (
@@ -1790,9 +1791,11 @@ class _EditSwap:
 
     async def _park(self) -> str | None:
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
+        kept_prefix = f"{KEPT_UNMOUNTED_PREFIX}{self.container_name.removeprefix(POD_CONTAINER_PREFIX)}_"
         listed = await self._run(
             f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
-            f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
+            f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$ "
+            f"--filter name=^{shlex.quote(kept_prefix)}"
         )
         if listed.exit_status != 0:
             # a host timeout (exit 124) prints nothing: read as "no container", the sweep would remove the pod
@@ -1800,17 +1803,23 @@ class _EditSwap:
         listing = [line.split() for line in (listed.stdout or "").splitlines() if line.strip()]
         names = {fields[0] for fields in listing}
         ids_by_name = {fields[0]: fields[1] for fields in listing if len(fields) > 1}
+        kept = sorted(name for name in names if name.startswith(kept_prefix))
+        names -= set(kept)
+        # a crashed edit that parked under the kept name: the newest kept one is then the pod's only copy
+        recover_kept = kept[-1] if self.container_name not in names and parked not in names and kept else None
         # the container this edit parks: the pod's, or the one recovered from a crashed edit below
-        container_id = ids_by_name.get(self.container_name if self.container_name in names else parked)
-        if names and container_id is None:
+        container_id = ids_by_name.get(
+            self.container_name if self.container_name in names else recover_kept or parked
+        )
+        if (names or recover_kept) and container_id is None:
             # its removal after the reply could only go by name, and a later edit may park another container under it
             raise Exception("[park_current_container] docker ps listed the pod without its container ID; the pod was left as it was")
         if self.container_name not in names:
-            if parked in names:
+            if parked in names or recover_kept:
                 # An earlier edit crashed between park and restore: the parked container is the
                 # customer's only copy. Give it its name back and carry on; never remove it.
                 renamed = await self._run(
-                    f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
+                    f"/usr/bin/docker rename {shlex.quote(recover_kept or parked)} {shlex.quote(self.container_name)}"
                 )
                 if renamed.exit_status != 0:
                     raise Exception(
@@ -1818,7 +1827,10 @@ class _EditSwap:
                         f"renamed back: {(renamed.stderr or '').strip()}"
                     )
                 logger.warning(
-                    _m("Recovered a parked container from an earlier edit", extra=get_extra_info({**self.default_extra, "parked": parked}))
+                    _m(
+                        "Recovered a parked container from an earlier edit",
+                        extra=get_extra_info({**self.default_extra, "parked": recover_kept or parked}),
+                    )
                 )
             else:
                 return None
@@ -1826,9 +1838,23 @@ class _EditSwap:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
             # the leftover parked one is stale and must not block the rename.
             await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
-        # read while it still runs: a stopped container has no mounts to read
-        unmounted = await self._run(_volume_unmounted_check(self.container_name))
-        self.keep_parked = _KEEP_MARK in (unmounted.stdout or "")
+        if recover_kept:
+            # it is stopped, so its mounts cannot be read again: it was kept, so it stays kept
+            self.keep_parked = True
+            kept.remove(recover_kept)
+        else:
+            # read while it still runs: a stopped container has no mounts to read
+            unmounted = await self._run(_volume_unmounted_check(self.container_name))
+            self.keep_parked = _KEEP_MARK in (unmounted.stdout or "")
+        if self.keep_parked:
+            if kept:
+                # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
+                raise Exception(
+                    f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
+                    "and the encrypted volume is unmounted again; the pod was left as it was"
+                )
+            # parked straight under the kept name, so no later rename can fail and leave it to a sweep or the next edit
+            parked = f"{kept_prefix}{int(time.time())}"
         renamed = await self._run(
             f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
         )
@@ -1890,22 +1916,6 @@ class _EditSwap:
         )
         return is_stopped
 
-    async def _keep_parked(self) -> None:
-        # the renter's files written while the volume was unmounted live only in this container's layer
-        kept = f"{KEPT_UNMOUNTED_PREFIX}{self.container_name.removeprefix(POD_CONTAINER_PREFIX)}_{int(time.time())}"
-        renamed = await self._run(f"/usr/bin/docker rename {shlex.quote(self.parked_id)} {shlex.quote(kept)}")
-        logger.error(
-            _m(
-                "PARKED_CONTAINER_KEPT_VOLUME_UNMOUNTED",
-                extra=get_extra_info({
-                    **self.default_extra,
-                    "parked": self.parked_name,
-                    "kept_as": kept if renamed.exit_status == 0 else self.parked_name,
-                    "rename_error": (renamed.stderr or "").strip() if renamed.exit_status != 0 else None,
-                }),
-            )
-        )
-
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         # Nothing here may change the create's own outcome: the cleanup and the undo are best effort,
         # and an SSH session that died (the very thing that fails an edit) must not turn the create's
@@ -1917,7 +1927,10 @@ class _EditSwap:
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
                 if self.keep_parked:
-                    await self._keep_parked()
+                    # the renter's files written while the volume was unmounted live only in this container's layer
+                    logger.error(
+                        _m("PARKED_CONTAINER_KEPT_VOLUME_UNMOUNTED", extra=get_extra_info({**self.default_extra, "kept_as": self.parked_name}))
+                    )
                     return False
                 removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
                 if removed.exit_status != 0:
@@ -1961,7 +1974,8 @@ class _EditSwap:
                 )
             )
             return
-        elif self.bring_up is not None:
+        elif self.bring_up is not None and not self.keep_parked:
+            # a kept one comes back as dockerd had it, unmounted: the remount would hide its files and the next edit would remove them
             try:
                 async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
                     await self.bring_up(self.container_name)
