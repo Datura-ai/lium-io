@@ -1698,6 +1698,25 @@ _PARK_KILL_WAIT_SECONDS = 30
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
+# A parked container whose encrypted volume was not mounted at park time holds the renter's writes to the
+# volume path in its own layer (dockerd restarted it by itself, without the gocryptfs mount). It is kept
+# under this prefix after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
+_KEEP_MARK = "volume-unmounted"
+
+
+def _volume_unmounted_check(container_name: str) -> str:
+    """Prints _KEEP_MARK when the container has its ciphertext volume but no gocryptfs plaintext mount.
+
+    Read from the host (/proc/<init pid>/mounts), so it needs nothing from the renter's image."""
+    awk = (
+        f"$2 == \"{_LIUM_CIPHER_MOUNT}\" {{c=1}} $3 == \"fuse.gocryptfs\" {{g=1}} "
+        f"END {{if (c && !g) print \"{_KEEP_MARK}\"}}"
+    )
+    return (
+        f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_name)}) "
+        f"&& [ \"$p\" -gt 0 ] && awk {shlex.quote(awk)} /proc/$p/mounts"
+    )
 
 
 class _UnkillableParkedContainer(Exception):
@@ -1747,6 +1766,8 @@ class _EditSwap:
         self.replacement_id: str | None = None
         # set when `docker kill` got no exit event and killing the processes directly did not stop it either
         self.unkillable = False
+        # the parked container ran without its encrypted volume mounted: kept, never removed, after a successful edit
+        self.keep_parked = False
 
     async def __aenter__(self) -> "_EditSwap":
         return self
@@ -1805,6 +1826,9 @@ class _EditSwap:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
             # the leftover parked one is stale and must not block the rename.
             await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
+        # read while it still runs: a stopped container has no mounts to read
+        unmounted = await self._run(_volume_unmounted_check(self.container_name))
+        self.keep_parked = _KEEP_MARK in (unmounted.stdout or "")
         renamed = await self._run(
             f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
         )
@@ -1866,6 +1890,22 @@ class _EditSwap:
         )
         return is_stopped
 
+    async def _keep_parked(self) -> None:
+        # the renter's files written while the volume was unmounted live only in this container's layer
+        kept = f"{KEPT_UNMOUNTED_PREFIX}{self.container_name.removeprefix(POD_CONTAINER_PREFIX)}_{int(time.time())}"
+        renamed = await self._run(f"/usr/bin/docker rename {shlex.quote(self.parked_id)} {shlex.quote(kept)}")
+        logger.error(
+            _m(
+                "PARKED_CONTAINER_KEPT_VOLUME_UNMOUNTED",
+                extra=get_extra_info({
+                    **self.default_extra,
+                    "parked": self.parked_name,
+                    "kept_as": kept if renamed.exit_status == 0 else self.parked_name,
+                    "rename_error": (renamed.stderr or "").strip() if renamed.exit_status != 0 else None,
+                }),
+            )
+        )
+
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         # Nothing here may change the create's own outcome: the cleanup and the undo are best effort,
         # and an SSH session that died (the very thing that fails an edit) must not turn the create's
@@ -1876,6 +1916,9 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
+                if self.keep_parked:
+                    await self._keep_parked()
+                    return False
                 removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
                 if removed.exit_status != 0:
                     logger.warning(

@@ -19,7 +19,13 @@ from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _s
 
 from core.docker_utils import DockerCommand
 from core.utils import retry_ssh_command
-from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply, inflight_creates
+from services.docker_service import (
+    EDIT_PARKED_SUFFIX,
+    DockerService,
+    _volume_unmounted_check,
+    create_steps_after_reply,
+    inflight_creates,
+)
 from services.prerun_host_probe import prerun_host_probe_command
 
 
@@ -137,6 +143,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     host_key = next(cmd for cmd in ssh.commands if "pod_ssh_host_key" in cmd)
     assert ssh.commands == [
         f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{parked}$',
+        # the volume-mount read of the running container: an unmounted encrypted volume keeps it after the edit
+        _volume_unmounted_check(name),
         f"/usr/bin/docker rename {name} {parked}",
         f"/usr/bin/docker stop -t 10 {parked}",
         # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted
@@ -381,7 +389,7 @@ async def test_a_kill_without_an_exit_event_falls_back_to_killing_the_processes(
         if cmd.startswith("/usr/bin/docker kill"):
             ssh.commands.append(cmd)
             return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
-        if "{{.State.Pid}}" in cmd:
+        if "{{.State.Pid}}" in cmd and "/proc/$p/mounts" not in cmd:  # not the park's volume-mount read
             killed_directly.append(cmd)
         if "docker inspect -f '{{.State.Running}}'" in cmd and killed_directly:
             return _ssh_result(stdout="false\n" if direct_kill_stops else "true\n")
@@ -775,3 +783,55 @@ async def test_a_docker_ps_the_host_times_out_fails_the_edit_and_keeps_the_pod(s
     assert _docker(ssh.commands, "rename") == []
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
     svc.clean_existing_containers.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unmounted", [True, False])
+async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volume(svc, monkeypatch, unmounted):
+    # dockerd restarted the pod by itself, without the gocryptfs mount: the renter's writes to the volume
+    # path are in the old container's layer only, so a successful edit keeps it out of every sweep
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    answer = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if "{{.State.Pid}}" in cmd and "/proc/$p/mounts" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="volume-unmounted\n" if unmounted else "")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
+    _patch_happy(svc, monkeypatch, ssh)
+    name = _pod_name(payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    renames = _docker(ssh.commands, "rename")
+    if unmounted:
+        assert f"/usr/bin/docker rm -fv id-{name}" not in ssh.commands
+        kept = renames[-1].split()
+        assert kept[:3] == ["/usr/bin/docker", "rename", f"id-{name}"]
+        assert kept[3].startswith("kept_unmounted_") and not kept[3].startswith("pod_")
+    else:
+        assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
+        assert len(renames) == 1
+
+
+@pytest.mark.parametrize(
+    ("mounts", "kept"),
+    [
+        ("/dev/loop1 /lium-cipher ext4 rw 0 0\n", True),  # the ciphertext volume without its plaintext mount
+        ("/dev/loop1 /lium-cipher ext4 rw 0 0\n/lium-cipher /root fuse.gocryptfs rw 0 0\n", False),
+        ("overlay / overlay rw 0 0\n", False),  # no encrypted volume at all
+    ],
+)
+def test_the_volume_mount_read_runs_in_a_real_shell(tmp_path, mounts, kept):
+    import subprocess
+
+    command = _volume_unmounted_check("x").replace(
+        "p=$(/usr/bin/docker inspect -f '{{.State.Pid}}' x)", "p=7"
+    ).replace("/proc/$p/mounts", f"{tmp_path}/$p")
+    (tmp_path / "7").write_text(mounts)
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
+    assert out == ("volume-unmounted\n" if kept else "")
