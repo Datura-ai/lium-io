@@ -1065,6 +1065,14 @@ class StaleContainerCleanupMessages:
         category="prep",
         impact="No rental container removed this cycle; live pods and fillers are left alone",
     )
+    TIMED_OUT = MessageTemplate(
+        event="Stale container cleanup timed out",
+        reason="STALE_CLEANUP_TIMED_OUT",
+        severity="warning",
+        category="prep",
+        impact="Cleanup stopped for this cycle; the rest of the validation runs",
+        remediation="Docker on the node answers slowly; check that dockerd is responsive.",
+    )
 
 
 class CustomBuildOrphanSweepMessages:

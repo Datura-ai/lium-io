@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -61,6 +62,10 @@ REAPED_POD_STATES_FLOOR = 32
 # record stays ended, so a provider recreating pod_<old id> each cycle would otherwise be exempt forever.
 # Never expired: see _ReapedPodStateQueue.claim_gpu_exemptions.
 REAPED_GPU_EXEMPT_KEY_PREFIX = "reaped_gpu_exempt:"
+# The cleanup's docker calls carry no timeout of their own, and a slow dockerd held this step for 5-10
+# min on some nodes (prod, 4-5 Nov), so the executor task hit its own timeout and the cycle ended
+# with no result. Healthy runs take under ~140 s; past this budget the step gives up for the cycle.
+STALE_CLEANUP_BUDGET_SECONDS = 180
 
 
 class StaleContainerCleanupCheck:
@@ -97,6 +102,23 @@ class StaleContainerCleanupCheck:
         self._last_sweep_at: dict[str, float] = {}
 
     async def run(self, ctx: Context) -> CheckResult:
+        try:
+            async with asyncio.timeout(STALE_CLEANUP_BUDGET_SECONDS):
+                return await self._run(ctx)
+        except TimeoutError:
+            # best effort: a container already removed is in the reaped queue and is reported next
+            # cycle; its GPU processes still count this cycle, as for an unconfirmed removal
+            return CheckResult(
+                passed=True,
+                event=render_message(
+                    Msg.TIMED_OUT,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"budget_seconds": STALE_CLEANUP_BUDGET_SECONDS},
+                ),
+            )
+
+    async def _run(self, ctx: Context) -> CheckResult:
         # DAH-1932: when a miner re-adds an executor it gets a new subnet UUID for the same
         # IP:port. `rented_data` is keyed by UUID, so the tenant that is still running on the
         # box is listed under the OLD uuid and this executor looks unrented. Removing "orphans"
