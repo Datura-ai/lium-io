@@ -18,8 +18,9 @@ own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
 matmul path and a consumed local pass must not skip it). Outside the first pass the matmul stays
 on SSH (`scored_ssh`), so its time cap is the validator's own, and the call carries VerifyX only,
-with a timeout that leaves room for this node's own measured SSH run from VerifyX to the end of
-the job (`SSH_TAIL_KEY`, recorded by `record_ssh_tail` after each run); with no measurement yet,
+with a timeout that leaves room for an SSH VerifyX rerun at its full cap
+(`VERIFYX_COMMAND_TIMEOUT_SECONDS`) plus this node's measured checks after VerifyX (`SSH_TAIL_KEY`,
+recorded by `record_ssh_tail` after each completed scored run); with no measurement yet,
 or too little room, the check is skipped and both steps stay on SSH. On the first pass the call's
 timeout is at most half the time the job has left, so a slow `/verify` still leaves the SSH
 fallback room. Every outcome is one `[local_verify] outcome` log line with `outcome`, `step` and
@@ -29,8 +30,8 @@ fallback room. Every outcome is one `[local_verify] outcome` log line with `outc
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from services.local_verify_client import (
@@ -64,6 +65,9 @@ from .capability import get_filler_only_container
 from .task_time import task_seconds_left
 from .verifyx import _first_pass_challenge_config
 
+if TYPE_CHECKING:
+    from services.redis_service import RedisService
+
 logger = logging.getLogger(__name__)
 
 LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
@@ -90,8 +94,8 @@ def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
     return answer.round_trip_ms > ROUND_TRIP_CAP_MS_BY_STEP[name]
 
 
-# This node's SSH time from VerifyX to the end of its last run in which VerifyX ran over SSH.
-SSH_TAIL_KEY = "local_verify_ssh_tail_s:{}"
+# This node's time for the checks after VerifyX, from its last completed scored run.
+SSH_TAIL_KEY = "local_verify_after_verifyx_s:{}"
 SSH_TAIL_TTL_SECONDS = 2 * 24 * 3600
 SSH_TAIL_MARGIN = 1.25
 SSH_TAIL_SLACK_SECONDS = 30
@@ -101,30 +105,29 @@ VERIFYX_STEP_ID = "gpu.validate.verifyx"
 
 
 def ssh_tail_seconds(steps: dict[str, float]) -> float | None:
-    """Seconds from VerifyX to the end of the run, when VerifyX ran over SSH (a consumed local
-    answer takes ~0 s there and says nothing about the SSH run); None otherwise."""
+    """Seconds of the checks after VerifyX, or None when the run had no VerifyX step."""
     ids = list(steps)
-    if VERIFYX_STEP_ID not in ids or steps[VERIFYX_STEP_ID] < 1:
+    if VERIFYX_STEP_ID not in ids:
         return None
-    return sum(steps[i] for i in ids[ids.index(VERIFYX_STEP_ID) :])
+    return sum(steps[i] for i in ids[ids.index(VERIFYX_STEP_ID) + 1 :])
 
 
-async def record_ssh_tail(redis, executor_uuid: str, steps: dict[str, float]) -> None:
-    tail = ssh_tail_seconds(steps)
+async def record_ssh_tail(
+    redis: RedisService, executor_uuid: str, steps: dict[str, float], *, first_pass: bool, ok: bool
+) -> None:
+    """Store the tail of a completed scored run only: a first pass runs a smaller VerifyX and a run
+    that stopped early skipped checks, so either would size the next budget too large."""
+    tail = ssh_tail_seconds(steps) if ok and not first_pass else None
     if tail is not None:
         await redis.set(SSH_TAIL_KEY.format(executor_uuid), str(tail), ex=SSH_TAIL_TTL_SECONDS)
 
 
-async def _scored_timeout_s(ctx: Context) -> tuple[int | None, str]:
-    """The scored call's timeout, or None with why it is skipped."""
-    raw = await ctx.services.redis.get(SSH_TAIL_KEY.format(ctx.executor.uuid))
-    if raw is None:
-        return None, "no measured SSH run yet"
-    tail = float(raw.decode() if isinstance(raw, bytes) else raw)
-    timeout_s = int(task_seconds_left(ctx) - tail * SSH_TAIL_MARGIN - SSH_TAIL_SLACK_SECONDS)
-    if timeout_s < SCORED_MIN_VERIFY_SECONDS:
-        return None, "no room for the SSH fallback"
-    return timeout_s, ""
+@dataclass(frozen=True)
+class CallBudget:
+    """The /verify call's timeout, or None with why the call is skipped."""
+
+    timeout_s: int | None
+    why: str = ""
 
 
 def _matmul_ssh_reason(ctx: Context) -> str | None:
@@ -181,13 +184,9 @@ class LocalVerifyCheck:
         if get_filler_only_container(ctx):
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
-        if ctx.config.first_pass:
-            timeout_s = int(task_seconds_left(ctx) / 2)
-        else:
-            # a full-size VerifyX that times out on /verify runs again over SSH: leave it room
-            timeout_s, why = await _scored_timeout_s(ctx)
-            if timeout_s is None:
-                return self._skipped(ctx, why)
+        budget = await self._call_budget(ctx)
+        if budget.timeout_s is None:
+            return self._skipped(ctx, budget.why)
         if ctx.config.validator_keypair is None:
             return self._fallback(
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
@@ -195,7 +194,7 @@ class LocalVerifyCheck:
 
         matmul_ssh_reason = _matmul_ssh_reason(ctx)
         client = self._client_factory(ctx)
-        client.timeout_s = max(1, min(client.timeout_s, timeout_s))
+        client.timeout_s = max(1, min(client.timeout_s, budget.timeout_s))
         advertised = await client.advertised(ctx.executor)
         if CAPABILITY not in advertised.capabilities:
             self._metric(ctx, "fallback", "call", "not_advertised")
@@ -233,6 +232,22 @@ class LocalVerifyCheck:
         finally:
             if matmul_challenge is not None:
                 matmul_challenge.close()
+
+    @staticmethod
+    async def _call_budget(ctx: Context) -> CallBudget:
+        if ctx.config.first_pass:
+            return CallBudget(int(task_seconds_left(ctx) / 2))
+        # a full-size VerifyX that times out on /verify runs again over SSH, up to its own cap: leave
+        # room for that cap and this node's checks after it
+        raw = await ctx.services.redis.get(SSH_TAIL_KEY.format(ctx.executor.uuid))
+        if raw is None:
+            return CallBudget(None, "no measured SSH run yet")
+        tail = float(raw.decode() if isinstance(raw, bytes) else raw)
+        reserve = VERIFYX_COMMAND_TIMEOUT_SECONDS + tail * SSH_TAIL_MARGIN + SSH_TAIL_SLACK_SECONDS
+        timeout_s = int(task_seconds_left(ctx) - reserve)
+        if timeout_s < SCORED_MIN_VERIFY_SECONDS:
+            return CallBudget(None, "no room for the SSH fallback")
+        return CallBudget(timeout_s)
 
     def _prepare_challenges(
         self, ctx: Context, specs: dict, *, matmul_on_ssh: bool

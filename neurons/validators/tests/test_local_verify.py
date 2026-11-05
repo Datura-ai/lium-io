@@ -1431,14 +1431,15 @@ async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("ssh_tail", "why"),
-    [(None, "no measured SSH run yet"), (b"700", "no room for the SSH fallback")],
+    # 200 s of later checks fitted beside a measured VerifyX; beside the VerifyX cap it does not
+    [(None, "no measured SSH run yet"), (b"200", "no room for the SSH fallback")],
 )
 async def test_a_scored_cycle_without_room_for_the_ssh_rerun_sends_no_verify_call(
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, ssh_tail, why
 ):
-    """Not the first pass: a full-size VerifyX that times out on /verify runs again over SSH. With
-    no measured SSH run of this node, or one that would not fit after the call, both steps run
-    over SSH."""
+    """Not the first pass: a full-size VerifyX that times out on /verify runs again over SSH, for up
+    to its own cap. With no measured run of this node, or no room for that cap and its later checks
+    after the call, both steps run over SSH."""
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     validation.validate_gpu_model_and_process_job = ssh_matmul
@@ -1466,7 +1467,7 @@ async def test_a_scored_cycle_sends_verifyx_only_with_room_left_for_the_ssh_reru
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
     """The matmul stays on SSH (its cap is the validator's own clock) and the call's timeout leaves
-    this node's measured SSH run from VerifyX to the end, with margin."""
+    an SSH VerifyX at its full cap plus this node's measured later checks, with margin."""
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     validation.validate_gpu_model_and_process_job = ssh_matmul
@@ -1486,7 +1487,7 @@ async def test_a_scored_cycle_sends_verifyx_only_with_room_left_for_the_ssh_reru
             validation=validation,
             verifyx=verifyx_service,
             first_pass=False,
-            ssh_tail=b"200",
+            ssh_tail=b"20",
         )
         left = task_seconds_left(ctx)
         local, verifyx, capability = await run_local_then_consumers(
@@ -1494,27 +1495,32 @@ async def test_a_scored_cycle_sends_verifyx_only_with_room_left_for_the_ssh_reru
         )
     assert len(executor.intents) == 1
     assert local.updates["state"].local_verify.fallbacks["matmul"] == "scored_ssh"
-    assert left - 200 * 1.25 - 31 <= seen["client"].timeout_s <= left - 200 * 1.25 - 30
+    reserve = vvs.VERIFYX_COMMAND_TIMEOUT_SECONDS + 20 * 1.25 + 30
+    assert left - reserve - 1 <= seen["client"].timeout_s <= left - reserve
     assert capability.event.what_we_saw["transport"] == "ssh"
     ssh_matmul.assert_awaited_once()
 
 
-def test_ssh_tail_is_measured_only_when_verifyx_ran_over_ssh():
+def test_the_tail_is_the_checks_after_verifyx():
     steps = {"executor.local_verify": 90.0, "gpu.validate.verifyx": 80.0, "gpu.validate.capability": 40.5, "z": 0.5}
-    assert ssh_tail_seconds(steps) == 121.0
-    assert ssh_tail_seconds({**steps, "gpu.validate.verifyx": 0.002}) is None
+    assert ssh_tail_seconds(steps) == 41.0
     assert ssh_tail_seconds({"executor.local_verify": 90.0}) is None
 
 
 @pytest.mark.asyncio
-async def test_record_ssh_tail_writes_only_a_measured_tail():
+@pytest.mark.parametrize(
+    ("first_pass", "ok", "stored"),
+    [(False, True, True), (True, True, False), (False, False, False)],
+    ids=["completed_scored", "first_pass", "stopped_early"],
+)
+async def test_only_a_completed_scored_run_records_the_tail(first_pass, ok, stored):
     redis = SimpleNamespace(set=AsyncMock())
-    await record_ssh_tail(redis, "u1", {"gpu.validate.verifyx": 0.01})
-    redis.set.assert_not_awaited()
-    await record_ssh_tail(redis, "u1", {"gpu.validate.verifyx": 80.0, "x": 20.0})
-    redis.set.assert_awaited_once_with(
-        SSH_TAIL_KEY.format("u1"), "100.0", ex=SSH_TAIL_TTL_SECONDS
-    )
+    steps = {"gpu.validate.verifyx": 80.0, "x": 20.0}
+    await record_ssh_tail(redis, "u1", steps, first_pass=first_pass, ok=ok)
+    if stored:
+        redis.set.assert_awaited_once_with(SSH_TAIL_KEY.format("u1"), "20.0", ex=SSH_TAIL_TTL_SECONDS)
+    else:
+        redis.set.assert_not_awaited()
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():

@@ -237,6 +237,8 @@ class TaskService:
                         self.redis_service,
                         executor_info.uuid,
                         (last_event.what_we_saw or {}).get("steps") or {},
+                        first_pass=first_pass,
+                        ok=ok,
                     )
                 except Exception as exc:  # noqa: BLE001 — a sizing hint, never the node's result
                     logger.warning(_m("could not record the SSH tail", extra={"executor_uuid": executor_info.uuid, "error": str(exc)}))
