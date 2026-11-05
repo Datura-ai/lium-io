@@ -3,7 +3,7 @@
 A central miner lists each node with the SSH host key the portal recorded when the account proved it controls the
 node (`expected_ssh_host_key`). Completing the SSH key exchange proves the machine the validator dialed (after DNS
 resolution, see node_host) holds that host key's private half, so this check requires the key the server presented
-in the handshake to be the recorded one: a hostname re-pointed to another machine presents another key.
+in the handshake to be one of the recorded ones (one per line): a hostname re-pointed to another machine presents another key.
 
 Scope: only a node registered by hostname, since an IP address cannot be re-pointed after registration.
 No expected key (a standalone or older miner, or a portal that does not record it yet): skipped and logged once per
@@ -43,7 +43,8 @@ class NodeAccountCheck:
     async def run(self, ctx: Context) -> CheckResult:
         executor = ctx.executor
         what = {"executor_uuid": executor.uuid, "address": executor.address}
-        expected = _key_body(executor.expected_ssh_host_key)
+        # the portal records every host key the node presented, one `<type> <base64>` per line
+        expected = {_key_body(line) for line in (executor.expected_ssh_host_key or "").splitlines()} - {""}
         if is_ip_literal(executor.address) or not expected:
             if not is_ip_literal(executor.address) and executor.uuid not in _logged_without_expected:
                 _logged_without_expected.add(executor.uuid)
@@ -55,7 +56,7 @@ class NodeAccountCheck:
                 )
             return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
 
-        if presented_host_key(ctx) != expected:
+        if presented_host_key(ctx) not in expected:
             event = render_message(Msg.MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
         return CheckResult(passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what))

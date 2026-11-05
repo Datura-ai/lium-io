@@ -27,11 +27,11 @@ class _OpenServer(asyncssh.SSHServer):
         return False  # no auth needed: the test only needs the key exchange
 
 
-def _executor_container_start(container: Path, volume: Path) -> asyncssh.SSHKey:
-    """The executor container's start (run.sh runs ssh_host_keys.sh); the ed25519 host key its sshd then serves."""
+def _executor_container_start(container: Path, volume: Path, key_type: str = "ed25519") -> asyncssh.SSHKey:
+    """The executor container's start (run.sh runs ssh_host_keys.sh); the host key of `key_type` its sshd serves."""
     env = {"PATH": "/usr/bin:/bin", "SSH_ROOT": str(container), "SSH_HOST_KEYS_DIR": str(volume)}
     subprocess.run(["sh", str(HOST_KEYS_SCRIPT)], env=env, check=True, capture_output=True)
-    return asyncssh.read_private_key(container / "etc/ssh/ssh_host_ed25519_key")
+    return asyncssh.read_private_key(container / f"etc/ssh/ssh_host_{key_type}_key")
 
 
 @pytest_asyncio.fixture
@@ -93,3 +93,28 @@ async def test_missing_expected_host_key_is_not_failed(two_machines):
     result = await NodeAccountCheck().run(_ctx("node.example.com", await dial(IP_B), None))
     assert result.passed
     assert result.event.reason_code == "NODE_ACCOUNT_SKIPPED"
+
+
+def _public(key: asyncssh.SSHKey) -> str:
+    return key.export_public_key("openssh").decode().strip()
+
+
+async def test_any_recorded_host_key_matches(tmp_path):
+    # the portal records every key the node presented; this validator session negotiates the rsa one
+    volume = tmp_path / "a-volume"
+    rsa_key = _executor_container_start(tmp_path / "a-container", volume, "rsa")
+    other = _executor_container_start(tmp_path / "b-container", tmp_path / "b-volume", "rsa")
+    recorded = f"{_public(asyncssh.read_private_key(volume / 'ssh_host_ed25519_key'))}\n\n{_public(rsa_key)}\n"
+    server_a = await asyncssh.listen(IP_A, 0, server_host_keys=[rsa_key], server_factory=_OpenServer)
+    port = server_a.sockets[0].getsockname()[1]
+    server_b = await asyncssh.listen(IP_B, port, server_host_keys=[other], server_factory=_OpenServer)
+    try:
+        async with asyncssh.connect(IP_A, port, known_hosts=None, username="root") as conn:
+            result = await NodeAccountCheck().run(_ctx("node.example.com", conn, recorded))
+            assert result.passed and result.event.reason_code == "NODE_ACCOUNT_OK"
+        async with asyncssh.connect(IP_B, port, known_hosts=None, username="root") as conn:
+            result = await NodeAccountCheck().run(_ctx("node.example.com", conn, recorded))
+            assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+    finally:
+        server_a.close()
+        server_b.close()
