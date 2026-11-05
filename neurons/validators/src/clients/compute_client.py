@@ -105,6 +105,7 @@ from services.redis_service import (
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
+    renter_create_id,
 )
 from clients.handlers.backup_handler import BackupHandler
 
@@ -1152,9 +1153,11 @@ class ComputeClient:
             retrying = None
             if not await self._write_backend_create_record(pod_id, add):
                 retrying = asyncio.ensure_future(self._retry_backend_create_record(pod_id, add))
+            create_id_token = renter_create_id.set(create_id)  # the create lock's owner, see executor_create_exclusion
             try:
                 return await self._drive_miner_job(job_request)
             finally:
+                renter_create_id.reset(create_id_token)
                 if retrying is not None:
                     retrying.cancel()
                     await asyncio.wait({retrying})
@@ -1292,7 +1295,8 @@ class ComputeClient:
                 continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
-            await redis_service.release_cut_off_create_lock(create.executor_id, pod_id)
+            for cut_off in pod_creates:  # whichever of the pod's cut-off creates held it
+                await redis_service.release_cut_off_create_lock(cut_off.executor_id, pod_id, cut_off.create_id)
             if create.resumes < MAX_CREATE_RESUMES:
                 # the count survives another restart before the backend's re-send arrives; the re-sent create
                 # takes over this record (its create id), so the pod keeps one

@@ -4,6 +4,7 @@ import logging
 import math
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Literal, NamedTuple
 
 import redis.asyncio as aioredis
@@ -162,9 +163,14 @@ def _executor_create_lock_key(executor_id: str) -> str:
     return f"lock:executor-create:{executor_id}"
 
 
-def _renter_create_lock_token(pod_id: str) -> str:
-    # names the create holding the lock, so a restarted connector can release exactly its cut-off creates' locks
-    return f"create:{pod_id}"
+# the connector's id of the create execution being run (InflightBackendCreate.create_id), set around the create
+renter_create_id: ContextVar[str] = ContextVar("renter_create_id", default="")
+
+
+def _renter_create_lock_token(pod_id: str, create_id: str = "") -> str:
+    # names the create EXECUTION holding the lock: a late release by an earlier create of the same pod whose lock
+    # lapsed must not free a retry's lock, and a restarted connector releases exactly its cut-off creates' locks
+    return f"create:{pod_id}:{create_id}" if create_id else f"create:{pod_id}"
 
 # DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
 # meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
@@ -371,7 +377,7 @@ class RedisService:
         lock = self.executor_create_lock(executor_id)
         held = False
         try:
-            held = bool(await lock.acquire(token=_renter_create_lock_token(pod_id)))
+            held = bool(await lock.acquire(token=_renter_create_lock_token(pod_id, renter_create_id.get())))
             if not held:
                 logger.warning(
                     _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
@@ -397,18 +403,19 @@ class RedisService:
                         )
                     )
 
-    async def release_cut_off_create_lock(self, executor_id: str, pod_id: str) -> None:
+    async def release_cut_off_create_lock(self, executor_id: str, pod_id: str, create_id: str = "") -> None:
         """The create lock a create cut off by a connector restart still holds, released if it is that create's.
 
         The connector that held it is gone, so nothing releases it before its TTL: the backend's re-send of the
         same create would wait out the rest of EXECUTOR_CREATE_LOCK_TIMEOUT (up to 6 min) and renters deleted the
-        pod first. A lock with another token (the rental probe's, or another pod's create) is left alone.
+        pod first. A lock with another token (the rental probe's, another pod's create, or another create of this pod)
+        is left alone.
         """
         key = _executor_create_lock_key(executor_id)
         try:
             async with self.redis.pipeline(transaction=True) as pipe:
                 await pipe.watch(key)
-                if await pipe.get(key) != _renter_create_lock_token(pod_id).encode():
+                if await pipe.get(key) != _renter_create_lock_token(pod_id, create_id).encode():
                     return
                 pipe.multi()
                 pipe.delete(key)

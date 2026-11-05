@@ -13,7 +13,7 @@ from clients.compute_client import (
     OutgoingMessages,
 )
 from payload_models.payloads import ContainerCreateRequest, ContainerDeleteRequest, FailedContainerRequest, WorkloadKind
-from services.redis_service import PENDING_PODS_PREFIX, InflightBackendCreate, RedisService
+from services.redis_service import PENDING_PODS_PREFIX, InflightBackendCreate, RedisService, renter_create_id
 
 
 class _FakeRedis:
@@ -665,6 +665,43 @@ def _fakeredis_service() -> RedisService:
 
 
 @pytest.mark.asyncio
+async def test_a_restart_releases_the_lock_of_the_cut_off_create_by_its_create_id() -> None:
+    redis_service = _fakeredis_service()
+    token = renter_create_id.set("cut-off-create")
+    try:
+        assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    finally:
+        renter_create_id.reset(token)
+    await redis_service.add_inflight_backend_create(
+        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, create_id="cut-off-create"
+    )
+
+    await _client(redis_service).fail_creates_cut_off_by_restart()
+
+    assert await redis_service.executor_create_lock("exec-1").acquire(blocking=False)
+
+
+@pytest.mark.asyncio
+async def test_a_late_release_by_a_create_whose_lock_lapsed_keeps_the_retrys_lock() -> None:
+    # create A outlives the TTL, the backend's retry B of the same pod takes the lock; A's release must not free it
+    redis_service = _fakeredis_service()
+    token = renter_create_id.set("create-a")
+    create_a = redis_service.executor_create_exclusion("exec-1", "pod-1")
+    assert await create_a.__aenter__()
+    renter_create_id.reset(token)
+    await redis_service.redis.delete("lock:executor-create:exec-1")  # A's TTL ran out
+    token = renter_create_id.set("create-b")
+    try:
+        assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    finally:
+        renter_create_id.reset(token)
+
+    await create_a.__aexit__(None, None, None)
+
+    assert not await redis_service.executor_create_lock("exec-1").acquire(blocking=False)
+
+
+@pytest.mark.asyncio
 async def test_a_restart_releases_the_create_lock_its_cut_off_create_held() -> None:
     redis_service = _fakeredis_service()
     # the dead connector's create took the executor's lock and never released it
@@ -678,15 +715,23 @@ async def test_a_restart_releases_the_create_lock_its_cut_off_create_held() -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("holder", ["probe", "other-pod"])
+@pytest.mark.parametrize("holder", ["probe", "other-pod", "same-pod-other-create"])
 async def test_a_restart_keeps_a_create_lock_held_by_another_create(holder: str) -> None:
     redis_service = _fakeredis_service()
     lock = redis_service.executor_create_lock("exec-1")
     if holder == "probe":
         assert await lock.acquire(blocking=False)
-    else:
+    elif holder == "other-pod":
         assert await redis_service.executor_create_exclusion("exec-1", "pod-2").__aenter__()
-    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+    else:
+        token = renter_create_id.set("live-create")
+        try:
+            assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+        finally:
+            renter_create_id.reset(token)
+    await redis_service.add_inflight_backend_create(
+        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, create_id="cut-off-create"
+    )
 
     await _client(redis_service).fail_creates_cut_off_by_restart()
 
