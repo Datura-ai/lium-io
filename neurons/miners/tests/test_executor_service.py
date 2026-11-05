@@ -200,7 +200,7 @@ async def test_register_pubkey_reserves_the_hook_time_only_when_the_hook_runs(
     """Ordinary checks never call the rental hook, so their uploads keep the whole wait minus the reply margin."""
     clock = [100.0]
 
-    async def slow_lookup(*_args):
+    async def slow_lookup(*_args, **_kwargs):
         clock[0] += lookup_seconds
         return [test_executor]
 
@@ -228,7 +228,7 @@ async def test_register_pubkey_first_upload_keeps_mains_full_timeout(
     """Retries must not cost a first-attempt success main accepted: attempt 1 always gets the full 10 s."""
     clock = [100.0]
 
-    async def slow_lookup(*_args):
+    async def slow_lookup(*_args, **_kwargs):
         clock[0] += lookup_seconds
         return [test_executor]
 
@@ -409,3 +409,52 @@ def test_an_update_writes_only_the_fields_the_portal_sent(tmp_path, messages, ex
     with Session(engine) as session:
         node = session.get(Executor, node_id)
         assert (node.address, node.port, node.validator, node.price_per_gpu) == expected
+
+
+@pytest.mark.asyncio
+async def test_central_miner_lists_each_node_with_its_registered_host_key_from_one_portal_read(executor_service):
+    """DAH-5729: the host key comes from the portal read the node list came from. The snapshot expiring while the
+    uploads run (the second read would then be a slow bulk refresh) must not cause another portal call."""
+    from datura.requests.miner_requests import ExecutorSSHInfo
+
+    from clients.miner_portal_api import MinerPortalAPI
+
+    keyed_node, unkeyed_node = str(uuid4()), str(uuid4())
+    portal_items = [
+        {"id": keyed_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
+         "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered"},
+        {"id": unkeyed_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
+    ]
+    es.settings.CENTRAL_MODE = True
+    es.settings.RENTAL_REQUEST_HOOK = None
+    reads = AsyncMock(side_effect=[portal_items, RuntimeError("portal read after the uploads")])
+
+    async def answered(executor, *_args, **_kwargs):
+        MinerPortalAPI._snapshot_fetched_at = None  # the cache expires mid-gather
+        return ExecutorSSHInfo(
+            uuid=str(executor.uuid), address=executor.address, port=executor.port, ssh_username="root",
+            ssh_port=22, python_path="/p", root_dir="/r",
+        )
+
+    executor_service.send_pubkey_to_executor = answered
+    with patch.object(MinerPortalAPI, "fetch_executors", reads):
+        registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    assert reads.await_count == 1
+    by_id = {info.uuid: info for info in registration.accepted}
+    assert by_id[keyed_node.lower()].expected_ssh_host_key == "ssh-ed25519 AAAAregistered"
+    assert by_id[unkeyed_node].expected_ssh_host_key is None
+
+
+@pytest.mark.asyncio
+async def test_standalone_miner_sends_no_expected_host_key(executor_service, test_executor):
+    from datura.requests.miner_requests import ExecutorSSHInfo
+
+    executor_service.executor_dao.get_executors_for_validator.return_value = [test_executor]
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.send_pubkey_to_executor = AsyncMock(return_value=ExecutorSSHInfo(
+        uuid=str(test_executor.uuid), address="127.0.0.1", port=8001, ssh_username="root",
+        ssh_port=22, python_path="/p", root_dir="/r",
+    ))
+    registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+    assert registration.accepted[0].expected_ssh_host_key is None

@@ -291,7 +291,12 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    async def get_executors_for_validator(self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None)  -> list[Executor]:
+    async def get_executors_for_validator(
+        self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None,
+        host_keys: dict[str, str] | None = None,
+    ) -> list[Executor]:
+        """`host_keys`, when given, is filled (central mode) with each node's SSH host key as the portal recorded it
+        at registration, by executor id, from the same portal read as the list (DAH-5729)."""
         # Standard mode: use local DB, in Standard mode
         if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
@@ -315,9 +320,12 @@ class ExecutorService:
                 if item.get("validator_hotkey") != validator_hotkey:
                     continue
 
+                uuid = UUID(item.get("id"))
+                if host_keys is not None and item.get("ssh_host_key"):
+                    host_keys[str(uuid)] = item["ssh_host_key"]
                 result.append(
                     Executor(
-                        uuid=UUID(item.get("id")),
+                        uuid=uuid,
                         validator=item.get("validator_hotkey"),
                         address=item.get("executor_ip_address"),
                         port=int(item.get("executor_ip_port")),
@@ -530,7 +538,10 @@ class ExecutorService:
             # DAH-5734: in a wave of ~200 requests the pickup came 2-7 s late and the answer still missed the 30 s
             budget -= min(max(0.0, time.time() - requested_at), MAX_REQUEST_PICKUP_LAG_SECONDS)
         deadline = time.monotonic() + budget
-        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
+        host_keys: dict[str, str] = {}
+        executors = await self.get_executors_for_validator(
+            validator_hotkey, miner_hotkey, executor_id, host_keys=host_keys
+        )
         tasks = [
             asyncio.create_task(
                 self.send_pubkey_to_executor(
@@ -551,6 +562,10 @@ class ExecutorService:
         for task in pending:
             task.cancel()
         results = [task.result() for task in done if not task.exception() and task.result()]
+        for info in results:
+            # no portal read here: the uploads can outlast the snapshot cache, and the reply must meet its deadline
+            if isinstance(info, ExecutorSSHInfo):
+                info.expected_ssh_host_key = host_keys.get(str(info.uuid))
         logger.info(
             _m( 
                 "Sent pubkey register to executors",
