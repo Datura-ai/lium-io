@@ -172,9 +172,7 @@ class PostRentalGpuRecheckCheck:
                 self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
                 return CheckResult(
                     passed=True,
-                    event=render_message(
-                        Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what
-                    ),
+                    event=render_message(Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what),
                 )
 
         probes = await self._run_every_card_probes(ctx, what)
