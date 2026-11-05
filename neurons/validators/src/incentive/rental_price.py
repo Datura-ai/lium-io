@@ -79,6 +79,7 @@ class InsufficientDisk(BaseModel):
     vram_gb: float
     disk_gb: float
     rate: float  # required disk-to-VRAM margin the machine failed to clear
+    disk_unknown: bool = False  # the containerd store's root could not be found: disk_gb is not a reading
 
 
 class MissingFull8xCapability(BaseModel):
@@ -347,7 +348,9 @@ class RentalPriceIncentive(DefaultIncentive):
         if vram_gb > 0 and disk_gb <= 0 and "containerd root unknown" in str(spec.get("hard_disk_scrape_error") or ""):
             # the scrape could not find where Docker's containerd store keeps containers: fail closed,
             # or hiding the store's root would pass the gate (machine_scrape CONTAINERD_ROOT_UNKNOWN)
-            return InsufficientDisk(vram_gb=round(vram_gb, 1), disk_gb=0.0, rate=MIN_DISK_TO_VRAM_RATE)
+            return InsufficientDisk(
+                vram_gb=round(vram_gb, 1), disk_gb=0.0, rate=MIN_DISK_TO_VRAM_RATE, disk_unknown=True
+            )
         if vram_gb <= 0 or disk_gb <= 0:
             # either number missing or zeroed: fail open, nobody loses incentive over telemetry
             if log_if_cannot_measure:

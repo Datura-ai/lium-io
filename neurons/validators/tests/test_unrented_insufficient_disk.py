@@ -12,6 +12,7 @@ import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from incentive.config import IncentiveConfig
+from incentive.miner_incentive_log import MinerLogLine
 from incentive.rental_price import RentalPriceIncentive
 from neurons.validators.tests.helpers import build_scrape_namespace
 from services.task_service import JobResult
@@ -162,4 +163,9 @@ def test_an_unknown_containerd_root_fails_the_gate_closed():
     measured = _build_incentive()._insufficient_disk(_make_job(spec=spec))
 
     assert measured is not None
-    assert (measured.vram_gb, measured.disk_gb) == (1128.0, 0.0)
+    assert (measured.vram_gb, measured.disk_gb, measured.disk_unknown) == (1128.0, 0.0, True)
+    # the provider is told the disk could not be measured, not that it has 0 GB
+    line = MinerLogLine.no_payout_because_insufficient_disk_for_vram(_make_job(spec=spec), measured)
+    assert "0.0 GB of total disk" not in line.message
+    assert "could not be measured" in line.message
+    assert line.fields["total_disk_gb"] is None

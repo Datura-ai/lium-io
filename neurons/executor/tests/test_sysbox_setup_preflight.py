@@ -419,6 +419,29 @@ def test_disk_is_read_from_the_containerd_docker_uses(tmp_path, daemons, address
     assert f"FIX  Free disk 50.0 GB on {root}/{expected} is below" in out
 
 
+@pytest.mark.parametrize(
+    "daemons, docker_root, remedy",
+    [
+        # Docker's own containerd keeps its root in data-root: moving data-root is the fix, no containerd config
+        ([_MANAGED], "data/docker", None),
+        # an external containerd: the config it really reads, or its --root argument
+        ([_EXTERNAL], None, '"root" in /etc/containerd/config.toml'),
+        ([["containerd", "--root={root}/data/flag", "-c", MANAGED_CONFIG]], None, "containerd's --root argument"),
+    ],
+)
+def test_the_containerd_store_fix_names_the_setting_that_moves_its_root(tmp_path, daemons, docker_root, remedy):
+    root, files = _containerd_fixture(tmp_path, *daemons)
+    env = {**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    if docker_root:
+        env["STUB_DOCKER_ROOT"] = f"{root}/{docker_root}"
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    if remedy is None:
+        assert "not under data-root" not in out and "/etc/containerd/config.toml" not in out
+    else:
+        assert f"Or move containerd's root ({remedy}," in out
+
+
 def test_two_containerd_daemons_without_dockers_address_are_not_measured(tmp_path):
     _, files = _containerd_fixture(tmp_path, _EXTERNAL, _MANAGED)
     rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=SNAPSHOTTER, files=files)
