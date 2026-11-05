@@ -828,28 +828,39 @@ async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volu
         assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
 
 
-def _start_exits(ssh, exit_status: int):
+def _kept_not_running(ssh):
     answer = ssh.run.side_effect
 
     def _side(cmd, *args, **kwargs):
-        if "docker start" in cmd:
+        if "docker inspect -f '{{.State.Running}}' kept_unmounted_" in cmd:
             ssh.commands.append(cmd)
-            return _ssh_result(exit_status=exit_status, stderr="stale vloopback mountpoint")
+            return _ssh_result(stdout="false\n")
         return answer(cmd, *args, **kwargs)
 
     ssh.run.side_effect = _side
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("restore_start_exit", [0, 1])
-async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch, restore_start_exit):
+@pytest.mark.parametrize(
+    "start_error, running, renamed_back",
+    [
+        (None, True, True),  # up with sshd, no remount, then the pod name
+        ("Docker SDK start failed: 500 no such device", True, False),  # start failed: stays kept
+        (None, False, False),  # start returned but the entrypoint already exited: stays kept
+    ],
+)
+async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch, start_error, running, renamed_back):
     # the remount would hide its layer files, and the retry would then read it as mounted and remove it
     payload = _edit_payload()
     ssh = _ssh_recording()
     _report_unmounted(ssh)
-    _start_exits(ssh, restore_start_exit)
+    if not running:
+        _kept_not_running(ssh)
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    docker_client = svc.rental_docker_client_factory.client
+    docker_client.start = AsyncMock(side_effect=RuntimeError(start_error) if start_error else None)
+    monkeypatch.setattr(svc, "_encrypted_local_volume_name", AsyncMock(return_value="volume_x"))
+    monkeypatch.setattr(svc, "setup_encrypted_local_volume", AsyncMock())
     monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("port clash")))
     name = _pod_name(payload)
 
@@ -857,20 +868,27 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeyp
 
     assert isinstance(result, FailedContainerRequest)
     kept = _docker(ssh.commands, "rename")[0].split()[3]
-    svc._bring_up_existing_container.assert_not_awaited()
-    if restore_start_exit == 0:
-        # started under its kept name, and given the pod name only once it runs
-        assert ssh.commands[-2:] == [f"/usr/bin/docker start {kept}", f"/usr/bin/docker rename {kept} {name}"]
+    # the real bring-up, under the kept name: start, sshd, never the remount
+    assert docker_client.start.await_args.kwargs["container_name"] == kept
+    svc._encrypted_local_volume_name.assert_not_awaited()
+    svc.setup_encrypted_local_volume.assert_not_awaited()
+    sshd = svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker
+    if start_error:
+        sshd.assert_not_awaited()
+    else:
+        assert sshd.await_args.kwargs["container_name"] == kept
+    if renamed_back:
+        assert ssh.commands[-2:] == [f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {kept}", f"/usr/bin/docker rename {kept} {name}"]
         return
-    # the start failed: it stays stopped under its kept name, and the next (successful) edit keeps it
-    assert ssh.commands[-1] == f"/usr/bin/docker start {kept}"
+    # not running: it stays stopped under its kept name, and the next (successful) edit keeps it
+    assert _docker(ssh.commands, "rename") == [_docker(ssh.commands, "rename")[0]]
     retry = _ssh_recording(container_present=False)
     retry.kept = [kept]
     _patch_happy(svc, monkeypatch, retry)
 
     assert isinstance(await _run(svc, payload), ContainerCreated)
     assert _docker(retry.commands, "rename") == []
-    assert _docker(retry.commands, "rm -fv id-") == []
+    assert _docker(retry.commands, "rm -fv") == []
 
 
 @pytest.mark.asyncio

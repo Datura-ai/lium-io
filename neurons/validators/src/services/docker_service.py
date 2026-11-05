@@ -1758,7 +1758,8 @@ class _EditSwap:
         # the pod's volume path: a bare `docker start` drops the gocryptfs plaintext mount and the
         # sshd, so the restore goes through the same steps as start_existing_container
         # (start, remount with allow_init=False, sshd bootstrap). None falls back to `docker start`.
-        self.bring_up: Callable[[str], Awaitable[None]] | None = None
+        # (container name, remount the encrypted volume)
+        self.bring_up: Callable[[str, bool], Awaitable[None]] | None = None
         # set once the reply went to the backend: from then on the edit stands, whatever ends the
         # steps after the reply (a delete's wait timing out cancels them)
         self.replacement_is_up = False
@@ -1962,7 +1963,7 @@ class _EditSwap:
 
         ``start=False``: the pod's GPUs are no longer on the node and its device request names the old
         cards, so it cannot start; the container gets its name back, stopped. A kept one (``keep_parked``)
-        is started without the remount and takes the pod name only once it runs."""
+        is brought up the same way minus the remount, and takes the pod name only once it is seen running."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
         q_replacement = shlex.quote(self.replacement_id) if self.replacement_id else q_name
         await self._run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
@@ -1970,10 +1971,20 @@ class _EditSwap:
         if self.keep_parked and start:
             # a kept one comes back as dockerd had it, unmounted (the remount would hide its files), and keeps
             # its kept name until it runs: stopped under the pod name, the next edit could not read it and would remove it
-            started = await self._run(f"/usr/bin/docker start {q_parked}")
-            renamed = started if started.exit_status != 0 else await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")
-            if renamed.exit_status != 0:
-                error = f"docker {'start' if renamed is started else 'rename'}: {(renamed.stderr or '').strip()}"
+            try:
+                if self.bring_up is not None:
+                    async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
+                        await self.bring_up(self.parked_name, False)
+                elif (started := await self._run(f"/usr/bin/docker start {q_parked}")).exit_status != 0:
+                    raise RuntimeError(f"docker start: {(started.stderr or '').strip()}")
+                # a start can return 0 while the entrypoint has already exited
+                running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {q_parked}")
+                if running.exit_status != 0 or (running.stdout or "").strip() != "true":
+                    raise RuntimeError("started, but it is not running")
+                if (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
+                    raise RuntimeError(f"docker rename: {(renamed.stderr or '').strip()}")
+            except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
+                error = f"{type(exc).__name__}: {exc}"
         elif not self.keep_parked and (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
             error = f"docker rename: {(renamed.stderr or '').strip()}"
         elif not start:
@@ -1988,7 +1999,7 @@ class _EditSwap:
         elif self.bring_up is not None:
             try:
                 async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
-                    await self.bring_up(self.container_name)
+                    await self.bring_up(self.container_name, True)
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
         else:
@@ -9855,13 +9866,14 @@ class DockerService:
                     # the sweep below must not treat the parked name as stale. A failed edit brings
                     # the parked container back the way start_container does (remount, sshd), at the
                     # pod's volume path.
-                    edit_swap.bring_up = lambda name: self._bring_up_existing_container(
+                    edit_swap.bring_up = lambda name, remount: self._bring_up_existing_container(
                         docker_client=docker_client,
                         ssh_client=ssh_client,
                         container_name=name,
                         local_volume_path=local_volume_path,
                         pod_id=payload.pod_id,
                         default_extra=default_extra,
+                        remount=remount,
                     )
                     current_step = "park_current_container"
                     # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
@@ -11666,6 +11678,7 @@ class DockerService:
         local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
+        remount: bool = True,
     ) -> None:
         """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
         holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
@@ -11699,6 +11712,7 @@ class DockerService:
             local_volume_path=local_volume_path,
             pod_id=pod_id,
             default_extra=default_extra,
+            remount=remount,
         )
 
     async def _restore_mount_and_sshd_after_start(
@@ -11710,11 +11724,13 @@ class DockerService:
         local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
+        remount: bool = True,
     ) -> None:
         """What a bare ``docker start`` drops: the gocryptfs plaintext mount (remounted with
         ``allow_init=False`` — an existing volume is never re-initialised) and the sshd. Shared by
-        ``start_existing_container`` and the undo of a failed edit."""
-        encrypted_volume_name = await self._encrypted_local_volume_name(
+        ``start_existing_container`` and the undo of a failed edit. ``remount=False`` (a kept container that
+        ran unmounted, its files in its own layer) skips the remount, which would hide them."""
+        encrypted_volume_name = remount and await self._encrypted_local_volume_name(
             docker_client,
             container_name,
         )
