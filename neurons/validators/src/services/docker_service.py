@@ -5668,6 +5668,8 @@ class DockerService:
         `volume rm` (prod 4 Nov, 8x B300 Engy and Dolphin): the cache's files are then unlinked on the host
         (_wipe_volume_cmd), only while every container mounting it is one of ``killed_fillers``; the empty volume
         is swept later, and a filler asking for it again is charged the whole download (_cache_missing_gb).
+        Such a filler's own run volume (volume_<id>, preallocated) is worth nothing and goes first, under the same
+        rule: its files are unlinked and fstrim gives the backing file's blocks back to the host (DAH-5798).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -5677,7 +5679,8 @@ class DockerService:
             cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
                 ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES, host_probe=host_probe
             )
-            if not cache_volumes:
+            killed: tuple[str, ...] = tuple(killed_fillers)
+            if not cache_volumes and not killed:
                 return False
 
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
@@ -5704,11 +5707,41 @@ class DockerService:
                     CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
                 )
 
+            # a trimmed run volume still counts its declared size among the pod volumes (fit.existing_gb) while
+            # its disk is back in df: without this the rental would be counted on that disk twice
+            trimmed_gb: float = 0
+
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb >= rental_needs_free_gb
+                return free_now_gb >= rental_needs_free_gb + trimmed_gb
 
-            killed: tuple[str, ...] = tuple(killed_fillers)
+            for filler in killed:
+                if await rental_fits():
+                    break
+                run_volume = f"volume_{filler.removeprefix(FILLER_CONTAINER_PREFIX)}"
+                try:
+                    declared_gb = await self._inspect_vloopback_volumes_bytes(ssh_client, [run_volume]) / (1024**3)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue  # no such volume, or not a vloopback one
+                if not declared_gb:
+                    continue
+                try:
+                    trimmed = await asyncio.wait_for(
+                        ssh_client.run(f'( {_wipe_volume_cmd(run_volume, *killed)} && fstrim "/proc/1/root$p" && echo trimmed )'),
+                        CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue  # best-effort, as the cache removals
+                if "trimmed" in (trimmed.stdout or "") and fit.fresh_sizing:
+                    trimmed_gb += declared_gb
+            # shortcut: resolve_volume_sizing still counts a trimmed run volume in its pool until the filler's delete
+            # removes it (seconds later), so a split node's slice can read up to share x its size high; exclude killed
+            # fillers' volumes there if that shows in prod.
+            fit = fit._replace(existing_gb=fit.existing_gb - trimmed_gb)
 
             def volume_remove(name: str) -> str:
                 if not killed:
@@ -5721,14 +5754,15 @@ class DockerService:
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
             removal_failed = False
             try:
-                await evict_cache_volumes_oldest_first(
-                    ssh_client,
-                    cache_volumes,
-                    remove,
-                    rental_fits,
-                    evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
-                    volume_remove=volume_remove,
-                )
+                if cache_volumes:
+                    await evict_cache_volumes_oldest_first(
+                        ssh_client,
+                        cache_volumes,
+                        remove,
+                        rental_fits,
+                        evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
+                        volume_remove=volume_remove,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
