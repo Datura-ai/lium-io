@@ -73,11 +73,40 @@ async def test_files_outside_the_pods_uid_map_warn_but_pass(context_factory, tmp
 @pytest.mark.asyncio
 async def test_runc_pods_and_matching_owners_are_ok(context_factory, tmp_path):
     me = os.getuid()
-    _proc(tmp_path, 4242, "         0          0 4294967295\n")  # no user namespace: never judged
+    _proc(
+        tmp_path, 4242, "         0          0 4294967295\n"
+    )  # no user namespace: nothing can be outside it
     _proc(tmp_path, 4343, f"         0     {me}      65536\n")
     result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh(str(tmp_path))))
     assert result.event.reason_code == Msg.OK.reason
-    assert [p["container"] for p in result.event.what_we_saw["pods"]] == ["pod_2"]
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"]["uid_map_base"] == 0 and pods["pod_1"]["outside_namespace"] == []
+    assert "unread" not in result.event.what_we_saw
+
+
+@pytest.mark.asyncio
+async def test_a_pod_not_read_back_is_unread_not_ok(context_factory, tmp_path):
+    # pod_2 restarted between docker inspect and the /proc read: its pid is gone
+    _proc(tmp_path, 4242, f"         0     {os.getuid()}      65536\n")
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh(str(tmp_path))))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UNREAD.reason
+    assert result.event.what_we_saw["unread"] == ["pod_2"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_ssh_output_is_unread_and_does_not_raise(context_factory):
+    async def run(cmd, check=False):
+        if cmd.startswith("/usr/bin/docker inspect"):
+            return SimpleNamespace(exit_status=0, stdout="/pod_1 4242\n/pod_2 ²\n", stderr="")
+        return SimpleNamespace(
+            exit_status=0, stdout="x|0 100000 65536|0|0\n4242|0 ² 65536|1|1\n", stderr=""
+        )
+
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, SimpleNamespace(run=run)))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UNREAD.reason
+    assert result.event.what_we_saw["unread"] == ["pod_1"]
 
 
 def test_read_command_reports_a_missing_pid_without_failing(tmp_path):

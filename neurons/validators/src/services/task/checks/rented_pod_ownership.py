@@ -23,22 +23,30 @@ def read_command(pids: list[int], proc: str = "/proc") -> str:
     )
 
 
+def _num(text: str) -> int | None:
+    # the provider controls the SSH endpoint: accept only plain ASCII digits ("²".isdigit() is True, int() fails)
+    text = text.strip()
+    return int(text) if text.isascii() and text.isdigit() else None
+
+
 def judge(line: str) -> dict | None:
-    """The pod's user namespace and the host owners of its / and /root; None when unreadable or not
-    in a user namespace (a runc pod maps 0 to the host's 0, so nothing can be outside it)."""
+    """The pod's user namespace and the host owners of its / and /root; None when the line is unreadable.
+    A runc pod (0 maps to the host's 0) has nothing outside its namespace."""
     pid, uid_map, root_uid, home_uid = (line.split("|") + ["", "", ""])[:4]
-    fields = uid_map.split()
-    if len(fields) != 3 or fields[0] != "0" or not all(f.isdigit() for f in fields):
+    pid_num, fields = _num(pid), [_num(f) for f in uid_map.split()]
+    if pid_num is None or len(fields) != 3 or fields[0] != 0 or None in fields:
         return None
-    base, length = int(fields[1]), int(fields[2])
-    if base == 0 or not root_uid.isdigit():
+    base, length = fields[1], fields[2]
+    if base == 0:
+        return {"pid": pid_num, "uid_map_base": 0, "host_owners": {}, "outside_namespace": []}
+    if _num(root_uid) is None:
         return None
-    owners = {"/": int(root_uid)}
-    if home_uid.isdigit():
-        owners["/root"] = int(home_uid)
+    owners = {"/": _num(root_uid)}
+    if _num(home_uid) is not None:
+        owners["/root"] = _num(home_uid)
     shifted = sorted(path for path, uid in owners.items() if not base <= uid < base + length)
     return {
-        "pid": int(pid),
+        "pid": pid_num,
         "uid_map_base": base,
         "host_owners": owners,
         "outside_namespace": shifted,
@@ -81,8 +89,8 @@ class RentedPodOwnershipCheck:
             # docker inspect exits 1 on a missing name but still prints the others
             for line in (res.stdout or "").splitlines():
                 name, _, pid = line.partition(" ")
-                if pid.strip().isdigit() and int(pid) > 0:
-                    pid_by_name[name.lstrip("/")] = int(pid)
+                if (_num(pid) or 0) > 0:
+                    pid_by_name[name.lstrip("/")] = _num(pid)
             if not pid_by_name:
                 return self._event(
                     ctx, Msg.UNREAD, {"reason": "no running rented container", "pods": names}
@@ -94,13 +102,24 @@ class RentedPodOwnershipCheck:
         except (asyncssh.Error, OSError, TimeoutError) as exc:
             return self._event(ctx, Msg.UNREAD, {"reason": "ssh error", "error": repr(exc)})
         name_by_pid = {pid: name for name, pid in pid_by_name.items()}
-        pods = []
+        pods = {}
         for line in (res.stdout or "").splitlines():
             pod = judge(line)
             if pod and pod["pid"] in name_by_pid:
-                pods.append({"container": name_by_pid[pod["pid"]], **pod})
-        template = Msg.SHIFTED if any(p["outside_namespace"] for p in pods) else Msg.OK
-        return self._event(ctx, template, {"pods": pods})
+                pods[pod["pid"]] = {"container": name_by_pid[pod["pid"]], **pod}
+        # a pod not read back (restarted between inspect and the read, or a garbled line) is unknown, not healthy
+        unread = sorted(name for pid, name in name_by_pid.items() if pid not in pods)
+        what = {"pods": list(pods.values())}
+        if any(p["outside_namespace"] for p in pods.values()):
+            template = Msg.SHIFTED
+        elif unread:
+            template = Msg.UNREAD
+            what.update(reason="pod not read back", unread=unread, exit_status=res.exit_status)
+        else:
+            template = Msg.OK
+        if unread:
+            what["unread"] = unread
+        return self._event(ctx, template, what)
 
     def _event(self, ctx: Context, template, what: dict) -> CheckResult:
         what = {"executor_uuid": ctx.executor.uuid, **what}
