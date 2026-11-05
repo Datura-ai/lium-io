@@ -495,6 +495,7 @@ class ComputeClient:
                             pod_ssh=data.get("pod_ssh"),
                             ssh_host_key=data.get("ssh_host_key"),
                             container_start_ok=data.get("container_start_ok"),
+                            container_start_skipped=data.get("container_start_skipped"),
                         )
 
                         async with self.lock:

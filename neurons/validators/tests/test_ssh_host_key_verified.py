@@ -93,3 +93,22 @@ async def test_container_start_ok_only_on_a_cycle_whose_rental_probe_passed() ->
     """DAH-5672: a failed-start pause lifts only on a report whose probe started its container."""
     assert (await _run(None)).container_start_ok is False
     assert (await _run(None, "RENTAL_PROBE_OK")).container_start_ok is True
+
+
+def test_container_start_skipped_names_why_no_test_container_started() -> None:
+    """DAH-5672 review: a skipped probe sends False too, so the backend needs the reason to show the provider."""
+    from services.task.messages import RentalProbeMessages as Msg
+    from services.task.service import container_start_skipped
+
+    def event(template, what):
+        return build_msg(
+            event=template.event, reason=template.reason, severity="info", impact="none", what=what
+        )
+
+    assert container_start_skipped([event(Msg.PROBE_OK, {})]) is None
+    assert container_start_skipped([]) is None
+    image = event(Msg.SKIPPED, {"reason": "default renter image is not pulled on the node"})
+    assert container_start_skipped([image]) == "default renter image is not pulled on the node"
+    carried = event(Msg.PROBE_FAILED, {"no_verdict_this_cycle": "skipped: rented"})
+    assert container_start_skipped([carried]) == "skipped: rented"
+    assert container_start_skipped([event(Msg.PROBE_FAILED, {"failed_step": "container_start"})]) is None

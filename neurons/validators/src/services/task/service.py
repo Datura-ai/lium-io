@@ -253,6 +253,7 @@ class TaskService:
                 result.container_start_ok = any(
                     event.reason_code == RentalProbeMessages.PROBE_OK.reason for event in events
                 )
+                result.container_start_skipped = container_start_skipped(events)
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
                 # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
@@ -344,3 +345,18 @@ class TaskService:
 
 
 TaskServiceDep = Annotated[TaskService, Depends(TaskService)]
+
+
+def container_start_skipped(events: list) -> str | None:
+    """DAH-5672 review: why this cycle's rental probe started no test container (skipped, inconclusive or a
+    standing failure carried without a verdict), so the backend can show the provider why the pause stays."""
+    for event in events:
+        what = event.what_we_saw or {}
+        if event.reason_code in (
+            RentalProbeMessages.SKIPPED.reason,
+            RentalProbeMessages.INCONCLUSIVE.reason,
+        ):
+            return str(what.get("reason") or "") or None
+        if event.reason_code == RentalProbeMessages.PROBE_FAILED.reason and what.get("no_verdict_this_cycle"):
+            return str(what["no_verdict_this_cycle"])
+    return None

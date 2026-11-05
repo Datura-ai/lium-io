@@ -238,6 +238,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # DAH-5672: True when this cycle's rental probe started its container on the node and it passed;
     # False on every other cycle. None from a validator that predates the field.
     container_start_ok: bool | None = None
+    # why this cycle's rental probe started no container; None when it ran or the validator predates it
+    container_start_skipped: str | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

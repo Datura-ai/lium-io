@@ -99,6 +99,8 @@ class JobResult(BaseModel):
     ssh_host_key_verified: bool = False
     # DAH-5672: this cycle's rental probe started its container and passed (RENTAL_PROBE_OK)
     container_start_ok: bool = False
+    # why this cycle's probe started no container (e.g. the default renter image is not pulled); None when it ran
+    container_start_skipped: str | None = None
 
     inspector_outcome: str = "SKIPPED"
 
