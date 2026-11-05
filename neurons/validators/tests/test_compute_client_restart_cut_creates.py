@@ -844,6 +844,20 @@ async def test_a_restart_keeps_a_create_lock_held_by_another_create(holder: str)
     assert not await redis_service.executor_create_lock("exec-1").acquire(blocking=False)
 
 
+@pytest.mark.asyncio
+async def test_a_create_outliving_its_lock_ttl_cannot_release_the_re_sends_lock() -> None:
+    redis_service = _fakeredis_service()
+    key = "lock:executor-create:exec-1"
+    assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    slow_token = await redis_service.redis.get(key)
+    await redis_service.redis.delete(key)  # the TTL lapsed mid-create
+
+    assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+
+    # Lock.release deletes only its own token, so the slow create's late release leaves the re-send's lock
+    assert await redis_service.redis.get(key) != slow_token
+
+
 class _PipelineOnADownRedis:
     async def __aenter__(self):
         return self

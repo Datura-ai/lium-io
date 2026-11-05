@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, NamedTuple
 
@@ -156,9 +157,9 @@ def _executor_create_lock_key(executor_id: str) -> str:
     return f"lock:executor-create:{executor_id}"
 
 
-def _renter_create_lock_token(pod_id: str) -> str:
+def _renter_create_lock_token_prefix(pod_id: str) -> str:
     # names the create holding the lock, so a restarted connector can release exactly its cut-off creates' locks
-    return f"create:{pod_id}"
+    return f"create:{pod_id}:"
 
 # DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
 # meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
@@ -364,7 +365,8 @@ class RedisService:
         lock = self.executor_create_lock(executor_id)
         held = False
         try:
-            held = bool(await lock.acquire(token=_renter_create_lock_token(pod_id)))
+            # unique per acquisition: a create outliving the TTL must not release a later re-send's lock of the same pod
+            held = bool(await lock.acquire(token=f"{_renter_create_lock_token_prefix(pod_id)}{uuid.uuid4().hex}"))
             if not held:
                 logger.warning(
                     _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
@@ -401,7 +403,7 @@ class RedisService:
         try:
             async with self.redis.pipeline(transaction=True) as pipe:
                 await pipe.watch(key)
-                if await pipe.get(key) != _renter_create_lock_token(pod_id).encode():
+                if not (await pipe.get(key) or b"").startswith(_renter_create_lock_token_prefix(pod_id).encode()):
                     return
                 pipe.multi()
                 pipe.delete(key)
