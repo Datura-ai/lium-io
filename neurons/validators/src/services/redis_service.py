@@ -29,6 +29,10 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
+# epoch seconds of the node's latest create (add_pending_pod); outlives VERIFYX_COMMAND_TIMEOUT_SECONDS (600) so a
+# VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
+CREATE_STARTED_AT_PREFIX = "create_started_at"
+CREATE_STARTED_AT_TTL_SECONDS = 900
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
 GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
@@ -63,6 +67,19 @@ SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
 SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
+
+
+def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
+    return f"{CREATE_STARTED_AT_PREFIX}:{miner_hotkey}:{executor_id}"
+
+
+# VerifyX runs the validator cut off and could not clean up: hash of run_dir -> epoch, reaped before the next run
+VERIFYX_STALE_RUNS_PREFIX = "verifyx_stale_runs"
+VERIFYX_STALE_RUNS_TTL_SECONDS = 7 * 24 * 3600
+
+
+def verifyx_stale_runs_key(miner_hotkey: str, executor_uuid: str) -> str:
+    return f"{VERIFYX_STALE_RUNS_PREFIX}:{miner_hotkey}:{executor_uuid}"
 
 
 def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
@@ -793,6 +810,7 @@ class RedisService:
         pod_id: str,
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
+        synthetic_probe: bool = False,
     ):
         # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
@@ -805,7 +823,14 @@ class RedisService:
         if gpu_uuids:
             item["gpu_uuids"] = list(gpu_uuids)
         pending_pods.append(item)
-        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        # one step: a marker written without its stamp would abort the caller before its cleanup and leave the marker behind
+        writes = RedisWrites().hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        if not synthetic_probe:
+            # the validator's own rental probe keeps its marker but leaves no stamp: once done it is no rental
+            writes = writes.set(
+                create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
+            )
+        await self.write_atomically(writes)
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str, kind: str | None = None):
         """Every pending mark of the pod, or only its marks of `kind` when given."""
