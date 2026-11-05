@@ -1,15 +1,15 @@
 {
   "schema": "lium.release/1",
   "version": "0.1.0",
-  "build_sha": "3b66b4f94aec",
+  "build_sha": "c85e86b4a4aa",
   "target": "aarch64-unknown-linux-gnu",
-  "key_id": "ed25519:04d614eaf59dbbb8",
-  "built_at": 1793779962,
+  "key_id": null,
+  "built_at": 1793868041,
   "artifacts": [
     {
       "name": "liumd",
-      "sha256": "7a5450395d4c5e1102053db565e056407423243c0f16ac22657b5f0d1dcf3aee",
-      "size": 38409096
+      "sha256": "8d1adbc1b440f52c02dc658d040de154e63b49b8a25e1d872df7b1b2003a0afa",
+      "size": 9048968
     }
   ]
 }
