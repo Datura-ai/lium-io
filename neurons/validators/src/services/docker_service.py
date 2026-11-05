@@ -2520,6 +2520,8 @@ _STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC = 5
 # check clears a leftover mark on a pod it sees running)
 _STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC = 30
 _STOPPED_BY_RECOVERY_CLEAR_RETRY_MAX_SEC = 300
+# a failed stop mark's first retry comes at once: until it lands, a validator restart loses the attribution
+_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC = 1
 # pod_id -> its pending retry, cancelled by the pod's next mark write so it never deletes a later recovery's mark
 _RECOVERY_MARK_CLEANUPS: dict[str, asyncio.Task] = {}
 # pods this process parked as <name>__stopped because the stop's mark could not be written: the trusted half of
@@ -2538,12 +2540,12 @@ def _cancel_recovery_mark_cleanup(pod_id: str) -> None:
 
 
 def _retry_recovery_mark_in_background(
-    pod_id: str, attempt: Callable[[], Awaitable[bool]], failed_event: str
+    pod_id: str, attempt: Callable[[], Awaitable[bool]], failed_event: str, first_delay: float | None = None
 ) -> None:
     """Retry a mark write or delete until it lands, backing off to the cap; replaces the pod's pending retry."""
 
     async def retry() -> None:
-        delay = _STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC
+        delay = _STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC if first_delay is None else first_delay
         while True:
             await asyncio.sleep(delay)
             if await attempt():
@@ -12241,7 +12243,15 @@ class DockerService:
             except Exception:
                 return False
 
-        _retry_recovery_mark_in_background(pod_id, write, "POD_RECOVERY_MARK_WRITE_FAILED")
+        _retry_recovery_mark_in_background(
+            pod_id, write, "POD_RECOVERY_MARK_WRITE_FAILED", first_delay=_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC
+        )
+
+    async def forget_recovery_stop(self, pod_id: str) -> None:
+        """Drop this process's pending mark retry and park record of a pod seen running again or gone: either,
+        left behind, would attribute a later provider stop to the recovery (lio#1827 review)."""
+        _cancel_recovery_mark_cleanup(pod_id)
+        _UNMARKED_RECOVERY_STOPS.discard(pod_id)
 
     async def unmounted_stop_outcome(self, pod_id: str) -> str | None:
         """Pop the outcome of this pod's last unmounted-pod stop: "stopped", "failed" (docker refused) or "unknown"."""

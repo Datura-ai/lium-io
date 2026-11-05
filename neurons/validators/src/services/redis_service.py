@@ -825,8 +825,9 @@ class RedisService:
         pending_pods.append(item)
         # one step: a marker written without its stamp would abort the caller before its cleanup and leave the marker behind
         writes = RedisWrites().hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
-        if not synthetic_probe:
-            # the validator's own rental probe keeps its marker but leaves no stamp: once done it is no rental
+        if kind is None and not synthetic_probe:
+            # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
+            # keep their marker but leave no stamp, since neither is a rental being created
             writes = writes.set(
                 create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
             )

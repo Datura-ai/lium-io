@@ -8605,7 +8605,7 @@ async def test_a_failed_stop_mark_is_written_in_the_background_once_redis_is_bac
         marks[key] = value
 
     docker_service.redis_service.set = AsyncMock(side_effect=set_mark)
-    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC", 0)
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC", 0)
     monkeypatch.setattr(docker_service, "_park_by_id", AsyncMock(return_value=True))
     monkeypatch.setattr(docker_service, "_stop_outcome", AsyncMock(return_value="stopped"))
 
@@ -8614,6 +8614,34 @@ async def test_a_failed_stop_mark_is_written_in_the_background_once_redis_is_bac
     await asyncio.gather(*docker_service_module._RECOVERY_MARK_CLEANUPS.values())
     assert marks == {"stopped_by_recovery:pod-1": "stopped"}
     docker_service_module._UNMARKED_RECOVERY_STOPS.discard("pod-1")
+    docker_service_module._UNMOUNTED_STOP_OUTCOMES.pop("pod-1", None)
+
+
+@pytest.mark.asyncio
+async def test_a_pod_seen_running_drops_a_pending_stop_mark_write(docker_service, monkeypatch):
+    # lio#1827 review: a stop mark landing after the provider restored the pod would excuse a later provider stop
+    marks: dict[str, str] = {}
+    redis_up = False
+
+    async def set_mark(key, value, ex=None):
+        if not redis_up:
+            raise ConnectionError("Redis down")
+        marks[key] = value
+
+    docker_service.redis_service.set = AsyncMock(side_effect=set_mark)
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC", 0.05)
+    monkeypatch.setattr(docker_service, "_park_by_id", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_stop_outcome", AsyncMock(return_value="stopped"))
+    assert await docker_service._mark_and_stop_unmounted_pod(AsyncMock(), "pod_pod-1", "pod-1") is True
+    task = docker_service_module._RECOVERY_MARK_CLEANUPS["pod-1"]
+
+    await docker_service.forget_recovery_stop("pod-1")
+    redis_up = True
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert marks == {}
+    assert "pod-1" not in docker_service_module._UNMARKED_RECOVERY_STOPS
     docker_service_module._UNMOUNTED_STOP_OUTCOMES.pop("pod-1", None)
 
 

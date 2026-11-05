@@ -12,7 +12,7 @@ from typing import Any, NamedTuple
 import asyncssh
 from pydantic import BaseModel
 
-from core.docker_utils import DockerCommand, collect_container_death_diagnostics
+from core.docker_utils import ContainerDeathDiagnostics, DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import (
@@ -272,7 +272,12 @@ class TenantEnforcementCheck:
                         # docker refused the stop: the pod still runs without its mount, taking the renter's writes
                         # unencrypted onto the host disk, so the host fails the check (lio#1827 review)
                         extra.setdefault("pods_stop_refused", []).append(pod_id)
-                        diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
+                        # bounded: a stalled read must not let the task deadline cancel this failure unpublished
+                        diagnostics = await _collect_pod_diagnostics(
+                            ctx.ssh,
+                            pod_container_name,
+                            timeout=max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS),
+                        )
                         state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
                         return with_pod_states(
                             self._pod_not_running_failure(ctx, pod_container_name, pod_id, diagnostics, extra)
@@ -1003,8 +1008,12 @@ async def _clear_leftover_recovery_mark(
 
     async def clear() -> bool:
         nonlocal absence_confirmed
-        if not container_gone and await ctx.services.redis.get(key) is None:
-            return False
+        if not container_gone:
+            # running again: a pending retry of a stop mark that never landed, or the park record, is stale and would
+            # attribute a later provider stop to the recovery, even with no mark in Redis (lio#1827 review)
+            await ctx.services.pod_recovery.forget_recovery_stop(pod_id)
+            if await ctx.services.redis.get(key) is None:
+                return False
         # under the create lock every mark write and its stop run under: never between a recovery's mark and its stop
         async with _no_create_in_flight(ctx, pod_id, pod_status) as clear_to_delete:
             if not clear_to_delete:
@@ -1022,6 +1031,7 @@ async def _clear_leftover_recovery_mark(
                 if not absent(await inspect(f"{container_name}{suffix}")):
                     return False
             absence_confirmed = True
+            await ctx.services.pod_recovery.forget_recovery_stop(pod_id)
             with contextlib.suppress(Exception):
                 await ctx.services.redis.delete(key)
             return True
@@ -1339,7 +1349,7 @@ def _penalty_evidence_from_diagnostics(diagnostics: dict[str, object]) -> dict[s
 
 
 async def _collect_pod_diagnostics(
-    ssh_client: asyncssh.SSHClientConnection, container_name: str
+    ssh_client: asyncssh.SSHClientConnection, container_name: str, timeout: float | None = None
 ) -> dict[str, object]:
     """Diagnostics for a pod the ps-running check reported as down (run-time death).
 
@@ -1347,5 +1357,12 @@ async def _collect_pod_diagnostics(
     failure path in docker_service (DAH-2395 / DAH-2193), so container deaths at
     create time and run time are queryable together.
     """
-    diagnostics = await collect_container_death_diagnostics(ssh_client, container_name)
+    # a caller that must still publish its result passes a timeout; the fields read before it are kept
+    diagnostics = ContainerDeathDiagnostics()
+    try:
+        await asyncio.wait_for(
+            collect_container_death_diagnostics(ssh_client, container_name, diagnostics), timeout=timeout
+        )
+    except TimeoutError:
+        diagnostics.capture_error = "diagnostics timed out"
     return diagnostics.to_log_fields()

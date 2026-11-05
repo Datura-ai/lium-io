@@ -605,6 +605,19 @@ async def test_collect_pod_diagnostics_never_raises_on_ssh_failure():
 
 
 @pytest.mark.asyncio
+async def test_collect_pod_diagnostics_is_bounded_by_its_timeout():
+    # lio#1827 review: a stalled docker read must not hold the stop-refused failure past the task deadline
+    async def hang(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    ssh = Mock(run=hang)
+
+    diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc", timeout=0.01)
+
+    assert diagnostics["diagnostics_capture_error"] == "diagnostics timed out"
+
+
+@pytest.mark.asyncio
 async def test_collect_pod_diagnostics_includes_host_context_when_available():
     state = {
         "Status": "exited",
@@ -1330,6 +1343,21 @@ async def test_tenant_enforcement_defers_only_a_confirmed_stop_of_an_unmounted_p
     else:
         assert result.passed, result.event
         assert _pod_states(result)["pod-1"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_forgets_a_pending_recovery_stop_of_a_running_pod(context_factory):
+    # lio#1827 review: with no mark in Redis yet, a pending stop-mark retry of a pod running again is still dropped
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    redis = _recovery_redis(lock, {})
+
+    assert (await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, redis=redis))).passed
+
+    docker.forget_recovery_stop.assert_awaited_once_with("pod-1")
+    lock.acquire.assert_not_awaited()
 
 
 def _recovery_redis(lock, marks: dict[str, str]) -> Mock:
