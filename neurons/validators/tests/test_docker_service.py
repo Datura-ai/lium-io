@@ -8675,6 +8675,86 @@ async def test_an_unmarked_park_survives_a_validator_restart_while_redis_is_down
 
 
 @pytest.mark.asyncio
+async def test_an_unmarked_stop_needs_its_db_record_before_the_park(docker_service, monkeypatch, unmarked_recovery_stop_db):
+    # lio#1827 review 4484261770 (F-31): Redis and the validator DB both down -> no park, no stop: a stop no restart
+    # could attribute would fail the host
+    docker_service.redis_service.set = AsyncMock(side_effect=ConnectionError("Redis down"))
+    monkeypatch.setattr(unmarked_recovery_stop_db, "add", AsyncMock(side_effect=ConnectionError("DB down")))
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    park = AsyncMock(return_value=True)
+    stop = AsyncMock(return_value="stopped")
+    monkeypatch.setattr(docker_service, "_park_by_id", park)
+    monkeypatch.setattr(docker_service, "_stop_outcome", stop)
+
+    assert await docker_service._mark_and_stop_unmounted_pod(AsyncMock(), "pod_pod-1", "pod-1") is False
+
+    park.assert_not_awaited()
+    stop.assert_not_awaited()
+    assert await docker_service.unmounted_stop_outcome("pod-1") == "unknown"
+    assert "pod-1" not in docker_service_module._RECOVERY_MARK_CLEANUPS
+
+
+@pytest.mark.asyncio
+async def test_a_failed_record_delete_stays_pending_until_it_lands(docker_service, monkeypatch, unmarked_recovery_stop_db):
+    # lio#1827 review 4484261750: the record leaves memory only with its DB row, so the next healthy check retries
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    assert await docker_service_module._record_unmarked_recovery_stop("pod-1")
+    remove = unmarked_recovery_stop_db.remove
+    monkeypatch.setattr(unmarked_recovery_stop_db, "remove", AsyncMock(side_effect=ConnectionError("DB down")))
+
+    await docker_service.forget_recovery_stop("pod-1")
+    assert await docker_service.recovery_stop_pending("pod-1")
+
+    monkeypatch.setattr(unmarked_recovery_stop_db, "remove", remove)
+    await docker_service.forget_recovery_stop("pod-1")
+    assert not await docker_service.recovery_stop_pending("pod-1")
+    assert unmarked_recovery_stop_db.pod_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_a_late_first_load_never_brings_back_a_dropped_record(docker_service, monkeypatch, unmarked_recovery_stop_db):
+    # lio#1827 review 4484261739: load A reads {pod-1} and stalls; load B lands, pod-1 is dropped; A's old read is
+    # then ignored
+    unmarked_recovery_stop_db.pod_ids = {"pod-1"}
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    read_once = unmarked_recovery_stop_db.all_pod_ids
+    a_read, a_may_return = asyncio.Event(), asyncio.Event()
+
+    async def stalled_read() -> set[str]:
+        snapshot = await read_once()
+        a_read.set()
+        await a_may_return.wait()
+        return snapshot
+
+    monkeypatch.setattr(unmarked_recovery_stop_db, "all_pod_ids", stalled_read)
+    load_a = asyncio.create_task(docker_service_module._load_unmarked_recovery_stops())
+    await a_read.wait()
+    monkeypatch.setattr(unmarked_recovery_stop_db, "all_pod_ids", read_once)
+    await docker_service_module._load_unmarked_recovery_stops()
+    await docker_service.forget_recovery_stop("pod-1")
+    a_may_return.set()
+    await load_a
+
+    assert not await docker_service.recovery_stop_pending("pod-1")
+
+    # the same when the drop lands before any load did
+    unmarked_recovery_stop_db.pod_ids = {"pod-2"}
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS_LOADED", False)
+    a_read.clear()
+    a_may_return.clear()
+    monkeypatch.setattr(unmarked_recovery_stop_db, "all_pod_ids", stalled_read)
+    load_a = asyncio.create_task(docker_service_module._load_unmarked_recovery_stops())
+    await a_read.wait()
+    monkeypatch.setattr(unmarked_recovery_stop_db, "all_pod_ids", AsyncMock(side_effect=ConnectionError("DB down")))
+    await docker_service_module._drop_unmarked_recovery_stop("pod-2")
+    a_may_return.set()
+    await load_a
+
+    assert "pod-2" not in docker_service_module._UNMARKED_RECOVERY_STOPS
+    assert unmarked_recovery_stop_db.pod_ids == set()
+
+
+@pytest.mark.asyncio
 async def test_forgetting_a_recovery_stop_waits_out_a_mark_write_under_way(docker_service, monkeypatch):
     # lio#1827 review (F-28): the cancelled retry is awaited, so a SET already sent ends before the caller's delete
     write_started, write_may_finish = asyncio.Event(), asyncio.Event()

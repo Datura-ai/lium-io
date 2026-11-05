@@ -898,8 +898,9 @@ _RECOVERY_DEADLINE_SEC = EXECUTOR_CREATE_LOCK_TIMEOUT - 120
 _RECOVERY_MARK_CLEAR_TIMEOUT_SEC = 5
 # the running-pod mount probe: the backend's path lookup (10 s) and the docker probe (30 s)
 _MOUNT_PROBE_SECONDS = 40
-# a restore cut by the deadline still marks, parks and stops the pod (5 s + three 30 s commands)
-_MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 100
+# a restore cut by the deadline still marks, records, parks and stops the pod: the 5 s mark, the 5 s DB record, three
+# 30 s commands and the record's 5 s drop after a park or stop that did not take
+_MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 105
 
 
 @contextlib.asynccontextmanager

@@ -176,11 +176,13 @@ class InMemoryUnmarkedRecoveryStops:
     async def all_pod_ids(self) -> set[str]:
         return set(self.pod_ids)
 
-    async def add(self, pod_id: str) -> None:
+    async def add(self, pod_id: str) -> bool:
         self.pod_ids.add(pod_id)
+        return True
 
-    async def remove(self, pod_id: str) -> None:
+    async def remove(self, pod_id: str) -> bool:
         self.pod_ids.discard(pod_id)
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -191,6 +193,7 @@ def unmarked_recovery_stop_db():
     store = InMemoryUnmarkedRecoveryStops()
     saved = docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED
     docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED = store, False
+    docker_service._UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.clear()
     yield store
     docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED = saved
 

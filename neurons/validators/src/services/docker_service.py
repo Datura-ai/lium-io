@@ -2531,6 +2531,8 @@ _RECOVERY_MARK_CLEANUPS: dict[str, asyncio.Task] = {}
 # the mark itself is still retried in the background until it lands.
 _UNMARKED_RECOVERY_STOPS: set[str] = set()
 _UNMARKED_RECOVERY_STOPS_LOADED = False
+# dropped while no load had landed yet: a load whose read predates the drop skips them
+_UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED: set[str] = set()
 _unmarked_recovery_stop_dao = UnmarkedRecoveryStopDao()
 # each DB read or write of that record; past it the in-process record stands alone
 _UNMARKED_RECOVERY_STOP_DB_TIMEOUT_SEC = 5
@@ -2553,6 +2555,7 @@ async def _cancel_recovery_mark_cleanup_and_wait(pod_id: str) -> None:
 
 
 async def _unmarked_recovery_stop_db(operation: Awaitable, pod_id: str):
+    """The operation's result (a write's True), or None when it failed or timed out."""
     try:
         return await asyncio.wait_for(operation, timeout=_UNMARKED_RECOVERY_STOP_DB_TIMEOUT_SEC)
     except asyncio.CancelledError:
@@ -2569,23 +2572,33 @@ async def _load_unmarked_recovery_stops() -> None:
     if _UNMARKED_RECOVERY_STOPS_LOADED:
         return
     stored = await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.all_pod_ids(), "")
-    if stored is not None:
-        _UNMARKED_RECOVERY_STOPS.update(stored)
+    # a read older than a load that already landed, or than a drop made since, must not bring a retired record back
+    if stored is not None and not _UNMARKED_RECOVERY_STOPS_LOADED:
+        _UNMARKED_RECOVERY_STOPS.update(stored - _UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED)
+        _UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.clear()
         _UNMARKED_RECOVERY_STOPS_LOADED = True
 
 
-async def _record_unmarked_recovery_stop(pod_id: str) -> None:
-    await _load_unmarked_recovery_stops()
+async def _record_unmarked_recovery_stop(pod_id: str) -> bool:
+    """True once the record is in the validator DB: only a durable record may attribute a park (F-31)."""
+    if not await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.add(pod_id), pod_id):
+        return False
+    _UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.discard(pod_id)
     _UNMARKED_RECOVERY_STOPS.add(pod_id)
-    await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.add(pod_id), pod_id)
+    return True
 
 
 async def _drop_unmarked_recovery_stop(pod_id: str) -> None:
-    await _load_unmarked_recovery_stops()
-    # unloaded, the DB may still hold it
-    if pod_id in _UNMARKED_RECOVERY_STOPS or not _UNMARKED_RECOVERY_STOPS_LOADED:
+    if pod_id not in _UNMARKED_RECOVERY_STOPS:
+        await _load_unmarked_recovery_stops()
+        # unloaded, the DB may still hold it
+        if _UNMARKED_RECOVERY_STOPS_LOADED and pod_id not in _UNMARKED_RECOVERY_STOPS:
+            return
+    # kept until the delete lands, so the pod stays pending and its next healthy check retries the delete
+    if await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.remove(pod_id), pod_id):
         _UNMARKED_RECOVERY_STOPS.discard(pod_id)
-        await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.remove(pod_id), pod_id)
+        if not _UNMARKED_RECOVERY_STOPS_LOADED:
+            _UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.add(pod_id)
 
 
 async def _unmarked_recovery_stop_known(pod_id: str) -> bool:
@@ -12459,9 +12472,20 @@ class DockerService:
             marked = False
         # parked under the recovery's own suffix, not an edit's __prev: without the mark, the name is what says we stopped it
         parked = f"{container_name}{RECOVERY_STOPPED_SUFFIX}"
-        if not marked and await self._park_by_id(ssh_client, container_name, parked):
-            container_name = parked
-            await _record_unmarked_recovery_stop(pod_id)
+        is_parked = False
+        if not marked:
+            # recorded in the validator DB before the park: with neither the mark nor that record, a validator restart
+            # would lose the attribution and the stop would fail the host, so the pod is left running for the next
+            # cycle (lio#1827 review F-31)
+            if not await _record_unmarked_recovery_stop(pod_id):
+                _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
+                logger.error(_m("POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD", extra=get_extra_info({"pod_id": pod_id})))
+                return False
+            is_parked = await self._park_by_id(ssh_client, container_name, parked)
+            if is_parked:
+                container_name = parked
+            else:
+                await _drop_unmarked_recovery_stop(pod_id)
         outcome = await self._stop_outcome(ssh_client, container_name)
         _UNMOUNTED_STOP_OUTCOMES[pod_id] = outcome
         if outcome == "failed":
@@ -12469,7 +12493,8 @@ class DockerService:
             # or excuse a later provider stop
             if marked:
                 await self._clear_stopped_by_recovery(pod_id)
-            await _drop_unmarked_recovery_stop(pod_id)
+            elif is_parked:
+                await _drop_unmarked_recovery_stop(pod_id)
         elif not marked:
             self._retry_stopped_mark_in_background(pod_id)
         return outcome == "stopped"
