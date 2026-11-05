@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -18,11 +19,14 @@ from services.verifyx_validation_service import (
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
 MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS = 10.0
+# what the checks after VerifyX (matmul, ports, DinD, cleanup) take on a slow node, 4 Nov prod
+COLD_RETRY_TAIL_RESERVE_SECONDS = 180
 _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 # A host can bring on a real Cloudflare 429 by flooding speed.cloudflare.com from its own IP just
@@ -128,6 +132,7 @@ class VerifyXCheck:
         # over SSH exactly as before.
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
+        first_started = time.monotonic()
         if local is not None and local.verifyx is not None:
             result = local.verifyx
             transport = "local_verify"
@@ -147,7 +152,19 @@ class VerifyXCheck:
         )
 
         cold_sample_retry: ColdSampleRetry | None = None
-        if _is_cold_sample_below_gate(ctx, result, prev_ema):
+        # The retry takes about as long as the first run; it must leave the rest of the task its
+        # time, or the task is cut off with no result at all (DAH-5781). shortcut: a local first
+        # answer counts as 0 s, while its retry runs over SSH; fine while local verify is fast.
+        first_run_s = time.monotonic() - first_started
+        retry_fits = task_seconds_left(ctx) - first_run_s >= COLD_RETRY_TAIL_RESERVE_SECONDS
+        if _is_cold_sample_below_gate(ctx, result, prev_ema) and not retry_fits:
+            logger.info(
+                _m(
+                    "VerifyX cold first sample not re-measured: no time left in the task",
+                    extra=get_extra_info({**ctx.default_extra, "first_run_s": round(first_run_s)}),
+                )
+            )
+        elif _is_cold_sample_below_gate(ctx, result, prev_ema):
             # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
             # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
             # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps

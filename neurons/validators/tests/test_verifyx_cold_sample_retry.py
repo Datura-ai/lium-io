@@ -102,6 +102,21 @@ async def test_failed_network_probe_on_first_sample_is_retried(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_no_retry_when_it_would_leave_the_rest_of_the_task_no_time(context_factory):
+    # 4 Nov prod: a 320 s first run on a new node, re-measured, cut the task off at 780 s.
+    service = _ProbeSequence(_probe(None), _probe(300.0))
+    ctx = _ctx(context_factory, service, _never_measured())
+    # 130 s left in the task
+    ctx = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert service.calls == 1
+    assert result.passed is False
+    assert "cold_sample_retry" not in result.event.what_we_saw
+
+
+@pytest.mark.asyncio
 async def test_a_worse_retry_keeps_the_first_sample(context_factory):
     service = _ProbeSequence(_probe(70.0), _probe(30.0))
 
