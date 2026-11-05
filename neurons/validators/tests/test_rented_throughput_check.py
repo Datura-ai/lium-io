@@ -286,6 +286,19 @@ async def test_two_slow_readings_zero_the_score_until_that_side_passes(answer, r
         assert (await check.run(ctx)).passed is True
 
 
+# a failure whose retry never ran (the node was unrented for hours) is not "in a row" with the next rental's first reading
+async def test_a_failure_from_hours_ago_starts_no_streak():
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_NET, SLOW_NET, SLOW_NET)
+        check = RentedThroughputCheck()
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW_ONCE.reason
+        clock.now += 5 * 3600
+        late = await check.run(ctx)
+        assert late.passed and late.event.reason_code == Msg.SLOW_ONCE.reason and len(runner.commands) == 2
+        clock.now += 31 * 60  # a retry on time still counts
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW.reason
+
+
 # the host NICs busy either way (inconclusive), or their counters unreadable (no verdict): no strike, the streak stays
 @pytest.mark.parametrize("busy", [BUSY_NET, BUSY_UPLOAD, NO_COUNTERS])
 async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
