@@ -4,7 +4,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Awaitable, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
 import asyncssh
 from pydantic import BaseModel, Field
@@ -28,6 +28,8 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
+
+logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class PodRecoverer(Protocol):
@@ -551,10 +553,39 @@ def _ended(events: list[ValidationEvent], ctx: Context) -> Tuple[bool, list[Vali
     return False, events, ctx.model_copy(update={"rented": False, "score": 0.0, "job_score": 0.0, "success": False})
 
 
+class SessionDroppedMidCheck(Exception):
+    """The run's open SSH session died under a check and did not survive one reconnect and rerun.
+
+    An executor container recreated under the validator (an image release its auto-updater pulls) closes every
+    open session at once; that says nothing about the node, so the run gets no verdict instead of a failure."""
+
+    def __init__(self, check_id: str, error: BaseException | None):
+        super().__init__(f"SSH session dropped during {check_id}: {error!r}")
+        self.check_id = check_id
+        self.error = error
+
+
+async def _session_dropped(ssh: asyncssh.SSHClientConnection) -> bool:
+    # asyncssh marks a lost connection closed one loop tick after the drop
+    await asyncio.sleep(0)
+    return ssh.is_closed() is True
+
+
+def _step_id(step: "Check | ParallelStage") -> str:
+    return step.checks[0].check_id if isinstance(step, ParallelStage) else step.check_id
+
+
 class Pipeline:
-    def __init__(self, checks: List[Check], sink: EventSink):
+    def __init__(
+        self,
+        checks: List[Check],
+        sink: EventSink,
+        reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
+    ):
+        """`reconnect` opens a fresh session to the same node; without it a dropped session ends the run as before."""
         self.checks = checks
         self.sink = sink
+        self.reconnect = reconnect
 
     async def _run_check(self, chk: Check, ctx: Context) -> _RanCheck:
         started = time.perf_counter()
@@ -615,6 +646,43 @@ class Pipeline:
             return await self._run_stage(step, ctx)
         return [await self._run_check(step, ctx)]
 
+    async def _attempt(self, step: Check | ParallelStage, ctx: Context) -> tuple[list[_RanCheck], BaseException | None]:
+        try:
+            return await self._run_step(step, ctx), None
+        except (asyncssh.Error, OSError) as exc:
+            return [], exc
+
+    async def _run_step_surviving_a_dropped_session(
+        self, step: Check | ParallelStage, ctx: Context
+    ) -> tuple[list[_RanCheck], Context]:
+        """Run the step; if the open session died under it, reconnect once and run the step again on the new one.
+
+        Whatever the step returned or raised, the session decides: still open, the step stands as it ran. Closed,
+        its result says nothing about the node. A failed reconnect or a second drop raises SessionDroppedMidCheck,
+        which the task reports as no verdict. A run that cannot connect at all never gets here."""
+        ran, error = await self._attempt(step, ctx)
+        if self.reconnect is None or not await _session_dropped(ctx.ssh):
+            if error is not None:
+                raise error
+            return ran, ctx
+        try:
+            fresh = await self.reconnect()
+        except (asyncssh.Error, OSError) as exc:
+            raise SessionDroppedMidCheck(_step_id(step), exc) from exc
+        logger.warning(
+            _m(
+                "SSH session dropped mid-check; reconnected, running the check again",
+                extra={**ctx.default_extra, "check_id": _step_id(step), "error": repr(error)[:300]},
+            )
+        )
+        ctx = ctx.model_copy(update={"ssh": fresh, "runner": SSHCommandRunner(fresh, max_retries=1)})
+        ran, error = await self._attempt(step, ctx)
+        if await _session_dropped(ctx.ssh):
+            raise SessionDroppedMidCheck(_step_id(step), error)
+        if error is not None:
+            raise error
+        return ran, ctx
+
     def _apply(self, current_ctx: Context, ran: _RanCheck, parallel: bool) -> Context:
         res = ran.result
         if not res.updates:
@@ -633,7 +701,7 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks = await self._run_step(step, current_ctx)
+            ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
             for ran in ran_checks:
                 ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
                 ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)

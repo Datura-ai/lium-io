@@ -32,7 +32,7 @@ from .availability import (
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
 from .models import JobResult, ValidationEvent, build_msg
-from .pipeline import PodRecoverer
+from .pipeline import PodRecoverer, SessionDroppedMidCheck
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
 
@@ -65,6 +65,24 @@ def _transport_unreachable_event(*, executor_uuid: str, error: BaseException) ->
         what={
             "executor_uuid": executor_uuid,
             "transport_error": repr(error)[:MAX_PEER_TEXT_LENGTH],
+        },
+    )
+
+
+def _session_dropped_event(*, executor_uuid: str, error: SessionDroppedMidCheck) -> ValidationEvent:
+    template = TenantEnforcementMessages.SESSION_DROPPED_MID_CHECK
+    return build_msg(
+        event=template.event,
+        reason=template.reason,
+        severity=template.severity,
+        category=template.category,
+        impact=template.impact,
+        remediation=template.remediation,
+        help_uri=template.help_uri or REASON_CODE_DOCS_URL,
+        check_id=error.check_id,
+        what={
+            "executor_uuid": executor_uuid,
+            "transport_error": repr(error.error)[:MAX_PEER_TEXT_LENGTH],
         },
     )
 
@@ -225,7 +243,12 @@ class TaskService:
                         checks = self.pipeline_factory.build_checks(fast_path=True)
                     else:
                         checks = self.pipeline_factory.build_checks()
-                pipeline = self.pipeline_factory.build_pipeline(checks)
+                async def reconnect() -> asyncssh.SSHClientConnection:
+                    # the dead connection is replaced on the shell, so leaving the block closes the new one
+                    await shell.connect_asyncssh()
+                    return shell.ssh_client
+
+                pipeline = self.pipeline_factory.build_pipeline(checks, reconnect=reconnect)
                 ok, events, last_context = await pipeline.run(base_ctx)
 
                 # Determine log_text and success based on ok status
@@ -278,7 +301,14 @@ class TaskService:
             event = None
             # DAH-2748: SSH we could not open is an availability error, not a verdict on the
             # machine. One is enough to hide the node until a cycle succeeds.
-            if is_opening_ssh_connection and _is_ssh_transport_failure(e):
+            if isinstance(e, SessionDroppedMidCheck):
+                # The session the run had open died twice: no verdict, the node keeps its previous state
+                # (ResultHandler is not reached; the cycle withholds the result or carries a rented node's score).
+                event = _session_dropped_event(executor_uuid=executor_info.uuid, error=e)
+                failure_reason_code = event.reason_code
+                log_text = _m(event.event, extra=event.model_dump())
+                availability_problems = None
+            elif is_opening_ssh_connection and _is_ssh_transport_failure(e):
                 event = build_ssh_unreachable_event(
                     executor_uuid=executor_info.uuid,
                     host=executor_info.address,

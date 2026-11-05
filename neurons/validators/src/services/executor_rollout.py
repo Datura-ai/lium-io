@@ -476,8 +476,9 @@ def withhold_renter_gpu_reset_verdicts(
             withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
             logger.info(
                 _m(
-                    "Verdict withheld: the renter is resetting the node's GPUs",
+                    "Verdict withheld: the renter is resetting the node's GPUs, or the SSH session dropped mid-check",
                     extra={
+                        "reason_code": result.failure_reason_code,
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,
                         "job_batch_id": result.job_batch_id,
@@ -491,8 +492,17 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
+# A run that ended on one of these says nothing about the node: no verdict, a rented node keeps its last score.
+_HELD_WITHOUT_VERDICT = frozenset(
+    {
+        MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+        TenantEnforcementMessages.SESSION_DROPPED_MID_CHECK.reason,
+    }
+)
+
+
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
-    return result.failure_reason_code == MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason
+    return result.failure_reason_code in _HELD_WITHOUT_VERDICT
 
 
 # rental and pay flags the held result of this cycle reads fresh from the cycle's rental snapshot
@@ -554,8 +564,10 @@ async def carry_renter_gpu_reset_results(
             )
             logger.info(
                 _m(
-                    "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
+                    "Score carried: the renter is resetting the node's GPUs, or the SSH session dropped mid-check;"
+                    " the last scored result stands",
                     extra={
+                        "reason_code": held.failure_reason_code,
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": held.executor_info.uuid,
                         "job_batch_id": held.job_batch_id,
