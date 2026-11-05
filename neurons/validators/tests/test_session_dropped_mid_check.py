@@ -94,23 +94,32 @@ async def test_a_check_whose_session_dropped_runs_again_on_a_new_session(raises)
     assert len(calls) == 1 and check.sessions[1] is fresh
 
 
-async def test_a_failed_reconnect_keeps_the_transport_failure():
+class _FailsOnDrop(_Check):
+    """Returns a verdict of its own on the dead session, as CapabilityCheck does."""
+
+    async def run(self, ctx: Context) -> CheckResult:
+        self.sessions.append(ctx.ssh)
+        if len(self.sessions) <= self.drops:
+            ctx.ssh.is_closed.return_value = True
+            return CheckResult(passed=False, event=_event("GPU_VERIFICATION_FAILED"))
+        return CheckResult(passed=True, event=_event("PORTS_OK"))
+
+
+@pytest.mark.parametrize("check_cls", [_Check, _FailsOnDrop])
+async def test_a_failed_reconnect_raises_the_transport_failure(check_cls):
     reconnect, calls = _reconnect([OSError("connection refused")])
 
-    ok, events, _ = await Pipeline([_Check(drops=1)], _NullSink(), reconnect=reconnect).run(
-        _ctx(_session())
-    )
-
-    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE" and len(calls) == 1
+    with pytest.raises(asyncssh.ConnectionLost):
+        await Pipeline([check_cls(drops=1)], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    assert len(calls) == 1
 
 
 async def test_a_second_drop_keeps_the_transport_failure_and_there_is_no_third_try():
-    check = _Check(drops=2)
+    check = _FailsOnDrop(drops=2)
     reconnect, calls = _reconnect([_session(), _session()])
 
-    ok, events, _ = await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
-
-    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
+    with pytest.raises(asyncssh.ConnectionLost):
+        await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
     assert len(calls) == 1 and len(check.sessions) == 2
 
 
@@ -125,11 +134,9 @@ async def test_a_run_reconnects_at_most_once():
     first, later = _Observe(drops=2), _Later(drops=1)
     reconnect, calls = _reconnect([_session(), _session()])
 
-    ok, _, _ = await Pipeline([first, later], _NullSink(), reconnect=reconnect).run(
-        _ctx(_session())
-    )
-
-    assert not ok and len(calls) == 1 and len(later.sessions) == 1
+    with pytest.raises(asyncssh.ConnectionLost):
+        await Pipeline([first, later], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+    assert len(calls) == 1 and len(later.sessions) == 0
 
 
 async def test_a_check_that_leaves_host_state_is_not_replayed():
@@ -139,9 +146,8 @@ async def test_a_check_that_leaves_host_state_is_not_replayed():
     check = _StartsContainers(drops=1)
     reconnect, calls = _reconnect([_session()])
 
-    ok, events, _ = await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
-
-    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
+    with pytest.raises(asyncssh.ConnectionLost):
+        await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
     assert not calls and len(check.sessions) == 1
 
 

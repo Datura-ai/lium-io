@@ -650,10 +650,10 @@ class Pipeline:
         """Run the step; if the open session died under it, reconnect once and run the step again on the new one.
 
         Whatever the step returned or raised, the session decides: still open, the step stands as it ran. Closed,
-        it runs once more on a fresh session and that run stands, a second drop included, as does the first run
-        when the reconnect fails or the step is not replayable: a transport failure, which the executor-image
-        rollout window withholds while a release recreates containers. A connect that fails at the start of the
-        run never gets here."""
+        it runs once more on a fresh session and that run stands. A failure on a session that is closed at the end
+        (the reconnect failed, the rerun dropped too, or the step is not replayable) is raised as the transport
+        failure it is, whatever the check returned, which the executor-image rollout window withholds while a
+        release recreates containers. A connect that fails at the start of the run never gets here."""
         ran, error = await self._attempt(step, ctx)
         if (
             self.reconnect is not None
@@ -680,6 +680,14 @@ class Pipeline:
                 )
                 ctx = ctx.model_copy(update={"ssh": fresh, "runner": SSHCommandRunner(fresh, max_retries=1)})
                 ran, error = await self._attempt(step, ctx)
+        if (
+            error is None
+            and self.reconnect is not None
+            and any(not r.result.passed for r in ran)
+            and await _session_dropped(ctx.ssh)
+        ):
+            # a failure the check returned on a session that died is the transport's, not the node's
+            error = asyncssh.ConnectionLost("SSH session closed under the check")
         if error is not None:
             raise error
         return ran, ctx
