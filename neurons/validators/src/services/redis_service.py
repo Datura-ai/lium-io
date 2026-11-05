@@ -126,6 +126,11 @@ FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
 # treats anything in the portal snapshot that is NOT here as never validated. Seeded by every
 # cycle's publish, so one completed cycle after deploy is enough to know the whole fleet.
 EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
+# DAH-5716: executor ids a provider asked to have checked again; the express lane pops each one
+# it picks. Written by the connector process, read by the validator process.
+EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
+# shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
+EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -394,6 +399,20 @@ class RedisService:
     async def get_validated_executors(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_VALIDATED_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def request_executor_recheck(self, executor_id: str) -> None:
+        async with self.lock:
+            await self.redis.sadd(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
+            await self.redis.expire(
+                EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS
+            )
+
+    async def get_executor_recheck_requests(self) -> set[str]:
+        members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
+        return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def pop_executor_recheck_request(self, executor_id: str) -> None:
+        await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
