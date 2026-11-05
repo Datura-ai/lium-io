@@ -699,6 +699,8 @@ class Pipeline:
             self.reconnect is not None
             and not self.reconnected
             and _replays_after_session_drop(step)
+            # a fault the step already finished reading stands: a replay could read nothing and pass over it
+            and not any(_a_finding(r) for r in ran if not r.result.passed)
             and await _session_dropped(ctx.ssh)
         ):
             self.reconnected = True

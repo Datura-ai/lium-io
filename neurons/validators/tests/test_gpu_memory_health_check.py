@@ -306,7 +306,8 @@ async def test_a_recovery_action_still_required_cycles_in_a_row_fails_the_rented
         # were it replayed, the one cycle would count twice and fail the node a cycle early
         (0, True, 2, Msg.RESET_ADVISED.reason),
         (1, True, 3, Msg.FAILED.reason),
-        (2, True, 4, Msg.FAILED.reason),
+        # a fault the first run read is never replayed, so even a replayable check counts it once
+        (2, True, 3, Msg.FAILED.reason),
     ],
 )
 async def test_a_dropped_session_counts_a_reset_required_cycle_once(

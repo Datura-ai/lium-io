@@ -254,3 +254,33 @@ async def test_an_availability_finding_stays_the_verdict_when_the_session_drops(
     ok, events, _ = await Pipeline([_LosesAGpu()], _NullSink(), reconnect=AsyncMock()).run(_ctx(_session()))
 
     assert not ok and [e.reason_code for e in events] == ["GPU_LOST"]
+
+
+@pytest.mark.parametrize("reconnect_outcome", ["fails", "replay reads nothing", "no reconnect"])
+async def test_a_fault_read_before_the_drop_is_not_replayed_away(reconnect_outcome):
+    # review r4484301862: a replay that reads no report would pass over the fault the first run read
+    class _ReadsAFaultThenNothing:
+        check_id = "gpu.validate.nvlink_fault"
+        fatal = True
+
+        def __init__(self):
+            self.runs = 0
+
+        async def run(self, ctx: Context) -> CheckResult:
+            self.runs += 1
+            if self.runs > 1:
+                return CheckResult(passed=True, event=_event("NVLINK_UNKNOWN"))
+            ctx.ssh.is_closed.return_value = True
+            return CheckResult(passed=False, event=_event("NVLINK_FAULT"), fatal=True)
+
+    check = _ReadsAFaultThenNothing()
+    reconnect = {
+        "fails": AsyncMock(side_effect=OSError("refused")),
+        "replay reads nothing": AsyncMock(return_value=_session()),
+        "no reconnect": None,
+    }[reconnect_outcome]
+
+    ok, events, _ = await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session()))
+
+    assert not ok and events[-1].reason_code == "NVLINK_FAULT" and check.runs == 1
+    assert failed_check_event(ok, events).what_we_saw["failed_reason"] == "NVLINK_FAULT"
