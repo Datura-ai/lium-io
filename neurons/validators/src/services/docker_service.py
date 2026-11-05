@@ -1728,13 +1728,14 @@ _DROP_MARK = "drop"
 _STARTUP_WRITE_SECONDS = 300
 
 
-def _layer_data_check(container_name: str, plaintext_path: str) -> str:
+def _layer_data_check(container_name: str, plaintext_path: str, startup_shortcut: bool = True) -> str:
     """Prints _DROP_MARK only when the container is safe to remove: no encrypted volume, or no file its layer
     added or changed under the plaintext path (``docker diff``). Any other output, an error included, keeps it.
 
     The layer is read, not the mounts: files written while unmounted stay in the layer after a remount.
     When the host can read the overlay2 upper dir, only files changed later than _STARTUP_WRITE_SECONDS after
-    the container was created count (ctime, which a renter cannot set back); otherwise ``docker diff`` decides."""
+    the container was created count (ctime, which a renter cannot set back); otherwise ``docker diff`` decides.
+    Without ``startup_shortcut`` only ``docker diff`` decides: a copy already kept is never released by the age bound."""
     name = shlex.quote(container_name)
     under = shlex.quote(f"{plaintext_path.rstrip('/')}/")
     upper_under = shlex.quote(plaintext_path.rstrip("/"))
@@ -1742,13 +1743,16 @@ def _layer_data_check(container_name: str, plaintext_path: str) -> str:
         '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
         f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
     )
-    return (
-        f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
-        f"printf '%s\\n' \"$m\" | grep -qxF {_LIUM_CIPHER_MOUNT} || {{ echo {_DROP_MARK}; exit 0; }}; "
+    shortcut = (
         f"c=$(/usr/bin/docker inspect -f '{{{{.Created}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
         f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && u=\"${{c#* }}\"{upper_under} && [ -d \"$u\" ] "
         f"&& f=$(find \"$u\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
         "-print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
+    )
+    return (
+        f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
+        f"printf '%s\\n' \"$m\" | grep -qxF {_LIUM_CIPHER_MOUNT} || {{ echo {_DROP_MARK}; exit 0; }}; "
+        f"{shortcut if startup_shortcut else ''}"
         f"{{ /usr/bin/docker diff {name} || echo diff-failed; }} | awk -v p={under} {shlex.quote(awk)}"
     )
 
@@ -1886,12 +1890,14 @@ class _EditSwap:
             kept.remove(recover_kept)
         for leftover in list(kept):
             # every edit parks under the kept name, so a clean one is an earlier edit's copy whose removal failed
-            if await self._layer_safe_to_remove(ids_by_name.get(leftover) or leftover):
+            if await self._layer_safe_to_remove(ids_by_name.get(leftover) or leftover, already_kept=True):
                 await self._run(f"/usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)} 2>/dev/null || true")
                 kept.remove(leftover)
         # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
         # Unknown path or an unreadable diff keeps it.
-        self.keep_parked = not await self._layer_safe_to_remove(recover_kept or self.container_name)
+        self.keep_parked = not await self._layer_safe_to_remove(
+            recover_kept or self.container_name, already_kept=bool(recover_kept)
+        )
         if self.keep_parked and kept:
             # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
             raise Exception(
@@ -1940,11 +1946,12 @@ class _EditSwap:
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
 
-    async def _layer_safe_to_remove(self, container: str) -> bool:
-        """True only when the layer check says the container holds no renter files under the plaintext path."""
+    async def _layer_safe_to_remove(self, container: str, already_kept: bool = False) -> bool:
+        """True only when the layer check says the container holds no renter files under the plaintext path.
+        A copy already under the kept name is read by ``docker diff`` alone: the startup-age bound never releases it."""
         if not self.plaintext_path:
             return False
-        checked = await self._run(_layer_data_check(container, self.plaintext_path))
+        checked = await self._run(_layer_data_check(container, self.plaintext_path, startup_shortcut=not already_kept))
         return (checked.stdout or "").strip() == _DROP_MARK
 
     async def _killed_after_failed_stop(self, parked: str, stopped) -> bool:

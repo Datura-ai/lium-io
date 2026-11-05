@@ -1251,13 +1251,14 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
 
 
 @pytest.mark.parametrize(
-    ("created_ago", "kept"),
+    ("created_ago", "startup_shortcut", "kept"),
     [
-        (0, False),  # written by the image's startup, before the first mount: not the renter's
-        (3600, True),  # written an hour after creation: an unmounted restart, the renter's
+        (0, True, False),  # written by the image's startup, before the first mount: not the renter's
+        (3600, True, True),  # written an hour after creation: an unmounted restart, the renter's
+        (0, False, True),  # a copy already kept: the age bound never releases it, only docker diff decides
     ],
 )
-def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, kept):
+def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, startup_shortcut, kept):
     import subprocess
     import time
 
@@ -1275,7 +1276,7 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created
         "exit 2\n"
     )
     docker.chmod(0o755)
-    command = _layer_data_check("pod_x", "/root").replace("/usr/bin/docker", str(docker))
+    command = _layer_data_check("pod_x", "/root", startup_shortcut).replace("/usr/bin/docker", str(docker))
     out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
     assert (out.strip() != "drop") is kept
 
@@ -1294,3 +1295,6 @@ async def test_a_clean_kept_leftover_next_to_the_pod_is_removed_before_parking(s
     assert isinstance(result, ContainerCreated)
     removed = ssh.commands.index(f"/usr/bin/docker rm -fv id-{old} 2>/dev/null || true")
     assert removed < ssh.commands.index(f"/usr/bin/docker rename {_pod_name(payload)} {_kept(payload)}")
+    # an already-kept copy is released by docker diff alone, never by the startup-age bound
+    leftover_read = next(c for c in ssh.commands if "/usr/bin/docker diff" in c and f"id-{old}" in c)
+    assert "-newerct" not in leftover_read
