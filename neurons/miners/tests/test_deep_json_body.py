@@ -43,7 +43,7 @@ print(sys.getrecursionlimit(), statuses[0])
 """
 
 
-def test_deep_json_body_does_not_crash_the_miner(tmp_path):
+def test_miner_answers_a_deeply_nested_body_with_4xx(tmp_path):
     # Arrange
     (tmp_path / "tmp").mkdir()  # the test SQLite URI is relative: tmp/test_miner.db
     env = {**os.environ, "PYTHONPATH": SRC_DIR}

@@ -32,10 +32,9 @@ from web3._utils.request import async_get_response_from_post_request
 from web3.exceptions import ContractLogicError, TransactionNotFound
 from web3.logs import DISCARD
 
-# py_ecc (loaded by eth_account above) raises the limit to 100 000. At that depth a nested JSON body overflows the
-# 8 MB C stack and the process segfaults before RecursionError. Every entry point (miner, connector, cli) imports
-# this module. On Python 3.11 amd64 the json parser survives up to 40 000; legit code needs ~300 (eth_keys point
-# multiply recurses ~256 deep).
+# py_ecc (loaded by eth_account above) raises the limit to 100 000, deeper than the 8 MB C stack can hold, so deep
+# recursion in C code crashes the process instead of raising RecursionError. Every entry point imports this module.
+# 10 000 keeps a wide margin both ways: legit code needs ~300 frames, the C stack holds ~40 000 on Python 3.11.
 sys.setrecursionlimit(10_000)
 
 logger = logging.getLogger(__name__)
