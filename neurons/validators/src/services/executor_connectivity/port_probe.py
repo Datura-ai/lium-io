@@ -41,6 +41,10 @@ class PortProbe:
             return PortProbeResult(tuple(batch.successful), tuple(batch.failed), "batch", external="blocked")
         successful, failed = batch.successful, batch.failed
         tier = "batch"
+        if batch.start_hung:
+            # DAH-5682: both batch container starts hung, so the later tiers' containers start on the same stuck
+            # Docker; ~90 s (semi-batch 60 s, fallback 30 s) for the same verdict. The DinD probe still runs.
+            return PortProbeResult((), tuple(failed), tier, batch.external)
 
         if not successful:
             # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.

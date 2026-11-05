@@ -89,6 +89,7 @@ async def evict_cache_volumes_oldest_first(
     run_removal: Callable[[str], Awaitable[object]],
     has_room: Callable[[], Awaitable[bool]],
     evict_first_prefix: str | None = None,
+    volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
 ) -> None:
     """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
 
@@ -123,7 +124,7 @@ async def evict_cache_volumes_oldest_first(
         ),
     )
     for index, name in enumerate(ordered):
-        await run_removal(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(name)}")
+        await run_removal(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {volume_remove(name)}")
         if index + 1 < len(ordered) and await has_room():
             return
 

@@ -19,6 +19,9 @@ from core.docker_utils import df_command, parse_df_available_bytes
 FLATTENED_IMAGE_REPO = "lium-flattened"
 # headroom left on the Docker disk after the copy, so the pod and the node still have room to write
 FLATTEN_DISK_MARGIN_BYTES = 10 * 1024**3
+# what a full-node create may write between its sizing and the flatten's disk check (its container, its volumes):
+# the sizing keeps it free beside the copy, as the grant's GiB floors alone leave the check almost none
+FLATTEN_SIZING_SLACK_BYTES = 10 * 1024**3
 # a 24 GB image takes about 5-15 minutes to copy; past this the create fails with the original error
 FLATTEN_TIMEOUT_SECONDS = 1800
 _DOCKER_READ_TIMEOUT_SECONDS = 120
