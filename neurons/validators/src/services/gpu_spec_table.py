@@ -182,6 +182,9 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
 GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
 # `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300, so the same nominal size; no GB300 reading observed yet.
 GPU_VRAM_SIZES_MB["NVIDIA GB300"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
+# DAH-5863: `NVIDIA GB10` (DGX Spark) has no memory of its own; its GPU uses the host's 128 GB, which the
+# scrape reports as its capacity (machine_scrape read_gpu_memory_mb).
+GPU_VRAM_SIZES_MB["NVIDIA GB10"] = [131072]
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
@@ -322,6 +325,20 @@ def matmul_probe_vram_mb(model: str | None, reported_vram_mb: int | None = None)
             return round(reported_vram_mb * VRAM_FLOOR_RATIO)
         return None
     return round(min(sizes) * VRAM_FLOOR_RATIO)
+
+
+# DAH-5863: GPUs with no memory of their own that use the host RAM (UNIFIED_MEMORY_GPU_NAMES in the scrape)
+UNIFIED_MEMORY_GPU_MODELS = frozenset({"NVIDIA GB10"})
+# shortcut: a fixed share of the host RAM leaves room for the OS, docker and page cache; measure on a real GB10
+UNIFIED_MEMORY_MATMUL_SHARE = 0.75
+
+
+def matmul_memory_mb(model: str | None, capacity_mb: int | float | None) -> int | float | None:
+    """The memory (MB) a matmul is sized from: the card's capacity, or on a unified-memory card the matmul share
+    of it, since the host fills the rest of that memory."""
+    if capacity_mb and normalize_gpu_model(model) in UNIFIED_MEMORY_GPU_MODELS:
+        return int(capacity_mb * UNIFIED_MEMORY_MATMUL_SHARE)
+    return capacity_mb
 
 
 def get_expected_vram_windows(canonical_model: str) -> list[tuple[int, int]] | None:

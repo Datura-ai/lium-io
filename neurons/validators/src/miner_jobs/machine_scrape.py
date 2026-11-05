@@ -2207,6 +2207,23 @@ def get_disk_health() -> DiskHealthObservation:
     return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
 
 
+# Cards whose GPU has no memory of its own and uses the host RAM (DGX Spark): NVML answers Not Supported
+# for their memory, and for their power cap.
+UNIFIED_MEMORY_GPU_NAMES = ("NVIDIA GB10",)
+
+
+def read_gpu_memory_mb(handle, name):
+    """(total, used) MB of one card. On a unified-memory card the total is the host RAM's and its own
+    use cannot be told apart from the host's, so it is None."""
+    try:
+        memory_info = nvmlDeviceGetMemoryInfo(handle)
+    except NVMLError as exc:
+        if name not in UNIFIED_MEMORY_GPU_NAMES or exc.value != NVML_ERROR_NOT_SUPPORTED:
+            raise
+        return psutil.virtual_memory().total / (1024 ** 2), None
+    return memory_info.c_nvmlMemory_t_total / (1024 ** 2), memory_info.c_nvmlMemory_t_used / (1024 ** 2)
+
+
 def read_gpu_details(device_count, gpu_process_ids):
     """The detail rows of every card NVML can read, and the first per-card error (repr) or None."""
     gpu_details = []
@@ -2220,20 +2237,25 @@ def read_gpu_details(device_count, gpu_process_ids):
 
             # Get GPU utilization rates
             utilization = nvmlDeviceGetUtilizationRates(handle)
-            memory_info = nvmlDeviceGetMemoryInfo(handle)
+            name = nvmlDeviceGetName(handle)
+            memory_total_mb, memory_used_mb = read_gpu_memory_mb(handle, name)
 
             gpu_details.append(
                 {
-                    "gpu.name": nvmlDeviceGetName(handle),
+                    "gpu.name": name,
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
-                    "gpu.capacity": memory_info.c_nvmlMemory_t_total / (1024 ** 2),  # in MB
+                    "gpu.capacity": memory_total_mb,  # in MB
                     # Not interchangeable with gpu.memory_utilization below: that one is NVML's
                     # memory-BUS duty cycle, which drops to 0 on a loaded-but-idle GPU.
                     # Reads a few hundred MB above `nvidia-smi memory.used` because NVML v1 counts the
                     # driver-reserved block (measured: 386 MB on an A4000, 728 MB on a B200).
-                    "gpu.memory_used_mb": memory_info.c_nvmlMemory_t_used / (1024 ** 2),  # in MB
+                    "gpu.memory_used_mb": memory_used_mb,  # in MB
                     "gpu.cuda": f"{major}.{minor}",
-                    "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
+                    "gpu.power_limit": (
+                        safeNvmlValue(lambda: nvmlDeviceGetPowerManagementLimit(handle) / 1000)
+                        if name in UNIFIED_MEMORY_GPU_NAMES
+                        else nvmlDeviceGetPowerManagementLimit(handle) / 1000
+                    ),
                     "gpu.power_default_limit": safeNvmlValue(
                         lambda: nvmlDeviceGetPowerManagementDefaultLimit(handle) / 1000
                     ),

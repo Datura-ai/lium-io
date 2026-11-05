@@ -6,6 +6,10 @@ import logging
 from contextlib import contextmanager
 from typing import Optional
 
+import psutil
+
+from services.gpu_spec_table import UNIFIED_MEMORY_GPU_MODELS, normalize_gpu_model
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +45,16 @@ def suppress_library_output():
         os.close(stderr_dup)
 
 
+def _memory_total_mb(pynvml, handle, name) -> int:
+    """A card's memory in MB, 0 when NVML cannot read it; a unified-memory card (GB10) uses the host RAM."""
+    try:
+        return pynvml.nvmlDeviceGetMemoryInfo(handle).total // (1024 * 1024)
+    except Exception:
+        if normalize_gpu_model(name) in UNIFIED_MEMORY_GPU_MODELS:
+            return psutil.virtual_memory().total // (1024 * 1024)
+        return 0
+
+
 def get_gpu_info(include_utilization: bool = False, include_memory: bool = False) -> Optional[dict]:
     """
     Get GPU information from the local system.
@@ -70,11 +84,7 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
         # Get memory from first GPU if requested
         gpu_memory_mb = None
         if include_memory:
-            try:
-                memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                gpu_memory_mb = memory_info.total // (1024 * 1024)  # MB
-            except:
-                gpu_memory_mb = 0
+            gpu_memory_mb = _memory_total_mb(pynvml, handle, gpu_name)
 
         # Get UUIDs from all GPUs
         uuids = []
@@ -95,16 +105,12 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
                     gpu_util = 0
                     mem_util = 0
 
-                # Get memory info
-                try:
-                    memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    memory_total = memory_info.total // (1024 * 1024)  # MB
-                except:
-                    memory_total = 0
+                name = pynvml.nvmlDeviceGetName(handle)
+                memory_total = _memory_total_mb(pynvml, handle, name)
 
                 gpu_details.append({
                     "index": i,
-                    "name": pynvml.nvmlDeviceGetName(handle),
+                    "name": name,
                     "uuid": uuid,
                     "utilization": gpu_util,
                     "memory_utilization": mem_util,

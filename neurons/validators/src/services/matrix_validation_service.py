@@ -13,7 +13,7 @@ import asyncssh
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.gpu_spec_table import matmul_probe_vram_mb
+from services.gpu_spec_table import matmul_memory_mb, matmul_probe_vram_mb
 
 logger = logging.getLogger(__name__)
 _rng = secrets.SystemRandom()
@@ -492,7 +492,7 @@ class ValidationService:
         # GPU model<->VRAM consistency is gated earlier in the pipeline by
         # GpuVramPrecheck (before the rented short-circuit), so it is NOT
         # repeated here. gpu_capacity_mb is still needed to size the matmul.
-        gpu_capacity_mb = self.get_gpu_memory(machine_spec)
+        gpu_capacity_mb = matmul_memory_mb(gpu_model, self.get_gpu_memory(machine_spec))
         if vram_budget_mb and gpu_capacity_mb:
             gpu_capacity_mb = min(gpu_capacity_mb, vram_budget_mb)
 
