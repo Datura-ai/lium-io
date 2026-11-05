@@ -43,6 +43,13 @@ MAX_PACKAGE_FALLBACK_PROBES = 8
 # (a slow first run plus its retry overran the task timeout and the node got no report at all).
 COLD_RETRY_RESERVE_SECONDS = 150
 _package_fallback_probes: dict[tuple[str, str], int] = {}
+# DAH-5742: an idle filler-only node keeps its stored EMA for at most this many skips in a row (~24 h of
+# job cycles); then it is probed once, so a slower link than the stored figure shows up.
+# shortcut: per process, so a validator restart starts the count again; a backend-held measured-at would survive it.
+MAX_FILLER_SKIPS = 96
+# (skips, the stored EMA they reused): the count restarts only once the backend stores a new reading, so a failed
+# day-probe (stored only on a passing cycle) probes again next cycle instead of skipping another day on the old speed
+_filler_skips: dict[tuple[str, str], tuple[int, tuple]] = {}
 
 
 @dataclass(frozen=True)
@@ -92,7 +99,14 @@ class VerifyXCheck:
         # score 0 every cycle and stay hidden for as long as the filler runs.
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
         # filler runs, and a fresh sample is what lets it recover.
-        if (
+        skip_key = (ctx.miner_hotkey, ctx.executor.uuid)
+        stored = (
+            (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if stored_ema else None
+        )
+        skips, skipped_on = _filler_skips.get(skip_key, (0, stored))
+        if skipped_on != stored:
+            skips = 0
+        reusable = (
             filler_container
             and stored_ema
             and stored_ema.ema_verifyx_download_speed is not None
@@ -100,7 +114,11 @@ class VerifyXCheck:
                 stored_ema.ema_verifyx_upload_speed is None
                 or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
-        ):
+        )
+        # a day of reuse is up: this probe refreshes the network reading only (r4472607210)
+        filler_refresh = bool(reusable) and skips >= MAX_FILLER_SKIPS
+        if reusable and not filler_refresh:
+            _filler_skips[skip_key] = (skips + 1, stored)
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -125,6 +143,8 @@ class VerifyXCheck:
         sizing = (
             {"challenge_config_overrides": _first_pass_challenge_config()}
             if ctx.config.first_pass
+            else {"challenge_config_overrides": FILLER_REFRESH_CHALLENGE_CONFIG}
+            if filler_refresh
             else {}
         )
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
@@ -393,6 +413,16 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EXECUTOR_CRASH": Msg.VERIFY_FAILED_EXECUTOR_CRASH,
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
+}
+
+
+# DAH-5742 (r4472607210): the RAM and disk a filler holds are ours (lium-platform keeps a 50 GiB disk and 4 GiB RAM
+# reserve beside it), so the day's refresh tests them at 1 GB and keeps the network legs and the EMA gates as they are
+FILLER_REFRESH_CHALLENGE_CONFIG = {
+    "memory_min_test_gb": 1,
+    "memory_max_test_gb": 1,
+    "storage_min_available_gb": 1,
+    "storage_throughput_test_gb": 1,
 }
 
 
