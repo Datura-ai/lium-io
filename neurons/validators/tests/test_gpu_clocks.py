@@ -749,6 +749,25 @@ async def test_the_reboot_hung_gpu_reset_flag(monkeypatch, enabled):
 
 
 @pytest.mark.asyncio
+async def test_every_reboot_hung_gpu_check_logs_its_duration(monkeypatch, caplog):
+    # DAH-5301 shadow cut: a healthy reboot logs it too, so the check count and its added seconds are measurable
+    import logging
+
+    import services.docker_service as ds
+    from services.hung_gpu_reset import HungGpuResult
+
+    service, _gates, _started = _service_with_gated_steps([])
+    service.redis_service = None
+    monkeypatch.setattr(ds, "SSHCommandRunner", lambda *_a, **_k: None)
+    monkeypatch.setattr(ds, "reset_hung_pod_gpus", AsyncMock(return_value=HungGpuResult()))
+
+    with caplog.at_level(logging.INFO, logger=ds.logger.name):
+        assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) is None
+
+    assert sum("Hung GPU check on reboot done" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_reboot_whose_lock_wait_runs_out_runs_no_hung_gpu_reset(monkeypatch):
     import services.docker_service as ds
 
