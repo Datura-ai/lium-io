@@ -48,6 +48,11 @@ def test_container_published_host_ports_count_as_taken():
     assert _parse_listening_ports(FILLER_PUBLISHED) == {22, 10083, 10071, 10063}
 
 
+def test_listening_ports_read_a_published_range():
+    block = "0.0.0.0:20040-20049->20040-20049/tcp, :::20040-20049->20040-20049/tcp\n"
+    assert _parse_listening_ports(block) == set(range(20040, 20050))
+
+
 @pytest.mark.asyncio
 async def test_two_filler_ports_move_in_one_remap_and_skip_published_ports(monkeypatch):
     monkeypatch.setattr("services.docker_service.asyncio.sleep", AsyncMock())

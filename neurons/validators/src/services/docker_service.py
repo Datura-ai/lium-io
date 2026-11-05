@@ -397,7 +397,8 @@ _PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
 _LISTENING_PORTS_COMMAND = (
     "{ ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null; docker ps --format '{{.Ports}}' 2>/dev/null; } || true"
 )
-_PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})->")
+# docker ps prints a published block as a range: `0.0.0.0:20040-20049->20040-20049/tcp`
+_PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})(?:-(\d{1,5}))?->[\d-]+/tcp")
 # dockerd's two bind refusals name the host address the bind was for:
 #   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
 #   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
@@ -472,9 +473,12 @@ def _port_collision_candidates(
 
 def _parse_listening_ports(output: str) -> set[int]:
     """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`),
-    plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`)."""
+    plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`, ranges too)."""
     ports: set[int] = {
-        int(port) for port in _PUBLISHED_HOST_PORT_RE.findall(output) if 0 < int(port) <= 65535
+        port
+        for first, last in _PUBLISHED_HOST_PORT_RE.findall(output)
+        for port in range(int(first), int(last or first) + 1)
+        if 0 < port <= 65535
     }
     for line in output.splitlines():
         for column in line.split():
