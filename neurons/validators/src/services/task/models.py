@@ -94,6 +94,8 @@ class JobResult(BaseModel):
     # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
     # None when the node has no rented pod with an ssh_port or the probe did not run.
     pod_ssh: list[PodSshObservation] | None = None
+    # DAH-5651: ContextState.host_runtime_fault, this cycle's DinD test container on the host never answered
+    host_runtime_fault: bool = False
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False

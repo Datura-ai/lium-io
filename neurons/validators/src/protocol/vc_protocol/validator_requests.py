@@ -240,6 +240,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     container_start_ok: bool | None = None
     # why this cycle's rental probe started no container; None when it ran or the validator predates it
     container_start_skipped: str | None = None
+    # DAH-5651: this cycle's DinD test container on the host never answered. None from an older validator;
+    # the backend reads it with a silent rented pod as a down host.
+    host_runtime_fault: bool | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

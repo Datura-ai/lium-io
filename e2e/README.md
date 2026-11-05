@@ -4,7 +4,7 @@ A real executor (`neurons/executor`, this checkout) on its own docker daemon, a 
 owns it, and the validator's own services (`neurons/validators/src`) driving them the way `Validator.sync` and the
 connector do — sign in over REST, install the cycle's SSH key through the miner, SSH in, upload and run the
 obfuscated scrape, walk the check pipeline, publish the verdict, rent a container, tear it down. The only thing
-missing is the chain: the subtensor client is never constructed, the miner never syncs, and the hotkeys are three
+missing is the chain: the subtensor client is never connected, the miner never syncs, and the hotkeys are three
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
@@ -121,11 +121,18 @@ does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite e
 and the first pod keeps its container; a re-sent create that meets its own leftover `pod_<id>` replaces it and runs; a
 customer create on a node running a `filler_*` container removes the filler and starts the pod.
 
+Also, each in its own file beside the suite's main one: the executor's public `GET /miner-identity` names the
+configured miner hotkey and echoes a hex nonce (422 without one), and `GET /update-status` answers 200 without a
+signature (`tests/protocol/test_executor_public_routes.py`); with `UNREACHABLE_EXECUTOR_REPORT_ENABLED` on, the seeded
+offline executor gets its own `EXECUTOR_UNREACHABLE_BY_MINER` result at score 0 (`tests/cycle/test_cycle_unreachable_executor.py`);
+a pod whose image defaults to a bare shell (`CMD ["/bin/bash"]`) stays up and opens to the renter, and the cycle's rented
+pod SSH probe reads a banner from a live pod and none once its container is stopped (`tests/rental/test_rental_pod_runtime.py`).
+
 ## Known verdicts the suite pins
 
-- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
-  `gpu_details[0]`, so a host with zero GPUs cannot report `gpu.count = 0`; the validator sees the scrape's
-  `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
+- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** The stack's executor has no `libnvidia-ml`, so
+  `miner_jobs/machine_scrape.py` returns an empty GPU list and then derives its output key from `gpu_details[0]`;
+  the validator sees the scrape's `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
   the current behaviour so a change to it is a visible diff (and the misleading remediation is tracked as a ticket).
 
 ## What it cannot prove (and where that is proven)

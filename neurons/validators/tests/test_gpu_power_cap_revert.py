@@ -342,6 +342,42 @@ async def test_a_reset_while_the_filler_is_stopping_is_not_a_revert(context_fact
     assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
 
 
+class FirstSetFailsRedis(FakeRedis):
+    def __init__(self, initial: dict[str, str] | None = None) -> None:
+        super().__init__(initial)
+        self.set_failures = 1
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        if self.set_failures:
+            self.set_failures -= 1
+            raise ConnectionError("redis blip")
+        await super().set(key, value, ex)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_clear_is_retried_once_the_filler_is_gone(
+    context_factory, monkeypatch
+) -> None:
+    # Review (#1924): the clear before the stop hit a Redis blip; the delete clears again once
+    # the container is gone, so a stock reading while the run is still STOPPING is no revert.
+    redis = FirstSetFailsRedis({
+        _pod_index_key(POD_ID): json.dumps(["GPU-a"]),
+        _restore_key("GPU-a"): _stored_restore_record(executor_id=CHECK_EXECUTOR_UUID),
+    })
+
+    await clear_filler_pod_applied_caps(redis, POD_ID)
+    stale = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert stale.capped_to_watts == 280
+    await clear_filler_pod_applied_caps(redis, POD_ID)
+
+    cleared = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert cleared.capped_to_watts is None
+    await _run_check_while_filler_runs(
+        context_factory, monkeypatch, redis, [cleared], [("GPU-a", 400.0)]
+    )
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
 @pytest.mark.asyncio
 async def test_a_failed_delete_puts_the_cap_claim_back(context_factory, monkeypatch) -> None:
     # Review (#1583): stop and forced removal failed, so the filler may still run with our cap;

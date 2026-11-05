@@ -52,7 +52,7 @@ _TAIL_CHARS = 200
 # busybox timeout's TERM/KILL exits: the fetch ran out of time, whatever it read by then is the reading
 _TIMEOUT_EXITS = frozenset({124, 143, 137})
 # the container could not reach the endpoint at all: a renter's pip/hf download fails the same way
-NODE_SIDE_ERRORS = frozenset({"dns_failed", "unreachable", "timeout"})
+NODE_SIDE_ERRORS = frozenset({"dns_failed", "unreachable", "timeout", "connection_reset"})
 
 # busybox sh in alpine (the port check's helper image, already on the node). /proc/uptime is the clock: busybox
 # date has no sub-second format everywhere. Exit 0 always: the marker lines are the answer.
@@ -89,7 +89,7 @@ class EndpointReading:
     bytes: int = 0
     seconds: float | None = None
     mbps: float | None = None
-    # None = measured; else why not: dns_failed, unreachable, timeout, http_error, no_output, other
+    # None = measured; else why not: dns_failed, unreachable, timeout, connection_reset, http_error, no_output, other
     error: str | None = None
     detail: str | None = None
     network: str | None = None
@@ -108,6 +108,9 @@ def _error_kind(stderr: str) -> str:
         return "http_error"
     if "refused" in text or "unreachable" in text or "no route" in text:
         return "unreachable"
+    # the connection opened but was cut mid-handshake or mid-transfer, while DNS and routing still work
+    if "reset by peer" in text or "eof" in text or "handshake" in text or "closed prematurely" in text:
+        return "connection_reset"
     return "other"
 
 

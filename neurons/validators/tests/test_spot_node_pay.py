@@ -1481,3 +1481,4 @@ async def test_secure_uses_an_average_taken_over_24_gpu_hours(context_factory):
     secure = await _handled(context_factory, _spot_reply(spot_executor_ids=[], **sample))
 
     assert secure.filler_revenue_per_gpu_hour == 2.0
+
