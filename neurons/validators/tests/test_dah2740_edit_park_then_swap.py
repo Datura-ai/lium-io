@@ -71,6 +71,8 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             return _ssh_result(exit_status=stop_exit, stderr="tried to kill container, but did not receive an exit event")
         if "docker inspect -f '{{.State.Running}}'" in cmd:
             return _ssh_result(stdout="false\n" if kill_stops else "true\n")
+        if "docker inspect -f '{{.State.Status}}'" in cmd:
+            return _ssh_result(stdout="running\n")
         if "docker rename" in cmd and cmd.split()[-2].endswith(EDIT_PARKED_SUFFIX):  # parked -> original name
             return _ssh_result(exit_status=rename_back_exit, stderr="rename back failed")
         return _ssh_result(exit_status=0)
@@ -828,13 +830,13 @@ async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volu
         assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
 
 
-def _kept_not_running(ssh):
+def _kept_not_running(ssh, status):
     answer = ssh.run.side_effect
 
     def _side(cmd, *args, **kwargs):
-        if "docker inspect -f '{{.State.Running}}' kept_unmounted_" in cmd:
+        if "docker inspect -f '{{.State.Status}}' kept_unmounted_" in cmd:
             ssh.commands.append(cmd)
-            return _ssh_result(stdout="false\n")
+            return _ssh_result(stdout=f"{status}\n")
         return answer(cmd, *args, **kwargs)
 
     ssh.run.side_effect = _side
@@ -842,20 +844,21 @@ def _kept_not_running(ssh):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "start_error, running, renamed_back",
+    "start_error, status, renamed_back",
     [
-        (None, True, True),  # up with sshd, no remount, then the pod name
-        ("Docker SDK start failed: 500 no such device", True, False),  # start failed: stays kept
-        (None, False, False),  # start returned but the entrypoint already exited: stays kept
+        (None, "running", True),  # up with sshd, no remount, then the pod name
+        ("Docker SDK start failed: 500 no such device", "running", False),  # start failed: stays kept
+        (None, "exited", False),  # start returned but the entrypoint already exited: stays kept
+        (None, "restarting", False),  # restart backoff (.State.Running still true): stays kept
     ],
 )
-async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch, start_error, running, renamed_back):
+async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch, start_error, status, renamed_back):
     # the remount would hide its layer files, and the retry would then read it as mounted and remove it
     payload = _edit_payload()
     ssh = _ssh_recording()
     _report_unmounted(ssh)
-    if not running:
-        _kept_not_running(ssh)
+    if status != "running":
+        _kept_not_running(ssh, status)
     _patch_happy(svc, monkeypatch, ssh)
     docker_client = svc.rental_docker_client_factory.client
     docker_client.start = AsyncMock(side_effect=RuntimeError(start_error) if start_error else None)
@@ -878,7 +881,7 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeyp
     else:
         assert sshd.await_args.kwargs["container_name"] == kept
     if renamed_back:
-        assert ssh.commands[-2:] == [f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {kept}", f"/usr/bin/docker rename {kept} {name}"]
+        assert ssh.commands[-2:] == [f"/usr/bin/docker inspect -f '{{{{.State.Status}}}}' {kept}", f"/usr/bin/docker rename {kept} {name}"]
         return
     # not running: it stays stopped under its kept name, and the next (successful) edit keeps it
     assert _docker(ssh.commands, "rename") == [_docker(ssh.commands, "rename")[0]]

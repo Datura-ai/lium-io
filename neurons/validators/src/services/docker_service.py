@@ -1977,9 +1977,10 @@ class _EditSwap:
                         await self.bring_up(self.parked_name, False)
                 elif (started := await self._run(f"/usr/bin/docker start {q_parked}")).exit_status != 0:
                     raise RuntimeError(f"docker start: {(started.stderr or '').strip()}")
-                # a start can return 0 while the entrypoint has already exited
-                running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {q_parked}")
-                if running.exit_status != 0 or (running.stdout or "").strip() != "true":
+                # a start can return 0 while the entrypoint has already exited; Status is "restarting", not
+                # "running", in restart backoff, where .State.Running still reads true
+                running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Status}}}}' {q_parked}")
+                if running.exit_status != 0 or (running.stdout or "").strip() != "running":
                     raise RuntimeError("started, but it is not running")
                 if (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
                     raise RuntimeError(f"docker rename: {(renamed.stderr or '').strip()}")
