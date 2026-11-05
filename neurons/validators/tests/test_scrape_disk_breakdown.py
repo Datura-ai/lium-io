@@ -880,7 +880,7 @@ def test_a_renter_gets_the_room_both_the_store_and_data_root_have(
     scrape["os"].stat = lambda path: SimpleNamespace(st_dev=devices[path])
 
     store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
-    hard_disk = {**scrape["hard_disk_reading"](data_root_usage or store_usage), "filler_run_volume_kb": 100 * 1024**2}
+    hard_disk = {**scrape["hard_disk_reading"](data_root_usage or store_usage), "filler_released_kb": 100 * 1024**2}
     scrape["release_filler_cache"](hard_disk)
     scrape["report_tighter_store"](hard_disk, store_usage if data_root_usage else None)
 
