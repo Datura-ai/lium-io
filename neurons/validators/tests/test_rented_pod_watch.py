@@ -191,6 +191,23 @@ async def test_non_running_pods_are_ignored_and_pods_that_leave_are_forgotten():
 
 
 @pytest.mark.asyncio
+async def test_a_reboot_keeps_the_owed_reachable():
+    backend, probe = FakeBackend(_rented(p1="RUNNING")), FakeProbe()
+    watch = await _answered(backend, probe, "p1")
+    probe.results = {"p1": PodSshResult.REFUSED}
+    await watch.tick()
+    await watch.tick()
+
+    backend.rented = _rented(p1="REBOOT_PENDING")
+    await watch.tick()
+    backend.rented = _rented(p1="RUNNING")
+    probe.results = {"p1": PodSshResult.BANNER}
+    await watch.tick()
+
+    assert _states(backend) == ["unreachable", "reachable"]
+
+
+@pytest.mark.asyncio
 async def test_an_older_backend_404_is_tolerated():
     backend, probe = FakeBackend(_rented(p1="RUNNING"), reject=404), FakeProbe()
     watch = await _answered(backend, probe, "p1")

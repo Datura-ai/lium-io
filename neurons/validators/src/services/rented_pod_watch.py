@@ -78,14 +78,18 @@ class RentedPodWatch:
         rented = await self.backend_client.get_rented_pod_targets()
         if rented is None:
             return  # no list is no news: keep every counter
-        running = {
-            pod.pod_id
+        listed = {
+            pod.pod_id: pod.status
             for executor in rented.executors.values()
             for pod in executor.pods
-            if pod.status == POD_STATUS_RUNNING
         }
+        running = {pod_id for pod_id, status in listed.items() if status == POD_STATUS_RUNNING}
         for pod_id in [p for p in self._pods if p not in running]:
-            del self._pods[pod_id]
+            if pod_id in listed:
+                # a reboot is a new container, but an owed reachable must still follow it
+                self._pods[pod_id] = _PodState(posted=self._pods[pod_id].posted)
+            else:
+                del self._pods[pod_id]
 
         probed_at = datetime.now(UTC)
         observations = await self.probe(
