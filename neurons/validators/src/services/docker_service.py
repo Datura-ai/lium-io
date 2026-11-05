@@ -9089,10 +9089,16 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         executor_info: ExecutorSSHInfo,
         log_extra: dict,
+        vulkan_icd_docker_client: RentalDockerSdkClient | None = None,
     ) -> None:
         # the create's steps a renter's first login does not need; closes the create's sessions
         try:
             async with connections:
+                if vulkan_icd_docker_client is not None:
+                    # best effort, logs its own duration and failure
+                    await self.register_vulkan_icd_with_rental_docker(
+                        vulkan_icd_docker_client, container_name=log_extra["container_name"], log_extra=log_extra
+                    )
                 started_ms = now_ms()
                 # logs its own failure as "Inspector collector start failed"
                 await self._run_inspector_collector_lifecycle(
@@ -9139,6 +9145,7 @@ class DockerService:
         # check after it) is gated on this, never on workload_kind alone.
         removes_every_filler = payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not beside_fillers
         warnings = []
+        vulkan_icd_after_reply = False
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
@@ -10821,9 +10828,8 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                        await self.register_vulkan_icd_with_rental_docker(
-                            docker_client, container_name=container_name, log_extra=default_extra
-                        )
+                        # after the reply: the renter's first login does not need it, and it took a median 1.4 s
+                        vulkan_icd_after_reply = True
                     elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                         docker_client=docker_client,
                         container_name=container_name,
@@ -11113,6 +11119,7 @@ class DockerService:
                         connections.pop_all(),
                         ssh_client=ssh_client,
                         executor_info=executor_info,
+                        vulkan_icd_docker_client=docker_client if vulkan_icd_after_reply else None,
                         log_extra={**default_extra, "container_name": container_name},
                     ),
                 )
