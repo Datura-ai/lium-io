@@ -1,6 +1,7 @@
 import time
 from unittest.mock import AsyncMock
 
+import asyncssh
 import pytest
 from neurons.validators.src.services.gpu_power_limit import (
     POWER_STATE_CMD,
@@ -167,7 +168,11 @@ async def test_pod_index_delete_failure_after_successful_restore(require_complet
         (None, GpuPowerCapResult.APPLIED),
         ("nonzero", GpuPowerCapResult.HOST_REFUSED),
         ("not_stuck", GpuPowerCapResult.HOST_REFUSED),
+        ("unreadable", GpuPowerCapResult.HOST_REFUSED),
+        ("garbled", GpuPowerCapResult.HOST_REFUSED),
         ("timeout", GpuPowerCapResult.FAILED),
+        ("refused_session", GpuPowerCapResult.FAILED),
+        ("readback_timeout", GpuPowerCapResult.FAILED),
         ("redis", GpuPowerCapResult.FAILED),
     ],
 )
@@ -183,8 +188,18 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
         if " -pl 200" in command:
             if failure == "timeout":
                 raise TimeoutError("hung")
+            if failure == "refused_session":
+                raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "refused")
             return FakeRun(exit_status=1 if failure == "nonzero" else 0)
-        return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+        if "--query-gpu=power.limit" in command:
+            if failure == "readback_timeout":
+                raise TimeoutError("hung")
+            if failure == "unreadable":
+                return FakeRun(exit_status=9)
+            if failure == "garbled":
+                return FakeRun(stdout="[N/A], [N/A]\n")
+            return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+        return FakeRun()
 
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act / Assert: only the host's own refusal reads HOST_REFUSED.
