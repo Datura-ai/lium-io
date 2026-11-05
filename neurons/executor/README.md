@@ -11,6 +11,8 @@ Before the first command, the machine needs:
 - **Docker Engine installed and running** — `docker ps` works. The Sysbox installer below refuses to run without it (`lium mine` runs the Docker install script too, but only after this step, and it is a no-op on a machine that already has Docker);
 - **a public IP** with the service port (`8080`) and the node SSH port (`2200`) reachable, and the hotkey (SS58 address) of your registered provider account — see the [Provider Quickstart](https://docs.lium.io/providers/quickstart).
 
+**GB300 and other ARM (Grace) hosts are not supported yet:** validators cannot verify an aarch64 node, so it earns nothing. The installer and the executor image are being made ready for aarch64; this note will say when ARM nodes can be added.
+
 RAM, disk (including the 1.5× VRAM rule for the idle incentive) and the recommended XFS storage setup are in the [Node Quickstart requirements](https://docs.lium.io/providers/nodes/quickstart#requirements).
 
 Install [Sysbox](https://docs.lium.io/providers/nodes/sysbox) first — validators reject a node without the `sysbox-runc` runtime. The installer below also sets up the NVIDIA Container Toolkit:
@@ -33,7 +35,7 @@ The script installs the [`lium`](https://github.com/Datura-ai/lium) CLI and runs
 2. runs `scripts/install_executor_on_ubuntu.sh` (Docker Engine and the compose plugin), then checks prerequisites — `nvidia-smi`, `nvidia-container-cli`, `docker info`,
 3. renders `neurons/executor/.env` from `.env.template` with the hotkey and the ports — you are prompted for the service port (`8080`), the node SSH port (`2200`), an optional public SSH port and an optional renting port range; pass `--auto` to accept the defaults without prompts,
 4. starts the executor with `docker compose up -d` and waits for the container to report `healthy`,
-5. runs the validator's own check against the node (`daturaai/lium-validator:latest`).
+5. runs the validator's own check against the node (`daturaai/compute-subnet-validator:preflight`).
 
 At the end it prints the node's endpoint, GPU type and count, and a `provider.lium.io/nodes?action=add&…` link that pre-fills the **Add Node** form in the [Provider Portal](https://provider.lium.io) with those values. Other options: `-d/--dir` (checkout directory, default `compute-subnet`) and `-b/--branch` (default `main`); `lium mine --help` lists them.
 
@@ -96,6 +98,7 @@ defaults are `8001` / `8001` / `2200` (`lium mine` proposes `8080` for the servi
 - **SSH_PORT**: ssh port map into 22 of your executor docker container
 - **SSH_PUBLIC_PORT**: [Optional] ssh public access port of your executor docker container. If `SSH_PUBLIC_PORT` is equal to `SSH_PORT` then you don't have to specify this port.
 - **EXECUTOR_SSH_SOURCE_PIN**: [Optional] Off by default. Set to `true` to let the validator's keys log in only from the validator's addresses. Leave it off if inbound SSH to your executor passes through a relay or tunnel, or through Docker's userland-proxy (sshd then sees the Docker gateway address), because the validator's own address never reaches the executor.
+- **EXECUTOR_SSH_SOURCE_LIMITS**: [Optional] On by default. sshd lets one address hold at most 10 unfinished logins and refuses an address for a while after repeated failed logins, so one scanner cannot crowd out the validator. The validator's addresses and private addresses are never refused. They turn off by themselves in a CVM and on the first connection from a private address (a relay, tunnel or NAT in front of port 2200, or Docker's userland-proxy then shows one address for every client); set `false` to turn them off from the start. `.env` is read when the container is created: apply a change with `docker compose up -d --force-recreate`: the `.env` is mounted into the runner, so a plain `docker compose up -d` or `docker restart` keeps the old values.
 - **MINER_HOTKEY_SS58_ADDRESS**: your provider hotkey (SS58 address). It must be the hotkey this node is listed under: the validator signs each SSH key it sends for the miner hotkey it is validating, and the executor logs (and, once enforcement is on, refuses) a key issued for a different hotkey
 - **RENTING_PORT_RANGE**: The port range that are publicly accessible. This can be empty if all ports are open. Available formats are: 
   - Range Specification(`from-to`): a range of ports, such as 2000-2005. This means ports from 2000 to 2005 will be open for the validator to select.
@@ -109,12 +112,14 @@ Note: Please use either **RENTING_PORT_RANGE** or **RENTING_PORT_MAPPINGS** and 
 Optional, commented out in the template (`src/core/config.py` has the defaults):
 
 - **COMPUTE_REST_API_URL**: the Lium backend the executor pre-pulls its GPU's cache template image from (default `https://lium.io/api`; empty disables the pre-pull)
+- **PRE_PULL_TEMPLATES_ENABLED**: on an idle node, also pull the most-rented official template images so rentals start faster; this uses disk (keeps `PRE_PULL_MIN_FREE_GB` free) and bandwidth (default `true`; set `false` to opt this node out)
 - **CACHE_TEMPLATE_REFRESH_SECONDS**: how often the template digest is re-checked (default `900`)
 - **CONTAINER_SIGNATURE_MAX_AGE_SECONDS**: maximum clock skew accepted on signed pod-metrics and pod-log requests (default `300`; keep the host on NTP rather than widening this)
-- **EXECUTOR_LOCAL_VERIFY_ENABLED**: answer the validator's one-call `POST /verify` (the verification suite from one signed intent, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused, and so is an intent that does not name this host's `MINER_HOTKEY_SS58_ADDRESS`) instead of 404 (default `false`; the validator falls back to its SSH checks either way)
+- **EXECUTOR_LOCAL_VERIFY_ENABLED**: answer the validator's one-call `POST /verify` (the verification suite from one signed intent, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused, and so is an intent that names neither this host's `MINER_HOTKEY_SS58_ADDRESS` nor `LIUM_POOL_HOTKEY`) instead of 404 (default `false`; the validator falls back to its SSH checks either way)
 - **LOCAL_VERIFY_MAX_DEADLINE_SECONDS**: the longest a `/verify` intent may keep the GPU before the executor answers with what finished (default `600`)
 - **LOCAL_VERIFY_INTENT_WINDOW_SECONDS**: how far a `/verify` intent's `issued_at` may be from this host's clock (default `120`; NTP, as above)
-- **REQUIRE_MINER_BOUND_SSH_KEY**: refuse a validator SSH key that was not signed for this host's `MINER_HOTKEY_SS58_ADDRESS` (default `false`: such a key is accepted and logged as `ssh_key_miner_binding`)
+- **REQUIRE_MINER_BOUND_SSH_KEY**: refuse a validator SSH key that was not signed for this host's `MINER_HOTKEY_SS58_ADDRESS` or `LIUM_POOL_HOTKEY` (default `false`: such a key is accepted and logged as `ssh_key_miner_binding`)
+- **LIUM_POOL_HOTKEY**: the Lium pool hotkey, also accepted for validator SSH keys and `/verify` intents because a provider on Lium-held (USDT) payouts is served under it (default: the Lium pool hotkey; empty accepts only `MINER_HOTKEY_SS58_ADDRESS`). Written at start to `/etc/liumd/pool_hotkey` for liumd. A TEE (dstack) node cannot set it and always uses the default
 - **NODE_HEARTBEAT_ENABLED**: send a signed heartbeat to `{COMPUTE_REST_API_URL}/v1/node-heartbeat` every interval, signed with this host's SSH ed25519 host key, so the backend sees uptime between validator checks (default `false`; a failed send is logged and retried, and repeated 401/404 answers back off up to one hour). A new container makes a new host key at start, so the backend refuses its heartbeats until the next validator check has connected to the node and passed on the new key
 - **NODE_HEARTBEAT_INTERVAL_SECONDS**: seconds between heartbeats (default `60`; a value below `10` is used as `10` with a warning)
 
@@ -229,14 +234,67 @@ Causes the installer names:
 
 - **`docker plugin disable` fails with `plugin vloopback:latest is in use`**: volumes left by ended rentals still use the plugin. Remove only those: first `docker ps -aq --filter name=pod_` must print nothing (a stopped `pod_*` container is still a rental, and its disk is one of these volumes). Then take each name printed by `docker volume ls --format '{{.Driver}} {{.Name}}' | awk '$1 ~ /^vloopback(:|$)/ && $2 ~ /^volume_/ {print $2}'` (the driver shows as `vloopback` or `vloopback:latest`), and remove it with `docker volume rm <name>` only when `docker ps -a --filter volume=<name> -q` prints nothing. Leave volumes with other names alone. Run the installer again.
 - **`error setting up ID-mapped mount on path 206/fs` (a relative path, any number before `/fs`) from the volume test**: that path is an image layer, not the volume. Sysbox 0.6.6 and older fail this way on a large image with Docker's containerd image store; see [Sysbox troubleshooting](https://docs.lium.io/providers/nodes/sysbox). Re-run the installer with no rental on the node (it upgrades an older Sysbox). If `sysbox-runc --version` already shows the version the installer pins, send support the installer output and the output of `sysbox-runc --version` and `docker plugin inspect vloopback` before changing the plugin.
+- **`setting up ID-mapped mount on path l/<ID>` when a rental starts**: the renter's image has more layers than fit in one page of overlay mount options (no fixed count: the longer Docker's data-root path, the fewer layers fit), and Sysbox 0.7.1 cannot start such an image on Docker's classic `overlay2` image store ([nestybox/sysbox#725](https://github.com/nestybox/sysbox/issues/725); fixed upstream but not in a Sysbox release yet). When the rental takes the whole node's disk, the validator then builds a single-layer copy of the image on your node (`lium-flattened:<image ID>`, about the image's size on Docker's disk, reused by later rentals of the same image) and starts the pod from it; when the copy would leave less than 10 GB free beyond the disk the pod was granted, the renter is told to pick another node. Any other rental (for example one that shares the node with other rentals) gets no copy: it fails with this error and the renter is told to rent another node or flatten the image into fewer layers. No change is needed on your side.
 - **`error setting up ID-mapped mount on path /…` (an absolute path) from the volume test**: Sysbox mounts volumes through ID-mapped mounts, and the filesystem under Docker's data-root does not support them. Put the data-root on ext4 or XFS ([Docker Storage Setup](https://docs.lium.io/providers/nodes/docker-storage)), then run the installer again.
 - **`docker plugin install` fails**: the host cannot pull `ashald/docker-volume-loopback` from Docker Hub. Check the host's proxy or DNS, then run the installer again.
 
 Validator releases after this change also run the test in the machine scrape, on nodes whose Docker accepts `--storage-opt` (a node without it is rented without a disk limit and is not tested); a validator on an earlier release does not run it. The scrape checks the plugin, `Mountpoint`, and a volume mounted into a container under the runtime this node's rentals get (Sysbox when the scrape's Sysbox GPU test passes, Docker's default runtime otherwise). They only read the plugin, never install or change it, and remove their test container and volume (`lium_storage_check_*`) when the test ends.
 
+### Docker data-root on a loop image
+
+A data-root on a loop-mounted image file (`/dev/loopN` in `df /var/lib/docker`) must have direct I/O on. Buffered, every write in a rented pod is cached twice; one pod writing heavily can stall Docker for minutes and the node is delisted. The installer reports it as a `FIX`. Better: put the data-root on a real disk ([Docker Storage Setup](https://docs.lium.io/providers/nodes/docker-storage)).
+
+**Switch it on now** (no rental running; on a busy device the command waits until the writes stop):
+
+```shell
+sudo losetup --direct-io=on /dev/loopN
+losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
+```
+
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. When direct I/O cannot be set (`losetup` fails with `Invalid argument`, e.g. an image whose sector size is smaller than its disk's), Docker still starts so the node stays up, the journal shows a warning and the installer's `--check` reports `FIX`; move the data-root to a real disk then. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), or a real disk replaces the image at the same mount point, the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
+
+1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
+
+   ```
+   /data/img.raw /data/dockerimg xfs loop,pquota,nofail,x-systemd.requires=/data 0 0
+   ```
+
+2. The script, the unit, and Docker requiring it:
+
+   ```shell
+   sudo tee /usr/local/sbin/loop-dio-docker >/dev/null <<'EOF'
+   #!/bin/sh
+   MNT=/data/dockerimg
+   root=$(tr -d '\n\r' 2>/dev/null </etc/docker/daemon.json | sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+   root=${root:-/var/lib/docker}   # no "data-root" key: Docker's default
+   case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
+   src=$(findmnt -n -o SOURCE --mountpoint "$MNT") || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
+   case "$src" in /dev/loop*) losetup --direct-io=on "$src" || echo "<4>direct I/O failed on $src, Docker starts buffered: move the data-root to a real disk" ;; esac   # a real disk needs nothing
+   EOF
+   sudo chmod 755 /usr/local/sbin/loop-dio-docker
+   sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
+   [Unit]
+   Description=Direct I/O on the Docker data-root loop device
+   Wants=data-dockerimg.mount
+   After=data-dockerimg.mount
+   Before=docker.service containerd.service
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/usr/local/sbin/loop-dio-docker
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   sudo mkdir -p /etc/systemd/system/docker.service.d
+   printf '[Unit]\nRequires=loop-dio-docker.service\nAfter=loop-dio-docker.service\n' | sudo tee /etc/systemd/system/docker.service.d/loop-dio.conf >/dev/null
+   sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
+   ```
+
+   `data-dockerimg.mount` is the mount unit systemd makes from the fstab line; for another mount point, `systemd-escape -p --suffix=mount <dir>` prints its name.
+
 ## The executor image
 
-`Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: it turns sshd's `PerSourcePenalties` off through `/etc/ssh/sshd_config.d/lium.conf` when the base's OpenSSH knows the directive (9.8 and later), and fails the build when `sshd -T` rejects the rendered configuration. The same drop-in sets `LogLevel VERBOSE`, so every login records the key fingerprint that opened it. The container runs no syslog: `run.sh` starts `sshd_log_receiver.py` as `/dev/log`, which keeps the `Accepted` lines with sshd's time and pid in `/var/log/sshd-auth.log` (renamed to `.1` past 50 MB). Each cycle the validator logs the lines it has not read yet as `Executor sshd logins` and moves its cursor in `/var/log/sshd-auth.cursor` only after that.
+`Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: its drop-in `/etc/ssh/sshd_config.d/lium.conf` sets `LoginGraceTime 20` and `MaxStartups 60:30:200` and, when the base's OpenSSH knows `PerSourcePenalties` (9.8 and later), `PerSourceMaxStartups 10`, `PerSourcePenalties yes` and a `PerSourcePenaltyExemptList` of the private ranges and the image's validator SSH sources; it fails the build when `sshd -T` rejects the rendered configuration. At start `run.sh` calls `sshd_setup.sh start`, which puts the build's off drop-in (`PerSourceMaxStartups none`, `PerSourcePenalties no`) in front of `lium.conf` when `EXECUTOR_SSH_SOURCE_LIMITS=false` or the executor runs in a CVM, where every client reaches sshd from one address; `sshd_log_receiver.py` does the same and reloads sshd on the first connection from a private address (sshd's `Connection from` line, before authentication). The same drop-in sets `LogLevel VERBOSE`, so every login records the key fingerprint that opened it. The container runs no syslog: `run.sh` starts `sshd_log_receiver.py` as `/dev/log`, which keeps the `Accepted` lines with sshd's time and pid in `/var/log/sshd-auth.log` (renamed to `.1` past 50 MB). Each cycle the validator logs the lines it has not read yet as `Executor sshd logins` and moves its cursor in `/var/log/sshd-auth.cursor` only after that.
 
 ### Validator hotkeys and uploaded ssh keys
 

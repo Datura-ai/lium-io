@@ -212,6 +212,9 @@ class DummyRedisService:
     async def expire(self, key: str, seconds: int):
         pass
 
+    async def persist(self, key: str):
+        pass
+
     async def write_atomically(self, writes):
         for name, args, kwargs in writes.ops:
             await getattr(self, name)(*args, **kwargs)

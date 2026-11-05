@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.config import Settings, settings
+from core.config import settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
 )
@@ -28,12 +28,6 @@ from tests.test_cached_template_verification import (
 from tests.test_verifyx_cold_sample_retry import _known, _never_measured, _probe, _ProbeSequence
 
 IMAGE_CHECK = "executor.validate.cached_template"
-
-
-@pytest.fixture(autouse=True)
-def _hold_enabled(monkeypatch):
-    # The hold ships off; every test below runs it on unless it says otherwise.
-    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", True)
 
 
 def _event(check_id: str, *, failed: bool) -> ValidationEvent:
@@ -71,86 +65,70 @@ _ABSENT = None
 _STORED = {"ema_verifyx_download_speed": 200.0, "ema_verifyx_upload_speed": 50.0}
 _PASSED = None
 _HELD = "VerifyX EMA held"
-_WOULD_HOLD = "would not have moved it"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("specs", "rented_data", "failed_check", "image_cached", "hold", "ema", "log"),
+    ("specs", "rented_data", "failed_check", "image_cached", "ema", "log"),
     [
         # the raw samples are still published in every row: only the smoothed value is held
         pytest.param(
-            _measured_specs(120.0, 120.0, 40.0), _never_measured(), IMAGE_CHECK, None, True,
+            _measured_specs(120.0, 120.0, 40.0), _never_measured(), IMAGE_CHECK, None,
             (_ABSENT, _ABSENT), _HELD, id="failed-another-check-does-not-seed",
         ),
         pytest.param(
-            _measured_specs(50.0, 125.0, 45.0), _known(200.0), IMAGE_CHECK, None, True,
+            _measured_specs(50.0, 125.0, 45.0), _known(200.0), IMAGE_CHECK, None,
             (200.0, 50.0), _HELD, id="failed-cycle-keeps-the-previous-ema",
         ),
         pytest.param(
-            _measured_specs(120.0, 120.0, 40.0), None, IMAGE_CHECK, None, True,
+            _measured_specs(120.0, 120.0, 40.0), None, IMAGE_CHECK, None,
             (120.0, 40.0), None, id="failed-cycle-without-the-backends-answer-holds-nothing",
         ),
         # the cached-image check passed (advisory, or a fresh node held as pending) without the image
         pytest.param(
-            _measured_specs(20.0, 160.0, 40.0), _known(300.0), _PASSED, False, True,
+            _measured_specs(20.0, 160.0, 40.0), _known(300.0), _PASSED, False,
             (160.0, 40.0), None, id="passing-uncached-cycle-of-a-known-node-publishes",
         ),
         pytest.param(
-            _measured_specs(120.0, 120.0, 40.0), _never_measured(), _PASSED, False, True,
+            _measured_specs(120.0, 120.0, 40.0), _never_measured(), _PASSED, False,
             (_ABSENT, _ABSENT), _HELD, id="passing-uncached-cycle-does-not-seed",
         ),
         pytest.param(
-            _measured_specs(120.0, 120.0, 40.0), _never_measured(), _PASSED, True, True,
+            _measured_specs(120.0, 120.0, 40.0), _never_measured(), _PASSED, True,
             (120.0, 40.0), None, id="passing-cached-cycle-seeds",
         ),
         # every node looks never-measured without rented_data; a backend blip must not hold them all
         pytest.param(
-            _measured_specs(120.0, 120.0, 40.0), None, _PASSED, False, True,
+            _measured_specs(120.0, 120.0, 40.0), None, _PASSED, False,
             (120.0, 40.0), None, id="passing-uncached-cycle-without-the-backends-answer-publishes",
         ),
         pytest.param(
-            _measured_specs(60.0, 80.0, 40.0), _known(100.0), VerifyXCheck.check_id, None, True,
+            _measured_specs(60.0, 80.0, 40.0), _known(100.0), VerifyXCheck.check_id, None,
             (80.0, 40.0), None, id="verifyx-failing-its-own-gate-moves-the-ema",
         ),
         pytest.param(
-            _measured_specs(300.0, 250.0, 45.0), _known(200.0), _PASSED, True, True,
+            _measured_specs(300.0, 250.0, 45.0), _known(200.0), _PASSED, True,
             (250.0, 45.0), None, id="passing-cycle-publishes-the-new-ema",
         ),
         pytest.param(
             {"gpu": {"count": 1}, "network": {"download_speed": 900.0}}, _known(200.0),
-            "executor.validate.port_count", None, True, (_ABSENT, _ABSENT), None,
+            "executor.validate.port_count", None, (_ABSENT, _ABSENT), None,
             id="failure-before-verifyx-ran-adds-no-ema",
         ),
         pytest.param(
             {"gpu": {"count": 1}, "network": {"ema_verifyx_download_speed": 60.0}}, _known(200.0),
-            IMAGE_CHECK, None, True, (200.0, _ABSENT), _HELD,
+            IMAGE_CHECK, None, (200.0, _ABSENT), _HELD,
             id="hold-touches-only-the-keys-this-cycle-wrote",
         ),
         pytest.param(
             {"gpu": {"count": 1}, "network": dict(_STORED)}, _known(200.0), IMAGE_CHECK, None,
-            True, (200.0, 50.0), None, id="stored-ema-only-is-published-unchanged-and-not-logged",
-        ),
-        pytest.param(
-            {"gpu": {"count": 1}, "network": dict(_STORED)}, _known(200.0), IMAGE_CHECK, None,
-            False, (200.0, 50.0), None, id="flag-off-stored-ema-only-is-not-logged",
-        ),
-        pytest.param(
-            _measured_specs(120.0, 120.0, 40.0), _never_measured(), IMAGE_CHECK, None, False,
-            (120.0, 40.0), _WOULD_HOLD, id="flag-off-failed-cycle-seeds-as-before",
-        ),
-        pytest.param(
-            _measured_specs(120.0, 120.0, 40.0), _never_measured(), _PASSED, False, False,
-            (120.0, 40.0), _WOULD_HOLD, id="flag-off-passing-uncached-cycle-seeds-as-before",
+            (200.0, 50.0), None, id="stored-ema-only-is-published-unchanged-and-not-logged",
         ),
     ],
 )
 async def test_what_a_cycle_publishes(
-    monkeypatch, context_factory, caplog, specs, rented_data, failed_check, image_cached, hold, ema, log
+    monkeypatch, context_factory, caplog, specs, rented_data, failed_check, image_cached, ema, log
 ):
-    if not hold:
-        assert Settings.model_fields["VERIFYX_EMA_HOLD_ENABLED"].default is False
-    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", hold)
     state = build_state(specs=specs, rented_data=rented_data, recommended_image_cached=image_cached)
 
     with caplog.at_level(logging.INFO):
@@ -200,35 +178,23 @@ async def _cycle_with_the_image_check(context_factory, probes, rented_data, redi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("grace", "hold", "cycle_2_passes", "cycle_2_ema"),
+    ("cycle_2_passes", "cycle_2_ema"),
     [
-        pytest.param(False, False, False, 86.7, id="main"),
-        # the grace alone: cycle 1 passes as PENDING and seeds 120
-        pytest.param(True, False, False, 86.7, id="grace"),
-        # the hold alone: cycle 1 fails the image check and is held
-        pytest.param(False, True, True, 238.0, id="hold"),
-        # both: cycle 1 passes as PENDING and is held
-        pytest.param(True, True, True, 238.0, id="grace-and-hold"),
+        # cycle 1 passes as PENDING and is held
+        pytest.param(True, 238.0, id="grace-and-hold"),
     ],
 )
-async def test_the_incident_with_the_fresh_node_grace(
-    monkeypatch, context_factory, grace, hold, cycle_2_passes, cycle_2_ema
-):
+async def test_the_incident_with_the_fresh_node_grace(monkeypatch, context_factory, cycle_2_passes, cycle_2_ema):
     monkeypatch.setattr(settings, "CACHED_TEMPLATE_CUTOFF", datetime.utcnow() - timedelta(days=1))
-    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", grace)
-    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", hold)
     redis = _fake_redis_service()
 
     # Cycle 1: a fresh node, its executor's first pre-pull still running; VerifyX samples 120.
     ok, events, network = await _cycle_with_the_image_check(
         context_factory, _ProbeSequence(_probe(120.0)), _never_measured(), redis, cached=False
     )
-    assert ok is grace
-    assert (
-        events[-1].reason_code
-        == (CachedTemplateMessages.PENDING if grace else CachedTemplateMessages.NOT_CACHED).reason
-    )
-    assert ("ema_verifyx_download_speed" in network) is not hold
+    assert ok is True
+    assert events[-1].reason_code == CachedTemplateMessages.PENDING.reason
+    assert "ema_verifyx_download_speed" not in network
 
     # Cycle 2: the image is on disk now; the first sample reads 53.4, a re-measure 238.
     probes = _ProbeSequence(_probe(53.4), _probe(238.0))

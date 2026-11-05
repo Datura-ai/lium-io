@@ -4,7 +4,7 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Container, Iterator
 from typing import Annotated
 from uuid import UUID
 
@@ -22,6 +22,8 @@ from datura.requests.miner_requests import (
     SSHKeyRemoved,
 )
 from datura.requests.validator_requests import (
+    ExecutorListResponse,
+    SimpleValidatorRequest,
     SSHPubKeyRemoveRequest,
     SSHPubKeySubmitRequest,
     GetPodLogsRequest,
@@ -37,6 +39,7 @@ from payload_models.payloads import (
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    ContainerStopRequest,
     AddSshPublicKeyRequest,
     RemoveSshPublicKeysRequest,
     FailedContainerErrorCodes,
@@ -50,8 +53,13 @@ from payload_models.payloads import (
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
+    GpuResetErrorCode,
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
+    LockPodGpuClocksRequest,
+    PodGpuClocksResult,
+    PodGpuResetResult,
+    ResetPodGpuRequest,
     WorkloadKind,
     now_ms,
 )
@@ -67,14 +75,22 @@ from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
+from services.task.checks.duplicate_executor import _gpu_uuids
 from services.task.availability import (
     availability_errors,
     build_executor_unreachable_by_miner_event,
     build_rented_executor_not_listed_event,
+    RunningOutageTally,
 )
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
-from services.storage_operations import cancel_storage_operation, start_storage_operation, supports_workspace_field
+from services.storage_operations import (
+    cancel_storage_operation,
+    report_launch_failure,
+    start_storage_operation,
+    supports_workspace_field,
+)
+from services.storage_operations import upload_secrets_file
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +105,15 @@ def _miner_job_script_path(script_name: str) -> str:
 
 def _nohup_command(argv: list[str], log_path: str) -> str:
     return f"{shlex.join(argv)} > {shlex.quote(log_path)} 2>&1 &"
+
+
+async def _storage_known_hosts(docker_service: DockerService, executor_info: ExecutorSSHInfo, payload):
+    """The same pinned host-key policy the rental paths use, for backup/restore/cancel SSH."""
+    return await docker_service._prepare_known_hosts_policy(
+        executor_info,
+        payload.miner_hotkey,
+        {"miner_hotkey": payload.miner_hotkey, "executor_id": payload.executor_id, "pod_id": payload.pod_id},
+    )
 
 
 def _get_error_details(error: Exception) -> str:
@@ -255,6 +280,7 @@ JOB_LENGTH = 30
 
 # HTTP timeout constants for REST API calls
 REST_SSH_SUBMIT_TIMEOUT = 30  # Timeout for SSH key submission requests
+REST_EXECUTOR_LIST_TIMEOUT = 5  # the miner's POST /executors is a DB read
 REST_CONTAINER_OP_TIMEOUT = 30  # Timeout for container operations
 REST_POD_LOGS_TIMEOUT = 30  # Timeout for pod logs requests
 REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
@@ -273,6 +299,47 @@ EXPRESS_LANE = "express"
 # seeds that set once, after scoring and publishing — minutes after the miner's wave returned).
 # Kept in in_flight so the express lane does not run the same node a second time meanwhile.
 CYCLE_DONE = "cycle-done"
+
+
+async def _gocryptfs_mount_is_live(ssh_client, container_name: str, plaintext_path: str) -> bool:
+    # same test as the executor's workspace.py: the rental PID's mountinfo has a fuse.gocryptfs at the path
+    container_q = shlex.quote(container_name)
+    result = await ssh_client.run(
+        f"cat /proc/$(docker inspect -f '{{{{.State.Pid}}}}' {container_q})/mountinfo", check=True
+    )
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        if "-" not in fields or len(fields) < 10:
+            continue
+        separator = fields.index("-")
+        if fields[4] == plaintext_path and fields[separator + 1] == "fuse.gocryptfs":
+            return True
+    return False
+
+
+async def _remount_dropped_gocryptfs(ssh_client, payload: BackupContainerRequest, docker_service: DockerService) -> None:
+    # DAH-5047: a RUNNING pod's plaintext mount can drop; remount it (never init) so the backup reads real data.
+    # Best effort: any failure is logged and the backup launches anyway, the executor reports its usual error.
+    extra = {"pod_id": payload.pod_id, "container_name": payload.container_name}
+    try:
+        if await _gocryptfs_mount_is_live(ssh_client, payload.container_name, payload.source_volume_path):
+            return
+        logger.warning(_m("DAH-5047: gocryptfs mount down before backup, remounting", extra=get_extra_info(extra)))
+        # source_volume is the encrypted volume the executor checks at /lium-cipher
+        await docker_service.setup_encrypted_local_volume(
+            ssh_client=ssh_client,
+            container_name=payload.container_name,
+            plaintext_path=payload.source_volume_path,
+            volume_name=payload.source_volume,
+            pod_id=payload.pod_id,
+            log_tag=f"backup_container_{payload.pod_id}",
+            log_extra=extra,
+            allow_init=False,
+        )
+    except Exception as error:
+        logger.error(
+            _m("DAH-5047: pre-backup gocryptfs check/remount failed", extra=get_extra_info({**extra, "error": str(error)}))
+        )
 
 
 class MinerService:
@@ -297,9 +364,20 @@ class MinerService:
         # wave's list of the node's miner, or the wave could verify and publish the node again
         # under the same id once the lane let go of it.
         self.miners_awaiting_wave_list: dict[str, str] = {}
-        # per miner hotkey, the rented executor uuids it left out of its previous answer (RENTED_NOT_LISTED_ONE_CYCLE_GRACE).
+        # The express lane's queue (its live _pending map): new executors it will verify within
+        # minutes. The wave leaves them to it too, not only the ones it is running: in the wave a
+        # new node waits its turn and runs the full check, 7-15 min to listed (DAH-5601).
+        self.express_queued: Container[str] = frozenset()
+        # per miner hotkey, the rented executor uuids it left out of its previous answer (one-cycle grace: a
+        # single miss is mostly a key upload that missed the miner's 10 s window, so the row starts at the second).
         # shortcut: in memory, so a restart costs one extra cycle before a real outage is reported.
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
+        # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
+        self.published_gpu_uuids: dict[str, set[str]] = {}
+        # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
+        self.outage_tally: RunningOutageTally | None = None
+        # DAH-5635: executor uuid -> the availability errors this process's last cycle publish sent for it
+        self.cycle_published_availability: dict[str, list[dict]] = {}
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -318,7 +396,7 @@ class MinerService:
         default_extra: dict,
     ) -> list[ExecutorSSHInfo]:
         """The wave takes every executor the miner returned, minus those the express lane is
-        verifying at this moment, so a new node's hardware tests never run twice concurrently
+        verifying or has queued, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched.
 
@@ -330,7 +408,10 @@ class MinerService:
         executors = self._first_entry_per_uuid(executors, default_extra)
         claimed: list[ExecutorSSHInfo] = []
         for executor in executors:
-            if self.in_flight.get(executor.uuid) == EXPRESS_LANE:
+            if (
+                self.in_flight.get(executor.uuid) == EXPRESS_LANE
+                or executor.uuid in self.express_queued
+            ):
                 logger.info(
                     _m(
                         "Executor left to the express lane this cycle",
@@ -405,6 +486,49 @@ class MinerService:
         for executor_id in [e for e, lane in self.in_flight.items() if lane == CYCLE_DONE]:
             del self.in_flight[executor_id]
 
+    async def publish_new_executors_at_pass(self, job: dict | None) -> None:
+        """A wave result that passed, for an executor no cycle has published yet, is published as
+        soon as its miner answers, spec-only like the express lane's (no scored_at): at the cycle's
+        end it waited for the slowest miner in the fleet, 9-14 min (a node verified at 17:51 was
+        listed at 18:03). The cycle still scores and publishes it as today. Never fails the wave."""
+        if not job:
+            return
+        try:
+            validated = await self.redis_service.get_validated_executors()
+            if not validated:
+                # cold set (fresh box or Redis wipe): every executor would look new; the cycle publishes
+                return
+            new = [
+                result
+                for result in job.get("results", [])
+                if result.is_successful
+                and not result.is_rented
+                and result.executor_info.uuid not in validated
+            ]
+            if not new:
+                return
+            await self.publish_machine_specs(
+                new, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+            logger.info(
+                _m(
+                    "[sync] New executors published at pass, ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [r.executor_info.uuid for r in new],
+                        }
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[sync] Could not publish new executors at pass; the cycle publishes them",
+                    extra=get_extra_info({"error": str(exc)}),
+                )
+            )
+
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
         return public_key.decode("utf-8") if isinstance(public_key, bytes) else public_key
@@ -461,7 +585,7 @@ class MinerService:
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
         (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
         try:
-            return await self._route_job_to_miner(
+            job = await self._route_job_to_miner(
                 payload,
                 encrypted_files,
                 rented_data,
@@ -470,6 +594,9 @@ class MinerService:
                 executor_id=executor_id,
                 first_pass=first_pass,
             )
+            if executor_id is None:
+                await self.publish_gpu_set_changes(job)
+            return job
         finally:
             if executor_id is None:
                 self._stop_awaiting_wave_list(payload)
@@ -659,6 +786,7 @@ class MinerService:
             # exempt the node from spot-tier or Discord exclusions.
             is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
             is_on_spot_pay_list = is_spot and executor_uuid in (rented_data.provider_spot_executor_ids or [])
+            is_in_maintenance = executor_uuid in (rented_data.maintenance_executor_ids or [])
             discord_connected_ids = rented_data.provider_discord_connected_executor_ids
             provider_discord_connected = (
                 True if discord_connected_ids is None else executor_uuid in discord_connected_ids
@@ -695,6 +823,7 @@ class MinerService:
                     is_spot=is_spot,
                     is_on_spot_pay_list=is_on_spot_pay_list,
                     provider_discord_connected=provider_discord_connected,
+                    is_in_maintenance=is_in_maintenance,
                 )
             )
 
@@ -755,14 +884,12 @@ class MinerService:
         miner_returned_executors: list[ExecutorSSHInfo],
         executor_id: str | None,
     ) -> Iterator[tuple[str, RentedExecutor]]:
-        """The missing rented executors that get a row: with RENTED_NOT_LISTED_ONE_CYCLE_GRACE only those the
-        miner also left out of its previous answer."""
+        """The missing rented executors that get a row: only those the miner also left out of its previous
+        answer (one-cycle grace)."""
         for executor_uuid, rented_executor in self._missing_rented(
             payload, rented_data, miner_returned_executors, executor_id
         ):
-            if settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE and executor_uuid not in self.rented_missed_last_cycle.get(
-                payload.miner_hotkey, ()
-            ):
+            if executor_uuid not in self.rented_missed_last_cycle.get(payload.miner_hotkey, ()):
                 continue
             yield executor_uuid, rented_executor
 
@@ -816,7 +943,7 @@ class MinerService:
                 payload, rented_data, miner_returned_executors, executor_id
             )
         ]
-        if settings.RENTED_NOT_LISTED_ONE_CYCLE_GRACE and rented_data and executor_id is None:
+        if rented_data and executor_id is None:
             # this miner's misses replace its previous ones: a node it returned, or whose rental ended, drops out
             self.rented_missed_last_cycle[payload.miner_hotkey] = {
                 executor_uuid
@@ -1033,6 +1160,92 @@ class MinerService:
         await self.redis_service.request_forced_validation_cycle()
         logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
 
+    async def publish_gpu_set_changes(self, job: dict | None) -> None:
+        """Publish at once a passed node that lost a GPU UUID since the spec last published for it.
+
+        The backend rents the GPU UUIDs of the spec it has, and the cycle publishes only once every
+        miner is done (up to ~15 min later); until then every rent of such a node fails the gpu_flags
+        guard (a card back under a new UUID, 27 Oct). Spec-only like the express lane, scored_at None;
+        the cycle's publish overwrites it. A UUID another of the miner's executors reports too waits for
+        the cycle's duplicate pass.
+        """
+        try:
+            if not job or not job.get("miner_coldkey"):
+                return
+            results: list[JobResult] = job.get("results") or []
+            changed = []
+            for result in results:
+                published = self.published_gpu_uuids.get(str(result.executor_info.uuid).lower())
+                current = set(_gpu_uuids(result))
+                if not (published and current and result.is_successful) or published <= current:
+                    continue
+                elsewhere = {
+                    uuid
+                    for other in results
+                    if other is not result and other.is_successful
+                    for uuid in _gpu_uuids(other)
+                }
+                if not current & elsewhere:
+                    changed.append(result)
+            if not changed:
+                return
+            logger.info(
+                _m(
+                    "Publishing nodes whose GPU UUIDs changed ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [str(result.executor_info.uuid) for result in changed],
+                        }
+                    ),
+                ),
+            )
+            await self.publish_machine_specs(
+                changed, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+        except Exception as exc:
+            # never costs the miner its cycle result: the cycle still publishes the node
+            logger.error(
+                _m("Early publish of changed GPU UUIDs failed", extra=get_extra_info({"error": str(exc)})),
+                exc_info=True,
+            )
+
+    async def publish_unreachable_early(self, job: dict | None) -> None:
+        """DAH-5635: publish an unrented node that failed with an availability error as soon as its
+        miner answers, spec-only like publish_gpu_set_changes (scored_at None), so the backend hides
+        it now and not after the slowest miner in the fleet (a node lost at 13:26 was hidden at 13:36
+        and failed a rent meanwhile). ``outage_tally`` decides what may go (RunningOutageTally); the
+        cycle's publish overwrites it. Never fails the wave."""
+        tally = self.outage_tally
+        if not job or tally is None:
+            return
+        try:
+            early = tally.add(job.get("results") or [])
+            if not early or not job.get("miner_coldkey"):
+                return
+            # recorded before the publish: a node hidden by a partial publish must be re-listable too
+            tally.published_early.update(str(result.executor_info.uuid) for result in early)
+            await self.publish_machine_specs(
+                early, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+            logger.info(
+                _m(
+                    "[sync] Unreachable nodes published ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [str(result.executor_info.uuid) for result in early],
+                        }
+                    ),
+                )
+            )
+        except Exception as exc:
+            # never costs the miner its cycle result: the cycle still publishes the node
+            logger.error(
+                _m("Early publish of unreachable nodes failed", extra=get_extra_info({"error": str(exc)})),
+                exc_info=True,
+            )
+
     async def publish_machine_specs(
         self,
         results: list[JobResult],
@@ -1070,6 +1283,12 @@ class MinerService:
             ),
         )
         batch_total = len(results) if is_whole_miner_batch else None
+        if is_whole_miner_batch:
+            for result in results:
+                if result.availability_errors is not None:
+                    self.cycle_published_availability[str(result.executor_info.uuid).lower()] = list(
+                        result.availability_errors
+                    )
         for result in results:
             try:
                 await self.redis_service.publish(
@@ -1138,6 +1357,9 @@ class MinerService:
                     exc_info=True,
                 )
                 continue
+            # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
+            if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
+                self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
             if settings.POD_STATES_REPORT_ENABLED:
                 await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
@@ -1247,6 +1469,17 @@ class MinerService:
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
             )
+        elif isinstance(payload, ContainerStopRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=headline,
+                detail=detail,
+                error_type=FailedContainerErrorTypes.ContainerStopFailed,
+                error_code=error_code,
+            )
         elif isinstance(payload, AddSshPublicKeyRequest):
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -1266,6 +1499,33 @@ class MinerService:
                 workload_kind=payload.workload_kind,
                 msg=detail or headline,
             )
+        elif isinstance(payload, ResetPodGpuRequest):
+            # nothing on the host changed: the reset never reached the executor
+            return PodGpuResetResult(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                request_id=payload.request_id,
+                ok=False,
+                error_code=GpuResetErrorCode.OperationInProgress
+                if error_code == FailedContainerErrorCodes.RentingInProgress
+                else GpuResetErrorCode.ExecutorUnreachable,
+                detail=headline,
+            )
+        elif isinstance(payload, LockPodGpuClocksRequest):
+            # nothing on the host changed: the request never reached the executor
+            return PodGpuClocksResult(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                request_id=payload.request_id,
+                ok=False,
+                error_code=GpuResetErrorCode.OperationInProgress
+                if error_code == FailedContainerErrorCodes.RentingInProgress
+                else GpuResetErrorCode.ExecutorUnreachable,
+            )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -1284,9 +1544,25 @@ class MinerService:
         # DAH-2728: register the create BEFORE the miner handshake — a delete whose handshake is
         # quicker would otherwise reach the executor first and see a pod that does not exist yet.
         if not isinstance(payload, ContainerCreateRequest):
-            return await self._route_container(payload)
+            result = await self._route_container(payload)
+            await self._report_storage_dispatch_failure(payload, result)
+            return result
         with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
             return await self._route_container(payload)
+
+    async def _report_storage_dispatch_failure(self, payload: ContainerBaseRequest, result: object) -> None:
+        """A Restic backup/restore that fails before its runner starts (executor unreachable, old image)
+        reports nothing itself, so the backend waited 20 min and logged "stopped reporting progress".
+        Report the failure now. The backend ignores a second report on a log that is already terminal."""
+        if not isinstance(result, FailedContainerRequest) or getattr(payload, "backup_engine", None) != "restic":
+            return
+        if isinstance(payload, BackupContainerRequest):
+            operation_id, spec = payload.backup_log_id, self._restic_backup_operation_spec(payload)
+        elif isinstance(payload, RestoreContainerRequest) and not payload.recovery:
+            operation_id, spec = payload.restore_log_id, self._restic_restore_operation_spec(payload)
+        else:
+            return
+        await report_launch_failure(UUID(operation_id), spec, RuntimeError(result.msg))
 
     async def _route_container(self, payload: ContainerBaseRequest):
         """Route a container request over the miner's REST API."""
@@ -1330,7 +1606,7 @@ class MinerService:
         )
         return await self._add_debug_ssh_key(payload)
 
-    async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey):
+    async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey, docker_service: DockerService):
         """Handle backup container request."""
         async with asyncssh.connect(
             host=executor_info.address,
@@ -1338,7 +1614,7 @@ class MinerService:
             **await public_host_sock(executor_info.address, executor_info.ssh_port),
             username=executor_info.ssh_username,
             client_keys=[pkey],
-            known_hosts=None,
+            known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
 
             if payload.backup_engine == "restic":
@@ -1346,10 +1622,15 @@ class MinerService:
                 if payload.exclude_patterns and not await supports_workspace_field(
                     ssh_client, executor_info.python_path, "exclude_patterns"
                 ):
-                    raise RuntimeError(
+                    error = RuntimeError(
                         "executor image cannot skip caches and keys (no workspace.exclude_patterns); "
                         "the provider must update the executor image"
                     )
+                    # report the real reason first; the generic dispatch-failure report then finds the log terminal
+                    await report_launch_failure(operation_id, self._restic_backup_operation_spec(payload), error)
+                    raise error
+                if payload.volume_encrypted and payload.container_name:
+                    await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
                 await start_storage_operation(
                     ssh_client,
                     executor_info.python_path,
@@ -1381,11 +1662,9 @@ class MinerService:
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "--source-volume", payload.source_volume,
                 "--backup-path", payload.backup_path,
-                "--auth-token", payload.auth_token,
+                "--secrets-file", await upload_secrets_file(ssh_client, payload.auth_token, payload.backup_volume_info),
                 "--backup-log-id", payload.backup_log_id,
                 "--backup-volume-name", payload.backup_volume_info.name,
-                "--backup-volume-iam_user_access_key", payload.backup_volume_info.iam_user_access_key,
-                "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
                 "--source-volume-path", payload.source_volume_path,
                 "--backup-target-path", payload.backup_target_path,
             ]
@@ -1395,7 +1674,7 @@ class MinerService:
                 check=True,
             )
 
-    async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey):
+    async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey, docker_service: DockerService):
         """Handle restore container request."""
         async with asyncssh.connect(
             host=executor_info.address,
@@ -1403,7 +1682,7 @@ class MinerService:
             **await public_host_sock(executor_info.address, executor_info.ssh_port),
             username=executor_info.ssh_username,
             client_keys=[pkey],
-            known_hosts=None,
+            known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
 
             if payload.backup_engine == "restic":
@@ -1440,11 +1719,9 @@ class MinerService:
                 "--target-volume", payload.target_volume,
                 "--restore-path", payload.restore_path,
                 "--backup-source-path", payload.backup_source_path,
-                "--auth-token", payload.auth_token,
+                "--secrets-file", await upload_secrets_file(ssh_client, payload.auth_token, payload.backup_volume_info),
                 "--restore-log-id", payload.restore_log_id,
                 "--backup-volume-name", payload.backup_volume_info.name,
-                "--backup-volume-iam_user_access_key", payload.backup_volume_info.iam_user_access_key,
-                "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
                 "--target-volume-path", payload.target_volume_path,
             ]
             await ssh_client.run(
@@ -1458,6 +1735,7 @@ class MinerService:
         executor_info: ExecutorSSHInfo,
         payload: CancelStorageOperationRequest,
         pkey: SSHKey,
+        docker_service: DockerService,
     ) -> None:
         async with asyncssh.connect(
             host=executor_info.address,
@@ -1465,7 +1743,7 @@ class MinerService:
             **await public_host_sock(executor_info.address, executor_info.ssh_port),
             username=executor_info.ssh_username,
             client_keys=[pkey],
-            known_hosts=None,
+            known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
             await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
 
@@ -1544,6 +1822,42 @@ class MinerService:
             "X-Timestamp": str(payload.timestamp),
             "X-Signature": signature,
         }
+
+    async def list_executor_ids(self, miner: bittensor.NeuronInfo) -> list[str] | None:
+        """The executor uuids a miner lists for this validator, or None when it does not answer.
+
+        The miner's POST /executors (verify_simple_validator_signature: we sign our own hotkey) is
+        a read of its executor table that installs nothing on the nodes, unlike the cycle's
+        ssh-pubkey-submit. The express lane asks self-hosted miners, whose new nodes the portal
+        snapshot does not list.
+        """
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        extra = {"miner_hotkey": miner.hotkey}
+        try:
+            request = SimpleValidatorRequest(
+                signature=f"0x{my_key.sign(my_key.ss58_address).hex()}",
+                validator_hotkey=my_key.ss58_address,
+            )
+            status, data = await self._make_rest_request(
+                method="POST",
+                url=f"http://{miner.axon_info.ip}:{miner.axon_info.port}/executors",
+                json_data=request.model_dump(),
+                headers={"Content-Type": "application/json"},
+                timeout=REST_EXECUTOR_LIST_TIMEOUT,
+                log_extra=extra,
+                operation_name="executor list",
+            )
+            if status != 200 or data is None:
+                raise ValueError(f"status {status}")
+            return [executor.uuid for executor in ExecutorListResponse.model_validate(data).executors]
+        except Exception as exc:
+            logger.info(
+                _m(
+                    "[express] Miner did not list its executors",
+                    extra=get_extra_info({**extra, "error": str(exc) or type(exc).__name__}),
+                )
+            )
+            return None
 
     async def _make_rest_request(
         self,
@@ -2020,6 +2334,7 @@ class MinerService:
             ssh_service=self.ssh_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+            backend_client=self.task_service.backend_client,
         )
 
         try:
@@ -2044,8 +2359,8 @@ class MinerService:
                 _m("Sent SSH key to miner via REST API.", extra=get_extra_info(default_extra)),
             )
 
-            # A restarting miner refuses connections for about a minute. Nothing has reached it
-            # yet, so a create waits that out instead of failing the renter's pod.
+            # A restarting miner refuses connections for about a minute. A create waits that out instead of
+            # failing the renter's pod; a resubmitted key is harmless, the removal drops every copy.
             deadline = time.monotonic() + MINER_RESTART_WAIT_S
             while True:
                 # The miner accepts a signed timestamp for 10 s only, so each attempt signs anew.
@@ -2061,12 +2376,16 @@ class MinerService:
                         log_extra=default_extra,
                         operation_name="SSH key submit",
                     )
-                    break
+                    # A request held up by the restart reaches the new miner after the signature aged out.
+                    stale = status == 401 and "too old" in str(response_data)
+                    if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
+                        break
                 except aiohttp.ClientConnectorError:
-                    is_create = isinstance(payload, ContainerCreateRequest)
-                    if not is_create or time.monotonic() >= deadline:
+                    # refused: it never reached the miner, so its rental hook did not run and a resubmit must
+                    # run it. A timeout may have run it, and the hook is not idempotent: that create fails.
+                    if not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
                         raise
-                    await asyncio.sleep(MINER_RESTART_RETRY_S)
+                await asyncio.sleep(MINER_RESTART_RETRY_S)
 
             if status != 200 or response_data is None:
                 error_msg = "Failed to submit SSH key"
@@ -2199,6 +2518,9 @@ class MinerService:
                         my_key,
                         private_key.decode("utf-8"),
                     )
+                elif isinstance(payload, ContainerStopRequest):
+                    # DAH-5510: the platform stops a moved pod's old container on the node it left
+                    result = await docker_service.stop_container(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, AddSshPublicKeyRequest):
                     logger.info(
                         _m(
@@ -2218,12 +2540,16 @@ class MinerService:
                     result = await docker_service.remove_ssh_keys(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, InstallJupyterServerRequest):
                     result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, ResetPodGpuRequest):
+                    result = await docker_service.reset_pod_gpus(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, LockPodGpuClocksRequest):
+                    result = await docker_service.lock_pod_gpu_clocks(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, BackupContainerRequest):
-                    result = await self.handle_backup_container_req(executor, payload, ssh_pkey)
+                    result = await self.handle_backup_container_req(executor, payload, ssh_pkey, docker_service)
                 elif isinstance(payload, RestoreContainerRequest):
-                    result = await self.handle_restore_container_req(executor, payload, ssh_pkey)
+                    result = await self.handle_restore_container_req(executor, payload, ssh_pkey, docker_service)
                 elif isinstance(payload, CancelStorageOperationRequest):
-                    result = await self.handle_cancel_storage_operation_req(executor, payload, ssh_pkey)
+                    result = await self.handle_cancel_storage_operation_req(executor, payload, ssh_pkey, docker_service)
                 else:
                     log_text = _m(
                         "Unexpected request",
@@ -2282,7 +2608,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             return self._handle_container_error(
                 payload=payload,
@@ -2395,7 +2721,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             logger.error(log_text)
 
@@ -2535,7 +2861,7 @@ class MinerService:
         except Exception as e:
             log_text = _m(
                 "Resulted in an exception",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({**default_extra, "error": _get_error_details(e)}),
             )
             logger.error(log_text, exc_info=True)
 

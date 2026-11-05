@@ -13,6 +13,7 @@ from services.const import LIUM_INFRA_CONTAINER_PREFIXES
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
+from .rental_owner import rental_of_this_node
 from .gpu_usage import (
     carries_a_rental_prefix,
     lium_workload_containers,
@@ -246,7 +247,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     # A custom image builds in `lium-dind-build-<pod_id>`, which is on no rental list and burns
     # cores. The pod id keeps the name rename-proof: it has to match a pod the BACKEND reports
     # here, the same rule the orphan sweep removes such a container by.
-    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
@@ -421,8 +422,9 @@ class ProviderSideLoadCheck:
     judged, rented or idle alike — the provider cheats the renter in the first case and the
     marketplace in the second.
 
-    A CPU load above the floor zeroes the score; a disk figure above it is logged only. An inability
-    to measure never withholds money — a missing or malformed signal passes silently.
+    Shadow by default like every other money-withholding gate: without
+    PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED the verdict is logged, not scored. An inability to
+    measure never withholds money — a missing or malformed signal passes silently.
     """
 
     check_id = "host.validate.provider_side_load"
@@ -538,8 +540,16 @@ class ProviderSideLoadCheck:
         # it is read once, with no second look, and every docker category nobody enumerated
         # (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
         # node. The shadow week measures the disk numbers before that half is armed.
-        enforce: bool = provider_side_load.is_cpu_above_limit
-        impact = None if enforce else "Disk is observed only: score was NOT changed"
+        enforce: bool = (
+            settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED
+            and provider_side_load.is_cpu_above_limit
+        )
+        if enforce:
+            impact = None
+        elif not provider_side_load.is_cpu_above_limit:
+            impact = "Disk is observed only: score was NOT changed"
+        else:
+            impact = "Shadow observation only: score was NOT changed"
         event = render_message(
             Msg.LOAD_ABOVE_LIMIT,
             ctx=ctx,
