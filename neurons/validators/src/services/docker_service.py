@@ -1698,6 +1698,10 @@ _PARK_KILL_WAIT_SECONDS = 30
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
+# A parked container whose encrypted volume was not mounted at park time holds the renter's writes to the
+# volume path in its own layer (dockerd restarted it by itself, without the gocryptfs mount). It is kept
+# under this prefix after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 
 
 class _UnkillableParkedContainer(Exception):
@@ -9057,11 +9061,15 @@ class DockerService:
         one `docker inspect` asks, so a rebooted legacy rental is not taken for a new one (F-12)."""
         name = f"{POD_CONTAINER_PREFIX}{pod_id}"
         names = (name, name + EDIT_PARKED_SUFFIX)  # an edit parks the old container before the probe
+        kept = f"{KEPT_UNMOUNTED_PREFIX}{pod_id}_"  # an edit may keep the old container under a stamped name
         if host_probe is not None:
-            return any(n in (host_probe.container_names or ()) for n in names)
+            return any(n in names or n.startswith(kept) for n in (host_probe.container_names or ()))
         try:
+            # docker's name filter is a substring match, so grep keeps only names that start with the prefix
             result = await ssh_client.run(
                 " || ".join(f"/usr/bin/docker container inspect {shlex.quote(n)} >/dev/null 2>&1" for n in names)
+                + f" || /usr/bin/docker ps -a --filter name={shlex.quote(kept)} --format '{{{{.Names}}}}'"
+                f" | grep -q {shlex.quote('^' + kept)}"
             )
         except Exception:
             return False

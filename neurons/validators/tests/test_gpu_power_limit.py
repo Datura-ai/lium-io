@@ -298,7 +298,14 @@ async def test_raise_without_redis_never_records_or_raises(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("container_names", "expected"),
-    [(("pod_pod-1",), True), (("pod_pod-1__prev",), True), (("pod_pod-2",), False), (None, False)],
+    [
+        (("pod_pod-1",), True),
+        (("pod_pod-1__prev",), True),
+        (("kept_unmounted_pod-1_1700000000",), True),
+        (("kept_unmounted_pod-10_1700000000",), False),
+        (("pod_pod-2",), False),
+        (None, False),
+    ],
 )
 @pytest.mark.asyncio
 async def test_create_passes_pod_on_host_from_the_prerun_listing(monkeypatch, container_names, expected) -> None:
@@ -333,6 +340,8 @@ async def test_create_without_a_probe_asks_docker_whether_the_pod_is_on_host(mon
     assert raise_mock.await_args.kwargs["pod_on_host"] is expected
     assert "docker container inspect pod_pod-1" in ssh.run.await_args.args[0]
     assert "docker container inspect pod_pod-1__prev" in ssh.run.await_args.args[0]
+    assert "--filter name=kept_unmounted_pod-1_ " in ssh.run.await_args.args[0]
+    assert "grep -q '^kept_unmounted_pod-1_'" in ssh.run.await_args.args[0]
 
 
 @pytest.mark.asyncio
