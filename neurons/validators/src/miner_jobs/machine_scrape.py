@@ -912,6 +912,10 @@ def report_tighter_store(hard_disk, store_usage):
         return
     store = hard_disk_reading(store_usage)
     free_kb = min(store["hard_disk_free"], hard_disk["hard_disk_free"])
+    if hard_disk.get("hard_disk_engy_cache_released_gb"):
+        # a tighter store hides part of data-root's released cache: only what still shows in free was credited
+        lost_gb = -(-(hard_disk["hard_disk_free"] - free_kb) * 1024 // 10**9)
+        hard_disk["hard_disk_engy_cache_released_gb"] = max(hard_disk["hard_disk_engy_cache_released_gb"] - lost_gb, 0)
     utilization = max(store["hard_disk_utilization"], hard_disk["hard_disk_utilization"])
     if store["hard_disk_total"] < hard_disk["hard_disk_total"]:
         hard_disk.update(store)
@@ -1168,6 +1172,7 @@ def get_docker_disk_usage():
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
         "filler_released_kb": (filler_run_volumes + engy_released) // 1024,
+        "engy_released_kb": engy_released // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
         "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
@@ -1189,9 +1194,13 @@ def release_filler_cache(hard_disk):
     # listing floor, the disk a renter is offered and the filler fit checks see that space. The Dolphin cache
     # is not in it: it stays used. The key is dropped: not part of the reported block.
     cache_kb = hard_disk.pop("filler_released_kb", 0)
+    engy_kb = hard_disk.pop("engy_released_kb", 0)
+    # the Engy bytes really counted as free: the backend takes them back off for a job that keeps the cache
+    hard_disk["hard_disk_engy_cache_released_gb"] = 0
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)
+    hard_disk["hard_disk_engy_cache_released_gb"] = min(engy_kb, hard_disk["hard_disk_used"] - used_kb) * 1024 // 10**9
     hard_disk["hard_disk_free"] += hard_disk["hard_disk_used"] - used_kb
     hard_disk["hard_disk_used"] = used_kb
     hard_disk["hard_disk_utilization"] = used_kb / hard_disk["hard_disk_total"] * 100

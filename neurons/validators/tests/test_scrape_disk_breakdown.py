@@ -111,6 +111,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_containers": (282628096 + 1024) // 1024,
         "hard_disk_volumes": 5454000000 // 1024,
         "filler_released_kb": 0,
+        "engy_released_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
         "hard_disk_by_container": {},
         "hard_disk_by_volume": {},
@@ -285,6 +286,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_containers": 0,
         "hard_disk_volumes": 0,
         "filler_released_kb": 0,
+        "engy_released_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
         "hard_disk_by_container": {},
         "hard_disk_by_volume": {},
@@ -1004,6 +1006,7 @@ def test_the_engy_cache_is_reported_as_free_disk_and_the_dolphin_cache_stays_use
         "hard_disk_volumes": 50 * 1024**2,
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
+        "hard_disk_engy_cache_released_gb": 1500 * 1024**3 // 10**9,
         "hard_disk_by_container": {},
         "hard_disk_by_volume": {
             "engy_cache_hf_kimi-k3-0123abcd": 1500 * 1024**2,
@@ -1035,6 +1038,54 @@ def test_an_engy_cache_a_non_filler_container_mounts_stays_used(scrape: dict) ->
     assert usage["filler_released_kb"] == 0
     assert usage["hard_disk_volumes"] == 1500 * 1024**2
     assert usage["hard_disk_engy_cache_used_gb"] == 1500 * 1024**3 // 10**9
+
+
+@pytest.mark.parametrize(
+    "held, store_free_gib, expected_free_gib, expected_released_gib",
+    [
+        # shared filesystem (no separate store): a reclaimable cache is all credited, a held one none of it
+        (False, None, 2000, 1500),
+        (True, None, 500, 0),
+        # a separate store with less room hides part of the credit: only what shows in free was released
+        (False, 1000, 1000, 500),
+        (True, 1000, 500, 0),
+        # a separate store with more room hides nothing
+        (False, 3000, 2000, 1500),
+    ],
+)
+def test_the_engy_cache_credited_to_free_is_reported(
+    scrape: dict, held, store_free_gib, expected_free_gib, expected_released_gib
+) -> None:
+    # Arrange — 1500 GiB Engy cache on a 4000 GiB data-root with 500 GiB free before the release; the backend
+    # subtracts hard_disk_engy_cache_released_gb (not the used size) for a job that keeps the cache
+    mounts = [{"Type": "volume", "Name": "engy_cache_x"}]
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {
+                "LayersSize": 0,
+                "Containers": [{"Names": ["/provider_app" if held else f"/{scrape['FILLER_CONTAINER_PREFIX']}x"], "Mounts": mounts}],
+                "Volumes": [{"Name": "engy_cache_x", "UsageData": {"Size": 1500 * _GiB}}],
+            },
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": []},
+        },
+    )
+    hard_disk = {"hard_disk_total": 4000 * 1024**2, "hard_disk_used": 3500 * 1024**2,
+                 "hard_disk_free": 500 * 1024**2, "hard_disk_utilization": 87.5}
+    store = None
+    if store_free_gib is not None:
+        store = _Usage(8000 * _GiB, (8000 - store_free_gib) * _GiB, store_free_gib * _GiB)
+
+    # Act
+    hard_disk.update(scrape["get_docker_disk_usage"]())
+    scrape["release_filler_cache"](hard_disk)
+    scrape["report_tighter_store"](hard_disk, store)
+
+    # Assert
+    assert hard_disk["hard_disk_free"] == expected_free_gib * 1024**2
+    assert hard_disk["hard_disk_engy_cache_released_gb"] == expected_released_gib * _GiB // 10**9
+    assert hard_disk["hard_disk_engy_cache_used_gb"] == 1500 * _GiB // 10**9
 
 
 def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeypatch) -> None:
@@ -1123,13 +1174,13 @@ def test_a_labelled_volume_the_rental_cleanup_does_not_sweep_stays_used(scrape: 
 
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:
     # Arrange — the host half of the scrape failed, the docker half did not
-    hard_disk = {"hard_disk_volumes": 0, "filler_released_kb": 5}
+    hard_disk = {"hard_disk_volumes": 0, "filler_released_kb": 5, "engy_released_kb": 5}
 
     # Act
     scrape["release_filler_cache"](hard_disk)
 
-    # Assert
-    assert hard_disk == {"hard_disk_volumes": 0}
+    # Assert — nothing was credited to free
+    assert hard_disk == {"hard_disk_volumes": 0, "hard_disk_engy_cache_released_gb": 0}
 
 
 def test_a_capability_check_is_named_and_removed_even_when_it_times_out() -> None:

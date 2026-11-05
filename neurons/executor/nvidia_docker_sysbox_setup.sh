@@ -566,7 +566,8 @@ tighter_df_kb() {
     local dir kb best="" where=""
     for dir in "$DISK_DIR" "$DATA_ROOT"; do
         kb=$(df -Pk "$dir" 2>/dev/null | awk -v c="$1" 'NR == 2 {print $c}')
-        if ! [ "${kb:-0}" -gt 0 ] 2>/dev/null; then
+        # 0 available is a reading (a full disk), not a missing one
+        if ! [[ "$kb" =~ ^[0-9]+$ ]]; then
             [ -n "$best" ] && continue
             return 0
         fi
@@ -624,7 +625,7 @@ check_free_disk_for_node() {
     local data_root free_kb free_gb needed_gb
     resolve_disk_dir || { pf_skip "Free disk for the node — $CTRD_UNKNOWN"; return 0; }
     read -r free_kb data_root <<<"$(tighter_df_kb 4)"
-    [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $DISK_DIR."; return 0; }
+    [[ "$free_kb" =~ ^[0-9]+$ ]] || { pf_skip "Free disk for the node — cannot read the free space of $DISK_DIR."; return 0; }
     free_gb=$(awk -v k="$free_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
     needed_gb=$MIN_FREE_STORAGE_GB
     docker image inspect "$VERIFY_IMAGE" &>/dev/null || needed_gb=$((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB))
