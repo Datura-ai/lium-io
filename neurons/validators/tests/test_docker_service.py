@@ -8759,6 +8759,40 @@ async def test_recover_pod_clears_a_leftover_cgroup_and_starts_once_more(
 
 
 @pytest.mark.parametrize(
+    "cgroup_result, expected_recovered, starts",
+    [
+        pytest.param("removed", True, 2, id="recorded_cgroup_error_cleared_then_started"),
+        pytest.param("busy", False, 1, id="still_busy_left_for_the_next_cycle"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_whose_recorded_error_is_the_leftover_cgroup(
+    docker_service, monkeypatch, cgroup_result, expected_recovered, starts
+):
+    # the failed start saved the cgroup error as State.Error and there is no stale mountpoint to repair:
+    # recovery still runs, so a busy cleanup this cycle is retried on the next one
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    start_existing_container = AsyncMock(side_effect=[RuntimeError(_CGROUP_BUSY_ERROR), None])
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    async def run(command, *_args, **_kwargs):
+        if "--format '{{.Id}}'" in command:
+            return _make_ssh_command_result(stdout=f"{_ORPHANED_TASK_ID}\n")
+        if "cgroup.procs" not in command and "/sys/fs/cgroup" in command:
+            return _make_ssh_command_result(stdout=f"{cgroup_result}\n")
+        return _make_ssh_command_result(stdout="")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _CGROUP_BUSY_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    assert start_existing_container.await_count == starts
+
+
+@pytest.mark.parametrize(
     "status, holds_process, expected",
     [
         ("exited", False, "removed"),

@@ -11800,9 +11800,12 @@ class DockerService:
         # and never matches, so a customer's stop is never overridden.
         # ticket-0729: the same pod can first be stuck behind an orphaned shim of its own old task;
         # that shim is cleared below, then the stale-mountpoint repair runs as usual.
+        # DAH-5834: a start that failed on the old run's leftover cgroup records that error itself,
+        # so it opens recovery too; the start below clears the cgroup and tries once more.
         orphaned_task_id = _orphaned_task_id(container_error or "")
+        stale_cgroup = _is_stale_container_cgroup_error(container_error or "")
         if not container_error or not (
-            orphaned_task_id or _is_stale_vloopback_mountpoint_error(container_error)
+            orphaned_task_id or stale_cgroup or _is_stale_vloopback_mountpoint_error(container_error)
         ):
             return False
         # one recovery per pod at a time: a second check cycle acting on the same stale verdict
@@ -11819,6 +11822,7 @@ class DockerService:
                 container_name=container_name,
                 pod_id=pod_id,
                 orphaned_task_id=orphaned_task_id,
+                stale_cgroup=stale_cgroup,
                 local_volume_path=local_volume_path,
                 default_extra=default_extra,
             )
@@ -11837,6 +11841,7 @@ class DockerService:
         orphaned_task_id: str | None,
         local_volume_path: str | None,
         default_extra: dict[str, Any],
+        stale_cgroup: bool = False,
     ) -> bool:
         log_extra = {**default_extra, "container_name": container_name}
         try:
@@ -11877,8 +11882,8 @@ class DockerService:
                 )
             )
             return False
-        # an orphaned-shim pod may have no stale mountpoint at all; its start is the test
-        if not repaired_volume and not orphaned_task_id:
+        # an orphaned-shim or leftover-cgroup pod may have no stale mountpoint at all; its start is the test
+        if not repaired_volume and not orphaned_task_id and not stale_cgroup:
             logger.warning(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED",
