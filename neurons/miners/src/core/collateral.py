@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import pathlib
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
@@ -30,6 +31,12 @@ from web3._utils.method_formatters import log_entry_formatter
 from web3._utils.request import async_get_response_from_post_request
 from web3.exceptions import ContractLogicError, TransactionNotFound
 from web3.logs import DISCARD
+
+# py_ecc (loaded by eth_account above) raises the limit to 100 000. At that depth a nested JSON body overflows the
+# 8 MB C stack and the process segfaults before RecursionError. Every entry point (miner, connector, cli) imports
+# this module. On Python 3.11 amd64 the json parser survives up to 40 000; legit code needs ~300 (eth_keys point
+# multiply recurses ~256 deep).
+sys.setrecursionlimit(10_000)
 
 logger = logging.getLogger(__name__)
 
