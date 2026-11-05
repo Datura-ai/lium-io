@@ -1883,22 +1883,24 @@ class _EditSwap:
                 )
             await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
         if recover_kept:
-            # it was kept, so it stays kept
-            self.keep_parked = True
             kept.remove(recover_kept)
-        else:
-            # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
-            # Unknown path or an unreadable diff keeps it.
-            self.keep_parked = not await self._layer_safe_to_remove(self.container_name)
-        if self.keep_parked:
-            if kept:
-                # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
-                raise Exception(
-                    f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
-                    "and this one holds renter files under the volume path too; the pod was left as it was"
-                )
-            # parked straight under the kept name, so no later rename can fail and leave it to a sweep or the next edit
-            parked = recover_kept or f"{kept_prefix}{int(time.time())}"
+        for leftover in list(kept):
+            # every edit parks under the kept name, so a clean one is an earlier edit's copy whose removal failed
+            if await self._layer_safe_to_remove(ids_by_name.get(leftover) or leftover):
+                await self._run(f"/usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)} 2>/dev/null || true")
+                kept.remove(leftover)
+        # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
+        # Unknown path or an unreadable diff keeps it.
+        self.keep_parked = not await self._layer_safe_to_remove(recover_kept or self.container_name)
+        if self.keep_parked and kept:
+            # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
+            raise Exception(
+                f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
+                "and this one holds renter files under the volume path too; the pod was left as it was"
+            )
+        # every candidate is parked under the protected kept name, before the stop: no later rename can fail and leave
+        # renter files written during the shutdown to a sweep; a clean one is removed by ID after the edit
+        parked = recover_kept or f"{kept_prefix}{int(time.time())}"
         if not recover_kept:
             renamed = await self._run(
                 f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
@@ -1926,6 +1928,15 @@ class _EditSwap:
                 "[park_current_container] the running container could not be stopped, the pod was left "
                 f"as it was: {(stopped.stderr or '').strip() or f'exit {stopped.exit_status}'}"
             )
+        if not self.keep_parked and not await self._layer_safe_to_remove(container_id):
+            # a write between the running read and the stop (or by its shutdown) shows only on the stopped layer:
+            # decided here, before the replacement exists, so the one-kept limit holds; a failed edit brings it back unmounted
+            self.keep_parked = True
+            if kept:
+                raise Exception(
+                    f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
+                    "and this one wrote renter files under the volume path while it stopped; the pod was restored"
+                )
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
 
@@ -1977,15 +1988,7 @@ class _EditSwap:
         try:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
-                # stale one. Best effort — a wedged remove is left to the stale-container sweep.
-                if not self.keep_parked and not await self._layer_safe_to_remove(self.parked_id):
-                    # park read the layer while the container still ran: a write between that read and the stop
-                    # (or by its shutdown) is only seen now, on the stopped container, so it is kept after all
-                    kept_as = f"{KEPT_UNMOUNTED_PREFIX}{self.container_name.removeprefix(POD_CONTAINER_PREFIX)}_{int(time.time())}"
-                    renamed = await self._run(f"/usr/bin/docker rename {shlex.quote(self.parked_id)} {shlex.quote(kept_as)}")
-                    if renamed.exit_status == 0:
-                        self.parked_name = kept_as
-                    self.keep_parked = True
+                # stale one. Best effort — a wedged remove is left to the next edit's clean-leftover removal.
                 if self.keep_parked:
                     # the renter's files written while the volume was unmounted live only in this container's layer
                     logger.error(
