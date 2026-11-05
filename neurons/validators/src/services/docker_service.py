@@ -1553,6 +1553,10 @@ class AuthorizedKeysWriteFailed(RuntimeError):
     """The volume setup exec mounted the encrypted volume but could not write the renter's keys."""
 
 
+class VolumeSetupExecFailed(RuntimeError):
+    """`docker exec` itself failed for the volume setup (no status of the script's own): the image may have exited."""
+
+
 # DAH-5037: a default job's own last output rides as `container_logs_tail` in the failure detail, so a
 # provider whose image exits at start sees why; the backend's GPU-fault check skips that field. Filler
 # (default-job) containers only: a renter's container output is never read.
@@ -1690,6 +1694,10 @@ async def _explain_add_public_keys_failure(
 # minute apart failed, the third worked)
 _PARK_KILL_SETTLE_SECONDS = 2
 _PARK_KILL_WAIT_SECONDS = 30
+# each SSH command of the edit swap (stop -t 10 included); exit 124 when the host ends it
+_PARK_COMMAND_TIMEOUT_SECONDS = 60
+# the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
+_RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 
 
 class _UnkillableParkedContainer(Exception):
@@ -1743,6 +1751,11 @@ class _EditSwap:
     async def __aenter__(self) -> "_EditSwap":
         return self
 
+    async def _run(self, command: str) -> asyncssh.SSHCompletedProcess:
+        # a wedged dockerd can hang `docker stop`/`kill`/`inspect` forever (a reboot hung until the
+        # connector pod was replaced): the host ends each command (exit 124), the validator bounds the rest
+        return await _run_with_host_timeout(self.ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+
     async def park(self) -> str | None:
         """Rename the running container aside and stop it. None when there is nothing to park."""
         try:
@@ -1756,10 +1769,13 @@ class _EditSwap:
 
     async def _park(self) -> str | None:
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
-        listed = await self.ssh_client.run(
+        listed = await self._run(
             f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
             f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
         )
+        if listed.exit_status != 0:
+            # a host timeout (exit 124) prints nothing: read as "no container", the sweep would remove the pod
+            raise Exception(f"[park_current_container] docker ps exited {listed.exit_status}; the pod was left as it was")
         listing = [line.split() for line in (listed.stdout or "").splitlines() if line.strip()]
         names = {fields[0] for fields in listing}
         ids_by_name = {fields[0]: fields[1] for fields in listing if len(fields) > 1}
@@ -1772,7 +1788,7 @@ class _EditSwap:
             if parked in names:
                 # An earlier edit crashed between park and restore: the parked container is the
                 # customer's only copy. Give it its name back and carry on; never remove it.
-                renamed = await self.ssh_client.run(
+                renamed = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                 )
                 if renamed.exit_status != 0:
@@ -1788,15 +1804,15 @@ class _EditSwap:
         elif parked in names:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
             # the leftover parked one is stale and must not block the rename.
-            await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
-        renamed = await self.ssh_client.run(
+            await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
+        renamed = await self._run(
             f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
         )
         if renamed.exit_status != 0:
             raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
         self.parked_name = parked
         self.parked_id = container_id
-        stopped = await self.ssh_client.run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
+        stopped = await self._run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
         if stopped.exit_status != 0 and not await self._killed_after_failed_stop(parked, stopped):
             # The container cannot be stopped: give it its name back and fail the edit with the
             # pod exactly as it was. This is the wedge that used to surface as RetryError[...]
@@ -1804,16 +1820,16 @@ class _EditSwap:
             # stays set so __aexit__ tries the full restore once more. The kill can still land after
             # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
             # container stays parked for __aexit__ to restore.
-            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
             if running.exit_status == 0 and (running.stdout or "").strip() == "true":
-                renamed_back = await self.ssh_client.run(
+                renamed_back = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                 )
                 if renamed_back.exit_status == 0:
                     self.parked_name = None
             raise (_UnkillableParkedContainer if self.unkillable else Exception)(
                 "[park_current_container] the running container could not be stopped, the pod was left "
-                f"as it was: {(stopped.stderr or '').strip()}"
+                f"as it was: {(stopped.stderr or '').strip() or f'exit {stopped.exit_status}'}"
             )
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
@@ -1821,17 +1837,17 @@ class _EditSwap:
     async def _killed_after_failed_stop(self, parked: str, stopped) -> bool:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
         2026: 12 park failures on 10 hosts, all on dind-lium1). Kill it once; True when Docker reports it stopped within _PARK_KILL_WAIT_SECONDS."""
-        killed = await self.ssh_client.run(f"/usr/bin/docker kill {shlex.quote(parked)}")
+        killed = await self._run(f"/usr/bin/docker kill {shlex.quote(parked)}")
         for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
             await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
-            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
             is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
             if is_stopped:
                 break
         if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
             # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
-            await self.ssh_client.run(DockerCommand.kill_container_processes(parked))
-            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            await self._run(DockerCommand.kill_container_processes(parked))
+            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
             is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
             self.unkillable = not is_stopped
         logger.warning(
@@ -1860,7 +1876,7 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
-                removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
+                removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(
@@ -1889,8 +1905,8 @@ class _EditSwap:
         cards, so it cannot start; the container gets its name back, stopped."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
         q_replacement = shlex.quote(self.replacement_id) if self.replacement_id else q_name
-        await self.ssh_client.run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
-        renamed = await self.ssh_client.run(f"/usr/bin/docker rename {q_parked} {q_name}")
+        await self._run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
+        renamed = await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")
         error: str | None = None
         if renamed.exit_status != 0:
             error = f"docker rename: {(renamed.stderr or '').strip()}"
@@ -1904,11 +1920,12 @@ class _EditSwap:
             return
         elif self.bring_up is not None:
             try:
-                await self.bring_up(self.container_name)
+                async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
+                    await self.bring_up(self.container_name)
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
         else:
-            started = await self.ssh_client.run(f"/usr/bin/docker start {q_name}")
+            started = await self._run(f"/usr/bin/docker start {q_name}")
             if started.exit_status != 0:
                 error = f"docker start: {(started.stderr or '').strip()}"
         extra = get_extra_info({**self.default_extra, "parked": self.parked_name, "restored": error is None})
@@ -2669,7 +2686,7 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
-def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
+def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     # unlink the volume's files on the host, through the executor's view of the host root: the
     # pod's open files stay writable until its processes die, and the kernel drops an unlinked
     # file's unwritten pages at that last close instead of writing them. No `docker run`: with
@@ -2678,14 +2695,15 @@ def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
     # from the validated name and each lookup must answer, so a failed or empty answer can never
     # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
     # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
+    # Only `container_names` may mount it (docker names never hold a space).
     volume = shlex.quote(local_volume)
-    pod = shlex.quote(container_name)
+    allowed = shlex.quote(f" {' '.join(container_names)} ")
     docker = "/usr/bin/docker"
     return (
         f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
         'd=${dm%% *}; m=${dm#* }; '
         f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
-        f'for u in $users; do [ "$u" = {pod} ] || {{ echo "volume in use by $u"; exit 6; }}; done; '
+        f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
@@ -5608,6 +5626,7 @@ class DockerService:
         payload: ContainerCreateRequest,
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
+        killed_fillers: Iterable[str] = (),
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
@@ -5625,6 +5644,10 @@ class DockerService:
         re-create (`local_volume`) mounts a volume already on disk: only its container storage is new, and
         there is no volume to clamp. When df cannot be read the clamp is skipped too; the create then fails
         at the volume step instead of short-changing the renter.
+        A filler this create just killed can still be exiting and mount its Engy cache, so dockerd refuses the
+        `volume rm` (prod 4 Nov, 8x B300): the cache's files are then unlinked on the host (_wipe_volume_cmd), only
+        while every container mounting it is one of ``killed_fillers``; the empty volume is swept later, and a
+        filler asking for it again is charged the whole download (_engy_cache_missing_gb).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -5665,11 +5688,27 @@ class DockerService:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
                 return free_now_gb >= rental_needs_free_gb
 
+            killed: tuple[str, ...] = tuple(killed_fillers)
+
+            def volume_remove(name: str) -> str:
+                # a Dolphin cache is never wiped: its readiness is not measured, so an empty one would read as ready
+                if not killed or not name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+                    return DockerCommand.volume_remove(name)
+                return (
+                    f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
+                    f"( {_wipe_volume_cmd(name, *killed)} ) || true"
+                )
+
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
             removal_failed = False
             try:
                 await evict_cache_volumes_oldest_first(
-                    ssh_client, cache_volumes, remove, rental_fits, evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX
+                    ssh_client,
+                    cache_volumes,
+                    remove,
+                    rental_fits,
+                    evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
+                    volume_remove=volume_remove,
                 )
             except asyncio.CancelledError:
                 raise
@@ -6248,7 +6287,7 @@ class DockerService:
         while wrapped_var == pad_var:
             wrapped_var = _opaque_shell_name()
 
-        async def fail_step(step: str, message: str, result: Any | None = None) -> None:
+        async def fail_step(step: str, message: str, result: Any | None = None, exec_failed: bool = False) -> None:
             exit_status = getattr(result, "exit_status", None)
             stdout = (getattr(result, "stdout", "") or "")[-2000:] if result else ""
             stderr = (getattr(result, "stderr", "") or "")[-2000:] if result else ""
@@ -6274,7 +6313,13 @@ class DockerService:
                     }),
                 )
             )
-            error_class = AuthorizedKeysWriteFailed if step == "add_public_keys" else RuntimeError
+            error_class = (
+                AuthorizedKeysWriteFailed
+                if step == "add_public_keys"
+                else VolumeSetupExecFailed
+                if exec_failed
+                else RuntimeError
+            )
             raise error_class(
                 f"{message} (step={step}, exit_status={exit_status}, stderr={stderr or '<empty>'})"
             )
@@ -6355,10 +6400,9 @@ class DockerService:
             if isinstance(outcome, BaseException):
                 raise outcome
         if setup_result.exit_status != 0:
-            step, message = _VOLUME_SETUP_EXEC_FAILURES.get(
-                setup_result.exit_status, _VOLUME_SETUP_UPLOAD_FAILURE
-            )
-            await fail_step(step, message, setup_result)
+            script_reported_failure = _VOLUME_SETUP_EXEC_FAILURES.get(setup_result.exit_status)
+            step, message = script_reported_failure or _VOLUME_SETUP_UPLOAD_FAILURE
+            await fail_step(step, message, setup_result, exec_failed=script_reported_failure is None)
 
         # The mount is created by root, so on an image whose USER is not root the
         # renter's own workload would own nothing inside its workspace and could
@@ -9970,6 +10014,7 @@ class DockerService:
                         payload=payload,
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
+                        killed_fillers=[name for name in removed_containers if name.startswith(FILLER_CONTAINER_PREFIX)],
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
@@ -10646,6 +10691,30 @@ class DockerService:
                         except AuthorizedKeysWriteFailed as exc:
                             # the mount is up: fail at add_public_keys below, as a separate keys exec did
                             keys_write_failure = exc
+                        except VolumeSetupExecFailed as setup_exc:
+                            # An image whose command exits at start breaks the setup exec itself ("OCI runtime
+                            # exec failed", prod 3 Nov): name the exiting image as the keys step does. The keys
+                            # ride in this exec, and the backend tells the renter only at add_public_keys.
+                            explained = await _explain_add_public_keys_failure(
+                                docker_client,
+                                container_name=container_name,
+                                image=payload.docker_image,
+                                cause=setup_exc,
+                                log_extra=default_extra,
+                            )
+                            if explained is setup_exc:
+                                raise
+                            if isinstance(explained, ImageExitedDuringKeyInjection):
+                                current_step = "add_public_keys"
+                            await _attach_filler_log_tail(
+                                explained,
+                                docker_client,
+                                container_name=container_name,
+                                workload_kind=payload.workload_kind,
+                                environment=custom_options.environment,
+                                log_extra=default_extra,
+                            )
+                            raise explained from setup_exc
                         volume_encryption_status = VolumeEncryptionStatus.ENABLED
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
@@ -12596,6 +12665,15 @@ class DockerService:
                         with _best_effort_delete_step(log, "sweep_wedged_gpus_after_failed_remove"):
                             await _sweep_wedged_gpus_after_teardown(ssh_client, log)
                     raise
+
+                if payload.workload_kind == WorkloadKind.FILLER:
+                    # Review (#1924): the clear before the stop is best-effort, so a Redis blip
+                    # there would leave our claim on a filler that is gone. Clear again now that
+                    # it is gone; a claim already cleared is rewritten unchanged.
+                    with _best_effort_delete_step(log, "reclear_filler_applied_cap"):
+                        await clear_filler_pod_applied_caps(
+                            self.redis_service, payload.pod_id, log_extra=default_extra
+                        )
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.

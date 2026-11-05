@@ -171,7 +171,7 @@ services:
 
   # The validator image plus pytest. The suites import the validator's own services (MinerService, TaskService,
   # DockerService) and run them against the miner and the executor above — the same code path the validator
-  # process takes every cycle, minus the chain (the subtensor client is never constructed).
+  # process takes every cycle, minus the chain (the subtensor client is never connected).
   tester:
     build:
       context: ./tester

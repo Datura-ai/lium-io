@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
-from services.docker_service import DockerService, _filler_run_volume_gb
+from services.docker_service import DockerService, _filler_run_volume_gb, _wipe_volume_cmd
 
 
 @pytest.fixture
@@ -393,6 +393,64 @@ async def test_a_rental_still_short_is_clamped_only_when_a_removal_failed(
         RemovingSshClient([_KIMI, "volume_pod"], free_gb=2389), rental, {}
     ) is True
     assert rental.volume_limit_gb == volume_gb
+
+
+class KilledFillerHostSshClient(HostSshClient):
+    """prod 4 Nov, 8x B300: the filler the create killed is still exiting and mounts kimi-k3, so `volume rm` fails.
+    The wipe unlinks the files (disk freed) only when every user is in its allowed list; the volume stays listed."""
+
+    def __init__(self, users: list[str], **kwargs):
+        super().__init__([_KIMI, "volume_pod"], **kwargs)
+        self.users = users
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command and "/proc/1/root" in command:
+            allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
+            if all(user in allowed for user in self.users):
+                self._free_bytes += 1561 * 1024**3
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_cache_the_killed_filler_still_mounts_is_wiped_and_the_order_keeps_its_size(docker_service):
+    ssh_client = KilledFillerHostSshClient(["filler_79ba7fa2"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=["filler_79ba7fa2"]
+    ) is True
+    assert rental.volume_limit_gb == 2620
+    assert _removed_volumes(ssh_client) == [_KIMI]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("killed_fillers", [[], ["filler_79ba7fa2"]])
+async def test_a_cache_a_live_filler_mounts_is_not_wiped_and_the_order_clamps(docker_service, killed_fillers):
+    ssh_client = KilledFillerHostSshClient(["filler_79ba7fa2", "filler_live"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=killed_fillers
+    ) is True
+    assert rental.volume_limit_gb == 2389 - 1310
+
+
+def test_the_wipe_refuses_a_volume_another_container_mounts():
+    command = _wipe_volume_cmd(_KIMI, "filler_a", "filler_b")
+    assert "ok=' filler_a filler_b '" in command and "exit 6" in command
+    assert 'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} +' in command
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_cache_left_behind_is_swept_and_never_mounted_as_ready(docker_service):
+    # the wipe leaves an empty kimi-k3 volume: another model's filler sweeps it, the same model's is charged it all
+    other = _make_payload(
+        workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name="engy_cache_hf_80gb_other", target="/c")]
+    )
+    assert await docker_service.sweep_stale_cache_volumes(FakeSshClient([_KIMI, "volume_pod"]), other, {}) == [_KIMI]
+
+    ssh_client = DuHostSshClient([_KIMI], free_gb=1200, du_stdout=_kb(0))
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {}) == []
 
 
 @pytest.mark.asyncio
