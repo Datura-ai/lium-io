@@ -31,6 +31,7 @@ from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.local_verify import (
     ROUND_TRIP_CAP_MS_BY_STEP,
+    SCORED_SSH_FALLBACK_RESERVE_SECONDS,
     LocalVerifyCheck,
 )
 from neurons.validators.src.services.task.checks.task_time import task_seconds_left
@@ -1421,11 +1422,70 @@ async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
 
 
 @pytest.mark.asyncio
-async def test_a_scored_cycle_sends_no_verify_call(
+async def test_a_scored_cycle_runs_both_steps_in_one_call_one_after_the_other(
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
-    """Not the first pass: VerifyX is full size and can time out on /verify, then run again over SSH
-    past JOB_TIME_OUT. No call is made; both steps run over SSH."""
+    """DAH-5781: not the first pass, the full-size steps go in one call but never side by side (a
+    full-size VerifyX beside the matmul runs out of RAM). Both passing steps are consumed."""
+    validation = matmul_service(monkeypatch)
+    validation.validate_gpu_model_and_process_job = AsyncMock(
+        side_effect=AssertionError("matmul ran over SSH")
+    )
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        side_effect=AssertionError("VerifyX ran over SSH")
+    )
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            first_pass=False,
+        )
+        local, verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+        )
+    assert executor.intents[0]["parallel_gpu"] is False
+    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
+    assert capability.event.what_we_saw["transport"] == "local_verify"
+    assert verifyx.event.what_we_saw["transport"] == "local_verify"
+
+
+def _with_seconds_left(ctx, seconds: float):
+    return ctx.model_copy(
+        update={
+            "started_at_monotonic": ctx.started_at_monotonic - (task_seconds_left(ctx) - seconds)
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_scored_cycle_leaves_the_job_the_time_to_run_both_steps_again_over_ssh(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
+    """DAH-5781 (2b2add06 reverted): a slow full-size VerifyX that uses the whole /verify timeout
+    must still leave the SSH rerun its reserve before the task is cancelled."""
+    monkeypatch.setattr(settings, "LOCAL_VERIFY_TIMEOUT_SECONDS", 240)
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            first_pass=False,
+        )
+        await LocalVerifyCheck(client_factory=client_factory(keypair)).run(
+            _with_seconds_left(ctx, SCORED_SSH_FALLBACK_RESERVE_SECONDS + 200)
+        )
+    # the ~200 s above the reserve (a second may pass before it is read), minus the margin
+    assert executor.intents[0]["deadline_s"] + EXECUTOR_DEADLINE_MARGIN_SECONDS in (199, 200)
+
+
+@pytest.mark.asyncio
+async def test_a_scored_cycle_with_no_room_beside_the_ssh_reserve_sends_no_call(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     validation.validate_gpu_model_and_process_job = ssh_matmul
@@ -1438,13 +1498,42 @@ async def test_a_scored_cycle_sends_no_verify_call(
             first_pass=False,
         )
         local, verifyx, capability = await run_local_then_consumers(
-            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+            _with_seconds_left(ctx, SCORED_SSH_FALLBACK_RESERVE_SECONDS + 60),
+            LocalVerifyCheck(client_factory=client_factory(keypair)),
         )
     assert executor.intents == []
-    assert local.event.what_we_saw["why"] == "not the first pass"
+    assert local.event.what_we_saw["why"] == "no room for the SSH fallback"
     assert capability.event.what_we_saw["transport"] == "ssh"
     ssh_matmul.assert_awaited_once()
     assert verifyx.event.what_we_saw.get("transport") != "local_verify"
+
+
+@pytest.mark.asyncio
+async def test_the_matmul_of_a_serial_call_is_judged_on_its_own_step_time(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
+    """DAH-5781: one after the other, the round trip also holds the full VerifyX, so a scored call
+    holds the matmul to its cap on its own step time; VerifyX keeps the round trip."""
+    validation = matmul_service(monkeypatch)
+    validation.validate_gpu_model_and_process_job = AsyncMock(
+        side_effect=AssertionError("matmul ran over SSH")
+    )
+    # each step takes 50 ms: the serial round trip is over 100 ms, the matmul step itself is not
+    monkeypatch.setitem(ROUND_TRIP_CAP_MS_BY_STEP, "matmul", 80)
+    async with FakeExecutor(keypair, step_sleep=0.05) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            first_pass=False,
+        )
+        local, _verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+        )
+    assert local.event.what_we_saw["round_trip_ms"] > ROUND_TRIP_CAP_MS_BY_STEP["matmul"]
+    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
+    assert capability.event.what_we_saw["transport"] == "local_verify"
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():

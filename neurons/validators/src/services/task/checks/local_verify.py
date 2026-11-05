@@ -16,11 +16,13 @@ path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the valid
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
-matmul path and a consumed local pass must not skip it). Nothing is sent outside the first pass
-(`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's timeout and then run
-again over SSH, past `JOB_TIME_OUT`; the check is skipped and both steps stay on SSH. The call's
-timeout is at most half the time the job has left, so a slow `/verify` still leaves the SSH
-fallback room. Every outcome is one `[local_verify] outcome` log line with `outcome`, `step` and
+matmul path and a consumed local pass must not skip it). On the first pass the call's timeout
+is at most half the time the job has left. In a scored cycle (`ctx.config.first_pass` off, DAH-5781)
+the full-size steps run one after the other, and the call's timeout leaves the job
+`SCORED_SSH_FALLBACK_RESERVE_SECONDS` for running both steps again over SSH; with less room than
+`SCORED_MIN_VERIFY_SECONDS` no call is sent and both steps stay on SSH. The matmul of a serial call
+is judged on its own step time, since the round trip also holds the full VerifyX. Every outcome
+is one `[local_verify] outcome` log line with `outcome`, `step` and
 `reason` (the per-outcome metric).
 """
 
@@ -84,7 +86,20 @@ ROUND_TRIP_CAP_MS_BY_STEP = {
 }
 
 
-def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
+# DAH-5781: what the job keeps for running both full-size steps again over SSH after a scored
+# /verify that ran out. Measured over SSH: VerifyX 65 s and matmul 72 s on a 1x L4 (temp-dev,
+# 5 Nov); VerifyX p90 149 s across providers (SWEEP_provider_verify). p90 VerifyX + the matmul
+# cap (120 s) + 30 s.
+SCORED_SSH_FALLBACK_RESERVE_SECONDS = 300
+# below this a serial full-size call (VerifyX p50 80 s + the matmul) cannot finish: SSH only
+SCORED_MIN_VERIFY_SECONDS = 120
+
+
+def _over_time(name: str, answer: LocalVerifyAnswer, *, serial: bool = False) -> bool:
+    if serial and name == "matmul":
+        # one after the other, the round trip also holds the full VerifyX (DAH-5781)
+        # the step time is the executor's word, as in the speed log; with none, the round trip
+        return (answer.step(name).ms or answer.round_trip_ms) > ROUND_TRIP_CAP_MS_BY_STEP[name]
     return answer.round_trip_ms > ROUND_TRIP_CAP_MS_BY_STEP[name]
 
 
@@ -139,9 +154,14 @@ class LocalVerifyCheck:
         if get_filler_only_container(ctx):
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
-        if not ctx.config.first_pass:
-            # a full-size VerifyX can time out on /verify, then run again over SSH past JOB_TIME_OUT
-            return self._skipped(ctx, "not the first pass")
+        if ctx.config.first_pass:
+            # half the time left: a /verify that runs out leaves the SSH fallback as much
+            timeout_s = int(task_seconds_left(ctx) / 2)
+        else:
+            # DAH-5781: keep the job the time to run both full-size steps again over SSH
+            timeout_s = int(task_seconds_left(ctx) - SCORED_SSH_FALLBACK_RESERVE_SECONDS)
+            if timeout_s < SCORED_MIN_VERIFY_SECONDS:
+                return self._skipped(ctx, "no room for the SSH fallback")
         if ctx.config.validator_keypair is None:
             return self._fallback(
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
@@ -149,8 +169,7 @@ class LocalVerifyCheck:
 
         matmul_ssh_reason = _matmul_ssh_reason()
         client = self._client_factory(ctx)
-        # half the time the job has left: a /verify that runs out leaves the SSH fallback as much
-        client.timeout_s = max(1, min(client.timeout_s, int(task_seconds_left(ctx) / 2)))
+        client.timeout_s = max(1, min(client.timeout_s, timeout_s))
         advertised = await client.advertised(ctx.executor)
         if CAPABILITY not in advertised.capabilities:
             self._metric(ctx, "fallback", "call", "not_advertised")
@@ -307,7 +326,7 @@ class LocalVerifyCheck:
             reason = _step_reason(step)
             outcome.fallbacks["matmul"] = reason
             self._metric(ctx, "fallback", "matmul", reason, detail=step.error or "", **common)
-        elif _over_time("matmul", answer):
+        elif _over_time("matmul", answer, serial=not ctx.config.first_pass):
             # Past the cap the SSH run would have failed it as timed out; a pass that slow is
             # not consumed — the SSH run decides.
             outcome.fallbacks["matmul"] = "step_overtime"
