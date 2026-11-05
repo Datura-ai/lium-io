@@ -271,6 +271,10 @@ class Settings(BaseSettings):
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
+    # DAH-5301: a reboot resets a hung pod GPU while the pod is stopped. Off = shadow: the hung GPU query runs and
+    # the validator logs the hung GPUs, why, and whether it would reset or refuse; nothing on the host changes and
+    # the backend gets no warning.
+    HUNG_GPU_RESET_ON_REBOOT_ENABLED: bool = Field(env="HUNG_GPU_RESET_ON_REBOOT_ENABLED", default=False)
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
