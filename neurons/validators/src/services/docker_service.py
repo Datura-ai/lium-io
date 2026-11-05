@@ -8232,14 +8232,20 @@ class DockerService:
                         old_ip = str(ipaddress.ip_address((ip_res.stdout or "").strip()))
                 except (asyncio.TimeoutError, ValueError):
                     pass
-                await self._teardown_dind_build(
+                if not await self._teardown_dind_build(
                     ssh_client=ssh_client,
                     dind_name=dind_name,
                     dind_image=dind_image,
                     dind_ip=old_ip,
                     cidrs=cidrs,
                     default_extra=default_extra,
-                )
+                ):
+                    # the old DinD still holds the name, so `docker run --name` would fail; the finally's
+                    # teardown tries it once more with its IP, so its rules go only once it is stopped
+                    dind_ip = old_ip
+                    return CustomBuildOutcome(
+                        False, "build_dind_start", "the previous build container could not be stopped"
+                    )
             # `timeout(1)` on the executor kills the `docker run` (and so the
             # image pull) when it outlives the bound: asyncssh's own `timeout=`
             # only stops waiting, the remote command would run on. The
@@ -8608,6 +8614,49 @@ class DockerService:
                 default_extra=default_extra,
             )
 
+    async def _stop_dind_until_confirmed(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        dind_name: str,
+        dind_ip: str | None,
+        setup_timeout_s: int,
+        default_extra: dict,
+    ) -> bool:
+        """Pause the build DinD (kill it if the pause did not freeze it), retried up to _DIND_STOP_ATTEMPTS.
+
+        True once it is confirmed paused, stopped or gone; a daemon error is none of those."""
+        dind_q = shlex.quote(dind_name)
+        inspect_state_cmd = f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}{{{{.State.Paused}}}}' {dind_q} 2>&1"
+        stop_cmd = (
+            f"/usr/bin/docker pause {dind_q} >/dev/null 2>&1; s=$({inspect_state_cmd}); "
+            f"[ \"$s\" = truefalse ] && {{ /usr/bin/docker kill {dind_q} >/dev/null 2>&1; s=$({inspect_state_cmd}); }}; "
+            f'case "$s" in truetrue|false*|*"No such"*) exit 0;; esac; exit 1'
+        )
+        for attempt in range(1, _DIND_STOP_ATTEMPTS + 1):
+            try:
+                res = await ssh_client.run(stop_cmd, check=False, timeout=setup_timeout_s)
+                if res.exit_status == 0:
+                    return True
+                error = f"exit {res.exit_status}"
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                error = str(exc)
+            logger.warning(
+                _m(
+                    "Custom build DinD pause before teardown failed",
+                    extra=get_extra_info(
+                        {**default_extra, "error": error, "dind_name": dind_name, "attempt": attempt}
+                    ),
+                )
+            )
+        # Its build may still run: keep its network rules (and the DinD holding its IP).
+        logger.error(
+            _m(
+                "Custom build DinD not confirmed stopped; network rules kept",
+                extra=get_extra_info({**default_extra, "dind_name": dind_name, "dind_ip": dind_ip}),
+            )
+        )
+        return False
+
     async def _teardown_dind_build(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -8616,8 +8665,9 @@ class DockerService:
         dind_ip: str | None,
         cidrs: list[str],
         default_extra: dict,
-    ) -> None:
-        """Best-effort teardown of the throwaway DinD container + its egress rules.
+    ) -> bool:
+        """Best-effort teardown of the throwaway DinD container + its egress rules. False when the DinD
+        was not confirmed stopped, so it (and its rules) were kept.
 
         The DNS ACCEPTs go by their tag and the DinD IP (`_egress_filter_script`),
         so the teardown never needs to know which resolvers the apply saw.
@@ -8641,40 +8691,8 @@ class DockerService:
         """
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
-        # A DinD the pause did not freeze is killed. Exit 0 only once it is confirmed
-        # paused, stopped or gone: a daemon error is none of those.
-        dind_q = shlex.quote(dind_name)
-        state = f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}{{{{.State.Paused}}}}' {dind_q} 2>&1"
-        stop_cmd = (
-            f"/usr/bin/docker pause {dind_q} >/dev/null 2>&1; s=$({state}); "
-            f"[ \"$s\" = truefalse ] && {{ /usr/bin/docker kill {dind_q} >/dev/null 2>&1; s=$({state}); }}; "
-            f'case "$s" in truetrue|false*|*"No such"*) exit 0;; esac; exit 1'
-        )
-        for attempt in range(1, _DIND_STOP_ATTEMPTS + 1):
-            try:
-                res = await ssh_client.run(stop_cmd, check=False, timeout=setup_timeout_s)
-                if res.exit_status == 0:
-                    break
-                error = f"exit {res.exit_status}"
-            except Exception as exc:  # noqa: BLE001 — best-effort
-                error = str(exc)
-            logger.warning(
-                _m(
-                    "Custom build DinD pause before teardown failed",
-                    extra=get_extra_info(
-                        {**default_extra, "error": error, "dind_name": dind_name, "attempt": attempt}
-                    ),
-                )
-            )
-        else:
-            # Its build may still run: keep its network rules (and the DinD holding its IP).
-            logger.error(
-                _m(
-                    "Custom build DinD not confirmed stopped; network rules kept",
-                    extra=get_extra_info({**default_extra, "dind_name": dind_name, "dind_ip": dind_ip}),
-                )
-            )
-            return
+        if not await self._stop_dind_until_confirmed(ssh_client, dind_name, dind_ip, setup_timeout_s, default_extra):
+            return False
         if dind_ip:
             try:
                 remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
@@ -8750,6 +8768,7 @@ class DockerService:
                     ),
                 )
             )
+        return True
 
     async def _cleanup_custom_build_artifacts(
         self,

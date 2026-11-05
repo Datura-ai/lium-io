@@ -545,6 +545,36 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
 
 
 @pytest.mark.asyncio
+async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_stops_early(svc, monkeypatch):
+    """DAH-5666: the old DinD still holds the name, so the create stops before `docker run --name` fails on it."""
+    from services.docker_service import inflight_creates
+
+    ssh_client = _make_dind_ssh()
+    inner = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if cmd.startswith("/usr/bin/docker pause "):
+            ssh_client.calls.append(cmd)
+            return _ssh_result(exit_status=1)
+        return await inner(cmd, **kw)
+
+    ssh_client.run = _run
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+
+    with inflight_creates.track(payload.pod_id):
+        ok, step, _ = await svc._custom_build_image(
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+        )
+
+    assert (ok, step) == (False, "build_dind_start")
+    assert not any("run -d --runtime=sysbox-runc" in c for c in ssh_client.calls)
+    # neither stop (the resumed one nor the finally's retry) confirmed it, so its rules and container stay
+    assert not any("-D DOCKER-USER" in c or c.startswith("/usr/bin/docker rm -fv") for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
 async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_rules_go(svc):
     """DAH-5437: a cut-off attempt's build may still run in its DinD; it must never run without the rules."""
     ssh_client = _make_dind_ssh()
@@ -618,7 +648,7 @@ async def test_A27d_the_rules_stay_while_the_build_container_is_not_confirmed_st
         return await inner(cmd, **kw)
 
     ssh_client.run = _run
-    await svc._teardown_dind_build(
+    confirmed = await svc._teardown_dind_build(
         ssh_client=ssh_client,
         dind_name="dind_x",
         dind_image="img",
@@ -627,6 +657,7 @@ async def test_A27d_the_rules_stay_while_the_build_container_is_not_confirmed_st
         default_extra={},
     )
 
+    assert confirmed is False
     assert len(ssh_client.calls) == 3
     assert all(c.startswith("/usr/bin/docker pause dind_x ") for c in ssh_client.calls)
 
