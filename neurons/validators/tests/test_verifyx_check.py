@@ -56,6 +56,7 @@ class DummyVerifyXService:
             "executor_info": executor_info,
             "default_extra": default_extra,
             "machine_spec": machine_spec,
+            "challenge_config_overrides": challenge_config_overrides,
         }
 
         if self.success:
@@ -283,6 +284,44 @@ async def test_verifyx_skips_active_filler_and_reuses_prev_ema(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_skips(context_factory, monkeypatch):
+    """DAH-5742: a stored EMA is not reused forever; the probe runs after MAX_FILLER_SKIPS and the count restarts."""
+    monkeypatch.setattr(verifyx_module, "_filler_skips", {})
+    monkeypatch.setattr(verifyx_module, "MAX_FILLER_SKIPS", 2)
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"network": {"download_speed": 90.0, "upload_speed": 80.0}},
+    )
+    state = build_state(
+        specs={"gpu": {"count": 8}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+            network_ema={
+                "executor-123": NetworkEMA(ema_verifyx_download_speed=182.0, ema_verifyx_upload_speed=161.0)
+            },
+        ),
+    )
+    ctx = context_factory(services=build_services(verifyx=verifyx_service), config=build_context_config(), state=state)
+
+    reasons = [(await VerifyXCheck().run(ctx)).event.reason_code for _ in range(4)]
+
+    assert reasons[:2] == [Msg.FILLER_SKIPPED.reason] * 2
+    assert reasons[2] != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
+    # r4472607210: RAM and disk the filler holds are not tested at full size on the refresh
+    assert verifyx_service.called_with["challenge_config_overrides"] == verifyx_module.FILLER_REFRESH_CHALLENGE_CONFIG
+    # r4472207526: the backend has not stored a new reading (a failed probe stores none), so it probes again
+    assert reasons[3] != Msg.FILLER_SKIPPED.reason
+
+    # the backend stored the probe's reading: the count restarts and skipping resumes
+    ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(
+        ema_verifyx_download_speed=95.0, ema_verifyx_upload_speed=85.0
+    )
+    assert (await VerifyXCheck().run(ctx)).event.reason_code == Msg.FILLER_SKIPPED.reason
+
+
+@pytest.mark.asyncio
 async def test_verifyx_probes_never_measured_node_under_active_filler(context_factory):
     """A filler that starts before the first stored EMA must not leave the node unmeasured."""
     verifyx_service = DummyVerifyXService(
@@ -307,6 +346,7 @@ async def test_verifyx_probes_never_measured_node_under_active_filler(context_fa
     assert result.passed is True
     assert result.event.reason_code != Msg.FILLER_SKIPPED.reason
     assert verifyx_service.called_with is not None
+    assert verifyx_service.called_with["challenge_config_overrides"] is None
     network = result.updates["state"].specs["network"]
     assert network["ema_verifyx_download_speed"] == pytest.approx(510.0)
 
