@@ -854,19 +854,47 @@ def _kept_rename_fails(ssh):
     ssh.run.side_effect = _side
 
 
+def _kept_stop_wedged(ssh):
+    """DinD's lost exit event: `docker stop` and `docker kill` fail; only the direct process kill stops it."""
+    answer = ssh.run.side_effect
+    killed_directly = []
+
+    def _side(cmd, *args, **kwargs):
+        wedged = "did not receive an exit event"
+        if cmd.startswith("/usr/bin/docker stop -t 10 kept_unmounted_") or cmd.startswith("/usr/bin/docker kill kept_unmounted_"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr=f"cannot stop container: tried to kill container, but {wedged}")
+        if "{{.State.Pid}}" in cmd and "kept_unmounted_" in cmd and "/proc/$p/mounts" not in cmd:
+            killed_directly.append(cmd)
+            ssh.commands.append(cmd)
+            return _ssh_result()
+        if "docker inspect -f '{{.State.Running}}' kept_unmounted_" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="false\n" if killed_directly else "true\n")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
+    return killed_directly
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "start_error, status, renamed_back",
+    "start_error, status, renamed_back, stop_wedged",
     [
-        (None, "running", True),  # up with sshd, no remount, then the pod name
-        ("Docker SDK start failed: 500 no such device", "running", False),  # start failed: stays kept
-        (None, "exited", False),  # start returned but the entrypoint already exited: stays kept
-        (None, "restarting", False),  # restart backoff (.State.Running still true): stays kept
-        (None, "running", False),  # running, but the rename to the pod name failed: stopped, stays kept
+        (None, "running", True, False),  # up with sshd, no remount, then the pod name
+        ("Docker SDK start failed: 500 no such device", "running", False, False),  # start failed: stays kept
+        (None, "exited", False, False),  # start returned but the entrypoint already exited: stays kept
+        (None, "restarting", False, False),  # restart backoff (.State.Running still true): stays kept
+        (None, "running", False, False),  # running, but the rename to the pod name failed: stopped, stays kept
+        (None, "running", False, True),  # ... and its stop is wedged: killed via the park path's fallback
     ],
 )
-async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeypatch, start_error, status, renamed_back):
+async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
+    svc, monkeypatch, start_error, status, renamed_back, stop_wedged
+):
     # the remount would hide its layer files, and the retry would then read it as mounted and remove it
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
     payload = _edit_payload()
     ssh = _ssh_recording()
     _report_unmounted(ssh)
@@ -874,6 +902,7 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeyp
         _kept_not_running(ssh, status)
     elif not renamed_back and not start_error:
         _kept_rename_fails(ssh)
+    killed_directly = _kept_stop_wedged(ssh) if stop_wedged else None
     _patch_happy(svc, monkeypatch, ssh)
     docker_client = svc.rental_docker_client_factory.client
     docker_client.start = AsyncMock(side_effect=RuntimeError(start_error) if start_error else None)
@@ -900,7 +929,11 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(svc, monkeyp
         return
     # not running (or not renamed): it is stopped under its kept name, and the next (successful) edit keeps it
     assert _docker(ssh.commands, "rename")[1:] == ([f"/usr/bin/docker rename {kept} {name}"] if status == "running" and not start_error else [])
-    assert ssh.commands[-1] == f"/usr/bin/docker stop -t 10 {kept} 2>/dev/null || true"
+    if stop_wedged:
+        assert killed_directly == [DockerCommand.kill_container_processes(kept)]
+        assert ssh.commands[-1] == f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {kept}"
+    else:
+        assert ssh.commands[-1] == f"/usr/bin/docker stop -t 10 {kept}"
     retry = _ssh_recording(container_present=False)
     retry.kept = [kept]
     _patch_happy(svc, monkeypatch, retry)

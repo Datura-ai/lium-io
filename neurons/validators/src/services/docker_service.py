@@ -1988,7 +1988,10 @@ class _EditSwap:
                 error = f"{type(exc).__name__}: {exc}"
                 # left running under its kept name, nothing would ever stop it or free the pod's GPUs: stopped,
                 # the next edit recovers it as the crashed-edit kept copy
-                await self._run(f"/usr/bin/docker stop -t 10 {q_parked} 2>/dev/null || true")
+                stopped = await self._run(f"/usr/bin/docker stop -t 10 {q_parked}")
+                if stopped.exit_status != 0:
+                    # a wedged DinD stop (no exit event): the park path's kill and direct-process fallback
+                    await self._killed_after_failed_stop(self.parked_name, stopped)
         elif not self.keep_parked and (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
             error = f"docker rename: {(renamed.stderr or '').strip()}"
         elif not start:
