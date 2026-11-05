@@ -540,7 +540,8 @@ class PortConnectivityCheck:
         self, ctx: Context, gate: _PressureGate, extra: dict[str, object], *, busy_ports: set[int]
     ) -> CheckResult:
         """No containers on a Docker root whose sync already stalls: the last completed check's ports are
-        republished (PortCountCheck counts them as today) and sysbox is what the validator's own probe verified
+        republished for the rental probe's ports (PortCountCheck counts none of them: it withholds an idle node's
+        verdict and gives a rented one only its filler ports) and sysbox is what the validator's own probe verified
         (the host's scrape never counts); the sysbox and DinD-miss memories are left as they are."""
         assert gate.memory is not None and gate.reading is not None
         sysbox = gate.sysbox_verified

@@ -461,22 +461,30 @@ def withhold_rollout_verdicts(
     return standing_by_miner, withheld
 
 
+_PORT_CHECK_DEFERRED = PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+
+
 def withhold_renter_gpu_reset_verdicts(
     job_results: dict[str, list[JobResult]],
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
-    """DAH-4658: a scrape held for the renter's own GPU reset gets no verdict, as a rollout failure gets none."""
+    """DAH-4658: a scrape held for the renter's own GPU reset gets no verdict, as a rollout failure gets none.
+    DAH-5851: neither does an idle node's port check deferred for disk pressure; it is never carried, so no
+    idle pay comes from the republished ports."""
     standing_by_miner: dict[str, list[JobResult]] = {}
     withheld: list[WithheldVerdict] = []
     for miner_hotkey, results in job_results.items():
         standing_by_miner[miner_hotkey] = []
         for result in results:
-            if not _held_for_renter_gpu_reset(result):
+            port_check_deferred = result.failure_reason_code == _PORT_CHECK_DEFERRED
+            if not (port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
             withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
             logger.info(
                 _m(
-                    "Verdict withheld: the renter is resetting the node's GPUs",
+                    "Verdict withheld: the port check was deferred for disk pressure"
+                    if port_check_deferred
+                    else "Verdict withheld: the renter is resetting the node's GPUs",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,

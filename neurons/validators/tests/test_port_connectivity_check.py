@@ -1104,6 +1104,33 @@ async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferr
 
 
 @pytest.mark.asyncio
+async def test_a_deferred_cycle_withholds_an_idle_nodes_verdict_and_never_carries_it(context_factory, monkeypatch):
+    """DAH-5851: an idle node (our filler on it) on a deferral is neither hidden for 0 ports nor scored from the
+    republished ones: the run is withheld at the cycle's end, and the renter-GPU-reset carry never picks it up."""
+    from services.executor_rollout import withhold_renter_gpu_reset_verdicts
+    from neurons.validators.src.services.task.checks.port_count import PortCountCheck
+    from neurons.validators.src.services.task.messages import PortCountMessages
+    from tests.test_executor_rollout_grace import _failed
+
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED)
+    _remember(redis_service, ctx, pairs=[(port, port) for port in range(40020, 40044)])
+    connected = await PortConnectivityCheck().run(ctx)
+    counted = await PortCountCheck().run(ctx.model_copy(update=connected.updates))
+
+    assert connectivity.called_with is None
+    reason = PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    assert not counted.passed and counted.event.reason_code == reason
+    assert "listing_hidden" not in counted.event.model_dump_json()
+    standing, withheld = withhold_renter_gpu_reset_verdicts(
+        {"miner": [_failed("deferred-node", reason), _failed("other-node", "INSUFFICIENT_PORTS")]}
+    )
+    assert [w.result.executor_info.uuid for w in withheld] == ["deferred-node"]
+    assert [r.executor_info.uuid for r in standing["miner"]] == ["other-node"]
+
+
+@pytest.mark.asyncio
 async def test_a_remembered_identity_that_changed_is_not_republished(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
     redis_service = DummyRedis()

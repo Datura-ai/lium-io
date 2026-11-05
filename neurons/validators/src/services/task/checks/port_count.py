@@ -158,7 +158,7 @@ class PortCountCheck:
         # cleanup) and frees them, so they join both the count and verified_ports, the set the
         # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
         # a deferred cycle's ports are the last completed check's, not this cycle's: never listed or paid
-        # from (a rental keeps its exemption below)
+        # from (an idle node's verdict is withheld in run, a rental keeps its exemption)
         deferred = ctx.state.port_check_deferred
         probed = [] if deferred else list((ctx.state.specs or {}).get("verified_ports") or [])
         held = (
@@ -190,6 +190,19 @@ class PortCountCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         port_count, is_rented, updated_state = self._count(ctx, ctx.state.rented_data)
+
+        if ctx.state.port_check_deferred and not is_rented:
+            # DAH-5851: the deferral is our own disk-pressure skip, not a reading of the node, so it neither passes
+            # on the republished ports nor fails on none: the cycle's verdict is withheld
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.VERDICT_WITHHELD_PORT_CHECK_DEFERRED,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"republished_port_count": ctx.state.verified_port_count},
+                ),
+            )
 
         split_need = split_port_requirement(ctx.state)
         if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
