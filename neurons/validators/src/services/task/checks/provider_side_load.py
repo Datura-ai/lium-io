@@ -418,9 +418,9 @@ class ProviderSideLoadCheck:
     because he never touches the card.
 
     The verdict comes from the specs the scrape already collects: host CPU minus every Lium
-    container's CPU, and disk used minus the docker breakdown. Above the floors the node is
-    judged, rented or idle alike — the provider cheats the renter in the first case and the
-    marketplace in the second.
+    container's CPU, and disk used minus the docker breakdown. Above the floors an idle node is
+    judged; beside a Lium pod or filler the reading is logged only, since it carries Lium's own
+    load. A workload the provider runs all day shows on the idle cycles.
 
     Shadow by default like every other money-withholding gate: without
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED the verdict is logged, not scored. An inability to
@@ -540,14 +540,15 @@ class ProviderSideLoadCheck:
         # it is read once, with no second look, and every docker category nobody enumerated
         # (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
         # node. The shadow week measures the disk numbers before that half is armed.
-        enforce: bool = (
-            settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED
-            and provider_side_load.is_cpu_above_limit
-        )
+        # beside a Lium pod or filler the host reading carries Lium's own load
+        judged: bool = provider_side_load.is_cpu_above_limit and not lium_workload_containers(ctx)
+        enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED and judged
         if enforce:
             impact = None
         elif not provider_side_load.is_cpu_above_limit:
             impact = "Disk is observed only: score was NOT changed"
+        elif not judged:
+            impact = "Observed only beside a Lium workload: score was NOT changed"
         else:
             impact = "Shadow observation only: score was NOT changed"
         event = render_message(
