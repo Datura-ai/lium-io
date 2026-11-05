@@ -529,6 +529,17 @@ async def test_an_emptied_dolphin_cache_is_charged_its_download_and_a_filled_one
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "granted"), [(100, False), (400, True)])
+async def test_an_unmeasured_dolphin_cache_is_charged_its_download(docker_service, free_gb, granted):
+    # a failed du can hide a wiped volume: charge the download rather than mount it as ready
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=_DPHN[1], target="/c")])
+    payload.volume_limit_gb = 40
+    ssh_client = DuHostSshClient([_DPHN[1]], free_gb=free_gb, du_stdout="")
+
+    assert bool(await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})) is granted
+
+
+@pytest.mark.asyncio
 async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(docker_service, monkeypatch):
     class HangingRemoval(HostSshClient):
         async def run(self, command: str, *args, **kwargs):
