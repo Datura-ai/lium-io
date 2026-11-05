@@ -137,6 +137,7 @@ from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, 
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
+    FLATTEN_SIZING_SLACK_BYTES,
     FlattenMeasureFailed,
     ImageFlattenNoDisk,
     flatten_copy_bytes,
@@ -1215,6 +1216,21 @@ def _neighbours_unwritten_bytes(inspect_stdout: str, container_name: str) -> int
             raise ValueError(f"unreadable storage size {cap!r} on {name}")
         total += max(cap_bytes - int(written or 0), 0)
     return total
+
+
+async def _flatten_sizing_budget(
+    ssh_client: asyncssh.SSHClientConnection, image: str, container_name: str
+) -> int | None:
+    """The disk a full-node create's sizing keeps free for a flatten it may need: the copy (`flatten_copy_bytes`)
+    and, as the flatten's own check does, what the node's other containers may still write. None: no copy."""
+    copy = await flatten_copy_bytes(ssh_client, image)
+    if copy is None:
+        return None
+    try:
+        layers = await ssh_client.run(_WRITABLE_LAYERS_COMMAND, check=True, timeout=120)
+        return copy + _neighbours_unwritten_bytes(str(layers.stdout or ""), container_name)
+    except Exception:  # the copy alone: the flatten's own disk check still guards
+        return copy
 
 
 def sysbox_many_layers_sentence(exc: Exception) -> str | None:
@@ -7809,7 +7825,12 @@ class DockerService:
         if flatten_copy_bytes is not None:
             # the flatten keeps this grant free on top of the copy: leave the copy room before granting
             min_slice_bytes = (payload.min_volume_gb or 0) * _FRESH_SIZING_GB_BYTES * 1.5
-            slice_candidates.append(("flatten_copy", max(df_avail_bytes - flatten_copy_bytes, min_slice_bytes, 0)))
+            slice_candidates.append(
+                (
+                    "flatten_copy",
+                    max(df_avail_bytes - flatten_copy_bytes - FLATTEN_SIZING_SLACK_BYTES, min_slice_bytes, 0),
+                )
+            )
         capped_by, slice_bytes = min(slice_candidates, key=lambda item: item[1])
 
         # -o size= requires a positive integer; floor to at least 1 GB before
@@ -10129,7 +10150,7 @@ class DockerService:
                         and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
                         and _flatten_reserved_bytes(None, None, payload.disk_share) is not None
                     ):
-                        flatten_copy = await flatten_copy_bytes(ssh_client, payload.docker_image)
+                        flatten_copy = await _flatten_sizing_budget(ssh_client, payload.docker_image, container_name)
 
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"

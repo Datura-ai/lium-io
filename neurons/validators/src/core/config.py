@@ -292,9 +292,6 @@ class Settings(BaseSettings):
     # Off: an outside failure is logged ("log-only"), never failed, so prod can count the nodes it would fail
     # (the shadow step). On: a node fails on its second outside failure in a row.
     EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
-    # DAH-5682: both batch attempts ran out of time inside the test container's start (a stuck Docker), so the
-    # semi-batch and fallback tiers are skipped; the DinD probe still runs. Off: the skip is only logged.
-    PORT_PROBE_SKIP_TIERS_ON_HUNG_START: bool = Field(env="PORT_PROBE_SKIP_TIERS_ON_HUNG_START", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
