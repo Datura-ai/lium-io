@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import asyncssh
 import pytest
+from services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
 from services.task.checks.port_connectivity import PortConnectivityCheck
 from services.task.checks.rental_probe import RentalProbeCheck
 from services.task.checks.rented_machine import TenantEnforcementCheck
@@ -151,7 +152,7 @@ async def test_a_check_that_leaves_host_state_is_not_replayed():
 
 
 def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
-    for check in (PortConnectivityCheck, RentalProbeCheck, TenantEnforcementCheck):
+    for check in (PortConnectivityCheck, RentalProbeCheck, TenantEnforcementCheck, GpuMemoryHealthCheck):
         assert check.replays_after_session_drop is False
 
 

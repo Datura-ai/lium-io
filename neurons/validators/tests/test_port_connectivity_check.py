@@ -25,6 +25,7 @@ from neurons.validators.src.services.task.checks.port_connectivity import (
 )
 from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
+from neurons.validators.src.services.task.messages import TenantEnforcementMessages
 
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state
@@ -1693,6 +1694,38 @@ async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
     assert await service.redis.ttl("disk_pressure_deferrals:hk:ex") > 3000
     await service.clear_disk_pressure_deferrals("hk", "ex", shadow=False)
     assert await service.disk_pressure_deferrals("hk", "ex", shadow=False) == 0
+
+
+class _Session:
+    def __init__(self, closed: bool):
+        self.closed = closed
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connectivity",
+    [
+        {"success": False, "status": "error"},
+        {"success": False, "status": "no_working_ports"},
+        # the drop failed only the DinD probe, so two batch ports read as a partial "ok"
+        {"success": True, "verified_port_count": 2, "dind_ok": False},
+        {"success": True, "verified_port_count": 3},
+    ],
+)
+async def test_a_lost_ssh_session_ends_the_run_without_a_ports_verdict(context_factory, connectivity):
+    # the session died, so nothing was measured or saved; the run ends on EXECUTOR_TRANSPORT_UNREACHABLE
+    redis_service = DummyRedis()
+    ctx = _port_ctx(context_factory, redis_service, success=False, connectivity=DummyConnectivityService(**connectivity))
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=True)})
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert (result.passed, result.fatal, result.updates) == (False, True, {})
+    assert result.event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert redis_service.verified_ports == {}
 
 
 class CountingBackendService(DummyBackendService):
