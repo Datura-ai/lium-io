@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from unittest.mock import AsyncMock, Mock
 
@@ -56,8 +57,10 @@ def test_changes_refuse_an_env_value_with_a_line_break():
         image_flatten_changes({"Env": ["A=1\n2"]})
 
 
-def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2"):
+def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0):
     async def run(command, check=False, timeout=None):
+        if command.startswith("/usr/bin/docker info --format '{{json .DriverStatus}}'"):
+            return Mock(exit_status=same_disk_rc, stdout="")
         if command.startswith("/usr/bin/docker info --format '{{.Driver}}'"):
             return Mock(exit_status=0, stdout=f"{driver}\n")
         if command.startswith("/usr/bin/docker image inspect --format"):
@@ -100,12 +103,69 @@ async def test_the_copy_is_built_from_the_inspected_image_id_never_the_mutable_t
 
 
 @pytest.mark.asyncio
-async def test_no_flatten_off_the_classic_overlay2_store():
-    # the containerd store keeps images outside the data root the disk check measures
-    ssh = _ssh(exists=False, driver="overlayfs")
+async def test_no_flatten_on_a_store_off_the_measured_disk():
+    # the containerd store keeps images under containerd's root, which may not be the data root the disk check measures
+    ssh = _ssh(exists=False, driver="overlayfs", same_disk_rc=1)
     with pytest.raises(RuntimeError, match="storage driver"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
-    assert ssh.run.await_count == 1
+    assert ssh.run.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_containerd_store_flattens_when_its_root_shares_the_measured_disk():
+    ssh = _ssh(exists=False, driver="overlayfs")
+    assert await flatten_image_on_host(ssh, "model:dev", lease="r1") == _TAG
+
+
+def _same_disk_rc(tmp_path, *, driver_status: str, config: str | None) -> int:
+    """The real check line against a fake docker whose `run` maps each --mount dst to its src locally."""
+    data_root = tmp_path / "docker"
+    data_root.mkdir()
+    (tmp_path / "etc" / "containerd").mkdir(parents=True)
+    if config is not None:
+        (tmp_path / "etc" / "containerd" / "config.toml").write_text(config)
+    fake = tmp_path / "fake-docker"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        "a = sys.argv[1:]\n"
+        "if a[0] == 'info':\n"
+        f"    print({driver_status!r} if 'DriverStatus' in a[2] else {str(data_root)!r}); sys.exit(0)\n"
+        "mounts, i = {}, 2\n"
+        "while a[i] == '--mount':\n"
+        "    kv = dict(p.split('=', 1) for p in a[i + 1].split(',') if '=' in p); i += 2\n"
+        f"    src = {str(tmp_path)!r} + kv['src'] if kv['src'] == '/etc' else kv['src']\n"
+        "    if not __import__('os').path.isdir(src): sys.exit(125)\n"
+        "    mounts[kv['dst']] = src\n"
+        "script = a[i + 3]\n"
+        "for dst, src in mounts.items(): script = script.replace(dst + '/', src + '/')\n"
+        "sys.exit(subprocess.run(['sh', '-c', script]).returncode)\n"
+    )
+    fake.chmod(0o755)
+    command = image_flatten.containerd_store_on_data_root_command().replace("/usr/bin/docker", str(fake))
+    return subprocess.run(["sh", "-c", command], capture_output=True).returncode
+
+
+_STORE = '[["driver-type","io.containerd.snapshotter.v1"]]'
+
+
+@pytest.mark.parametrize(
+    "driver_status, root, expected_same",
+    [
+        (_STORE, "same", True),
+        (_STORE, "other", False),  # containerd root on another filesystem than the measured data root
+        (_STORE, "missing", False),
+        ('[["Backing Filesystem","zfs"]]', "same", False),  # a classic driver other than overlay2
+    ],
+)
+def test_containerd_store_check_requires_its_root_on_the_data_root_filesystem(
+    tmp_path, driver_status, root, expected_same
+):
+    path = {"same": tmp_path / "ctrd", "other": "/proc", "missing": tmp_path / "nope"}[root]
+    if root == "same":
+        path.mkdir()
+    config = f'version = 2\nroot = "{path}"\n[plugins]\n  root = "/ignored"\n'
+    assert (_same_disk_rc(tmp_path, driver_status=driver_status, config=config) == 0) is expected_same
 
 
 _HEALTH = {"Interval": 30 * 10**9, "Timeout": 5 * 10**9, "StartPeriod": 0, "Retries": 3}

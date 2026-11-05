@@ -3,8 +3,9 @@
 Sysbox 0.7.1 on Docker's classic overlay2 store (and 0.6.6 and older on the containerd store) cannot
 ID-map the relative layer paths Docker uses once an image has more layers than fit in one page of
 overlay mount options (nestybox/sysbox#725, fixed upstream but not in a Sysbox release yet). A
-one-layer copy of the same files starts. Only on classic overlay2: the disk check measures Docker's
-data root, which the containerd store does not write its images to. `docker export | docker import`
+one-layer copy of the same files starts. The disk check measures Docker's data root, so on the
+containerd store (which writes images under containerd's root) it runs only when both share one
+filesystem. `docker export | docker import`
 keeps only the root filesystem, so the image config is put back with `--change`; SHELL (written into a
 shell-form health check instead) and ONBUILD (build-time only) are not carried over.
 """
@@ -14,7 +15,7 @@ import shlex
 
 import asyncssh
 
-from core.docker_utils import df_command, parse_df_available_bytes
+from core.docker_utils import ALPINE_HELPER_IMAGE, df_command, parse_df_available_bytes
 
 FLATTENED_IMAGE_REPO = "lium-flattened"
 # headroom left on the Docker disk after the copy, so the pod and the node still have room to write
@@ -270,6 +271,25 @@ async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: st
     return None if copy is not None and copy.exit_status == 0 else size + FLATTEN_DISK_MARGIN_BYTES
 
 
+def containerd_store_on_data_root_command() -> str:
+    """Exit 0 only on Docker's containerd image store with containerd's root on the filesystem of Docker's
+    data root, the disk every flatten check measures. Docker resolves both bind sources on the node, so a
+    symlinked root counts where it points; a missing root fails the mount and so the check."""
+    # shortcut: reads only a top-level `root` in /etc/containerd/config.toml (no imports, no snapshotter
+    # root_path); a node that moves its images elsewhere that way gets a disk check of the wrong disk
+    root_sed = "sed -n '/^\\[/q; s/^root *= *\"\\(.*\\)\".*/\\1/p' /e/containerd/config.toml"
+    same_fs = '[ "$(stat -c %d /d/.)" = "$(stat -c %d /c/.)" ]'
+    return (
+        "/usr/bin/docker info --format '{{json .DriverStatus}}' | grep -q io.containerd.snapshotter || exit 1; "
+        "root=$(/usr/bin/docker info --format '{{.DockerRootDir}}') || exit 1; "
+        f"croot=$(/usr/bin/docker run --rm --mount type=bind,src=/etc,dst=/e,readonly {ALPINE_HELPER_IMAGE} "
+        f"sh -c {shlex.quote(root_sed)} 2>/dev/null); "
+        '/usr/bin/docker run --rm --mount "type=bind,src=$root,dst=/d,readonly" '
+        '--mount "type=bind,src=${croot:-/var/lib/containerd},dst=/c,readonly" '
+        f"{ALPINE_HELPER_IMAGE} sh -c {shlex.quote(same_fs)}"
+    )
+
+
 async def flatten_image_on_host(
     ssh_client: asyncssh.SSHClientConnection,
     image: str,
@@ -294,7 +314,11 @@ async def flatten_image_on_host(
     )
     # the containerd store reports its snapshotter (e.g. overlayfs) and keeps images outside DockerRootDir
     if str(driver.stdout).strip() != "overlay2":
-        raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
+        same_disk = await ssh_client.run(
+            containerd_store_on_data_root_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
+        )
+        if same_disk.exit_status != 0:
+            raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
     inspect = await ssh_client.run(
         f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}",
         check=True,
