@@ -21,5 +21,7 @@ COPY . .
 
 ENV ENV=prod
 ENV PYTHONUNBUFFERED=1
+# a crash in native code (exit 245 = SIGSEGV through pdm) dumps every thread's Python stack to stderr
+ENV PYTHONFAULTHANDLER=1
 
 CMD ["bash", "run.sh"]
