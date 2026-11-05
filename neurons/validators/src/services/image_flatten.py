@@ -336,13 +336,20 @@ def containerd_daemon_reads_etc_config(daemons: str) -> bool:
     return len(lines) == 1 and lines[0][1:] in _CONTAINERD_CONFIG_ARGS
 
 
-# where containerd writes an image's data under its root: the overlayfs snapshots and the content store.
-# Either can be its own mount (or a symlink to one), so each is checked, not just the root.
-_CONTAINERD_DATA_DIRS = ("io.containerd.snapshotter.v1.overlayfs", "io.containerd.content.v1.content")
+# where containerd writes an image's data under its root: the overlayfs snapshots and the content store, and the
+# children it writes into (snapshots/, ingest/, blobs/sha256/). Any can be its own mount (or a symlink to one),
+# so each is checked, not just the root.
+_CONTAINERD_DATA_DIRS = (
+    "io.containerd.snapshotter.v1.overlayfs",
+    "io.containerd.snapshotter.v1.overlayfs/snapshots",
+    "io.containerd.content.v1.content",
+    "io.containerd.content.v1.content/ingest",
+    "io.containerd.content.v1.content/blobs/sha256",
+)
 
 
 def same_filesystem_as_data_root_command(path: str) -> str:
-    """Exit 0 only when `path` and its snapshot and content directories are on the filesystem of Docker's data
+    """Exit 0 only when `path` and its snapshot and content directories (and the children written into) are on the filesystem of Docker's data
     root, the disk every flatten check measures. Each is its own bind source, which Docker resolves on the node,
     so a symlink counts where it points; a missing path fails the mount and so the check."""
     dirs = [path, *(f"{path.rstrip('/')}/{sub}" for sub in _CONTAINERD_DATA_DIRS)]

@@ -199,6 +199,8 @@ _STORE = '[["driver-type","io.containerd.snapshotter.v1"]]'
 def _ctrd(root, **elsewhere):
     """A containerd root with its snapshot and content directories; `elsewhere` links one to another filesystem."""
     for sub in image_flatten._CONTAINERD_DATA_DIRS:
+        if any(sub.startswith(f"{linked}/") for linked in elsewhere):
+            continue  # under a linked directory: the link decides
         (root / sub).parent.mkdir(parents=True, exist_ok=True)
         if sub in elsewhere:
             (root / sub).symlink_to(elsewhere[sub])
@@ -213,6 +215,9 @@ def _ctrd(root, **elsewhere):
         ("io.containerd.snapshotter.v1.overlayfs", "/proc", False),  # snapshots on another filesystem
         ("io.containerd.content.v1.content", "/proc", False),  # the content store on another filesystem
         ("io.containerd.snapshotter.v1.overlayfs", "/nonexistent", False),  # a dangling link fails the mount
+        ("io.containerd.snapshotter.v1.overlayfs/snapshots", "/proc", False),  # only the snapshots child elsewhere
+        ("io.containerd.content.v1.content/ingest", "/proc", False),  # only the content ingest child elsewhere
+        ("io.containerd.content.v1.content/blobs/sha256", "/proc", False),  # only the content blobs child elsewhere
     ],
 )
 def test_the_snapshot_and_content_dirs_must_share_the_data_root_filesystem(tmp_path, sub, target, expected):
