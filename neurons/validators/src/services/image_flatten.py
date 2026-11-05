@@ -12,6 +12,7 @@ shell-form health check instead) and ONBUILD (build-time only) are not carried o
 
 import json
 import shlex
+import tomllib
 
 import asyncssh
 
@@ -271,23 +272,68 @@ async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: st
     return None if copy is not None and copy.exit_status == 0 else size + FLATTEN_DISK_MARGIN_BYTES
 
 
-def containerd_store_on_data_root_command() -> str:
-    """Exit 0 only on Docker's containerd image store with containerd's root on the filesystem of Docker's
-    data root, the disk every flatten check measures. Docker resolves both bind sources on the node, so a
-    symlinked root counts where it points; a missing root fails the mount and so the check."""
-    # shortcut: reads only a top-level `root` in /etc/containerd/config.toml (no imports, no snapshotter
-    # root_path); a node that moves its images elsewhere that way gets a disk check of the wrong disk
-    root_sed = "sed -n '/^\\[/q; s/^root *= *\"\\(.*\\)\".*/\\1/p' /e/containerd/config.toml"
-    same_fs = '[ "$(stat -c %d /d/.)" = "$(stat -c %d /c/.)" ]'
+_CONTAINERD_DEFAULT_ROOT = "/var/lib/containerd"
+_CONTAINERD_NO_CONFIG_EXIT = 3
+
+
+def containerd_config_command() -> str:
+    """Prints /etc/containerd/config.toml on Docker's containerd image store; exits
+    _CONTAINERD_NO_CONFIG_EXIT when there is none, any other non-zero when not on that store or unreadable."""
+    read = f"[ -e /e/containerd/config.toml ] || exit {_CONTAINERD_NO_CONFIG_EXIT}; cat /e/containerd/config.toml"
     return (
         "/usr/bin/docker info --format '{{json .DriverStatus}}' | grep -q io.containerd.snapshotter || exit 1; "
+        f"/usr/bin/docker run --rm --mount type=bind,src=/etc,dst=/e,readonly {ALPINE_HELPER_IMAGE} "
+        f"sh -c {shlex.quote(read)}"
+    )
+
+
+def containerd_root(config: str | None) -> str | None:
+    """containerd's root from its config text (None: no config file, so the default root), or None when it
+    cannot be told for sure (unparsable, `imports` that may override it, not an absolute path)."""
+    if config is None:
+        return _CONTAINERD_DEFAULT_ROOT
+    try:
+        doc = tomllib.loads(config)
+    except tomllib.TOMLDecodeError:
+        return None
+    # shortcut: an imported file may set root too; refuse rather than read the imports
+    if doc.get("imports"):
+        return None
+    root = doc.get("root", _CONTAINERD_DEFAULT_ROOT)
+    # a comma would split the --mount option the same-disk check binds it with
+    if not isinstance(root, str) or not root.startswith("/") or "," in root:
+        return None
+    return root
+
+
+def same_filesystem_as_data_root_command(path: str) -> str:
+    """Exit 0 only when `path` is on the filesystem of Docker's data root, the disk every flatten check
+    measures. Docker resolves both bind sources on the node, so a symlink counts where it points; a missing
+    path fails the mount and so the check."""
+    same_fs = '[ "$(stat -c %d /d/.)" = "$(stat -c %d /c/.)" ]'
+    return (
         "root=$(/usr/bin/docker info --format '{{.DockerRootDir}}') || exit 1; "
-        f"croot=$(/usr/bin/docker run --rm --mount type=bind,src=/etc,dst=/e,readonly {ALPINE_HELPER_IMAGE} "
-        f"sh -c {shlex.quote(root_sed)} 2>/dev/null); "
         '/usr/bin/docker run --rm --mount "type=bind,src=$root,dst=/d,readonly" '
-        '--mount "type=bind,src=${croot:-/var/lib/containerd},dst=/c,readonly" '
+        f"--mount {shlex.quote(f'type=bind,src={path},dst=/c,readonly')} "
         f"{ALPINE_HELPER_IMAGE} sh -c {shlex.quote(same_fs)}"
     )
+
+
+async def containerd_store_on_data_root(ssh_client: asyncssh.SSHClientConnection) -> bool:
+    """Docker's containerd image store with containerd's root on the filesystem of Docker's data root.
+    False whenever the root cannot be determined, so a flatten never measures the wrong disk."""
+    # shortcut: reads /etc/containerd/config.toml only (no snapshotter root_path); a node that moves its
+    # images elsewhere that way gets a disk check of the wrong disk
+    read = await ssh_client.run(containerd_config_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
+    if read.exit_status not in (0, _CONTAINERD_NO_CONFIG_EXIT):
+        return False
+    root = containerd_root(str(read.stdout) if read.exit_status == 0 else None)
+    if root is None:
+        return False
+    same = await ssh_client.run(
+        same_filesystem_as_data_root_command(root), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
+    )
+    return same.exit_status == 0
 
 
 async def flatten_image_on_host(
@@ -314,10 +360,7 @@ async def flatten_image_on_host(
     )
     # the containerd store reports its snapshotter (e.g. overlayfs) and keeps images outside DockerRootDir
     if str(driver.stdout).strip() != "overlay2":
-        same_disk = await ssh_client.run(
-            containerd_store_on_data_root_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
-        )
-        if same_disk.exit_status != 0:
+        if not await containerd_store_on_data_root(ssh_client):
             raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
     inspect = await ssh_client.run(
         f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}",

@@ -60,7 +60,9 @@ def test_changes_refuse_an_env_value_with_a_line_break():
 def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0):
     async def run(command, check=False, timeout=None):
         if command.startswith("/usr/bin/docker info --format '{{json .DriverStatus}}'"):
-            return Mock(exit_status=same_disk_rc, stdout="")
+            return Mock(exit_status=same_disk_rc, stdout="version = 3\n")
+        if command.startswith("root=$(/usr/bin/docker info --format '{{.DockerRootDir}}')"):
+            return Mock(exit_status=0, stdout="")
         if command.startswith("/usr/bin/docker info --format '{{.Driver}}'"):
             return Mock(exit_status=0, stdout=f"{driver}\n")
         if command.startswith("/usr/bin/docker image inspect --format"):
@@ -142,8 +144,13 @@ def _same_disk_rc(tmp_path, *, driver_status: str, config: str | None) -> int:
         "sys.exit(subprocess.run(['sh', '-c', script]).returncode)\n"
     )
     fake.chmod(0o755)
-    command = image_flatten.containerd_store_on_data_root_command().replace("/usr/bin/docker", str(fake))
-    return subprocess.run(["sh", "-c", command], capture_output=True).returncode
+    async def run(command, check=False, timeout=None):
+        done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", str(fake))], capture_output=True, text=True)
+        return Mock(exit_status=done.returncode, stdout=done.stdout)
+
+    ssh = Mock()
+    ssh.run = AsyncMock(side_effect=run)
+    return 0 if asyncio.run(image_flatten.containerd_store_on_data_root(ssh)) else 1
 
 
 _STORE = '[["driver-type","io.containerd.snapshotter.v1"]]'
@@ -166,6 +173,33 @@ def test_containerd_store_check_requires_its_root_on_the_data_root_filesystem(
         path.mkdir()
     config = f'version = 2\nroot = "{path}"\n[plugins]\n  root = "/ignored"\n'
     assert (_same_disk_rc(tmp_path, driver_status=driver_status, config=config) == 0) is expected_same
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        ("version = 3\nroot = '{same}'\n", True),  # the reviewer's config: literal-string root, version 3
+        ('version = 2\nroot = "{same}"\n', True),
+        ('root="{same}" # comment\n', True),
+        ("version = 3\nroot = '{other}'\n", False),  # points at another filesystem: never the default root
+        ("version = 3\nroot = '{same}\n", False),  # unparsable: refuse, never assume
+        ("imports = ['/etc/containerd/conf.d/*.toml']\nroot = '{same}'\n", False),  # imports may move it
+        ("root = 'relative/ctrd'\n", False),
+    ],
+)
+def test_containerd_root_comes_from_the_config_or_the_check_refuses(tmp_path, config, expected):
+    (tmp_path / "ctrd").mkdir()
+    if config is not None:
+        config = config.format(same=tmp_path / "ctrd", other="/proc")
+    rc = _same_disk_rc(tmp_path, driver_status=_STORE, config=config)
+    assert (rc == 0) is expected
+
+
+def test_the_default_root_is_used_only_without_a_config_file():
+    assert image_flatten.containerd_root(None) == "/var/lib/containerd"
+    assert image_flatten.containerd_root("version = 3\n[plugins]\n  root = '/x'\n") == "/var/lib/containerd"
+    assert image_flatten.containerd_root("version = 3\nroot = '/mnt/ssd/containerd'\n") == "/mnt/ssd/containerd"
+    assert image_flatten.containerd_root("root = [") is None
 
 
 _HEALTH = {"Interval": 30 * 10**9, "Timeout": 5 * 10**9, "StartPeriod": 0, "Retries": 3}
