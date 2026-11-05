@@ -1874,7 +1874,13 @@ class _EditSwap:
                 return None
         elif parked in names:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
-            # the leftover parked one is stale and must not block the rename.
+            # the leftover parked one is stale and must not block the rename. Its layer may hold renter
+            # files (the earlier edit could not rename it to the kept name): then it stays and the edit stops.
+            if not await self._layer_safe_to_remove(ids_by_name.get(parked) or parked):
+                raise Exception(
+                    f"[park_current_container] a parked container from an earlier edit ({parked}) holds renter "
+                    "files under the volume path; the pod was left as it was"
+                )
             await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
         if recover_kept:
             # it was kept, so it stays kept
@@ -1883,12 +1889,7 @@ class _EditSwap:
         else:
             # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
             # Unknown path or an unreadable diff keeps it.
-            checked = (
-                await self._run(_layer_data_check(self.container_name, self.plaintext_path))
-                if self.plaintext_path
-                else None
-            )
-            self.keep_parked = checked is None or (checked.stdout or "").strip() != _DROP_MARK
+            self.keep_parked = not await self._layer_safe_to_remove(self.container_name)
         if self.keep_parked:
             if kept:
                 # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
@@ -1927,6 +1928,13 @@ class _EditSwap:
             )
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
+
+    async def _layer_safe_to_remove(self, container: str) -> bool:
+        """True only when the layer check says the container holds no renter files under the plaintext path."""
+        if not self.plaintext_path:
+            return False
+        checked = await self._run(_layer_data_check(container, self.plaintext_path))
+        return (checked.stdout or "").strip() == _DROP_MARK
 
     async def _killed_after_failed_stop(self, parked: str, stopped) -> bool:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
@@ -1970,6 +1978,14 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
+                if not self.keep_parked and not await self._layer_safe_to_remove(self.parked_id):
+                    # park read the layer while the container still ran: a write between that read and the stop
+                    # (or by its shutdown) is only seen now, on the stopped container, so it is kept after all
+                    kept_as = f"{KEPT_UNMOUNTED_PREFIX}{self.container_name.removeprefix(POD_CONTAINER_PREFIX)}_{int(time.time())}"
+                    renamed = await self._run(f"/usr/bin/docker rename {shlex.quote(self.parked_id)} {shlex.quote(kept_as)}")
+                    if renamed.exit_status == 0:
+                        self.parked_name = kept_as
+                    self.keep_parked = True
                 if self.keep_parked:
                     # the renter's files written while the volume was unmounted live only in this container's layer
                     logger.error(

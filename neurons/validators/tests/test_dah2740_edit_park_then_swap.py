@@ -195,6 +195,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
         host_key,
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+        # the layer read again on the stopped container, right before its removal
+        _layer_data_check(f"id-{name}", "/root"),
         f"/usr/bin/docker rm -fv id-{name}",
     ]
 
@@ -980,6 +982,47 @@ async def test_edit_keeps_a_parked_container_that_ran_without_its_encrypted_volu
         assert _docker(ssh.commands, "rm -fv id-") == []
     else:
         assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
+
+
+@pytest.mark.asyncio
+async def test_a_write_between_the_layer_read_and_the_stop_keeps_the_parked_container(svc, monkeypatch):
+    # park read the layer while the container ran; renter files landed before (or during) the stop:
+    # the read on the stopped container, right before removal, keeps it under the kept name
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    answer = ssh.run.side_effect
+    name = _pod_name(payload)
+
+    def _side(cmd, *args, **kwargs):
+        if "/usr/bin/docker diff" in cmd and f"id-{name}" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert _docker(ssh.commands, "rm -fv id-") == []
+    last_rename = _docker(ssh.commands, "rename")[-1].split()
+    assert last_rename[2] == f"id-{name}" and last_rename[3].startswith(f"kept_unmounted_{payload.pod_id}_")
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_parked_container_with_renter_files_is_never_removed(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    ssh.parked_present = True
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert _docker(ssh.commands, "rm -fv") == [] and _docker(ssh.commands, "rename") == []
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
 
 
 def _kept_not_running(ssh, status):
