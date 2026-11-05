@@ -27,6 +27,7 @@ from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
+from .node_account import NodeAccountCheck
 from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
 from .pinned_memory_probe import PinnedMemoryProbeCheck
@@ -57,7 +58,7 @@ from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
-from .verifyx import VerifyXCheck
+from .verifyx import VerifyXCheck, VerifyXColdRetryCheck
 
 __all__ = [
     "BannedGpuCheck",
@@ -95,6 +96,7 @@ __all__ = [
     "SshdAuthLogCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
+    "NodeAccountCheck",
     "NvlinkFaultCheck",
     "NvmlDigestCheck",
     "PinnedMemoryProbeCheck",
@@ -121,4 +123,5 @@ __all__ = [
     "SshdBootstrapCheck",
     "UploadFilesCheck",
     "VerifyXCheck",
+    "VerifyXColdRetryCheck",
 ]

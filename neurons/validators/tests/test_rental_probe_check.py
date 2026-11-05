@@ -1507,7 +1507,9 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     assert ids.index("RentalProbeCheck") == ids.index("RentalVerificationCheck") + 1
     # DAH-5320: only the shadow idle disk write sits between the probe and scoring
     assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
-    assert ids.index("IdleDiskWriteCheck") == ids.index("ScoreCheck") - 1
+    # DAH-5462: then VerifyX's cold-sample retry, in the time every other check left
+    assert ids.index("IdleDiskWriteCheck") == ids.index("VerifyXColdRetryCheck") - 1
+    assert ids.index("VerifyXColdRetryCheck") == ids.index("ScoreCheck") - 1
     assert ids.index("RentalProbeCheck") > ids.index("PortConnectivityCheck")
     assert ids.index("RentalProbeCheck") > ids.index("TenantEnforcementCheck")
     dry = [
@@ -1515,7 +1517,7 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     ]
     assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
     fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
-    assert fast[-4:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck"]
+    assert fast[-5:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
 
 
 @pytest.mark.asyncio
@@ -1716,7 +1718,7 @@ async def test_a_filler_node_is_probed_beside_its_filler():
         result = await RentalProbeCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
-    assert docker.create_options == [{"beside_fillers": True}]
+    assert docker.create_options == [{"beside_fillers": True, "synthetic_probe": True}]
     assert redis.stamped()
 
 
@@ -1741,7 +1743,7 @@ async def test_a_probe_on_a_node_without_a_filler_creates_with_beside_fillers_of
     with probe_settings(), renter_path():
         await RentalProbeCheck().run(ctx)
 
-    assert docker.create_options == [{"beside_fillers": False}]
+    assert docker.create_options == [{"beside_fillers": False, "synthetic_probe": True}]
 
 
 @pytest.mark.asyncio

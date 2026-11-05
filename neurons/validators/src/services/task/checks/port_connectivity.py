@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import TypedDict
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
-from services.const import DEFAULT_JOB_OWNER_LIUM, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
+from services.const import DEFAULT_JOB_OWNER_LIUM, MIN_PORT_COUNT, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
 from services.redis_service import VerifiedPortsMemory
 
@@ -147,6 +147,11 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        # imported here: port_count also imports from this module, so a top-level import is circular
+        from .port_count import split_port_requirement
+
+        split_need = split_port_requirement(ctx.state)
+
         gate = await self._disk_pressure_gate(ctx, rented_data, rented_executor, filler_ports)
         if gate.deferred:
             return await self._deferred(ctx, gate, extra, busy_ports=set(rented_ports) | set(filler_ports))
@@ -173,6 +178,10 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
+            # a rented node is exempt from the split requirement (PortCountCheck), so only the floor applies;
+            # one whose every listed pod is stale is re-probed to its split target by TenantEnforcementCheck
+            min_ports=split_need[1] if split_need and not (rented_executor and rented_executor.pods)
+            else MIN_PORT_COUNT,
             dind_deadline_monotonic=time.monotonic() + task_seconds_left(ctx) - CHECKS_AFTER_DIND_RESERVE_SECONDS,
         )
         if _ssh_session_closed(ctx.ssh):
@@ -242,6 +251,8 @@ class PortConnectivityCheck:
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
             externally_unreachable=result.status == "externally_unreachable",
+            host_runtime_fault=result.host_runtime_fault,
+            external_probe_blocked=result.external_probe == "blocked",
         )
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
