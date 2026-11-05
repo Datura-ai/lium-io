@@ -108,6 +108,8 @@ UPLOAD_SSH_KEY_BUDGET_SECONDS = VALIDATOR_SSH_SUBMIT_TIMEOUT_SECONDS - UPLOAD_SS
 UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS = 1.0
 # a retry with less time than this left cannot get the executor's answer (it collects attestation)
 UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS = 3.0
+# the validator's clock starts when it signs the request; a request queued longer than this is read as clock skew
+MAX_REQUEST_PICKUP_LAG_SECONDS = 10.0
 
 
 class PubkeyRegistration(pydantic.BaseModel):
@@ -504,6 +506,7 @@ class ExecutorService:
         nonce: str | None = None,
         validator_miner_signature: str | None = None,
         is_rental_request: bool = False,
+        requested_at: float | None = None,
     ) -> PubkeyRegistration:
         """Register pubkeys to executors for given validator.
 
@@ -512,6 +515,8 @@ class ExecutorService:
             pubkey (bytes): SSH pubkey from validator.
             nonce (Optional[str]): Validator attestation challenge, relayed to
                 each executor untouched (covered by validator_signature).
+            requested_at (Optional[float]): Unix time the validator signed the request (X-Timestamp);
+                the budget then counts from it, not from when this miner picked the request up
 
         Return:
             PubkeyRegistration: the executors the miner lists for the validator, and the SSH
@@ -521,6 +526,9 @@ class ExecutorService:
         budget = UPLOAD_SSH_KEY_BUDGET_SECONDS
         if is_rental_request and settings.RENTAL_REQUEST_HOOK:
             budget -= RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS
+        if requested_at is not None:
+            # DAH-5734: in a wave of ~200 requests the pickup came 2-7 s late and the answer still missed the 30 s
+            budget -= min(max(0.0, time.time() - requested_at), MAX_REQUEST_PICKUP_LAG_SECONDS)
         deadline = time.monotonic() + budget
         executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
@@ -535,9 +543,14 @@ class ExecutorService:
             for executor in executors
         ]
 
-        results = [
-            result for result in await asyncio.gather(*tasks, return_exceptions=True) if result
-        ]
+        # DAH-5734: answer by the deadline with the uploads that finished. Attempt 1 always gets its full 10 s, so a few
+        # dead executors could push the answer past the validator's 30 s and it then skipped the whole hotkey (4 Nov).
+        done, pending = set(), set()
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=max(0.0, deadline - time.monotonic()))
+        for task in pending:
+            task.cancel()
+        results = [task.result() for task in done if not task.exception() and task.result()]
         logger.info(
             _m( 
                 "Sent pubkey register to executors",
@@ -547,6 +560,7 @@ class ExecutorService:
                     "executor_ids": [str(executor.uuid) for executor in executors],
                     "executors": len(executors),
                     "accepted_executors": len(results),
+                    "cut_off_at_deadline": len(pending),
                 }),
             ),
         )

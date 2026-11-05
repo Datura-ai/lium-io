@@ -25,8 +25,6 @@ logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
 MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS = 10.0
-# what the checks after VerifyX (matmul, ports, DinD, cleanup) take on a slow node, 4 Nov prod
-COLD_RETRY_TAIL_RESERVE_SECONDS = 180
 _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 # A host can bring on a real Cloudflare 429 by flooding speed.cloudflare.com from its own IP just
@@ -41,7 +39,17 @@ _kept_upload_probes: dict[tuple[str, str], int] = {}
 # gated on the package reading are counted the same way; past this many each one is logged, and
 # the missing capacity reading is fed as the 0 it is.
 MAX_PACKAGE_FALLBACK_PROBES = 8
+# DAH-5723: what the checks after VerifyX need of the task's time; a cold-sample retry that would eat it is skipped
+# (a slow first run plus its retry overran the task timeout and the node got no report at all).
+COLD_RETRY_RESERVE_SECONDS = 150
 _package_fallback_probes: dict[tuple[str, str], int] = {}
+# DAH-5742: an idle filler-only node keeps its stored EMA for at most this many skips in a row (~24 h of
+# job cycles); then it is probed once, so a slower link than the stored figure shows up.
+# shortcut: per process, so a validator restart starts the count again; a backend-held measured-at would survive it.
+MAX_FILLER_SKIPS = 96
+# (skips, the stored EMA they reused): the count restarts only once the backend stores a new reading, so a failed
+# day-probe (stored only on a passing cycle) probes again next cycle instead of skipping another day on the old speed
+_filler_skips: dict[tuple[str, str], tuple[int, tuple]] = {}
 
 
 @dataclass(frozen=True)
@@ -91,7 +99,14 @@ class VerifyXCheck:
         # score 0 every cycle and stay hidden for as long as the filler runs.
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
         # filler runs, and a fresh sample is what lets it recover.
-        if (
+        skip_key = (ctx.miner_hotkey, ctx.executor.uuid)
+        stored = (
+            (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if stored_ema else None
+        )
+        skips, skipped_on = _filler_skips.get(skip_key, (0, stored))
+        if skipped_on != stored:
+            skips = 0
+        reusable = (
             filler_container
             and stored_ema
             and stored_ema.ema_verifyx_download_speed is not None
@@ -99,7 +114,11 @@ class VerifyXCheck:
                 stored_ema.ema_verifyx_upload_speed is None
                 or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
-        ):
+        )
+        # a day of reuse is up: this probe refreshes the network reading only (r4472607210)
+        filler_refresh = bool(reusable) and skips >= MAX_FILLER_SKIPS
+        if reusable and not filler_refresh:
+            _filler_skips[skip_key] = (skips + 1, stored)
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -124,6 +143,8 @@ class VerifyXCheck:
         sizing = (
             {"challenge_config_overrides": _first_pass_challenge_config()}
             if ctx.config.first_pass
+            else {"challenge_config_overrides": FILLER_REFRESH_CHALLENGE_CONFIG}
+            if filler_refresh
             else {}
         )
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
@@ -132,7 +153,7 @@ class VerifyXCheck:
         # over SSH exactly as before.
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
-        first_started = time.monotonic()
+        first_run_started = time.monotonic()
         if local is not None and local.verifyx is not None:
             result = local.verifyx
             transport = "local_verify"
@@ -152,16 +173,14 @@ class VerifyXCheck:
         )
 
         cold_sample_retry: ColdSampleRetry | None = None
-        # The retry takes about as long as the first run; it must leave the rest of the task its
-        # time, or the task is cut off with no result at all (DAH-5781). shortcut: a local first
-        # answer counts as 0 s, while its retry runs over SSH; fine while local verify is fast.
-        first_run_s = time.monotonic() - first_started
-        retry_fits = task_seconds_left(ctx) - first_run_s >= COLD_RETRY_TAIL_RESERVE_SECONDS
+        # the retry runs over SSH and is expected to take as long as an SSH first run did
+        # shortcut: a consumed local answer took ~0 s here, so only the reserve is checked; time LocalVerifyCheck if that overruns
+        retry_fits = task_seconds_left(ctx) > time.monotonic() - first_run_started + COLD_RETRY_RESERVE_SECONDS
         if _is_cold_sample_below_gate(ctx, result, prev_ema) and not retry_fits:
             logger.info(
                 _m(
-                    "VerifyX cold first sample not re-measured: no time left in the task",
-                    extra=get_extra_info({**ctx.default_extra, "first_run_s": round(first_run_s)}),
+                    "VerifyX cold first sample below the gate, no time left to re-measure",
+                    extra=get_extra_info({**ctx.default_extra, "task_seconds_left": int(task_seconds_left(ctx))}),
                 )
             )
         elif _is_cold_sample_below_gate(ctx, result, prev_ema):
@@ -394,6 +413,16 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EXECUTOR_CRASH": Msg.VERIFY_FAILED_EXECUTOR_CRASH,
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
+}
+
+
+# DAH-5742 (r4472607210): the RAM and disk a filler holds are ours (lium-platform keeps a 50 GiB disk and 4 GiB RAM
+# reserve beside it), so the day's refresh tests them at 1 GB and keeps the network legs and the EMA gates as they are
+FILLER_REFRESH_CHALLENGE_CONFIG = {
+    "memory_min_test_gb": 1,
+    "memory_max_test_gb": 1,
+    "storage_min_available_gb": 1,
+    "storage_throughput_test_gb": 1,
 }
 
 

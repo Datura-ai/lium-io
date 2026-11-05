@@ -102,21 +102,6 @@ async def test_failed_network_probe_on_first_sample_is_retried(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_no_retry_when_it_would_leave_the_rest_of_the_task_no_time(context_factory):
-    # 4 Nov prod: a 320 s first run on a new node, re-measured, cut the task off at 780 s.
-    service = _ProbeSequence(_probe(None), _probe(300.0))
-    ctx = _ctx(context_factory, service, _never_measured())
-    # 130 s left in the task
-    ctx = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
-
-    result = await VerifyXCheck().run(ctx)
-
-    assert service.calls == 1
-    assert result.passed is False
-    assert "cold_sample_retry" not in result.event.what_we_saw
-
-
-@pytest.mark.asyncio
 async def test_a_worse_retry_keeps_the_first_sample(context_factory):
     service = _ProbeSequence(_probe(70.0), _probe(30.0))
 
@@ -183,3 +168,18 @@ async def test_ram_or_disk_failure_on_the_first_sample_is_not_retried(context_fa
     assert service.calls == 1
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+
+
+@pytest.mark.asyncio
+async def test_a_cold_sample_is_not_re_measured_when_the_retry_would_outrun_the_task(context_factory, monkeypatch):
+    # DAH-5723: a slow first run plus its retry overran the task timeout and the node got no report
+    from neurons.validators.src.services.task.checks import verifyx
+
+    monkeypatch.setattr(verifyx, "task_seconds_left", lambda ctx: verifyx.COLD_RETRY_RESERVE_SECONDS - 1)
+    service = _ProbeSequence(_probe(40.0))
+
+    result = await VerifyXCheck().run(_ctx(context_factory, service, _never_measured()))
+
+    assert service.calls == 1
+    assert result.passed is False
+    assert "cold_sample_retry" not in result.event.what_we_saw

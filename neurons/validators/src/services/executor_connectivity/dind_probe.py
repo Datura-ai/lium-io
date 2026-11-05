@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import socket
+import time
 from typing import Any
 
 import asyncssh
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 # Long enough for a first pull of the DinD image. It is enforced on the node (`timeout -s KILL`): cancelling only
 # our SSH wait leaves the remote CLI running, and it could create the container after the removal in `finally`.
 DIND_RUN_TIMEOUT_SECONDS = 180
+# the shortest create a cycle short on time still gets; the caller's deadline keeps time for the checks after this one
+DIND_MIN_RUN_TIMEOUT_SECONDS = 30
 # our own wait on top of it, for an SSH channel that hangs after the remote command is gone
 DIND_RUN_SSH_GRACE_SECONDS = 30
 DIND_SSH_READY_TIMEOUT_SECONDS = 30
@@ -171,10 +174,17 @@ class DindVerifier:
         container_name_prefix: str,
         sysbox: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
-        """Verify DinD on port."""
+        """Verify DinD on port. `deadline_monotonic`: the cycle time budget the create must end within."""
         name = f"{container_name_prefix}_{port.external}"
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
+        run_timeout = DIND_RUN_TIMEOUT_SECONDS
+        if deadline_monotonic is not None:
+            left = int(deadline_monotonic - time.monotonic())
+            run_timeout = max(DIND_MIN_RUN_TIMEOUT_SECONDS, min(run_timeout, left))
+            if run_timeout < DIND_RUN_TIMEOUT_SECONDS:
+                log_ctx["run_timeout"] = run_timeout
         created = False
         sshd_answered = False
         sysbox_timed_out = False
@@ -186,8 +196,8 @@ class DindVerifier:
             cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
             logger.debug("run: %s...", cmd[:100])
 
-            cmd = f"timeout -s KILL {DIND_RUN_TIMEOUT_SECONDS} {cmd}"
-            async with asyncio.timeout(DIND_RUN_TIMEOUT_SECONDS + DIND_RUN_SSH_GRACE_SECONDS):
+            cmd = f"timeout -s KILL {run_timeout} {cmd}"
+            async with asyncio.timeout(run_timeout + DIND_RUN_SSH_GRACE_SECONDS):
                 result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
@@ -468,6 +478,7 @@ class DindProbe:
         container_name_prefix: str,
         sysbox_runtime: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
         return await self.verifier.verify(
             port,
@@ -476,4 +487,5 @@ class DindProbe:
             container_name_prefix=container_name_prefix,
             sysbox=sysbox_runtime,
             log_ctx=log_ctx,
+            deadline_monotonic=deadline_monotonic,
         )
