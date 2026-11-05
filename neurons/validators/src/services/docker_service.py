@@ -110,6 +110,7 @@ from services.default_docker_image_digest_service import fetch_docker_hub_digest
 from services.gpu_power_limit import (
     NVIDIA_SMI_TIMEOUT_SECONDS,
     POWER_LIMIT_SET_CONCURRENCY,
+    GpuPowerCapResult,
     GpuPowerRestoreStateError,
     apply_filler_gpu_power_limits,
     clear_filler_pod_applied_caps,
@@ -10417,7 +10418,7 @@ class DockerService:
                 # raise records this create FAILED (12h backoff) — never run the miner uncapped.
                 if payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits:
                     current_step = "gpu_power_cap"
-                    cap_applied = await apply_filler_gpu_power_limits(
+                    cap_result = await apply_filler_gpu_power_limits(
                         ssh_client,
                         payload.gpu_power_limits,
                         self.redis_service,
@@ -10425,7 +10426,11 @@ class DockerService:
                         payload.executor_id,
                         log_extra=default_extra,
                     )
-                    if not cap_applied:
+                    if cap_result is not GpuPowerCapResult.APPLIED:
+                        # The backend bans the node only on gpu_power_cap_refused: our own Redis or SSH error
+                        # keeps gpu_power_cap, which no backend bans on (old or new).
+                        if cap_result is GpuPowerCapResult.HOST_REFUSED:
+                            current_step = "gpu_power_cap_refused"
                         raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
                 else:
                     if early_gpu_power_restore is not None:
