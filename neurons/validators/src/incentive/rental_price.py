@@ -28,12 +28,18 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
+from services.gpu_spec_table import RTX_4090_48GB
 from services.const import (
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
     MIN_PORT_COUNT,
     SECONDS_PER_BLOCK,
     TEMPO,
+)
+from services.gpu_power_limit import (
+    CAP_REVERT_WINDOW_SECONDS,
+    GpuPowerCapRevert,
+    read_gpu_power_cap_reverts,
 )
 from services.task.models import MixedFormulaInputs
 from services.task_service import JobResult
@@ -62,12 +68,20 @@ CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
 
 # The share of a GPU configuration's average filler revenue per GPU-hour that a node is paid:
-# spot-node pay (ENABLE_SPOT_NODE_PAY) and the secure floor (ENABLE_SECURE_FILLER_REVENUE_FLOOR).
+# spot-node pay and the secure floor.
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
 FILLER_REVENUE_PAY_FACTOR = 1.0
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
 # The share of the secure rental incentive that a rented spot node earns (ENABLE_SPOT_RENTAL_INCENTIVE).
 SPOT_RENTAL_INCENTIVE_FACTOR = 0.5
+
+# DAH-2786 — GPU power cap revert gate. An unrented executor whose host raises the GPU power
+# limit back while a Lium idle job runs kills that job and still collects the unrented
+# incentive. It forfeits the incentive after this many reverted JOBS inside
+# `CAP_REVERT_WINDOW_SECONDS`. One is not enough, because a driver reload can undo a cap on
+# its own; two is reachable inside a day even with the backend's 12h backoff after each
+# killed job, and a host running a reset timer breaks every job it is given.
+MIN_POWER_CAP_REVERTS_TO_PENALIZE = 2
 
 
 # ── Spec measurements ────────────────────────────────────────────────────────
@@ -99,6 +113,17 @@ class PowerCapIncapable(BaseModel):
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
 
 
+class PowerCapReverted(BaseModel):
+    """How often this executor's host undid a verified GPU power cap, and the last evidence.
+
+    The watt readings are carried so the provider is shown the numbers that were judged."""
+
+    revert_count: int
+    window_hours: int
+    capped_to_watts: int  # what the validator applied and read back
+    found_watts: int  # what the host had put back while the job ran
+
+
 class PortLimitedRemainder(BaseModel):
     """The free remainder of a partially rented split node with fewer usable free ports than it
     has minimum-size splits (DAH-3698, owner rule 26 Oct 2026: one usable, unique renter port per
@@ -110,6 +135,15 @@ class PortLimitedRemainder(BaseModel):
     required_port_count: int
     free_split_count: int
     paid_split_count: int  # splits that have a port: their GPUs keep the idle pay
+    unpaid_gpu_count: int
+
+
+class DiskLimitedRemainder(BaseModel):
+    """The free remainder of a partially rented split node that SplitDiskCheck (`specs.split_disk`) lists fewer
+    free GPUs of than it has (DAH-4961): only the listed ones earn idle pay."""
+
+    free_split_count: int
+    paid_split_count: int  # splits with disk room: their GPUs keep the idle pay
     unpaid_gpu_count: int
 
 
@@ -167,7 +201,7 @@ class RentalPriceEstimate(BaseModel):
     base_model: str
     gpu_count: int
     is_rented: bool
-    usd_per_epoch: float
+    usd_per_epoch: float | None                         # None = no estimate for this model (unavailable)
     count_bucket: int | None = None                     # gpu_count_bucket the executor was placed into
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
@@ -516,6 +550,47 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
+    async def _power_cap_reverted(self, result: JobResult) -> PowerCapReverted | None:
+        # The validator records one revert per Lium job whose verified cap the host raised while
+        # the job ran (services/gpu_power_limit.py). A Redis outage returns no reverts, so the
+        # gate fails open like every other unknown here.
+        if result.spec is None:
+            # a synthetic or estimated job result: no real executor, so nothing to look up
+            return None
+        reverts: list[GpuPowerCapRevert] = await read_gpu_power_cap_reverts(
+            self.redis_service, str(result.executor_info.uuid)
+        )
+        if len(reverts) < MIN_POWER_CAP_REVERTS_TO_PENALIZE:
+            return None
+        last: GpuPowerCapRevert = reverts[-1]
+        return PowerCapReverted(
+            revert_count=len(reverts),
+            window_hours=CAP_REVERT_WINDOW_SECONDS // 3600,
+            capped_to_watts=last.capped_to_watts,
+            found_watts=last.found_watts,
+        )
+
+    def _log_power_cap_revert_limit(self, result: JobResult, reverted: PowerCapReverted) -> None:
+        enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT
+        logger.info(
+            _m(
+                "Unrented executor reverts the GPU power cap of Lium's own idle jobs"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "power_cap_revert_count": reverted.revert_count,
+                    "power_cap_revert_window_hours": reverted.window_hours,
+                    "capped_to_watts": reverted.capped_to_watts,
+                    "found_watts": reverted.found_watts,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
     @staticmethod
     def _port_limited_remainder(result: JobResult) -> PortLimitedRemainder | None:
         # None whenever the spec does not carry a readable count: a synthetic result or an
@@ -550,6 +625,47 @@ class RentalPriceIncentive(DefaultIncentive):
             unpaid_gpu_count=free_gpu_count
             if paid_split_count == 0
             else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+        )
+
+    @staticmethod
+    def _disk_limited_remainder(result: JobResult) -> DiskLimitedRemainder | None:
+        # None when the spec carries no readable sizing (unsplit node, older validator): no change to idle pay
+        if not result.is_split_remainder or result.spec is None or not result.gpu_splitting_min_count:
+            return None
+        sizing: Any = result.spec.get("split_disk")
+        if not isinstance(sizing, dict):
+            return None
+        listable: Any = sizing.get("listable_split_count")
+        # the listing offers exactly listable_gpu_count free GPUs, so scoring pays the same count
+        listable_gpus: Any = sizing.get("listable_gpu_count")
+        if any(not isinstance(v, int) or isinstance(v, bool) for v in (listable, listable_gpus)):
+            return None
+        free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
+        paid_gpu_count: int = min(free_gpu_count, max(listable_gpus, 0))
+        if paid_gpu_count >= free_gpu_count:
+            return None
+        return DiskLimitedRemainder(
+            free_split_count=free_gpu_count // result.gpu_splitting_min_count,
+            paid_split_count=max(listable, 0) if paid_gpu_count else 0,
+            unpaid_gpu_count=free_gpu_count - paid_gpu_count,
+        )
+
+    def _log_disk_limited_remainder(self, result: JobResult, disk_limited: DiskLimitedRemainder) -> None:
+        logger.info(
+            _m(
+                "Free remainder of a partially rented split node has too little free disk to be listed",
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "free_split_count": disk_limited.free_split_count,
+                    "paid_split_count": disk_limited.paid_split_count,
+                    "unpaid_gpu_count": disk_limited.unpaid_gpu_count,
+                    "enforced": True,
+                    "reason": ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
+                    "pool": "rental_partial" if disk_limited.paid_split_count else "rental_excluded",
+                },
+            )
         )
 
     def _log_port_limited_remainder(
@@ -784,7 +900,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     * result.sysbox_multiplier
                     * result.driver_multiplier
                 )
-                if settings.ENABLE_SECURE_FILLER_REVENUE_FLOOR and result.filler_revenue_per_gpu_hour is not None:
+                if result.filler_revenue_per_gpu_hour is not None:
                     self._secure_floor_candidates.append((base_model, result))
 
                 # DAH-2528: a split-capable node pinned to its gpu_count bucket may
@@ -1104,8 +1220,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # this path (earns_spot_rental_incentive decides its pay), and neither is the free remainder of
         # a partially rented one: it has no configuration average of its own (spot_tier, not "no average")
         return (
-            settings.ENABLE_SPOT_NODE_PAY
-            and result.is_spot
+            result.is_spot
             and result.is_on_spot_pay_list
             and not result.is_rented
             and not result.is_split_remainder
@@ -1221,8 +1336,7 @@ class RentalPriceIncentive(DefaultIncentive):
         and a node with no listed rate stay at 0: they are not in `_secure_floor_candidates`, so
         the unbucketed cost carries no top-up for them."""
         if (
-            not settings.ENABLE_SECURE_FILLER_REVENUE_FLOOR
-            or result.filler_revenue_per_gpu_hour is None
+            result.filler_revenue_per_gpu_hour is None
             or not result.max_cap
             or not result.hourly_rate
         ):
@@ -1342,6 +1456,25 @@ class RentalPriceIncentive(DefaultIncentive):
                 MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited_remainder)
             )
 
+        # DAH-4961: likewise only the free GPUs SplitDiskCheck lists (none under the host disk floor) earn
+        # idle pay. Read after the port rule so a GPU either rule leaves unpaid is counted once.
+        disk_limited_remainder: DiskLimitedRemainder | None = (
+            self._disk_limited_remainder(job_result) if idle_pool_candidate else None
+        )
+        if disk_limited_remainder is not None:
+            if eligible_for_rental_share:
+                self._log_disk_limited_remainder(job_result, disk_limited_remainder)
+            if disk_limited_remainder.paid_split_count == 0:
+                eligible_for_rental_share = False
+            else:
+                # port_unpaid_gpu_count holds every free GPU left out of the pools; the merge adds it back
+                newly_unpaid: int = max(0, disk_limited_remainder.unpaid_gpu_count - job_result.port_unpaid_gpu_count)
+                job_result.gpu_count -= newly_unpaid
+                job_result.port_unpaid_gpu_count += newly_unpaid
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_disk_limited_remainder(job_result, disk_limited_remainder)
+            )
+
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays active).
         if self._should_run_idle_pool_gate(
@@ -1405,6 +1538,27 @@ class RentalPriceIncentive(DefaultIncentive):
                 job_result, power_cap_incapable
             )
             job_result.record_incentive_log(reason)
+
+        # DAH-2786 power cap revert gate: an idle machine whose host puts the GPU power limit
+        # back kills the Lium job it is being paid to host, so it forfeits the unrented
+        # incentive (node stays active). Shadow-only while the flag is off.
+        power_cap_revert_enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT
+        power_cap_reverted: PowerCapReverted | None = (
+            await self._power_cap_reverted(job_result)
+            if self._should_run_idle_pool_gate(
+                idle_pool_candidate, eligible_for_rental_share, power_cap_revert_enforced
+            )
+            else None
+        )
+        if power_cap_reverted is not None:
+            if eligible_for_rental_share:
+                self._log_power_cap_revert_limit(job_result, power_cap_reverted)
+            if power_cap_revert_enforced:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_reverts_gpu_power_cap(
+                    job_result, power_cap_reverted
+                )
+                job_result.record_incentive_log(reason)
 
         # an eligible node has these two factors checked after pricing (_explain_zero_effective_rate)
         if idle_pool_candidate and not eligible_for_rental_share:
@@ -1484,6 +1638,11 @@ class RentalPriceIncentive(DefaultIncentive):
         gpu_count = params.gpu_count
         is_rented = params.is_rented
 
+        if gpu_model == RTX_4090_48GB and not settings.RTX_4090_48GB_MODEL_ENABLED:
+            # DAH-5508: off, the card is rejected, so no estimate at all (0.0 would read as an available $0)
+            return RentalPriceEstimate(
+                gpu_model=gpu_model, base_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented, usd_per_epoch=None
+            )
         base_model = BASE_GPU_MAP.get(gpu_model)
         cap_spec = self.config.max_unrented_gpus.get(base_model, {}) if base_model else {}
         eligible_for_unrented_estimate = (
@@ -1713,6 +1872,9 @@ async def precompute_all_estimates(
     on-demand request to the validator.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
+    if not settings.RTX_4090_48GB_MODEL_ENABLED:
+        # DAH-5508: the validator rejects this card while off, so publish no estimate for it.
+        gpu_models.remove(RTX_4090_48GB)
     estimates: dict[str, dict] = {}
     for gpu_model in gpu_models:
         estimates[gpu_model] = {

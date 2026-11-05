@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import shlex
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedPod
+from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import (
     ContainerState,
     PodContainerState,
@@ -30,9 +31,14 @@ from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
+from .rental_owner import rental_of_this_node
+from .task_time import task_seconds_left
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)
+
+# cycle time kept after the rented pod reads, to report the result and close the shell
+POD_READ_RESERVE_SECONDS = 30
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -99,33 +105,6 @@ def _gpu_usage_violation_details(
     }
 
 
-def _rental_of_validated_miner(
-    ctx: Context, rented_executor: RentedExecutor | None
-) -> RentedExecutor | None:
-    """The rental listed under this executor's UUID, or None when it belongs to another miner on a
-    different endpoint (logged as RENTED_OWNER_MISMATCH). On the same IP and port the renter's pod
-    is on this box, so it stays rented and the VerifyX/matmul probes never run beside it."""
-    if not rented_executor or rented_executor.miner_hotkey == ctx.miner_hotkey:
-        return rented_executor
-    logger.warning(
-        _m(
-            "RENTED_OWNER_MISMATCH",
-            extra=get_extra_info(
-                {
-                    **ctx.default_extra,
-                    "executor_uuid": ctx.executor.uuid,
-                    "rental_miner_hotkey": rented_executor.miner_hotkey,
-                }
-            ),
-        )
-    )
-    same_endpoint = (rented_executor.executor_ip_address, str(rented_executor.executor_ip_port)) == (
-        ctx.executor.address,
-        str(ctx.executor.port),
-    )
-    return rented_executor if same_endpoint else None
-
-
 # The backend's create is still running for a pod in these statuses (a first rental or a reboot), and it
 # records the container name only when that create answers: a custom-Dockerfile build can take longer
 # than the grace below.
@@ -180,9 +159,7 @@ class TenantEnforcementCheck:
 
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
-        rented_executor = _rental_of_validated_miner(
-            ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        )
+        rented_executor = rental_of_this_node(ctx, log_mismatch=True)
         # EVERY filler on the node: a partially rented split node keeps one filler per free VRAM
         # bundle running beside the renter (DAH-2465/DAH-2467), and allowlisting only the first
         # makes its siblings' GPU processes read as usage outside the tenant.
@@ -241,7 +218,12 @@ class TenantEnforcementCheck:
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
             try:
-                pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, pod_container_name, ctx.default_extra)
+                # bounded by the cycle time budget: a read hung on a dead shell ends as a TimeoutError (an OSError),
+                # so the cycle reports the node unreachable instead of being dropped without a result
+                async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
+                    pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(
+                        ctx.ssh, pod_container_name, ctx.default_extra
+                    )
             except (asyncssh.Error, OSError) as exc:
                 return with_pod_states(
                     _executor_transport_unreachable_result(

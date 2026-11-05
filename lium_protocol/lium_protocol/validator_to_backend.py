@@ -58,6 +58,10 @@ class ValidatorMessageType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
     # 1.16.0: the answer to ResetPodGpuRequest
     PodGpuResetResult = "PodGpuResetResult"
+    # 2.4.0: the answer to LockPodGpuClocksRequest
+    PodGpuClocksResult = "PodGpuClocksResult"
+    # 2.5.0: after its start sweep, the creates a new connector runs again (DAH-5437)
+    ResumedCreatesReport = "ResumedCreatesReport"
 
 
 VALIDATOR_MESSAGES: Registry[ValidatorMessage] = Registry(ValidatorMessageType)
@@ -243,6 +247,19 @@ class PodStatesReport(ValidatorMessage):
     chunk_index: int = pydantic.Field(ge=0)
     chunk_total: int = pydantic.Field(ge=1)
     pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
+
+
+@VALIDATOR_MESSAGES.register
+class ResumedCreatesReport(ValidatorMessage):
+    """2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.
+    `pod_ids` are the creates the previous connector was running that were cut off; the validator keeps no copy
+    of a create request, so the backend sends each listed create again from its own records, and each gets its
+    own reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the
+    old connector: the backend fails it at once. An older validator never sends this, and the backend then
+    changes nothing."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.ResumedCreatesReport
+    pod_ids: list[str] = pydantic.Field(default_factory=list)
 
 
 @VALIDATOR_MESSAGES.register
@@ -451,7 +468,8 @@ class SshPubKeyRemoved(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
-    # the failed request's command_id; echoed for an AddSshPublicKeyRequest, empty otherwise
+    # the failed request's command_id, echoed for an AddSshPublicKeyRequest and (since lium-io#2028) a
+    # ContainerCreateRequest; empty otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None
@@ -532,6 +550,8 @@ class GpuResetErrorCode(enum.Enum):
     ContainerNotFound = "ContainerNotFound"
     OperationInProgress = "OperationInProgress"
     ExecutorUnreachable = "ExecutorUnreachable"
+    # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
+    ClockLockNotSupported = "ClockLockNotSupported"
 
 
 class GpuResetOutcome(pydantic.BaseModel):
@@ -553,4 +573,27 @@ class PodGpuResetResult(PodContainerResponse):
     error_code: GpuResetErrorCode | None = None
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
+    detail: str | None = None
+
+
+class GpuClockOutcome(pydantic.BaseModel):
+    index: int
+    uuid: str
+    result: Literal["locked", "reset", "failed"]
+    applied_min_mhz: int | None = None
+    applied_max_mhz: int | None = None
+    detail: str | None = None
+
+
+@VALIDATOR_MESSAGES.register
+class PodGpuClocksResult(PodContainerResponse):
+    """2.4.0: the answer to `backend_to_validator.LockPodGpuClocksRequest`, same `request_id`.
+    `gpus` is one outcome per GPU touched, with the clamped range applied; empty when a precheck refused
+    before anything changed, when `detail` says why. `error_code` reuses `GpuResetErrorCode`."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.PodGpuClocksResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    gpus: list[GpuClockOutcome] = []
     detail: str | None = None

@@ -136,8 +136,7 @@ def _job(**overrides) -> JobResult:
 
 
 @pytest.mark.asyncio
-async def test_an_excluded_spot_node_gets_no_spot_pay(monkeypatch):
-    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
+async def test_an_excluded_spot_node_gets_no_spot_pay():
     incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
     spot = _job(
         is_spot=True,

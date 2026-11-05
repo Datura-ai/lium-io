@@ -46,6 +46,7 @@ from services.docker_service import (
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
+from services.image_flatten import flatten_wait_command
 from services.nvidia_devices import (
     MissingRentedGpuError,
     PROC_GPU_INFO_CMD,
@@ -149,7 +150,8 @@ def _ssh(*results):
 
 
 def _cmds(client) -> list[str]:
-    return [c.args[0] for c in client.run.await_args_list if c.args]
+    # the DAH-4663 clock-lock safety net (`-rgc` before a create) is covered in test_gpu_clocks; these tests pin the probe order
+    return [c.args[0] for c in client.run.await_args_list if c.args and " -rgc " not in c.args[0]]
 
 
 # ------------------------------------------------------------------
@@ -562,8 +564,8 @@ def _relisting_commands(ssh_client) -> list[str]:
 
 
 def _fresh_sizing_payload(**over):
-    # the DAH-2183 contract: the volume is sized on the host's free disk
-    return _deploy_payload(disk_share=0.5, volume_limit_gb=1000, min_volume_gb=2, **over)
+    # the DAH-2183 contract: the volume is sized on the host's free disk; the backend orders what the listing gave
+    return _deploy_payload(disk_share=0.5, volume_limit_gb=40, min_volume_gb=2, **over)
 
 
 @pytest.mark.asyncio
@@ -603,6 +605,8 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
         "cat /proc/sys/kernel/pid_max",
         "cat /proc/meminfo",
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
+        # the sizing measures the disk under the node flatten lock
+        next((c for c in _cmds(ssh_client) if c.startswith(flatten_wait_command()[:40])), "no flatten wait"),
     ]
     assert _relisting_commands(ssh_client) == []
     handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
@@ -662,7 +666,7 @@ async def test_customer_create_whose_filler_removal_times_out_fails_at_its_own_s
 ):
     """A filler rm that times out, its processes not shown exiting, fails the create, never hangs it; at
     filler_removal_stuck (DAH-5012), not container_cleanup, which the backend counts against the node."""
-    # the filler stays listed, so the create re-lists it until this deadline before failing
+    # the filler stays listed, so the create re-sends its rm until this deadline before failing
     monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 1)
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(
@@ -676,8 +680,9 @@ async def test_customer_create_whose_filler_removal_times_out_fails_at_its_own_s
 
     assert type(result).__name__ == "FailedContainerRequest"
     assert result.failure_step == "filler_removal_stuck"
-    [removal] = [call for call in ssh_client.run.await_args_list if call.args[0].startswith("/usr/bin/docker rm -fv")]
+    removal, *resent = [call for call in ssh_client.run.await_args_list if call.args[0].startswith("/usr/bin/docker rm -fv")]
     assert removal.kwargs["timeout"] == ds_module._FILLER_ONLY_RM_TIMEOUT_SECONDS
+    assert resent
 
 
 def _removal_commands(ssh_client) -> list[str]:
@@ -928,3 +933,114 @@ def svc_fixture():
     )
 
 
+
+
+@pytest.mark.asyncio
+async def test_a_customer_create_waits_for_the_engy_cache_removal_before_it_sizes_and_runs_the_pod(
+    svc_fixture, monkeypatch
+):
+    """DAH-5260: the scrape lists the 1561 GB kimi-k3 cache as free and the backend sizes the rental on it, so the
+    pod fits only once the volume is gone. A slow `docker volume rm` must answer before the pod volume is sized and
+    created and before `docker run`; a removal left running beside them would fail the create for want of disk."""
+    svc = svc_fixture
+    kimi = "engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"
+    ssh_client = _deploy_ssh_client()
+    _wire(svc, monkeypatch, ssh_client, probe_result=_probe(volumes=(ProbedVolume(name=kimi, driver="local"),)))
+    monkeypatch.delattr(svc, "reclaim_dphn_cache_for_rental")
+    gb = 1024**3
+    free = {"bytes": 2389 * gb}
+    events: list[str] = []
+    host = ssh_client.run.side_effect
+
+    async def run(cmd, *args, **kwargs):
+        if f"volume rm {kimi}" in cmd:
+            await asyncio.sleep(0.2)  # the unlink of ~1.5 TB
+            free["bytes"] += 1561 * gb
+            events.append("cache volume removed")
+        return host(cmd, *args, **kwargs)
+
+    def recorded(event: str, answer: object = None):
+        async def record(*_args, **_kwargs):
+            events.append(event)
+            return answer
+
+        return record
+
+    ssh_client.run.side_effect = run
+    monkeypatch.setattr(svc, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
+    monkeypatch.setattr(svc, "_get_fs_available_bytes", AsyncMock(side_effect=lambda *_a: free["bytes"]))
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(side_effect=recorded("volume sized", ds_module.VolumeSizingResult(2620, 1310, "legacy"))),
+    )
+    monkeypatch.setattr(svc, "create_local_volume", AsyncMock(side_effect=recorded("volume created")))
+    svc._run_rental_docker_create_with_port_retry.side_effect = recorded("docker run")
+
+    result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=2620, storage_limit_gb=1310))
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert events == ["cache volume removed", "volume sized", "volume created", "docker run"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("clamped_gb", "created"), [(2500, True), (1059, False)])
+async def test_a_rental_volume_clamped_far_below_the_order_fails_the_create(
+    svc_fixture, monkeypatch, clamped_gb, created
+):
+    """DAH-5260: a removal that failed leaves less disk than the listing; the reclaim clamps the volume. Within 5% of the
+    2620 GB order the pod is created; 1059 GB is a short-change, so the create fails and the backend's rent retry moves
+    the pod to another node."""
+    svc = svc_fixture
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+
+    async def clamp(*, payload, **_kwargs):
+        payload.volume_limit_gb = clamped_gb
+        return True
+
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(side_effect=clamp))
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(return_value=ds_module.VolumeSizingResult(clamped_gb, 1310, "legacy"))
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=2620, storage_limit_gb=1310))
+
+    if created:
+        assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    else:
+        assert type(result).__name__ == "FailedContainerRequest"
+        assert result.failure_step == ds_module.RENTAL_DISK_SHORT_STEP
+        svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("clamped_gb", "sized_gb", "created"), [(None, 106, True), (120, 120, True), (120, 106, False)]
+)
+async def test_the_ordered_share_is_checked_on_the_final_volume_size_only_after_a_clamp(
+    svc_fixture, monkeypatch, clamped_gb, sized_gb, created
+):
+    """DAH-5260: the 95% check runs on the size the volume is created with, and only when a cache removal failed (the
+    reclaim clamped the order). The fresh sizing alone often gives a rental under 95% with no cache on the
+    node: those are created as before (Rustam, 3 Nov)."""
+    svc = svc_fixture
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+
+    async def reclaim(*, payload, **_kwargs):
+        if clamped_gb is None:
+            return False
+        payload.volume_limit_gb = clamped_gb
+        return True
+
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(side_effect=reclaim))
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(return_value=ds_module.VolumeSizingResult(sized_gb, 61, "fresh"))
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=123, storage_limit_gb=61))
+
+    if created:
+        assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    else:
+        assert type(result).__name__ == "FailedContainerRequest"
+        assert result.failure_step == ds_module.RENTAL_DISK_SHORT_STEP
+        assert "106 GB sized of 123 GB ordered" in result.detail
+        svc._run_rental_docker_create_with_port_retry.assert_not_awaited()

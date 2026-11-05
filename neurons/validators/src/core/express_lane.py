@@ -26,7 +26,7 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import bittensor
 from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI
@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 # One line per express verification; its registration_to_publish_s is the deploy metric.
 EXPRESS_PUBLISHED_EVENT = "[express] Executor verified and published ahead of the cycle"
+# Same line for a first pass that ran to a failed result (published so the provider sees why).
+EXPRESS_FAILED_EVENT = "[express] Executor failed its first check, result published ahead of the cycle"
+# A restart drops the in-memory queue and an express check in flight. Nodes registered this long
+# before the first cycle since start and still not in the validated set get the lane again.
+RESTART_LOOKBACK = timedelta(minutes=30)
 # The miner did not return the executor (its portal snapshot is not refreshed yet, or the node is
 # unreachable): try again later, a bounded number of times, then leave it to the normal cycle.
 MAX_ATTEMPTS = 3
@@ -133,6 +138,9 @@ class ExpressLane:
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
         self._pending: dict[str, _Pending] = {}
+        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle). The
+        # same dict, never rebound, so the wave always reads the current queue.
+        self.miner_service.express_queued = self._pending
         self._tasks: set[asyncio.Task] = set()
         self._my_hotkey: str | None = None
         # Given up on this process's watch (MAX_ATTEMPTS without the miner returning them); the
@@ -294,11 +302,11 @@ class ExpressLane:
                     executor.validator_hotkey != my_hotkey
                     or executor.id in validated
                     or executor.id in self._left_to_cycle
-                    # Registered before the first cycle since start (or with no registration
-                    # time to go by): long-known to this validator even if never published since
+                    # Registered well before the first cycle since start (or with no registration
+                    # time to go by; RESTART_LOOKBACK covers what a restart cut off): long-known to this validator even if never published since
                     # the flag went on — its miner failed or was offline. The cycle owns it.
                     or executor.created_at is None
-                    or executor.created_at < fleet_known_since
+                    or executor.created_at < fleet_known_since - RESTART_LOOKBACK
                 ):
                     continue
                 present.add(executor.id)
@@ -552,7 +560,7 @@ class ExpressLane:
         registered_at = pending.executor.created_at
         logger.info(
             _m(
-                EXPRESS_PUBLISHED_EVENT,
+                EXPRESS_PUBLISHED_EVENT if passed else EXPRESS_FAILED_EVENT,
                 extra=get_extra_info(
                     {
                         **extra,

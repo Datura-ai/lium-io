@@ -1,23 +1,24 @@
-import json
 import asyncio
+import json
 import logging
 import math
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ValidationError
-from payload_models.payloads import WorkloadKind
-from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
-from redis.backoff import ExponentialBackoff
-from redis.asyncio.retry import Retry  # NOT redis.retry.Retry: the sync one silently never retries
 from datura.requests.miner_requests import ExecutorSSHInfo
+from payload_models.payloads import WorkloadKind
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
+from pydantic import BaseModel, ValidationError
+from redis.asyncio.retry import Retry  # NOT redis.retry.Retry: the sync one silently never retries
+from redis.backoff import ExponentialBackoff
+from services.const import GPU_MODEL_RATES
+
 from core.config import settings
 from core.utils import _m
-from services.const import GPU_MODEL_RATES
 
 MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
@@ -28,6 +29,8 @@ POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 GPU_RESET_PENDING_KIND = "gpu_reset"
+# DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
+GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
 # DAH-4658: the pod of a renter GPU reset that ended a moment ago, per node, for a short TTL
 GPU_RESET_RECENT_PREFIX = "gpu_reset_recent"
 # DAH-4658: a rented node's last scored result, carried into a cycle where the renter's own GPU reset hides the cards
@@ -106,6 +109,11 @@ PORT_VERIFY_MISS_PREFIX = "port_verify_miss"
 EXTERNAL_PROBE_MISS_PREFIX = "external_probe_miss"
 # ticket-0494: one key per executor while its last DinD probe that reached the container found sysbox.
 SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
+# DAH-5244: one key per executor with the port pairs its last completed port check verified, under which
+# address/range/mappings, so a cycle deferred for disk pressure can republish them.
+VERIFIED_PORTS_PREFIX = "verified_ports"
+# DAH-5244: one key per executor counting port checks deferred in a row (":shadow" for the simulated count).
+DISK_PRESSURE_DEFERRALS_PREFIX = "disk_pressure_deferrals"
 # One key per executor: when this validator first found it without its recommended default image
 # (epoch seconds). Opens CachedTemplateVerificationCheck's fresh-node grace.
 CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
@@ -175,6 +183,9 @@ class InflightBackendCreate(BaseModel):
     executor_id: str
     workload_kind: WorkloadKind
     started_at_unix_seconds: int
+    # DAH-5437: how many connector restarts this create has already been resumed after. The request itself is never
+    # stored (it carries the renter's environment and credentials); the backend re-sends it from its own records.
+    resumes: int = 0
 
 
 class RedisWrite(NamedTuple):
@@ -230,6 +241,11 @@ def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
     """The verified record is per (miner hotkey, executor id): an executor id is unique only per hotkey, so a
     hotkey that lists another's executor id writes, resets and marks only its own record."""
     return f"{miner_hotkey}:{executor_id}"
+
+
+class VerifiedPortsMemory(NamedTuple):
+    pairs: list[tuple[int, int]]
+    measured_at: float
 
 
 class RedisService:
@@ -445,6 +461,62 @@ class RedisService:
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
 
+    @staticmethod
+    def _verified_ports_key(miner_hotkey: str, executor_id: str) -> str:
+        return f"{VERIFIED_PORTS_PREFIX}:{miner_hotkey}:{executor_id}"
+
+    async def record_verified_ports(
+        self, miner_hotkey: str, executor_id: str, identity: str, pairs: list[tuple[int, int]], ttl_seconds: int
+    ) -> None:
+        """What a completed port check verified (an empty list included: a known failure is never replaced by an
+        older success), under `identity` (address, range, mappings); a republish never refreshes it."""
+        payload = {"identity": identity, "pairs": [list(p) for p in pairs], "measured_at": time.time()}
+        await self.set(self._verified_ports_key(miner_hotkey, executor_id), json.dumps(payload), ex=ttl_seconds)
+
+    async def last_verified_ports(
+        self, miner_hotkey: str, executor_id: str, identity: str
+    ) -> VerifiedPortsMemory | None:
+        """The last completed check's pairs when they were measured under the same identity, else None."""
+        raw = await self.get(self._verified_ports_key(miner_hotkey, executor_id))
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            if data["identity"] != identity:
+                return None
+            return VerifiedPortsMemory(
+                pairs=[(int(i), int(e)) for i, e in data["pairs"]], measured_at=float(data["measured_at"])
+            )
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    @staticmethod
+    def _disk_pressure_deferrals_key(miner_hotkey: str, executor_id: str, shadow: bool) -> str:
+        suffix = ":shadow" if shadow else ""
+        return f"{DISK_PRESSURE_DEFERRALS_PREFIX}{suffix}:{miner_hotkey}:{executor_id}"
+
+    async def disk_pressure_deferrals(self, miner_hotkey: str, executor_id: str, *, shadow: bool) -> int:
+        raw = await self.get(self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow))
+        try:
+            return int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    async def record_disk_pressure_deferral(
+        self, miner_hotkey: str, executor_id: str, *, shadow: bool, ttl_seconds: int
+    ) -> int:
+        """One more port check deferred (or, shadow, one that would have been); the new count. INCR, so two
+        cycles never take the same slot of the bounded streak."""
+        key = self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow)
+        async with self.lock:
+            count = await self.redis.incr(key)
+            await self.redis.expire(key, ttl_seconds)
+        return int(count)
+
+    async def clear_disk_pressure_deferrals(self, miner_hotkey: str, executor_id: str, *, shadow: bool) -> None:
+        """A port check completed: the streak of deferrals ends."""
+        await self.delete(self._disk_pressure_deferrals_key(miner_hotkey, executor_id, shadow))
+
     async def first_uncached_at(self, executor_id: str, now: float, ttl_seconds: int) -> float:
         """When this validator first found the executor without its recommended image (epoch s).
 
@@ -631,6 +703,21 @@ class RedisService:
             return None
         return {"owner_flag": owner_flag, "containers": [{"name": container_name}]}
 
+    async def rented_pod_ids(self) -> frozenset[str]:
+        """pods whose container the rented-machine cache lists, i.e. a create that finished"""
+        pod_ids: set[str] = set()
+        for raw in (await self.hgetall(RENTED_MACHINE_PREFIX)).values():
+            try:
+                containers = json.loads(raw).get("containers") or []
+            except (ValueError, AttributeError):
+                continue
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                if container.get("pod_id") and str(container.get("name", "")).strip():
+                    pod_ids.add(container["pod_id"])
+        return frozenset(pod_ids)
+
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
 
@@ -652,7 +739,8 @@ class RedisService:
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
     ):
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         now = int(time.time())
 
         item: dict = {"time": now, "pod_id": pod_id}
@@ -665,7 +753,7 @@ class RedisService:
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         pending_pods = [item for item in pending_pods if item.get('pod_id', '') != pod_id]
         if pending_pods:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
@@ -712,13 +800,19 @@ class RedisService:
                 await self.redis.delete(key)
 
     async def add_inflight_backend_create(
-        self, pod_id: str, miner_hotkey: str, executor_id: str, workload_kind: WorkloadKind
+        self,
+        pod_id: str,
+        miner_hotkey: str,
+        executor_id: str,
+        workload_kind: WorkloadKind,
+        resumes: int = 0,
     ) -> None:
         create = InflightBackendCreate(
             miner_hotkey=miner_hotkey,
             executor_id=executor_id,
             workload_kind=workload_kind,
             started_at_unix_seconds=int(time.time()),
+            resumes=resumes,
         )
         await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
 
@@ -737,9 +831,16 @@ class RedisService:
                 # one bad entry must not block the sweep of the others on every start
                 logger.error(_m("Dropping an unreadable inflight backend create", extra={"pod_id": pod_id}))
                 await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+                continue
+            if set(json.loads(entry)) - set(InflightBackendCreate.model_fields):
+                # an entry an earlier build wrote with the whole create request in it: rewritten without
+                await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, creates[pod_id].model_dump_json())
         return creates
 
-    async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
+    async def get_pending_pods(
+        self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60
+    ) -> list[dict]:
+        """Pending-pod entries younger than `max_age_seconds` (None: every entry)."""
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
             return []
@@ -755,7 +856,10 @@ class RedisService:
         pending_pods = []
         
         for item in data:
-            if now - item.get('time', 0) >= 30 * 60:  # 30 mins
+            if (
+                max_age_seconds is not None
+                and now - item.get('time', 0) >= max_age_seconds
+            ):
                 continue
             pending_pods.append(item)
         

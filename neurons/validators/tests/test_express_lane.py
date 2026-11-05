@@ -22,6 +22,7 @@ import pytest
 import services.file_encrypt_service as file_encrypt_service
 from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
 from core.express_lane import (
+    EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
     CycleInputs,
     ExpressLane,
@@ -166,6 +167,20 @@ async def test_the_cycle_asks_for_every_executor(rest_miner_service):
     assert rest_miner_service.in_flight == {first: CYCLE_DONE, second: CYCLE_DONE}
 
 
+@pytest.mark.asyncio
+async def test_the_wave_leaves_a_node_the_express_lane_has_queued_to_it(rest_miner_service):
+    """DAH-5601: queued, not yet running (per-miner cap, retry wait), the node still goes express:
+    in the wave it waited its turn and ran the full check, 7-15 min from add to listed."""
+    queued, known = str(uuid4()), str(uuid4())
+    rest_miner_service.miner_returns(queued, known)
+    rest_miner_service.express_queued = {queued: object()}
+
+    job = await _request(rest_miner_service)
+
+    assert {r.executor_info.uuid for r in job["results"]} == {known}
+    assert queued not in rest_miner_service.in_flight
+
+
 # --- ExpressLane: discovery, caps, publish, retries -----------------------------------------
 
 
@@ -185,6 +200,7 @@ class _Harness:
             miner_service = MinerService.__new__(MinerService)
             miner_service.in_flight = {}
             miner_service.miners_awaiting_wave_list = {}
+            miner_service.express_queued = frozenset()
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         # A self-hosted miner that does not answer its executor list (the portal-snapshot cases).
@@ -451,6 +467,50 @@ async def test_a_result_produced_after_the_job_files_vanished_is_not_the_nodes_v
     assert await harness.tick_and_settle() == 1
     harness.miner_service.publish_machine_specs.assert_awaited_once()
     assert harness.lane._pending[new_node].failed_runs == 1
+
+
+@pytest.mark.asyncio
+async def test_a_restart_queues_a_recently_added_unvalidated_node_again(monkeypatch, wallet):
+    """A restart drops the queue and kills an express check in flight. The new process's first
+    cycle starts after the node registered; the node still goes express, queued before the wave
+    asks its miner, while a long-known node stays the cycle's."""
+    cut_off, long_known = str(uuid4()), str(uuid4())
+    snapshot = {
+        "miner-a": [
+            _portal_executor(cut_off, registered_seconds_ago=180),
+            _portal_executor(long_known, registered_seconds_ago=7200),
+        ]
+    }
+    harness = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])  # a fresh service instance
+    harness.inputs.fleet_known_since = datetime.now(UTC)  # the first cycle since start began now
+    harness.miner_service.miners_awaiting_wave_list = {"miner-a": CYCLE_BATCH_ID}
+
+    assert await harness.tick_and_settle() == 0  # Validator.sync()'s pass before the wave asks
+    assert set(harness.miner_service.express_queued) == {cut_off}
+
+    harness.miner_service.miners_awaiting_wave_list = {}  # the wave has the miner's list
+    assert await harness.tick_and_settle() == 1
+    assert harness.miner_service.request_job_to_miner.await_args.kwargs["executor_id"] == cut_off
+    assert await harness.redis_service.get_validated_executors() == {cut_off}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_pass_logs_as_failed(monkeypatch, wallet, caplog):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.job_for = lambda payload, executor_id: {
+        "miner_hotkey": "miner-a",
+        "miner_coldkey": "c",
+        "results": [_job_result(executor_id, score=0.0)],
+    }
+
+    with caplog.at_level(logging.INFO):
+        assert await harness.tick_and_settle() == 1
+
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert not [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
+    (failed,) = [r for r in caplog.records if r.getMessage() == EXPRESS_FAILED_EVENT]
+    assert failed.msg.extra["outcome"] == "failed"
 
 
 # --- Redis seed and portal auth -------------------------------------------------------------
