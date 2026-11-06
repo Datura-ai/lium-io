@@ -1723,7 +1723,8 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 _DROP_MARK = "drop"
 # The image's entrypoint writes under the plaintext path before the first gocryptfs mount: those layer files
-# carry an inode change time within this long of the container's creation and are not the renter's.
+# carry an inode change time within this long of the container's creation, or of its last start (a restart
+# runs the entrypoint again before the remount), and are not the renter's.
 # shortcut: a fixed bound, not the recorded first-mount time; a create whose mount came later keeps the container.
 _STARTUP_WRITE_SECONDS = 300
 
@@ -1736,7 +1737,7 @@ def _layer_data_check(
 
     The layer is read, not the mounts: files written while unmounted stay in the layer after a remount.
     When the host can read the overlay upper dir, only files changed later than _STARTUP_WRITE_SECONDS after
-    the container was created count (ctime, which a renter cannot set back, and Created never moves: a copy
+    the container was created, and not within that long of its last start, count (ctime, which a renter cannot set back, and Created never moves: a copy
     this reads clean read clean when it was kept); otherwise ``docker diff`` decides. The upper dir is the
     overlay2 one, else (containerd store) the running container's root mount's, else ``upper_dir``, read through
     /proc/1/root: the SSH session is the executor's container, which runs with the host's PIDs. A line
@@ -1758,11 +1759,13 @@ def _layer_data_check(
     shortcut = (
         'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
         '[ -d "$1" ] && echo "$1"; }; '
-        f"c=$(/usr/bin/docker inspect -f '{{{{.Created}}}} {{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
-        f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && c=\"${{c#* }}\" && p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
+        f"c=$(/usr/bin/docker inspect -f '{{{{.Created}}}} {{{{.State.StartedAt}}}} {{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
+        f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && c=\"${{c#* }}\" "
+        f"&& s=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && c=\"${{c#* }}\" && p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
         f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
         f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
         f"&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
+        f"! \\( -newerct \"@$((s - 1))\" ! -newerct \"@$((s + {_STARTUP_WRITE_SECONDS}))\" \\) "
         "-print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
     return (
