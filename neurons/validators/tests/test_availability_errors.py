@@ -419,14 +419,20 @@ def test_the_peer_text_of_an_ssh_failure_is_capped() -> None:
 
 
 class _DictRedis:
-    def __init__(self) -> None:
-        self.kv: dict[str, str] = {}
+    """Honours ex/nx against the attestation service's clock."""
+
+    def __init__(self, clock=None) -> None:
+        self.kv: dict[str, tuple[str, float | None]] = {}
+        self.clock = clock or (lambda: 0.0)
 
     async def get(self, key):
-        return self.kv.get(key)
+        value, expires = self.kv.get(key, (None, None))
+        return None if expires is not None and self.clock() >= expires else value
 
-    async def set(self, key, value, ex=None):
-        self.kv[key] = value
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and await self.get(key) is not None:
+            return
+        self.kv[key] = (value, None if ex is None else self.clock() + ex)
 
 
 _PASSED = HostPolicyResult(attestation_digest="d", gpu_attestation_passed=True)
@@ -525,3 +531,30 @@ async def test_an_unreadable_attestation_record_withholds_the_run_instead_of_fai
 
     assert result.failure_reason_code == VALIDATOR_REDIS_UNAVAILABLE
     service.attestation_service.record_attestation_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_executor_left_out_of_the_due_challenge_loses_its_earlier_pass(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from core.config import settings
+    from services import attestation_service as attestation_module
+
+    now = [1_000_000.0]
+    monkeypatch.setattr(attestation_module, "time", SimpleNamespace(time=lambda: now[0]))
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    monkeypatch.setattr(settings, "TDX_REATTEST_INTERVAL_SECONDS", 3600)
+    attestation = attestation_module.AttestationService(redis_service=_DictRedis(clock=lambda: now[0]))
+
+    await _wave(attestation, "5Miner", [("A", _PASSED), ("B", _PASSED)])  # 00:00, challenged
+    now[0] += 1800  # 00:30: the express lane challenges a new node C alone
+    await _wave(attestation, "5Miner", [("C", _PASSED)], executor_id="C")
+    now[0] += 1800  # 01:00: due again; A is left out, B passes
+    await _wave(attestation, "5Miner", [("B", _PASSED)])
+    now[0] += 300  # 01:05: no challenge; A comes back with its old evidence
+
+    assert await _wave(attestation, "5Miner", [("A", _PASSED), ("B", _PASSED), ("C", _PASSED)]) == {
+        "A": False,
+        "B": True,
+        "C": False,
+    }

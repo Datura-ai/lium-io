@@ -156,13 +156,16 @@ class AttestationService:
             return
         try:
             if passed:
-                await self.redis_service.set(
-                    f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}", str(time.time())
-                )
-                # outlives the interval, so it still stands on the last nonce-free wave before the next challenge
+                interval = settings.TDX_REATTEST_INTERVAL_SECONDS
+                cadence_key = f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}"
+                now = time.time()
+                # the interval starts at the first pass and never moves, so no pass outlives the next challenge
+                await self.redis_service.set(cadence_key, str(now), ex=interval, nx=True)
+                raw = await self.redis_service.get(cadence_key)
+                started = float(raw.decode() if isinstance(raw, bytes) else raw) if raw else now
                 await self.redis_service.set(
                     f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}", "1",
-                    ex=2 * settings.TDX_REATTEST_INTERVAL_SECONDS,
+                    ex=max(1, int(started + interval - now)),
                 )
             else:
                 # outlives the interval, so a sibling executor's later pass cannot cancel it

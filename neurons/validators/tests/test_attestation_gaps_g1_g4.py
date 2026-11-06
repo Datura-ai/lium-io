@@ -92,8 +92,9 @@ class FakeRedis:
     async def get(self, key):
         return self.kv.get(key)
 
-    async def set(self, key, value, ex=None):
-        self.kv[key] = value
+    async def set(self, key, value, ex=None, nx=False):
+        if not (nx and key in self.kv):
+            self.kv[key] = value
 
 
 def _jwt(claims: dict) -> str:

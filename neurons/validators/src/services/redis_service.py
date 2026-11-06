@@ -597,9 +597,12 @@ class RedisService:
             value = await self.redis.get(key)
         return float(value) if value is not None else now
 
-    async def set(self, key: str, value: str, ex: int | None = None):
-        """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
-        await self.redis.set(key, value, ex=ex)
+    async def set(self, key: str, value: str, ex: int | None = None, nx: bool = False):
+        """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry), `nx` only if absent."""
+        if nx:
+            await self.redis.set(key, value, ex=ex, nx=True)
+        else:
+            await self.redis.set(key, value, ex=ex)
 
     async def get(self, key: str):
         """Get a value by key from Redis."""
