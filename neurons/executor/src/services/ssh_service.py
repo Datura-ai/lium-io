@@ -73,8 +73,9 @@ def _in_cvm() -> bool:
         return False
 
 
-# The pinned addresses come from `<COMPUTE_REST_API_URL>/watchtower/ssh-sources`, signed by the validator like
-# `/watchtower/digest`, so a NAT change or turning the pin off fleet-wide needs no executor release.
+# The pinned addresses come from `<COMPUTE_REST_API_URL>/watchtower/ssh-sources`, signed by the validator as
+# `ssh-sources:{sources}:{timestamp}` (the prefix keeps it apart from a signed digest), so a NAT change or turning
+# the pin off fleet-wide needs no executor release.
 SSH_SOURCES_CACHE_SECONDS = 300
 SSH_SOURCES_TIMEOUT_SECONDS = 5.0
 SSH_SOURCES_MAX_SKEW_SECONDS = 10 * 60
