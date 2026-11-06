@@ -94,6 +94,19 @@ def disk(mb: int = 256, secs: float = 0.5, rc: int = 0) -> str:
     return f"lium_disk bytes={mb * 1024 * 1024} start=10.0 end={10 + secs} rc={rc}\n"
 
 
+
+async def test_a_standing_disk_verdict_never_reports_a_passing_write_as_the_failure():
+    with flags() as clock:
+        ctx, _ = make_ctx(SLOW_DISK, SLOW_DISK, BUSY_DISK)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        await check.run(ctx)
+        clock.now += 31 * 60
+        slow = await check.run(ctx)
+    assert slow.updates["rented_throughput_slow_detail"] == "disk"
+
+
 GOOD = snaps() + disk() + FAST
 SLOW_DISK = snaps() + disk(secs=30.0) + FAST  # 9 MB/s
 SLOW_NET = snaps() + disk() + SLOW

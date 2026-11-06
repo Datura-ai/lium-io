@@ -381,7 +381,8 @@ def slow_detail(state: _State) -> str:
         parts.append(f"network: {', '.join(slow)} measured, {need:g} Mbps required" if slow and need else "network")
     if state.disk_failures >= READINGS_BEFORE_VERDICT:
         mb, need = (reading.get("disk") or {}).get("mb_per_s"), reading.get("disk_min_mb_per_s")
-        parts.append(f"disk: {mb:.1f} MB/s measured, {need:g} MB/s required" if mb is not None and need else "disk")
+        # a standing verdict can carry a later passing or unjudged write; only a value under the bar is the failure
+        parts.append(f"disk: {mb:.1f} MB/s measured, {need:g} MB/s required" if mb is not None and need and mb < need else "disk")
     return "; ".join(parts)
 
 
