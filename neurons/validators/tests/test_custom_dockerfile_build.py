@@ -598,18 +598,19 @@ async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "before_kill, after_kill, killed, confirmed",
+    "before_kill, after_kill, ps, killed, confirmed",
     [
-        ("truetrue", "", False, True),  # paused
-        ("falsefalse", "", False, True),  # stopped
-        ("Error: No such object: dind_x", "", False, True),  # gone
-        ("truefalse", "falsefalse", True, True),  # the pause did not freeze it: killed
-        ("truefalse", "truefalse", True, False),  # the kill did not stop it either
-        ("Cannot connect to the Docker daemon", "", False, False),  # state unknown
+        ("truetrue", "", "printf abc", False, True),  # paused
+        ("falsefalse", "", "printf abc", False, True),  # stopped
+        ("Error: No such object: dind_x", "", "exit 0", False, True),  # gone
+        ("error: no such object: dind_x", "", "exit 0", False, True),  # gone, another docker's wording
+        ("truefalse", "falsefalse", "printf abc", True, True),  # the pause did not freeze it: killed
+        ("truefalse", "truefalse", "printf abc", True, False),  # the kill did not stop it either
+        ("Cannot connect to the Docker daemon", "", "exit 1", False, False),  # state unknown
     ],
 )
 async def test_A27c_a_build_container_the_pause_did_not_freeze_is_killed_before_its_rules_go(
-    svc, tmp_path, before_kill, after_kill, killed, confirmed
+    svc, tmp_path, before_kill, after_kill, ps, killed, confirmed
 ):
     """DAH-5437: the pause command, run by a shell against a fake docker, kills a DinD it left running
     and exits 0 only once the DinD is confirmed paused, stopped or gone (DAH-5666)."""
@@ -623,6 +624,7 @@ async def test_A27c_a_build_container_the_pause_did_not_freeze_is_killed_before_
     docker.write_text(
         f'#!/bin/sh\necho "$@" >> {log}\n[ "$1" = pause ] && exit 1\n'
         f'[ "$1" = inspect ] && {{ grep -q "^kill" {log} && printf "{after_kill}" || printf "{before_kill}"; }}\n'
+        f'[ "$1" = ps ] && {{ {ps}; }}\n'
         "exit 0\n"
     )
     docker.chmod(0o755)
