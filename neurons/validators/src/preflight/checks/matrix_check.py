@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 from preflight.base import PreflightCheck, CheckResult, CheckStatus
 from preflight.utils import suppress_library_output, get_gpu_info
 from services.gpu_precheck import GpuPrecheckError, precheck_gpu_spec
+from services.gpu_spec_table import matmul_memory_mb
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ class MatrixValidationCheck(PreflightCheck):
             wrapper = self._load_wrapper(self.lib_path)
 
             # 3) Choose dimensions/seed/uuid
-            dim_n, seed, challenge_uuid, dim_k = self._choose_params(gpu_info["gpu_memory_mb"])
+            dim_n, seed, challenge_uuid, dim_k = self._choose_params(matmul_memory_mb(gpu_info["gpu_model"], gpu_info["gpu_memory_mb"]))
 
             # 4) Generate cipher (encrypt side)
             cipher_text = self._generate_cipher_text(
