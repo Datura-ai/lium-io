@@ -1834,8 +1834,10 @@ class _EditSwap:
     destroyed. Entered together with the SSH connection so the undo still has a live session.
     """
 
-    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict):
+    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict, docker_client=None):
         self.ssh_client = ssh_client
+        # the create's Docker SDK connection, independent of the SSH session: stops a renamed pod a dead SSH lost track of
+        self.docker_client = docker_client
         self.container_name = container_name
         self.parked_name: str | None = None
         # the parked container's own Docker ID: its removal after the reply can land after a later edit
@@ -1972,6 +1974,9 @@ class _EditSwap:
         parked = recover_kept or f"{kept_prefix}{int(time.time())}"
         if not recover_kept:
             self.was_mounted = await self._plaintext_mounted(self.container_name)
+            if self.was_mounted is None and self.plaintext_path:
+                # unknown, an undo could not tell whether to remount the workspace: the running pod stays as it is
+                raise Exception("[park_current_container] the pod's volume mount could not be read; the pod was left as it was")
             await self._rename_aside(container_id, parked)
         self.parked_name = parked
         self.parked_id = container_id
@@ -2009,13 +2014,13 @@ class _EditSwap:
         return parked
 
     async def _plaintext_mounted(self, container: str) -> bool | None:
-        """Whether the running container has a mount at the plaintext path; None when that cannot be read."""
+        """Whether the container has a mount at the plaintext path (a stopped one has none); None when that cannot be read."""
         if not self.plaintext_path:
             return None
         read = await self._run(
-            f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container)}) && [ \"$p\" -gt 0 ] "
-            f"&& [ -r /proc/$p/mountinfo ] && awk -v m={shlex.quote(self.plaintext_path.rstrip('/'))} "
-            "'$5 == m {f=1} END {print f ? \"mounted\" : \"unmounted\"}' /proc/$p/mountinfo"
+            f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container)}) && "
+            f"{{ [ \"$p\" = 0 ] && echo unmounted || {{ [ -r /proc/$p/mountinfo ] && awk -v m={shlex.quote(self.plaintext_path.rstrip('/'))} "
+            "'$5 == m {f=1} END {print f ? \"mounted\" : \"unmounted\"}' /proc/$p/mountinfo; }; }"
         )
         out = (read.stdout or "").strip() if read.exit_status == 0 else ""
         return {"mounted": True, "unmounted": False}.get(out)
@@ -2039,8 +2044,13 @@ class _EditSwap:
             return
         if name != self.container_name:
             # unknown: give it the pod name back by ID (a no-op error when it was never renamed); still running
+            back = None
             with contextlib.suppress(Exception):
-                await self._run(f"/usr/bin/docker rename {shlex.quote(container_id)} {shlex.quote(self.container_name)}")
+                back = await self._run(f"/usr/bin/docker rename {shlex.quote(container_id)} {shlex.quote(self.container_name)}")
+            if (back is None or back.exit_status != 0) and self.docker_client is not None:
+                # maybe renamed out of every delete's reach and still running: stop it by ID (its layer stays)
+                with contextlib.suppress(Exception):
+                    await self.docker_client.stop(container_name=container_id)
         raise Exception(f"[park_current_container] docker rename failed: {error}")
 
     async def _layer_safe_to_remove(self, container: str, upper_dir: str | None = None, already_kept: bool = False) -> bool:
@@ -9722,7 +9732,7 @@ class DockerService:
                 )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
-                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
+                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra, docker_client=docker_client)
                 )
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))

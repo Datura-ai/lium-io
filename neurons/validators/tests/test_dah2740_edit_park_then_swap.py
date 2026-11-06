@@ -96,6 +96,8 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
         if "/usr/bin/docker diff" in cmd:  # the park's layer read: no renter files under the volume path
             return _ssh_result(stdout="drop\n")
+        if "/proc/$p/mountinfo" in cmd:  # the park's mount read: the plaintext path is not mounted
+            return _ssh_result(stdout="unmounted\n")
         if cmd == HUNG_GPU_QUERY_COMMAND:  # DAH-5301: the pod's GPU is healthy
             return _ssh_result(stdout="GPU-test, 0, 0\n--compute-apps--\n")
         if "docker stop" in cmd:
@@ -1258,7 +1260,34 @@ async def test_a_rename_whose_reply_is_lost_goes_by_the_name_docker_now_has(svc,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mounted", [True, False], ids=["mounted", "unmounted"])
+async def test_a_lost_rename_that_cannot_be_undone_over_ssh_stops_the_pod_by_id(svc, monkeypatch):
+    # Docker applied the rename, then the SSH session died: the pod may run under the kept name, out of every
+    # delete's reach; the create's own Docker SDK connection stops it by ID, its layer kept
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    answer = ssh.run.side_effect
+    name, kept = _pod_name(payload), _kept(payload)
+
+    def _side(cmd, *args, **kwargs):
+        if cmd == f"/usr/bin/docker rename {name} {kept}" or cmd.startswith("/usr/bin/docker inspect -f '{{.Name}}'") or cmd == f"/usr/bin/docker rename id-{name} {name}":
+            ssh.commands.append(cmd)
+            raise ConnectionError("SSH connection closed")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
+    _patch_happy(svc, monkeypatch, ssh)
+    sdk = svc.rental_docker_client_factory.client
+    sdk.stop = AsyncMock()
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert any(c.kwargs["container_name"] == f"id-{name}" for c in sdk.stop.await_args_list)
+    assert _docker(ssh.commands, "rm -fv") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mounted", [True, False, None], ids=["mounted", "unmounted", "unreadable"])
 @pytest.mark.parametrize("layer_files", [True, False], ids=["layer_files", "clean_layer"])
 async def test_a_failed_edit_restores_the_mount_the_pod_had(svc, monkeypatch, mounted, layer_files):
     # keeping older layer files must not take a mounted pod off its encrypted workspace; only a pod that ran
@@ -1271,6 +1300,8 @@ async def test_a_failed_edit_restores_the_mount_the_pod_had(svc, monkeypatch, mo
     def _side(cmd, *args, **kwargs):
         if "/proc/$p/mountinfo" in cmd and "docker diff" not in cmd:
             ssh.commands.append(cmd)
+            if mounted is None:  # the host timed the read out
+                return _ssh_result(exit_status=124)
             return _ssh_result(stdout="mounted\n" if mounted else "unmounted\n")
         return answer(cmd, *args, **kwargs)
 
@@ -1284,6 +1315,12 @@ async def test_a_failed_edit_restores_the_mount_the_pod_had(svc, monkeypatch, mo
     result = await _run(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
+    if mounted is None:
+        # an undo could not know whether to remount: the running pod is never parked
+        assert _docker(ssh.commands, "rename") == []
+        assert _docker(ssh.commands, "stop") == []
+        svc.setup_encrypted_local_volume.assert_not_awaited()
+        return
     assert svc.setup_encrypted_local_volume.await_count == (mounted or not layer_files)
     assert _docker(ssh.commands, "rename")[-1].endswith(f" {_pod_name(payload)}")  # the pod again, under its name
 
@@ -1383,7 +1420,9 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     import subprocess
     import time
 
-    now = time.time_ns()  # before the file below: the windows are in nanoseconds, like the records
+    # before the file below: the windows are in nanoseconds, like the records; the kernel stamps the file's mtime
+    # from its coarse clock, which can lag time_ns() by a tick
+    now = time.time_ns() - 10**8
     host_upper = "/var/lib/docker/x/diff"
     proc = tmp_path / "proc"
     upper = proc / "1" / "root" / host_upper.lstrip("/")
@@ -1575,3 +1614,31 @@ async def test_a_clean_kept_leftover_docker_will_not_remove_fails_the_edit_befor
 
     assert not isinstance(result, ContainerCreated)
     assert not any(c.startswith(f"/usr/bin/docker rename {_pod_name(payload)} ") for c in ssh.commands)
+
+
+@pytest.mark.parametrize(
+    ("pid", "path", "out"),
+    [("0", "/root", "unmounted"), ("self", "/proc", "mounted"), ("self", "/no/such/mount", "unmounted"), ("999999999", "/root", None)],
+    ids=["stopped", "mounted", "unmounted", "unreadable"],
+)
+def test_the_mount_read_runs_in_a_real_shell(pid, path, out):
+    # a stopped container (Pid 0) has no mount; a Pid without a readable mountinfo is unknown
+    import os
+    import subprocess
+
+    from services.docker_service import _EditSwap
+
+    swap = _EditSwap(Mock(), "pod_x", {})
+    swap.plaintext_path = path
+    commands = []
+
+    async def _record(cmd):
+        commands.append(cmd)
+        return _ssh_result(exit_status=1)
+
+    swap._run = _record
+    asyncio.run(swap._plaintext_mounted("pod_x"))
+    command = commands[0].replace("/usr/bin/docker inspect -f '{{.State.Pid}}' pod_x", f"echo {os.getpid() if pid == 'self' else pid}")
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+
+    assert (done.stdout.strip() if done.returncode == 0 else None) == out
