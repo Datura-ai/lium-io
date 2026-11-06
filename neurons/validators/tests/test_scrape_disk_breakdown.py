@@ -96,6 +96,7 @@ def scrape() -> dict:
         {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket,
          "run_cmd": _ctr(_running_root("/var/lib/containerd"))},
     )
+    namespace["real_running_containerd_argv"] = namespace["running_containerd_argv"]
     namespace["running_containerd_argv"] = lambda address: None  # no containerd process visible unless a test says
     return namespace
 
@@ -763,6 +764,54 @@ def test_a_host_without_ctr_reads_the_running_containerds_flags(scrape: dict, mo
     _stub_filesystem(scrape, monkeypatch, host_dirs=host_dirs, usage_by_path={**paths, "/proc/1/root/data/docker": _DOCKER_PARTITION})
 
     assert scrape["get_host_disk_usage"]() == expected
+
+
+def test_a_containerd_root_flag_does_not_skip_a_config_that_moves_the_snapshots(scrape: dict, monkeypatch) -> None:
+    # --root names the big disk, the config's root_path puts the snapshots on a small one: unknown, never the --root
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["run_cmd"] = _no_ctr
+    scrape["running_containerd_argv"] = lambda address: ["containerd", "--root", "/var/lib/containerd"]
+    scrape["open"] = _containerd_config('[plugins."io.containerd.snapshotter.v1.overlayfs"]\n  root_path = "/small/snapshots"\n')
+    _stub_filesystem(scrape, monkeypatch, host_dirs={_SNAPSHOTS}, usage_by_path={_SNAPSHOTS: _BIG})
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["containerd_store_root"](_SNAPSHOTTER_INFO, _OVERLAYFS)
+
+
+def _proc(scrape: dict, monkeypatch, processes: dict, namespaces: dict) -> None:
+    """/proc with these pid -> argv, and pid -> mount namespace links (a pid left out cannot be read)."""
+    cmdlines = {f"/proc/{pid}/cmdline": "\0".join(argv).encode() + b"\0" for pid, argv in processes.items()}
+
+    def fake_open(path, mode="r"):
+        if path not in cmdlines:
+            raise FileNotFoundError(path)
+        return io.BytesIO(cmdlines[path])
+
+    def readlink(path):
+        pid = path.split("/")[2]
+        if pid not in namespaces:
+            raise PermissionError(13, "denied", path)
+        return namespaces[pid]
+
+    scrape["open"] = fake_open
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=os.path, listdir=lambda _: ["1", *processes], readlink=readlink))
+
+
+def test_a_rentals_containerd_on_the_same_socket_path_is_not_dockers(scrape: dict, monkeypatch) -> None:
+    scrape["running_containerd_argv"] = scrape["real_running_containerd_argv"]
+    rental = ["/usr/bin/containerd", "--root", "/small/containerd"]  # inside a rental's own mount namespace
+    host = ["/usr/bin/containerd", "--root", "/data/containerd"]
+    _proc(scrape, monkeypatch, {"300": rental, "400": host}, {"1": "mnt:[1]", "300": "mnt:[7]", "400": "mnt:[1]"})
+
+    assert scrape["containerd_flag"](scrape["running_containerd_argv"](_CTRD_ADDRESS), "root") == "/data/containerd"
+
+
+def test_a_containerd_whose_namespace_cannot_be_read_is_unknown(scrape: dict, monkeypatch) -> None:
+    scrape["running_containerd_argv"] = scrape["real_running_containerd_argv"]
+    _proc(scrape, monkeypatch, {"300": ["containerd"]}, {"1": "mnt:[1]"})
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["running_containerd_argv"](_CTRD_ADDRESS)
 
 
 @pytest.mark.parametrize(

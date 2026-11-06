@@ -959,13 +959,14 @@ def containerd_store_root(info, plugin):
         # folder may be a leftover. The running daemon's own --root and --config flags are read off its process.
         data_root = info.get("DockerRootDir") or "/var/lib/docker"
         argv = running_containerd_argv(address) or []
+        # read first: a snapshotter root_path or imports in the config still move the store under a --root
+        named = containerd_config_root(containerd_flag(argv, "config", "c") or "/etc/containerd/config.toml", data_root)
         flag_root = containerd_flag(argv, "root")
         if flag_root:
             root = host_realpath(flag_root.rstrip("/"))
             if not os.path.isdir(f"/proc/1/root{root}/{plugin}"):
                 raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no {plugin} under containerd's --root")
             return f"{root}/{plugin}"
-        named = containerd_config_root(containerd_flag(argv, "config", "c") or "/etc/containerd/config.toml", data_root)
         for root in [f"{named}/{plugin}"] if named else (f"/var/lib/containerd/{plugin}", f"{data_root}/containerd/daemon/{plugin}"):
             if os.path.isdir(f"/proc/1/root{root}"):
                 return root
@@ -1021,6 +1022,12 @@ def running_containerd_argv(address):
         if os.path.basename(argv[0]) == "containerd" and same(
             containerd_flag(argv, "address", "a") or "/run/containerd/containerd.sock", address
         ):
+            # a containerd inside a rental serves the same path in its own mount namespace: only the host's counts
+            try:
+                if os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/1/ns/mnt"):
+                    continue
+            except OSError as exc:
+                raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and containerd's namespace is unreadable: {exc!r}")
             return argv
     return None
 

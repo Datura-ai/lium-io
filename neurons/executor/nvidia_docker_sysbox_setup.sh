@@ -490,8 +490,9 @@ ctrd_flag() {
 }
 
 ctrd_running_argv() {
-    # CTRD_ARGV: the command line of the containerd process serving address $1; empty when none is visible
-    local f addr argv
+    # CTRD_ARGV: the command line of the host containerd process serving address $1; empty when none is visible.
+    # Fails when such a process's mount namespace cannot be read.
+    local f addr argv ns host_ns
     CTRD_ARGV=()
     for f in "$(host_path /proc)"/[0-9]*/cmdline; do
         [ -r "$f" ] || continue
@@ -499,6 +500,9 @@ ctrd_running_argv() {
         [ "${#argv[@]}" -gt 0 ] && [ "${argv[0]##*/}" = containerd ] || continue
         addr=$(ctrd_flag address a "${argv[@]}") || addr=/run/containerd/containerd.sock
         [ "${addr#/var}" = "${1#/var}" ] || continue   # /var/run is /run
+        # a containerd inside a rental serves the same path in its own mount namespace: only the host's counts
+        ns=$(readlink "${f%/cmdline}/ns/mnt") && host_ns=$(readlink "$(host_path /proc)/1/ns/mnt") || return 1
+        [ "$ns" = "$host_ns" ] || continue
         CTRD_ARGV=("${argv[@]}")
         return 0
     done
@@ -539,13 +543,14 @@ resolve_disk_dir() {
         # the system containerd, else of Docker's own one; unknown when its config (--config, else the default file)
         # moves the root, as the built-in folder may be a leftover
         local flag_root config
-        ctrd_running_argv "$address"
+        ctrd_running_argv "$address" || return 1
+        # read first: a snapshotter root_path or imports in the config still move the store under a --root
+        config=$(ctrd_flag config c "${CTRD_ARGV[@]}") || config=/etc/containerd/config.toml
+        ctrd_config_moves_root "$config" && return 1
         if flag_root=$(ctrd_flag root "" "${CTRD_ARGV[@]}"); then
             [ -n "$flag_root" ] || return 1
             DISK_DIR=$(host_path "${flag_root%/}/$plugin")
         else
-            config=$(ctrd_flag config c "${CTRD_ARGV[@]}") || config=/etc/containerd/config.toml
-            ctrd_config_moves_root "$config" && return 1
             DISK_DIR=$(host_path "/var/lib/containerd/$plugin")
             [ -d "$DISK_DIR" ] || DISK_DIR=$data_root/containerd/daemon/$plugin
         fi

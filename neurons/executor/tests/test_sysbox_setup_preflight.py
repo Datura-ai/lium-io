@@ -24,7 +24,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir"]
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir", "readlink"]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
@@ -223,8 +223,15 @@ def _host_root(tmp_path: Path, files: dict[str, str | None] | None = None) -> Pa
             continue
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        if isinstance(content, Link):
+            path.symlink_to(content)
+        else:
+            path.write_text(content)
     return root
+
+
+class Link(str):
+    """A fixture entry that is a symlink to this target (as /proc/<pid>/ns/mnt reads)."""
 
 
 def _script_copy(tmp_path: Path) -> Path:
@@ -492,9 +499,10 @@ def test_a_host_without_ctr_whose_store_cannot_be_told_is_skipped_not_passed(tmp
     assert "SKIP" in out and "PASS=1" not in out
 
 
-def _containerd_process(*flags: str) -> dict[str, str]:
-    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads
-    return {"proc/4242/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0"}
+def _containerd_process(*flags: str, pid: int = 4242, mnt: str = "mnt:[1]") -> dict[str, str]:
+    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads, in mount namespace mnt
+    return {f"proc/{pid}/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0",
+            f"proc/{pid}/ns/mnt": Link(mnt), "proc/1/ns/mnt": Link("mnt:[1]")}
 
 
 def test_a_host_without_ctr_is_measured_at_the_running_containerds_root_flag(tmp_path):
@@ -505,10 +513,25 @@ def test_a_host_without_ctr_is_measured_at_the_running_containerds_root_flag(tmp
     assert f"/small/containerd/{_OVERLAYFS}" in out, out
 
 
+def test_a_rentals_containerd_on_the_same_socket_path_is_not_read_as_dockers(tmp_path):
+    # a rental's own containerd names a small --root in its own mount namespace; the host's has no flags
+    files = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
+             **_containerd_process("--root", "/small/containerd", pid=300, mnt="mnt:[7]"), **_containerd_process()}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert f"/small/containerd/{_OVERLAYFS}" not in out, out
+    assert SNAPSHOTS in out, out
+
+
 @pytest.mark.parametrize(
     "files",
     [
         {f"{SNAPSHOTS}/.keep": "", **_containerd_process("--root=/gone/containerd")},  # its --root holds no store
+        # --root names the big disk while the config's root_path puts the snapshots on a small one
+        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml":
+         '[plugins."io.containerd.snapshotter.v1.overlayfs"]\n  root_path = "/small/snapshots"\n',
+         **_containerd_process("--root", "/var/lib/containerd")},
+        # a containerd on Docker's socket whose mount namespace cannot be read
+        {f"{SNAPSHOTS}/.keep": "", "proc/4242/cmdline": "/usr/bin/containerd\0"},
         # its --config moves the root while /etc/containerd/config.toml is at the default
         {f"{SNAPSHOTS}/.keep": "", "opt/ctrd.toml": 'root = "/small/containerd"\n',
          **_containerd_process("-c", "/opt/ctrd.toml")},
