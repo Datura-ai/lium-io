@@ -522,6 +522,18 @@ def test_a_rentals_containerd_on_the_same_socket_path_is_not_read_as_dockers(tmp
     assert SNAPSHOTS in out, out
 
 
+def test_a_host_containerd_whose_config_serves_another_address_is_not_read_as_dockers(tmp_path):
+    # Docker's own containerd sets its socket in its config, not on the command line: it is not the one on Docker's
+    files = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
+             "run/docker/containerd/containerd.toml": '[grpc]\n  address = "/run/docker/containerd/containerd.sock"\n',
+             **_containerd_process("--config", "/run/docker/containerd/containerd.toml", "--root", "/small/containerd",
+                                   pid=300),
+             **_containerd_process()}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert f"/small/containerd/{_OVERLAYFS}" not in out, out
+    assert SNAPSHOTS in out, out
+
+
 @pytest.mark.parametrize(
     "files",
     [
@@ -535,6 +547,9 @@ def test_a_rentals_containerd_on_the_same_socket_path_is_not_read_as_dockers(tmp
         # its --config moves the root while /etc/containerd/config.toml is at the default
         {f"{SNAPSHOTS}/.keep": "", "opt/ctrd.toml": 'root = "/small/containerd"\n',
          **_containerd_process("-c", "/opt/ctrd.toml")},
+        # two host containerds on Docker's socket: which one Docker talks to cannot be told
+        {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
+         **_containerd_process("--root", "/small/containerd", pid=300), **_containerd_process()},
     ],
 )
 def test_a_host_without_ctr_reads_the_running_containerds_flags_or_skips(tmp_path, files):

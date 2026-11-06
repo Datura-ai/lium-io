@@ -50,6 +50,7 @@ DISK_HELPERS = {
     "containerd_store_root",
     "containerd_config_root",
     "running_containerd_argv",
+    "containerd_config_address",
     "containerd_flag",
     "host_realpath",
     "CONTAINERD_ROOT_UNKNOWN",
@@ -778,11 +779,14 @@ def test_a_containerd_root_flag_does_not_skip_a_config_that_moves_the_snapshots(
         scrape["containerd_store_root"](_SNAPSHOTTER_INFO, _OVERLAYFS)
 
 
-def _proc(scrape: dict, monkeypatch, processes: dict, namespaces: dict) -> None:
-    """/proc with these pid -> argv, and pid -> mount namespace links (a pid left out cannot be read)."""
+def _proc(scrape: dict, monkeypatch, processes: dict, namespaces: dict, configs: dict | None = None) -> None:
+    """/proc with these pid -> argv, pid -> mount namespace links (a pid left out cannot be read), host path -> config."""
     cmdlines = {f"/proc/{pid}/cmdline": "\0".join(argv).encode() + b"\0" for pid, argv in processes.items()}
+    texts = {f"/proc/1/root{path}": text for path, text in (configs or {}).items()}
 
-    def fake_open(path, mode="r"):
+    def fake_open(path, mode="r", **kwargs):
+        if path in texts:
+            return io.StringIO(texts[path])
         if path not in cmdlines:
             raise FileNotFoundError(path)
         return io.BytesIO(cmdlines[path])
@@ -804,6 +808,26 @@ def test_a_rentals_containerd_on_the_same_socket_path_is_not_dockers(scrape: dic
     _proc(scrape, monkeypatch, {"300": rental, "400": host}, {"1": "mnt:[1]", "300": "mnt:[7]", "400": "mnt:[1]"})
 
     assert scrape["containerd_flag"](scrape["running_containerd_argv"](_CTRD_ADDRESS), "root") == "/data/containerd"
+
+
+def test_a_host_containerd_whose_config_sets_another_address_is_not_dockers(scrape: dict, monkeypatch) -> None:
+    scrape["running_containerd_argv"] = scrape["real_running_containerd_argv"]
+    other = ["containerd", "--config", "/run/docker/containerd/containerd.toml", "--root", "/small/containerd"]
+    system = ["containerd", "--root", "/data/containerd"]
+    configs = {"/run/docker/containerd/containerd.toml": '[grpc]\n  address = "/run/docker/containerd/containerd.sock"\n'}
+    _proc(scrape, monkeypatch, {"300": other, "400": system}, {"1": "mnt:[1]", "300": "mnt:[1]", "400": "mnt:[1]"}, configs)
+
+    assert scrape["containerd_flag"](scrape["running_containerd_argv"](_CTRD_ADDRESS), "root") == "/data/containerd"
+
+
+def test_two_host_containerds_on_dockers_address_are_unknown(scrape: dict, monkeypatch) -> None:
+    scrape["running_containerd_argv"] = scrape["real_running_containerd_argv"]
+    configs = {"/etc/b.toml": '[grpc]\naddress = "/run/containerd/containerd.sock"\n'}
+    processes = {"300": ["containerd", "--root", "/small/containerd"], "400": ["containerd", "-c", "/etc/b.toml"]}
+    _proc(scrape, monkeypatch, processes, {"1": "mnt:[1]", "300": "mnt:[1]", "400": "mnt:[1]"}, configs)
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["running_containerd_argv"](_CTRD_ADDRESS)
 
 
 def test_a_containerd_whose_namespace_cannot_be_read_is_unknown(scrape: dict, monkeypatch) -> None:

@@ -1013,22 +1013,46 @@ def running_containerd_argv(address):
     def same(a, b):
         return a.removeprefix("/var") == b.removeprefix("/var")  # /var/run is /run
 
+    found = []
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 argv = f.read().decode(errors="replace").split("\0")
         except OSError:
             continue
-        if os.path.basename(argv[0]) == "containerd" and same(
-            containerd_flag(argv, "address", "a") or "/run/containerd/containerd.sock", address
-        ):
+        if os.path.basename(argv[0]) != "containerd":
+            continue
+        # without --address the config's [grpc] address counts (Docker's own containerd sets it there)
+        config = containerd_flag(argv, "config", "c") or "/etc/containerd/config.toml"
+        served = containerd_flag(argv, "address", "a") or containerd_config_address(config)
+        if same(served or "/run/containerd/containerd.sock", address):
             # a containerd inside a rental serves the same path in its own mount namespace: only the host's counts
             try:
                 if os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/1/ns/mnt"):
                     continue
             except OSError as exc:
                 raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and containerd's namespace is unreadable: {exc!r}")
-            return argv
+            found.append(argv)
+    if len(found) > 1:
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and more than one host containerd serves {address}")
+    return found[0] if found else None
+
+
+def containerd_config_address(config):
+    # the address containerd's config ([grpc] address) serves on, or None when it sets none or cannot be read
+    try:
+        with open(f"/proc/1/root{config}", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    section = ""
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        header = re.fullmatch(r"\[\s*([^\]]+?)\s*\]", line)
+        if header:
+            section = header.group(1)
+        elif section == "grpc" and (match := re.fullmatch(r"address\s*=\s*[\"'](.+)[\"']", line)):
+            return match.group(1)
     return None
 
 

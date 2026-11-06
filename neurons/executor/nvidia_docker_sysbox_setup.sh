@@ -491,22 +491,32 @@ ctrd_flag() {
 
 ctrd_running_argv() {
     # CTRD_ARGV: the command line of the host containerd process serving address $1; empty when none is visible.
-    # Fails when such a process's mount namespace cannot be read.
-    local f addr argv ns host_ns
+    # Fails when such a process's mount namespace cannot be read, or when more than one host containerd serves $1.
+    local f addr config argv ns host_ns
     CTRD_ARGV=()
     for f in "$(host_path /proc)"/[0-9]*/cmdline; do
         [ -r "$f" ] || continue
         mapfile -d '' -t argv 2>/dev/null <"$f" || continue
         [ "${#argv[@]}" -gt 0 ] && [ "${argv[0]##*/}" = containerd ] || continue
-        addr=$(ctrd_flag address a "${argv[@]}") || addr=/run/containerd/containerd.sock
+        # without --address the config's [grpc] address counts (Docker's own containerd sets it there)
+        config=$(ctrd_flag config c "${argv[@]}") || config=/etc/containerd/config.toml
+        addr=$(ctrd_flag address a "${argv[@]}") || addr=$(ctrd_config_address "$config")
+        [ -n "$addr" ] || addr=/run/containerd/containerd.sock
         [ "${addr#/var}" = "${1#/var}" ] || continue   # /var/run is /run
         # a containerd inside a rental serves the same path in its own mount namespace: only the host's counts
         ns=$(readlink "${f%/cmdline}/ns/mnt") && host_ns=$(readlink "$(host_path /proc)/1/ns/mnt") || return 1
         [ "$ns" = "$host_ns" ] || continue
+        [ "${#CTRD_ARGV[@]}" -eq 0 ] || return 1
         CTRD_ARGV=("${argv[@]}")
-        return 0
     done
     return 0
+}
+
+ctrd_config_address() {
+    # the [grpc] address containerd's config ($1) serves on; empty when it sets none or cannot be read
+    awk '{sub(/#.*/, "")} /^[ \t]*\[/ {s = $0; gsub(/[][ \t]/, "", s); next}
+        s == "grpc" && match($0, /^[ \t]*address[ \t]*=/) {v = $0; sub(/^[^=]*=[ \t]*/, "", v); gsub(/[ \t"\047]/, "", v); print v; exit}' \
+        "$(host_path "$1")" 2>/dev/null
 }
 
 ctrd_config_moves_root() {
