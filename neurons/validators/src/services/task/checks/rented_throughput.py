@@ -56,6 +56,9 @@ LATE_SKIPS_BEFORE_VERDICT = 3
 SAVE_RESERVE_SECONDS = 5
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
+# a failed reading older than this (its retry never ran, e.g. the node was unrented in between) does not count
+# "in a row" with the next one: RETRY_SECONDS plus LATE_SKIPS_BEFORE_VERDICT late cycles fit well inside it
+STREAK_GAP_SECONDS = 3 * RETRY_SECONDS
 BUSY_WINDOW_SECONDS = 2
 DISK_MARKER = "lium_disk"
 SNAP_MARKER = "lium_tp"
@@ -419,7 +422,8 @@ class RentedThroughputCheck:
     cannot be read makes it inconclusive; an unsure measurement stays inconclusive. Incomplete pod counters (a pod stopped, restarted or unreadable) make a
     failing side inconclusive too. Inconclusive = no strike and no pass however many in a row (owner decision: IO that
     cannot be attributed never fails a node), re-probed after RETRY_SECONDS.
-    READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
+    READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart; a side's lone failure older than
+    STREAK_GAP_SECONDS starts no streak) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading; so do LATE_SKIPS_BEFORE_VERDICT due readings in a row
     skipped for too little cycle time (RENTED_THROUGHPUT_NOT_RUN), until a reading completes. Non-fatal: the rental keeps running.
 
@@ -479,10 +483,11 @@ class RentedThroughputCheck:
         skip_under_pressure = await self._reserve_probe_skip(ctx, key, state)
         reading, net, disk = await self._measure_and_judge(ctx, skip_under_pressure=skip_under_pressure)
         reading["inconclusive"] = "inconclusive" in (net, disk)
-        net_failures, disk_failures = (
-            _step(state.net_failures, net),
-            _step(state.disk_failures, disk),
-        )
+        net_failures, disk_failures = state.net_failures, state.disk_failures
+        if now - state.at > STREAK_GAP_SECONDS:
+            # per side, only a strike short of a verdict expires: a standing SLOW stays until a reading passes
+            net_failures, disk_failures = (n if n >= READINGS_BEFORE_VERDICT else 0 for n in (net_failures, disk_failures))
+        net_failures, disk_failures = _step(net_failures, net), _step(disk_failures, disk)
         failures = max(net_failures, disk_failures)
         state = _State(
             at=now,

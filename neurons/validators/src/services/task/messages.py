@@ -958,6 +958,19 @@ class SysboxRequiredMessages:
             "toolkit; the sysbox check runs again on the next cycle."
         ),
     )
+    # DAH-5844: the test container started but its sshd never answered and its log names no cause
+    # (dind_probe.DIND_SSHD_NOT_READY), so nothing about sysbox was measured. Same impact as SYSBOX_MISSING.
+    DIND_PROBE_UNREACHABLE = MessageTemplate(
+        event="Sysbox test container never became reachable",
+        reason="DIND_PROBE_UNREACHABLE",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Sysbox was not measured. Check that the node's mapped ports accept SSH from outside and that the "
+            "host is not overloaded; the sysbox check runs again on the next cycle."
+        ),
+    )
     SYSBOX_OK = MessageTemplate(
         event="Sysbox requirement satisfied",
         reason="SYSBOX_REQUIRED_OK",
