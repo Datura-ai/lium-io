@@ -604,6 +604,10 @@ async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_r
         ("falsefalse", "", "printf abc", False, True),  # stopped
         ("Error: No such object: dind_x", "", "exit 0", False, True),  # gone
         ("error: no such object: dind_x", "", "exit 0", False, True),  # gone, another docker's wording
+        ("Error response from daemon: No such container: dind_x", "", "exit 0", False, True),  # gone, daemon text
+        ("", "", "exit 0", False, True),  # gone, inspect printed nothing
+        ("[]", "", "exit 0", False, True),  # gone, inspect printed an empty list
+        ("unexpected state", "", "printf abc", False, False),  # unknown wording but ps still lists it
         ("truefalse", "falsefalse", "printf abc", True, True),  # the pause did not freeze it: killed
         ("truefalse", "truefalse", "printf abc", True, False),  # the kill did not stop it either
         ("Cannot connect to the Docker daemon", "", "exit 1", False, False),  # state unknown
