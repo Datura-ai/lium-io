@@ -83,21 +83,40 @@ class GPUCheck(PreflightCheck):
             # Check 3: GPU utilization (must be idle)
             high_util_gpus = []
             for idx, detail in enumerate(gpu_details):
-                gpu_util = detail.get("utilization", 0)
-                mem_util = detail.get("memory_utilization", 0)
+                samples = detail.get("utilization_samples") or [
+                    (detail.get("utilization", 0), detail.get("memory_utilization", 0))
+                ]
 
-                if gpu_util >= gpu_utilization_limit or mem_util > gpu_memory_utilization_limit:
-                    high_util_gpus.append({
-                        "gpu_index": idx,
-                        "gpu_utilization": gpu_util,
-                        "memory_utilization": mem_util
-                    })
+                # A card driving a display with no compute processes is idle: its memory
+                # utilization is the screen refresh, not a workload (ticket-0996). The process
+                # count is read with each sample, so a process starting mid-window is seen.
+                procs = detail.get("compute_process_samples") or [None] * len(samples)
+                display_active = detail.get("display_active")
+
+                # Idle only if one whole sample passes; independent minima would let
+                # alternating busy reads (6,0),(0,6) pass.
+                if not any(
+                    gpu_util < gpu_utilization_limit
+                    and (mem_util <= gpu_memory_utilization_limit or (display_active and n_procs == 0))
+                    for (gpu_util, mem_util), n_procs in zip(samples, procs)
+                ):
+                    high_util_gpus.append({"gpu_index": idx, "samples": samples})
 
             if high_util_gpus:
                 return CheckResult(
                     name=self.name,
                     status=CheckStatus.FAILED,
-                    message=f"GPUs must be idle. {len(high_util_gpus)} GPU(s) have high utilization (>={gpu_utilization_limit}%). Stop running processes"
+                    message=(
+                        f"GPUs must be idle. {len(high_util_gpus)} GPU(s) have high utilization "
+                        f"(GPU >={gpu_utilization_limit}% or memory >{gpu_memory_utilization_limit}% "
+                        f"in every sample): "
+                        + "; ".join(
+                            f"GPU {g['gpu_index']}: "
+                            + ", ".join(f"GPU {gu}% memory {mu}%" for gu, mu in g["samples"])
+                            for g in high_util_gpus
+                        )
+                        + ". Stop running processes"
+                    )
                 )
 
             # Check 4: GPU UUIDs (uniqueness)

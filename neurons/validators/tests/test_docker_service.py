@@ -10311,7 +10311,9 @@ _COPY = 24 * _GIB + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES
         # review: 200 GiB free gave 120 + 60 and the copy then needed 214; the copy is budgeted first
         (200, None, None, _COPY, False, "flatten_copy", "flattened"),
         (200, None, None, None, False, "pool", "no_disk"),  # no budget (few layers): the flatten guard refuses
-        (200, 500, None, _COPY, False, "flatten_copy", "flattened"),  # non-binding request cap
+        # an ordered volume is never cut for the copy (5 Nov: 233 GB ordered, 157 granted); no room: refused
+        (200, 500, None, _COPY, False, "pool", "no_disk"),
+        (200, 115, None, _COPY, False, "request_cap", "no_disk"),
         (200, 40, None, _COPY, False, "request_cap", "flattened"),  # binding request cap
         # the minimum volume stays granted; a disk too small for it and the copy refuses the flatten
         (100, None, 50, _COPY, False, "flatten_copy", "no_disk"),
@@ -10323,7 +10325,8 @@ _COPY = 24 * _GIB + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES
     ids=[
         "review_full_node",
         "unbudgeted",
-        "cap_nonbinding",
+        "order_over_pool",
+        "order_kept",
         "cap_binding",
         "min_volume_short",
         "min_volume_fits",
@@ -10349,6 +10352,7 @@ async def test_fresh_sizing_leaves_room_for_the_flatten_it_admits(
             flatten_copy_bytes=copy_bytes,
         )
         assert sizing.capped_by == capped_by
+        assert capped_by != "request_cap" or sizing.volume_limit_gb == volume_limit_gb
         assert min_volume_gb is None or sizing.volume_limit_gb >= min_volume_gb
         volume_gb, storage_gb = sizing.volume_limit_gb, sizing.storage_limit_gb
     client = _SysboxFailingRentalClient({"sglang"})
