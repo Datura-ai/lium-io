@@ -958,7 +958,9 @@ def containerd_store_root(info, plugin):
         # containerd, else of Docker's own one; unknown when containerd's config moves the root, as the built-in
         # folder may be a leftover. The running daemon's own --root and --config flags are read off its process.
         data_root = info.get("DockerRootDir") or "/var/lib/docker"
-        argv = running_containerd_argv(address) or []
+        argv = running_containerd_argv(address)
+        if argv is None:  # the built-in folder may be a leftover of a containerd that is not Docker's
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no host containerd serves {address}")
         # read first: a snapshotter root_path or imports in the config still move the store under a --root
         named = containerd_config_root(containerd_flag(argv, "config", "c") or "/etc/containerd/config.toml", data_root)
         flag_root = containerd_flag(argv, "root")
@@ -1039,20 +1041,25 @@ def running_containerd_argv(address):
 
 
 def containerd_config_address(config):
-    # the address containerd's config ([grpc] address) serves on, or None when it sets none or cannot be read
+    # the address containerd's config ([grpc] address) serves on, or None when it sets none or cannot be read;
+    # unknown when it sets none but imports more files, which may set it
     try:
         with open(f"/proc/1/root{config}", errors="replace") as f:
             text = f.read()
     except OSError:
         return None
-    section = ""
+    section, imports = "", False
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         header = re.fullmatch(r"\[\s*([^\]]+?)\s*\]", line)
         if header:
             section = header.group(1)
+        elif not section and (match := re.fullmatch(r"imports\s*=(.*)", line)):
+            imports = re.sub(r"[\s\"']", "", match.group(1)) not in ("", "[]")
         elif section == "grpc" and (match := re.fullmatch(r"address\s*=\s*[\"'](.+)[\"']", line)):
             return match.group(1)
+    if imports:
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and its address may be in an imported file")
     return None
 
 

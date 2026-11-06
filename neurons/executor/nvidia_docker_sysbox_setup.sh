@@ -491,7 +491,8 @@ ctrd_flag() {
 
 ctrd_running_argv() {
     # CTRD_ARGV: the command line of the host containerd process serving address $1; empty when none is visible.
-    # Fails when such a process's mount namespace cannot be read, or when more than one host containerd serves $1.
+    # Fails when such a process's mount namespace cannot be read, when more than one host containerd serves $1,
+    # or when a containerd's address may be set in a file its config imports.
     local f addr config argv ns host_ns
     CTRD_ARGV=()
     for f in "$(host_path /proc)"/[0-9]*/cmdline; do
@@ -500,7 +501,8 @@ ctrd_running_argv() {
         [ "${#argv[@]}" -gt 0 ] && [ "${argv[0]##*/}" = containerd ] || continue
         # without --address the config's [grpc] address counts (Docker's own containerd sets it there)
         config=$(ctrd_flag config c "${argv[@]}") || config=/etc/containerd/config.toml
-        addr=$(ctrd_flag address a "${argv[@]}") || addr=$(ctrd_config_address "$config")
+        # status 3: no address in the config but imports that may set one, so which daemon serves $1 is unknown
+        if ! addr=$(ctrd_flag address a "${argv[@]}"); then addr=$(ctrd_config_address "$config") || [ $? -ne 3 ] || return 1; fi
         [ -n "$addr" ] || addr=/run/containerd/containerd.sock
         [ "${addr#/var}" = "${1#/var}" ] || continue   # /var/run is /run
         # a containerd inside a rental serves the same path in its own mount namespace: only the host's counts
@@ -513,9 +515,12 @@ ctrd_running_argv() {
 }
 
 ctrd_config_address() {
-    # the [grpc] address containerd's config ($1) serves on; empty when it sets none or cannot be read
+    # the [grpc] address containerd's config ($1) serves on; empty when it sets none or cannot be read.
+    # Status 3 when it sets none but imports more files, which may set it.
     awk '{sub(/#.*/, "")} /^[ \t]*\[/ {s = $0; gsub(/[][ \t]/, "", s); next}
-        s == "grpc" && match($0, /^[ \t]*address[ \t]*=/) {v = $0; sub(/^[^=]*=[ \t]*/, "", v); gsub(/[ \t"\047]/, "", v); print v; exit}' \
+        s == "" && match($0, /^[ \t]*imports[ \t]*=/) {v = $0; sub(/^[^=]*=/, "", v); gsub(/[ \t"\047]/, "", v); imp = v != "" && v != "[]"}
+        s == "grpc" && match($0, /^[ \t]*address[ \t]*=/) {v = $0; sub(/^[^=]*=[ \t]*/, "", v); gsub(/[ \t"\047]/, "", v); print v; done = 1; exit}
+        END {if (!done && imp) exit 3}' \
         "$(host_path "$1")" 2>/dev/null
 }
 
@@ -554,6 +559,8 @@ resolve_disk_dir() {
         # moves the root, as the built-in folder may be a leftover
         local flag_root config
         ctrd_running_argv "$address" || return 1
+        # none on Docker's socket: the built-in folder may be a leftover of a containerd that is not Docker's
+        [ "${#CTRD_ARGV[@]}" -gt 0 ] || return 1
         # read first: a snapshotter root_path or imports in the config still move the store under a --root
         config=$(ctrd_flag config c "${CTRD_ARGV[@]}") || config=/etc/containerd/config.toml
         ctrd_config_moves_root "$config" && return 1

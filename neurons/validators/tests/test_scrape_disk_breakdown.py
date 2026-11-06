@@ -98,7 +98,7 @@ def scrape() -> dict:
          "run_cmd": _ctr(_running_root("/var/lib/containerd"))},
     )
     namespace["real_running_containerd_argv"] = namespace["running_containerd_argv"]
-    namespace["running_containerd_argv"] = lambda address: None  # no containerd process visible unless a test says
+    namespace["running_containerd_argv"] = lambda address: ["containerd"]  # the system containerd unless a test says
     return namespace
 
 
@@ -836,6 +836,44 @@ def test_a_containerd_whose_namespace_cannot_be_read_is_unknown(scrape: dict, mo
 
     with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
         scrape["running_containerd_argv"](_CTRD_ADDRESS)
+
+
+_CUSTOM_ADDRESS = "/run/custom/containerd.sock"
+_IMPORTS_ONLY = 'imports = ["/etc/containerd/conf.d/*.toml"]\n'
+
+
+@pytest.mark.parametrize(
+    "address, processes, namespaces, configs",
+    [
+        # no containerd process visible at all: the built-in folder may be a leftover
+        (_CTRD_ADDRESS, {}, {"1": "mnt:[1]"}, {}),
+        # the only one on Docker's socket is a rental's, in its own mount namespace
+        (_CTRD_ADDRESS, {"300": ["containerd"]}, {"1": "mnt:[1]", "300": "mnt:[7]"}, {}),
+        # Docker's containerd sets its address in an imported file: its own address cannot be told
+        (_CUSTOM_ADDRESS, {"300": ["containerd", "--config", "/etc/containerd/custom.toml"]},
+         {"1": "mnt:[1]", "300": "mnt:[1]"}, {"/etc/containerd/custom.toml": _IMPORTS_ONLY}),
+    ],
+)
+def test_a_host_without_ctr_whose_dockers_containerd_cannot_be_found_is_unknown(
+    scrape: dict, monkeypatch, address, processes, namespaces, configs
+) -> None:
+    scrape["running_containerd_argv"] = scrape["real_running_containerd_argv"]
+    scrape["run_cmd"] = _no_ctr
+    _proc(scrape, monkeypatch, processes, namespaces, configs)
+    scrape["os"].path = SimpleNamespace(basename=os.path.basename, isdir=lambda path: path == _SNAPSHOTS)  # stale store
+    info = {**_SNAPSHOTTER_INFO, "Containerd": {"Address": address}}
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["containerd_store_root"](info, _OVERLAYFS)
+
+
+def test_a_containerd_config_with_imports_and_its_own_address_is_still_read(scrape: dict, monkeypatch) -> None:
+    scrape["running_containerd_argv"] = scrape["real_running_containerd_argv"]
+    argv = ["containerd", "--config", "/etc/containerd/custom.toml", "--root", "/data/containerd"]
+    configs = {"/etc/containerd/custom.toml": _IMPORTS_ONLY + f'[grpc]\n  address = "{_CUSTOM_ADDRESS}"\n'}
+    _proc(scrape, monkeypatch, {"300": argv}, {"1": "mnt:[1]", "300": "mnt:[1]"}, configs)
+
+    assert scrape["containerd_flag"](scrape["running_containerd_argv"](_CUSTOM_ADDRESS), "root") == "/data/containerd"
 
 
 @pytest.mark.parametrize(

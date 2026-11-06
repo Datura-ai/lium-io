@@ -467,6 +467,12 @@ def test_an_unknown_containerd_root_is_skipped_not_read_as_the_leftover(tmp_path
     assert "SKIP" in out and "is below" not in out
 
 
+def _containerd_process(*flags: str, pid: int = 4242, mnt: str = "mnt:[1]") -> dict[str, str]:
+    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads, in mount namespace mnt
+    return {f"proc/{pid}/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0",
+            f"proc/{pid}/ns/mnt": Link(mnt), "proc/1/ns/mnt": Link("mnt:[1]")}
+
+
 _NO_CTR_DISKS = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
 
 
@@ -478,6 +484,7 @@ _NO_CTR_DISKS = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STU
     ],
 )
 def test_a_host_without_ctr_is_measured_at_containerds_built_in_root(tmp_path, files):
+    files = {**files, **_containerd_process()}
     rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
     assert rc == 1, out
     assert "SKIP " not in out
@@ -497,12 +504,6 @@ def test_a_host_without_ctr_whose_store_cannot_be_told_is_skipped_not_passed(tmp
     rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
     assert rc == 0, out
     assert "SKIP" in out and "PASS=1" not in out
-
-
-def _containerd_process(*flags: str, pid: int = 4242, mnt: str = "mnt:[1]") -> dict[str, str]:
-    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads, in mount namespace mnt
-    return {f"proc/{pid}/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0",
-            f"proc/{pid}/ns/mnt": Link(mnt), "proc/1/ns/mnt": Link("mnt:[1]")}
 
 
 def test_a_host_without_ctr_is_measured_at_the_running_containerds_root_flag(tmp_path):
@@ -550,10 +551,26 @@ def test_a_host_containerd_whose_config_serves_another_address_is_not_read_as_do
         # two host containerds on Docker's socket: which one Docker talks to cannot be told
         {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
          **_containerd_process("--root", "/small/containerd", pid=300), **_containerd_process()},
+        # no containerd process on Docker's socket at all: the built-in folder may be a leftover
+        {f"{SNAPSHOTS}/.keep": ""},
+        # the only one on Docker's socket is a rental's, in its own mount namespace
+        {f"{SNAPSHOTS}/.keep": "", **_containerd_process(mnt="mnt:[7]")},
     ],
 )
 def test_a_host_without_ctr_reads_the_running_containerds_flags_or_skips(tmp_path, files):
     rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert rc == 0, out
+    assert "SKIP" in out and "PASS=1" not in out
+
+
+def test_a_containerd_whose_address_may_be_imported_is_skipped(tmp_path):
+    # Docker's containerd sets its custom address in an imported file: which daemon serves it cannot be told
+    files = {f"{SNAPSHOTS}/.keep": "", "etc/containerd/custom.toml": 'imports = ["/etc/containerd/conf.d/*.toml"]\n',
+             **_containerd_process("--config", "/etc/containerd/custom.toml", "--root", "/small/containerd")}
+    env = {**_NO_CTR_DISKS, "STUB_CONTAINERD_ADDRESS": "/run/custom/containerd.sock"}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files, without=("ctr",))
+    assert rc == 0, out
+    assert "SKIP" in out and "PASS=1" not in out
     assert rc == 0, out
     assert "SKIP" in out and "PASS=1" not in out
 
