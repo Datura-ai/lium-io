@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING, Any
 
 from .models import AVAILABILITY_CATEGORY, build_msg
@@ -34,9 +34,9 @@ def shown(value: float, decimals: int, *, failed_below: bool) -> str:
     A value below a minimum rounds down and a value above a maximum rounds up (49.96 GB free
     shows as 49.9, not 50.0, against a 50 GB minimum).
     """
-    scale = 10**decimals
-    scaled = round(value * scale, 6)  # drop float noise before flooring (49.9 * 10 = 498.999...)
-    return f"{(math.floor(scaled) if failed_below else math.ceil(scaled)) / scale:.{decimals}f}"
+    # decimal from the shortest str(): no float noise (49.9 stays 49.9) and no pre-rounding (99.99999999 stays below 100)
+    step = Decimal(1).scaleb(-decimals)
+    return f"{Decimal(str(value)).quantize(step, rounding=ROUND_FLOOR if failed_below else ROUND_CEILING):.{decimals}f}"
 
 
 def render_message(

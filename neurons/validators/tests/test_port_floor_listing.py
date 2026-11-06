@@ -616,6 +616,20 @@ async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented
     assert len(set(specs["verified_ports"]) - busy_pod_ports) >= MIN_PORT_COUNT
 
 
+
+@pytest.mark.asyncio
+async def test_ports_held_by_our_filler_are_not_reported_as_answering(context_factory):
+    """No probe reply and 2 filler-held ports: the shortfall names both, never "2 answered"."""
+    rented_data = RentedExecutorsResponse(executors={}, filler_ports_by_executor={"executor-123": [2004, 2001]})
+    ctx = context_factory(state=build_state(verified_port_count=0, specs={"verified_ports": []}, rented_data=rented_data))
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.remediation.startswith(
+        f"0 renting ports answered, 2 held by Lium's Default Job: 2 of {MIN_PORT_COUNT} required available."
+    )
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enforce_floor", [True, False])
 @pytest.mark.parametrize(
@@ -871,6 +885,29 @@ async def test_a_stale_split_nodes_reprobe_keeps_crediting_its_idle_fillers_port
     assert tenant_result.updates["state"].specs["available_port_count"] == 24
     assert sorted(tenant_result.updates["state"].specs["verified_ports"]) == list(range(40000, 40024))
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reprobe_ok", [True, False])
+async def test_a_deferred_stale_split_node_states_a_reprobe_as_a_measurement(context_factory, monkeypatch, reprobe_ok):
+    """A deferred cycle whose re-probe completes reports that reading; a failed re-probe has none to report."""
+    from dataclasses import replace
+
+    ctx = stale_split_ctx(context_factory, Firewalled(blocked=set()), 40020)
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, port_check_deferred=True)})
+    if not reprobe_ok:
+        monkeypatch.setattr(ctx.services.connectivity, "verify_ports", AsyncMock(side_effect=RuntimeError("ssh")))
+
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is False
+    if reprobe_ok:
+        assert tenant_result.event.remediation.startswith("21 renting ports answered, 24 required.")
+        assert tenant_result.updates["state"].port_check_deferred is True  # the pipeline flag is untouched
+    else:
+        assert tenant_result.event.remediation.startswith("Renting-port check deferred; no current measurement.")
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("since_snapshot, passed", [("nothing", False), ("rental", True), ("filler", True)])

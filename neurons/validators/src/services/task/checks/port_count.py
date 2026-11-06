@@ -104,6 +104,13 @@ def ports_answered_text(state: ContextState, port_count: int, required: int) -> 
     """The measured-vs-required prefix; a deferred cycle has no current reading to state."""
     if state.port_check_deferred:
         return "Renting-port check deferred; no current measurement. Wait for the next check."
+    # the count adds ports held by our idle filler, which the probe skips: they did not answer
+    held = max(port_count - (state.verified_port_count or 0), 0)
+    if held:
+        return (
+            f"{port_count - held} renting ports answered, {held} held by Lium's Default Job: "
+            f"{port_count} of {required} required available."
+        )
     return f"{port_count} renting ports answered, {required} required."
 
 

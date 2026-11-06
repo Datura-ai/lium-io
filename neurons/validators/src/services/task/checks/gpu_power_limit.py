@@ -114,8 +114,9 @@ class GpuPowerLimitCheck:
             if stale_cap_event is not None:
                 return CheckResult(passed=True, event=stale_cap_event)
             measured = "; ".join(
-                f"GPU {m.index}: {m.power_limit:.0f} W limit, default {m.power_default_limit:.0f} W "
-                f"({shown(m.power_limit_ratio * 100, 0, failed_below=True)}%)"
+                f"GPU {m.index}: {shown(m.power_limit, 0, failed_below=True)} W limit, "
+                f"default {m.power_default_limit:.0f} W "
+                f"({shown(m.power_limit / m.power_default_limit * 100, 0, failed_below=True)}%)"
                 for m in rejected
             )
             event = render_message(

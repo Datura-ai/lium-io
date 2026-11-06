@@ -348,12 +348,15 @@ async def test_a_low_power_limit_names_each_gpu_measured_and_required(context_fa
 
 
 @pytest.mark.asyncio
-async def test_a_power_limit_just_under_the_floor_never_shows_as_meeting_it(context_factory, read_records_mock) -> None:
-    ctx = context_factory(state=_state(current_limit=314.9, default_limit=350))
+@pytest.mark.parametrize("current_limit", [314.9, 314.99, 314.9999999])
+async def test_a_power_limit_just_under_the_floor_never_shows_as_meeting_it(
+    context_factory, read_records_mock, current_limit
+) -> None:
+    ctx = context_factory(state=_state(current_limit=current_limit, default_limit=350))
 
     result = await GpuPowerLimitCheck().run(ctx)
 
-    # the requirement is the message's own wording, never a second copy of the threshold
+    # neither the watts nor the ratio round up onto the 315 W / 90% floor the GPU failed
     assert result.event.remediation.startswith(
-        "GPU 0: 315 W limit, default 350 W (89%). Restore the GPU power limit to at least 90% of the default"
+        "GPU 0: 314 W limit, default 350 W (89%). Restore the GPU power limit to at least 90% of the default"
     )

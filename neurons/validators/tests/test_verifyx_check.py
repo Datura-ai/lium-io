@@ -928,12 +928,13 @@ def test_verifyx_verdict_applies_the_upload_floor(upload, prev_upload, fallback,
 
 
 @pytest.mark.asyncio
-async def test_an_average_speed_just_under_the_floor_never_shows_as_meeting_it(context_factory):
-    # prev_ema=199.92, current=0 -> EMA 99.96, which must not read as 100.0
+# prev_ema, current=0 -> EMA half of it: 99.96 and 99.99999999 must not read as 100.0
+@pytest.mark.parametrize("prev_download", [199.92, 199.99999998])
+async def test_an_average_speed_just_under_the_floor_never_shows_as_meeting_it(context_factory, prev_download):
     services = build_services(verifyx=DummyVerifyXService(success=True, updated_specs={"network": {}}))
     state = build_state(
         specs={"gpu": {"count": 1}},
-        rented_data=_rented_data_with_ema("executor-123", download=199.92),
+        rented_data=_rented_data_with_ema("executor-123", download=prev_download),
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 

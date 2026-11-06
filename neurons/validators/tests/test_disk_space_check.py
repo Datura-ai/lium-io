@@ -346,6 +346,10 @@ async def test_a_zero_floor_asks_no_disk_of_a_split(context_factory, monkeypatch
             _disk(50, settings.MIN_FREE_DISK_GB - 0.04),
             f"{settings.MIN_FREE_DISK_GB - 0.1:.1f} GB free, {settings.MIN_FREE_DISK_GB} GB required.",
         ),
+        (
+            _disk(50, settings.MIN_FREE_DISK_GB - 1e-8),
+            f"{settings.MIN_FREE_DISK_GB - 0.1:.1f} GB free, {settings.MIN_FREE_DISK_GB} GB required.",
+        ),
     ],
 )
 async def test_a_failed_disk_floor_names_the_measured_and_required_value(context_factory, specs, measured):
