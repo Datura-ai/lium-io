@@ -4169,6 +4169,7 @@ class DockerService:
         executor: ExecutorSSHInfo,
         miner_hotkey: str | None,
         log_context: dict,
+        teardown: bool = False,
     ) -> asyncssh.SSHKnownHosts | None:
         """Single chokepoint for every rental-path SSH host-key policy.
 
@@ -4181,6 +4182,7 @@ class DockerService:
         try:
             host_policy = await self.attestation_service.prepare_host_policy(
                 executor,
+                teardown=teardown,
             )
             return host_policy.known_hosts
         except AttestationError:
@@ -11461,6 +11463,7 @@ class DockerService:
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
+                teardown=True,
             )
         except AttestationError as exc:
             log_text = _m(
@@ -12631,6 +12634,7 @@ class DockerService:
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
+                teardown=True,
             )
         except AttestationError as exc:
             log.error("Attestation failed", error=str(exc))
@@ -13302,6 +13306,7 @@ class DockerService:
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
+                teardown=True,
             )
         except AttestationError as exc:
             log_text = _m(
