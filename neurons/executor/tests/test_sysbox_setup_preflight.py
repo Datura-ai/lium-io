@@ -492,6 +492,34 @@ def test_a_host_without_ctr_whose_store_cannot_be_told_is_skipped_not_passed(tmp
     assert "SKIP" in out and "PASS=1" not in out
 
 
+def _containerd_process(*flags: str) -> dict[str, str]:
+    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads
+    return {"proc/4242/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0"}
+
+
+def test_a_host_without_ctr_is_measured_at_the_running_containerds_root_flag(tmp_path):
+    # --root on the command line moves the store; the stale built-in folder must not be measured instead
+    files = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
+             **_containerd_process("--root", "/small/containerd")}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert f"/small/containerd/{_OVERLAYFS}" in out, out
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {f"{SNAPSHOTS}/.keep": "", **_containerd_process("--root=/gone/containerd")},  # its --root holds no store
+        # its --config moves the root while /etc/containerd/config.toml is at the default
+        {f"{SNAPSHOTS}/.keep": "", "opt/ctrd.toml": 'root = "/small/containerd"\n',
+         **_containerd_process("-c", "/opt/ctrd.toml")},
+    ],
+)
+def test_a_host_without_ctr_reads_the_running_containerds_flags_or_skips(tmp_path, files):
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert rc == 0, out
+    assert "SKIP" in out and "PASS=1" not in out
+
+
 # ── free disk for the node's images and VerifyX's storage test ───────────────
 
 

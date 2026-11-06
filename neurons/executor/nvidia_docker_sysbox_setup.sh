@@ -472,14 +472,47 @@ ctrd_export_root() {
     awk -v want="$2" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF == 2 && $1 == "root" {print $2; exit}' <<<"$1"
 }
 
+ctrd_flag() {
+    # the value of flag -$1/--$1 (or short -$2/--$2) in the rest of the arguments, as "x" or "=x"; fails when absent
+    local name=$1 short=$2 arg n
+    shift 2
+    while [ $# -gt 0 ]; do
+        arg=$1
+        shift
+        for n in "$name" ${short:+"$short"}; do
+            case "$arg" in
+                -"$n"=* | --"$n"=*) echo "${arg#*=}"; return 0 ;;
+                -"$n" | --"$n") echo "${1:-}"; return 0 ;;
+            esac
+        done
+    done
+    return 1
+}
+
+ctrd_running_argv() {
+    # CTRD_ARGV: the command line of the containerd process serving address $1; empty when none is visible
+    local f addr argv
+    CTRD_ARGV=()
+    for f in "$(host_path /proc)"/[0-9]*/cmdline; do
+        [ -r "$f" ] || continue
+        mapfile -d '' -t argv 2>/dev/null <"$f" || continue
+        [ "${#argv[@]}" -gt 0 ] && [ "${argv[0]##*/}" = containerd ] || continue
+        addr=$(ctrd_flag address a "${argv[@]}") || addr=/run/containerd/containerd.sock
+        [ "${addr#/var}" = "${1#/var}" ] || continue   # /var/run is /run
+        CTRD_ARGV=("${argv[@]}")
+        return 0
+    done
+    return 0
+}
+
 ctrd_config_moves_root() {
-    # containerd's config names a root other than its built-in one, a snapshotter root_path, or more config files
+    # containerd's config ($1) names a root other than its built-in one, a snapshotter root_path, or more config files
     awk '{sub(/#.*/, "")} match($0, /^[ \t]*(root|root_path|imports)[ \t]*=/) {
         key = $0; sub(/[ \t]*=.*/, "", key); gsub(/[ \t]/, "", key)
         value = $0; sub(/^[^=]*=[ \t]*/, "", value); gsub(/[ \t"\047]/, "", value); sub(/\/$/, "", value)
         if (value == "" || value == "[]" || (key == "root" && value == "/var/lib/containerd")) next
         found = 1; exit
-    } END {exit !found}' "$(host_path /etc/containerd/config.toml)" 2>/dev/null
+    } END {exit !found}' "$(host_path "$1")" 2>/dev/null
 }
 
 resolve_disk_dir() {
@@ -502,12 +535,20 @@ resolve_disk_dir() {
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
     if ! command -v ctr &>/dev/null; then
-        # no ctr (a Docker install without containerd's CLI): the built-in root of the system containerd, else of
-        # Docker's own one; unknown when containerd's config moves the root, as the built-in folder may be a leftover
-        # shortcut: a root set by containerd's --root flag is not seen; read the process if such hosts turn up
-        ctrd_config_moves_root && return 1
-        DISK_DIR=$(host_path "/var/lib/containerd/$plugin")
-        [ -d "$DISK_DIR" ] || DISK_DIR=$data_root/containerd/daemon/$plugin
+        # no ctr (a Docker install without containerd's CLI): the running daemon's --root, else the built-in root of
+        # the system containerd, else of Docker's own one; unknown when its config (--config, else the default file)
+        # moves the root, as the built-in folder may be a leftover
+        local flag_root config
+        ctrd_running_argv "$address"
+        if flag_root=$(ctrd_flag root "" "${CTRD_ARGV[@]}"); then
+            [ -n "$flag_root" ] || return 1
+            DISK_DIR=$(host_path "${flag_root%/}/$plugin")
+        else
+            config=$(ctrd_flag config c "${CTRD_ARGV[@]}") || config=/etc/containerd/config.toml
+            ctrd_config_moves_root "$config" && return 1
+            DISK_DIR=$(host_path "/var/lib/containerd/$plugin")
+            [ -d "$DISK_DIR" ] || DISK_DIR=$data_root/containerd/daemon/$plugin
+        fi
         listing=""
     else
         # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it
