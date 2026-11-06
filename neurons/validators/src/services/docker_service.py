@@ -2538,6 +2538,8 @@ _unmarked_recovery_stop_dao = UnmarkedRecoveryStopDao()
 _UNMARKED_RECOVERY_STOP_DB_TIMEOUT_SEC = 5
 # pod_id -> outcome of its last unmounted-pod stop, popped by the rented-machine check: only a confirmed stop defers
 _UNMOUNTED_STOP_OUTCOMES: dict[str, str] = {}
+# pods this process paused itself: only these are unpaused, never a pause the provider made
+_PAUSED_BY_RECOVERY: set[str] = set()
 
 
 def _cancel_recovery_mark_cleanup(pod_id: str) -> None:
@@ -12483,6 +12485,8 @@ class DockerService:
                 paused = await ssh_client.run(
                     f"/usr/bin/docker pause {shlex.quote(container_name)}", timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
                 )
+                if getattr(paused, "exit_status", 1) == 0:
+                    _PAUSED_BY_RECOVERY.add(pod_id)
                 logger.error(
                     _m(
                         "POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD",
@@ -12515,6 +12519,10 @@ class DockerService:
         )
         return getattr(probed, "exit_status", 1) == 0 and (probed.stdout or "").strip() == "true"
 
+    async def paused_by_recovery(self, pod_id: str) -> bool:
+        # shortcut: in-process only, so a validator restart leaves our own pause in place for a person to lift
+        return pod_id in _PAUSED_BY_RECOVERY
+
     async def resume_paused_unmounted_pod(
         self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
     ) -> bool:
@@ -12532,6 +12540,7 @@ class DockerService:
             await self._clear_stopped_by_recovery(pod_id)  # still paused: nothing was stopped
             _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
             return False
+        _PAUSED_BY_RECOVERY.discard(pod_id)
         return True
 
     async def _kill_orphaned_task_shim(

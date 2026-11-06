@@ -1217,6 +1217,27 @@ async def test_tenant_enforcement_a_recovery_past_its_deadline_fails_inside_the_
     lock.release.assert_awaited_once()
 
 
+@pytest.mark.parametrize("budget_left", [False, True])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_parked_recovery_comes_out_of_the_cycle_budget(
+    context_factory, monkeypatch, budget_left
+):
+    # lio#1827 review 4490776354: a recovery outliving the task drops its verdict
+    docker = AsyncMock()
+    recovery_deadlines = []
+    docker.recover_parked_pod_container.side_effect = lambda **_kw: recovery_deadlines.append(deadlines[-1]) or True
+    ctx, _lock = _parked_recovery_ctx(context_factory, docker)
+    floor = rented_machine_module.POD_READ_RESERVE_SECONDS + rented_machine_module._PARKED_RECOVERY_CLEANUP_RESERVE_SEC
+    monkeypatch.setattr(rented_machine_module, "task_seconds_left", lambda _ctx: floor + (60 if budget_left else 0))
+    deadlines = []
+    real_timeout = asyncio.timeout
+    monkeypatch.setattr(rented_machine_module.asyncio, "timeout", lambda d: deadlines.append(d) or real_timeout(d))
+
+    await TenantEnforcementCheck().run(ctx)
+
+    assert recovery_deadlines == ([60] if budget_left else [])
+
+
 @pytest.mark.parametrize(
     "create_in_flight, local_volume_path, recover_enabled, expected_restored",
     [
@@ -1282,6 +1303,7 @@ async def test_tenant_enforcement_resumes_a_paused_unmounted_pod_only_once_its_s
         context_factory, ssh, docker, backend=DummyBackendClient(active=True, local_volume_path="/workspace"), redis=redis
     )
     docker.container_paused.return_value = True
+    docker.paused_by_recovery.return_value = True
 
     result = await TenantEnforcementCheck().run(ctx)
 
@@ -1295,6 +1317,33 @@ async def test_tenant_enforcement_resumes_a_paused_unmounted_pod_only_once_its_s
         docker.encrypted_volume_mount_missing.assert_not_awaited()
         docker.restore_volume_mount_of_running_container.assert_not_awaited()
         assert _pod_states(result)["pod-1"] == "unknown"
+
+
+@pytest.mark.parametrize("paused_by_us", [True, False], ids=["our_pause", "provider_pause"])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_unpauses_only_a_pod_it_paused_itself(context_factory, paused_by_us):
+    # lio#1827 review 4490776342: a paused state alone is no proof the pause was ours
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.paused_by_recovery.return_value = paused_by_us
+    docker.encrypted_volume_mount_missing.return_value = False  # a paused container refuses the probe's exec
+    docker.resume_paused_unmounted_pod.return_value = True
+    lock = Mock(acquire=AsyncMock(return_value=True), release=AsyncMock())
+    redis = Mock(
+        backend_create_inflight=AsyncMock(return_value=False),
+        renting_in_progress=AsyncMock(return_value=False),
+        executor_create_lock=Mock(return_value=lock),
+    )
+    ctx = build_recovery_context(
+        context_factory, ssh, docker, backend=DummyBackendClient(active=True, local_volume_path="/workspace"), redis=redis
+    )
+    docker.container_paused.return_value = True  # after the build, which defaults it to False
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True, result.event
+    assert docker.resume_paused_unmounted_pod.await_count == (1 if paused_by_us else 0)
+    docker.restore_volume_mount_of_running_container.assert_not_awaited()
 
 
 @pytest.mark.parametrize("probe_fits", [False, True])

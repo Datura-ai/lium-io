@@ -901,6 +901,8 @@ _MOUNT_PROBE_SECONDS = 40
 # a restore cut by the deadline still marks, records, parks and stops the pod: the 5 s mark, the 5 s DB record, three
 # 30 s commands and the record's 5 s drop after a park or stop that did not take
 _MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 105
+# a parked recovery cut by its deadline still stops the container and parks it back
+_PARKED_RECOVERY_CLEANUP_RESERVE_SEC = 90
 
 
 @contextlib.asynccontextmanager
@@ -955,11 +957,15 @@ async def _recover_parked_pod_container(
             stopped_by_recovery = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}") is not None
         if not stopped_by_recovery:
             return False
+    # out of the cycle's time: a recovery outliving the task drops its verdict
+    budget = task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS - _PARKED_RECOVERY_CLEANUP_RESERVE_SEC
+    if budget <= 0:
+        return False  # left parked: the next cycle recovers it
     async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
         if not clear:
             return False
         try:
-            async with asyncio.timeout(_RECOVERY_DEADLINE_SEC):
+            async with asyncio.timeout(min(_RECOVERY_DEADLINE_SEC, budget)):
                 return await ctx.services.pod_recovery.recover_parked_pod_container(
                     ssh_client=ctx.ssh,
                     executor_info=ctx.executor,
@@ -1101,7 +1107,7 @@ async def _restore_missing_volume_mount(
             local_volume_path = await _plaintext_volume_path(ctx, pod_id)
             # paused by a restore whose stop no store could record: an exec into it is refused, which the probe
             # below reads as "cannot tell", so it is resumed first, under the create lock, once the mark is written
-            if await recovery.container_paused(ctx.ssh, container_name):
+            if await recovery.container_paused(ctx.ssh, container_name) and await recovery.paused_by_recovery(pod_id):
                 async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
                     if not clear or not await recovery.resume_paused_unmounted_pod(ctx.ssh, container_name, pod_id):
                         return False
