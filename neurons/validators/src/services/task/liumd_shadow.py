@@ -2,9 +2,10 @@
 
 `TaskService.create_task` calls `run_liumd_shadow` once per node, after the pipeline has run and
 the node's `JobResult` is built, on the SSH session the pipeline used. With
-`VALIDATOR_LIUMD_SHADOW` off nothing here runs. With it on, the GPU steps today's run executed
-(the capability matmul, VerifyX) are prepared again the way their checks prepare them, sent in one
-signed intent through `liumd run` (`LiumdExecClient`), judged with the same functions
+`VALIDATOR_LIUMD_SHADOW` off nothing here runs. With it on the fact steps always run, and with
+`LIUMD_SHADOW_GPU_STEPS_ENABLED` on the GPU steps today's run executed (the capability matmul,
+VerifyX) are prepared again the way their checks prepare them, sent in one signed intent through
+`liumd run` (`LiumdExecClient`), judged with the same functions
 (`evaluate_matmul_output`, `evaluate_verifyx_capture`), and compared with today's verdicts read from
 the run's events. VerifyX's verdict is `verifyx_verdict`, the check's own pass/fail including the
 download-EMA floor, read against the stored EMA; the capture is judged with `record_tally=False`, so
@@ -12,8 +13,8 @@ the shadow writes no EMA, state or network-gate tally. The outcome is one `[lium
 log line. Nothing is returned to the caller, stored, or scored.
 
 It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (reserved, non-rentable
-dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default),
-never on an express-lane first pass. VerifyX is not compared on an executor with no stored download
+dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default,
+`all` for every executor), never on an express-lane first pass. VerifyX is not compared on an executor with no stored download
 EMA: today's check may take a second sample there, the shadow takes one
 (`liumd_reason="cold_sample_retry"`).
 
@@ -50,6 +51,7 @@ from core.utils import _m, get_extra_info
 
 from .checks.capability import CapabilityCheck
 from .checks.local_verify import _step_reason
+from .checks.provider_side_load import docker_containers
 from .checks.verifyx import (
     MAX_KEPT_UPLOAD_PROBES,
     MAX_PACKAGE_FALLBACK_PROBES,
@@ -199,14 +201,19 @@ async def _compare(
     # Executor UUIDs are miner-chosen: an entry matches only its miner's executor at its endpoint.
     executor = ctx.executor
     key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
-    if key not in settings.get_liumd_shadow_reserved_executors():
+    reserved = settings.get_liumd_shadow_reserved_executors()
+    if reserved is not None and key not in reserved:
         return _skipped("not_reserved", steps=steps)
     if _workload_on_node(ctx, today):
         return _skipped("workload", steps=steps)
     # All-cards enforcement can reject a card before today's matmul; the shadow's one ordinary
     # matmul is not comparable (checks/local_verify.py `allcards_ssh`).
     allcards = settings.MATMUL_ALLCARDS_CHECK_ENABLED
-    ask_matmul = today["matmul"].verdict in RAN and not allcards
+    ask_matmul = (
+        settings.LIUMD_SHADOW_GPU_STEPS_ENABLED
+        and today["matmul"].verdict in RAN
+        and not allcards
+    )
     # On a never-measured executor today's check may re-measure a cold sample below the gate
     # (DAH-2959) and pass on the second; the shadow's one sample is not comparable.
     cold_retry = _cold_retry_possible(ctx)
@@ -227,10 +234,14 @@ async def _compare(
     elif upload_cap:
         steps["verifyx"]["liumd_reason"] = "upload_fallback_cap"
     ask_verifyx = (
-        today["verifyx"].verdict in RAN and not cold_retry and not fallback_cap and not upload_cap
+        settings.LIUMD_SHADOW_GPU_STEPS_ENABLED
+        and today["verifyx"].verdict in RAN
+        and not cold_retry
+        and not fallback_cap
+        and not upload_cap
     )
-    if not (ask_matmul or ask_verifyx):
-        return _skipped("no_gpu_step_ran", steps=steps)
+    # The fact steps run even when today's run reached no GPU step: the docker, ports and
+    # inspector data is useful on a node that stopped earlier, and the client asks for no GPU work.
     specs = ctx.state.specs
     if not specs:
         return _skipped("no_specs", steps=steps)
@@ -284,6 +295,7 @@ async def _compare(
             parallel_gpu=first_pass,
             deadline_s=executor_deadline_s(int(budget)),
         )
+        intent["steps"]["inspector"] = False
         client = client_factory(ctx, budget)
         try:
             answer = await client.run(ctx.ssh, intent)
@@ -408,10 +420,13 @@ def _judged(
             entry["agree"] = entry["liumd_verdict"] == today[name].verdict
             compared.append(entry["agree"])
     complete = len(compared) == len(requested)
+    facts = _facts(ctx, answer)
     return {
         "outcome": "compared",
         "reason": "ok",
         "agree": all(compared) if complete and compared else None,
+        "facts_agree": facts["agree"],
+        "facts": facts["checks"],
         "round_trip_ms": answer.round_trip_ms,
         "executor_elapsed_ms": answer.elapsed_ms,
         "executor_version": answer.executor_version,
@@ -419,3 +434,43 @@ def _judged(
         "first_pass": ctx.config.first_pass,
         "steps": steps,
     }
+
+
+def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
+    """Compare the facts both paths collect. Missing or skipped data is not a mismatch."""
+    specs = ctx.state.specs or {}
+    checks: list[dict[str, Any]] = []
+
+    def check(field: str, liumd: Any, python: Any) -> None:
+        checks.append({"field": field, "liumd": liumd, "python": python, "agree": liumd == python})
+
+    docker = answer.step("docker")
+    data = docker.data if docker.status == "ok" and isinstance(docker.data, dict) else None
+    if (
+        data
+        and isinstance(data.get("containers"), list)
+        and isinstance(specs.get("docker"), dict)
+    ):
+        # liumd lists every container; today's scrape lists the running ones, and `specs` is the
+        # miner's raw machine JSON, so read it through the check that owns that shape.
+        liumd_names = sorted(
+            c["name"]
+            for c in data["containers"]
+            if isinstance(c, dict) and c.get("name") and c.get("status") == "running"
+        )
+        python_names = sorted(row.name for row in docker_containers(specs) if row.name)
+        check("docker.container_names", liumd_names, python_names)
+
+    ports = answer.step("ports")
+    data = ports.data if ports.status == "ok" and isinstance(ports.data, dict) else None
+    if data:
+        check("ports.port_range", data.get("port_range"), ctx.executor.port_range)
+        check("ports.port_mappings", data.get("port_mappings"), ctx.executor.port_mappings)
+
+    inspector = answer.step("inspector")
+    data = inspector.data if inspector.status == "ok" and isinstance(inspector.data, dict) else None
+    local_checksum = getattr(getattr(ctx.services, "inspector", None), "local_checksum", None)
+    if data and local_checksum:
+        check("inspector.lib_sha256", data.get("lib_sha256"), local_checksum)
+
+    return {"agree": all(c["agree"] for c in checks) if checks else None, "checks": checks}

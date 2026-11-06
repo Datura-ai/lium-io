@@ -96,6 +96,19 @@ RUN if [ "$INSTALL_GPU_ATTESTATION" = "true" ]; then \
 
 COPY . .
 
+# The liumd binary is the vendored CI artifact under neurons/executor/liumd, installed at the path
+# the validator's SSH client runs. It arrives as the `liumd` named build context, so the per-arch
+# binaries never enter an image layer. There is no manifest or source check at runtime; the image
+# digest is the delivery trust boundary.
+RUN --mount=type=bind,from=liumd,source=.,target=/tmp/liumd \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) artifact=/tmp/liumd/liumd-amd64 ;; \
+      arm64) artifact=/tmp/liumd/liumd-arm64 ;; \
+      *) echo "no liumd artifact for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+  && install -m 0755 "$artifact" /usr/local/bin/liumd \
+  && /usr/local/bin/liumd version
+
 # arm64 takes the aarch64 builds (lib*-aarch64.so, from celium-gpu-verifier's aarch64 build) once they are
 # vendored; until then the validator refuses ARM hosts with ARM_VERIFIER_NOT_AVAILABLE.
 RUN for f in libdmcompverify libverifyx libinspector; do \
