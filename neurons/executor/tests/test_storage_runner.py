@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -49,6 +50,7 @@ from storage.workspace import (
     DockerUserNamespaceWorkspace,
     DockerVolumeWorkspace,
     LocalWorkspace,
+    NamespaceWorkspace,
     WorkspaceResolutionError,
     WorkspaceResolver,
 )
@@ -2362,3 +2364,102 @@ def test_real_restic_finds_the_parent_when_the_backup_path_changes(
     assert summaries[0]["files_new"] == 20
     assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
 
+
+
+IMAGE = "sha256:" + "c" * 64
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entrypoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, encrypted: bool
+) -> None:
+    # DAH-5893: the executor resolves the workspace and starts the helper; restic, retries and reporting run in the
+    # helper, so an executor restart leaves the operation running.
+    spec = tmp_path / "op.json"
+    spec.write_text(json.dumps(_operation_payload()))
+    spec.chmod(0o600)
+    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec)])
+    workspace = (
+        DockerUserNamespaceWorkspace(IMAGE, "rental-pod", CONTAINER_ID, 4242, PurePosixPath("/proc/4242/root/root"), True)
+        if encrypted
+        else DockerVolumeWorkspace(IMAGE, "customer-volume", PurePosixPath("/workspace/checkpoints"), True)
+    )
+    monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", lambda self, operation: workspace)
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append((command, kwargs.get("env") or {}))  # type: ignore[arg-type]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
+    monkeypatch.setattr("storage.restic.subprocess.Popen", lambda *a, **k: pytest.fail("the executor ran restic"))
+
+    assert storage_runner.main() == 0
+
+    command, env = next((c, e) for c, e in calls if c[1] == "run")
+    assert "--detach" in command and "--rm" not in command and f"{storage_runner.SPEC_ENV}" in command
+    entrypoint = command.index("--entrypoint")
+    assert command[entrypoint + 1 : entrypoint + 4] == [sys.executable, IMAGE, str(Path(storage_runner.__file__).resolve())]
+    assert command[entrypoint + 4] == "--in-helper"
+    assert ("--namespace-pid" in command and "--privileged" in command and "host" in command) is encrypted
+    assert ("customer-volume:/workspace:ro" in command) is not encrypted
+    for secret in ("access-key", "secret-key", "session-token", "repository-password"):
+        assert secret not in " ".join(command)  # by environment only, like today's helper credentials
+    assert json.loads(env[storage_runner.SPEC_ENV])["repository"]["password"] == "repository-password"
+
+
+def test_in_helper_encrypted_commands_run_restic_under_nsenter() -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(mode="encrypted_running"))
+    runner = ResticStorageRunner(operation, NamespaceWorkspace(4242, PurePosixPath("/proc/4242/root/root")))
+
+    command, cwd = runner._execution_command(["backup", "."], working_directory=True)
+
+    assert command[:5] == ["/usr/bin/nsenter", "-t", "4242", "-U", "--"]
+    assert command[5:9] == ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh"] and cwd is None
+    assert "docker" not in " ".join(command)
+
+
+@pytest.mark.parametrize(("oom_kills", "message"), [("1", "backup ran out of memory"), ("0", "backup was killed")])
+def test_in_helper_a_killed_restic_child_is_reported_from_the_helper_cgroup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, oom_kills: str, message: str
+) -> None:
+    events = tmp_path / "memory.events"
+    events.write_text(f"low 0\nhigh 0\nmax 3\noom 1\noom_kill {oom_kills}\n")
+    monkeypatch.setattr("storage.restic.CGROUP_MEMORY_EVENTS", str(events))
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "file").write_text("x")
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path / "data"), event_writer=JsonEventWriter(
+        str(OPERATION_ID), 0, output=io.StringIO()))
+
+    class SignalledPopen(_FakePopen):
+        def wait(self) -> int:
+            return -9  # restic is the wrapper's own child: Popen reports the signal, not 137
+
+    monkeypatch.setattr(
+        "storage.restic.subprocess.run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="[]", stderr="")
+    )
+    monkeypatch.setattr("storage.restic.subprocess.Popen", SignalledPopen)
+
+    with pytest.raises(ResticOperationError, match=message):
+        runner.run()
+
+
+def test_in_helper_sigterm_reports_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # cancel is `docker kill --signal TERM <helper>`: the wrapper stops restic and reports CANCELLED itself
+    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--in-helper", "--workspace", "/workspace"])
+    monkeypatch.setenv(storage_runner.SPEC_ENV, json.dumps(_operation_payload()))
+
+    def cancelled(self: object) -> None:
+        raise StorageOperationCancelled("storage runner received SIGTERM")
+
+    monkeypatch.setattr(storage_runner.ResticStorageRunner, "run", cancelled)
+    output = io.StringIO()
+    monkeypatch.setattr(storage_runner, "JsonEventWriter", lambda *a, **k: JsonEventWriter(*a, **{**k, "output": output}))
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        assert storage_runner.main() == 130
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert '"status":"CANCELLED"' in output.getvalue()
+    assert storage_runner.SPEC_ENV not in os.environ  # read once, then dropped from the wrapper's environment

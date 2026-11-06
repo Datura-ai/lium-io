@@ -11382,7 +11382,7 @@ class DockerService:
             retain_terminal_artifacts=True,
         )
         # an executor restart drops this SSH session; the restore keeps running and the wait reattaches to it
-        return await wait_for_storage_operation(ssh_client, files, reconnect=reconnect_ssh)
+        return await wait_for_storage_operation(ssh_client, files, reconnect=reconnect_ssh, spec=spec)
 
     async def _run_legacy_bootstrap_restore(
         self,

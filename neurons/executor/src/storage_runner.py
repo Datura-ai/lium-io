@@ -38,7 +38,11 @@ def main() -> int:
     event_writer: JsonEventWriter | None = None
     try:
         # in the helper the spec comes from its environment; drop it there once read
-        payload = _parse_object(os.environ.pop(SPEC_ENV, "")) if arguments.in_helper else _load_operation(arguments.spec)
+        payload = (
+            _parse_object(os.environ.pop(SPEC_ENV, ""))
+            if arguments.in_helper
+            else _load_operation(arguments.spec)
+        )
         operation = StorageOperationSpec.from_mapping(payload)
         reporter = (
             StorageEventReporter(operation.operation_id, operation.action, operation.reporter)
@@ -114,9 +118,13 @@ def _parse_arguments() -> argparse.Namespace:
         "--cancel-file",
         help="local marker created by the validator when cancellation is requested",
     )
-    parser.add_argument("--in-helper", action="store_true", help="run the operation (the helper's entrypoint)")
+    parser.add_argument(
+        "--in-helper", action="store_true", help="run the operation (the helper's entrypoint)"
+    )
     parser.add_argument("--workspace", help="in the helper: the workspace path")
-    parser.add_argument("--namespace-pid", type=int, help="in the helper: the encrypted rental's PID for nsenter")
+    parser.add_argument(
+        "--namespace-pid", type=int, help="in the helper: the encrypted rental's PID for nsenter"
+    )
     return parser.parse_args()
 
 
