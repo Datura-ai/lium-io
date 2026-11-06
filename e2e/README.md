@@ -4,11 +4,12 @@ A real executor (`neurons/executor`, this checkout) on its own docker daemon, a 
 owns it, and the validator's own services (`neurons/validators/src`) driving them the way `Validator.sync` and the
 connector do — sign in over REST, install the cycle's SSH key through the miner, SSH in, upload and run the
 obfuscated scrape, walk the check pipeline, publish the verdict, rent a container, tear it down. The only thing
-missing is the chain: the subtensor client is never constructed, the miner never syncs, and the hotkeys are three
+missing is the chain: the subtensor client is never connected, the miner never syncs, and the hotkeys are three
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
-**`e2e-gate`**, routed by `.github/actions/changed-packages`); a PR that touches none of those skips it, and
+**`e2e-gate`**, routed by `.github/actions/changed-packages`; a push to `main` runs it when the push changed one of
+those); a PR that touches none of those, or only a neuron's own `tests/`, skips it, and
 `tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
 stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
 container on the provider's host.
@@ -66,8 +67,9 @@ cache exports, 1.63 GB, and the `--load` of five tarballs are inside the step); 
 Dockerfile input changed, built in 61 s (36 layers `CACHED`; the 61 s is the five cache-manifest imports, the blob
 downloads and the five `--load`s) and the whole `e2e-gate` job took 4 min 20 s against 6 min 57 s cold. The gha backend
 needs the Actions cache URL and token in the environment and a builder that can export cache: `test.yml` adds
-`docker/setup-buildx-action` and `crazy-max/ghaction-github-runtime` before `gate.sh` for that. The `pod` image is not in
-the cache: `seed` builds it on the executor host's dockerd (dind), which has no builder of its own. Cache reads follow the
+`docker/setup-buildx-action` and `crazy-max/ghaction-github-runtime` before `gate.sh` for that. `make build` also builds the
+`pod` image on the host (cache scope `e2e-pod`) and `seed` loads it onto the executor host's dockerd (dind; on the GPU
+path the executor uses the host's daemon, which already has it), so `make up` needs a `make build` first. Cache reads follow the
 Actions cache rules: a `pull_request` run reads the entries of its merge ref (`refs/pull/N/merge`) and of main, and
 writes to its merge ref; a push to main writes main's, which every later PR reads.
 
@@ -89,10 +91,12 @@ executor `/version`; the miner lists both seeded executors for the validator's s
 stranger's signature under the validator's hotkey (401); the four REST headers (`AuthenticationPayload`) are
 accepted, the miner installs the key on the executor and the key opens it over SSH, `ssh-pubkey-remove` closes it
 again; a stranger's signature → 401, an unregistered validator → 403, a stale or future timestamp → 401, headers
-naming another miner still yield only this miner's executors (the miner does not compare the hotkey; the test
-accepts 200/401/403 and checks the list); on the executor, the miner+validator double signature is accepted
+naming another miner → 403; on the executor, the miner+validator double signature is accepted
 (`/upload_ssh_key` → SSH coordinates → SSH works → `/remove_ssh_key`), a spoofed validator signature → 401, a spoofed
-miner signature → 401/403, a substituted public key (#744) → 400/401.
+miner signature → 401/403, a substituted public key (#744) → 400/401. The stack's executor enforces the miner binding
+(`REQUIRE_MINER_BOUND_SSH_KEY=true`, `executor/e2e.env`), so every suite proves the validator and the miner send it: a
+key bound to the pool hotkey (`E2E_POOL_HOTKEY`) is accepted, one bound to another miner, one without a binding and a
+binding a stranger signed → 403. A fresh dated nonce is accepted; a stale one, a stripped one and a swapped one → 401.
 
 **`tests/cycle`** — `MinerService.request_job_to_miner` (the REST path `lium mine` providers are on):
 the pyarmor+PyInstaller scrape build, key install through the miner, SSH, scrape upload + run, the check pipeline,
@@ -109,17 +113,26 @@ sysbox, and on a GPU-less runner the scrape halts the pipeline before the check,
 AVAILABLE verdict can be observed).
 
 **`tests/rental`** — `MinerService.handle_container`: `ContainerCreateRequest` for the executor → a container from
-`pod/Dockerfile` (ubuntu + openssh-server; `seed` builds it onto the executor's dockerd) with the renter's key,
+`pod/Dockerfile` (ubuntu + openssh-server; `seed` loads it onto the executor's dockerd) with the renter's key,
 `ContainerCreated` with the port map; the renter's key opens the pod on the executor's address (what `lium exec`
 does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite expects `nvidia-smi -L` to list GPUs — not yet observed);
 `ContainerDeleteRequest` → `ContainerDeleted` and the port is closed. A create for an executor the miner does not own
-→ `FailedContainerRequest`, fast.
+→ `FailedContainerRequest`, fast. A delayed duplicate of a create the platform has not recorded yet → `RentingInProgress`,
+and the first pod keeps its container; a re-sent create that meets its own leftover `pod_<id>` replaces it and runs; a
+customer create on a node running a `filler_*` container removes the filler and starts the pod.
+
+Also, each in its own file beside the suite's main one: the executor's public `GET /miner-identity` names the
+configured miner hotkey and echoes a hex nonce (422 without one), and `GET /update-status` answers 200 without a
+signature (`tests/protocol/test_executor_public_routes.py`); with `UNREACHABLE_EXECUTOR_REPORT_ENABLED` on, the seeded
+offline executor gets its own `EXECUTOR_UNREACHABLE_BY_MINER` result at score 0 (`tests/cycle/test_cycle_unreachable_executor.py`);
+a pod whose image defaults to a bare shell (`CMD ["/bin/bash"]`) stays up and opens to the renter, and the cycle's rented
+pod SSH probe reads a banner from a live pod and none once its container is stopped (`tests/rental/test_rental_pod_runtime.py`).
 
 ## Known verdicts the suite pins
 
-- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
-  `gpu_details[0]`, so a host with zero GPUs cannot report `gpu.count = 0`; the validator sees the scrape's
-  `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
+- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** The stack's executor has no `libnvidia-ml`, so
+  `miner_jobs/machine_scrape.py` returns an empty GPU list and then derives its output key from `gpu_details[0]`;
+  the validator sees the scrape's `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
   the current behaviour so a change to it is a visible diff (and the misleading remediation is tracked as a ticket).
 
 ## What it cannot prove (and where that is proven)

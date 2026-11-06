@@ -9,9 +9,10 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
-    MissingFlagshipCapability,
+    MissingFull8xCapability,
     PortLimitedRemainder,
     PowerCapIncapable,
+    PowerCapReverted,
     RentalPriceIncentive,
 )
 from services.task_service import JobResult
@@ -27,6 +28,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_tier",
         "provider_discord_not_connected",
         "new_rentals_paused",
+        "provider_maintenance",
         "miner_default_job",
         "hotkey_excluded_from_scoring",
         "gpu_model_not_eligible_for_unrented_incentive",
@@ -37,6 +39,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "insufficient_disk_for_vram",
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
+        "reverts_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
         "provider_email_not_confirmed",
@@ -45,6 +48,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_no_headroom_at_burn_cap",
         "validation_failed",
         "rented_sysbox_not_confirmed",
+        "disk_limited_remainder",
     }
 
 
@@ -151,9 +155,9 @@ def _job(**overrides) -> JobResult:
             "rented node",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            lambda job: MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job,
-                MissingFlagshipCapability(
+                MissingFull8xCapability(
                     ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
                 ),
             ),
@@ -169,11 +173,33 @@ def _job(**overrides) -> JobResult:
             "CAP_SYS_ADMIN",
         ),
         (
+            lambda job: MinerLogLine.no_payout_because_reverts_gpu_power_cap(
+                job,
+                PowerCapReverted(
+                    revert_count=3, window_hours=24, capped_to_watts=280, found_watts=400
+                ),
+            ),
+            "reverts_gpu_power_cap",
+            "nvidia-smi -pl",
+        ),
+        (
             lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
-                job, PortLimitedRemainder(available_port_count=2, required_port_count=3)
+                job, PortLimitedRemainder(
+                    available_port_count=2, required_port_count=4, free_split_count=4, paid_split_count=0, unpaid_gpu_count=4
+                )
             ),
             "port_limited_remainder",
             "2 free port",
+        ),
+        (
+            # below one whole split: no port remedy (DAH-3698 F15)
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(
+                    available_port_count=3, required_port_count=3, free_split_count=0, paid_split_count=0, unpaid_gpu_count=2
+                )
+            ),
+            "port_limited_remainder",
+            "fewer than its minimum rental",
         ),
     ],
 )

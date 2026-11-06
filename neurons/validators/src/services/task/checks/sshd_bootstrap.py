@@ -11,15 +11,16 @@ from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 from services.redis_service import (
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
-    SSHD_BOOTSTRAP_FAILED_PREFIX,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
+    sshd_bootstrap_failed_key,
 )
 
 from ...const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
 from ..messages import SshdBootstrapMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ class SshdBootstrapCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
         sshd_bootstrap_failed = False if is_rented else await self._sshd_bootstrap_failed(ctx)
         what = {"sshd_bootstrap_failed": sshd_bootstrap_failed, "is_rented": is_rented}
@@ -109,7 +110,8 @@ class SshdBootstrapCheck:
 
     async def _sshd_bootstrap_failed(self, ctx: Context) -> bool:
         """The verdict for an unrented node: its stamp, else a probe of its running filler (stamped on failure)."""
-        key = f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{ctx.executor.uuid}"
+        key = sshd_bootstrap_failed_key(ctx.miner_hotkey, ctx.executor.uuid)
+        # no pre-hotkey stamp: a filler success clears only this key, and no stamp re-probes the filler
         try:
             if await ctx.services.redis.get(key):
                 return True

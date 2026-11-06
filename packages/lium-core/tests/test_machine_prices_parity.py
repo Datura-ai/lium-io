@@ -2,6 +2,7 @@ from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
 SERVER = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 WORKSTATION = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+MAX_Q = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
 
 
 def test_rtx_pro_6000_editions_are_anchored_at_parity():
@@ -28,3 +29,10 @@ def test_rtx_5090_d_is_its_own_class_below_the_5090():
     prices = DEFAULT_SHARED_CONFIG.machine_prices
     assert prices["NVIDIA GeForce RTX 5090 D"] < prices["NVIDIA GeForce RTX 5090"]
     assert "NVIDIA GeForce RTX 5090 D" in DEFAULT_SHARED_CONFIG.required_deposit_amount
+
+
+def test_rtx_pro_6000_max_q_matches_the_workstation():
+    # DAH-3453: the 300 W Max-Q variant of the same 96 GB card, priced at Workstation parity
+    cfg = DEFAULT_SHARED_CONFIG
+    assert cfg.machine_prices[MAX_Q] == cfg.machine_prices[WORKSTATION]
+    assert cfg.required_deposit_amount[MAX_Q] == cfg.required_deposit_amount[WORKSTATION]
