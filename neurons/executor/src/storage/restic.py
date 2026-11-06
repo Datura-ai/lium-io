@@ -213,6 +213,7 @@ class ResticStorageRunner:
         self._workspace = workspace
         self._restic_binary = restic_binary
         self._docker_binary = docker_binary
+        self._repository_via_helper = False
         self._events = event_writer or JsonEventWriter(
             str(operation.operation_id),
             operation.progress_interval_seconds,
@@ -330,20 +331,39 @@ class ResticStorageRunner:
             retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
 
     def _run_repository_command(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        if self._repository_via_helper:
+            return self._supervised_run(self._repository_helper_command(restic_arguments))
+        result = self._supervised_run(self._restic_command(restic_arguments))
+        if (
+            result.returncode not in (0, 10)
+            and getattr(self._workspace, "image", None)
+            and _dns_lookup_failed(result.stderr or result.stdout)
+        ):
+            # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge
+            # resolves fine; the backup itself already runs in a default-bridge helper.
+            print("Repository DNS lookup failed in the executor; using a helper container", file=sys.stderr, flush=True)
+            self._repository_via_helper = True
+            return self._supervised_run(self._repository_helper_command(restic_arguments))
+        return result
+
+    def _repository_helper_command(self, restic_arguments: list[str]) -> list[str]:
+        return [
+            *self._docker_helper_base(),
+            "--rm",
+            "--entrypoint",
+            self._restic_binary,
+            self._workspace.image,
+            *self._restic_command(restic_arguments)[1:],
+        ]
+
+    def _supervised_run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         # restic retries S3 for ~15 min on its own; heartbeat meanwhile so the backend does not mark the run stale.
         # shortcut: on cancellation the read-only restic child is left to exit by itself; use Popen if that matters.
         results: queue.Queue[subprocess.CompletedProcess[str] | BaseException] = queue.Queue()
 
         def run() -> None:
             try:
-                results.put(
-                    subprocess.run(
-                        self._restic_command(restic_arguments),
-                        env=self._environment,
-                        capture_output=True,
-                        text=True,
-                    )
-                )
+                results.put(subprocess.run(command, env=self._environment, capture_output=True, text=True))
             except BaseException as error:  # noqa: BLE001 - re-raised in the caller's thread
                 results.put(error)
 
@@ -357,33 +377,7 @@ class ResticStorageRunner:
                 continue
             if isinstance(result, BaseException):
                 raise result
-            if (
-                result.returncode not in (0, 10)
-                and getattr(self._workspace, "image", None)
-                and _dns_lookup_failed(result.stderr or result.stdout)
-            ):
-                return self._run_repository_command_on_default_bridge(restic_arguments)
             return result
-
-    def _run_repository_command_on_default_bridge(
-        self, restic_arguments: list[str]
-    ) -> subprocess.CompletedProcess[str]:
-        # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge
-        # resolves fine; the backup itself already runs in a default-bridge helper.
-        print("Repository DNS lookup failed in the executor; retrying in a helper container", file=sys.stderr, flush=True)
-        return subprocess.run(
-            [
-                *self._docker_helper_base(),
-                "--rm",
-                "--entrypoint",
-                self._restic_binary,
-                self._workspace.image,
-                *self._restic_command(restic_arguments)[1:],
-            ],
-            env=self._environment,
-            capture_output=True,
-            text=True,
-        )
 
     def _redacted_repository_failure_detail(
         self,

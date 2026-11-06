@@ -341,6 +341,41 @@ def test_slow_repository_probe_keeps_heartbeating(
     assert '"event":"heartbeat"' in event_output.getvalue()
 
 
+def test_dns_fallback_helper_heartbeats_and_is_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    event_output = io.StringIO()
+    event_writer = JsonEventWriter(
+        str(OPERATION_ID), 0, heartbeat_interval_seconds=0.0, output=event_output
+    )
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace"),
+        read_only=True,
+    )
+    runner = ResticStorageRunner(operation, workspace, event_writer=event_writer)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[0] != "/usr/bin/docker":
+            return _repository_command_result(
+                1, standard_error="dial tcp: lookup bucket on 127.0.0.11:53: server misbehaving"
+            )
+        if "snapshots" in command and len(commands) == 2:
+            time.sleep(1.5)  # slow helper probe: the heartbeat loop must keep running
+            return _repository_command_result(10)
+        return _repository_command_result(0, standard_output="[]")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", run)
+    runner._ensure_repository_for_backup()
+
+    assert '"event":"heartbeat"' in event_output.getvalue()
+    # the executor is tried once; init goes straight to the helper
+    assert [command[0] == "/usr/bin/docker" for command in commands] == [False, True, True]
+    assert commands[2][-2:] == ["init", "--json"]
+
+
 def test_backup_repository_initialization_retries_transient_access_denied(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
