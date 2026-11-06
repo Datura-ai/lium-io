@@ -18,10 +18,12 @@ from services.task.checks import rented_throughput as module
 from services.task.checks.container_download_speed import CAP_BYTES
 from services.task.checks.rented_throughput import (
     RentedThroughputCheck,
+    _State,
     parse_busy,
     parse_disk,
     parse_during,
     pods_incomplete,
+    slow_detail,
     throughput_command,
 )
 from services.task.messages import RentedThroughputMessages as Msg
@@ -1380,3 +1382,18 @@ async def test_a_reading_sends_one_control_request_per_endpoint_and_names_the_co
     assert net == "fail"
     assert sorted(c.args[0] for c in reaches.await_args_list) == sorted(urls.values())
     assert [e.split()[0] for e in reading["net_failed"]] == ["hf"]
+
+
+@pytest.mark.parametrize(
+    "verdict, mb, detail",
+    [
+        ("fail", 8.9, "disk: 8.9 MB/s measured, 50 MB/s required"),
+        ("pass", 80.0, "disk"),
+        ("none", 8.9, "disk"),
+        ("inconclusive", 8.9, "disk"),
+    ],
+)
+def test_a_standing_disk_verdict_names_only_a_write_this_reading_judged_failing(verdict, mb, detail):
+    # two confirmed failures stand; a later excused (renter load) or unsure write is not published as the failure
+    reading = {"disk": {"mb_per_s": mb}, "disk_min_mb_per_s": 50, "disk_verdict": verdict}
+    assert slow_detail(_State(at=0, disk_failures=2, reading=reading)) == detail
