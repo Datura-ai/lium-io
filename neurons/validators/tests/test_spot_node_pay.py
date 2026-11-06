@@ -109,9 +109,11 @@ async def _run(
 
 
 def _without_filler_averages(results: list[JobResult]) -> list[JobResult]:
-    # the same cycle with no spot pay and no floor top-up: neither is paid without an average
+    # the same cycle with no spot pay and no floor top-up: no floor without an average, and the spot
+    # nodes off the pay list (an unmeasured one is seeded with its secure rate)
     for result in results:
         result.filler_revenue_per_gpu_hour = None
+        result.is_on_spot_pay_list = False
     return results
 
 
@@ -344,13 +346,22 @@ async def test_spot_without_a_lium_filler_gets_zero():
 
 
 @pytest.mark.asyncio
-async def test_spot_whose_config_has_no_average_gets_zero():
-    spot = _spot(filler_revenue_per_gpu_hour=None)
+async def test_spot_whose_config_has_no_average_is_seeded_with_its_secure_rate():
+    # Fish 23 Oct: every GPU model gets idle pay; the seed is not scaled down by the model's (tiny) earnings
+    spot = _spot(filler_revenue_per_gpu_hour=None, filler_revenue_usd_per_hour=None)
+    measured = _spot("spot-2", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=8.0)
 
-    await _run([spot])
+    incentive = await _run([spot, measured])
 
-    assert spot.incentive == 0
-    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+    secure_rate = HOURLY_RATE
+    assert spot.effective_rate == pytest.approx(secure_rate)
+    assert spot.spot_pool_multiplier == pytest.approx(1.0)
+    assert spot.incentive > 0
+    assert _codes(spot) == []
+    assert _logged(spot, "Spot-tier rate seeded")[0]["spot_rate_seed"] == pytest.approx(secure_rate)
+    # the measured node still shares only its model's filler earnings
+    assert measured.spot_pool_multiplier == pytest.approx(8.0 / 16.0)
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -409,13 +420,14 @@ async def test_secure_decision_pays_an_idle_spot_node_no_lium_filler_runs_on(sec
 
 
 @pytest.mark.asyncio
-async def test_secure_decision_keeps_the_spot_amount_and_its_missing_average(secure_decision_on):
-    spot = _spot(filler_revenue_per_gpu_hour=None)
+async def test_secure_decision_seeds_a_spot_node_with_no_average(secure_decision_on):
+    spot = _spot(has_lium_filler=False, filler_revenue_per_gpu_hour=None)
 
     await _run([spot])
 
-    assert spot.incentive == 0
-    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+    assert spot.effective_rate == pytest.approx(HOURLY_RATE)
+    assert spot.incentive > 0
+    assert _codes(spot) == []
 
 
 @pytest.mark.asyncio

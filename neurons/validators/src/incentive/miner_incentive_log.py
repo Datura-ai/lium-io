@@ -120,7 +120,7 @@ class ZeroIncentiveReason(StrEnum):
     REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
     # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
-    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
+    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"  # wire code, append-only; no longer emitted: an unmeasured configuration is seeded with its secure rate
     SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
     # Group C: the validation run itself did not pass; context.reason_code names the check
     VALIDATION_FAILED = "validation_failed"
@@ -617,16 +617,19 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_spot_no_filler_revenue_for_gpu_config(result: JobResult) -> MinerLogLine:
-        return MinerLogLine._no_payout(
-            result,
-            reason=ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG,
+    def spot_rate_seeded_from_secure_rate(result: JobResult) -> MinerLogLine:
+        return MinerLogLine(
             message=(
-                f"No subnet incentive: there is no average filler revenue yet for the "
-                f"{result.gpu_count}x {result.gpu_model} configuration, and spot-tier pay is "
-                "measured against it."
+                f"Spot-tier rate seeded: there is no average filler revenue yet for the "
+                f"{result.gpu_count}x {result.gpu_model} configuration, so this executor is paid "
+                "what it would earn idle on Secure until there is one."
             ),
-            extra_fields={"filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour},
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "spot_rate_seed": result.effective_rate,
+            },
         )
 
     @staticmethod
