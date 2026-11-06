@@ -84,7 +84,7 @@ async def test_a_cycle_between_pulls_publishes_the_last_reading(rented):
     ctx.runner.run.reset_mock()
     if rented:  # a split node with a pod on it is still a move target
         rented_data = SimpleNamespace(
-            executors={ctx.executor.uuid: SimpleNamespace(pods=[object()])}
+            executors={ctx.executor.uuid: SimpleNamespace(pods=[object()], miner_hotkey=ctx.miner_hotkey)}
         )
         ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data)})
 
@@ -104,7 +104,7 @@ async def test_a_rented_cycle_renews_the_records_ttl_without_a_pull():
     before = redis.store[key]
     redis.ttl[key] = 60  # nearly expired
     ctx.runner.run.reset_mock()
-    rented_data = SimpleNamespace(executors={ctx.executor.uuid: SimpleNamespace(pods=[object()])})
+    rented_data = SimpleNamespace(executors={ctx.executor.uuid: SimpleNamespace(pods=[object()], miner_hotkey=ctx.miner_hotkey)})
     ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data)})
 
     result = await module.RegistryPullCheck().run(ctx)
