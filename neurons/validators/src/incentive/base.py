@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from services.redis_service import RedisService
 from services.task_service import JobResult
 
+from core.config import settings
 from incentive.burn_service import BurnService
 from incentive.config import IncentiveConfig
 from incentive.utils import log_for_monitoring
@@ -51,8 +52,13 @@ class BaseIncentive(ABC):
             None
         """
         t1 = time.time()
+        excluded_hotkeys: set[str] = settings.get_scoring_excluded_hotkeys()
+        idle_excluded_hotkeys: set[str] = settings.get_idle_incentive_excluded_hotkeys()
         for hotkey, results in self.job_results.items():
             for result in results:
+                result.is_hotkey_excluded_from_scoring = hotkey in excluded_hotkeys or (
+                    hotkey in idle_excluded_hotkeys and not result.is_rented
+                )
                 await self._pre_process_job_result(hotkey, result)
 
         await self._on_finish_pre_process()
@@ -139,7 +145,6 @@ class BaseIncentive(ABC):
     async def calculate_final_weights(
         self,
         miners: list[bittensor.NeuronInfo],
-        last_mechanism_step_block: int | None,
         current_epoch: int | None = None,
     ) -> dict[str, float]:
         """Calculate final weights with burning logic applied for this cycle.
@@ -150,7 +155,6 @@ class BaseIncentive(ABC):
 
         Args:
             miners: List of all miners (needed to identify burners by UID)
-            last_mechanism_step_block: For burner selection randomization
 
         Returns:
             dict[str, float]: Weights with burning applied for each miner.

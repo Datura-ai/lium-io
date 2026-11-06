@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 from core.config import settings
+from incentive.burn_service import verified_burner_hotkey
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
 
@@ -51,6 +52,28 @@ class MissingScoredHotkeys:
 
 class ProviderPortalDataUnavailable(RuntimeError):
     """No live or Redis-cached provider snapshot is available."""
+
+
+def scored_registered_neurons(
+    miners: Sequence[bittensor.NeuronInfo],
+    registered: Sequence[bittensor.NeuronInfo],
+    miner_scores: dict[str, float],
+) -> list[bittensor.NeuronInfo]:
+    """Registered neurons with a score that the served-miner list does not carry."""
+    selected = {miner.hotkey for miner in miners}
+    return [neuron for neuron in registered if neuron.hotkey in miner_scores and neuron.hotkey not in selected]
+
+
+def fold_unregistered_into_burner(
+    miner_scores: dict[str, float], present_hotkeys: set[str], burner_hotkey: str | None
+) -> dict[str, float]:
+    """A settled vector is a day old and may name a hotkey that deregistered since. Its share goes to the verified
+    burner instead of to everyone else through normalization; with no verified burner it is dropped as before."""
+    folded = {hotkey: score for hotkey, score in miner_scores.items() if hotkey in present_hotkeys}
+    lost = sum(score for hotkey, score in miner_scores.items() if hotkey not in present_hotkeys)
+    if lost > 0 and burner_hotkey is not None and burner_hotkey in present_hotkeys:
+        folded[burner_hotkey] = folded.get(burner_hotkey, 0.0) + lost
+    return folded
 
 
 @contextlib.contextmanager
@@ -204,6 +227,7 @@ class SubtensorClient:
     miners: list[bittensor.NeuronInfo] = []
     uid_to_evm_address: dict[int, str] = {}
     hotkey_to_evm_address: dict[str, str] = {}
+    hotkeys_routed_via_central_miner: frozenset[str] = frozenset()
 
     @classmethod
     def get_instance(cls) -> Self:
@@ -442,11 +466,6 @@ class SubtensorClient:
             node = self.get_node()
             return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
 
-    def get_last_mechansim_step_block(self):
-        with _log_sync_block("get_last_mechansim_step_block"):
-            node = self.get_node()
-            return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
-
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(hotkey)
@@ -638,6 +657,7 @@ class SubtensorClient:
         opted_in_by_hotkey = {
             opted_in.miner_hotkey: opted_in for opted_in in opted_in_miners
         }
+        self.hotkeys_routed_via_central_miner = frozenset(opted_in_by_hotkey)
         for neuron in metagraph.neurons:
             opted_in = opted_in_by_hotkey.get(neuron.hotkey)
             if opted_in is not None:
@@ -705,7 +725,10 @@ class SubtensorClient:
         return self.miners
     
     async def send_weights_to_lium(self, payload: dict):
-        """Send weights to lium."""
+        """Send weights to lium. Without a chain block the backend refuses the report (422), so it is not sent."""
+        if payload.get("current_block") is None:
+            logger.warning(_m("[send_weights_to_lium] No current block; latest-set-weights not sent", extra=get_extra_info({})))
+            return
         try:
             keypair = settings.get_bittensor_wallet().get_hotkey()
             validator_hotkey = keypair.ss58_address
@@ -720,7 +743,14 @@ class SubtensorClient:
             )
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
                 url = f"{api_url}"
-                await session.post(url, json=payload, headers={"Authorization": f"{signature}"})
+                async with session.post(url, json=payload, headers={"Authorization": f"{signature}"}) as response:
+                    if response.status >= 400:
+                        logger.error(
+                            _m(
+                                "[send_weights_to_lium] latest-set-weights refused",
+                                extra=get_extra_info({"status": response.status, "body": (await response.text())[:500]}),
+                            ),
+                        )
         except Exception as e:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
@@ -765,7 +795,9 @@ class SubtensorClient:
         self,
         miner_scores: dict[str, float],
         active_hotkeys: set[str] | None = None,
-    ) -> None:
+        wait_for_inclusion: bool = False,
+        include_registered_scored: bool = False,
+    ) -> bool:
         """Set weights using accumulated scores with burning already applied.
 
         The miner_scores dict already includes burning logic from calculate_final_weights
@@ -794,9 +826,16 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            return
+            return False
 
         metagraph = self.get_metagraph()
+        if include_registered_scored:
+            # DAH-4001: a settled vector is a day old. A provider that removed its last node since then is no longer
+            # in the served-miner list, but its hotkey is still registered and the pay the backend approved is its.
+            miners = list(miners) + scored_registered_neurons(miners, metagraph.neurons, miner_scores)
+            miner_scores = fold_unregistered_into_burner(
+                miner_scores, {miner.hotkey for miner in miners}, verified_burner_hotkey(metagraph.neurons)
+            )
         self._log_scored_hotkeys_missing_from_selected_miners(
             miner_scores=miner_scores,
             selected_miners=miners,
@@ -858,7 +897,7 @@ class SubtensorClient:
             active_hotkeys or set(),
             # only the uids that actually receive burn, mirroring BurnService.is_burner —
             # a retired burner slot is an ordinary miner uid and must be able to take the floor
-            set(settings.NEW_BURNERS if settings.ENABLE_NEW_BURN_LOGIC else settings.BURNERS),
+            set(settings.NEW_BURNERS),
         )
 
         logger.info(
@@ -903,12 +942,14 @@ class SubtensorClient:
             "weights": [int(w) for w in list(uint_weights)],
             "version_key": int(self.version_key),
             "wait_for_finalization": False,
-            "wait_for_inclusion": False,
+            "wait_for_inclusion": wait_for_inclusion,
             "current_block": current_block,
             "updated_at": datetime.utcnow().isoformat() + "Z",
         }
         await self.send_weights_to_lium(payload)
 
+        # stays on the event loop on purpose: the substrate websocket behind `self.subtensor` is shared with every
+        # other chain read and is not thread-safe, so a thread here could interleave frames with a concurrent read
         result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.netuid,
@@ -916,7 +957,7 @@ class SubtensorClient:
             weights=uint_weights,
             version_key=self.version_key,
             wait_for_finalization=False,
-            wait_for_inclusion=False,
+            wait_for_inclusion=wait_for_inclusion,
         )
         if result is True:
             logger.info(
@@ -937,6 +978,7 @@ class SubtensorClient:
                     ),
                 ),
             )
+        return result is True
 
     def get_last_update(self, block):
         try:

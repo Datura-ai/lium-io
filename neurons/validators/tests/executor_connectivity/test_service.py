@@ -139,7 +139,6 @@ async def test_verify_ports_passes_the_range_tallies_through(
             sysbox_runtime=False,
             status="ok",
             port_ranges=ranges,
-            second_pass="ran",
         )
     )
 
@@ -148,4 +147,3 @@ async def test_verify_ports_passes_the_range_tallies_through(
     )
 
     assert result.port_ranges == ranges
-    assert result.second_pass == "ran"

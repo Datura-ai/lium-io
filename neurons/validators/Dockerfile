@@ -8,7 +8,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-RUN pip install -U pdm
+RUN pip install "pdm==2.29.3" "unearth<0.19"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./
@@ -22,6 +22,8 @@ COPY . .
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/
 RUN mv libinspector.so /usr/lib/
+# the aarch64 builds the validator checks ARM executors against (core/checksums.arch_lib_path)
+RUN for f in lib*-aarch64.so; do [ ! -e "$f" ] || mv "$f" /usr/lib/; done
 
 ENV ENV=prod
 ENV USE_TORCH=0

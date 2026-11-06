@@ -9,7 +9,7 @@ The stack runs two containers: `executor-executor-runner-1` and `executor-watcht
 1. At start, and then every 5 minutes, the updater (`executor-watchtower-1`, image `daturaai/lium-watchtower`, source `../../watchtower`) reads the digest of the current runner image from `https://lium.io/api/watchtower/digest`. A digest is the identity of an image: `sha256:` followed by 64 hex characters. The validator signs the response. The updater checks the signature.
 2. When the runner container runs a different digest, the updater first makes sure that the host can start a GPU container: it starts a throwaway container from the runner's own image with every GPU requested and the entrypoint `true`, then removes it. The throwaway container carries the label `io.lium.watchtower.probe=nvidia-runtime`. Before the updater starts a new one, it removes every container with that label that an earlier check left behind, so a held host never collects them. If the daemon cannot start that container, the updater does not pull. It logs `Update held` with the reason and tries again at the next check. The most common reason is `NVIDIA_RUNTIME_MISMATCH`: the host's NVIDIA driver and its libraries no longer match, which happens after a driver package update without a reboot. A new executor container cannot start on such a host, so an update would take the node offline.
 3. When the GPU container starts, the updater pulls `daturaai/compute-subnet-executor-runner@<digest>` and recreates the runner from it with the same name, labels, mounts and restart policy.
-4. The runner starts the executor containers from the compose file that is baked into its image. That file pins the executor image by digest.
+4. The runner starts the executor containers from the compose file that is baked into its image. That file pins the executor image by digest. When an executor container is already running, the runner first runs the same GPU check with the executor's current image. If it fails, the runner keeps the running executor, logs `Update held, running executor kept` with the cause and the remedy, and exits; it tries again when Docker restarts it.
 
 The updater never pulls by tag. A pull by tag (`runner:latest`) asks the host's Docker daemon, and the daemon asks a registry mirror first when `/etc/docker/daemon.json` has one. A mirror can keep an old copy of the tag, and the pull then "succeeds" with the old image. A pull by digest is content-addressed: the daemon checks the hash of what it receives, so a mirror can answer with the right image or with an error, never with an old one. When the daemon's path fails, the updater pulls the same digest from `registry-1.docker.io` directly, which the daemon's mirror setting does not cover.
 
@@ -33,6 +33,16 @@ docker image inspect --format '{{index .RepoDigests 0}}' "$(docker inspect execu
 ```
 
 If the two digests are equal, the node runs the current runner. If they differ, the node is behind: follow the next section.
+
+## Check the hotkey a node is set up for
+
+The executor names the miner hotkey from `MINER_HOTKEY_SS58_ADDRESS` in `.env` on request. `nonce` is any 32 to 128 hex characters; the answer echoes it back:
+
+```bash
+curl -s "http://127.0.0.1:$(grep -E '^EXTERNAL_PORT=' .env | cut -d= -f2)/miner-identity?nonce=$(openssl rand -hex 16)"
+```
+
+The answer is `{"miner_hotkey": "<ss58>", "nonce": "<the nonce sent>"}`, plus `"account_claim"` when `MINER_ACCOUNT_CLAIM` is set in `.env` (`lium mine --register` writes it). An executor older than this route answers `401`: update it as described below.
 
 ## One-time restart of a node that stopped updating
 

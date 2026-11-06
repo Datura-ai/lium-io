@@ -50,7 +50,7 @@ parse_arguments() {
 
 # Function to detect package manager
 detect_package_manager() {
-    echo "Detecting Linux distribution and package manager..."
+    echo "Detecting Linux distribution and package manager..." >&2
     if command -v apk >/dev/null 2>&1; then
         echo "apk"
     elif command -v apt >/dev/null 2>&1; then
@@ -89,7 +89,7 @@ install_system_packages() {
         "apk")
             echo "Installing packages with apk (Alpine)..."
             apk update
-            apk add --no-cache python3 python3-dev python3-pip py3-pip build-base linux-headers gcc g++ make bash
+            apk add --no-cache python3 python3-dev py3-pip build-base linux-headers gcc g++ make bash
             ;;
         "apt")
             echo "Installing packages with apt (Ubuntu/Debian)..."
@@ -159,8 +159,8 @@ install_python_packages() {
 
 # Install Python and Jupyter if needed
 install_python_jupyter() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "Python not found. Installing system packages and Python..."
+    if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then
+        echo "Python or venv support not found. Installing system packages and Python..."
         install_system_packages
     else
         echo "Python is already installed."

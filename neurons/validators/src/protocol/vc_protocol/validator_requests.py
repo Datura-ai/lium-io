@@ -27,6 +27,7 @@ class RequestType(enum.Enum):
     GpuEstimatesRequest = "GpuEstimatesRequest"
     EstimateResponse = "EstimateResponse"
     PodStatesReport = "PodStatesReport"
+    ResumedCreatesReport = "ResumedCreatesReport"
 
 
 class BaseValidatorRequest(BaseRequest, DeliveryStamps):
@@ -169,6 +170,15 @@ class PodStatesReport(BaseValidatorRequest):
     pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
 
 
+class ResumedCreatesReport(BaseValidatorRequest):
+    """DAH-5437 (lium_protocol 2.5.0): the cut-off creates this connector's start sweep asks the backend to send
+    again from its own records (no request is stored here), sent once, first on its first authenticated socket. The backend fails at once a create it sent before that socket authenticated
+    that still waits and is not listed, e.g. one whose in-flight record Redis lost."""
+
+    message_type: RequestType = RequestType.ResumedCreatesReport
+    pod_ids: list[str] = pydantic.Field(default_factory=list)
+
+
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
@@ -222,6 +232,12 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None until
     # the cycle probes; an older backend ignores the key.
     pod_ssh: list[PodSshObservation] | None = None
+    # The node's SSH host public key, sent only when this cycle connected with known_hosts pinned to it.
+    # The backend trusts a heartbeat key only from here; None when the cycle did not reach the node.
+    ssh_host_key: str | None = None
+    # DAH-5651: this cycle's DinD test container on the host never answered. None from an older validator;
+    # the backend reads it with a silent rented pod as a down host.
+    host_runtime_fault: bool | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):
@@ -293,6 +309,8 @@ class ResetVerifiedJobEvidence(_AbsentWhenNone):
     pod_id: str | None = None
     container_name: str | None = None
     container: ResetVerifiedJobContainerEvidence | None = None
+    # DAH-4658: GpuFingerprintCheck in warn mode: the hard verdict (GPU_MISSING tells a missing card from a swap)
+    anchor_hard_would_be: str | None = None
 
 
 class ResetVerifiedJobRequest(BaseValidatorRequest):

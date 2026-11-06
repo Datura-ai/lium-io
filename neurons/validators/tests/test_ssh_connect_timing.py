@@ -138,7 +138,7 @@ async def test_auth_banner_captured(monkeypatch, caplog):
     )
 
     with caplog.at_level(logging.INFO, logger=MODULE_LOGGER):
-        async with connect_with_phase_timing(host="h", port=22):
+        async with connect_with_phase_timing(host="203.0.113.7", port=22):
             pass
 
     rec = _record(caplog, "ssh_connect_phase_timing")
@@ -153,7 +153,7 @@ async def test_missing_marks_log_none_without_crashing(monkeypatch, caplog):
     monkeypatch.setattr(sct.asyncssh, "connect", _connect_returning(conn, fire=False))
 
     with caplog.at_level(logging.INFO, logger=MODULE_LOGGER):
-        async with connect_with_phase_timing(host="h", port=22):
+        async with connect_with_phase_timing(host="203.0.113.7", port=22):
             pass
 
     rec = _record(caplog, "ssh_connect_phase_timing")
@@ -193,7 +193,7 @@ async def test_clean_connection_lost_is_silent(monkeypatch, caplog):
     monkeypatch.setattr(sct.asyncssh, "connect", _connect_returning(conn))
 
     with caplog.at_level(logging.INFO, logger=MODULE_LOGGER):
-        async with connect_with_phase_timing(host="h", port=22):
+        async with connect_with_phase_timing(host="203.0.113.7", port=22):
             pass
 
     assert _record(caplog, "ssh_connection_lost") is None
@@ -210,7 +210,7 @@ async def test_phase_timing_suppressed_when_flag_off(monkeypatch, caplog):
     monkeypatch.setattr(sct.asyncssh, "connect", _connect_returning(conn, lost_exc=exc))
 
     with caplog.at_level(logging.INFO, logger=MODULE_LOGGER):
-        async with connect_with_phase_timing(host="h", port=22) as client:
+        async with connect_with_phase_timing(host="203.0.113.7", port=22) as client:
             assert client is conn
 
     # The per-connection phase-timing line is gated off ...
@@ -228,7 +228,7 @@ async def test_custom_client_factory_rejected(monkeypatch):
         sct.asyncssh, "connect", AsyncMock(side_effect=AssertionError("must not connect"))
     )
     with pytest.raises(ValueError, match="custom client_factory"):
-        async with connect_with_phase_timing(host="h", client_factory=lambda: None):
+        async with connect_with_phase_timing(host="203.0.113.7", client_factory=lambda: None):
             pass
 
 
@@ -244,7 +244,7 @@ async def test_connect_failure_propagates_and_does_not_log(monkeypatch, caplog):
 
     with caplog.at_level(logging.INFO, logger=MODULE_LOGGER):
         with pytest.raises(ConnectionResetError):
-            async with connect_with_phase_timing(host="h", port=22):
+            async with connect_with_phase_timing(host="203.0.113.7", port=22):
                 pass
 
     assert _record(caplog, "ssh_connect_phase_timing") is None

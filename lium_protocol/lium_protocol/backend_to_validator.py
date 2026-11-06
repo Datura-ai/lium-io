@@ -39,6 +39,12 @@ class BackendMessageType(enum.Enum):
     ForcedValidationCycleRequest = "ForcedValidationCycleRequest"
     # ask the validator for an exact rental estimate; it answers with EstimateResponse
     GetEstimateRequest = "GetEstimateRequest"
+    # 1.16.0: reset a running pod's GPUs; the validator answers with PodGpuResetResult
+    ResetPodGpuRequest = "ResetPodGpuRequest"
+    # 2.4.0: lock or reset a running pod's GPU clocks; the validator answers with PodGpuClocksResult
+    LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
+    # 2.6.0: validate one node now (a provider's "Recheck now")
+    RecheckExecutorRequest = "RecheckExecutorRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -51,6 +57,7 @@ class BackendMessage(Message):
 class ServerRequest(BackendMessage):
     """A request about one executor of one miner."""
 
+    command_id: str = ""
     miner_hotkey: str
     executor_id: str
     # the validator's copy carries where the miner listens; the backend does not send them
@@ -164,10 +171,17 @@ class ContainerCreateRequest(ContainerRequest):
     cluster_membership: ClusterMembership | None = None
     # DAH-2211: build from this Dockerfile on the host instead of pulling `docker_image`
     dockerfile_content: str | None = None
+    # 1.11.0: a gzipped tar of the build context for `dockerfile_content`, fetched by the validator and
+    # checked against `build_context_sha256` (hex) before the build; None builds with the Dockerfile alone
+    build_context_url: str | None = None
+    build_context_sha256: str | None = None
     # DAH-1524: the image ships sshd (and runs Jupyter itself); None keeps the validator's bootstrap
     ships_sshd: bool | None = None
     gpu_power_limits: list[GpuPowerLimit] | None = None
     cache_volumes: list[CacheVolume] | None = None
+    # 1.18.0: False when the backend rents the pod part of its host; the validator then withholds the host-wide
+    # devices whatever GPUs the host shows. None from an older backend: the validator's own count decides.
+    whole_host: bool | None = None
 
 
 @BACKEND_MESSAGES.register
@@ -247,6 +261,8 @@ class BackupContainerRequest(ContainerRequest):
     repository_pod_id: str | None = None
     repository_password: str | None = pydantic.Field(default=None, repr=False)
     failure_timeout_seconds: int = pydantic.Field(default=STORAGE_OPERATION_REPORTING_FAILURE_TIMEOUT_SECONDS, gt=0)
+    # 1.8.0: restic --exclude patterns (the default backup skips caches and keys); an older validator ignores them.
+    exclude_patterns: list[str] = []
 
 
 @BACKEND_MESSAGES.register
@@ -267,6 +283,8 @@ class RestoreContainerRequest(ContainerRequest):
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
     failure_timeout_seconds: int = pydantic.Field(default=STORAGE_OPERATION_REPORTING_FAILURE_TIMEOUT_SECONDS, gt=0)
+    # a reconnect re-dispatch of a restore that may already be running; its dispatch failure is not reported
+    recovery: bool = False
 
 
 @BACKEND_MESSAGES.register
@@ -282,6 +300,39 @@ class InstallJupyterServerRequest(ContainerRequest):
     jupyter_port_map: tuple[int, int]
     local_volume: str | None = None
     local_volume_path: str | None = None
+
+
+@BACKEND_MESSAGES.register
+class ResetPodGpuRequest(ContainerRequest):
+    """1.16.0: the renter asked to reset the GPUs of their running pod. `gpu_uuids` is every GPU
+    the backend holds for the pod; `gpu_indices` picks some of them by pod index (the pod's GPUs sorted by
+    host PCI bus id, the 0..n-1 order `nvidia-smi` shows inside the pod), None for all of them. Answered by
+    `validator_to_backend.PodGpuResetResult` with the same `request_id`."""
+
+    message_type: BackendMessageType = BackendMessageType.ResetPodGpuRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    request_id: str
+    # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
+    local_volume_path: str | None = None
+
+
+@BACKEND_MESSAGES.register
+class LockPodGpuClocksRequest(ContainerRequest):
+    """2.4.0: the renter asked to lock the graphics clocks of their running pod's GPUs to
+    `[min_mhz, max_mhz]` (None = the GPU's own bound; clamped to its supported clocks), or with `reset`
+    to give them back to the driver. `gpu_uuids` and `gpu_indices` as in `ResetPodGpuRequest`. Answered
+    by `validator_to_backend.PodGpuClocksResult` with the same `request_id`."""
+
+    message_type: BackendMessageType = BackendMessageType.LockPodGpuClocksRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    min_mhz: int | None = None
+    max_mhz: int | None = None
+    reset: bool = False
+    request_id: str
 
 
 @BACKEND_MESSAGES.register
@@ -307,6 +358,15 @@ class ForcedValidationCycleRequest(BackendMessage):
     """Staging only: start the validation cycle now. No executor — the cycle validates the whole fleet."""
 
     message_type: BackendMessageType = BackendMessageType.ForcedValidationCycleRequest
+
+
+@BACKEND_MESSAGES.register
+class RecheckExecutorRequest(BackendMessage):
+    """2.6.0: validate one node now, outside the cycle (a provider's "Recheck now" in the portal). A validator that
+    does not list the node ignores it; an older validator ignores the message."""
+
+    message_type: BackendMessageType = BackendMessageType.RecheckExecutorRequest
+    executor_id: str
 
 
 # --- typeless replies on the socket -----------------------------------------------------------------
@@ -340,6 +400,7 @@ class RentedMachine(pydantic.BaseModel):
     executor_ip_port: str
     containers: list[RentedContainer]
     owner_flag: bool = False
+    self_rent: bool = False  # DAH-5244, as http.RentedExecutor.self_rent
     rented_ports: list[int] = []  # as above
 
 

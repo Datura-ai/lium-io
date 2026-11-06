@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 import docker
-from datura.requests.validator_requests import ssh_pubkey_signing_blob
+from datura.requests.validator_requests import ssh_pubkey_signing_blob, upload_nonce_issued_at
 from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
@@ -32,7 +32,7 @@ from services.hardware_service import get_docker_client, get_system_metrics, get
 from services.update_status_service import ExpectedDigestCache, collect_update_status
 from core.config import settings
 
-from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
+from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod, MinerIdentityResponse
 from payloads.backend import ContainerUtilizationPayload, SignaturePayload
 from payloads.chutes import ChutesCommandPayload, ChutesInstallPayload
 from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
@@ -48,6 +48,7 @@ from services.local_verify_service import (
     BusyError,
     LocalVerifyService,
     NonceCache,
+    accepted_miner_hotkeys,
     canonical_intent_message,
     check_intent_target,
     check_intent_window,
@@ -262,9 +263,14 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
     the bare-public-key format. `require_nonce` is the G3 enforcement phase:
     attestation-relevant requests without a nonce are rejected outright.
     """
-    if require_nonce and not payload.nonce:
-        logger.warning("Rejecting SSH-key upload without an attestation nonce (enforcement on)")
+    issued_at = upload_nonce_issued_at(payload.nonce)
+    # I-78: enforcement wants the dated nonce, so an old captured signature (none, or a bare one) is refused
+    if require_nonce and issued_at is None:
+        logger.warning("Rejecting SSH-key upload without a dated validator nonce (enforcement on)")
         raise HTTPException(status_code=401, detail="Attestation nonce required")
+    if issued_at is not None and abs(time.time() - issued_at) > settings.UPLOAD_NONCE_MAX_AGE_SECONDS:
+        logger.warning("Rejecting SSH-key upload with a nonce minted %ds away", int(time.time() - issued_at))
+        raise HTTPException(status_code=401, detail="Stale upload nonce")
     try:
         signed_blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce)
         if match_validator_hotkey(signed_blob, payload.validator_signature) is None:
@@ -312,6 +318,51 @@ def _validate_chutes_signature(message: str, signature: str) -> None:
         raise HTTPException(status_code=401, detail="Invalid validator signature")
 
 
+def _accepted_miner_hotkeys() -> set[str]:
+    return accepted_miner_hotkeys(
+        own=settings.MINER_HOTKEY_SS58_ADDRESS,
+        pool=settings.LIUM_POOL_HOTKEY,
+        shared_portal_hotkey=settings.DEFAULT_MINER_HOTKEY,
+    )
+
+
+def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
+    """Check the validator issued this key for this executor's own miner hotkey or the pool's.
+
+    Logs `ssh_key_miner_binding` with miner_binding = legacy (no miner-bound signature),
+    bad_signature or mismatch, and refuses the upload only with REQUIRE_MINER_BOUND_SSH_KEY.
+    """
+    own_hotkey = settings.MINER_HOTKEY_SS58_ADDRESS
+    if not payload.miner_hotkey or not payload.validator_miner_signature:
+        miner_binding = "legacy"
+    else:
+        blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce, payload.miner_hotkey)
+        try:
+            signed = match_validator_hotkey(blob, payload.validator_miner_signature) is not None
+        except Exception:
+            signed = False
+        if not signed:
+            miner_binding = "bad_signature"
+        elif payload.miner_hotkey not in _accepted_miner_hotkeys():
+            miner_binding = "mismatch"
+        else:
+            return
+    enforced = settings.REQUIRE_MINER_BOUND_SSH_KEY
+    logger.warning(
+        _m(
+            "ssh_key_miner_binding",
+            extra={
+                "miner_binding": miner_binding,
+                "signed_miner_hotkey": payload.miner_hotkey,
+                "executor_miner_hotkey": own_hotkey,
+                "enforced": enforced,
+            },
+        )
+    )
+    if enforced:
+        raise HTTPException(status_code=403, detail="SSH key was not issued for this miner")
+
+
 @apis_router.post("/upload_ssh_key")
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
@@ -323,6 +374,7 @@ async def upload_ssh_key(
     # request); removals never carry a nonce.
     _validate_validator_signature(payload, require_nonce=settings.REQUIRE_ATTESTATION_NONCE)
     logger.info("upload_ssh_key validator signature validated")
+    _check_miner_binding(payload)
     logger.info("upload_ssh_key service call started")
     response = await miner_service.upload_ssh_key(payload)
     logger.info("upload_ssh_key service call completed")
@@ -485,16 +537,43 @@ async def get_version():
     Get the executor version information.
 
     Returns:
-        dict: {"version": "x.y.z", "capabilities": [...]} plus, while `local_verify/1` is
-        advertised, `local_verify_port`: the loopback port the validator's SSH tunnel targets for
+        dict: {"version": "x.y.z", "capabilities": [...], "local_verify_port": ...}:
+        `local_verify_port` is the loopback port the validator's SSH tunnel targets for
         `POST /verify` (this process's own INTERNAL_PORT; the miner's EXTERNAL_PORT may differ).
         Read over plain HTTP, so a proxy can change it: a wrong port only fails the tunnel's
         connect, and the validator then runs its SSH checks as before.
     """
-    version = {"version": _get_version(), "capabilities": _capabilities()}
-    if settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
-        version["local_verify_port"] = settings.INTERNAL_PORT
-    return version
+    return {
+        "version": _get_version(),
+        "capabilities": [LOCAL_VERIFY_CAPABILITY],
+        "local_verify_port": settings.INTERNAL_PORT,
+    }
+
+
+# A hex nonce of 16 to 64 bytes: long enough that an answer cannot be prepared before the request,
+# short enough that the echo stays small.
+MINER_IDENTITY_NONCE_PATTERN = r"^[0-9a-fA-F]{32,128}$"
+
+
+@apis_router.get("/miner-identity", response_model_exclude_none=True)
+async def get_miner_identity(
+    nonce: Annotated[str, Query(pattern=MINER_IDENTITY_NONCE_PATTERN)],
+) -> MinerIdentityResponse:
+    """
+    The miner hotkey this executor is configured for (`MINER_HOTKEY_SS58_ADDRESS`), with the
+    caller's nonce echoed back so the answer belongs to this request. Lets a service that is about
+    to list this executor under an account confirm that the machine at this address is set up for
+    that account's hotkey. Public: the hotkey is public on chain.
+
+    With `MINER_ACCOUNT_CLAIM` set (`lium mine --register` writes it), the answer also carries it as
+    `account_claim`: every node of an e-mail or Google portal account reports the same pool hotkey, so
+    the claim is what ties the node to the account that installed it. It is not a secret.
+    """
+    return MinerIdentityResponse(
+        miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
+        nonce=nonce,
+        account_claim=settings.MINER_ACCOUNT_CLAIM or None,
+    )
 
 
 def _is_loopback_client(request: Request) -> bool:
@@ -528,12 +607,10 @@ def _get_local_verify_service() -> LocalVerifyService:
 
 
 async def _admit_verify_intent(request: Request) -> VerifyIntent:
-    """The guards a `/verify` intent passes before anything runs: the flag, the loopback peer, the
-    body, the validator signature, the time window and the miner it names. Returns the admitted
-    intent; raises the HTTP refusal otherwise. Claims no nonce, so a refusal here leaves the signed
-    intent usable."""
-    if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
-        raise HTTPException(status_code=404, detail="Not Found")
+    """The guards a `/verify` intent passes before anything runs: the loopback peer, the body,
+    the validator signature, the time window and the miner it names. Returns the admitted intent;
+    raises the HTTP refusal otherwise. Claims no nonce, so a refusal here leaves the signed intent
+    usable."""
     if not _is_loopback_client(request):
         # Logged so a provider can see why a validator that still posts over the network gets the
         # SSH checks instead: the peer is the docker gateway or the CVM's slirp address, not loopback.
@@ -563,7 +640,7 @@ async def _admit_verify_intent(request: Request) -> VerifyIntent:
 
     refused = check_intent_window(
         intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
-    ) or check_intent_target(intent, settings.MINER_HOTKEY_SS58_ADDRESS)
+    ) or check_intent_target(intent, _accepted_miner_hotkeys())
     if refused:
         logger.warning("local verify refused: %s nonce=%s", refused, intent.nonce)
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
@@ -584,7 +661,7 @@ async def local_verify(request: Request):
     Auth is the validator hotkey signature every validator-facing route here uses
     (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
     (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
-    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
+    window. (An image without the route answers 422 from MinerMiddleware;
     the validator treats every non-200 as "use SSH".)
     """
     intent = await _admit_verify_intent(request)
