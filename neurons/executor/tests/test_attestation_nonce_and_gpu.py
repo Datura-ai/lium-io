@@ -12,6 +12,7 @@ Covers:
   host-mode never emits; a missing NVIDIA stack degrades to a logged None.
 """
 
+import asyncio
 import socket as socketlib
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ from middlewares.miner import MinerMiddleware
 # conftest.py already inserted src/ into sys.path and set required env vars.
 from core.config import settings
 from routes.apis import apis_router
+from services.gpu_attestation_service import GPUAttestationService
 from services.miner_service import MinerService
 from services.tdx_service import TDXQuoteService
 
@@ -183,3 +185,11 @@ def test_tdx_quote_served_only_on_the_dstack_socket(
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_gpu_evidence_only_in_cvm(monkeypatch, tmp_path):
+    # Arrange — no flag: bare metal (no dstack socket) never emits CC evidence
+    monkeypatch.setattr(settings, "DSTACK_SOCKET_PATH", str(tmp_path / "missing.sock"))
+
+    # Act / Assert
+    assert asyncio.run(GPUAttestationService().collect("ab" * 32)) is None
