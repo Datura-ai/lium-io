@@ -323,6 +323,13 @@ class Settings(BaseSettings):
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
     FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
+    # The first pass's shortest VerifyX network wait (package try, each speed-test direction). The
+    # library sizes each wait from its transfer at the acceptance floor plus a margin, between this and
+    # VERIFYX NETWORK_TIMEOUT_SECONDS, and gives a failed package one sized try plus a 10 s retry: a slow
+    # mirror cost a new node 4 min at two 120 s tries, while a healthy node at the floor still has time
+    # for a 500 MiB package. Cycle challenges send no floor and keep the full wait. A library without
+    # sizing ignores the keys and waits the full time.
+    FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS: int = Field(env="FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS", default=45)
     # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
     # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
     # judge the answer with the same unseal/verify code. The POST travels through a direct-tcpip
@@ -824,8 +831,10 @@ class Settings(BaseSettings):
     # no incentive ledger row); the next cycle scores and overwrites it as today.
     EXPRESS_LANE_TICK_SECONDS: int = Field(env="EXPRESS_LANE_TICK_SECONDS", default=30)
     # Hard bound on the extra load a registration flood can add: at most this many express
-    # verifications in flight at once (so also per tick), and per miner.
-    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=4)
+    # verifications in flight at once (so also per tick), and per self-hosted miner (a hotkey
+    # routed through the central miner is bounded by the global cap only). A wave runs every
+    # executor at once, so 8 is small beside it; at 4 a few nodes added together queued minutes.
+    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=8)
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )

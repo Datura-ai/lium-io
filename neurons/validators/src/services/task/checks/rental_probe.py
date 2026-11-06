@@ -5,7 +5,9 @@ import logging
 import shlex
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import asyncssh
@@ -180,6 +182,8 @@ class _ProbeOutcome:
     create_step: str | None = None
     ssh_port: int | None = None
     inconclusive_reason: str | None = None
+    # A passed probe's teardown, left for RentalProbeCheck.run to start once the verdict is recorded
+    teardown: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -287,8 +291,11 @@ class RentalProbeCheck:
             )
 
         if outcome.failed_step is None:
-            await _stamp_last_ok(ctx)
-            await _clear_failure(ctx)
+            try:
+                await _stamp_last_ok(ctx)
+                await _clear_failure(ctx)
+            finally:
+                _teardown_after_verdict(ctx, outcome)
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
@@ -905,7 +912,9 @@ async def _probe(
     6. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
 
     A step that ends the probe returns None and says why in `outcome` (a failed step, or an inconclusive
-    reason). The teardown runs in `finally`, so it also runs after a raise or a cancel.
+    reason). The teardown runs in `finally`, so it also runs after a raise or a cancel. A probe that
+    passed hands its teardown to `run` instead (`outcome.teardown`): it runs after the verdict, off the
+    node's first listing (p50 35 s, 5 Nov), see `_teardown_after_verdict`.
     """
     outcome = _ProbeOutcome()
     pod_id = str(uuid.uuid4())
@@ -936,9 +945,14 @@ async def _probe(
         _step_gpu_count(ctx, outcome, login)
         if outcome.failed_step is None:
             _step_egress(ctx, outcome, login)
+        if outcome.failed_step is None and outcome.inconclusive_reason is None:
+            outcome.teardown = partial(
+                _settle, ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra
+            )
         return outcome
     finally:
-        await _step_teardown(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
+        if outcome.teardown is None:
+            await _step_teardown(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
 
 
 async def _step_container_start(
@@ -1172,6 +1186,47 @@ async def _step_teardown(
             cancelled = True
     if cancelled:
         raise asyncio.CancelledError()
+
+
+# Passed probes' teardowns still running: the loop keeps only a weak reference to a task.
+_TEARDOWNS_AFTER_VERDICT: set[asyncio.Task] = set()
+
+
+def _teardown_after_verdict(ctx: Context, outcome: _ProbeOutcome) -> None:
+    """Start a passed probe's teardown in the background; the pass is already recorded.
+
+    The pending-pod mark stays until it ends, so the stale-container sweep leaves the container to it.
+    A teardown that does not finish clears the pass stamp, so the next cycle probes the node again, as
+    an inconclusive run would; the leftover goes to the by-name removal and the stale-container sweep.
+    """
+    task = asyncio.ensure_future(_teardown_passed_probe(ctx, outcome))
+    _TEARDOWNS_AFTER_VERDICT.add(task)
+    task.add_done_callback(_TEARDOWNS_AFTER_VERDICT.discard)
+
+
+async def _teardown_passed_probe(ctx: Context, outcome: _ProbeOutcome) -> None:
+    try:
+        await outcome.teardown()
+        step = next((s for s in outcome.steps if s.name == STEP_TEARDOWN), None)
+        extra = {**ctx.default_extra, "teardown": step.as_record() if step else None}
+        if step is not None and not step.ok:
+            await _clear_last_ok(ctx)
+            logger.warning(
+                _m(
+                    "Rental probe teardown after a passed verdict did not finish; the node is probed again next cycle",
+                    extra=get_extra_info(extra),
+                )
+            )
+        else:
+            logger.info(_m("Rental probe torn down after its verdict", extra=get_extra_info(extra)))
+    except Exception:
+        logger.error(
+            _m(
+                "Rental probe teardown after the verdict failed",
+                extra=get_extra_info(ctx.default_extra),
+            ),
+            exc_info=True,
+        )
 
 
 async def _settle(
