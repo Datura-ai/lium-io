@@ -45,7 +45,12 @@ async def test_cancel_fallback_removes_the_helper_container(
             subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
 
     helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
-    assert docker_log.read_text().splitlines() == [f"stop --time 5 {helper}", f"rm -f -- {helper}"]
+    runner = f"lium-storage-runner-{str(OPERATION_ID)[:12]}"
+    # with no local runner the executor restarted: the surviving runner container is stopped too
+    surviving_runner = [] if runner_pid else [f"stop --time 30 {runner}", f"rm -f -- {runner}"]
+    assert docker_log.read_text().splitlines() == [
+        *surviving_runner, f"stop --time 5 {helper}", f"rm -f -- {helper}"
+    ]
     if runner_pid:
         assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
 
@@ -100,4 +105,6 @@ async def test_start_never_removes_a_running_helper(
     helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
     probe = next(c for c in commands if "docker ps -q" in c)
     assert f"name=^{helper}$" in probe and "pgrep -f" in probe
+    # a runner container that outlived an executor restart also owns the operation
+    assert f"name=^lium-storage-runner-{str(OPERATION_ID)[:12]}$" in probe
     assert any("docker rm -f" in c for c in commands) is not kept

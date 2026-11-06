@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import stat
+import subprocess
 import sys
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 
 from storage.models import OperationSpecError, StorageOperationSpec
 from storage.reporting import ReportingLeaseExpired, StorageEventReporter
 from storage.restic import (
+    HELPER_LABEL,
     JsonEventWriter,
     ResticOperationError,
     ResticResult,
@@ -19,6 +23,11 @@ from storage.restic import (
 )
 from storage.workspace import WorkspaceResolutionError, WorkspaceResolver
 
+DOCKER_BINARY = "/usr/bin/docker"
+# Set inside the detached runner container: it runs the operation itself instead of launching another one.
+DETACHED_ENV = "LIUM_STORAGE_DETACHED"
+SPEC_ENV = "LIUM_STORAGE_SPEC"
+
 
 def _cancel_on_sigterm(signum: int, frame: object) -> None:
     # Raising unwinds through ResticStorageRunner's finally, which removes the helper container.
@@ -26,11 +35,17 @@ def _cancel_on_sigterm(signum: int, frame: object) -> None:
 
 
 def main() -> int:
-    signal.signal(signal.SIGTERM, _cancel_on_sigterm)
     arguments = _parse_arguments()
+    if os.environ.get(DETACHED_ENV) != "1":
+        return _run_detached(arguments)
+    signal.signal(signal.SIGTERM, _cancel_on_sigterm)
     event_writer: JsonEventWriter | None = None
     try:
-        payload = _load_operation(arguments.spec)
+        payload = (
+            _parse_object(os.environ.pop(SPEC_ENV, ""))
+            if SPEC_ENV in os.environ
+            else _load_operation(arguments.spec)
+        )
         operation = StorageOperationSpec.from_mapping(payload)
         reporter = (
             StorageEventReporter(operation.operation_id, operation.action, operation.reporter)
@@ -81,6 +96,108 @@ def main() -> int:
         else:
             print(json.dumps({"event": "result", "status": "FAILED", "message": str(error)}))
         return 1
+
+
+def runner_container_name(operation_id: str) -> str:
+    return f"lium-storage-runner-{operation_id[:12]}"
+
+
+def _run_detached(arguments: argparse.Namespace) -> int:
+    """Run the operation in its own container, so reporting and restic outlive an executor restart.
+
+    This process only follows that container for the validator's log/status files: if the executor
+    container is replaced, this process dies and the runner container carries on and reports to the
+    backend. A cancel file is forwarded as SIGTERM, which the runner turns into a CANCELLED result.
+    """
+    try:
+        payload = _load_operation(arguments.spec)
+        operation_id = str(payload.get("operation_id") or "")
+        if not operation_id:
+            raise OperationSpecError("operation spec is missing operation_id")
+        image = WorkspaceResolver()._helper_image()
+    except (OperationSpecError, WorkspaceResolutionError, OSError) as error:
+        print(
+            json.dumps({"event": "result", "status": "FAILED", "message": str(error)}), flush=True
+        )
+        return 1
+    name = runner_container_name(operation_id)
+    started = subprocess.run(
+        _runner_container_command(name, operation_id, image),
+        env={
+            **os.environ,
+            SPEC_ENV: json.dumps(payload),
+        },  # by name only: the spec never reaches argv
+        capture_output=True,
+        text=True,
+    )
+    if started.returncode != 0:
+        message = f"storage runner container did not start: {(started.stderr or '').strip()[-500:]}"
+        print(json.dumps({"event": "result", "status": "FAILED", "message": message}), flush=True)
+        return 1
+
+    def cancel_requested() -> bool:
+        return bool(arguments.cancel_file) and Path(arguments.cancel_file).exists()
+
+    def on_sigterm(signum: int, frame: object) -> None:
+        # A cancel stops the runner; any other SIGTERM (executor shutdown) leaves it running.
+        if cancel_requested():
+            subprocess.run([DOCKER_BINARY, "kill", "--signal", "TERM", name], capture_output=True)
+            return
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+    logs = subprocess.Popen([DOCKER_BINARY, "logs", "--follow", name], stderr=subprocess.STDOUT)
+    stop_forwarding = threading.Event()
+    threading.Thread(
+        target=_forward_cancel, args=(name, cancel_requested, stop_forwarding), daemon=True
+    ).start()
+    waited = subprocess.run([DOCKER_BINARY, "wait", name], capture_output=True, text=True)
+    stop_forwarding.set()
+    try:
+        logs.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logs.kill()
+    subprocess.run([DOCKER_BINARY, "rm", "--force", name], capture_output=True)
+    try:
+        return int(waited.stdout.strip())
+    except ValueError:
+        return 1
+
+
+def _forward_cancel(name: str, cancel_requested: object, stop: threading.Event) -> None:
+    while not stop.wait(1):
+        if cancel_requested():  # type: ignore[operator]
+            subprocess.run([DOCKER_BINARY, "kill", "--signal", "TERM", name], capture_output=True)
+            return
+
+
+def _runner_container_command(name: str, operation_id: str, image: str) -> list[str]:
+    return [
+        DOCKER_BINARY,
+        "run",
+        "--detach",
+        "--name",
+        name,
+        # the helper label lets a later operation remove this container once it has long exited
+        "--label",
+        f"{HELPER_LABEL}={operation_id}",
+        # the runner inspects rental containers and their /proc entries and drives docker, like the executor
+        "--privileged",
+        "--pid",
+        "host",
+        "--volume",
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "--env",
+        SPEC_ENV,
+        "--env",
+        f"{DETACHED_ENV}=1",
+        "--env",
+        f"LIUM_STORAGE_HELPER_IMAGE={image}",
+        "--entrypoint",
+        sys.executable,
+        image,
+        str(Path(__file__).resolve()),
+    ]
 
 
 def _parse_arguments() -> argparse.Namespace:

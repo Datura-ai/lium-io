@@ -2243,3 +2243,80 @@ def test_real_restic_finds_the_parent_when_the_backup_path_changes(
     assert summaries[0]["files_new"] == 20
     assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
 
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_executor_side_runner_launches_a_detached_runner_that_outlives_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cancelled: bool
+) -> None:
+    # The executor-side process only launches and follows the runner container. A SIGTERM from an
+    # executor shutdown leaves that container running; a SIGTERM after a cancel request stops it.
+    spec = tmp_path / "op.json"
+    spec.write_text(json.dumps(_operation_payload()))
+    spec.chmod(0o600)
+    cancel_file = tmp_path / "op.cancel"
+    if cancelled:
+        cancel_file.touch()
+    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec), "--cancel-file", str(cancel_file)])
+    monkeypatch.setenv("LIUM_STORAGE_HELPER_IMAGE", "sha256:" + "c" * 64)
+    monkeypatch.delenv(storage_runner.DETACHED_ENV, raising=False)
+    calls: list[list[str]] = []
+    launch_env: dict[str, str] = {}
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        if command[1] == "run":
+            launch_env.update(kwargs["env"])  # type: ignore[arg-type]
+        if command[1] == "wait":
+            os.kill(os.getpid(), signal.SIGTERM)  # the executor is stopped while the operation runs
+            return SimpleNamespace(returncode=0, stdout="130\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(storage_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(storage_runner.subprocess, "Popen", lambda *a, **k: SimpleNamespace(wait=lambda timeout: 0))
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        if cancelled:
+            assert storage_runner.main() == 130
+        else:
+            with pytest.raises(SystemExit) as exited:
+                storage_runner.main()
+            assert exited.value.code == 143
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    name = storage_runner.runner_container_name(str(OPERATION_ID))
+    launch = calls[0]
+    assert launch[1:3] == ["run", "--detach"] and name in launch and "--privileged" in launch
+    assert f"{storage_runner.HELPER_LABEL}={OPERATION_ID}" in launch
+    assert "repository-password" not in " ".join(launch)  # the spec goes by environment, never argv
+    assert json.loads(launch_env[storage_runner.SPEC_ENV])["operation_id"] == str(OPERATION_ID)
+    rest = [command[1:] for command in calls[1:]]
+    if cancelled:
+        assert ["kill", "--signal", "TERM", name] in rest and rest[-1] == ["rm", "--force", name]
+    else:
+        assert rest == [["wait", name]]  # never stopped or removed: it keeps running and reporting
+
+
+def test_detached_runner_reads_its_spec_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.argv", ["storage_runner.py"])
+    monkeypatch.setenv(storage_runner.DETACHED_ENV, "1")
+    monkeypatch.setenv(storage_runner.SPEC_ENV, json.dumps(_operation_payload()))
+    ran: list[StorageOperationSpec] = []
+
+    class FakeRunner:
+        def __init__(self, operation: StorageOperationSpec, *args: object, **kwargs: object) -> None:
+            ran.append(operation)
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr(storage_runner, "ResticStorageRunner", FakeRunner)
+    monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", lambda self, operation: None)
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        assert storage_runner.main() == 0
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert ran[0].operation_id == OPERATION_ID
+    assert storage_runner.SPEC_ENV not in os.environ  # the secrets leave the process environment

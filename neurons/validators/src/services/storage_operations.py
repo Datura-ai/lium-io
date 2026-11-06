@@ -265,6 +265,7 @@ async def cancel_storage_operation(
     files = StorageOperationFiles.for_operation(operation_id)
     spec = await _read_operation_spec(ssh_client, files.spec)
     helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    runner_name = f"lium-storage-runner-{str(operation_id)[:12]}"
     cancel_path = shlex.quote(str(files.cancel))
     pid_path = shlex.quote(str(files.pid))
     # Let the runner terminate its Restic process and helper first. Direct
@@ -287,6 +288,9 @@ async def cancel_storage_operation(
         "fi; "
         'kill -0 "$pid" 2>/dev/null && exit 3 || true; '
         "else "
+        # no local runner (the executor restarted): stop the surviving runner container; it reports CANCELLED
+        f"/usr/bin/docker stop --time 30 {shlex.quote(runner_name)} >/dev/null 2>&1 || true; "
+        f"/usr/bin/docker rm -f -- {shlex.quote(runner_name)} >/dev/null 2>&1 || true; "
         f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         "fi"
@@ -334,9 +338,13 @@ async def _helper_owned_by_live_runner(
     helper_name = f"lium-storage-{str(operation_id)[:12]}"
     # "[-]-spec" keeps pgrep from matching this command's own shell
     runner_pattern = f"[-]-spec {files.spec}"
+    runner_name = f"lium-storage-runner-{str(operation_id)[:12]}"
+    # a runner container still running survived an executor restart and owns this operation
     result = await ssh_client.run(
+        f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{runner_name}$')} --filter status=running"
+        " | grep -q . || { "
         f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running"
-        f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
+        f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null; }}",
         check=False,
     )
     return result.exit_status == 0
