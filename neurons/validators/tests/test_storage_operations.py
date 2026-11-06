@@ -13,13 +13,16 @@ from services import storage_operations
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
-def _fake_docker(tmp_path: Path, inspect_output: str | None) -> tuple[Path, Path]:
-    """A docker that logs its calls; `inspect` answers like a runner container when given an output."""
+def _fake_docker(tmp_path: Path, inspect_output: str | None, fed: bool = True) -> tuple[Path, Path]:
+    """A docker that logs its calls; `inspect` answers like a runner container when given an output.
+
+    `logs` shows the runner's spec-received marker when ``fed``."""
     docker_log = tmp_path / "docker.log"
     fake_docker = tmp_path / "docker"
     inspect = f'echo "{inspect_output}"; exit 0' if inspect_output is not None else "exit 1"
     fake_docker.write_text(
         f'#!/bin/sh\necho "$*" >> {docker_log}\nif [ "$1" = inspect ]; then {inspect}; fi\n'
+        + (f'if [ "$1" = logs ]; then echo {storage_operations.RUNNER_SPEC_RECEIVED}; fi\n' if fed else "")
     )
     fake_docker.chmod(0o755)
     return fake_docker, docker_log
@@ -246,7 +249,8 @@ async def test_a_running_runner_container_owns_the_operation(
     running_name = f"{running}{str(OPERATION_ID)[:12]}" if running else "none"
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(
-        f'#!/bin/sh\ncase "$*" in *"name=^{running_name}$"*) echo abc123;; esac\n'
+        f'#!/bin/sh\ncase "$*" in *"name=^{running_name}$"*) echo abc123;; '
+        f'"logs {running_name}") echo {storage_operations.RUNNER_SPEC_RECEIVED};; esac\n'
     )
     fake_docker.chmod(0o755)
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
@@ -256,3 +260,31 @@ async def test_a_running_runner_container_owns_the_operation(
         )
         is owned
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fed", [True, False])
+async def test_redispatch_keeps_a_fed_runner_and_replaces_an_unfed_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fed: bool
+) -> None:
+    # Real state and ownership shell against a fake docker with a running runner container. Only a runner that
+    # logged the spec-received marker owns the run; one whose launcher died before the handoff is replaced.
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+    fake_docker, docker_log = _fake_docker(tmp_path, "running 0", fed=fed)
+    ssh_client = _local_ssh(fake_docker)
+    ssh_client.start_sftp_client = None
+    runner = f"lium-storage-runner-{str(OPERATION_ID)[:12]}"
+    if fed:
+        files = await storage_operations.start_storage_operation(
+            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+        assert files.runner == runner
+        assert f"rm -f -- {runner}" not in docker_log.read_text()
+    else:
+        with pytest.raises(TypeError):  # reaches the sftp spec write: a fresh launch
+            await storage_operations.start_storage_operation(
+                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            )
+        assert f"rm -f -- {runner}" in docker_log.read_text().splitlines()

@@ -13,6 +13,8 @@ import asyncssh
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
+# storage_runner.py prints this once it has read its spec; until then nobody may count it as owning the run
+RUNNER_SPEC_RECEIVED = "storage-runner-spec-received"
 # storage_runner.py's exit code when its container never received the spec on stdin
 RUNNER_SPEC_TIMEOUT_EXIT = 75
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
@@ -147,6 +149,12 @@ async def start_storage_operation(
                     break
         if existing_state == f"STATUS:{RUNNER_SPEC_TIMEOUT_EXIT}":
             # the runner never received its spec (the executor restarted mid-handoff): launch it afresh
+            await _remove_operation_artifacts(ssh_client, files)
+            existing_state = "STARTING"
+        if existing_state == "UNFED":
+            if await _launcher_alive(ssh_client, files):
+                return files  # its launcher is handing it the spec right now
+            # its launcher died before the handoff (an executor restart): nobody will feed it
             await _remove_operation_artifacts(ssh_client, files)
             existing_state = "STARTING"
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
@@ -298,7 +306,9 @@ async def _operation_state(
         f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
         # the runner container survives an executor restart, the files and the executor-side PID do not
         f"elif state=$(/usr/bin/docker inspect -f '{{{{.State.Status}}}} {{{{.State.ExitCode}}}}' {runner} 2>/dev/null); then "
-        'case "$state" in (exited*|dead*) echo "STATUS:${state#* }";; (*) echo RUNNING;; esac; '
+        'case "$state" in (exited*|dead*) echo "STATUS:${state#* }";; '
+        f"(*) if /usr/bin/docker logs {runner} 2>&1 | grep -q {RUNNER_SPEC_RECEIVED}; then echo RUNNING; "
+        "else echo UNFED; fi;; esac; "
         # executors before the runner container: their runner is a process in the executor container
         f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
@@ -372,6 +382,12 @@ async def _remote_file_exists(
     return result.exit_status == 0
 
 
+async def _launcher_alive(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
+    runner_pattern = f"[-]-spec {files.spec}"  # "[-]" keeps pgrep from matching this command's own shell
+    result = await ssh_client.run(f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null", check=False)
+    return result.exit_status == 0
+
+
 async def _helper_owned_by_live_runner(
     ssh_client: asyncssh.SSHClientConnection,
     operation_id: UUID,
@@ -384,7 +400,7 @@ async def _helper_owned_by_live_runner(
     # a runner container still running survived an executor restart and owns this operation
     result = await ssh_client.run(
         f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{runner_name}$')} --filter status=running"
-        " | grep -q . || { "
+        f" | grep -q . && /usr/bin/docker logs {shlex.quote(runner_name)} 2>&1 | grep -q {RUNNER_SPEC_RECEIVED} || {{ "
         f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running"
         f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null; }}",
         check=False,
