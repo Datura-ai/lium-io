@@ -51,11 +51,22 @@ logger = logging.getLogger(__name__)
 # cycle time kept after the rented pod reads, to report the result and close the shell
 POD_READ_RESERVE_SECONDS = 30
 
+def _scraped_container_ids(ctx: Context) -> dict[str, str]:
+    return {
+        str(entry.get("name") or ""): str(entry.get("container_id") or "")
+        for entry in ((ctx.state.specs or {}).get("docker") or {}).get("containers") or []
+        if isinstance(entry, dict)
+    }
+
+
 async def _remember_fillers(ctx: Context, names: list[str]) -> None:
+    container_ids = _scraped_container_ids(ctx)
     try:
         for name in names:
-            key = f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
-            await ctx.services.redis.set(key, "1", ex=RECENT_FILLER_TTL_SECONDS)
+            # the record is the container itself: a replacement under the same name is not our load
+            if container_ids.get(name):
+                key = f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
+                await ctx.services.redis.set(key, container_ids[name], ex=RECENT_FILLER_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Recent filler record not written for %s: %s", ctx.executor.uuid, exc)
 
@@ -63,11 +74,15 @@ async def _remember_fillers(ctx: Context, names: list[str]) -> None:
 async def _recently_listed_fillers(ctx: Context, names: set[str]) -> list[str]:
     """The filler-named containers the snapshot listed on THIS node within RECENT_FILLER_TTL_SECONDS: our own load."""
     found = []
+    container_ids = _scraped_container_ids(ctx)
     try:
         for name in sorted(names):
-            if name.startswith(FILLER_CONTAINER_PREFIX) and await ctx.services.redis.get(
-                f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
-            ):
+            if not name.startswith(FILLER_CONTAINER_PREFIX) or not container_ids.get(name):
+                continue
+            recorded = await ctx.services.redis.get(f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}")
+            if isinstance(recorded, bytes):
+                recorded = recorded.decode()
+            if recorded == container_ids[name]:
                 found.append(name)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Recent filler records unreadable for %s: %s", ctx.executor.uuid, exc)
