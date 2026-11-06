@@ -171,28 +171,7 @@ def provider_load_gate(*, enforce: bool = True, stack_cap: bool = False):
 
 
 @pytest.mark.asyncio
-async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory):
-    ctx = context_factory(
-        state=_rented_state(SN13_SPECS),
-        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)]),
-    )
-
-    with provider_load_gate(enforce=True):
-        result = await ProviderSideLoadCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.updates["provider_side_load_passed"] is False
-    assert result.event.reason_code == Msg.LOAD_ABOVE_LIMIT.reason
-    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
-    assert result.updates["state"].specs["provider_side_load"] == {
-        "cpu_cores": 8.9,
-        "disk_kb": 1528 * GB_KB,
-    }
-
-
-@pytest.mark.asyncio
-async def test_idle_machine_is_judged_the_same_as_a_rented_one(context_factory):
-    # The provider cheats the renter when rented and the marketplace when idle — same verdict.
+async def test_enforcement_zeroes_the_score_on_an_idle_machine(context_factory):
     ctx = context_factory(
         state=build_state(specs=SN13_SPECS, rented_data=_no_rentals()),
         runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)]),
@@ -202,8 +181,32 @@ async def test_idle_machine_is_judged_the_same_as_a_rented_one(context_factory):
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.passed is False
+    assert result.updates["provider_side_load_passed"] is False
+    assert result.event.reason_code == Msg.LOAD_ABOVE_LIMIT.reason
     assert result.event.what_we_saw["is_rented"] is False
     assert result.event.what_we_saw["provider_cpu_cores"] == 10.5  # nothing of Lium's to subtract
+    assert result.updates["state"].specs["provider_side_load"] == {
+        "cpu_cores": 10.5,
+        "disk_kb": 1528 * GB_KB,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_rented_machine_is_observed_only(context_factory):
+    # beside a renter's pod the host reading carries the renter's own load
+    ctx = context_factory(
+        state=_rented_state(SN13_SPECS),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert "provider_side_load_passed" not in result.updates
+    assert result.event.reason_code == Msg.LOAD_ABOVE_LIMIT.reason
+    assert result.event.impact == "Observed only beside a Lium workload: score was NOT changed"
+    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
 
 
 @pytest.mark.asyncio
@@ -270,22 +273,21 @@ async def test_the_executor_container_is_subtracted_without_being_rented(context
 
 
 @pytest.mark.asyncio
-async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_factory):
+async def test_a_foreign_container_zeroes_the_score_of_an_idle_machine(context_factory):
     # The whole point of the ticket, end to end: the provider mines another subnet with
-    # `docker run` while a renter holds the pod.
+    # `docker run` on a listed machine.
     specs = {
         **SN13_SPECS,
         "docker": {
             **SN13_SPECS["docker"],
             "containers": [
-                {"name": "pod_renter", "cpu_percent": 158.0},
                 {"name": "sn13_miner", "cpu_percent": 700.0},
             ],
         },
     }
     ctx = context_factory(
-        state=_rented_state(specs),
-        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0), ("c2", "sn13_miner", 700.0)]),
+        state=build_state(specs=specs, rented_data=_no_rentals()),
+        runner=confirming_runner(10.56, 32, [("c2", "sn13_miner", 700.0)]),
     )
 
     with provider_load_gate(enforce=True):
@@ -293,7 +295,7 @@ async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_
 
     assert result.passed is False
     assert result.updates["provider_side_load_passed"] is False
-    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
+    assert result.event.what_we_saw["provider_cpu_cores"] == 10.5
 
 
 @pytest.mark.asyncio
@@ -620,15 +622,15 @@ async def test_a_miner_renamed_dockerd_is_capped_like_every_other_forged_name(co
     # `pgrep -x dockerd` matches a process NAME, and a provider owns the host: copying the miner
     # to `dockerd` would otherwise hide nine cores on the reading that decides money.
     ctx = context_factory(
-        state=_rented_state(CPU_ONLY_SPECS),
-        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)], dockerd_cores=9.0),
+        state=build_state(specs=CPU_ONLY_SPECS, rented_data=_no_rentals()),
+        runner=confirming_runner(10.56, 32, [("c1", "sn13_miner", 158.0)], dockerd_cores=9.0),
     )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.passed is False
-    assert result.event.what_we_saw["provider_cpu_cores"] == 6.9  # 10.56 - 1.58 - 2.0 capped
+    assert result.event.what_we_saw["provider_cpu_cores"] == 8.5  # 10.56 - 2.0 capped
 
 
 def _miner_on_the_executor_image() -> dict[str, object]:
