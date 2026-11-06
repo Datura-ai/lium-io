@@ -1722,14 +1722,10 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 # after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
 KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 _DROP_MARK = "drop"
-# The image's entrypoint writes under the plaintext path before the first gocryptfs mount: those layer files
-# carry an inode change time within this long of the container's creation and are not the renter's.
-# A restart reruns the entrypoint too: only one the validator made and remounted counts, from its start to the end
-# of its remount as recorded under _VALIDATOR_STARTS_DIR (one "start end" line per start in nanoseconds, keyed by
-# container id).
-# A window never outlives the remount, so files after a later restart of Docker's own (unseen) always keep the copy.
-# shortcut: a fixed bound, not the recorded first-mount time; a create whose mount came later keeps the container.
-_STARTUP_WRITE_SECONDS = 300
+# The image's entrypoint writes under the plaintext path before each gocryptfs mount. Only a start the validator
+# itself made (the create, or a start of a stopped container) and then mounted counts as startup, from that start to
+# the end of its mount, as recorded under _VALIDATOR_STARTS_DIR (one "start end" line per start in nanoseconds, keyed
+# by container id). Any other file, a Docker restart's included, keeps the copy.
 # on the host disk: the executor container (and its /var/tmp) is recreated on every executor release
 _VALIDATOR_STARTS_DIR = "/proc/1/root/var/lib/lium_validator_starts"
 
@@ -1741,14 +1737,13 @@ def _layer_data_check(
     added or changed under the plaintext path (``docker diff``). Any other output, an error included, keeps it.
 
     The layer is read, not the mounts: files written while unmounted stay in the layer after a remount.
-    When the host can read the overlay upper dir, only files changed later than _STARTUP_WRITE_SECONDS after
-    the container was created count (ctime, which a renter cannot set back, and Created never moves: a copy
-    this reads clean read clean when it was kept); otherwise ``docker diff`` decides. The upper dir is the
+    When the host can read the overlay upper dir, only files changed outside every recorded validator start count
+    (ctime, which a renter cannot set back); otherwise ``docker diff`` decides. The upper dir is the
     overlay2 one, else (containerd store) the running container's root mount's, else ``upper_dir``, read through
     /proc/1/root: the SSH session is the executor's container, which runs with the host's PIDs. A line
     ``upper <dir>`` names the one it used, so a read of the stopped container can be handed it.
     Without ``startup_shortcut`` only ``docker diff`` decides: a copy already kept (possibly by docker diff alone,
-    when no upper dir was readable) is never released by the age bound."""
+    when no upper dir was readable) is never released by a startup window."""
     name = shlex.quote(container_name)
     under = shlex.quote(f"{plaintext_path.rstrip('/')}/")
     upper_under = shlex.quote(plaintext_path.rstrip("/"))
@@ -1764,8 +1759,8 @@ def _layer_data_check(
     shortcut = (
         'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
         '[ -d "$1" ] && echo "$1"; }; '
-        f"c=$(/usr/bin/docker inspect -f '{{{{.Created}}}} {{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
-        f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && c=\"${{c#* }}\" && p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
+        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
+        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
         f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
         f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
         # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
@@ -1776,8 +1771,7 @@ def _layer_data_check(
         "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
         "w=\"$w ! ( -newerct $(n $s) ! -newerct $(n $e) )\"; "
         f"done 2>/dev/null < {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"; true; }} "
-        f"&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
-        "$w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
+        "&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
     return (
         f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
@@ -1785,6 +1779,33 @@ def _layer_data_check(
         f"{shortcut if startup_shortcut else ''}"
         f"{{ /usr/bin/docker diff {name} || echo diff-failed; }} | awk -v p={under} {shlex.quote(awk)}"
     )
+
+
+async def _stopped_before_start(docker_client: RentalDockerSdkClient, container_name: str) -> bool:
+    """True only when Docker says the container is stopped: the start that follows is then the validator's. Docker
+    accepts a start of a running container as success, so an unreadable state counts as running."""
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+    except Exception:  # noqa: BLE001 — unknown: no start window, so the layer read keeps the copy
+        return False
+    return state.running is False and state.restarting is False
+
+
+async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> None:
+    """Record [the container's current start, now] as the validator's start window, just after its mount: the layer
+    read counts files changed in it as the entrypoint's. Call only for a start the validator verifiably made itself.
+    RestartCount above 0 means Docker restarted it since that start: nothing is recorded. Nanoseconds: a whole-second
+    end padded up a second would cover a restart of Docker's own later in that second."""
+    name = shlex.quote(container_name)
+    with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):  # without it the read keeps, never drops
+        await ssh_client.run(
+            "i=$(/usr/bin/docker inspect -f "
+            f"'{{{{.Id}}}} {{{{.RestartCount}}}} {{{{.State.StartedAt}}}}' {name}) "
+            f"&& r=\"${{i#* }}\" && [ \"${{r%% *}}\" = 0 ] && s=$(date -d \"${{r#* }}\" +%s%N) && mkdir -p "
+            f"{_VALIDATOR_STARTS_DIR} && echo \"$s $(date +%s%N)\" >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
+            check=False,
+            timeout=30,
+        )
 
 
 class _UnkillableParkedContainer(Exception):
@@ -1841,6 +1862,8 @@ class _EditSwap:
         self.keep_parked = False
         # the overlay upper dir the last layer read used
         self._upper_dir: str | None = None
+        # the plaintext path was mounted when parked (None: unknown); a failed edit restores that, kept or not
+        self.was_mounted: bool | None = None
 
     async def __aenter__(self) -> "_EditSwap":
         return self
@@ -1948,11 +1971,8 @@ class _EditSwap:
         # renter files written during the shutdown to a sweep; a clean one is removed by ID after the edit
         parked = recover_kept or f"{kept_prefix}{int(time.time())}"
         if not recover_kept:
-            renamed = await self._run(
-                f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
-            )
-            if renamed.exit_status != 0:
-                raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
+            self.was_mounted = await self._plaintext_mounted(self.container_name)
+            await self._rename_aside(container_id, parked)
         self.parked_name = parked
         self.parked_id = container_id
         stopped = await self._run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
@@ -1987,6 +2007,41 @@ class _EditSwap:
                 )
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
+
+    async def _plaintext_mounted(self, container: str) -> bool | None:
+        """Whether the running container has a mount at the plaintext path; None when that cannot be read."""
+        if not self.plaintext_path:
+            return None
+        read = await self._run(
+            f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container)}) && [ \"$p\" -gt 0 ] "
+            f"&& [ -r /proc/$p/mountinfo ] && awk -v m={shlex.quote(self.plaintext_path.rstrip('/'))} "
+            "'$5 == m {f=1} END {print f ? \"mounted\" : \"unmounted\"}' /proc/$p/mountinfo"
+        )
+        out = (read.stdout or "").strip() if read.exit_status == 0 else ""
+        return {"mounted": True, "unmounted": False}.get(out)
+
+    async def _rename_aside(self, container_id: str, parked: str) -> None:
+        """Rename the pod to ``parked``. A failed or timed-out rename may still have been applied: the name Docker
+        now has for the container's ID decides, never the reply."""
+        error = None
+        try:
+            renamed = await self._run(f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}")
+            if renamed.exit_status == 0:
+                return
+            error = (renamed.stderr or "").strip() or f"exit {renamed.exit_status}"
+        except Exception as exc:  # noqa: BLE001 — a lost reply: the state below decides
+            error = f"{type(exc).__name__}: {exc}"
+        name = None
+        with contextlib.suppress(Exception):
+            named = await self._run(f"/usr/bin/docker inspect -f '{{{{.Name}}}}' {shlex.quote(container_id)}")
+            name = (named.stdout or "").strip().lstrip("/") if named.exit_status == 0 else None
+        if name == parked:
+            return
+        if name != self.container_name:
+            # unknown: give it the pod name back by ID (a no-op error when it was never renamed); still running
+            with contextlib.suppress(Exception):
+                await self._run(f"/usr/bin/docker rename {shlex.quote(container_id)} {shlex.quote(self.container_name)}")
+        raise Exception(f"[park_current_container] docker rename failed: {error}")
 
     async def _layer_safe_to_remove(self, container: str, upper_dir: str | None = None, already_kept: bool = False) -> bool:
         """True only when the layer check says the container holds no renter files under the plaintext path.
@@ -2078,18 +2133,19 @@ class _EditSwap:
 
         ``start=False``: the pod's GPUs are no longer on the node and its device request names the old
         cards, so it cannot start; the container gets its name back, stopped. A kept one (``keep_parked``)
-        is brought up the same way minus the remount, and takes the pod name only once it is seen running."""
+        is brought up the same way, remounted only if it was mounted when parked, and takes the pod name only once it is seen running."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
         q_replacement = shlex.quote(self.replacement_id) if self.replacement_id else q_name
         await self._run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
         error: str | None = None
         if self.keep_parked and start:
-            # a kept one comes back as dockerd had it, unmounted (the remount would hide its files), and keeps
-            # its kept name until it runs: stopped, it keeps the kept name's protection
+            # a kept one comes back mounted or not as it was parked, and keeps its kept name until it runs:
+            # stopped, it keeps the kept name's protection
             try:
                 if self.bring_up is not None:
                     async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
-                        await self.bring_up(self.parked_name, False)
+                        # mounted when parked: remounted (its older layer files stay, hidden, in the kept copy)
+                        await self.bring_up(self.parked_name, self.was_mounted is True)
                 elif (started := await self._run(f"/usr/bin/docker start {q_parked}")).exit_status != 0:
                     raise RuntimeError(f"docker start: {(started.stderr or '').strip()}")
                 # a start can return 0 while the entrypoint has already exited; Status is "restarting", not
@@ -10891,6 +10947,8 @@ class DockerService:
                                 allow_init=created_local_volume,
                                 authorized_keys=payload.user_public_keys if keys_in_volume_setup else (),
                             )
+                            # docker run's start is the validator's own: its entrypoint's files up to here are startup
+                            await _record_validator_start(ssh_client, container_name)
                         except AuthorizedKeysWriteFailed as exc:
                             # the mount is up: fail at add_public_keys below, as a separate keys exec did
                             keys_write_failure = exc
@@ -11828,6 +11886,7 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
+            stopped_before = await _stopped_before_start(docker_client, container_name)
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start)
             await run_logged_rental_docker_sdk_operation(
@@ -11855,6 +11914,7 @@ class DockerService:
                     local_volume_path=local_volume_path,
                     pod_id=pod_id,
                     default_extra=default_extra,
+                    record_start=stopped_before,
                 )
 
     async def _bring_up_existing_container(
@@ -11881,6 +11941,7 @@ class DockerService:
                 container_name=container_name,
             )
 
+        stopped_before = await _stopped_before_start(docker_client, container_name)
         try:
             await _start()
         except Exception as exc:
@@ -11901,6 +11962,7 @@ class DockerService:
             pod_id=pod_id,
             default_extra=default_extra,
             remount=remount,
+            record_start=stopped_before,
         )
 
     async def _restore_mount_and_sshd_after_start(
@@ -11913,11 +11975,14 @@ class DockerService:
         pod_id: str,
         default_extra: dict[str, Any],
         remount: bool = True,
+        record_start: bool = False,
     ) -> None:
         """What a bare ``docker start`` drops: the gocryptfs plaintext mount (remounted with
         ``allow_init=False`` — an existing volume is never re-initialised) and the sshd. Shared by
         ``start_existing_container`` and the undo of a failed edit. ``remount=False`` (a kept container that
-        ran unmounted, its files in its own layer) skips the remount, which would hide them."""
+        ran unmounted, its files in its own layer) skips the remount, which would hide them. ``record_start``: the
+        caller saw the container stopped before its own start, so this start is the validator's (a no-op start of a
+        running container, or a remount alone, records nothing)."""
         encrypted_volume_name = remount and await self._encrypted_local_volume_name(
             docker_client,
             container_name,
@@ -11938,20 +12003,8 @@ class DockerService:
                 log_extra=default_extra,
                 allow_init=False,
             )
-            # the start just made is ours and now remounted: the layer read counts its entrypoint writes as startup;
-            # RestartCount (reset by our start) above 0 means Docker restarted it during the remount: record nothing;
-            # both times are in nanoseconds: a whole-second end padded up a second would cover a restart of
-            # Docker's own later in that second
-            name = shlex.quote(container_name)
-            with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):  # without it the read keeps, never drops
-                await ssh_client.run(
-                    "i=$(/usr/bin/docker inspect -f "
-                    f"'{{{{.Id}}}} {{{{.RestartCount}}}} {{{{.State.StartedAt}}}}' {name}) "
-                    f"&& r=\"${{i#* }}\" && [ \"${{r%% *}}\" = 0 ] && s=$(date -d \"${{r#* }}\" +%s%N) && mkdir -p "
-                    f"{_VALIDATOR_STARTS_DIR} && echo \"$s $(date +%s%N)\" >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
-                    check=False,
-                    timeout=30,
-                )
+            if record_start:
+                await _record_validator_start(ssh_client, container_name)
         ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
             docker_client=docker_client,
             container_name=container_name,
