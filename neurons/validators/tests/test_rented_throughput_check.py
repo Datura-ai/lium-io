@@ -1367,3 +1367,16 @@ async def test_a_slow_verdict_names_only_confirmed_endpoints(answers, detail):
             slow = await check.run(ctx)
             clock.now += 31 * 60
     assert re.fullmatch(detail, slow.updates["rented_throughput_slow_detail"])
+
+
+async def test_a_reading_sends_one_control_request_per_endpoint_and_names_the_confirmed_one():
+    # both fetches cut: _judge's control requests (PyPI fails, HF answers) are reused, never repeated
+    both_cuts = snaps() + disk() + RENTALS + line("pypi", 0, 30.0, 143) + line("hf", 0, 30.0, 143)
+    urls = dict(download_module.ENDPOINTS)
+    reaches = AsyncMock(side_effect=lambda url: url == urls["hf"])
+    with flags(), patch.object(download_module, "validator_reaches", reaches):
+        ctx, _ = make_ctx(both_cuts)
+        reading, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert net == "fail"
+    assert sorted(c.args[0] for c in reaches.await_args_list) == sorted(urls.values())
+    assert [e.split()[0] for e in reading["net_failed"]] == ["hf"]

@@ -28,12 +28,9 @@ from ..messages import RentedThroughputMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
-from . import container_download_speed as download_speed
 from .container_download_speed import (
     _FETCH_SCRIPT,
     _TIMEOUT_EXITS,
-    ENDPOINTS,
-    NODE_SIDE_ERRORS,
     ContainerDownloadSpeedCheck,
     download_speed_command,
     parse_download_speed,
@@ -659,13 +656,10 @@ class RentedThroughputCheck:
             "disk_min_mb_per_s": settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S,
         }
         if net == "fail":
-            # the endpoints _judge fails on: slow, or cut while the validator reaches them (each checked, no short-circuit)
-            urls = dict(ENDPOINTS)
+            # what _judge confirmed, reused: no second control request to any endpoint
             reading["net_failed"] = [
                 f"{r.endpoint} {r.mbps:.1f} Mbps" if r.mbps is not None else f"{r.endpoint} {r.error}"
-                for r in endpoints
-                if (r.mbps is not None and r.mbps < settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS)
-                or (r.error in NODE_SIDE_ERRORS and await download_speed.validator_reaches(urls[r.endpoint]))
+                for r in judged.failed
             ]
         if pressure is not None:
             # shadow: what the disk side would be with the gate enforced, next to what it is
