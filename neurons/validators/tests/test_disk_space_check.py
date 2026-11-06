@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.const import MAX_DISK_UTILIZATION_PERCENT
@@ -144,6 +146,36 @@ async def test_default_job_or_filler_does_not_exempt_a_full_disk(context_factory
     result = await DiskSpaceCheck().run(ctx)
 
     assert result.passed is False
+    assert result.event.reason_code == Msg.TOO_FULL.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [0.0, 0.05])
+async def test_a_rental_lookup_past_its_timeout_counts_as_a_live_rental(context_factory, cap):
+    # review 5772289851: run near the deadline (after the cold retry), the per-pod lookup is capped
+    class HangingBackend:
+        async def get_pod_rental_active(self, pod_id):
+            await asyncio.sleep(3600)
+
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=[RentedPod(pod_id="pod-a", container_name="container_pod-a", rented_ports=[])],
+            )
+        }
+    )
+    ctx = context_factory(
+        state=build_state(specs=_disk(95, 500), rented_data=rented_data),
+        services=build_services(backend=HangingBackend()),
+        rented=False,
+    )
+
+    result = await asyncio.wait_for(DiskSpaceCheck().run(ctx, rental_lookup_timeout=cap), 5)
+
+    assert result.passed is True
     assert result.event.reason_code == Msg.TOO_FULL.reason
 
 
