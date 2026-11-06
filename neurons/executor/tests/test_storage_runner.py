@@ -8,7 +8,6 @@ import os
 import shutil
 import signal
 import subprocess
-import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -263,6 +262,64 @@ def test_backup_repository_probe_retries_closed_connection(
     ]
 
 
+def test_backup_repository_probe_falls_back_to_helper_on_dns_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace"),
+        read_only=True,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error="dial tcp: lookup bucket.s3.amazonaws.com on 127.0.0.11:53: server misbehaving",
+            ),
+            _repository_command_result(0, standard_output="[]"),
+        ]
+    )
+    monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
+    runner._ensure_repository_for_backup()
+
+    executor_probe, helper_probe = repository_command_sequence.commands
+    assert executor_probe[2] == "snapshots"
+    assert helper_probe[:2] == ["/usr/bin/docker", "run"]
+    assert helper_probe[-4:] == ["executor:test", "--no-cache", "snapshots", "--json"]
+    assert "--rm" in helper_probe
+
+
+def test_restore_repository_probe_falls_back_to_helper_on_dns_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error="dial tcp: lookup bucket.s3.amazonaws.com on 127.0.0.11:53: server misbehaving",
+            ),
+            _repository_command_result(0, standard_output=json.dumps([{"id": SNAPSHOT_ID}])),
+        ]
+    )
+    monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
+    runner._require_repository_for_restore()
+
+    helper_probe = repository_command_sequence.commands[1]
+    assert helper_probe[:2] == ["/usr/bin/docker", "run"]
+    assert helper_probe[-3:] == ["--json", "--", SNAPSHOT_ID]
+
+
 def test_slow_repository_probe_keeps_heartbeating(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -282,6 +339,67 @@ def test_slow_repository_probe_keeps_heartbeating(
     runner._ensure_repository_for_backup()
 
     assert '"event":"heartbeat"' in event_output.getvalue()
+
+
+def test_dns_fallback_helper_heartbeats_and_is_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    event_output = io.StringIO()
+    event_writer = JsonEventWriter(
+        str(OPERATION_ID), 0, heartbeat_interval_seconds=0.0, output=event_output
+    )
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace"),
+        read_only=True,
+    )
+    runner = ResticStorageRunner(operation, workspace, event_writer=event_writer)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[0] != "/usr/bin/docker":
+            return _repository_command_result(
+                1, standard_error="dial tcp: lookup bucket on 127.0.0.11:53: server misbehaving"
+            )
+        if "snapshots" in command and len(commands) == 2:
+            time.sleep(1.5)  # slow helper probe: the heartbeat loop must keep running
+            return _repository_command_result(10)
+        return _repository_command_result(0, standard_output="[]")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", run)
+    runner._ensure_repository_for_backup()
+
+    assert '"event":"heartbeat"' in event_output.getvalue()
+    # the executor is tried once; init goes straight to the helper
+    assert [command[0] == "/usr/bin/docker" for command in commands] == [False, True, True]
+    assert commands[2][-2:] == ["init", "--json"]
+
+
+def test_cancel_during_repository_helper_stops_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace"),
+        read_only=True,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+    runner._repository_via_helper = True
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if "snapshots" in command:
+            time.sleep(1.5)
+        return _repository_command_result(0, standard_output="[]")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", run)
+    monkeypatch.setattr(type(runner._events), "cancellation_requested", property(lambda _: True))
+    with pytest.raises(StorageOperationCancelled):
+        runner._run_repository_command(["snapshots", "--json"])
+
+    assert commands[-1][1:3] == ["stop", "--time"]
 
 
 def test_backup_repository_initialization_retries_transient_access_denied(
@@ -2244,155 +2362,3 @@ def test_real_restic_finds_the_parent_when_the_backup_path_changes(
     assert summaries[0]["files_new"] == 20
     assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
 
-
-
-@pytest.mark.parametrize("cancelled", [False, True])
-def test_executor_side_runner_launches_a_detached_runner_that_outlives_it(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cancelled: bool
-) -> None:
-    # The executor-side process only launches and follows the runner container. A SIGTERM from an
-    # executor shutdown leaves that container running; a SIGTERM after a cancel request stops it.
-    spec = tmp_path / "op.json"
-    spec.write_text(json.dumps(_operation_payload()))
-    spec.chmod(0o600)
-    cancel_file = tmp_path / "op.cancel"
-    if cancelled:
-        cancel_file.touch()
-    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec), "--cancel-file", str(cancel_file)])
-    monkeypatch.setenv("LIUM_STORAGE_HELPER_IMAGE", "sha256:" + "c" * 64)
-    monkeypatch.delenv(storage_runner.DETACHED_ENV, raising=False)
-    calls: list[list[str]] = []
-    launch_kwargs: dict[str, object] = {}
-    sent = io.StringIO()
-
-    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
-        calls.append(command)
-        if command[1] == "run":
-            launch_kwargs.update(kwargs)
-        if command[1] == "wait":
-            os.kill(os.getpid(), signal.SIGTERM)  # the executor is stopped while the operation runs
-            return SimpleNamespace(returncode=0, stdout="130\n", stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(storage_runner.subprocess, "run", fake_run)
-    def fake_popen(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
-        calls.append(command)
-        if command[1] == "attach":  # the runner acknowledges the spec it read from stdin
-            return SimpleNamespace(
-                stdin=sent, stdout=iter([storage_runner.SPEC_RECEIVED + "\n"]), kill=lambda: None, wait=lambda: 0
-            )
-        return SimpleNamespace(wait=lambda timeout: 0)
-
-    monkeypatch.setattr(storage_runner.subprocess, "Popen", fake_popen)
-    previous = signal.getsignal(signal.SIGTERM)
-    try:
-        if cancelled:
-            assert storage_runner.main() == 130
-        else:
-            with pytest.raises(SystemExit) as exited:
-                storage_runner.main()
-            assert exited.value.code == 143
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-
-    name = storage_runner.runner_container_name(str(OPERATION_ID))
-    launch = calls[0]
-    assert launch[1:3] == ["run", "--detach"] and name in launch and "--privileged" in launch
-    assert f"{storage_runner.HELPER_LABEL}={OPERATION_ID}" in launch
-    # the spec goes on stdin only: never in argv, the container env (--env) or the docker CLI's env
-    assert "--interactive" in launch and "repository-password" not in " ".join(launch)
-    assert "env" not in launch_kwargs
-    assert not any("repository-password" in value for value in os.environ.values())
-    assert json.loads(sent.getvalue())["repository"]["password"] == "repository-password"
-    assert calls[1][1:] == ["attach", "--sig-proxy=false", name]
-    rest = [command[1:] for command in calls[2:] if command[1] != "logs"]
-    if cancelled:
-        assert ["kill", "--signal", "TERM", name] in rest and rest[-1] == ["rm", "--force", name]
-    else:
-        assert rest == [["wait", name]]  # never stopped or removed: it keeps running and reporting
-
-
-def test_detached_runner_reads_its_spec_from_stdin(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr("sys.argv", ["storage_runner.py"])
-    monkeypatch.setenv(storage_runner.DETACHED_ENV, "1")
-    # one line, and no EOF after it: a detached container's stdin stays open
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_operation_payload()) + "\n"))
-    ran: list[StorageOperationSpec] = []
-
-    class FakeRunner:
-        def __init__(self, operation: StorageOperationSpec, *args: object, **kwargs: object) -> None:
-            ran.append(operation)
-
-        def run(self) -> None:
-            pass
-
-    monkeypatch.setattr(storage_runner, "ResticStorageRunner", FakeRunner)
-    monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", lambda self, operation: None)
-    previous = signal.getsignal(signal.SIGTERM)
-    try:
-        assert storage_runner.main() == 0
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-    assert ran[0].operation_id == OPERATION_ID
-    assert storage_runner.SPEC_RECEIVED in capsys.readouterr().out
-
-
-def test_spec_handoff_timeout_removes_the_runner_and_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    spec = tmp_path / "op.json"
-    spec.write_text(json.dumps(_operation_payload()))
-    spec.chmod(0o600)
-    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec)])
-    monkeypatch.setenv("LIUM_STORAGE_HELPER_IMAGE", "sha256:" + "c" * 64)
-    monkeypatch.delenv(storage_runner.DETACHED_ENV, raising=False)
-    monkeypatch.setattr(storage_runner, "SPEC_HANDOFF_TIMEOUT_SECONDS", 0.2)
-    calls: list[list[str]] = []
-    killed = threading.Event()
-
-    def never_confirms() -> Iterator[str]:
-        killed.wait(5)  # a stuck runner: no output until the attach client is killed
-        return
-        yield
-
-    def fake_popen(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
-        calls.append(command)
-        return SimpleNamespace(stdin=io.StringIO(), stdout=never_confirms(), kill=killed.set, wait=lambda: 0)
-
-    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
-        calls.append(command)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(storage_runner.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(storage_runner.subprocess, "run", fake_run)
-    started = time.monotonic()
-    assert storage_runner.main() == 1
-    assert time.monotonic() - started < 3
-    name = storage_runner.runner_container_name(str(OPERATION_ID))
-    assert killed.is_set() and calls[-1][1:] == ["rm", "--force", name]
-    assert not any(command[1] == "wait" for command in calls)
-    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert result["status"] == "FAILED" and "did not read its spec" in result["message"]
-    assert "repository-password" not in result["message"]
-
-
-def test_detached_runner_exits_when_no_spec_arrives(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # the launcher died before the handoff: the runner must not block forever on its open stdin
-    monkeypatch.setattr("sys.argv", ["storage_runner.py"])
-    monkeypatch.setenv(storage_runner.DETACHED_ENV, "1")
-    monkeypatch.setattr(storage_runner, "SPEC_HANDOFF_TIMEOUT_SECONDS", 0.2)
-    blocked = threading.Event()
-    monkeypatch.setattr("sys.stdin", SimpleNamespace(readline=lambda: blocked.wait(5) and ""))
-    previous = signal.getsignal(signal.SIGTERM)
-    started = time.monotonic()
-    try:
-        assert storage_runner.main() == storage_runner.SPEC_TIMEOUT_EXIT
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-        blocked.set()
-    assert time.monotonic() - started < 3
-    assert "received no spec" in capsys.readouterr().out

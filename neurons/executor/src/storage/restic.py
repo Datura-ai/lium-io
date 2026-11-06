@@ -23,7 +23,9 @@ from storage.models import (
 from storage.reporting import StorageEventReporter
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
+    DockerVolumeWorkspace,
     LocalWorkspace,
+    NamespaceWorkspace,
     ResolvedWorkspace,
 )
 
@@ -49,6 +51,11 @@ RESTIC_HELPER_OOM_SCORE_ADJ = "1000"
 RESTIC_HELPER_GOGC = "50"
 SIGKILL_EXIT = 137
 HELPER_LABEL = "lium.backup-helper"
+# Set on helpers whose entrypoint is storage_runner.py: they report for themselves and outlive the executor.
+WRAPPER_LABEL = "lium.storage-wrapper"
+# The operation spec, by name only: its value comes from the launching process's environment, never argv.
+SPEC_ENV = "LIUM_STORAGE_SPEC"
+CGROUP_MEMORY_EVENTS = "/sys/fs/cgroup/memory.events"
 STALE_HELPER_AGE = timedelta(minutes=10)
 # Without `|| exit`, a failed cd leaves sh in the helper's own directory and restic backs that up instead.
 # sh's own cd error is dropped: StorageEventReporter keeps the first diagnostic, which must be ours.
@@ -509,12 +516,13 @@ class ResticStorageRunner:
             self._operation, repository=replace(self._operation.repository, **credentials)
         )
         self._environment = self._build_environment()
-        # the stopped helper's --rm removal can lag; the rerun reuses its name
-        subprocess.run(
-            [self._docker_binary, "rm", "-f", self._helper_container_name()],
-            capture_output=True,
-            text=True,
-        )
+        if self._uses_helper_container():
+            # the stopped helper's --rm removal can lag; the rerun reuses its name
+            subprocess.run(
+                [self._docker_binary, "rm", "-f", self._helper_container_name()],
+                capture_output=True,
+                text=True,
+            )
         self._events.diagnostic("storage credentials expired; renewed them, restarting the backup")
 
     def _restore(self) -> ResticResult:
@@ -588,7 +596,7 @@ class ResticStorageRunner:
     ) -> tuple[int, Mapping[str, object] | None]:
         started_at = time.monotonic()
         # The helper runs without --rm so its OOMKilled state can be read after exit, then it is removed.
-        helper = not isinstance(self._workspace, LocalWorkspace)
+        helper = self._uses_helper_container()
         if helper:
             self._remove_stopped_helpers()
             self._remove_helper_container()
@@ -674,7 +682,8 @@ class ResticStorageRunner:
                     summary = payload
 
             exit_code = process.wait()
-            return exit_code, summary
+            # a child killed by a signal (inside the helper restic is a direct child): the shell's 128+N form
+            return (128 - exit_code if exit_code < 0 else exit_code), summary
         except StorageOperationCancelled:
             if process.poll() is None:  # SIGTERM to the runner, not a cancel that already stopped it
                 self._terminate_process(process)
@@ -703,8 +712,12 @@ class ResticStorageRunner:
         self._terminate_process(process)
         raise StorageOperationCancelled("storage operation cancellation requested")
 
+    def _uses_helper_container(self) -> bool:
+        return isinstance(self._workspace, (DockerVolumeWorkspace, DockerUserNamespaceWorkspace))
+
     def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-        self._stop_helper_container()
+        if self._uses_helper_container():
+            self._stop_helper_container()
         try:
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=10)
@@ -796,6 +809,14 @@ class ResticStorageRunner:
 
     def _killed_helper_message(self, action: str) -> str:
         """Exit 137: say out of memory only when docker recorded an OOM kill."""
+        if not self._uses_helper_container():
+            # restic was this helper's child: its own cgroup counts the OOM kills
+            try:
+                with open(CGROUP_MEMORY_EVENTS) as events:
+                    oom_kills = int(dict(line.split() for line in events if line.strip()).get("oom_kill", "0"))
+            except (OSError, ValueError):
+                oom_kills = 0
+            return f"{action} ran out of memory" if oom_kills else f"{action} was killed (often out of memory)"
         state = self._helper_state
         if state.get("OOMKilled") is True:
             return f"{action} ran out of memory"
@@ -835,7 +856,7 @@ class ResticStorageRunner:
             cwd = str(self._workspace.path) if working_directory else None
             return restic_command, cwd
 
-        if isinstance(self._workspace, DockerUserNamespaceWorkspace):
+        if isinstance(self._workspace, (DockerUserNamespaceWorkspace, NamespaceWorkspace)):
             if working_directory:
                 namespace_command = [
                     "/bin/sh",
@@ -847,6 +868,8 @@ class ResticStorageRunner:
                 ]
             else:
                 namespace_command = restic_command
+            if isinstance(self._workspace, NamespaceWorkspace):
+                return self._nsenter_command(namespace_command), None
             return self._encrypted_helper_command(namespace_command), None
 
         volume_mode = "ro" if self._workspace.read_only else "rw"
@@ -890,7 +913,7 @@ class ResticStorageRunner:
             self._workspace_path(),
             "--sparse",
         ]
-        if isinstance(self._workspace, DockerUserNamespaceWorkspace):
+        if isinstance(self._workspace, (DockerUserNamespaceWorkspace, NamespaceWorkspace)):
             # User xattrs belong to customer data; only host-managed namespaces
             # that cannot be written from the rental user namespace are skipped.
             arguments.extend(["--exclude-xattr", "security.*", "--exclude-xattr", "trusted.*"])
@@ -920,6 +943,8 @@ class ResticStorageRunner:
         ]
         if isinstance(self._workspace, LocalWorkspace):
             return pipeline_command, None
+        if isinstance(self._workspace, NamespaceWorkspace):
+            return self._nsenter_command(pipeline_command), None
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
             return self._encrypted_helper_command(pipeline_command), None
         return [
@@ -954,7 +979,57 @@ class ResticStorageRunner:
             *namespace_command,
         ]
 
-    def _docker_helper_base(self) -> list[str]:
+    def _nsenter_command(self, namespace_command: list[str]) -> list[str]:
+        assert isinstance(self._workspace, NamespaceWorkspace)
+        return ["/usr/bin/nsenter", "-t", str(self._workspace.pid), "-U", "--", *namespace_command]
+
+    def launch_wrapper_helper(self, python: str, runner: str, spec_json: str) -> None:
+        """Start the helper detached with storage_runner.py --in-helper as its entrypoint, and return.
+
+        The helper then runs restic, its retries and all reporting itself, so it outlives the executor.
+        """
+        workspace = self._workspace
+        if isinstance(workspace, DockerUserNamespaceWorkspace):
+            # same privileges as the encrypted helper: nsenter needs the host PID namespace
+            access = ["--pid", "host", "--privileged", "--security-opt", "label=disable"]
+            arguments = ["--workspace", str(workspace.path), "--namespace-pid", str(workspace.pid)]
+        elif isinstance(workspace, DockerVolumeWorkspace):
+            volume_mode = "ro" if workspace.read_only else "rw"
+            access = ["--security-opt", "no-new-privileges", "-v", f"{workspace.volume_name}:/workspace:{volume_mode}"]
+            arguments = ["--workspace", str(workspace.path)]
+        else:
+            raise ResticOperationError("the storage helper needs a docker volume or encrypted workspace")
+        self._remove_stopped_helpers()
+        command = [
+            *self._docker_helper_base(wrapper=True),
+            *access,
+            "--detach",
+            "--label",
+            f"{WRAPPER_LABEL}=1",
+            "-e",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "--entrypoint",
+            python,
+            workspace.image,
+            runner,
+            "--in-helper",
+            *arguments,
+        ]
+        started = subprocess.run(
+            command, env={**os.environ, SPEC_ENV: spec_json}, capture_output=True, text=True
+        )
+        if started.returncode != 0:
+            detail = _redact((started.stderr or "").strip(), self._secret_values())
+            raise ResticOperationError(f"storage helper did not start: {_bounded_message(detail, 500)}")
+
+    def _docker_helper_base(self, *, wrapper: bool = False) -> list[str]:
+        # the wrapper helper gets the whole spec (repository credentials and reporter token) in one variable,
+        # and keeps its (redacted) event log so the validator can read why it failed
+        secrets = ["-e", SPEC_ENV] if wrapper else [
+            "-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY", "-e", "AWS_SESSION_TOKEN",
+            "-e", "AWS_DEFAULT_REGION", "-e", "RESTIC_REPOSITORY", "-e", "RESTIC_PASSWORD",
+        ]
+        logs = ["--log-driver", "json-file", "--log-opt", "max-size=10m"] if wrapper else ["--log-driver", "none"]
         return [
             self._docker_binary,
             "run",
@@ -962,8 +1037,7 @@ class ResticStorageRunner:
             self._helper_container_name(),
             "--label",
             f"{HELPER_LABEL}={self._operation.operation_id}",
-            "--log-driver",
-            "none",
+            *logs,
             "--memory",
             restic_restore_helper_memory()
             if self._operation.action is StorageAction.RESTORE and self._operation.engine is StorageEngine.RESTIC
@@ -977,18 +1051,7 @@ class ResticStorageRunner:
             "--read-only",
             "--tmpfs",
             f"/tmp:rw,nosuid,nodev,size={RESTIC_TMPFS_BYTES}",
-            "-e",
-            "AWS_ACCESS_KEY_ID",
-            "-e",
-            "AWS_SECRET_ACCESS_KEY",
-            "-e",
-            "AWS_SESSION_TOKEN",
-            "-e",
-            "AWS_DEFAULT_REGION",
-            "-e",
-            "RESTIC_REPOSITORY",
-            "-e",
-            "RESTIC_PASSWORD",
+            *secrets,
         ]
 
     def _helper_container_name(self) -> str:
