@@ -28,7 +28,7 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
-# executor uuid -> the availability errors last published for it; outlives a restart by far, a cycle rewrites it
+# hotkey:executor uuid -> the availability errors last published for it; outlives a restart, a cycle rewrites it
 PUBLISHED_AVAILABILITY_PREFIX = "published_availability"
 PUBLISHED_AVAILABILITY_TTL = 24 * 3600
 # epoch seconds of the node's latest create (add_pending_pod); outlives VERIFYX_COMMAND_TIMEOUT_SECONDS (600) so a

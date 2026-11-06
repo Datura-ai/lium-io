@@ -155,5 +155,5 @@ async def test_only_the_cycle_publish_records_what_it_sent(monkeypatch, whole_ba
 
     await service.publish_machine_specs([node, unchecked], "hk", "ck", is_whole_miner_batch=whole_batch)
 
-    expected = {str(node.executor_info.uuid).lower(): [SSH]} if recorded else {}
+    expected = {("hk", str(node.executor_info.uuid).lower()): [SSH]} if recorded else {}
     assert service.cycle_published_availability == expected

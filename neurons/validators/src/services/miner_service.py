@@ -384,26 +384,29 @@ class MinerService:
         self.published_gpu_uuids: dict[str, set[str]] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
-        # DAH-5635: executor uuid -> the availability errors this process's last cycle publish sent for it
-        self.cycle_published_availability: dict[str, list[dict]] = {}
+        # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
+        # it; two miners can report one uuid, and the backend tells their nodes apart by hotkey (review 4491025362)
+        self.cycle_published_availability: dict[tuple[str, str], list[dict]] = {}
 
-    async def remember_published_availability(self, executor_uuid: str, errors: list[dict]) -> None:
+    async def remember_published_availability(self, miner_hotkey: str, executor_uuid: str, errors: list[dict]) -> None:
         """Kept in Redis too, so a partial publication after a restart still merges with it."""
-        self.cycle_published_availability[executor_uuid] = errors
+        self.cycle_published_availability[(miner_hotkey, executor_uuid)] = errors
         try:
             await self.redis_service.set(
-                f"{PUBLISHED_AVAILABILITY_PREFIX}:{executor_uuid}", json.dumps(errors), ex=PUBLISHED_AVAILABILITY_TTL
+                f"{PUBLISHED_AVAILABILITY_PREFIX}:{miner_hotkey}:{executor_uuid}",
+                json.dumps(errors),
+                ex=PUBLISHED_AVAILABILITY_TTL,
             )
         except Exception as exc:  # noqa: BLE001 - the memory copy still serves this process
             logger.warning(_m("published availability not kept in Redis", extra={"error": str(exc)}))
 
-    async def published_availability(self, executor_uuid: str) -> list[dict] | None:
+    async def published_availability(self, miner_hotkey: str, executor_uuid: str) -> list[dict] | None:
         """What this validator last published for the node, read back from Redis after a restart. None when it cannot
         be established (no key, expired, unreadable or malformed): that is not proof the backend holds nothing."""
-        if executor_uuid in self.cycle_published_availability:
-            return self.cycle_published_availability[executor_uuid]
+        if (miner_hotkey, executor_uuid) in self.cycle_published_availability:
+            return self.cycle_published_availability[(miner_hotkey, executor_uuid)]
         try:
-            stored = await self.redis_service.get(f"{PUBLISHED_AVAILABILITY_PREFIX}:{executor_uuid}")
+            stored = await self.redis_service.get(f"{PUBLISHED_AVAILABILITY_PREFIX}:{miner_hotkey}:{executor_uuid}")
             errors = json.loads(stored) if stored is not None else None
         except Exception as exc:  # noqa: BLE001 - unknown
             logger.warning(_m("published availability not read from Redis", extra={"error": str(exc)}))
@@ -1318,7 +1321,7 @@ class MinerService:
             for result in results:
                 if result.availability_errors is not None:
                     await self.remember_published_availability(
-                        str(result.executor_info.uuid).lower(), list(result.availability_errors)
+                        miner_hotkey, str(result.executor_info.uuid).lower(), list(result.availability_errors)
                     )
         for result in results:
             try:

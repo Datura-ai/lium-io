@@ -257,7 +257,7 @@ def _session_lost(uuid: str, availability_errors: list[dict] | None) -> JobResul
     return result
 
 
-def _miner_service(published: dict[str, list[dict]], redis: "_FakeRedis | None" = None) -> MinerService:
+def _miner_service(published: dict[tuple[str, str], list[dict]], redis: "_FakeRedis | None" = None) -> MinerService:
     service = MinerService.__new__(MinerService)
     service.cycle_published_availability = published
     service.redis_service = redis or _FakeRedis()
@@ -281,7 +281,7 @@ async def test_a_session_lost_in_the_port_check_is_unscored_and_publishes_only_i
     validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=NEW)
     window = _open_window() if in_rollout else MagicMock(covers=lambda _: False)
     validator_process.observe_executor_rollout = AsyncMock(return_value=window)
-    validator_process.miner_service = _miner_service({"node-1": [STORED_HOLD]})
+    validator_process.miner_service = _miner_service({("5Miner", "node-1"): [STORED_HOLD]})
     lost = _session_lost("node-1", findings)
     healthy = _scored("node-2")
 
@@ -348,7 +348,7 @@ async def test_consecutive_partial_publications_keep_every_earlier_reason():
     """Review 4470167912: a second lost-session publication merged with the last whole-batch list only, so it
     dropped the reason the first one published."""
     validator_process = _validator_process(_tracker(_FakeRedis()))
-    validator_process.miner_service = _miner_service({"node-1": [STORED_HOLD]})
+    validator_process.miner_service = _miner_service({("5Miner", "node-1"): [STORED_HOLD]})
     other = {"reason_code": "GPU_COUNT_MISMATCH"}
     first, second = _session_lost("node-1", [GPU_FINDING]), _session_lost("node-1", [other])
 
@@ -384,7 +384,7 @@ async def test_a_partial_publication_after_a_restart_keeps_the_reason_published_
         before.miner_service._pod_states_capped_for_spec = lambda result, extra: None
         await before.miner_service.publish_machine_specs([held], "5Miner", "5Cold", is_whole_miner_batch=True)
     else:
-        before.miner_service.cycle_published_availability = {"node-1": []}
+        before.miner_service.cycle_published_availability = {("5Miner", "node-1"): []}
         await before.publish_session_lost_findings(
             [WithheldVerdict(miner_hotkey="5Miner", result=_session_lost("node-1", [STORED_HOLD]))], {"5Miner": "5Cold"}
         )
@@ -405,7 +405,7 @@ async def test_a_new_finding_is_published_for_a_merge_when_the_earlier_list_is_u
     nothing cached as the full list); the backend merges a session-lost report by reason code, keeping a stored hold."""
     redis = _FakeRedis()
     if cache == "malformed":
-        redis.store["published_availability:node-1"] = "{not json"
+        redis.store["published_availability:5Miner:node-1"] = "{not json"
     elif cache == "read_fails":
         redis.get = AsyncMock(side_effect=ConnectionError("redis down"))
     validator_process = _validator_process(_tracker(_FakeRedis()))
@@ -421,7 +421,7 @@ async def test_a_new_finding_is_published_for_a_merge_when_the_earlier_list_is_u
 
     assert lost.availability_errors == [GPU_FINDING]
     assert lost.scored_at is None  # the backend's marker for a session-lost (merged) report
-    assert "node-1" not in validator_process.miner_service.cycle_published_availability
+    assert ("5Miner", "node-1") not in validator_process.miner_service.cycle_published_availability
     validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
         [lost], "5Miner", "5Cold", is_whole_miner_batch=False
     )
@@ -455,3 +455,23 @@ def test_a_miner_whose_only_withheld_result_is_a_lost_session_gets_no_eligibilit
     ]
 
     assert session_kept_hotkeys(withheld) == {"5Rollout"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_a_partial_publication_merges_only_its_own_miners_earlier_list(restart):
+    """Review 4491025362: two miners can report one executor uuid. Keyed by the uuid alone, a partial publication for
+    miner A merged in the hold published for miner B's node, hiding A's node for a fault on another machine."""
+    redis = _FakeRedis()
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = _miner_service({}, redis)
+    await validator_process.miner_service.remember_published_availability("5MinerB", "node-1", [STORED_HOLD])
+    if restart:
+        validator_process.miner_service.cycle_published_availability = {}
+    lost = _session_lost("node-1", [GPU_FINDING])
+
+    await validator_process.publish_session_lost_findings(
+        [WithheldVerdict(miner_hotkey="5MinerA", result=lost)], {"5MinerA": "5ColdA"}
+    )
+
+    assert lost.availability_errors == [GPU_FINDING]

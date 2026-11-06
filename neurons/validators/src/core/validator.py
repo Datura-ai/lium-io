@@ -794,9 +794,10 @@ class Validator:
                         )
                         # DAH-5635: a node published early gets back what the last cycle published for it
                         if self.miner_service.outage_tally is not None:
-                            self.miner_service.outage_tally.restore_published_early(
-                                cycle_results, self.miner_service.cycle_published_availability
-                            )
+                            published = self.miner_service.cycle_published_availability
+                            for miner_hotkey, results in incentive.job_results.items():
+                                mine = {uuid: e for (hotkey, uuid), e in published.items() if hotkey == miner_hotkey}
+                                self.miner_service.outage_tally.restore_published_early(results, mine)
 
                     # each node's pod SSH observations ride on its result; a probed rented
                     # node the cycle has no result for gets one carrying only them. A withheld
@@ -1590,7 +1591,9 @@ class Validator:
                 continue
             result.pod_ssh = pod_ssh.get(executor_uuid, result.pod_ssh)
             before = (
-                await self.miner_service.published_availability(executor_uuid) if result.availability_errors else None
+                await self.miner_service.published_availability(withheld.miner_hotkey, executor_uuid)
+                if result.availability_errors
+                else None
             )
             if not result.availability_errors:
                 result.availability_errors = None  # no finding: None leaves the stored reasons alone
@@ -1599,7 +1602,7 @@ class Validator:
                 result.availability_errors += [error for error in before if error.get("reason_code") not in found]
                 # review 4470167912: the next partial publication merges with this one, not with an older list
                 await self.miner_service.remember_published_availability(
-                    executor_uuid, list(result.availability_errors)
+                    withheld.miner_hotkey, executor_uuid, list(result.availability_errors)
                 )
             # else review 4472994399: the earlier list is unknown; the finding still goes out alone, and the backend
             # merges a session-lost report by reason code, so the stored codes it did not re-check (GPU_LOST) stay

@@ -778,6 +778,7 @@ async def test_a_recheck_survives_a_deferral_and_ends_with_its_run_budget(monkey
     assert node not in harness.lane._pending  # never queued: the wave keeps scoring it
 
     for _ in range(express_lane.RECHECK_MAX_RUNS - 1):
+        harness.lane._recheck_pending[node].not_before = 0.0  # the deferral holds it until then
         assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0
@@ -824,7 +825,54 @@ async def test_a_failed_recheck_runs_again_when_the_first_pass_retry_is_on(monke
 
     assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == {node}
+    harness.lane._recheck_pending[node].not_before = 0.0  # FIRST_PASS_FAILED_RETRY_SECONDS later
     assert await harness.tick_and_settle() == 1  # the retry, the budget's last run
     assert harness.miner_service.publish_machine_specs.await_count == 2
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+    assert await harness.tick_and_settle() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_whose_sessions_are_lost_keeps_its_runs_for_a_verdict(monkeypatch, wallet):
+    """Review 4491025356: a lost session in the port check is no verdict, so it spends none of the
+    recheck's runs; the request still ends after SESSION_LOST_MAX_RUNS lost sessions."""
+    import core.express_lane as express_lane
+
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+
+    def lost(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = lost
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+
+    for _ in range(express_lane.RECHECK_MAX_RUNS):
+        assert await harness.tick_and_settle() == 1
+        pending = harness.lane._recheck_pending[node]
+        assert pending.not_before > 0  # the deferral outlives the tick
+        pending.not_before = 0.0
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+
+    harness.job_for = lambda payload, executor_id: {
+        "results": [_job_result(executor_id, job_batch_id=payload.job_batch_id)]
+    }
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+
+    harness.job_for = lost
+    await harness.redis_service.request_executor_recheck(node)
+    for _ in range(SESSION_LOST_MAX_RUNS):
+        assert await harness.tick_and_settle() == 1
+        if node in harness.lane._recheck_pending:
+            harness.lane._recheck_pending[node].not_before = 0.0
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0
