@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import stat
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import asyncssh
 import pytest
 from cryptography.hazmat.primitives import serialization
 
@@ -146,3 +150,34 @@ def test_script_refuses_a_public_key_that_is_not_ed25519(tmp_path):
 
     assert result.returncode == 2
     assert not (tmp_path / "etc-ssh" / "ssh_host_ed25519_key").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,refused,fallback_status", [(0, False, 0), (1, False, 0), (0, True, 0), (1, False, 1)])
+async def test_install_uses_existing_ssh_and_keeps_private_key_out_of_command(monkeypatch, status, refused, fallback_status):
+    from core.config import settings
+    from services.docker_service import DockerService
+
+    monkeypatch.setattr(settings, "VOLUME_MASTER_SECRET", SECRET)
+    service = object.__new__(DockerService)
+    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=status)))
+    ssh.run.side_effect = asyncssh.ChannelOpenError(1, "refused") if refused else None
+    container = "pod name';$(touch /tmp/unwanted)"
+
+    fallback = AsyncMock(return_value=SimpleNamespace(exit_status=fallback_status))
+    await service.install_pod_ssh_host_key(
+        ssh, docker_client=SimpleNamespace(exec_in_container=fallback), container_name=container, pod_id=POD_ID, log_extra={},
+    )
+    assert fallback.await_count == (status != 0 or refused)
+    if fallback.await_count:
+        assert fallback.await_args.args[0].stdin == ssh.run.call_args.kwargs["input"]
+
+    args, kwargs = ssh.run.call_args
+    argv = shlex.split(args[0])
+    host_key = derive_pod_ssh_host_key(SECRET, POD_ID)
+    assert argv[:6] == ["/usr/bin/docker", "exec", "-i", "-u", "0", container]
+    assert argv[-1] == host_key.public_openssh
+    assert host_key.private_openssh not in args[0]
+    assert _public_of(kwargs.pop("input")) == host_key.public_openssh
+    assert kwargs == {"check": False}
+    ssh.run.assert_awaited_once()

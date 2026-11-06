@@ -52,7 +52,8 @@ class SwitchValidatorPayload(BaseModel):
 
 class SyncExecutorPayload(BaseModel):
     uuid: UUID
-    validator: str
+    # absent from an address-only update (DAH-2865)
+    validator: str | None = None
     address: str
     port: int
     price_per_gpu: float | None = None

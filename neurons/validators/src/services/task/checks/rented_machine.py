@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import shlex
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedPod
+from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import (
     ContainerState,
     PodContainerState,
@@ -24,13 +25,28 @@ from ...const import (
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
+from services.gpu_reset import renter_gpu_reset_in_progress
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
+from . import port_connectivity
+from .port_connectivity import PortConnectivityCheck
+from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
+from .rental_owner import rental_of_this_node
+from .task_time import task_seconds_left
+from .port_count import (
+    hidden_from_renters_text,
+    port_count_below_listing_floor,
+    port_floor_what,
+    split_port_shortfall,
+    split_ports_event,
+)
 
 logger = logging.getLogger(__name__)
+
+# cycle time kept after the rented pod reads, to report the result and close the shell
+POD_READ_RESERVE_SECONDS = 30
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -97,33 +113,16 @@ def _gpu_usage_violation_details(
     }
 
 
-def _rental_of_validated_miner(
-    ctx: Context, rented_executor: RentedExecutor | None
-) -> RentedExecutor | None:
-    """The rental listed under this executor's UUID, or None when enforcement is on and it belongs
-    to another miner. The mismatch is logged either way."""
-    if not rented_executor or rented_executor.miner_hotkey == ctx.miner_hotkey:
-        return rented_executor
-    logger.warning(
-        _m(
-            "RENTED_OWNER_MISMATCH",
-            extra=get_extra_info(
-                {
-                    **ctx.default_extra,
-                    "executor_uuid": ctx.executor.uuid,
-                    "rental_miner_hotkey": rented_executor.miner_hotkey,
-                    "enforced": settings.RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED,
-                }
-            ),
-        )
-    )
-    return None if settings.RENTED_OWNER_MISMATCH_ENFORCEMENT_ENABLED else rented_executor
+# The backend's create is still running for a pod in these statuses (a first rental or a reboot), and it
+# records the container name only when that create answers: a custom-Dockerfile build can take longer
+# than the grace below.
+_CREATE_IN_FLIGHT_POD_STATUSES = frozenset({"PENDING", "REBOOT_PENDING"})
 
 
 def _within_container_name_grace(pod: RentedPod) -> bool:
-    """An unnamed pod is waited for only this long after it was created; a pod with no
-    created_at (backend predates the field) is waited for as before."""
-    if pod.created_at is None:
+    """An unnamed pod is waited for while the backend's create is still running, else only this long
+    after it was created; a pod with no created_at (backend predates the field) is waited for as before."""
+    if pod.status in _CREATE_IN_FLIGHT_POD_STATUSES or pod.created_at is None:
         return True
     created_at = pod.created_at
     if created_at.tzinfo is None:
@@ -168,9 +167,7 @@ class TenantEnforcementCheck:
 
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
-        rented_executor = _rental_of_validated_miner(
-            ctx, rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        )
+        rented_executor = rental_of_this_node(ctx, log_mismatch=True)
         # EVERY filler on the node: a partially rented split node keeps one filler per free VRAM
         # bundle running beside the renter (DAH-2465/DAH-2467), and allowlisting only the first
         # makes its siblings' GPU processes read as usage outside the tenant.
@@ -221,11 +218,20 @@ class TenantEnforcementCheck:
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
+        # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
+        # is the provider's work, not POD_NOT_RUNNING, and is not recovered.
+        maintenance_window = maintenance_window_at_cycle_start(ctx)
+
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
             try:
-                pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, pod_container_name, ctx.default_extra)
+                # bounded by the cycle time budget: a read hung on a dead shell ends as a TimeoutError (an OSError),
+                # so the cycle reports the node unreachable instead of being dropped without a result
+                async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
+                    pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(
+                        ctx.ssh, pod_container_name, ctx.default_extra
+                    )
             except (asyncssh.Error, OSError) as exc:
                 return with_pod_states(
                     _executor_transport_unreachable_result(
@@ -246,9 +252,18 @@ class TenantEnforcementCheck:
                 extra.setdefault("pods_awaiting_container", []).append(pod_id)
                 ssh_pub_keys = []
                 continue
+            elif await renter_gpu_reset_in_progress(ctx.services.redis, ctx.miner_hotkey, ctx.executor.uuid, pod_id):
+                # DAH-4658: the renter's own GPU reset stops the pod for a moment. Judged next cycle, not penalised.
+                state_by_pod_id[pod_id] = ContainerState.UNKNOWN
+                extra.setdefault("pods_resetting_gpus", []).append(pod_id)
+                ssh_pub_keys = []
+                continue
             else:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
+                if maintenance_window is not None:
+                    ssh_pub_keys = []
+                    continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
                     stale_what = {
@@ -267,6 +282,41 @@ class TenantEnforcementCheck:
                     # The floor is enforced only when every listed pod is stale: a live rental on the same
                     # node is a real exemption, and this loop returns before it would reach later pods.
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
+                    # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
+                    # node whose every listed pod is stale is idle and needs them, with or without the floor flag
+                    split_short = split_port_shortfall(ctx.state)
+                    reprobed: dict[str, Any] = {}
+                    if split_short is not None and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                        # the probe skipped the stale pods' ports: re-probe them all, only answering ports count
+                        split_short, reprobed = await _reprobe_split_shortfall(ctx, split_short, rented_pods)
+                        if "rented_data" in reprobed:
+                            # a replacement rental took the node since the snapshot: judge it as the rented node it is
+                            # the re-probe's ports and count go with it, so allocation and idle pay read one measurement
+                            rented_now = replace(reprobed["state"], rented_data=reprobed["rented_data"])
+                            rerun = await self.run(
+                                ctx.model_copy(update={"state": rented_now, "port_count": reprobed["port_count"]})
+                            )
+                            return rerun.model_copy(
+                                update={"updates": {"port_count": reprobed["port_count"], **rerun.updates}}
+                            )
+                    else:
+                        split_short = None
+                    if split_short is not None:
+                        event = split_ports_event(
+                            ctx,
+                            self.check_id,
+                            reprobed.get("state", ctx.state),
+                            *split_short,
+                            what={"stale_pod": stale_what},
+                            extra=extra,
+                        )
+                        return with_pod_states(
+                            CheckResult(
+                                passed=False,
+                                event=event,
+                                updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None, **reprobed},
+                            )
+                        )
                     if (
                         port_count_below_floor is not None
                         and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
@@ -310,6 +360,7 @@ class TenantEnforcementCheck:
                                 "default_extra": extra,
                                 "rented": False,
                                 "ssh_pub_keys": None,
+                                **reprobed,
                             },
                         )
                     )
@@ -333,6 +384,19 @@ class TenantEnforcementCheck:
             if ssh_pub_keys is None:
                 # dockerd refused the keys read
                 ssh_pub_keys = []
+
+        if maintenance_window is not None:
+            return with_pod_states(
+                maintenance_failure(
+                    ctx,
+                    self.check_id,
+                    maintenance_window,
+                    extra,
+                    default_extra=extra,
+                    rented=True,
+                    ssh_pub_keys=ssh_pub_keys,
+                )
+            )
 
         container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)
@@ -639,8 +703,10 @@ def _with_pod_states(
             for pod in rented_pods
         ),
     ]
+    # a re-probe's state (DAH-3698) is carried, not the one the check started from
+    state = replace(result.updates.get("state", ctx.state), pod_states=pod_states)
     return result.model_copy(
-        update={"updates": {**result.updates, "state": replace(ctx.state, pod_states=pod_states)}}
+        update={"updates": {**result.updates, "state": state}}
     )
 
 
@@ -738,6 +804,83 @@ async def _recover_pod_after_stale_vloopback_mount(
             )
         )
         return False
+
+
+async def _reprobe_split_shortfall(
+    ctx: Context, split_short: tuple[int, tuple[int, int]], stale_pods: list[RentedPod]
+) -> tuple[tuple[int, tuple[int, int]] | None, dict[str, Any]]:
+    """Re-probe a split node whose every listed pod is stale, ports those pods held included.
+
+    Returns the shortfall (None once the node has its ports, or a rental started since the snapshot) and the
+    updates publishing the re-probed ports and counts, the set the backend allocates from; for a new rental,
+    those updates plus {"rented_data": the fresh read without the stale pods}. On a probe error the
+    shortfall stands and nothing is published, since an unprobed port is never credited."""
+    rented_data = ctx.state.rented_data
+    filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
+    try:
+        result = await ctx.services.connectivity.verify_ports(
+            ctx.ssh,
+            ctx.miner_hotkey,
+            ctx.executor,
+            ctx.state.sysbox_runtime,
+            rented_ports=[],
+            filler_ports=filler_ports,
+            log_ctx={
+                "pipeline_id": ctx.pipeline_id,
+                "job_batch_id": ctx.config.job_batch_id,
+                "miner_hotkey": ctx.miner_hotkey,
+                "executor_uuid": ctx.executor.uuid,
+                "executor_ip": ctx.executor.address,
+            },
+            min_ports=split_short[1][1],
+        )
+    except Exception:
+        logger.warning(_m("SPLIT_PORT_REPROBE_FAILED", extra=get_extra_info(ctx.default_extra)), exc_info=True)
+        return split_short, {}
+    # this re-probe supersedes the completed check on record: the next pressured cycle checks before it defers
+    port_connectivity._COMPLETED_CHECK_SAVED_AT.pop((ctx.miner_hotkey, ctx.executor.uuid), None)
+    # DAH-4537: the outside confirmation PortConnectivityCheck applies; a confirmed block credits no port, filler too
+    # one outside miss per cycle: a blocked re-probe after this cycle's blocked reading keeps that reading's verdict
+    if result.external_probe == "blocked" and ctx.state.external_probe_blocked:
+        unreachable = ctx.state.externally_unreachable
+    else:
+        unreachable = await PortConnectivityCheck._outside_failure_confirmed(ctx, result)
+    probed = [] if unreachable else [pair.external for pair in result.successful_ports]
+
+    def published(fillers: list[int]) -> tuple[tuple[int, tuple[int, int]] | None, dict[str, Any]]:
+        # the probe skips our idle filler's ports; they count as in PortCountCheck, which a rental frees
+        fillers = [] if unreachable else fillers
+        verified_ports = probed + sorted(set(fillers) - set(probed))
+        state = replace(
+            ctx.state,
+            specs={**ctx.state.specs, "verified_ports": verified_ports, "available_port_count": len(verified_ports)},
+            verified_port_count=len(probed),
+            probed_port_count=len(result.selected_ports),
+            verified_port_pairs=[] if unreachable else [(p.internal, p.external) for p in result.successful_ports],
+            externally_unreachable=ctx.state.externally_unreachable or unreachable,
+        )
+        return split_port_shortfall(ctx.state, len(verified_ports)), {"state": state, "port_count": len(verified_ports)}
+
+    split_short, updates = published(filler_ports)
+    if split_short is None:
+        return None, updates
+    # a rent or filler that started after the cycle's rental snapshot holds ports the re-probe found busy
+    try:
+        fresh = await ctx.services.backend.get_rented_executors_now()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Rented-executors re-read failed; the split port verdict stands: %s", exc)
+        fresh = None
+    if fresh is None:
+        return split_short, updates
+    rental = rental_of_this_node(ctx, rented_data=fresh)
+    stale_ids = {pod.pod_id for pod in stale_pods}
+    new_pods = [pod for pod in rental.pods if pod.pod_id not in stale_ids] if rental else []
+    if new_pods:
+        # rented again: handed back to be judged as rented; the stale pods are dropped so they are not re-judged
+        executors = {**fresh.executors, ctx.executor.uuid: rental.model_copy(update={"pods": new_pods})}
+        _, updates = published(fresh.get_filler_ports(ctx.executor.uuid))
+        return None, {**updates, "rented_data": fresh.model_copy(update={"executors": executors})}
+    return published(fresh.get_filler_ports(ctx.executor.uuid))
 
 
 async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:

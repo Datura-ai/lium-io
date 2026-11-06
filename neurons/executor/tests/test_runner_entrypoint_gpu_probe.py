@@ -27,6 +27,9 @@ DOCKER_STUB = textwrap.dedent(
         "inspect --format") echo "sha256:executorimage" ;;
         "ps --all") echo "${STUB_PROBE_LEFTOVERS:-}" ;;
         "rm --force") exit "${STUB_RM_EXIT:-0}" ;;
+        "image ls") echo "${STUB_EXECUTOR_IMAGES:-}" ;;
+        "image rm") exit "${STUB_IMAGE_RM_EXIT:-0}" ;;
+        "tag sha256:executorimage") exit "${STUB_TAG_EXIT:-0}" ;;
         "run --rm")
             [ -n "${STUB_PROBE_HANG:-}" ] && exec "$STUB_PROBE_HANG" 30
             [ -z "${STUB_PROBE_ERROR:-}" ] && exit 0
@@ -107,6 +110,40 @@ def test_first_install_recreates_without_probe(tmp_path, probe_error):
 
     assert not any(c.startswith("run ") for c in calls)
     assert recreated(calls)
+    assert not any(c.startswith("image rm") for c in calls)
+
+
+def test_previous_executor_image_is_removed_after_the_update(tmp_path):
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage"
+    )
+
+    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    assert calls.index("image rm sha256:previous") > up
+    assert "image rm sha256:executorimage" not in calls
+    assert "Removed old executor image sha256:previous" in result.stdout
+
+
+def test_every_past_releases_executor_image_goes_but_the_running_one(tmp_path):
+    result, calls = run_entrypoint(
+        tmp_path,
+        STUB_RUNNING_EXECUTOR="abc123",
+        STUB_EXECUTOR_IMAGES="sha256:v163 sha256:v164 sha256:executorimage",
+    )
+
+    assert "image rm sha256:v163" in calls
+    assert "image rm sha256:v164" in calls
+    assert "image rm sha256:executorimage" not in calls
+
+
+def test_previous_image_still_in_use_is_kept_and_the_update_goes_on(tmp_path):
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous", STUB_IMAGE_RM_EXIT="1"
+    )
+
+    assert "image rm sha256:previous" in calls
+    assert "Removed old" not in result.stdout
+    assert "image prune -f" in calls
 
 
 def test_a_hanging_probe_holds_the_update(tmp_path):
@@ -134,3 +171,28 @@ def test_a_leftover_probe_that_cannot_be_removed_holds_the_update(tmp_path):
     assert not recreated(calls)
     assert "cannot be removed (dead1)" in result.stdout
     assert "sleep 300" in calls
+
+
+def test_the_running_image_is_tagged_latest_before_any_old_image_is_removed(tmp_path):
+    # the validator's probes and Jupyter copies run daturaai/compute-subnet-executor:latest; removing the previous
+    # image drops its :latest, so the running image must hold the tag before any removal
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:v163 sha256:previous sha256:executorimage"
+    )
+
+    tag = calls.index("tag sha256:executorimage daturaai/compute-subnet-executor:latest")
+    removals = [i for i, c in enumerate(calls) if c.startswith("image rm")]
+    assert len(removals) == 2
+    assert all(tag < i for i in removals)
+
+
+def test_old_images_are_kept_when_the_running_image_cannot_be_tagged(tmp_path):
+    result, calls = run_entrypoint(
+        tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage", STUB_TAG_EXIT="1"
+    )
+
+    assert "tag sha256:executorimage daturaai/compute-subnet-executor:latest" in calls
+    assert not any(c.startswith("image rm") for c in calls)
+    assert recreated(calls)
+    assert "image prune -f" in calls
+    assert any(c.startswith("compose logs") for c in calls)

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from core.config import settings
-from services.nvidia_devices import read_kernel_gpu_view
+from services.nvidia_devices import (
+    KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS,
+    missing_gpu_uuids,
+    query_gpu_minor_map_from_proc,
+    read_kernel_gpu_view,
+)
 
 from ..messages import GpuKernelCountMessages as Msg
 from ..messages import MessageTemplate, render_message
@@ -12,7 +18,6 @@ from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental, kernel_gpu_view, reported_gpu_uuids
 
-SHADOW_ONLY_IMPACT = "Shadow observation only: the validation result was NOT changed"
 KERNEL_VIEW_SOURCE_CONTAINER = "container"
 KERNEL_VIEW_SOURCE_HOST = "host_pid1_root"
 
@@ -158,14 +163,27 @@ async def host_view_verdict(
     )
 
 
+async def unattachable_gpu_uuids(ctx: Context, reported_uuids: list[str]) -> list[str]:
+    """DAH-5519: the reported cards the create step's own kernel lookup cannot find, so it refuses every
+    container on them (failure_step gpu_flags). An unreadable or empty lookup finds none: not evaluated, as before."""
+    if ctx.ssh is None or not reported_uuids:
+        return []
+    try:
+        attachable = await asyncio.wait_for(
+            query_gpu_minor_map_from_proc(ctx.ssh), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return []
+    return missing_gpu_uuids(reported_uuids, attachable) if attachable else []
+
+
 class GpuKernelCountCheck:
     """Cross-check the reported GPU list against the kernel's view of the cards.
 
     The reported count and UUIDs come from the scrape (NVML); the kernel list is
     /proc/driver/nvidia/gpus as BannedProviderCheck reads it once per cycle. A node whose kernel
     list is present and shorter than its reported GPU count gets GPU_KERNEL_COUNT_MISMATCH. That
-    verdict fails the validation only under GPU_KERNEL_COUNT_ENFORCEMENT_ENABLED; without it the
-    check always passes and the verdict is only logged. As with the ban checks, a failure stops
+    verdict fails the validation and zeroes the score. As with the ban checks, a failure stops
     the run only when the node has no live rental.
 
     The container the check reads in may have been handed only some of the host's cards. So a
@@ -173,7 +191,9 @@ class GpuKernelCountCheck:
     covers the reported cards the verdict is match_host_view and nothing fails.
 
     A kernel list that is missing (unreadable, empty, read failed, withheld behind a foreign
-    mount) is never a failure: the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED.
+    mount) is never a failure: the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED. One exception
+    (DAH-5519): behind a foreign mount, a reported card the create step cannot attach fails like a
+    short list (verdict unattachable), since no renter can start a container on it.
     """
 
     check_id = "gpu.validate.kernel_count"
@@ -185,7 +205,7 @@ class GpuKernelCountCheck:
             return CheckResult(passed=True, event=event)
         try:
             return await self._evaluate(ctx)
-        except Exception as exc:  # a check that only observes must not break the cycle
+        except Exception as exc:  # an evaluation error must not fail the node
             event = render_message(
                 Msg.NOT_EVALUATED,
                 ctx=ctx,
@@ -222,44 +242,43 @@ class GpuKernelCountCheck:
             kernel_check_fields["not_evaluated_reason"] = (
                 "kernel_list_behind_foreign_mount" if foreign_mounts else "kernel_list_unavailable"
             )
-        enforce = bool(settings.GPU_KERNEL_COUNT_ENFORCEMENT_ENABLED)
-        would_fail = verdict == "count_lower"
+            unattachable = (
+                await unattachable_gpu_uuids(ctx, reported_uuids) if foreign_mounts else []
+            )
+            if unattachable:
+                verdict = kernel_check_fields["kernel_verdict"] = "unattachable"
+                kernel_check_fields["unattachable_uuids"] = unattachable
+        would_fail = verdict in ("count_lower", "unattachable")
         kernel_check_fields.update(
             {
                 "reported_uuids": reported_uuids,
                 "kernel_gpu_uuids": kernel_uuids,
                 "kernel_gpu_foreign_mounts": foreign_mounts,
                 "would_fail": would_fail,
-                "enforced": enforce,
             }
         )
 
         event = self._render_event(ctx, kernel_check_fields)
-        if would_fail and enforce:
-            # Like the ban checks: a node with a renter's pod on it keeps being verified, so the
-            # failure stops the run only when there is no live rental.
-            return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx))
+        if would_fail:
+            # A node with a renter's pod on it keeps being verified, so the failure stops the
+            # run only when there is no live rental; the flag zeroes the score in either case.
+            return CheckResult(
+                passed=False,
+                event=event,
+                fatal=not has_live_rental(ctx),
+                updates={"gpu_kernel_count_passed": False},
+            )
         return CheckResult(passed=True, event=event)
 
     def _render_event(self, ctx: Context, kernel_check_fields: dict[str, Any]) -> ValidationEvent:
-        """The event for a finished evaluation: which template, and for a count mismatch in
-        shadow, a warning that says the result was not changed."""
-        if kernel_check_fields["would_fail"]:
-            enforce = kernel_check_fields["enforced"]
-            return render_message(
-                Msg.COUNT_MISMATCH,
-                ctx=ctx,
-                check_id=self.check_id,
-                severity=None if enforce else "warning",
-                impact=None if enforce else SHADOW_ONLY_IMPACT,
-                what=kernel_check_fields,
-            )
-        return render_message(
-            self._template_for(kernel_check_fields),
-            ctx=ctx,
-            check_id=self.check_id,
-            what=kernel_check_fields,
-        )
+        """The event for a finished evaluation."""
+        if kernel_check_fields["kernel_verdict"] == "unattachable":
+            template = Msg.UNATTACHABLE
+        elif kernel_check_fields["would_fail"]:
+            template = Msg.COUNT_MISMATCH
+        else:
+            template = self._template_for(kernel_check_fields)
+        return render_message(template, ctx=ctx, check_id=self.check_id, what=kernel_check_fields)
 
     @staticmethod
     def _template_for(kernel_check_fields: dict[str, Any]) -> MessageTemplate:

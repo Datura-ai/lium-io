@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import IO
 
 from storage.models import (
@@ -30,12 +32,43 @@ TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
+# DAH-2002: bound the helper so a backup cannot OOM the rental. Measured restic 0.19.1 peak RSS: 0.41 GiB at
+# 2M files, ~125 B per extra file; bytes barely matter (20 GiB file: 0.17 GiB). 4g covers ~30M files.
+# restic sizes its worker pools from GOMAXPROCS (~7.5 MiB per CPU); unpinned, 192+ CPU hosts hit 4g in seconds.
+RESTIC_HELPER_GOMAXPROCS = "8"
+RESTIC_HELPER_MEMORY = "4g"
+# restic restore loads the whole repository index before writing a byte, so its memory follows the repository,
+# not the restore. Restores that ran uncapped were SIGKILLed under 4g in restic's scan; 16g is unmeasured headroom,
+# limited to a quarter of host RAM so small hosts keep room for the rental, never under the 4g backups get.
+# oom-score-adj 1000 still makes the helper the first victim. Legacy tar restores load no index and keep 4g.
+RESTIC_RESTORE_HELPER_MAX_MIB = 16 * 1024
+RESTIC_HELPER_MIN_MIB = 4 * 1024
+MEMINFO_PATH = "/proc/meminfo"
+# Highest OOM score: the kernel kills the helper before the rental.
+RESTIC_HELPER_OOM_SCORE_ADJ = "1000"
+RESTIC_HELPER_GOGC = "50"
+SIGKILL_EXIT = 137
+HELPER_LABEL = "lium.backup-helper"
+STALE_HELPER_AGE = timedelta(minutes=10)
 # Without `|| exit`, a failed cd leaves sh in the helper's own directory and restic backs that up instead.
 # sh's own cd error is dropped: StorageEventReporter keeps the first diagnostic, which must be ours.
 # Runs the backup inside a helper (docker volume or encrypted namespace). A missing or empty path exits 66 before
 # restic starts, so nothing is uploaded (DAH-2002); a path that is not a directory fails.
 BACKUP_SOURCE_SCRIPT = '[ -e "$1" ] || exit 66; cd "$1" 2>/dev/null || exit 1; [ -n "$(ls -A)" ] || exit 66; shift; exec "$@"'
 BACKUP_SOURCE_MISSING_EXIT = 66
+
+# restic 0.19.1 prints this as the exit_error JSON "message" with --json, else as a plain stderr line
+SNAPSHOT_EMPTY_MESSAGE = "Fatal: unable to save snapshot: snapshot is empty"
+
+def restic_restore_helper_memory(meminfo_path: str = MEMINFO_PATH) -> str:
+    try:
+        with open(meminfo_path, encoding="ascii") as meminfo:
+            total_kib = next(int(line.split()[1]) for line in meminfo if line.startswith("MemTotal:"))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return RESTIC_HELPER_MEMORY
+    quarter_mib = total_kib // 4 // 1024
+    return f"{max(RESTIC_HELPER_MIN_MIB, min(RESTIC_RESTORE_HELPER_MAX_MIB, quarter_mib))}m"
+
 
 class ResticOperationError(RuntimeError):
     def __init__(self, message: str, *, error_code: str | None = None) -> None:
@@ -45,6 +78,16 @@ class ResticOperationError(RuntimeError):
 
 class StorageOperationCancelled(RuntimeError):
     pass
+
+
+class CredentialsExpired(ResticOperationError):
+    pass
+
+
+# DAH-4945: the backend renews scoped credentials up to 4 sessions' worth after the backup started.
+CREDENTIAL_RENEWALS = 3
+# one rerun after an S3 network timeout: restic keeps the packs it already uploaded, so the rerun sends only the rest
+TRANSIENT_UPLOAD_RERUNS = 1
 
 
 @dataclass(frozen=True)
@@ -94,6 +137,14 @@ class JsonEventWriter:
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
 
+    def log(self, message: str) -> None:
+        """operation log only; never becomes the stored error"""
+        self._write({"event": "log", "operation_id": self._operation_id, "message": message})
+
+    def rerun(self) -> None:
+        """the next restic run starts over: its own failure, not this one's, describes the operation"""
+        self._write({"event": "rerun", "operation_id": self._operation_id})
+
     def stage(self, stage: str) -> None:
         self._write({"event": "stage", "operation_id": self._operation_id, "stage": stage})
 
@@ -107,6 +158,10 @@ class JsonEventWriter:
     @property
     def heartbeat_interval_seconds(self) -> float:
         return self._heartbeat_interval_seconds
+
+    @property
+    def reporter(self) -> StorageEventReporter | None:
+        return self._reporter
 
     @property
     def cancellation_requested(self) -> bool:
@@ -164,6 +219,11 @@ class ResticStorageRunner:
             operation.heartbeat_interval_seconds,
         )
         self._environment = self._build_environment()
+        self._snapshot_empty = False
+        self._last_error_text = ""
+        self._restore_errors: list[tuple[str, str]] = []  # (item, message without the item)
+        self._helper_state: Mapping[str, object] = {}
+        self._helper_id = ""
 
     def run(self) -> ResticResult:
         if self._operation.engine is StorageEngine.RESTIC:
@@ -188,6 +248,16 @@ class ResticStorageRunner:
             retry_deadline=repository_readiness_deadline,
             accepted_exit_codes=(0, 10),
         )
+        if repository_probe.returncode not in (0, 10) and _connection_closed(
+            self._redacted_repository_failure_detail(repository_probe)
+        ):
+            # restic already spent ~15 min retrying, past the readiness window; probe once more on a fresh one.
+            repository_probe = self._run_repository_command_with_retry(
+                ["snapshots", "--json"],
+                repository_command_name="probe",
+                retry_deadline=time.monotonic() + 180.0,
+                accepted_exit_codes=(0, 10),
+            )
         if repository_probe.returncode == 0:
             return
         if repository_probe.returncode != 10:
@@ -231,12 +301,7 @@ class ResticStorageRunner:
         retry_delay_seconds = 2.0
         while True:
             self._raise_if_cancellation_requested()
-            repository_command_result = subprocess.run(
-                self._restic_command(restic_arguments),
-                env=self._environment,
-                capture_output=True,
-                text=True,
-            )
+            repository_command_result = self._run_repository_command(restic_arguments)
             if repository_command_result.returncode in accepted_exit_codes:
                 return repository_command_result
 
@@ -263,6 +328,36 @@ class ResticStorageRunner:
             self._wait_before_repository_retry(wait_seconds)
             # Avoid hammering S3 while still checking readiness at least every 30 seconds.
             retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
+
+    def _run_repository_command(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        # restic retries S3 for ~15 min on its own; heartbeat meanwhile so the backend does not mark the run stale.
+        # shortcut: on cancellation the read-only restic child is left to exit by itself; use Popen if that matters.
+        results: queue.Queue[subprocess.CompletedProcess[str] | BaseException] = queue.Queue()
+
+        def run() -> None:
+            try:
+                results.put(
+                    subprocess.run(
+                        self._restic_command(restic_arguments),
+                        env=self._environment,
+                        capture_output=True,
+                        text=True,
+                    )
+                )
+            except BaseException as error:  # noqa: BLE001 - re-raised in the caller's thread
+                results.put(error)
+
+        threading.Thread(target=run, name="restic-repository-command", daemon=True).start()
+        while True:
+            try:
+                result = results.get(timeout=1.0)
+            except queue.Empty:
+                self._events.heartbeat_if_due()
+                self._raise_if_cancellation_requested()
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            return result
 
     def _redacted_repository_failure_detail(
         self,
@@ -350,12 +445,16 @@ class ResticStorageRunner:
             "--json",
             "--host",
             f"lium-pod-{self._operation.pod_id}",
+            # encrypted pods back up /proc/<pid>/root/..., a path that changes on every container restart;
+            # restic's default host+paths parent match then misses and rescans every file
+            "--group-by",
+            "host",
             "--tag",
             f"lium-operation:{self._operation.operation_id}",
             *(f"--exclude={pattern}" for pattern in self._operation.workspace.exclude_patterns),
             ".",
         ]
-        # DAH-2002: a missing or empty path is a no-op, not a failed run
+        # DAH-2002/DAH-4693: a missing, empty or fully excluded path is a no-op, not a failed run
         nothing = ResticResult("COMPLETED", OperationResultQuality.EMPTY, None, 0)
         if isinstance(self._workspace, LocalWorkspace):
             path = self._workspace.path
@@ -363,18 +462,60 @@ class ResticStorageRunner:
                 raise ResticOperationError("the backup path is not a directory")
             if not path.exists() or not any(path.iterdir()):
                 return nothing
-        exit_code, summary = self._stream(command, working_directory=True)
+        renewals = reruns = 0
+        while True:
+            self._last_error_text = ""
+            try:
+                exit_code, summary = self._stream(command, working_directory=True)
+            except CredentialsExpired:
+                if renewals >= CREDENTIAL_RENEWALS:
+                    raise
+                renewals += 1
+                # restic resumes from the blobs its repository already indexed
+                self._renew_credentials()
+                continue
+            if (
+                exit_code not in (0, 3, SIGKILL_EXIT)
+                and not _snapshot_id(summary)
+                and reruns < TRANSIENT_UPLOAD_RERUNS
+                and _transient_upload_failure(self._last_error_text)
+            ):
+                reruns += 1
+                self._events.rerun()
+                continue
+            break
         snapshot_id = _snapshot_id(summary)
-        if exit_code == BACKUP_SOURCE_MISSING_EXIT and not snapshot_id:
+        # DAH-4693: an empty snapshot is a no-op only when excludes removed every file
+        snapshot_empty = self._snapshot_empty and bool(self._operation.workspace.exclude_patterns)
+        if (exit_code == BACKUP_SOURCE_MISSING_EXIT or snapshot_empty) and not snapshot_id:
             return nothing
         if exit_code == 0 and snapshot_id:
             return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
         if exit_code == 3 and snapshot_id:
             return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)
+        if exit_code == SIGKILL_EXIT:
+            raise ResticOperationError(self._killed_helper_message("backup"))
         raise ResticOperationError(
             f"restic backup failed with exit {exit_code}"
             + (" without a snapshot ID" if not snapshot_id else "")
         )
+
+    def _renew_credentials(self) -> None:
+        reporter = self._events.reporter
+        credentials = reporter.renew_credentials() if reporter else None
+        if not credentials:
+            raise ResticOperationError("storage credentials expired and could not be renewed")
+        self._operation = replace(
+            self._operation, repository=replace(self._operation.repository, **credentials)
+        )
+        self._environment = self._build_environment()
+        # the stopped helper's --rm removal can lag; the rerun reuses its name
+        subprocess.run(
+            [self._docker_binary, "rm", "-f", self._helper_container_name()],
+            capture_output=True,
+            text=True,
+        )
+        self._events.diagnostic("storage credentials expired; renewed them, restarting the backup")
 
     def _restore(self) -> ResticResult:
         if self._operation.engine is StorageEngine.TAR_AWS_CLI:
@@ -383,7 +524,23 @@ class ResticStorageRunner:
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
         command, cwd = self._restore_execution_command(snapshot_id)
-        exit_code, _ = self._stream_command(command, cwd)
+        exit_code, summary = self._stream_command(command, cwd)
+        if exit_code == SIGKILL_EXIT:
+            raise ResticOperationError(self._killed_helper_message("restore"))
+        # restic exits 1 when some files failed (e.g. the live workload removed a dir mid-restore), but also on
+        # disk-full and repository errors: only vanished-file errors count as PARTIAL, however many
+        # restic counts files it wrote, even ones removed afterwards: the files left are the total less the distinct
+        # failed items, and a restore whose whole target vanished has none left
+        total_files = (summary or {}).get("total_files")
+        failed_items = len({item for item, text in self._restore_errors if not _ERRORS_SUMMARY.match(text.strip())})
+        if (
+            exit_code == 1
+            and isinstance(total_files, int)
+            and total_files > failed_items
+            and _only_vanished_files(self._restore_errors)
+        ):
+            self._events.stage("FINALIZING")
+            return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
         self._events.stage("FINALIZING")
@@ -430,6 +587,12 @@ class ResticStorageRunner:
         restore_stats: RestoreStats | None = None,
     ) -> tuple[int, Mapping[str, object] | None]:
         started_at = time.monotonic()
+        # The helper runs without --rm so its OOMKilled state can be read after exit, then it is removed.
+        helper = not isinstance(self._workspace, LocalWorkspace)
+        if helper:
+            self._remove_stopped_helpers()
+            self._remove_helper_container()
+        helper_since = f"{time.time():.6f}"
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -472,6 +635,8 @@ class ResticStorageRunner:
                 line = raw_line.strip()
                 if not line:
                     continue
+                # DAH-4693: restic refuses to save an empty snapshot (plain-text form)
+                self._snapshot_empty = self._snapshot_empty or line == SNAPSHOT_EMPTY_MESSAGE
                 checkpoint = _restore_checkpoint(line)
                 if checkpoint is not None and restore_stats is not None:
                     self._events.restic_event(
@@ -483,11 +648,25 @@ class ResticStorageRunner:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
+                    if not _snapshot_id(summary):
+                        self._raise_if_credentials_expired(line)
+                        if line.startswith("Fatal:"):
+                            self._last_error_text = line
                     self._events.diagnostic(_redact(line, self._secret_values()))
                     continue
                 if not isinstance(payload, dict):
                     self._events.diagnostic("restic emitted a non-object JSON message")
                     continue
+                if payload.get("message_type") == "exit_error" and payload.get("message") == SNAPSHOT_EMPTY_MESSAGE:
+                    self._snapshot_empty = True
+                # an expiry after the summary (restic's lock cleanup) must not rerun a finished backup
+                if not _snapshot_id(summary):
+                    self._raise_if_credentials_expired(_error_text(payload))
+                    self._last_error_text = _error_text(payload) or self._last_error_text
+                if payload.get("message_type") in ("error", "exit_error"):
+                    item = payload.get("item")
+                    text = _error_text(payload)
+                    self._restore_errors.append((item if isinstance(item, str) and item else text, text))
                 self._events.restic_event(payload)
                 self._events.heartbeat_if_due()
                 self._cancel_if_requested(process)
@@ -497,12 +676,26 @@ class ResticStorageRunner:
             exit_code = process.wait()
             return exit_code, summary
         except StorageOperationCancelled:
+            if process.poll() is None:  # SIGTERM to the runner, not a cancel that already stopped it
+                self._terminate_process(process)
             raise
         except Exception:
             self._terminate_process(process)
             raise
         finally:
             output_reader.join(timeout=1)
+            if helper:
+                inspection = self._remove_helper_container()
+                state = inspection.get("State")
+                self._helper_state = state if isinstance(state, dict) else {}
+                self._helper_id = str(inspection.get("Id") or "")
+                if not inspection:  # gone before this cleanup: docker's events say who stopped and removed it
+                    self._log_helper_events(helper_since)
+
+    def _raise_if_credentials_expired(self, error_text: str) -> None:
+        # restic 0.19 retries an expired session for 15 minutes before failing; stop it now
+        if self._operation.repository.session_token and _credentials_expired(error_text):
+            raise CredentialsExpired("storage credentials expired")
 
     def _cancel_if_requested(self, process: subprocess.Popen[str]) -> None:
         if not self._events.cancellation_requested:
@@ -520,6 +713,110 @@ class ResticStorageRunner:
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
+
+    def _remove_stopped_helpers(self) -> None:
+        # A runner killed before cleanup leaves its exited helper (and its credentials) behind. Only long-exited
+        # helpers are removed: a created or running one may belong to another operation that is starting now.
+        listed = subprocess.run(
+            [self._docker_binary, "ps", "--all", "--quiet", "--filter", f"label={HELPER_LABEL}",
+             "--filter", "status=exited"],
+            capture_output=True,
+            text=True,
+        )
+        container_ids = listed.stdout.split() if listed.returncode == 0 else []
+        if not container_ids:
+            return
+        inspected = subprocess.run(
+            [self._docker_binary, "inspect", "--format", "{{.Id}} {{.State.Status}} {{.State.FinishedAt}}",
+             *container_ids],
+            capture_output=True,
+            text=True,
+        )
+        cutoff = datetime.now(timezone.utc) - STALE_HELPER_AGE
+        for line in inspected.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 3 or fields[1] != "exited":
+                continue
+            try:  # FinishedAt has nanoseconds; seconds are enough for a 10-minute cutoff
+                finished_at = datetime.strptime(fields[2][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if finished_at < cutoff:
+                subprocess.run([self._docker_binary, "rm", "--force", fields[0]], capture_output=True, text=True)
+
+    def _remove_helper_container(self) -> Mapping[str, object]:
+        """Remove the helper container; return its docker inspect object.
+
+        {} when docker has no such container; State.Status "unknown" when inspect failed otherwise.
+        """
+        name = self._helper_container_name()
+        inspection = subprocess.run(
+            [self._docker_binary, "inspect", "--format", "{{json .}}", name],
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run([self._docker_binary, "rm", "--force", name], capture_output=True, text=True)
+        if inspection.returncode != 0 and "no such" in (inspection.stderr or "").lower():
+            return {}
+        try:
+            state = json.loads(inspection.stdout) if inspection.returncode == 0 else None
+        except ValueError:
+            state = None
+        return state if isinstance(state, dict) else {"State": {"Status": "unknown"}}
+
+    def _log_helper_events(self, since: str) -> None:
+        """Log the helper's docker events (kill signal, die exit code, destroy) and take its ID from them."""
+        try:
+            listed = subprocess.run(
+                [self._docker_binary, "events", "--since", since, "--until", str(int(time.time()) + 1),
+                 "--filter", f"container={self._helper_container_name()}", "--format", "{{json .}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._events.log(f"helper docker events unavailable: {error}")
+            return
+        lines = []
+        for line in listed.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            actor = event.get("Actor") if isinstance(event.get("Actor"), dict) else {}
+            attributes = actor.get("Attributes") if isinstance(actor.get("Attributes"), dict) else {}
+            event_id = str(event.get("id") or actor.get("ID") or "")
+            self._helper_id = self._helper_id or event_id
+            # signal/exitCode/execDuration only: other attributes are image labels
+            kept = {key: attributes[key] for key in ("signal", "exitCode", "execDuration") if key in attributes}
+            lines.append(f"{event.get('time')} {event_id[:12]} {event.get('Action') or event.get('status')} {json.dumps(kept)}")
+        self._events.log("helper docker events: " + (" | ".join(lines) or f"none (exit {listed.returncode})"))
+
+    def _killed_helper_message(self, action: str) -> str:
+        """Exit 137: say out of memory only when docker recorded an OOM kill."""
+        state = self._helper_state
+        if state.get("OOMKilled") is True:
+            return f"{action} ran out of memory"
+        fields = ("Status", "OOMKilled", "Dead", "ExitCode", "Error", "StartedAt", "FinishedAt")
+        # a log event, not stderr: detached runs delete their stderr log on exit
+        self._events.log(
+            f"{action} helper exited 137; docker state "
+            + json.dumps({field: state.get(field) for field in fields})
+        )
+        # Docker's OOMKilled can miss a kill; the kernel log settles OOM against an outside SIGKILL
+        note = kernel_kill_note(self._helper_id)
+        self._events.log(note)
+        if "oom-kill:" in note and self._helper_id:  # the kernel's OOM kill that Docker's flag missed
+            return f"{action} ran out of memory"
+        if not state or state.get("Status") == "removing":  # removed mid-run, not an OOM
+            return f"{action} helper container was removed while running"
+        if state.get("Status") == "unknown":  # docker inspect failed for another reason
+            return f"{action} helper was killed (helper state unknown)"
+        if state.get("OOMKilled") is False:
+            return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
+        return f"{action} helper was killed (often out of memory)"
 
     def _stop_helper_container(self) -> None:
         subprocess.run(
@@ -661,11 +958,22 @@ class ResticStorageRunner:
         return [
             self._docker_binary,
             "run",
-            "--rm",
             "--name",
             self._helper_container_name(),
+            "--label",
+            f"{HELPER_LABEL}={self._operation.operation_id}",
             "--log-driver",
             "none",
+            "--memory",
+            restic_restore_helper_memory()
+            if self._operation.action is StorageAction.RESTORE and self._operation.engine is StorageEngine.RESTIC
+            else RESTIC_HELPER_MEMORY,
+            "--oom-score-adj",
+            RESTIC_HELPER_OOM_SCORE_ADJ,
+            "-e",
+            f"GOGC={RESTIC_HELPER_GOGC}",
+            "-e",
+            f"GOMAXPROCS={RESTIC_HELPER_GOMAXPROCS}",
             "--read-only",
             "--tmpfs",
             f"/tmp:rw,nosuid,nodev,size={RESTIC_TMPFS_BYTES}",
@@ -736,6 +1044,84 @@ def _is_retryable_repository_failure(failure_detail: str) -> bool:
     # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
     normalized_detail = "".join(failure_detail.casefold().split())
     return any(marker in normalized_detail for marker in retryable_failure_markers)
+
+
+def _connection_closed(failure_detail: str) -> bool:
+    # 28-29 Oct: 7 auto backups failed the probe on S3 "Connection closed by foreign host" in hourly bursts.
+    return "connection closed by foreign host" in failure_detail.casefold()
+
+
+def _transient_upload_failure(error_text: str) -> bool:
+    # restic gives up on an S3 upload after its own retries; 24h on 27 Oct: 11 auto backups failed on
+    # "Fatal: unable to save snapshot: client.PutObject: Put ...: request timeout"
+    text = error_text.casefold()
+    return "unable to save snapshot" in text and any(
+        marker in text for marker in ("request timeout", "i/o timeout", "connection reset", "tls handshake timeout")
+    )
+
+
+def _credentials_expired(error_text: str) -> bool:
+    # S3: "ExpiredToken: The provided token has expired."; minio-go often prints only the message.
+    # Only the last ": " component counts, so a file name like "open ExpiredToken.java: ..." never matches.
+    normalized = "".join(error_text.rsplit(":", 1)[-1].casefold().split()).rstrip(".")
+    return normalized in ("expiredtoken", "theprovidedtokenhasexpired")
+
+
+# a restore item the live workload removed mid-restore; anything else (ENOSPC, permission, repository) stays FAILED
+_VANISHED_FILE = re.compile(r"^(open|lstat|mkdir|rename|remove|chmod|l?chown|utimes?|symlink|link)\b.*: no such file or directory$")
+_ERRORS_SUMMARY = re.compile(r"^Fatal: (There were )?\d+ errors?\.?$")
+
+
+def _only_vanished_files(errors: list[tuple[str, str]]) -> bool:
+    """every error is a file the workload removed mid-restore, or restic's "N errors" summary. No loss bound
+    (Pixel, PR #2018): a whole deleted folder can be hundreds of files. Trade-off: a restic bug that loses files
+    as "no such file or directory" would also read as PARTIAL."""
+    failed = [text for _, text in errors if not _ERRORS_SUMMARY.match(text.strip())]
+    return bool(failed) and all(_VANISHED_FILE.match(text.strip()) for text in failed)
+
+
+def _error_text(payload: Mapping[str, object]) -> str:
+    """the message of a restic error/exit_error event, never its file names (item, current_files)"""
+    if payload.get("message_type") not in ("error", "exit_error"):
+        return ""
+    error = payload.get("error")
+    message = error.get("message") if isinstance(error, Mapping) else payload.get("message")
+    if not isinstance(message, str):
+        return ""
+    item = payload.get("item")
+    # restic repeats the file name in the message ("open /workspace/ExpiredToken.java: permission denied")
+    return message.replace(item, "") if isinstance(item, str) and item else message
+
+
+def kernel_kill_lines(dmesg: str, container_id: str) -> list[str]:
+    """The kernel's OOM kill lines for this container: its oom-kill line (matched by container ID, since docker
+    reports PID 0 after exit) and the "Killed process" line printed right after it."""
+    lines = dmesg.splitlines()
+    found: list[str] = []
+    for index, line in enumerate(lines):
+        if "oom-kill:" in line and container_id in line:
+            found.append(line)
+            if index + 1 < len(lines) and "Killed process" in lines[index + 1]:
+                found.append(lines[index + 1])
+    return found
+
+
+def kernel_kill_note(container_id: str) -> str:
+    """One log line naming the kernel's kill of the helper, or saying there was none; never raises."""
+    if not container_id:
+        # without an ID every host OOM line matches, and these lines reach the renter's logs: other pods' data
+        return "kernel: no helper ID to match"
+    try:
+        dmesg = subprocess.run(["dmesg", "--kernel", "--nopager"], capture_output=True, text=True, timeout=5)
+    except Exception as error:  # noqa: BLE001 - diagnostics only
+        return f"kernel: dmesg unreadable ({type(error).__name__})"
+    if dmesg.returncode != 0:
+        return f"kernel: dmesg unreadable (exit {dmesg.returncode})"
+    # the kill happened seconds ago; a bounded tail keeps a long-running host's ring buffer cheap
+    found = kernel_kill_lines("\n".join(dmesg.stdout.splitlines()[-2000:]), container_id)
+    if not found:
+        return "kernel: no kernel kill line for the helper"
+    return "kernel: " + " | ".join(found)
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:

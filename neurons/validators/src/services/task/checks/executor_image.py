@@ -16,6 +16,7 @@ from services.executor_image_policy import (
 from ..messages import ExecutorImageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 _EXECUTOR_NAME = re.compile(r"(?:^|-)executor-\d+$")
 # Same GPU probe the executor updater runs before an update (neurons/executor/EXECUTOR_UPDATE.md),
@@ -111,8 +112,7 @@ class ExecutorImageCheck:
             event = render_message(Msg.CURRENT, ctx=ctx, check_id=self.check_id, what=what)
             passed = True
         else:
-            rented_data = ctx.state.rented_data
-            rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+            rented_executor = rental_of_this_node(ctx)
             is_rented = rented_executor is not None and len(rented_executor.pods) > 0
             passed = is_rented
             if is_rented and await updater_holds_on_nvidia_mismatch(ctx):

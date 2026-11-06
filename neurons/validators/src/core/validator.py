@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
+from core.loop_sampler import start_loop_sampler
 from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
@@ -24,6 +25,10 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
+    carry_renter_gpu_reset_results,
+    has_renter_gpu_reset_holds,
+    remember_rented_scored_results,
+    withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -45,7 +50,7 @@ from services.redis_service import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
-from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.availability import RunningOutageTally, silence_availability_errors_on_our_own_outage
 from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
@@ -117,14 +122,20 @@ def settle_cycle_results(
                 and not (
                     job_result.is_new_rentals_paused and not job_result.is_rented
                 )
+                and not job_result.is_in_maintenance
             ):
                 total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
     return total_gpu_model_count_map
 
 
 def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
-    """All but a zeroed duplicate under the keeper's own executor UUID: that backend row hears the keeper."""
-    return [result for result in results if not result.duplicate_shares_kept_row]
+    """All but a zeroed duplicate under the keeper's own executor UUID (that backend row hears the keeper) and a
+    result carried over a renter GPU reset (the backend keeps the row it has)."""
+    return [
+        result
+        for result in results
+        if not result.duplicate_shares_kept_row and not result.carried_for_renter_gpu_reset
+    ]
 
 
 class Validator:
@@ -189,6 +200,7 @@ class Validator:
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+            backend_client=self.backend_client,
         )
         task_service = TaskService(
             ssh_service=ssh_service,
@@ -259,12 +271,11 @@ class Validator:
         )
 
     def express_lane_cycle_inputs(self) -> CycleInputs | None:
-        """DAH-2958: the express lane runs only once a full cycle has completed since start.
-        That cycle marks validated every executor of every miner that answered it; an executor
-        registered before it began whose miner failed or was offline is not in that set, so the
-        lane also skips everything registered before `fleet_known_since` (the inputs carry it)."""
-        if self.completed_cycles_since_start < 1:
-            return None
+        """DAH-2958: the express lane runs once the first cycle since start has begun (None before).
+        The lane skips everything registered before `fleet_known_since` (that cycle's start, the inputs
+        carry it), so it only ever takes executors no cycle since start could have known; one the running
+        cycle does pick up is in `in_flight` under the cycle lane, which the lane skips. Waiting for that
+        first cycle to finish instead kept new nodes out of the lane 8-14 minutes after every restart."""
         return self.cycle_inputs
 
     async def an_operator_asked_for_a_cycle_now(self) -> bool:
@@ -464,14 +475,13 @@ class Validator:
                     # cycle started, and the operator's request must survive to the next tick.
                     await self.redis_service.clear_forced_validation_cycle_request()
 
-                if self.first_cycle_started_at is None:
+                first_cycle = self.first_cycle_started_at is None
+                if first_cycle:
                     self.first_cycle_started_at = datetime.now(UTC)
                 # A fresh job-files directory for this cycle; the ones an express verification
                 # still reads are kept (DAH-2958). The express lane uses the new one from here on.
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=(
-                        self.express_lane.directories_in_use() if settings.EXPRESS_LANE_ENABLED else ()
-                    )
+                    keep_directories=self.express_lane.directories_in_use()
                 )
                 self.cycle_inputs = CycleInputs(
                     encrypted_files=encrypted_files,
@@ -483,6 +493,31 @@ class Validator:
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
+                if first_cycle and not settings.DRY_RUN:
+                    # Queue the nodes a restart cut off before this wave asks their miners, or the
+                    # wave takes them (minutes slower). The lane launches once each list is in.
+                    try:
+                        await self.express_lane.tick()
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[express] Restart queue pass failed",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
+                # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
+                # where the cycle withholds an unreachable verdict that an early publish would leak.
+                self.miner_service.outage_tally = (
+                    None
+                    if rollout_window.covers(job_block)
+                    else RunningOutageTally(
+                        job_batch_id,
+                        frozenset(
+                            str(executor_id).lower()
+                            for executor_id in (rented_executors.executors if rented_executors else {})
+                        ),
+                    )
+                )
                 # every listed rented pod's SSH (any status), probed once while the miners work
                 pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
@@ -491,7 +526,7 @@ class Validator:
                 # request jobs
                 jobs = [
                     asyncio.create_task(
-                        self.miner_service.request_job_to_miner(
+                        self.request_wave_job(
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
@@ -603,6 +638,8 @@ class Validator:
                             )
                             task.cancel()
 
+                    # DAH-4658: before the duplicate pass and the GPU count, so a carried result counts in both
+                    await self.carry_scores_over_renter_gpu_resets(all_job_results, rented_executors, miner_coldkeys)
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
                         {**self.default_extra, "job_batch_id": job_batch_id},
@@ -635,6 +672,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window
                     )
+                    await remember_rented_scored_results(all_job_results, self.redis_service)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -752,6 +790,11 @@ class Validator:
                                 extra={"silenced_results": silenced_count},
                             )
                         )
+                        # DAH-5635: a node published early gets back what the last cycle published for it
+                        if self.miner_service.outage_tally is not None:
+                            self.miner_service.outage_tally.restore_published_early(
+                                cycle_results, self.miner_service.cycle_published_availability
+                            )
 
                     # each node's pod SSH observations ride on its result; a probed rented
                     # node the cycle has no result for gets one carrying only them. A withheld
@@ -792,21 +835,20 @@ class Validator:
                         withheld.result.executor_info.uuid for withheld in withheld_results
                     )
 
-                    if settings.EXPRESS_LANE_ENABLED:
-                        # DAH-2958: everything published by a cycle is "validated" for the
-                        # express lane; only what the portal lists beyond this set is new.
-                        # Never lets a Redis blip end the cycle: the next cycle seeds again, and
-                        # the wave's CYCLE_DONE claims keep the lane off those executors until then.
-                        try:
-                            await self.redis_service.mark_executors_validated(published_executor_ids)
-                            self.miner_service.forget_cycle_done()
-                        except Exception as exc:
-                            logger.error(
-                                _m(
-                                    "[sync] Failed to record validated executors for the express lane",
-                                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                                ),
-                            )
+                    # DAH-2958: everything published by a cycle is "validated" for the
+                    # express lane; only what the portal lists beyond this set is new.
+                    # Never lets a Redis blip end the cycle: the next cycle seeds again, and
+                    # the wave's CYCLE_DONE claims keep the lane off those executors until then.
+                    try:
+                        await self.redis_service.mark_executors_validated(published_executor_ids)
+                        self.miner_service.forget_cycle_done()
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[sync] Failed to record validated executors for the express lane",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
 
                     # A cycle with no miners validated nobody, so it keeps the post-restart
                     # warm-up closed: set_weights and the express lane wait for a scored cycle.
@@ -1368,6 +1410,14 @@ class Validator:
             )
         )
 
+    async def request_wave_job(self, **kwargs) -> dict | None:
+        """One miner's wave request; its new executors that passed are listed now, and its unrented nodes that
+        failed with an availability error are hidden now (DAH-5635), not at the cycle's end."""
+        job = await self.miner_service.request_job_to_miner(**kwargs)
+        await self.miner_service.publish_new_executors_at_pass(job)
+        await self.miner_service.publish_unreachable_early(job)
+        return job
+
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
         if not settings.RENTED_POD_SSH_PROBE_ENABLED:
@@ -1478,6 +1528,22 @@ class Validator:
                 grace_cycles=0,
             )
 
+    async def carry_scores_over_renter_gpu_resets(
+        self,
+        all_job_results: dict[str, list[JobResult]],
+        rented_executors: RentedExecutorsResponse | None,
+        miner_coldkeys: dict[str, str | None],
+    ) -> None:
+        """DAH-4658: only a node the backend still lists as rented carries its score: right now, or in this
+        cycle's snapshot when the backend does not answer."""
+        if not has_renter_gpu_reset_holds(all_job_results):
+            return
+        rented = await self.backend_client.get_rented_executors_now() or rented_executors
+        rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
+        await carry_renter_gpu_reset_results(
+            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+        )
+
     async def withhold_verdicts_for_rollout(
         self,
         all_job_results: dict[str, list[JobResult]],
@@ -1496,7 +1562,8 @@ class Validator:
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
-        return standing, withheld_results
+        standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
+        return standing, withheld_results + held_for_gpu_reset
 
     async def record_withheld_verdicts(
         self,
@@ -1545,12 +1612,14 @@ class Validator:
             await self.initiate_services()
             self.should_exit = False
 
-            if settings.EXPRESS_LANE_ENABLED and not settings.DRY_RUN:
+            if not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
-                # MinerService.in_flight. Flag off: the task is never created.
+                # MinerService.in_flight.
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
+                # which code saturates the loop the lane shares with the wave (core/loop_sampler.py)
+                self.loop_sampler_stop = start_loop_sampler()
 
             while not self.should_exit:
                 await self.sync()
@@ -1583,6 +1652,8 @@ class Validator:
         )
 
         self.should_exit = True
+        if getattr(self, "loop_sampler_stop", None) is not None:
+            self.loop_sampler_stop.set()
 
         # Cleanup subtensor client
         if hasattr(self, 'subtensor_client'):

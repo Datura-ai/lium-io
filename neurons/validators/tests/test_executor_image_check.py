@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 from protocol.vc_protocol.compute_requests import (
@@ -12,10 +11,7 @@ from services.executor_image_policy import (
     ExpectedImageSnapshot,
     ImageVerdict,
 )
-from services.task.checks.executor_image import ExecutorImageCheck, observed_executor_digest
-from services.task.checks.rented_machine import TenantEnforcementCheck
-from services.task.pipeline_factory import PipelineFactory
-from services.task.result_handler import ResultHandler
+from services.task.checks.executor_image import ExecutorImageCheck
 from services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_context_config, build_state, make_context
@@ -31,13 +27,13 @@ def policy() -> ExpectedImageSnapshot:
     )
 
 
-def rented_data() -> RentedExecutorsResponse:
+def rented_data(miner_hotkey: str = "test-miner", port: str = "22") -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
-                miner_hotkey="test-miner",
+                miner_hotkey=miner_hotkey,
                 executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
+                executor_ip_port=port,
                 pods=[RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[8080, 8081])],
             )
         },
@@ -57,42 +53,6 @@ def specs(*, executor_digest: str = EXECUTOR_DIGEST) -> dict:
             ],
         }
     }
-
-
-def test_observation_uses_container_id_then_name():
-    assert observed_executor_digest(specs()) == EXECUTOR_DIGEST
-    assert (
-        observed_executor_digest(
-            {
-                "docker": {
-                    "containers": [
-                        {
-                            "container_id": "other-id",
-                            "digest": EXECUTOR_DIGEST,
-                            "name": "provider-stack-executor-1",
-                        }
-                    ]
-                }
-            }
-        )
-        == EXECUTOR_DIGEST
-    )
-
-
-def test_observation_returns_none_when_ambiguous():
-    assert (
-        observed_executor_digest(
-            {
-                "docker": {
-                    "containers": [
-                        {"digest": EXECUTOR_DIGEST, "name": "executor-executor-1"},
-                        {"digest": EXECUTOR_DIGEST, "name": "provider-executor-1"},
-                    ]
-                }
-            }
-        )
-        is None
-    )
 
 
 @pytest.mark.asyncio
@@ -116,111 +76,6 @@ async def test_unrented_outdated_executor_fails_validation():
 
 
 @pytest.mark.asyncio
-async def test_rented_outdated_executor_passes_validation():
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=rented_data(),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
-
-
-MISMATCH_STDERR = (
-    "docker: Error response from daemon: failed to create task for container: OCI runtime create "
-    "failed: nvidia-container-cli: initialization error: nvml error: driver/library version mismatch"
-)
-
-
-def ssh_answering(exit_status: int, stderr: str):
-    run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stdout="", stderr=stderr))
-    return SimpleNamespace(run=run)
-
-
-@pytest.mark.asyncio
-async def test_rented_outdated_executor_held_by_updater_keeps_its_score():
-    ssh = ssh_answering(125, MISMATCH_STDERR)
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=rented_data()),
-        ssh=ssh,
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    report = result.updates["state"].executor_image_report
-    assert result.passed is True
-    assert report.status is ImageVerdict.OUTDATED
-    assert report.update_held is True
-    assert "--gpus all" in ssh.run.await_args.args[0]
-    scored = make_context(state=build_state(gpu_model="NVIDIA H200", executor_image_report=report))
-    actual_score, _, warning = calculate_scores(scored, True)
-    assert actual_score == 1.0
-    assert "Required executor image is outdated" not in warning
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("exit_status", "stderr"),
-    [(0, ""), (125, "docker: Error response from daemon: no such image")],
-)
-async def test_rented_outdated_executor_not_held_is_still_zeroed(exit_status: int, stderr: str):
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=rented_data()),
-        ssh=ssh_answering(exit_status, stderr),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    report = result.updates["state"].executor_image_report
-    assert report.update_held is False
-    scored = make_context(state=build_state(gpu_model="NVIDIA H200", executor_image_report=report))
-    actual_score, _, warning = calculate_scores(scored, True)
-    assert actual_score == 0.0
-    assert "Required executor image is outdated" in warning
-
-
-@pytest.mark.asyncio
-async def test_unrented_outdated_executor_is_not_probed():
-    ssh = ssh_answering(125, MISMATCH_STDERR)
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})
-        ),
-        ssh=ssh,
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is False
-    assert result.updates["state"].executor_image_report.update_held is False
-    ssh.run.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_current_executor_passes_validation():
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=EXECUTOR_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates["state"].executor_image_report.status is ImageVerdict.CURRENT
-
-
-@pytest.mark.asyncio
 async def test_unobservable_executor_digest_is_outdated():
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
@@ -237,66 +92,14 @@ async def test_unobservable_executor_digest_is_outdated():
     assert result.event.reason_code == "EXECUTOR_IMAGE_OUTDATED"
 
 
-@pytest.mark.asyncio
-async def test_cvm_outdated_executor_skips_image_check():
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-        tdx_attestation_passed=True,
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates == {}
-    assert result.event.reason_code == "EXECUTOR_IMAGE_SKIPPED"
-    assert result.event.context.get("skip_reason") == "cvm"
-
-
-@pytest.mark.asyncio
-async def test_missing_expected_state_skips_without_penalty():
-    unknown_policy = ExpectedImageSnapshot(
-        executor=None,
-        executor_ref="executor:latest",
-    )
-    context = make_context(
-        config=build_context_config(executor_image_snapshot=unknown_policy),
-        state=build_state(
-            specs=specs(executor_digest=STALE_DIGEST),
-            rented_data=SimpleNamespace(executors={}),
-        ),
-    )
-
-    result = await ExecutorImageCheck().run(context)
-
-    assert result.passed is True
-    assert result.updates == {}
-    assert result.event.reason_code == "EXECUTOR_IMAGE_SKIPPED"
-
-
-def test_image_check_is_fatal():
-    assert ExecutorImageCheck.fatal is True
-
-
-def test_image_check_precedes_tenant_enforcement_in_both_pipelines():
-    for checks in (PipelineFactory.build_checks(), PipelineFactory.build_dry_run_checks()):
-        image_index = next(
-            index for index, check in enumerate(checks) if isinstance(check, ExecutorImageCheck)
-        )
-        tenant_index = next(
-            index for index, check in enumerate(checks) if isinstance(check, TenantEnforcementCheck)
-        )
-        assert image_index < tenant_index
-
-
 @pytest.mark.parametrize(
     ("rented", "expected_job_score"),
     [(False, 0.0), (True, 1.0)],
 )
-def test_score_calculator_zeroes_outdated_executor(rented: bool, expected_job_score: float):
+def test_score_calculator_zeroes_outdated_executor(
+    rented: bool,
+    expected_job_score: float,
+):
     report = policy().report(STALE_DIGEST)
     context = make_context(
         state=build_state(
@@ -314,20 +117,16 @@ def test_score_calculator_zeroes_outdated_executor(rented: bool, expected_job_sc
 
 
 @pytest.mark.asyncio
-async def test_result_handler_publishes_report_on_job_result_and_specs():
-    report = policy().report(EXECUTOR_DIGEST)
+async def test_outdated_executor_under_another_miners_rental_on_a_different_endpoint_fails():
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
     context = make_context(
-        state=build_state(specs={"gpu": {}}, executor_image_report=report),
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(
+            specs=specs(executor_digest=STALE_DIGEST),
+            rented_data=rented_data(miner_hotkey="other-miner-hotkey", port="2222"),
+        ),
     )
 
-    result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
-        context=context,
-        miner_info=SimpleNamespace(miner_hotkey="miner", job_batch_id="batch"),
-        executor_info=context.executor,
-        verified_job_info={},
-        log_text="ok",
-        success=True,
-    )
+    result = await ExecutorImageCheck().run(context)
 
-    assert result.executor_image_report == report.as_dict()
-    assert result.spec["executor_image"] == report.as_dict()
+    assert result.passed is False

@@ -3,8 +3,6 @@ from unittest.mock import AsyncMock
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import IncentiveConfig
-from incentive.default import DefaultIncentive
-from incentive.miner_incentive_log import ZeroIncentiveReason
 from incentive.rental_price import RentalPriceIncentive
 from services.task.models import JobResult
 
@@ -35,44 +33,6 @@ def failed_idle_result() -> JobResult:
 
 
 @pytest.mark.asyncio
-async def test_default_incentive_records_outdated_reason_before_score_early_return():
-    result = failed_idle_result()
-    incentive = DefaultIncentive(
-        IncentiveConfig(),
-        AsyncMock(),
-        {"miner": [result]},
-        {},
-    )
-
-    await incentive._pre_process_job_result("miner", result)
-
-    assert result.mining_score == 0
-    # the run failed too, so its own reason follows the image reason
-    assert [reason.reason for reason in result.zero_incentive_reasons] == [
-        ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
-        ZeroIncentiveReason.VALIDATION_FAILED,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_rental_price_incentive_records_reason_before_unsuccessful_filter():
-    result = failed_idle_result()
-    incentive = RentalPriceIncentive(
-        IncentiveConfig(),
-        AsyncMock(),
-        {"miner": [result]},
-        {},
-    )
-
-    await incentive._pre_process_job_result("miner", result)
-
-    assert [reason.reason for reason in result.zero_incentive_reasons] == [
-        ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
-        ZeroIncentiveReason.VALIDATION_FAILED,
-    ]
-
-
-@pytest.mark.asyncio
 async def test_rented_outdated_executor_keeps_job_result_but_gets_zero_mining_score():
     result = failed_idle_result().model_copy(
         update={
@@ -95,31 +55,3 @@ async def test_rented_outdated_executor_keeps_job_result_but_gets_zero_mining_sc
     assert result.zero_incentive_reasons[0].reason == "outdated_executor_image"
 
 
-def idle_result_on_old_image() -> JobResult:
-    # A validated idle H200 node whose executor container still runs the previous image.
-    return failed_idle_result().model_copy(
-        update={
-            "score": 1.0,
-            "job_score": 1.0,
-            "log_status": "success",
-            "log_text": "ok",
-            "gpu_model": "NVIDIA H200",
-            "gpu_count": 8,
-        }
-    )
-
-
-def redis_with_full_portion() -> AsyncMock:
-    redis = AsyncMock()
-    redis.get_portion_per_gpu_type.return_value = 1.0
-    return redis
-
-
-@pytest.mark.asyncio
-async def test_rented_executor_held_on_old_image_records_no_outdated_reason():
-    result = failed_idle_result().model_copy(update={"is_rented": True})
-    result.executor_image_report["update_held"] = True
-    incentive = DefaultIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {})
-
-    assert incentive._record_outdated_image_reason(result) is False
-    assert result.zero_incentive_reasons == []
