@@ -483,6 +483,33 @@ async def test_the_published_spec_carries_the_ssh_host_key():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [True, False])
+async def test_the_published_spec_carries_host_runtime_fault(fault):
+    # DAH-5651: JobResult -> the published payload -> both the validator's and lium_protocol's ExecutorSpecRequest
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lium_protocol"))
+    from lium_protocol.validator_to_backend import ExecutorSpecRequest as WireExecutorSpecRequest
+    from services.miner_service import MinerService
+
+    result = _result("e3").model_copy(update={"host_runtime_fault": fault})
+    service = MinerService.__new__(MinerService)
+    service.redis_service = AsyncMock()
+
+    with patch("services.miner_service.settings") as settings:
+        settings.DRY_RUN = False
+        settings.POD_STATES_REPORT_ENABLED = False
+        await MinerService.publish_machine_specs(service, [result], "hk-E3", "ck-E3", is_whole_miner_batch=False)
+
+    (_channel, payload), _ = service.redis_service.publish.call_args
+    assert payload["host_runtime_fault"] is fault
+    for model in (ExecutorSpecRequest, WireExecutorSpecRequest):
+        spec = model(**{k: v for k, v in payload.items() if k in model.model_fields}, validator_hotkey="v")
+        assert spec.host_runtime_fault is fault
+
+
+@pytest.mark.asyncio
 async def test_an_unverified_ssh_host_key_is_not_forwarded():
     from services.miner_service import MinerService
 

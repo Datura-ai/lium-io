@@ -235,6 +235,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # The node's SSH host public key, sent only when this cycle connected with known_hosts pinned to it.
     # The backend trusts a heartbeat key only from here; None when the cycle did not reach the node.
     ssh_host_key: str | None = None
+    # DAH-5651: this cycle's DinD test container on the host never answered. None from an older validator;
+    # the backend reads it with a silent rented pod as a down host.
+    host_runtime_fault: bool | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

@@ -1728,7 +1728,12 @@
     "ContainerWarningCode": {
       "enum": [
         "ExternalVolumeFailed",
-        "DockerInDockerDisabled"
+        "DockerInDockerDisabled",
+        "HungGpuReset",
+        "HungGpuNotResetMig",
+        "HungGpuNotResetNvlinkShared",
+        "HungGpuNotResetInUse",
+        "HungGpuNotResetUnsupported"
       ],
       "title": "ContainerWarningCode",
       "type": "string"
@@ -2351,6 +2356,18 @@
           ],
           "default": null,
           "title": "Gpu Attestation Passed"
+        },
+        "host_runtime_fault": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host Runtime Fault"
         },
         "incentive": {
           "anyOf": [
@@ -6580,7 +6597,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.6.0",
+  "protocol_version": "2.10.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
