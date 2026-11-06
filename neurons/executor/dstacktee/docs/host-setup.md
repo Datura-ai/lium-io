@@ -6,8 +6,9 @@ Provider guide for taking a TDX host from bare metal to an attested Lium CVM exe
 |---|---|---|
 | §1–§4 host bring-up (BIOS, kernel, QEMU, key provider) | once per host | ~1–2 h (dominated by BIOS + QEMU build) |
 | §5 executor deployment | once per executor | ~15 min |
-| §6 upgrades | per release | ~10 min |
-| §6.1 key-provider rebuild | only when a release changes `key-provider/` | ~15 min plus the CVM recreation |
+| §6 supervision and host hygiene | once per host | ~20 min |
+| §7 upgrades | per release | ~10 min |
+| §7.1 key-provider rebuild | only when a release changes `key-provider/` | ~15 min plus the CVM recreation |
 
 ## 1. Hardware and firmware
 
@@ -116,6 +117,8 @@ Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-
    sudo ./lium-cvm.sh run my-executor
    ```
 
+   This `run` is a foreground first boot, not how the executor should stay up — hand it to systemd in §6.
+
    `--check` prints the expected compose hash (the one in the release-notes section) and the hash of the file `new` wrote, and exits 1 when they differ, so there is nothing to compare by eye. `sha256sum run/vms/my-executor/shared/app-compose.json` prints the same actual hash on its own. A mismatch means the digest or a measured file differs from the release and the validator does not know the hash. What that costs depends on the validator's `ENABLE_ATTESTATION_WHITELIST`: on, the CVM scores zero; off (the default, and production today), the validator accepts the unknown hash and scores the node as before. Do not run a CVM that does not match the release either way: fix `.env` or `git checkout` the release tag, `sudo rm -rf run/vms/my-executor`, and run `new` again.
 
    Everything attestation-related inside the guest — sysbox force-install, digest-pinned runner, quote generation — is baked into the measured compose; there is nothing to configure in the guest.
@@ -126,26 +129,85 @@ Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-
 
 **Do not modify** `app/docker-compose*.yml`, `app/pre_launch_script.sh`, or `app/init_script.sh`: they are measured into the compose hash the validator whitelists — any local change makes attestation fail.
 
-## 6. Upgrades
+## 6. Supervision and host hygiene
+
+`lium-cvm.sh run` does not daemonize: QEMU runs in the foreground of that command, and the guest's serial console — everything the guest prints while booting, including failures that happen before the executor answers — is QEMU's stdout. So whatever supervises that process owns your only window into the guest. Run it under systemd, not in a login shell and not in a terminal multiplexer.
+
+```ini
+# /etc/systemd/system/lium-cvm@.service
+[Unit]
+Description=Lium CVM %i
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lium-io/neurons/executor/dstacktee
+ExecStart=/opt/lium-io/neurons/executor/dstacktee/lium-cvm.sh run %i
+# --timeout is not optional: `stop` waits 30 s by default, then returns success and leaves the
+# guest running, and systemd SIGTERMs QEMU — a hard power-off of a guest that is still writing.
+ExecStop=/opt/lium-io/neurons/executor/dstacktee/lium-cvm.sh stop %i --timeout 840
+# A multi-TB TDX guest does not finish shutting down in the default 90 s; keep this above the
+# ExecStop timeout so systemd's SIGKILL is never what ends the guest.
+TimeoutStopSec=15min
+Restart=on-failure
+# GPU passthrough is still being torn down when the unit restarts. Restarting immediately
+# fails with "vfio ... Device or resource busy" and burns the restart budget.
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Point both paths at the checkout you deploy from — the unit must run the same tree §7 upgrades,
+or `systemctl start` will quietly boot the old one. Stop the foreground `run` from §5 first: a
+second QEMU on the same GPUs dies with `vfio ... Device or resource busy` and the unit then
+retries every 60 s.
+
+```bash
+sudo ./lium-cvm.sh stop my-executor        # the §5 foreground run, if it is still up
+sudo systemctl daemon-reload
+sudo systemctl enable --now lium-cvm@my-executor
+journalctl -u lium-cvm@my-executor -f     # the guest console, live
+```
+
+**Nothing may restart this unit behind your back.** A guest restart is never free: rentals running inside the guest go down with it, and an encrypted rental does not come back on its own — it waits for the renter or Datura to recreate the pod, and the miner accrues downtime penalties in the meantime. Drain rentals before any planned restart, and stop the automation that would do it unplanned:
+
+```bash
+# never auto-restart the CVM on a library upgrade
+printf '$nrconf{override_rc}{qr(^lium-cvm@)} = 0;\n' | sudo tee /etc/needrestart/conf.d/lium-cvm.conf
+
+# security updates yes, automatic reboots no
+sudo tee /etc/apt/apt.conf.d/99-lium-no-reboot >/dev/null <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+```
+
+**Pin whatever package owns the QEMU binary `client.conf` names.** RTMR0 only reproduces under the exact QEMU the verifier's oracle was built from (§3). Following §3 you build it into `/opt/qemu-dstack`, outside apt's reach, and there is nothing to hold. If your `client.conf` instead points at a distro binary, `apt-mark hold` that package — an ordinary upgrade would silently change the measurement and the guest would come back unable to open its data disk.
+
+## 7. Upgrades
 
 Per release:
 
 ```bash
-sudo ./lium-cvm.sh stop my-executor
-git pull                                   # the release tag
+sudo systemctl stop lium-cvm@my-executor   # or: sudo ./lium-cvm.sh stop my-executor
+git fetch --tags
+git checkout <release tag>                 # exactly the released tree — the compose is measured
 # update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes ("CVM attestation";
 # no section yet → python3 scripts/compose_hash.py --release-notes prints it for the checkout)
 sudo rm -rf run/vms/my-executor            # see warning below
 sudo ./lium-cvm.sh new my-executor
 python3 scripts/compose_hash.py --check run/vms/my-executor/shared/app-compose.json   # exit 1 = not the release's compose
-sudo ./lium-cvm.sh run my-executor
+sudo systemctl start lium-cvm@my-executor  # or: sudo ./lium-cvm.sh run my-executor
 ```
 
 > **Warning — data disk.** The CVM's encrypted data disk key derives from the launch measurements. Any upgrade that changes measurements (OS image, host QEMU, OVMF, compose content) makes the existing `hda.img` undecryptable: the guest reboot-loops with `Failed to open encrypted data disk` even though the launcher reports success. Drain rentals before upgrading and recreate the VM directory. The new compose hash is whitelisted by Datura at release time — nothing to do on your side, but the compose must be exactly as released.
 
 The host QEMU from §3 is **not** touched by executor releases; leave it alone unless a release note says otherwise.
 
-### 6.1 Key-provider upgrade (only when a release says so)
+### 7.1 Key-provider upgrade (only when a release says so)
 
 A release that changes `key-provider/` (its `Cargo.lock`, Dockerfile or upstream commit) needs a rebuilt key provider. The rebuild changes MRENCLAVE and with it the disk key of **every** CVM on the host, so it is refused while any CVM disk exists. The guard lists the disks and never deletes one:
 
@@ -167,7 +229,7 @@ sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
 |---|---|---|
 | QEMU exits during guest boot: `VFIO_MAP_DMA failed: No space left on device` | default `dma_entry_limit` (65 535) exhausted by TDX page conversions | §2 — set `vfio_iommu_type1.dma_entry_limit=16777216` (runtime echo + GRUB persist) |
 | Guest reboot-loops; console shows `Failed to open encrypted data disk` | measurements changed under an existing `hda.img` (QEMU/image/compose changed), or the key provider was rebuilt outside `cvm_upgrade_guard.sh` | if a `lium-key-provider:pre-upgrade-*` or `pinned-*` tag holds the old image, `docker tag <that> lium-key-provider:local`, write its id to `/var/lib/lium-cvm/key-provider.image` and `sudo ./cvm_upgrade_guard.sh start`; otherwise recreate the VM (`stop`, remove `run/vms/<name>`, `new`, `run`) |
-| `cvm_upgrade_guard.sh upgrade` exits 3 | CVM disks exist on the host (the list names each `hda.img`, stopped CVMs included) | §6.1 — remove each listed disk by hand once its data is not needed; the guard never deletes |
+| `cvm_upgrade_guard.sh upgrade` exits 3 | CVM disks exist on the host (the list names each `hda.img`, stopped CVMs included) | §7.1 — remove each listed disk by hand once its data is not needed; the guard never deletes |
 | `cvm_upgrade_guard.sh upgrade` exits 4 | a registered VM root is missing (unmounted disk, removed checkout) or a registered root or sweep directory is not readable | mount the disk or fix the permission, or remove the stale line from `/var/lib/lium-cvm/vm-dirs`, then retry |
 | `cvm_upgrade_guard.sh` exits 1 with `declares a 'build:' section` or `<file> exists` | someone put a `build:` back into `key-provider/docker-compose.yaml`, or another compose file (`docker-compose.yml`, `docker-compose.override.yaml`, `compose.yaml`) sits in `key-provider/`; either lets a hand-run `docker compose build` rebuild the enclave past the guard | remove the `build:` section or the extra file (the build definition is `docker-compose.build.yaml`) and run the command again |
 | `cvm_upgrade_guard.sh start` or `lium-cvm.sh run` exits 6 | the pinned key-provider image is not on the host, the container came up on another image, or there is no pin and nothing to adopt while CVM disks exist | with CVM disks: restore the exact image (`docker load` from your backup, or `docker tag <id> lium-key-provider:local`); nothing is built. With no CVM disk: `sudo ./cvm_upgrade_guard.sh upgrade` rebuilds and pins |
@@ -177,3 +239,4 @@ sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
 | QEMU launch error mentioning `iommufd` / `VFIO_DEVICE_BIND_IOMMUFD` EINVAL | launcher predates the QEMU-version-gated VFIO backend | update to the current release — `dstack.py` now selects type1 automatically for QEMU < 10 |
 | Validation fails `CHECK_SYSBOX_COMPATIBILITY` inside the guest | compose not the released one (pre-launch sysbox force-install missing or altered) | redeploy with the unmodified released compose (§5) |
 | `lium-cvm.sh check` reports QEMU missing although §3 is done | `check` looks for `qemu-system-x86_64` on PATH; the launcher itself uses `client.conf` | add the §3 symlink, or ignore this one check line |
+| Guest is up and the executor answers, but a rental container is down | something inside the guest failed after boot, and the executor does not check it | read the guest console in the host journal: `journalctl -u lium-cvm@<name> --since '-1h'` (§6) — the guest prints boot failures there and nowhere else |
