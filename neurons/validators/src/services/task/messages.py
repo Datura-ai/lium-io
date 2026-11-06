@@ -1050,6 +1050,31 @@ class CollateralStatusMessages:
     )
 
 
+class NodeAccountMessages:
+    MATCH = MessageTemplate(
+        event="Node is the one its account registered",
+        reason="NODE_ACCOUNT_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Node account check not applicable",
+        reason="NODE_ACCOUNT_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Node at this address is not the one its account registered",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Verification failed; verification cleared",
+        remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
+    )
+
+
 class StaleContainerCleanupMessages:
     CLEANED = MessageTemplate(
         event="Stale container cleanup complete",
@@ -1499,6 +1524,13 @@ class DiskSpaceMessages:
         remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
         "longer need, or grow the disk. The next validation reads the disk again.",
     )
+    SPLIT_DISK = MessageTemplate(
+        event="Disk space per free split inspected",
+        reason="SPLIT_DISK_SIZED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
 
 
 class PortCountMessages:
@@ -1773,6 +1805,13 @@ class VerifyXMessages:
     VERIFY_SUCCESS = MessageTemplate(
         event="VerifyX validation passed",
         reason="VERIFYX_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    COLD_RETRY = MessageTemplate(
+        event="VerifyX second download sample",
+        reason="VERIFYX_COLD_RETRY",
         severity="info",
         category="env",
         impact="Proceed",
@@ -2573,13 +2612,6 @@ class CachedTemplateMessages:
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 
-    DISABLED = MessageTemplate(
-        event="Local verification disabled",
-        reason="LOCAL_VERIFY_DISABLED",
-        severity="info",
-        category="transport",
-        impact="None — every check runs over SSH as before",
-    )
     SKIPPED = MessageTemplate(
         event="Local verification skipped",
         reason="LOCAL_VERIFY_SKIPPED",
@@ -2593,7 +2625,7 @@ class LocalVerifyMessages:
         severity="info",
         category="transport",
         impact="None — the matmul and VerifyX run over SSH as before",
-        remediation="Update the executor image and set EXECUTOR_LOCAL_VERIFY_ENABLED=true to take the one-call path.",
+        remediation="Update the executor image to take the one-call path.",
     )
     FALLBACK = MessageTemplate(
         event="Local verification not used, SSH path taken",
@@ -2683,6 +2715,42 @@ class RentedPodNetworkMessages:
     NOT_RENTED = MessageTemplate(
         event="Rented pod network summary skipped: no running rental",
         reason="RENTED_POD_NETWORK_NOT_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class RentedPodOwnershipMessages:
+    OK = MessageTemplate(
+        event="Rented pod files are owned inside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SHIFTED = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; root login and sudo fail inside the pod until its files are repaired",
+        remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
+        "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
+        "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
+        "(only ids inside the old range; keep setuid bits and file capabilities). Shut the host down "
+        "cleanly to avoid this.",
+    )
+    UNREAD = MessageTemplate(
+        event="Rented pod file ownership not read",
+        reason="RENTED_POD_OWNERSHIP_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented pod file ownership skipped: no running rental",
+        reason="RENTED_POD_OWNERSHIP_NOT_RENTED",
         severity="info",
         category="runtime",
         impact="Proceed",
