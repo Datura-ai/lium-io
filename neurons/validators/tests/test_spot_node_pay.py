@@ -307,8 +307,9 @@ async def test_spot_is_paid_the_secure_side_when_it_is_lower():
 
     await _run([spot, secure])
 
-    assert spot.effective_rate == pytest.approx(HOURLY_RATE)
-    assert spot.incentive == pytest.approx(secure.incentive)
+    assert spot.effective_rate == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * HOURLY_RATE)
+    assert spot.incentive == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * secure.incentive)
+    assert "secure_rate = 0.8 * hourly_rate" in _messages(spot, SPOT_LINE)[0]
 
 
 @pytest.mark.asyncio
@@ -318,7 +319,7 @@ async def test_spot_secure_side_carries_the_nodes_own_sysbox_and_driver(monkeypa
 
     await _run([spot])
 
-    assert spot.effective_rate == pytest.approx(0.5 * HOURLY_RATE)
+    assert spot.effective_rate == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * 0.5 * HOURLY_RATE)
 
 
 @pytest.mark.asyncio
