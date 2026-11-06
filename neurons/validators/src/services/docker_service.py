@@ -10276,6 +10276,7 @@ class DockerService:
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
                         encrypted=False,
+                        reconnect_ssh=lambda: _connect_own_ssh(executor_info, pkey, known_hosts_policy),
                     )
                 # a fresh rental fails before its container exists rather than start without what it asked for
                 is_fresh_create = not payload.local_volume
@@ -10759,6 +10760,7 @@ class DockerService:
                                 local_volume_path=local_volume_path,
                                 encrypted=True,
                                 container_name=container_name,
+                                reconnect_ssh=lambda: _connect_own_ssh(executor_info, pkey, known_hosts_policy),
                             )
 
                     # DAH-2341: inject the customer's public keys before the sshd
@@ -11290,6 +11292,7 @@ class DockerService:
         local_volume_path: str,
         encrypted: bool,
         container_name: str | None = None,
+        reconnect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]] | None = None,
     ) -> None:
         if encrypted and not container_name:
             # No mode exists that restores into an encrypted volume without the pod: the
@@ -11365,7 +11368,8 @@ class DockerService:
             spec,
             retain_terminal_artifacts=True,
         )
-        await wait_for_storage_operation(ssh_client, files)
+        # an executor restart drops this SSH session; the restore keeps running and the wait reattaches to it
+        await wait_for_storage_operation(ssh_client, files, reconnect=reconnect_ssh)
 
     async def _run_legacy_bootstrap_restore(
         self,

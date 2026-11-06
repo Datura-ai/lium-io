@@ -1,3 +1,4 @@
+import contextlib
 import subprocess
 import sys
 from pathlib import Path
@@ -5,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import asyncssh
 import pytest
 
 from services import storage_operations
@@ -12,47 +14,120 @@ from services import storage_operations
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("runner_alive", [True, False])
-async def test_cancel_fallback_removes_the_helper_container(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runner_alive: bool
-) -> None:
-    # Runs the real cancel shell with a fake docker that records its calls.
-    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
-    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+def _fake_docker(tmp_path: Path, inspect_output: str | None) -> tuple[Path, Path]:
+    """A docker that logs its calls; `inspect` answers like a runner container when given an output."""
     docker_log = tmp_path / "docker.log"
     fake_docker = tmp_path / "docker"
-    fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
+    inspect = f'echo "{inspect_output}"; exit 0' if inspect_output is not None else "exit 1"
+    fake_docker.write_text(
+        f'#!/bin/sh\necho "$*" >> {docker_log}\nif [ "$1" = inspect ]; then {inspect}; fi\n'
+    )
     fake_docker.chmod(0o755)
-    runner_pid = None
-    if runner_alive:
-        # ignores the cancel file like an unresponsive runner; detached so no zombie keeps `kill -0` true
-        spawned = subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
-        runner_pid = int(spawned.stdout)
-        (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
+    return fake_docker, docker_log
 
+
+def _local_ssh(fake_docker: Path) -> SimpleNamespace:
     async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
-        # the remote path is fixed; point it at the fake and shorten the bounded wait
-        command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
+        # the remote path is fixed; point it at the fake and shorten the bounded waits
+        command = command.replace("/usr/bin/docker", str(fake_docker)).replace(
+            "sleep 0.25", "sleep 0.01"
+        )
         result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
-        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        return SimpleNamespace(
+            exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr
+        )
 
-    ssh_client = SimpleNamespace(run=run_locally)
+    return SimpleNamespace(run=run_locally)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_container", [True, False])
+async def test_cancel_targets_the_runner_by_name_never_a_stored_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runner_container: bool
+) -> None:
+    # Runs the real cancel shell with a fake docker. A stale PID file names a live unrelated process.
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    fake_docker, docker_log = _fake_docker(tmp_path, "running 0" if runner_container else None)
+    unrelated = subprocess.Popen(["sleep", "60"])
+    (tmp_path / f"{OPERATION_ID}.pid").write_text(str(unrelated.pid))
+    legacy = None
+    if not runner_container:
+        # an executor before the runner container: its runner is a local process named by its spec path
+        legacy = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+                "--spec",
+                str(tmp_path / f"{OPERATION_ID}.json"),
+            ]
+        )
     try:
-        await storage_operations.cancel_storage_operation(ssh_client, OPERATION_ID)
+        await storage_operations.cancel_storage_operation(_local_ssh(fake_docker), OPERATION_ID)
+        assert unrelated.poll() is None  # the stored PID is never signalled
+        if legacy:
+            assert legacy.wait(timeout=5) is not None
     finally:
-        if runner_pid:
-            subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
+        for process in (unrelated, legacy):
+            if process:
+                process.kill()
+                process.wait()
 
     helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
     runner = f"lium-storage-runner-{str(OPERATION_ID)[:12]}"
-    # with no local runner the executor restarted: the surviving runner container is stopped too
-    surviving_runner = [] if runner_pid else [f"stop --time 30 {runner}", f"rm -f -- {runner}"]
+    stopped_runner = [f"stop --time 30 {runner}", f"rm -f -- {runner}"] if runner_container else []
     assert docker_log.read_text().splitlines() == [
-        *surviving_runner, f"stop --time 5 {helper}", f"rm -f -- {helper}"
+        f"inspect {runner}",
+        *stopped_runner,
+        f"stop --time 5 {helper}",
+        f"rm -f -- {helper}",
+        f"rm -f -- {runner}",  # the artifacts cleanup
     ]
-    if runner_pid:
-        assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("container_state", "expected"),
+    [
+        ("running 0", "RUNNING"),
+        ("exited 0", "STATUS:0"),
+        ("exited 137", "STATUS:137"),
+        (None, "STARTING"),
+    ],
+)
+async def test_state_is_read_from_the_runner_container_when_the_files_are_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, container_state: str | None, expected: str
+) -> None:
+    # after an executor restart its status and PID files are gone; the runner container is not
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    fake_docker, _ = _fake_docker(tmp_path, container_state)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    assert await storage_operations._operation_state(_local_ssh(fake_docker), files) == expected
+
+
+@pytest.mark.asyncio
+async def test_wait_reattaches_after_the_executor_restarts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    (tmp_path / f"{OPERATION_ID}.status").write_text(
+        "0\n"
+    )  # what the restarted executor's runner left
+    fake_docker, _ = _fake_docker(tmp_path, None)
+
+    async def dropped(command: str, check: bool = False) -> SimpleNamespace:
+        raise asyncssh.ConnectionLost("executor restarted")
+
+    @contextlib.asynccontextmanager
+    async def reconnect():
+        yield _local_ssh(fake_docker)
+
+    await storage_operations.wait_for_storage_operation(
+        SimpleNamespace(run=dropped), files, poll_interval_seconds=0, reconnect=reconnect
+    )
+    assert not (tmp_path / f"{OPERATION_ID}.status").exists()
 
 
 @pytest.mark.parametrize("field", ["bootstrap", "exclude_patterns"])
@@ -63,7 +138,9 @@ def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(fi
     probe = storage_operations._WORKSPACE_FIELD_PROBE.replace("/root/app/src", str(executor_src))
 
     assert subprocess.run([sys.executable, "-c", probe, field], check=False).returncode == 0
-    assert subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3
+    assert (
+        subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3
+    )
 
 
 @pytest.mark.asyncio
@@ -74,7 +151,9 @@ async def test_start_never_removes_a_running_helper(
     monkeypatch: pytest.MonkeyPatch, helper_running: bool, runner_alive: bool
 ) -> None:
     # A repeated dispatch sees no runner PID yet (STARTING) while the first run's helper works.
-    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        storage_operations, "supports_storage_operation", AsyncMock(return_value=True)
+    )
     monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
     commands: list[str] = []
 
@@ -93,18 +172,48 @@ async def test_start_never_removes_a_running_helper(
     kept = helper_running and runner_alive
     if kept:
         files = await storage_operations.start_storage_operation(
-            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            ssh_client,
+            "python3",
+            OPERATION_ID,
+            {"engine": "restic"},
+            retain_terminal_artifacts=False,
         )
         assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     else:
         monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-        with pytest.raises(TypeError):  # stops at the sftp spec write, after the stale-helper removal
+        with pytest.raises(
+            TypeError
+        ):  # stops at the sftp spec write, after the stale-helper removal
             await storage_operations.start_storage_operation(
-                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+                ssh_client,
+                "python3",
+                OPERATION_ID,
+                {"engine": "restic"},
+                retain_terminal_artifacts=False,
             )
-    helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
-    probe = next(c for c in commands if "docker ps -q" in c)
-    assert f"name=^{helper}$" in probe and "pgrep -f" in probe
-    # a runner container that outlived an executor restart also owns the operation
-    assert f"name=^lium-storage-runner-{str(OPERATION_ID)[:12]}$" in probe
     assert any("docker rm -f" in c for c in commands) is not kept
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("running", "owned"),
+    [("lium-storage-runner-", True), ("lium-storage-", False), ("", False)],
+)
+async def test_a_running_runner_container_owns_the_operation(
+    tmp_path: Path, running: str, owned: bool
+) -> None:
+    # Runs the real ownership probe against a docker that lists only the named running container. A running
+    # runner container (it survived an executor restart) owns the run; a helper alone, with no local runner, not.
+    running_name = f"{running}{str(OPERATION_ID)[:12]}" if running else "none"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        f'#!/bin/sh\ncase "$*" in *"name=^{running_name}$"*) echo abc123;; esac\n'
+    )
+    fake_docker.chmod(0o755)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    assert (
+        await storage_operations._helper_owned_by_live_runner(
+            _local_ssh(fake_docker), OPERATION_ID, files
+        )
+        is owned
+    )
