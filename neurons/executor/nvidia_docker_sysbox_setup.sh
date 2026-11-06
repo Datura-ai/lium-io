@@ -464,47 +464,12 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
-CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (two containerd daemons and neither on Docker's address, or its root cannot be read)."
+CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (Docker names no containerd address, or that running containerd does not report its root)."
 
-docker_containerd() {
-    # CTRD_BIN, CTRD_CONFIG, CTRD_ROOT (--root, else empty): the containerd Docker uses. Without --containerd Docker
-    # runs its own on a generated --config whose root is <DockerRootDir>/containerd/daemon, so the host's
-    # /etc/containerd/config.toml and a leftover /var/lib/containerd say nothing about it. With two daemons, the one
-    # on Docker's address; fails when that cannot be told.
-    local f i bin cfg root addr address n=0 matches=0
-    local -a argv
-    address=$(docker info --format '{{with .Containerd}}{{.Address}}{{end}}' 2>/dev/null)
-    CTRD_BIN=containerd CTRD_CONFIG=/etc/containerd/config.toml CTRD_ROOT=""
-    # no daemon seen: Docker's own containerd (<exec-root>/containerd/containerd.sock) runs on the config beside it
-    case "$address" in */docker/containerd/*) CTRD_CONFIG=${address%/*}/containerd.toml ;; esac
-    for f in "${SYSBOX_SETUP_HOST_ROOT:-}"/proc/[0-9]*/cmdline; do
-        mapfile -d '' -t argv < "$f" 2>/dev/null || continue
-        [ "${argv[0]##*/}" = containerd ] || continue
-        # a rental's nested containerd (another root) reads its container's config: its address matches the host's too
-        f=${f%/cmdline}/root
-        [ -e "${SYSBOX_SETUP_HOST_ROOT:-}/proc/1/root" ] && [ -e "$f" ] && ! [ "$f" -ef "${SYSBOX_SETUP_HOST_ROOT:-}/proc/1/root" ] && continue
-        bin=${argv[0]} cfg=/etc/containerd/config.toml root="" addr=""
-        for ((i = 1; i < ${#argv[@]}; i++)); do
-            case "${argv[i]}" in
-                --config=*) cfg=${argv[i]#*=} ;;
-                --config | -c) i=$((i + 1)); cfg=${argv[i]:-} ;;
-                --root=*) root=${argv[i]#*=} ;;
-                --root) i=$((i + 1)); root=${argv[i]:-} ;;
-                --address=*) addr=${argv[i]#*=} ;;
-                --address | -a) i=$((i + 1)); addr=${argv[i]:-} ;;
-            esac
-        done
-        [ -n "$addr" ] || addr=$("$bin" --config "$cfg" config dump 2>/dev/null | sed -n "/^\[grpc\]/,/^\[/s/^ *address *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
-        n=$((n + 1))
-        # /var/run is /run
-        if [ -n "$address" ] && [ "${addr#/var}" = "${address#/var}" ]; then
-            matches=$((matches + 1))
-        elif [ "$n" -gt 1 ] || [ "$matches" -gt 0 ]; then
-            continue
-        fi
-        CTRD_BIN=$bin CTRD_CONFIG=$cfg CTRD_ROOT=$root
-    done
-    [ "$n" -le 1 ] || [ "$matches" -eq 1 ]
+ctrd_export_root() {
+    # the root the running containerd ($1: its plugin listing) reports for plugin $2; its config files may name a
+    # root it has not restarted onto
+    awk -v want="$2" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF == 2 && $1 == "root" {print $2; exit}' <<<"$1"
 }
 
 resolve_disk_dir() {
@@ -513,7 +478,7 @@ resolve_disk_dir() {
     # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
     # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd or its root cannot be told.
     # DATA_ROOT: Docker's data-root, where rental volumes stay whatever store keeps the containers.
-    local ctrd_root plugin root_path config data_root where
+    local address listing plugin content data_root
     DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
     [ -d "$DISK_DIR" ] || DISK_DIR=/
@@ -522,45 +487,21 @@ resolve_disk_dir() {
     CONTENT_DIR=""
     SNAPSHOTTER_FIX=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
-    docker_containerd || return 1
-    # containerd dumps defaults (exit 0) for a config that is gone: a missing generated or custom one is unknown
-    [ "$CTRD_CONFIG" = /etc/containerd/config.toml ] || [ -r "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" ] || return 1
-    # the merged config (imports resolved); no dump: its config file itself, unless that imports others, whose
-    # root or root_path would be missed: unknown then, as the validator's scrape follows them
-    config=$("$CTRD_BIN" --config "$CTRD_CONFIG" config dump 2>/dev/null) || {
-        config=$(cat "${SYSBOX_SETUP_HOST_ROOT:-}$CTRD_CONFIG" 2>/dev/null)
-        ! sed -n '/^ *\[/q; /^ *imports *=/p' <<<"$config" | grep -q . || return 1
-    }
-    ctrd_root=$CTRD_ROOT
-    # containerd 1.x dumps root = "...", 2.x root = '...'
-    [ -n "$ctrd_root" ] || ctrd_root=$(sed -n "/^\[/q; s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" <<<"$config" | head -1)
-    if [ -z "$ctrd_root" ]; then
-        # containerd's default root only for the system config: an unreadable generated (Docker-managed) or custom
-        # config does not mean a leftover /var/lib/containerd holds the containers
-        [ "$CTRD_CONFIG" = /etc/containerd/config.toml ] || return 1
-        ctrd_root="${SYSBOX_SETUP_HOST_ROOT:-}/var/lib/containerd"
-    fi
-    # a root that is not there is unknown, not the data-root
-    [ -d "$ctrd_root" ] || return 1
-    DISK_DIR=$ctrd_root
-    # pulled image layers land in the content store first, which may be another filesystem than the snapshots
-    [ ! -d "$ctrd_root/io.containerd.content.v1.content" ] || CONTENT_DIR=$ctrd_root/io.containerd.content.v1.content
-    # the snapshotter's root_path, when set, is where the snapshots really are; else its directory in the root,
-    # which may be a mount of another disk
+    address=$(docker info --format '{{with .Containerd}}{{.Address}}{{end}}' 2>/dev/null)
+    [ -n "$address" ] || return 1
+    # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it
+    listing=$(ctr --address "$address" plugins ls -d 2>/dev/null) || return 1
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
-    root_path=$(sed -n "/^ *\[plugins\.[\"']${plugin//./\\.}[\"']\]/,/^ *\[/s/^ *root_path *= *[\"']\([^\"']\+\)[\"'].*/\1/p" <<<"$config" | head -1)
-    if [ -n "$root_path" ]; then
-        [ -d "$root_path" ] || return 1
-        DISK_DIR=$root_path
-    elif [ -d "$ctrd_root/$plugin" ]; then
-        DISK_DIR=$ctrd_root/$plugin
-    fi
+    DISK_DIR=$(ctrd_export_root "$listing" "$plugin")
+    # a root that is not there is unknown, not the data-root
+    [ -n "$DISK_DIR" ] && [ -d "$DISK_DIR" ] || return 1
+    # pulled image layers land in the content store first, which may be another filesystem than the snapshots
+    content=$(ctrd_export_root "$listing" io.containerd.content.v1.content)
+    [ -z "$content" ] || [ ! -d "$content" ] || CONTENT_DIR=$content
     # Docker's own containerd keeps its root in data-root (<data-root>/containerd/daemon): the data-root fix covers it
     case "$DISK_DIR/" in "$data_root"/* | "${SYSBOX_SETUP_HOST_ROOT:-}$data_root"/*) return 0 ;; esac
-    # name the setting that really sets this containerd's root: a --root argument beats any config
-    if [ -n "$CTRD_ROOT" ]; then where="containerd's --root argument"; else where="\"root\" in $CTRD_CONFIG"; fi
-    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root ($where, or the snapshotter's \"root_path\") to the big disk."
+    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (or the snapshotter's \"root_path\") to the big disk and restart containerd."
 }
 
 tighter_df_kb() {

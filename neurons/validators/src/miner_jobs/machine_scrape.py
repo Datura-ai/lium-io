@@ -15,7 +15,6 @@ import hashlib
 from base64 import b64encode
 from cryptography.fernet import Fernet
 import tempfile
-import tomllib
 
 
 nvmlLib = None
@@ -677,7 +676,6 @@ def run_cmd(cmd):
 
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
-CONTAINERD_CONFIG_PATH = "/etc/containerd/config.toml"
 # the validator's disk gate reads this marker in hard_disk_scrape_error: an unknown root is not a passed check
 CONTAINERD_ROOT_UNKNOWN = "containerd root unknown"
 # /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
@@ -929,7 +927,7 @@ def disk_root_dir(info):
     docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return docker_root_dir
-    return containerd_root(*docker_containerd(info), info.get("Driver") or "overlayfs")
+    return containerd_store_root(info, f"io.containerd.snapshotter.v1.{info.get('Driver') or 'overlayfs'}")
 
 
 def get_content_store_usage():
@@ -938,158 +936,35 @@ def get_content_store_usage():
     info = docker_api_get("/info") or {}
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return None
-    content = containerd_root(*docker_containerd(info), "overlayfs", True)  # positional: the obfuscator renames parameters
+    content = containerd_store_root(info, "io.containerd.content.v1.content")
     data_root = info.get("DockerRootDir") or "/var/lib/docker"
-    if not os.path.isdir(f"/proc/1/root{content}") or any(on_one_filesystem(content, d) for d in (disk_root_dir(info), data_root)):
+    if any(on_one_filesystem(content, d) for d in (disk_root_dir(info), data_root)):
         return None
     return shutil.disk_usage(f"/proc/1/root{content}")
 
 
-def containerd_processes():
-    # argv of every containerd daemon on the host (the executor shares the host's pid namespace). Only those in
-    # the host's own root: a rental's nested containerd reads its container's config, so it would also match the
-    # host config's address and leave two candidates.
-    return [
-        process.info["cmdline"]
-        for process in psutil.process_iter(["cmdline"])
-        if (process.info["cmdline"] or [""])[0].rsplit("/", 1)[-1] == "containerd"
-        and in_host_root(process.pid)
-    ]
-
-
-def in_host_root(pid):
-    try:
-        root, host_root = os.stat(f"/proc/{pid}/root"), os.stat("/proc/1/root")
-    except OSError:
-        return False  # gone, or not readable: not a daemon we can resolve
-    return (root.st_dev, root.st_ino) == (host_root.st_dev, host_root.st_ino)
-
-
-def docker_containerd(info):
-    # (binary, --config, --root) of the containerd Docker uses. Without --containerd Docker runs its own on a
-    # generated --config whose root is <DockerRootDir>/containerd/daemon: /etc/containerd/config.toml and a
-    # leftover /var/lib/containerd say nothing about it. Two daemons: the one on Docker's /info address.
-    daemons = []
-    for argv in containerd_processes():
-        flags, args = {}, iter(argv[1:])
-        for arg in args:
-            name, equals, value = arg.partition("=")
-            name = {"-c": "--config", "-a": "--address"}.get(name, name)
-            if name in ("--config", "--root", "--address"):
-                flags[name] = value if equals else next(args, "")
-        daemons.append(
-            (
-                argv[0],
-                flags.get("--config") or CONTAINERD_CONFIG_PATH,
-                flags.get("--root"),
-                flags.get("--address"),
-            )
-        )
-    if len(daemons) > 1:
-        address = (info.get("Containerd") or {}).get("Address")
-        daemons = [
-            daemon
-            for daemon in daemons
-            if address
-            and same_socket(
-                address,
-                daemon[3]
-                or (containerd_dump(daemon[0], daemon[1]).get("grpc") or {}).get("address"),
-            )
-        ]
-        if len(daemons) != 1:
-            raise RuntimeError(
-                f"{CONTAINERD_ROOT_UNKNOWN}: cannot tell which containerd Docker uses"
-            )
-    if daemons:
-        return daemons[0][:3]
-    # no daemon seen: a Docker-managed address (<exec-root>/containerd/containerd.sock) still names Docker's own
-    # containerd, whose generated config sits beside the socket; the system config would point at a leftover root
+def containerd_store_root(info, plugin):
+    # the root the containerd Docker talks to reports for plugin (its Exports root), asked of that running daemon:
+    # its config files may already name a root it has not restarted onto. Unknown when it cannot be asked.
     address = (info.get("Containerd") or {}).get("Address") or ""
-    if "/docker/containerd/" in address:
-        return "containerd", f"{os.path.dirname(address)}/containerd.toml", None
-    return "containerd", CONTAINERD_CONFIG_PATH, None
-
-
-def same_socket(address, other):
-    # /var/run is /run
-    return bool(other) and address.removeprefix("/var") == other.removeprefix("/var")
-
-
-def containerd_dump(binary, config_path):
-    # the daemon's merged config, imports resolved, as the installer's preflight reads it; {} when it cannot run
-    if not all(re.fullmatch(r"[\w./+-]+", part) for part in (binary, config_path)):
-        return {}  # never handed to a shell
+    if not re.fullmatch(r"[\w./+-]+", address):  # never handed to a shell
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: Docker reports no containerd address")
     try:
-        return tomllib.loads(
-            run_cmd(f"timeout 20 chroot /proc/1/root {binary} --config {config_path} config dump")
-        )
-    except Exception:
-        return {}
-
-
-def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, root=None, snapshotter="overlayfs", content=False):
-    # where containerd's snapshotter keeps container filesystems on the host: its root_path, else its directory in
-    # containerd's effective root (a mount there counts), else that root. A leftover /var/lib/containerd proves
-    # nothing: a root moved in an imported config file leaves it behind, so the default is used only when no config
-    # sets one, and a root that cannot be read raises (CONTAINERD_ROOT_UNKNOWN) instead of measuring it.
-    plugin = f"io.containerd.snapshotter.v1.{snapshotter}"
-    dump = containerd_dump(binary, config_path)
-    dumped = dump.get("root")
-    root_path = ((dump.get("plugins") or {}).get(plugin) or {}).get("root_path")
-    # walked even after a dump: a missing literal import can still dump exit 0 with the default root
-    roots, sections = [], []
-    pending, seen = [config_path], set()
-    try:
-        while pending:
-            path = pending.pop(0)
-            if path in seen:
-                continue
-            seen.add(path)
-            try:
-                # resolved on the host (/var/run -> /run, an imported file linked elsewhere); path stays the logical
-                # one, which relative imports resolve against
-                with open(f"/proc/1/root{host_realpath(path)}") as config_file:
-                    config = tomllib.loads(config_file.read())
-            except FileNotFoundError:
-                if path != CONTAINERD_CONFIG_PATH:
-                    raise
-                config = {}  # no config at all: containerd runs on its default root
-            # containerd keeps an earlier nonempty value over an empty one
-            roots += [config["root"]] if isinstance(config.get("root"), str) and config["root"] else []
-            # a later file's plugin section replaces an earlier one whole, an empty root_path included
-            if isinstance((config.get("plugins") or {}).get(plugin), dict):
-                sections.append(config["plugins"][plugin].get("root_path"))
-            for pattern in config.get("imports") or []:
-                # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
-                pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
-                if "*" not in pattern:
-                    pending.append(pattern)  # literal: containerd opens it, a missing one fails
-                    continue
-                # the directory before the first glob character (*, ? or [) is resolved on the host (conf.d may be an
-                # absolute link elsewhere); matches keep the logical directory, which relative imports resolve against
-                base = re.split(r"[*?[]", pattern, maxsplit=1)[0].rsplit("/", 1)[0]
-                host_base = f"/proc/1/root{host_realpath(base or '/').rstrip('/')}"
-                matches = glob.glob(host_base + pattern[len(base):])
-                # a later file overrides an earlier one, in the order containerd merges them
-                pending += sorted(base + match[len(host_base):] for match in matches)
-    # unreadable, or not TOML containerd would load
-    except (OSError, ValueError, TypeError) as exc:
+        listing = run_cmd(f"timeout 20 chroot /proc/1/root ctr --address {address} plugins ls -d")
+    except Exception as exc:
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
-    root = host_realpath(root or dumped or (roots[-1] if roots else "/var/lib/containerd"))
-    if not os.path.isdir(f"/proc/1/root{root}"):
-        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
-    if content:  # the content store has no root_path of its own: it always sits in the effective root
-        return host_realpath(f"{root}/io.containerd.content.v1.content")
-    if not dump:  # a dump that ran is the merged config: its empty root_path is the default, not a gap to fill
-        root_path = sections[-1] if sections else None
-    if isinstance(root_path, str) and root_path:
-        root_path = host_realpath(root_path)
-        if not os.path.isdir(f"/proc/1/root{root_path}"):
-            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: snapshotter root_path {root_path!r} is not on the host")
-        return root_path
-    snapshots = host_realpath(f"{root}/{plugin}")
-    return snapshots if os.path.isdir(f"/proc/1/root{snapshots}") else root
+    kind = name = None
+    for words in (line.split() for line in listing.splitlines()):
+        if words[:1] == ["Type:"]:
+            kind, name = words[-1], None
+        elif words[:1] == ["ID:"]:
+            name = f"{kind}.{words[-1]}"
+        elif name == plugin and len(words) == 2 and words[0] == "root":
+            root = host_realpath(words[1])
+            if not os.path.isdir(f"/proc/1/root{root}"):
+                raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
+            return root
+    raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: containerd reports no root for {plugin}")
 
 
 def host_realpath(path):
