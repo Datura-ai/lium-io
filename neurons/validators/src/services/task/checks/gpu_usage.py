@@ -25,6 +25,7 @@ from services.const import (
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
+from services.gpu_reset import renter_gpu_resets
 from services.redis_service import FILLER_IMAGE_DIGESTS_PREFIX, FILLER_IMAGE_DIGESTS_TTL_SECONDS
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -39,6 +40,7 @@ from services.gpu_wedge import (
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,8 @@ class PodContainerRental:
     # Completes "no live rental on this node uses it: ..." in the remediation.
     provider_facing_rental_status: str
     rental_closed_at: datetime | None = None
+    # the node the backend's closed-rental record names; None when the record names none
+    rental_executor_id: str | None = None
 
 
 class GpuUsageCheck:
@@ -97,6 +101,18 @@ class GpuUsageCheck:
     async def run(self, ctx: Context) -> CheckResult:
         gpu_details = ctx.state.gpu_details
         gpu_processes = ctx.state.gpu_processes
+        # DAH-4658: a renter is resetting their pod's GPUs: neither judge nor cure those meanwhile; the node's
+        # other GPUs (another tenant's) still are. A mark that names no GPU covers the whole node.
+        if resets := await renter_gpu_resets(ctx.services.redis, ctx.miner_hotkey, ctx.executor.uuid):
+            if all(mark.get("gpu_uuids") for mark in resets):
+                resetting = {uuid for mark in resets for uuid in mark["gpu_uuids"]}
+                gpu_details = [detail for detail in gpu_details if detail.get("uuid") not in resetting]
+            else:
+                gpu_details = []
+            if not gpu_details:
+                return CheckResult(
+                    passed=True, event=render_message(Msg.GPU_RESET_IN_PROGRESS, ctx=ctx, check_id=self.check_id)
+                )
 
         ghost_result = await self._detect_and_cure_ghost_gpus(ctx, gpu_details, gpu_processes)
         if ghost_result is not None:
@@ -309,6 +325,14 @@ class GpuUsageCheck:
             # This node's portal page shows no rental for a pod registered elsewhere, so the usual
             # "confirm, then remove" advice would clear the removal of a live rental's container.
             remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
+        elif (
+            orphan.pod_id is None
+            or orphan.rental_closed_at is None
+            or orphan.rental_executor_id is None
+            or str(orphan.rental_executor_id) != str(ctx.executor.uuid)
+        ):
+            # the stale cleanup removes only a container whose ended rental the backend places on this node
+            remediation_template = Msg.ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION
         else:
             remediation_template = Msg.ORPHANED_CONTAINER.remediation
         event = render_message(
@@ -432,7 +456,7 @@ def lium_workload_containers(ctx: Context) -> set[str]:
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
-    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(pod.docker_container_name for pod in rented_executor.pods)
     containers.discard("")
@@ -455,8 +479,8 @@ def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
 
 
 async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
-    """The fillers running another image than the one the validator started them from; empty
-    while enforcement is off. A filler with no readable record or missing from the scrape is not
+    """The fillers running another image than the one the validator started them from (judged as
+    foreign GPU work). A filler with no readable record or missing from the scrape is not
     judged; a scraped empty digest (a locally built image has no RepoDigests) is a mismatch."""
     scraped = {
         str(entry.get("name") or ""): str(entry.get("digest") or "")
@@ -481,13 +505,12 @@ async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
             off_image.append(name)
     if off_image:
         logger.warning(
-            "FILLER_IMAGE_MISMATCH executor=%s miner=%s containers=%s enforced=%s",
+            "FILLER_IMAGE_MISMATCH executor=%s miner=%s containers=%s enforced=True",
             ctx.executor.uuid,
             ctx.miner_hotkey,
             off_image,
-            settings.FILLER_IMAGE_IDENTITY_ENFORCEMENT_ENABLED,
         )
-    return off_image if settings.FILLER_IMAGE_IDENTITY_ENFORCEMENT_ENABLED else []
+    return off_image
 
 
 def carries_a_rental_prefix(container_name: str) -> bool:
@@ -624,7 +647,7 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
 
-    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid) if ctx.state.rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     rented_at_run_start: bool = rented_executor is not None and any(
         pod.pod_id == pod_id for pod in rented_executor.pods
     )
@@ -651,7 +674,9 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             status = (
                 f"its rental's close time is {_in_minutes(-since_closed)} ahead of the validator's clock"
             )
-            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+            return PodContainerRental(
+                container_name, pod_id, PodRentalState.ORPHAN, status, closed_at, pod_rental.executor_id
+            )
         # A close time slightly ahead of this clock is backend-validator skew on a rental that just ended.
         status = (
             f"its rental ended {_in_minutes(since_closed)} ago"
@@ -659,7 +684,9 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             else "its rental ended just now"
         )
         if since_closed >= timedelta(minutes=RENTAL_TEARDOWN_GRACE_MINUTES):
-            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+            return PodContainerRental(
+                container_name, pod_id, PodRentalState.ORPHAN, status, closed_at, pod_rental.executor_id
+            )
         if rented_at_run_start:
             return PodContainerRental(container_name, pod_id, PodRentalState.ENDED_DURING_RUN, status, closed_at)
         # The backend deletes the pod row as it closes the rental, so a closed rental usually comes
@@ -695,9 +722,12 @@ def _the_answer_is_about_this_node(ctx: Context, owning_executor_id: str | None)
     nodes could name a squatter container after a live run of their honest one. A backend that
     predates the field sends nothing, and then the fleet snapshot is the only owner test we have.
     """
-    if owning_executor_id is None:
-        return True
-    return str(owning_executor_id) == str(ctx.executor.uuid)
+    if owning_executor_id is not None and str(owning_executor_id) != str(ctx.executor.uuid):
+        return False
+    # the UUID is the miner's word: a snapshot that lists it as another miner's rental elsewhere wins
+    rented_data = ctx.state.rented_data
+    listed = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    return listed is None or rental_of_this_node(ctx) is not None
 
 
 def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:

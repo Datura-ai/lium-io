@@ -200,7 +200,8 @@ def rental_run_spec_log_fields(run_spec: ContainerRunSpec) -> dict:
     return {
         "container_name": run_spec.name,
         "image": run_spec.image,
-        "command_argv": list(run_spec.command),
+        # the count only: the command can be the renter's startup_commands
+        "command_argc": len(run_spec.command),
         "environment_keys": sorted(run_spec.environment),
         "ports": [
             {

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import socket
+import time
 from typing import Any
 
 import asyncssh
@@ -30,6 +31,14 @@ logger = logging.getLogger(__name__)
 # connect, key exchange AND authentication against it, none of which carry over to the next
 # attempt, so a host slow enough to need 6s would fail every single try. An attempt is shortened
 # only when less than 12s of the deadline is left, which is time it could not have used anyway.
+# DAH-5419: `docker run` over SSH has no timeout of its own; a stuck daemon held it until the task was dropped.
+# Long enough for a first pull of the DinD image. It is enforced on the node (`timeout -s KILL`): cancelling only
+# our SSH wait leaves the remote CLI running, and it could create the container after the removal in `finally`.
+DIND_RUN_TIMEOUT_SECONDS = 180
+# the shortest create a cycle short on time still gets; the caller's deadline keeps time for the checks after this one
+DIND_MIN_RUN_TIMEOUT_SECONDS = 30
+# our own wait on top of it, for an SSH channel that hangs after the remote command is gone
+DIND_RUN_SSH_GRACE_SECONDS = 30
 DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
@@ -165,12 +174,20 @@ class DindVerifier:
         container_name_prefix: str,
         sysbox: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
-        """Verify DinD on port."""
+        """Verify DinD on port. `deadline_monotonic`: the cycle time budget the create must end within."""
         name = f"{container_name_prefix}_{port.external}"
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
+        run_timeout = DIND_RUN_TIMEOUT_SECONDS
+        if deadline_monotonic is not None:
+            left = int(deadline_monotonic - time.monotonic())
+            run_timeout = max(DIND_MIN_RUN_TIMEOUT_SECONDS, min(run_timeout, left))
+            if run_timeout < DIND_RUN_TIMEOUT_SECONDS:
+                log_ctx["run_timeout"] = run_timeout
         created = False
         sshd_answered = False
+        sysbox_timed_out = False
 
         try:
             logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
@@ -179,7 +196,9 @@ class DindVerifier:
             cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
             logger.debug("run: %s...", cmd[:100])
 
-            result = await ssh_client.run(cmd)
+            cmd = f"timeout -s KILL {run_timeout} {cmd}"
+            async with asyncio.timeout(run_timeout + DIND_RUN_SSH_GRACE_SECONDS):
+                result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                 # carried whether or not the probe asked for sysbox-runc: the executor's own sysbox
@@ -211,7 +230,9 @@ class DindVerifier:
             ) as ssh:
                 sshd_answered = True
                 if sysbox:
-                    sysbox = await self._sysbox_works(ssh, log_ctx)
+                    measured = await self._sysbox_works(ssh, log_ctx)
+                    sysbox_timed_out = measured is None
+                    sysbox = measured is True
 
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
@@ -220,6 +241,7 @@ class DindVerifier:
                 log_text=f"dind: check ok port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
+                sysbox_timed_out=sysbox_timed_out,
             )
 
         except Exception as e:
@@ -249,6 +271,7 @@ class DindVerifier:
                 sysbox_runtime=sysbox,
                 port=port,
                 error=error,
+                sshd_never_answered=created and not sshd_answered and isinstance(e, _NODE_SIDE_ERRORS),
             )
         finally:
             # One removal on every way out — ok, failed, raised, and cancelled (the validation
@@ -266,8 +289,12 @@ class DindVerifier:
                 _m("DinD container removal failed", extra=get_extra_info({**log_ctx, "error": str(e)}))
             )
 
-    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
-        """Run hello-world inside the DinD container; True when it exits 0 within 30s.
+    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool | None:
+        """Run hello-world inside the DinD container; True when it exits 0 within 30s, None when it timed out.
+
+        A timeout measured nothing: on a busy rented host (30 Oct, pod c0877f60) it is load, not a missing
+        Sysbox, and reading it as False forgot the node's verified Sysbox, so the renter's next launches ran
+        their Docker-in-Docker image without Sysbox and Docker could not start inside.
 
         daturaai/dind loads hello-world into the inner dockerd at start (DAH-1959), so no registry
         pull is needed; when that load failed, docker falls back to a Docker Hub pull.
@@ -275,7 +302,9 @@ class DindVerifier:
         try:
             result = await asyncio.wait_for(ssh.run("docker run --rm hello-world"), timeout=30)
         except asyncio.TimeoutError:
-            error_msg = "sysbox check timed out after 30s"
+            timed_out = {**log_ctx, "error": "sysbox check timed out after 30s"}
+            logger.warning(_m("Sysbox check failed", extra=get_extra_info(timed_out)))
+            return None
         else:
             if result.exit_status == 0:
                 uid_map = await self._read_uid_map(ssh)
@@ -450,6 +479,7 @@ class DindProbe:
         container_name_prefix: str,
         sysbox_runtime: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
         return await self.verifier.verify(
             port,
@@ -458,4 +488,5 @@ class DindProbe:
             container_name_prefix=container_name_prefix,
             sysbox=sysbox_runtime,
             log_ctx=log_ctx,
+            deadline_monotonic=deadline_monotonic,
         )

@@ -2,10 +2,10 @@
 
 **[Provider Documentation](https://docs.lium.io/providers)** — docs.lium.io calls a miner a *provider*, the
 central miner the *self-hosted provider* ([setup guide](https://docs.lium.io/providers/self-hosted-provider)),
-and an executor a *node*. Most providers do not run this service themselves: opting into the
-[Lium.io Central Provider Server](https://docs.lium.io/providers/provider-configuration) from the
-[Provider Portal](https://provider.lium.io) lets Lium run it for you, and nodes are then set up with
-`lium mine` ([Node Quickstart](https://docs.lium.io/providers/nodes/quickstart)).
+and an executor a *node*. Most providers do not run this service: the
+[Lium.io Central Provider Server](https://docs.lium.io/providers/provider-configuration) runs it for them and is
+ON by default in the [Provider Portal](https://provider.lium.io); nodes are set up with `lium mine`
+([Node Quickstart](https://docs.lium.io/providers/nodes/quickstart)).
 
 ## Overview
 
@@ -160,6 +160,8 @@ Executors are machines running on GPUs that you can add to your central miner. T
 
     **Optional parameters:**
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
+
+    **Tier:** a node added with this command starts on the **Spot** tier; the command has no tier option. A node you deleted in the Provider Portal and add again at the same IP and port within 7 days keeps its earlier tier. To move it to **Secure**, open the node's page in the Provider Portal and click **Change Tier** once the node has been listed for 7 days.
 
 ### List Executors
 

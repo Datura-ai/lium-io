@@ -212,6 +212,9 @@ class DummyRedisService:
     async def expire(self, key: str, seconds: int):
         pass
 
+    async def persist(self, key: str):
+        pass
+
     async def write_atomically(self, writes):
         for name, args, kwargs in writes.ops:
             await getattr(self, name)(*args, **kwargs)
@@ -246,7 +249,9 @@ class VerifyXResult:
 class DummyVerifyXService:
     """Mock VerifyX validation service."""
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+    ):
         return VerifyXResult()
 
 
