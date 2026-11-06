@@ -1,8 +1,9 @@
 """Spot-node pay and the secure floor.
 
 Spot: an idle spot node running Lium fillers is paid min(1.0 x its GPU configuration's average
-filler revenue per GPU-hour, its secure rate before cap dilution), outside the buckets, and a GPU
-model's spot nodes together at most what its fillers earn per hour (DAH-5128).
+filler revenue per GPU-hour, 0.8 x its secure rate before secure cap dilution), outside the secure
+buckets, diluted above the secure cap of its GPU model and bucket in a spot pool of its own
+(DAH-5944), and a GPU model's spot nodes together at most what its fillers earn per hour (DAH-5128).
 Secure floor: an idle secure node's cap-diluted rate is raised to 1.0 x that average, even
 above its listed rate. The two factors are separate constants. No cap (owner rule): spot pay and floor top-ups are paid on top of the
 burn-capped rental share, up to the whole incentive pool.
@@ -241,7 +242,8 @@ async def test_spot_nodes_of_a_model_share_what_its_fillers_earn(caplog):
     spots = [_spot(f"spot-{i}", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=earnings) for i in range(4)]
     secure = _node("secure-1")
 
-    incentive = await _run([*spots, secure])
+    # a cap that fits all four spot nodes, so only the filler-earnings pool scales them
+    incentive = await _run([*spots, secure], _config(cap=4 * 8))
 
     assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(earnings)
     for spot in spots:
@@ -261,7 +263,7 @@ async def test_a_model_s_spot_pool_does_not_dilute_another_model():
     a100 = "NVIDIA A100-SXM4-80GB"
     config = IncentiveConfig(
         rental_incentive_gpu_types=["H100", "A100"],
-        max_unrented_gpus={"H100": {8: BUCKET_CAP}, "A100": {8: BUCKET_CAP}},
+        max_unrented_gpus={"H100": {8: 2 * 8}, "A100": {8: BUCKET_CAP}},
         rental_prices_per_hour={H100: HOURLY_RATE, a100: HOURLY_RATE},
         gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
     )
@@ -355,18 +357,73 @@ async def test_spot_whose_config_has_no_average_gets_zero():
 
 
 @pytest.mark.asyncio
-async def test_spot_has_no_cap_and_does_not_dilute_secure_nodes():
+async def test_spot_over_its_cap_is_diluted_and_does_not_dilute_secure_nodes():
+    # DAH-5944: four 8x spot nodes in the 8-GPU cap of their own pool; one 8x secure node in its own
     spots = [_spot(f"spot-{i}", filler_revenue_per_gpu_hour=2.0) for i in range(4)]
     secure = _node("secure-1")
 
     incentive = await _run([*spots, secure])
 
-    # one 8x secure node fills the 8-GPU cap exactly; four 8x spot nodes sit outside it
     assert secure.unrented_cap_multiplier == 1.0
     assert secure.effective_rate == HOURLY_RATE
-    for spot in spots:
-        assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
     assert incentive.unrented_count_by_bucket[("H100", 8)] == 8
+    assert incentive.spot_count_by_bucket[("H100", 8)] == 32
+    for spot in spots:
+        assert spot.unrented_cap_multiplier == pytest.approx(8 / 32)
+        assert spot.cap_dilution_applied is True
+        assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 * 8 / 32)
+    [line] = _logged(spots[0], SPOT_LINE)
+    assert (line["total_unrented_by_gpu_type"], line["max_cap"], line["count_bucket"]) == (
+        32,
+        BUCKET_CAP,
+        8,
+    )
+    assert line["unrented_cap_multiplier"] == pytest.approx(0.25)
+    assert any("Spot cap dilution applied: 32 idle Spot GPUs" in m for m in _messages(spots[0], SPOT_LINE))
+    _assert_pool_pays_exactly(incentive)
+
+
+@pytest.mark.asyncio
+async def test_spot_at_its_cap_is_not_diluted():
+    spot = _spot(filler_revenue_per_gpu_hour=2.0)
+
+    await _run([spot])
+
+    assert spot.unrented_cap_multiplier == 1.0
+    assert spot.cap_dilution_applied is False
+    assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
+    assert not any("Spot cap dilution applied" in m for m in _messages(spot, SPOT_LINE))
+
+
+@pytest.mark.asyncio
+async def test_secure_nodes_over_their_cap_do_not_dilute_spot():
+    secures = [_node(f"secure-{i}") for i in range(4)]
+    spot = _spot(filler_revenue_per_gpu_hour=2.0)
+
+    incentive = await _run([*secures, spot])
+
+    assert secures[0].unrented_cap_multiplier == pytest.approx(8 / 32)
+    assert incentive.spot_count_by_bucket[("H100", 8)] == 8
+    assert spot.unrented_cap_multiplier == 1.0
+    assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
+
+
+@pytest.mark.asyncio
+async def test_the_filler_earnings_pool_scales_the_cap_diluted_spot_rates():
+    # cap 8 of 16 spot GPUs halves each rate to 1.0; 16 GPUs x 1.0 = 16 $/h against 4 $/h of filler earnings
+    spots = [
+        _spot(f"spot-{i}", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=4.0)
+        for i in range(2)
+    ]
+
+    incentive = await _run(spots)
+
+    for spot in spots:
+        assert spot.unrented_cap_multiplier == pytest.approx(0.5)
+        assert spot.spot_pool_multiplier == pytest.approx(4.0 / 16.0)
+        assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 * 0.5 * 4.0 / 16.0)
+    assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(4.0)
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio

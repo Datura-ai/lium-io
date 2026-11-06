@@ -791,16 +791,25 @@ class MinerLogLine(BaseModel):
         pay_factor: float,
         secure_share: float = 1.0,
     ) -> MinerLogLine:
+        cap_note: str = (
+            f" Spot cap dilution applied: {result.total_unrented_by_gpu_type} idle Spot GPUs of this GPU model "
+            f"in the {result.count_bucket}-GPU bucket against a cap of {result.max_cap}, so the rate is "
+            f"multiplied by {result.unrented_cap_multiplier:.4f}."
+            if result.cap_dilution_applied
+            else ""
+        )
         return MinerLogLine(
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
                 "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
                 f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate) "
                 f"(secure_rate = {secure_share:g} * hourly_rate * sysbox_multiplier * driver_multiplier) "
+                "* unrented_cap_multiplier (min(spot GPUs, max_cap) / spot GPUs: idle Spot GPUs of the "
+                "GPU model and bucket share the Secure cap, in a pool of their own) "
                 "* spot_pool_multiplier (below 1 when the GPU model's spot nodes together would be paid "
                 "more than its fillers earn per hour, filler_revenue_usd_per_hour); "
                 "paid on top of the rental share (paid_fraction < 1: the pool had room for only "
-                "that part of spot pay and floor top-ups)"
+                "that part of spot pay and floor top-ups)" + cap_note
             ),
             fields={
                 "hotkey": hotkey,
@@ -813,6 +822,11 @@ class MinerLogLine(BaseModel):
                 "sysbox_multiplier": result.sysbox_multiplier,
                 "driver_multiplier": result.driver_multiplier,
                 "secure_rate": secure_rate,
+                "count_bucket": result.count_bucket,
+                "max_cap": result.max_cap,
+                "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
+                "cap_dilution_applied": result.cap_dilution_applied,
                 "filler_revenue_usd_per_hour": result.filler_revenue_usd_per_hour,
                 "spot_pool_multiplier": result.spot_pool_multiplier,
                 "effective_rate": result.effective_rate,
