@@ -109,6 +109,15 @@ def no_docker_hub_digest_on_rent_path():
 
 
 @pytest.fixture(autouse=True)
+def no_registry_lookup_for_executor_build():
+    """The image check asks the registry whether an outdated digest is ours; no answer keeps tests offline."""
+    with patch(
+        "services.task.checks.executor_image.executor_build_published", AsyncMock(return_value=None)
+    ) as lookup:
+        yield lookup
+
+
+@pytest.fixture(autouse=True)
 def pod_ssh_answers_on_create_path(request):
     """create_container connects to the pod's mapped SSH port before ContainerCreated; tests have no pod there.
     test_pod_ssh_before_created.py covers the check itself (marker real_pod_ssh_check)."""

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -142,3 +143,61 @@ async def test_outdated_executor_under_another_miners_rental_on_a_different_endp
     result = await ExecutorImageCheck().run(context)
 
     assert result.passed is False
+
+
+@pytest.mark.asyncio
+async def test_unrented_executor_on_a_build_we_never_published_fails_even_warn_only(
+    warn_only, no_registry_lookup_for_executor_build
+):
+    no_registry_lookup_for_executor_build.return_value = False
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is False
+    assert result.updates["state"].executor_image_report.status is ImageVerdict.UNOFFICIAL
+    assert result.event.reason_code == "EXECUTOR_IMAGE_UNOFFICIAL"
+    no_registry_lookup_for_executor_build.assert_awaited_once_with(STALE_DIGEST)
+
+
+@pytest.mark.asyncio
+async def test_older_published_build_stays_a_warning(warn_only, no_registry_lookup_for_executor_build):
+    no_registry_lookup_for_executor_build.return_value = True
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is True
+    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
+
+
+@pytest.mark.asyncio
+async def test_current_build_needs_no_registry_lookup(warn_only, no_registry_lookup_for_executor_build):
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(), rented_data=SimpleNamespace(executors={})),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is True
+    no_registry_lookup_for_executor_build.assert_not_awaited()
+
+
+@pytest.mark.parametrize("rented", [False, True])
+def test_score_calculator_zeroes_an_unofficial_build_even_warn_only(warn_only, rented: bool):
+    report = replace(policy().report(STALE_DIGEST), status=ImageVerdict.UNOFFICIAL)
+    context = make_context(
+        state=build_state(gpu_model="NVIDIA H200", executor_image_report=report),
+        collateral_deposited=True,
+    )
+
+    actual_score, _, _ = calculate_scores(context, rented)
+
+    assert actual_score == 0.0

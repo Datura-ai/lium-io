@@ -108,15 +108,13 @@ class DefaultIncentive(BaseIncentive):
 
     @staticmethod
     def _record_outdated_image_reason(result: JobResult) -> bool:
-        """True when an OUTDATED executor image excludes this result from both pools.
-
-        Only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, the report still
-        travels on the result and its specs, but no reason is recorded and nothing is zeroed.
+        """True when the executor image excludes this result from both pools: always for an UNOFFICIAL
+        image, and for an OUTDATED one only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, an
+        OUTDATED report still travels on the result and its specs, but nothing is recorded or zeroed.
         """
-        if not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
-            return False
         report = result.executor_image_report or {}
-        if report.get("status") != "OUTDATED":
+        status = report.get("status")
+        if status != "UNOFFICIAL" and not (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and status == "OUTDATED"):
             return False
         if not any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value

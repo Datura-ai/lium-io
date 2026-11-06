@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from core.config import settings
+from services.default_docker_image_digest_service import executor_build_published
 from services.executor_image_policy import (
     ImageVerdict,
     normalize_sha256_digest,
@@ -76,13 +77,15 @@ class ExecutorImageCheck:
             return CheckResult(passed=True, event=event)
 
         report = snapshot.report(observed_executor_digest(ctx.state.specs))
+        if report.status is ImageVerdict.OUTDATED and await executor_build_published(report.observed_digest) is False:
+            report = replace(report, status=ImageVerdict.UNOFFICIAL)
         updated_state = replace(ctx.state, executor_image_report=report)
         what = report.as_dict()
 
         if report.status is ImageVerdict.CURRENT:
             event = render_message(Msg.CURRENT, ctx=ctx, check_id=self.check_id, what=what)
             passed = True
-        elif not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
+        elif report.status is ImageVerdict.OUTDATED and not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
             # Warning only (DAH-2701 paused until DAH-3419 restores auto-update): the verdict
             # and both digests are logged, the check passes, and the score is left alone.
             passed = True
@@ -102,7 +105,7 @@ class ExecutorImageCheck:
             is_rented = rented_executor is not None and len(rented_executor.pods) > 0
             passed = is_rented
             event = render_message(
-                Msg.OUTDATED,
+                Msg.UNOFFICIAL if report.status is ImageVerdict.UNOFFICIAL else Msg.OUTDATED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what=what,
