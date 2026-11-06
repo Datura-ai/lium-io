@@ -12983,7 +12983,7 @@ class DockerService:
             _m(
                 "Hung GPU check on reboot done",
                 extra=get_extra_info(
-                    {**default_extra, "seconds": round(time.monotonic() - started, 2), "hung": len(result.hung_uuids), "shadow": shadow}
+                    {**default_extra, "seconds": round(time.monotonic() - started, 2), "hung": len(result.hung_uuids), "shadow": shadow, "detail": result.detail}
                 ),
             )
         )
