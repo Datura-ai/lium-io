@@ -479,25 +479,16 @@ _NO_CTR_DISKS = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STU
 @pytest.mark.parametrize(
     "files",
     [
-        {f"{SNAPSHOTS}/.keep": ""},  # the system containerd's built-in root, on the 436 GB root disk
-        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'version = 2\nroot = "/var/lib/containerd"\n'},
-    ],
-)
-def test_a_host_without_ctr_is_measured_at_containerds_built_in_root(tmp_path, files):
-    files = {**files, **_containerd_process()}
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
-    assert rc == 1, out
-    assert "SKIP " not in out
-
-
-@pytest.mark.parametrize(
-    "files",
-    [
         # the root moved: the built-in folder is a leftover and the 14 TB data-root says nothing of the store
         {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'root = "/small/containerd"\n'},
         {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": '  root_path = "/small/snapshots"\n'},
         {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'imports = ["/opt/containerd/*.toml"]\n'},
         {},  # no store at a built-in root
+        # no --root: the config file on disk may not be what the daemon loaded (rewritten or deleted since)
+        {f"{SNAPSHOTS}/.keep": "", **_containerd_process()},
+        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'version = 2\nroot = "/var/lib/containerd"\n',
+         **_containerd_process()},
+        {f"{SNAPSHOTS}/.keep": "", "opt/ctrd.toml": 'root = "/var/lib/containerd"\n', **_containerd_process("-c", "/opt/ctrd.toml")},
     ],
 )
 def test_a_host_without_ctr_whose_store_cannot_be_told_is_skipped_not_passed(tmp_path, files):
@@ -517,7 +508,8 @@ def test_a_host_without_ctr_is_measured_at_the_running_containerds_root_flag(tmp
 def test_a_rentals_containerd_on_the_same_socket_path_is_not_read_as_dockers(tmp_path):
     # a rental's own containerd names a small --root in its own mount namespace; the host's has no flags
     files = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
-             **_containerd_process("--root", "/small/containerd", pid=300, mnt="mnt:[7]"), **_containerd_process()}
+             **_containerd_process("--root", "/small/containerd", pid=300, mnt="mnt:[7]"),
+             **_containerd_process("--root", "/var/lib/containerd")}
     rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
     assert f"/small/containerd/{_OVERLAYFS}" not in out, out
     assert SNAPSHOTS in out, out
@@ -529,7 +521,7 @@ def test_a_host_containerd_whose_config_serves_another_address_is_not_read_as_do
              "run/docker/containerd/containerd.toml": '[grpc]\n  address = "/run/docker/containerd/containerd.sock"\n',
              **_containerd_process("--config", "/run/docker/containerd/containerd.toml", "--root", "/small/containerd",
                                    pid=300),
-             **_containerd_process()}
+             **_containerd_process("--root", "/var/lib/containerd")}
     rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
     assert f"/small/containerd/{_OVERLAYFS}" not in out, out
     assert SNAPSHOTS in out, out

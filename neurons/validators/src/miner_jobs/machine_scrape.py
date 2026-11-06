@@ -954,25 +954,20 @@ def containerd_store_root(info, plugin):
     except Exception as exc:
         if "proc.returncode=127" not in str(exc):
             raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
-        # no ctr on the host (a Docker install without containerd's CLI): the built-in root of the system
-        # containerd, else of Docker's own one; unknown when containerd's config moves the root, as the built-in
-        # folder may be a leftover. The running daemon's own --root and --config flags are read off its process.
-        data_root = info.get("DockerRootDir") or "/var/lib/docker"
+        # no ctr on the host (a Docker install without containerd's CLI): only the running daemon's own --root counts.
+        # A config file on disk may not be what it loaded (rewritten or deleted since), so without --root it is unknown.
         argv = running_containerd_argv(address)
         if argv is None:  # the built-in folder may be a leftover of a containerd that is not Docker's
             raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no host containerd serves {address}")
-        # read first: a snapshotter root_path or imports in the config still move the store under a --root
-        named = containerd_config_root(containerd_flag(argv, "config", "c"), data_root)
         flag_root = containerd_flag(argv, "root")
-        if flag_root:
-            root = host_realpath(flag_root.rstrip("/"))
-            if not os.path.isdir(f"/proc/1/root{root}/{plugin}"):
-                raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no {plugin} under containerd's --root")
-            return f"{root}/{plugin}"
-        for root in [f"{named}/{plugin}"] if named else (f"/var/lib/containerd/{plugin}", f"{data_root}/containerd/daemon/{plugin}"):
-            if os.path.isdir(f"/proc/1/root{root}"):
-                return root
-        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no containerd store at its built-in root")
+        if not flag_root:
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and containerd runs without --root")
+        # a snapshotter root_path or imports in the config still move the store under a --root
+        containerd_config_root(containerd_flag(argv, "config", "c"), info.get("DockerRootDir") or "/var/lib/docker")
+        root = host_realpath(flag_root.rstrip("/"))
+        if not os.path.isdir(f"/proc/1/root{root}/{plugin}"):
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no {plugin} under containerd's --root")
+        return f"{root}/{plugin}"
     kind = name = None
     for words in (line.split() for line in listing.splitlines()):
         if words[:1] == ["Type:"]:

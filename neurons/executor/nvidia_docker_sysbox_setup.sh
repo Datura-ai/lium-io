@@ -464,7 +464,7 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
-CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (Docker names no containerd address, or that running containerd does not report its root)."
+CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (Docker names no containerd address, or that running containerd does not report its root). Without containerd's ctr CLI on the host, containerd must run with an explicit --root."
 
 ctrd_export_root() {
     # the root the running containerd ($1: its plugin listing) reports for plugin $2; its config files may name a
@@ -554,27 +554,21 @@ resolve_disk_dir() {
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
     if ! command -v ctr &>/dev/null; then
-        # no ctr (a Docker install without containerd's CLI): the running daemon's --root, else the built-in root of
-        # the system containerd, else of Docker's own one; unknown when its config (--config, else the default file)
-        # moves the root, as the built-in folder may be a leftover
+        # no ctr (a Docker install without containerd's CLI): only the running daemon's own --root counts. A config file
+        # on disk may not be what it loaded (rewritten or deleted since), so without --root the store is unknown
         local flag_root config
         ctrd_running_argv "$address" || return 1
         # none on Docker's socket: the built-in folder may be a leftover of a containerd that is not Docker's
         [ "${#CTRD_ARGV[@]}" -gt 0 ] || return 1
-        # read first: a snapshotter root_path or imports in the config still move the store under a --root
+        flag_root=$(ctrd_flag root "" "${CTRD_ARGV[@]}") && [ -n "$flag_root" ] || return 1
+        # a snapshotter root_path or imports in the config still move the store under a --root
         if config=$(ctrd_flag config c "${CTRD_ARGV[@]}"); then
             [ -f "$(host_path "$config")" ] || return 1   # its --config file is gone: the daemon keeps what it loaded
         else
             config=/etc/containerd/config.toml
         fi
         ctrd_config_moves_root "$config" && return 1
-        if flag_root=$(ctrd_flag root "" "${CTRD_ARGV[@]}"); then
-            [ -n "$flag_root" ] || return 1
-            DISK_DIR=$(host_path "${flag_root%/}/$plugin")
-        else
-            DISK_DIR=$(host_path "/var/lib/containerd/$plugin")
-            [ -d "$DISK_DIR" ] || DISK_DIR=$data_root/containerd/daemon/$plugin
-        fi
+        DISK_DIR=$(host_path "${flag_root%/}/$plugin")
         listing=""
     else
         # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it

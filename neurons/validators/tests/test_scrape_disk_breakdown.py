@@ -696,26 +696,6 @@ def _containerd_config(text, path="/etc/containerd/config.toml"):
 
 
 @pytest.mark.parametrize(
-    "config, host_dirs, expected",
-    [
-        (None, {_SNAPSHOTS, "/proc/1/root/data/docker"}, _ROOT_PARTITION),  # the system containerd's built-in root
-        ('version = 2\nroot = "/var/lib/containerd"\n', {_SNAPSHOTS}, _ROOT_PARTITION),  # the default named
-        (None, {_DAEMON_SNAPSHOTS, "/proc/1/root/data/docker"}, _DOCKER_PARTITION),  # Docker's own containerd
-    ],
-)
-def test_a_host_without_ctr_is_measured_at_containerds_built_in_root(
-    scrape: dict, monkeypatch, config, host_dirs, expected
-) -> None:
-    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
-    scrape["run_cmd"] = _no_ctr
-    scrape["open"] = _containerd_config(config)
-    paths = {_SNAPSHOTS: _ROOT_PARTITION, _DAEMON_SNAPSHOTS: _DOCKER_PARTITION, "/proc/1/root/data/docker": _DOCKER_PARTITION}
-    _stub_filesystem(scrape, monkeypatch, host_dirs=host_dirs, usage_by_path=paths)
-
-    assert scrape["get_host_disk_usage"]() == expected
-
-
-@pytest.mark.parametrize(
     "config, host_dirs",
     [
         # the root moved to a small disk: the built-in folder on the big disk is a leftover, never a pass
@@ -725,6 +705,10 @@ def test_a_host_without_ctr_is_measured_at_containerds_built_in_root(
         (None, {"/proc/1/root/data/docker"}),  # no store at a built-in root: never the data-root instead
         # a non-UTF-8 byte appended to a comment must not hide the moved root
         (b'root = "/small/containerd"\n# \xff\n', {_SNAPSHOTS, "/proc/1/root/data/docker"}),
+        # no --root: whatever config is on disk now may not be what the daemon loaded (rewritten or deleted later)
+        (None, {_SNAPSHOTS, "/proc/1/root/data/docker"}),
+        ('version = 2\nroot = "/var/lib/containerd"\n', {_SNAPSHOTS}),
+        (None, {_DAEMON_SNAPSHOTS, "/proc/1/root/data/docker"}),
     ],
 )
 def test_a_host_without_ctr_whose_store_cannot_be_told_is_unknown(scrape: dict, monkeypatch, config, host_dirs) -> None:
@@ -750,9 +734,6 @@ _SMALL_SNAPSHOTS = f"/proc/1/root/small/containerd/{_OVERLAYFS}"
         # started with --root and no config: its flag root is measured, never the stale built-in folder
         (["/usr/bin/containerd", "--root", "/small/containerd"], None, _SMALL),
         (["containerd", "--root=/small/containerd"], None, _SMALL),
-        # Docker's own containerd, whose generated --config names data-root's daemon folder
-        (["containerd", "--config", "/run/docker/containerd/containerd.toml"], 'root = "/data/docker/containerd/daemon"\n',
-         _DOCKER_PARTITION),
     ],
 )
 def test_a_host_without_ctr_reads_the_running_containerds_flags(scrape: dict, monkeypatch, argv, config, expected) -> None:
@@ -774,6 +755,27 @@ def test_a_containerd_root_flag_does_not_skip_a_config_that_moves_the_snapshots(
     scrape["running_containerd_argv"] = lambda address: ["containerd", "--root", "/var/lib/containerd"]
     scrape["open"] = _containerd_config('[plugins."io.containerd.snapshotter.v1.overlayfs"]\n  root_path = "/small/snapshots"\n')
     _stub_filesystem(scrape, monkeypatch, host_dirs={_SNAPSHOTS}, usage_by_path={_SNAPSHOTS: _BIG})
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["containerd_store_root"](_SNAPSHOTTER_INFO, _OVERLAYFS)
+
+
+@pytest.mark.parametrize(
+    "argv, config",
+    [
+        # started on a --config that moved the root, then the file rewritten to the built-in root: no --root, unknown
+        (["containerd", "--config", "/run/docker/containerd/containerd.toml"], 'root = "/var/lib/containerd"\n'),
+        (["containerd", "--config", "/run/docker/containerd/containerd.toml"], 'root = "/data/docker/containerd/daemon"\n'),
+        (["containerd", "--config", "/run/docker/containerd/containerd.toml"], "version = 2\n"),
+    ],
+)
+def test_a_host_without_ctr_never_trusts_a_config_file_for_the_root(scrape: dict, monkeypatch, argv, config) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["run_cmd"] = _no_ctr
+    scrape["running_containerd_argv"] = lambda address: argv
+    scrape["open"] = _containerd_config(config, "/run/docker/containerd/containerd.toml")
+    host_dirs = {_SNAPSHOTS, _DAEMON_SNAPSHOTS, "/proc/1/root/data/docker"}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=host_dirs, usage_by_path={_SNAPSHOTS: _BIG, _DAEMON_SNAPSHOTS: _BIG})
 
     with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
         scrape["containerd_store_root"](_SNAPSHOTTER_INFO, _OVERLAYFS)
