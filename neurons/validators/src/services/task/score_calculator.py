@@ -38,10 +38,9 @@ def calculate_scores(
     # Outdated executor image (DAH-2701). Enforcement is off by default until nodes
     # auto-update again (DAH-3419); off, ExecutorImageCheck logs the verdict as a warning.
     image_report = getattr(ctx.state, "executor_image_report", None)
-    if (
-        settings.EXECUTOR_IMAGE_CHECK_ENFORCE
-        and image_report
-        and image_report.status is ImageVerdict.OUTDATED
+    if image_report and (
+        image_report.status is ImageVerdict.UNOFFICIAL
+        or (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and image_report.status is ImageVerdict.OUTDATED)
     ):
         actual_score = 0.0
         job_score = 0.0
