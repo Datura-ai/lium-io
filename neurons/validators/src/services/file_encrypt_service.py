@@ -462,8 +462,11 @@ class FileEncryptService:
         root.mkdir(exist_ok=True)
         kept = {Path(path).resolve() for path in keep_directories()}
         for entry in root.iterdir():
-            if entry.is_dir() and entry.resolve() not in kept and not any(entry.iterdir()):
-                entry.rmdir()
+            try:
+                if entry.is_dir() and entry.resolve() not in kept and not any(entry.iterdir()):
+                    entry.rmdir()
+            except FileNotFoundError:  # a build's cleanup removed it first
+                continue
         directory = Path(tempfile.mkdtemp(prefix=f"cycle-{time.time_ns():020d}-", dir=root))
         source, all_keys, encryption_key = self._obfuscated_scrape()
         file_name = f"tmp{secrets.token_hex(4)}"
