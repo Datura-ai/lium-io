@@ -479,15 +479,14 @@ class AttestationService:
     ) -> bool | None:
         """Verify the executor's NVIDIA CC GPU evidence.
 
-        Enforcement (ENABLE_GPU_ATTESTATION_ENFORCEMENT) applies on attestation
-        events (a nonce was issued): missing/unbound/failed evidence raises
-        AttestationError. Outside events, or with enforcement off, verification
-        is observe-only: the result is logged and recorded but never raises.
+        Enforced on attestation events (a nonce was issued): missing/unbound/failed
+        evidence raises AttestationError. Outside events verification is
+        observe-only: the result is logged and recorded but never raises.
 
         Returns True (verified), False (verified-bad), or None (not performed /
         undeterminable). Never returns True unless NRAS accepted the evidence.
         """
-        enforce_event = settings.ENABLE_GPU_ATTESTATION_ENFORCEMENT and nonce is not None
+        enforce_event = nonce is not None
         payload_raw = executor.nvidia_payload
         log_extra = {"executor": f"{executor.address}:{executor.port}"}
 
@@ -522,24 +521,19 @@ class AttestationService:
         # nonce — a self-generated (phase-0) nonce is replayable and rejected.
         payload_nonce = payload.get("nonce")
         if nonce is not None and payload_nonce != nonce.value_hex:
-            if enforce_event:
-                logger.warning(_m(
-                    "GPU attestation rejected: evidence nonce is not the issued challenge",
-                    extra=get_extra_info({
-                        **log_extra,
-                        "reason": "gpu_nonce_unbound",
-                        "expected_nonce": nonce.value_hex,
-                        "payload_nonce": payload_nonce,
-                    }),
-                ))
-                raise AttestationError(
-                    f"NVIDIA GPU evidence from executor {executor.address}:{executor.port} is not "
-                    "bound to the issued attestation nonce"
-                )
-            logger.info(_m(
-                "GPU evidence nonce differs from issued challenge (observe-only, likely phase-0 self-nonce)",
-                extra=get_extra_info({**log_extra, "payload_nonce": payload_nonce}),
+            logger.warning(_m(
+                "GPU attestation rejected: evidence nonce is not the issued challenge",
+                extra=get_extra_info({
+                    **log_extra,
+                    "reason": "gpu_nonce_unbound",
+                    "expected_nonce": nonce.value_hex,
+                    "payload_nonce": payload_nonce,
+                }),
             ))
+            raise AttestationError(
+                f"NVIDIA GPU evidence from executor {executor.address}:{executor.port} is not "
+                "bound to the issued attestation nonce"
+            )
 
         expected_nonce_hex = nonce.value_hex if (nonce is not None and payload_nonce == nonce.value_hex) else (
             payload_nonce if isinstance(payload_nonce, str) else None
