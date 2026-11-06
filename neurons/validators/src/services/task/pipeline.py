@@ -72,6 +72,42 @@ class PodRecoverer(Protocol):
         default_extra: dict[str, Any],
     ) -> bool: ...
 
+    async def recover_parked_pod_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+        stopped_by_recovery: bool = False,
+    ) -> bool: ...
+
+    async def encrypted_volume_mount_missing(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, plaintext_path: str | None
+    ) -> bool: ...
+
+    async def restore_volume_mount_of_running_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool: ...
+
+    async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
+
+    async def forget_recovery_stop(self, pod_id: str) -> None: ...
+
+    async def recovery_stop_pending(self, pod_id: str) -> bool: ...
+
 
 @dataclass(frozen=True)
 class ContextServices:

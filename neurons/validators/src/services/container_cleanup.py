@@ -15,7 +15,8 @@ from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     CACHE_SWEEP_CONTAINER_NAME,
-    EDIT_PARKED_SUFFIX,
+    PARKED_SUFFIXES,
+    unparked_name,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
@@ -148,7 +149,7 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
         names.update(pod.docker_container_name for pod in executor.pods)
         # An edit parks the pod's current container under <name>__prev while the replacement
         # is created; it is the customer's only copy until then, whatever its age
-        names.update(f"{pod.docker_container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
+        names.update(f"{pod.docker_container_name}{suffix}" for pod in executor.pods for suffix in PARKED_SUFFIXES)
     # Every filler is protected — a GPU-split node runs one per VRAM bundle, and reaping a
     # sibling kills a live worker mid-cycle. The legacy single map covers an older backend.
     for fillers in rented_data.all_filler_containers_by_executor.values():
@@ -195,7 +196,7 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
     A renter's image can carry an inherited label naming another live pod, so the label counts only
     when it matches the name: the id after pod_/filler_ (ignoring __prev), or a probe's own name.
     """
-    base = container_name.removesuffix(EDIT_PARKED_SUFFIX)
+    base = unparked_name(container_name)
     if base.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
         return label if label == base.partition("_")[2] else ""
     return label if label == container_name else ""

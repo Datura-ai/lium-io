@@ -276,12 +276,18 @@ def build_services(**overrides) -> ContextServices:
     pod_recovery = AsyncMock()
     # A bare AsyncMock would report every pod as recovered; opt in per test instead.
     pod_recovery.recover_pod_after_stale_vloopback_mount.return_value = False
+    pod_recovery.recover_parked_pod_container.return_value = False
+    pod_recovery.encrypted_volume_mount_missing.return_value = False
+    pod_recovery.container_paused.return_value = False
     backend = AsyncMock()
     # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
     backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)
     backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=False)
     # A bare AsyncMock would report a live Lium workload on every node (DAH-3480); opt in per test.
     backend.get_rented_executors_now.return_value = None
+    if "pod_recovery" in overrides and isinstance(overrides["pod_recovery"], AsyncMock):
+        # a test's own recovery double: a bare AsyncMock would report every pod as paused
+        overrides["pod_recovery"].container_paused.return_value = False
     base = dict(
         ssh=None,
         # DAH-2870: the rented check keeps per-pod marks in Redis on every rented cycle.

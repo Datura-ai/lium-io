@@ -167,6 +167,37 @@ def setup_sql_logging():
     print("✅ SQL logging enabled for all tests")
 
 
+class InMemoryUnmarkedRecoveryStops:
+    """The validator DB table of unmarked recovery stops, in memory: survives a test's simulated restart."""
+
+    def __init__(self) -> None:
+        self.pod_ids: set[str] = set()
+
+    async def all_pod_ids(self) -> set[str]:
+        return set(self.pod_ids)
+
+    async def add(self, pod_id: str) -> bool:
+        self.pod_ids.add(pod_id)
+        return True
+
+    async def remove(self, pod_id: str) -> bool:
+        self.pod_ids.discard(pod_id)
+        return True
+
+
+@pytest.fixture(autouse=True)
+def unmarked_recovery_stop_db():
+    """docker_service writes its unmarked recovery stops through to the validator DB; tests keep it in memory."""
+    from services import docker_service
+
+    store = InMemoryUnmarkedRecoveryStops()
+    saved = docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED
+    docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED = store, False
+    docker_service._UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.clear()
+    yield store
+    docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED = saved
+
+
 @pytest.fixture(autouse=True)
 def _no_collateral_rpc():
     """CollateralStatusCheck never reaches a real RPC: no miner has an EVM address unless a test says so.
