@@ -2220,7 +2220,7 @@ def read_gpu_memory_mb(handle, name):
     except NVMLError as exc:
         if name not in UNIFIED_MEMORY_GPU_NAMES or exc.value != NVML_ERROR_NOT_SUPPORTED:
             raise
-        return psutil.virtual_memory().total / (1024 ** 2), None
+        return psutil.virtual_memory().total // (1024 ** 2), None
     return memory_info.c_nvmlMemory_t_total / (1024 ** 2), memory_info.c_nvmlMemory_t_used / (1024 ** 2)
 
 
@@ -2270,7 +2270,8 @@ def read_gpu_details(device_count, gpu_process_ids):
                         lambda: nvmlDeviceGetPowerManagementLimitConstraints(handle)[1] / 1000
                     ),
                     "gpu.graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
-                    "gpu.memory_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM),
+                    # DGX Spark (GB10) reports its memory clock as N/A: None instead of dropping the card's row
+                    "gpu.memory_speed": safeNvmlValue(lambda: nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM)),
                     "gpu.pcie": nvmlDeviceGetCurrPcieLinkWidth(handle),
                     "gpu.speed_pcie": nvmlDeviceGetPcieSpeed(handle),
                     "gpu.utilization": utilization.c_nvmlUtilization_t_gpu,

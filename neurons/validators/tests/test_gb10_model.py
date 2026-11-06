@@ -32,12 +32,11 @@ def _raise(code):
     raise NVMLError(code)
 
 
-def _scrape(memory_info, power_limit=lambda handle: 300_000):
+def _scrape(memory_info, power_limit=lambda handle: 300_000, clock=lambda handle, *_: 0, ram_bytes=HOST_RAM_BYTES):
     stubs = {
         name: (lambda handle, *_: 0)
         for name in (
             "nvmlDeviceGetPowerManagementDefaultLimit",
-            "nvmlDeviceGetClockInfo",
             "nvmlDeviceGetMaxClockInfo",
             "nvmlDeviceGetCurrPcieLinkWidth",
             "nvmlDeviceGetPcieSpeed",
@@ -46,12 +45,13 @@ def _scrape(memory_info, power_limit=lambda handle: 300_000):
         )
     }
     stubs |= {
+        "nvmlDeviceGetClockInfo": clock,
         "NVMLError": NVMLError,
         "NVML_ERROR_NOT_SUPPORTED": NOT_SUPPORTED,
         "NVML_CLOCK_GRAPHICS": 0,
         "NVML_CLOCK_MEM": 1,
         "NVML_TEMPERATURE_GPU": 0,
-        "psutil": SimpleNamespace(virtual_memory=lambda: SimpleNamespace(total=HOST_RAM_BYTES)),
+        "psutil": SimpleNamespace(virtual_memory=lambda: SimpleNamespace(total=ram_bytes)),
         "nvmlDeviceGetName": lambda handle: GB10 if handle == 0 else "NVIDIA H100 80GB HBM3",
         "nvmlDeviceGetHandleByIndex": lambda i: i,
         "nvmlDeviceGetCudaComputeCapability": lambda handle: (12, 1),
@@ -85,15 +85,24 @@ def test_the_host_ram_reading_passes_the_gb10_precheck_and_half_of_it_does_not()
         precheck_gpu_spec(GB10, HOST_RAM_BYTES // 1024**2 // 2)
 
 
-def test_a_gb10_reads_the_host_ram_and_no_used_memory_and_tolerates_no_power_cap():
-    scrape = _scrape(lambda handle: _raise(NOT_SUPPORTED), power_limit=lambda handle: _raise(NOT_SUPPORTED))
+def test_a_gb10_reads_the_host_ram_and_no_used_memory_and_tolerates_no_power_cap_or_memory_clock():
+    # a DGX Spark answers N/A for its memory clock; its RAM is not MiB-aligned, and the backend wants whole MB
+    scrape = _scrape(
+        lambda handle: _raise(NOT_SUPPORTED),
+        power_limit=lambda handle: _raise(NOT_SUPPORTED),
+        clock=lambda handle, kind: _raise(NOT_SUPPORTED) if kind == 1 else 2_400,
+        ram_bytes=HOST_RAM_BYTES + 512 * 1024,
+    )
 
     details, error = scrape["read_gpu_details"](1, set())
 
     assert error is None
     assert details[0]["gpu.capacity"] == 121_856
+    assert isinstance(details[0]["gpu.capacity"], int)
     assert details[0]["gpu.memory_used_mb"] is None
     assert details[0]["gpu.power_limit"] is None
+    assert details[0]["gpu.memory_speed"] is None
+    assert details[0]["gpu.graphics_speed"] == 2_400
 
 
 @pytest.mark.parametrize(
