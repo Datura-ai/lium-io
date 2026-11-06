@@ -62,7 +62,7 @@ async def test_context_first_pass_follows_the_caller(monkeypatch, first_pass, ex
     )
     encrypted_files = SimpleNamespace(
         encrypt_key="k", machine_scrape_file_name="scrape", machine_scrape_source=None,
-        all_keys={}, tmp_directory="/tmp/x",
+        all_keys={}, tmp_directory="/tmp/x", binary_build=None,
     )
     miner_info = SimpleNamespace(
         job_batch_id="b", miner_hotkey="m", miner_coldkey="c", miner_address="1.1.1.1", miner_port=1
