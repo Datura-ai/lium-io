@@ -6,6 +6,7 @@ from typing import Annotated
 
 import asyncssh
 import bittensor
+import redis.exceptions
 from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
@@ -41,7 +42,7 @@ from .messages import (
     TenantEnforcementMessages,
     render_message,
 )
-from .models import JobResult, ValidationEvent, build_msg
+from .models import VALIDATOR_REDIS_UNAVAILABLE, JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
@@ -338,6 +339,9 @@ class TaskService:
                 if has_reached_the_node and _is_ssh_transport_failure(e):
                     event = _transport_unreachable_event(executor_uuid=executor_info.uuid, error=e)
                     failure_reason_code = event.reason_code
+                elif isinstance(e, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):
+                    # DAH-5805: the validator's own Redis ended the run; the cycle withholds it instead of scoring 0
+                    failure_reason_code = VALIDATOR_REDIS_UNAVAILABLE
                 log_text = _m(
                     "Pipeline validation error",
                     extra=get_extra_info({
@@ -354,7 +358,7 @@ class TaskService:
                 # A cycle that opened the shell proves the node is reachable, so it reports an
                 # empty list and re-lists a node an earlier cycle hid. A cycle that never got
                 # there says nothing, and must not clear what the cycle before it found.
-                availability_problems = [] if has_reached_the_node else None
+                availability_problems = [] if has_reached_the_node and failure_reason_code != VALIDATOR_REDIS_UNAVAILABLE else None
             logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,

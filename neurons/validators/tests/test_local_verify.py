@@ -60,6 +60,7 @@ from services.local_verify_client import (
 
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
+from tests.test_verifyx_cold_sample_retry import _run as _verifyx_then_cold_retry
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
 EXECUTOR_UUID = "executor-123"
@@ -1472,10 +1473,20 @@ async def test_transport_names_the_sample_the_cold_retry_kept(
     must say so; a consumed local answer that lost to it is not what the event describes.
     First pass, so the kept-first case ends in the DAH-3011 deferred-gate success event too."""
     local_answer = vvs.VerifyXResponse(
-        data={"success": True, "network": {"download_speed": 59.9, "upload_speed": 20.0}}
+        data={
+            "success": True,
+            # clears the disk floor: the retry check judges the disk of the sample it keeps (DiskSpaceCheck)
+            "hard_disk": {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024},
+            "network": {"download_speed": 59.9, "upload_speed": 20.0},
+        }
     )
     ssh_answer = vvs.VerifyXResponse(
-        data={"success": True, "network": {"download_speed": retry_download, "upload_speed": 1.0}}
+        data={
+            "success": True,
+            # clears the disk floor: an adopted retry's disk is judged again (DiskSpaceCheck)
+            "hard_disk": {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024},
+            "network": {"download_speed": retry_download, "upload_speed": 1.0},
+        }
     )
     ssh = SimpleNamespace(validate_verifyx_and_process_job=AsyncMock(return_value=ssh_answer))
     ctx = make_context(
@@ -1488,7 +1499,7 @@ async def test_transport_names_the_sample_the_cold_retry_kept(
         ),
     )
 
-    result = await VerifyXCheck().run(ctx)
+    result = await _verifyx_then_cold_retry(ctx)
 
     ssh.validate_verifyx_and_process_job.assert_awaited_once()
     assert result.event.what_we_saw["cold_sample_retry"]["used"] == used

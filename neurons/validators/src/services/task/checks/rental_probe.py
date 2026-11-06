@@ -975,6 +975,7 @@ async def _step_container_start(
                 ctx.config.validator_keypair,
                 ctx.executor_ssh_private_key_encrypted,
                 beside_fillers=beside_fillers,
+                synthetic_probe=True,
             ),
             timeout=create_deadline,
         )

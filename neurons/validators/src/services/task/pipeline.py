@@ -207,6 +207,8 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
+    verifyx_cold_retry: Any = None
 
 
 class CheckResult(BaseModel):
@@ -782,9 +784,13 @@ class Pipeline:
                 )
                 last_of_run = index == last_index and position == len(ran_checks) - 1
                 if failed or res.halt or last_of_run:
+                    # the failed event's own check: a composite check (the cold retry's disk judgement) fails
+                    # with another check's event, and the provider timeline names the step from this
                     res.event.what_we_saw.update(
                         summarize_steps(
-                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                            steps,
+                            elapsed_time_ms,
+                            failed_check_id=(res.event.check_id or chk.check_id) if failed else None,
                         )
                     )
 
