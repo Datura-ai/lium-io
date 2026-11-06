@@ -1275,19 +1275,18 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
 
 
 @pytest.mark.parametrize(
-    ("created_ago", "started_ago", "store", "kept"),
+    ("created_ago", "store", "kept"),
     [
-        (0, 0, "overlay2", False),  # written by the image's startup, before the first mount: not the renter's
-        (3600, 3600, "overlay2", True),  # written an hour after the last start: unmounted, the renter's
-        (3600, 0, "overlay2", False),  # a restart ran the entrypoint again before the remount: not the renter's
-        (0, 0, "containerd", False),  # no UpperDir in inspect: the running container's root mount names it
-        (3600, 3600, "containerd", True),
-        (0, 0, "given", False),  # stopped on the containerd store: the upper dir the running read used
-        (0, 0, "none", True),  # no upper dir anywhere: docker diff decides, and lists the startup file
-        (0, 0, "kept", True),  # a copy already kept: the age bound never releases it, only docker diff decides
+        (0, "overlay2", False),  # written by the image's startup, before the first mount: not the renter's
+        (3600, "overlay2", True),  # written an hour after creation: an unmounted restart, the renter's
+        (0, "containerd", False),  # no UpperDir in inspect: the running container's root mount names it
+        (3600, "containerd", True),
+        (0, "given", False),  # stopped on the containerd store: the upper dir the running read used
+        (0, "none", True),  # no upper dir anywhere: docker diff decides, and lists the startup file
+        (0, "kept", True),  # a copy already kept: the age bound never releases it, only docker diff decides
     ],
 )
-def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, started_ago, store, kept):
+def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, store, kept):
     # the SSH session is the executor's container: the host's files are only under /proc/1/root
     import subprocess
     import time
@@ -1303,10 +1302,8 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created
         f"2 0 0:2 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
     )
     created = time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - created_ago))
-    started = time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - started_ago))
-    stamps = f"{created} {started}"
-    inspect = {"overlay2": f"{stamps} 4242 {host_upper}", "containerd": f"{stamps} 4242 <no value>"}.get(
-        store, f"{stamps} 0 <no value>"
+    inspect = {"overlay2": f"{created} 4242 {host_upper}", "containerd": f"{created} 4242 <no value>"}.get(
+        store, f"{created} 0 <no value>"
     )
     docker = tmp_path / "docker"
     docker.write_text(
