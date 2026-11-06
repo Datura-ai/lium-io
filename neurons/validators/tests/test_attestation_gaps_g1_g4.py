@@ -92,9 +92,8 @@ class FakeRedis:
     async def get(self, key):
         return self.kv.get(key)
 
-    async def set(self, key, value, ex=None, nx=False):
-        if not (nx and key in self.kv):
-            self.kv[key] = value
+    async def set(self, key, value):
+        self.kv[key] = value
 
 
 def _jwt(claims: dict) -> str:
@@ -403,36 +402,14 @@ async def test_verify_tdx_no_retry_on_report_data_or_nonce_mismatch(service, mon
     assert len(calls) == 1
 
 
-async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
-    # Arrange
-    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
-    monkeypatch.setattr(settings, "TDX_REATTEST_INTERVAL_SECONDS", 3600)
-    service = AttestationService(redis_service=FakeRedis())
+async def test_g3_every_wave_is_challenged_with_the_nonce_the_miner_is_sent(service):
+    upload_nonce = AttestationNonce.issue().value_hex
 
-    # Act
-    first = await service.maybe_issue_nonce("miner-hotkey")
-    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
-    second = await service.maybe_issue_nonce("miner-hotkey")
+    sent = await service.maybe_issue_nonce(upload_nonce)
+    unsent = await service.maybe_issue_nonce(None)
 
-    # Assert — one passed event per interval per miner
-    assert first is not None
-    assert len(first.value_bytes) == 32
-    assert second is None
-
-
-async def test_g3_a_failed_or_unanswered_event_never_opens_a_nonce_free_interval(monkeypatch):
-    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
-    monkeypatch.setattr(settings, "TDX_REATTEST_INTERVAL_SECONDS", 3600)
-    service = AttestationService(redis_service=FakeRedis())
-
-    # issuing alone starts no interval: the event may never be answered
-    assert await service.maybe_issue_nonce("miner-hotkey") is not None
-    assert await service.maybe_issue_nonce("miner-hotkey") is not None
-    # a failure wins over a sibling executor's pass in the same wave, whatever the order
-    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
-    await service.record_attestation_event("miner-hotkey", "exec-1", passed=False)
-    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
-    assert await service.maybe_issue_nonce("miner-hotkey") is not None
+    assert sent.value_hex == upload_nonce
+    assert unsent is not None and unsent.value_hex != upload_nonce
 
 
 def test_g3_signing_blob_covers_nonce():
@@ -802,13 +779,3 @@ async def test_prod_whitelist_rejects_july_staging_runner_compose(service, monke
         await service._check_whitelist(JULY_STAGING_RUNNER_COMPOSE_HASH, os_image, executor)
         is False
     )
-
-
-async def test_g3_a_request_for_one_executor_always_carries_a_challenge(monkeypatch):
-    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
-    service = AttestationService(redis_service=FakeRedis())
-    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
-
-    assert await service.maybe_issue_nonce("miner-hotkey") is None
-    assert await service.maybe_issue_nonce("miner-hotkey", "exec-2") is not None
-

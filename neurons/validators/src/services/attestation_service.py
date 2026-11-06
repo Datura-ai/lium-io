@@ -26,13 +26,6 @@ logger = logging.getLogger(__name__)
 # bare-metal node.
 TDX_ATTESTED_EXECUTOR_SET = "tdx_attested_executors"
 
-# Redis key prefix recording the last nonce-bound attestation event per miner,
-# used to bound re-attestation cadence (G3: freshness = provably recent, not
-# every wave).
-TDX_LAST_ATTESTATION_EVENT_PREFIX = "tdx_last_attestation_event"
-TDX_ATTESTATION_RETRY_PREFIX = "tdx_attestation_retry"
-TDX_EXECUTOR_NONCE_PASS_PREFIX = "tdx_executor_nonce_pass"
-
 
 class AttestationError(RuntimeError):
     """Raised when attestation or host verification fails."""
@@ -119,84 +112,11 @@ class AttestationService:
     def nonce_enabled(self) -> bool:
         return self.enabled
 
-    async def maybe_issue_nonce(self, miner_hotkey: str, executor_id: str | None = None) -> AttestationNonce | None:
-        """Mint a fresh attestation nonce when this miner is due for a
-        nonce-bound attestation event.
-
-        Freshness is bounded by TDX_REATTEST_INTERVAL_SECONDS rather than
-        demanded every validation wave — GPU evidence collection is seconds per
-        node, so the cadence is load-shed (see remediation plan §4). A failed
-        nonce-bound event sets a retry marker that overrides the interval, so a
-        failure is retried next wave instead of opening a nonce-free window.
-        Without Redis the interval cannot be tracked, so a nonce is issued every wave.
-        """
+    async def maybe_issue_nonce(self, upload_nonce: str | None) -> AttestationNonce | None:
+        """The challenge for this wave: the upload nonce the miner is sent, or a fresh one when it is sent none."""
         if not self.nonce_enabled:
             return None
-
-        # a request for one executor (the express lane) always carries a challenge: it is one node
-        if self.redis_service is not None and executor_id is None:
-            key = f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}"
-            try:
-                raw = await self.redis_service.get(key)
-                last = float(raw.decode() if isinstance(raw, bytes) else raw) if raw else 0.0
-                retry = await self.redis_service.get(f"{TDX_ATTESTATION_RETRY_PREFIX}:{miner_hotkey}")
-                if not retry and (time.time() - last) < settings.TDX_REATTEST_INTERVAL_SECONDS:
-                    return None
-            except Exception as exc:
-                logger.warning(_m(
-                    "Failed to read attestation-event cadence; issuing nonce",
-                    extra=get_extra_info({"miner_hotkey": miner_hotkey, "error": str(exc)}),
-                ))
-
-        return AttestationNonce.issue()
-
-    @staticmethod
-    def _host_key_digest(host_key: str | None) -> str:
-        return hashlib.sha256((host_key or "").encode("utf-8")).hexdigest()
-
-    async def record_attestation_event(
-        self, miner_hotkey: str, executor_uuid: str, passed: bool, host_key: str | None = None
-    ) -> None:
-        """Record a nonce-bound event: a pass starts the interval, a failure forces a nonce next wave."""
-        if self.redis_service is None:
-            return
-        try:
-            if passed:
-                interval = settings.TDX_REATTEST_INTERVAL_SECONDS
-                cadence_key = f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}"
-                now = time.time()
-                # the interval starts at the first pass and never moves, so no pass outlives the next challenge
-                await self.redis_service.set(cadence_key, str(now), ex=interval, nx=True)
-                raw = await self.redis_service.get(cadence_key)
-                started = float(raw.decode() if isinstance(raw, bytes) else raw) if raw else now
-                # bound to the host key that passed: another key under this uuid has not
-                await self.redis_service.set(
-                    f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}",
-                    self._host_key_digest(host_key),
-                    ex=max(1, int(started + interval - now)),
-                )
-            else:
-                # outlives the interval, so a sibling executor's later pass cannot cancel it
-                await self.redis_service.set(
-                    f"{TDX_ATTESTATION_RETRY_PREFIX}:{miner_hotkey}", "1",
-                    ex=settings.TDX_REATTEST_INTERVAL_SECONDS,
-                )
-        except Exception as exc:
-            logger.warning(_m(
-                "Failed to record attestation-event cadence",
-                extra=get_extra_info({"miner_hotkey": miner_hotkey, "error": str(exc)}),
-            ))
-
-    async def has_recent_nonce_bound_pass(self, miner_hotkey: str, executor_uuid: str, host_key: str | None) -> bool:
-        """Evidence without a challenge stands only for an executor that recently passed its own.
-
-        A Redis error propagates: the run ends as VALIDATOR_REDIS_UNAVAILABLE (withheld), not as a node failure.
-        """
-        if self.redis_service is None:
-            return False
-        raw = await self.redis_service.get(f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}")
-        stored = raw.decode() if isinstance(raw, bytes) else raw
-        return stored == self._host_key_digest(host_key)
+        return AttestationNonce(value_hex=upload_nonce) if upload_nonce else AttestationNonce.issue()
 
     def _expected_report_data(self, host_key: str) -> str:
         digest = hashlib.sha256(self.REPORT_PREFIX +
