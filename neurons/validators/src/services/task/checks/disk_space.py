@@ -10,7 +10,7 @@ from services.const import MAX_DISK_UTILIZATION_PERCENT
 from core.config import settings
 
 from ..messages import DiskSpaceMessages as Msg
-from ..messages import render_message
+from ..messages import render_message, shown
 from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
 
@@ -126,10 +126,10 @@ class DiskSpaceCheck:
             what.update(utilization_percent=utilization, free_gb=round(free_kb / KB_PER_GB, 1))
             if utilization > MAX_DISK_UTILIZATION_PERCENT:
                 template = Msg.TOO_FULL
-                measured = f"Disk {utilization:.0f}% full, at most {MAX_DISK_UTILIZATION_PERCENT}% allowed. "
+                measured = f"Disk {shown(utilization, 0, failed_below=False)}% full, at most {MAX_DISK_UTILIZATION_PERCENT}% allowed. "
             elif free_kb < settings.MIN_FREE_DISK_GB * KB_PER_GB:
                 template = Msg.FREE_TOO_LOW
-                measured = f"{free_kb / KB_PER_GB:.1f} GB free, {settings.MIN_FREE_DISK_GB} GB required. "
+                measured = f"{shown(free_kb / KB_PER_GB, 1, failed_below=True)} GB free, {settings.MIN_FREE_DISK_GB} GB required. "
             else:
                 return CheckResult(
                     passed=True,

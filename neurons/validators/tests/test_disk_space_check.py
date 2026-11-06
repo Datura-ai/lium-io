@@ -340,6 +340,12 @@ async def test_a_zero_floor_asks_no_disk_of_a_split(context_factory, monkeypatch
     [
         (_disk(95, 500), f"Disk 95% full, at most {MAX_DISK_UTILIZATION_PERCENT}% allowed."),
         (_disk(50, 12.34), f"12.3 GB free, {settings.MIN_FREE_DISK_GB} GB required."),
+        # a failing figure never rounds onto the limit it failed
+        (_disk(90.2, 500), f"Disk 91% full, at most {MAX_DISK_UTILIZATION_PERCENT}% allowed."),
+        (
+            _disk(50, settings.MIN_FREE_DISK_GB - 0.04),
+            f"{settings.MIN_FREE_DISK_GB - 0.1:.1f} GB free, {settings.MIN_FREE_DISK_GB} GB required.",
+        ),
     ],
 )
 async def test_a_failed_disk_floor_names_the_measured_and_required_value(context_factory, specs, measured):

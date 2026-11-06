@@ -925,3 +925,18 @@ def test_verifyx_verdict_applies_the_upload_floor(upload, prev_upload, fallback,
     data = {"success": True, "network": network}
 
     assert verifyx_verdict(data, prev, first_pass=False) is expected
+
+
+@pytest.mark.asyncio
+async def test_an_average_speed_just_under_the_floor_never_shows_as_meeting_it(context_factory):
+    # prev_ema=199.92, current=0 -> EMA 99.96, which must not read as 100.0
+    services = build_services(verifyx=DummyVerifyXService(success=True, updated_specs={"network": {}}))
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=199.92),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.event.remediation.startswith("Average download speed 99.9 Mbps, 100 Mbps required.")

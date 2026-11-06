@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,17 @@ class MessageTemplate:
     impact: str
     remediation: str | None = None
     help_uri: str | None = None
+
+
+def shown(value: float, decimals: int, *, failed_below: bool) -> str:
+    """Format a failing reading so rounding never makes it look like it meets the limit.
+
+    A value below a minimum rounds down and a value above a maximum rounds up (49.96 GB free
+    shows as 49.9, not 50.0, against a 50 GB minimum).
+    """
+    scale = 10**decimals
+    scaled = round(value * scale, 6)  # drop float noise before flooring (49.9 * 10 = 498.999...)
+    return f"{(math.floor(scaled) if failed_below else math.ceil(scaled)) / scale:.{decimals}f}"
 
 
 def render_message(

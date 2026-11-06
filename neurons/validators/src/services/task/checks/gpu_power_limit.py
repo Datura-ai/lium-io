@@ -17,7 +17,7 @@ from services.gpu_power_limit import (
 )
 
 from ..messages import GpuPowerLimitMessages as Msg
-from ..messages import render_message
+from ..messages import render_message, shown
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 
@@ -115,7 +115,7 @@ class GpuPowerLimitCheck:
                 return CheckResult(passed=True, event=stale_cap_event)
             measured = "; ".join(
                 f"GPU {m.index}: {m.power_limit:.0f} W limit, default {m.power_default_limit:.0f} W "
-                f"({m.power_limit_ratio:.0%})"
+                f"({shown(m.power_limit_ratio * 100, 0, failed_below=True)}%)"
                 for m in rejected
             )
             event = render_message(

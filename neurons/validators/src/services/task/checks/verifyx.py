@@ -26,7 +26,7 @@ from services.verifyx_validation_service import (
     _is_speed_reading,
 )
 
-from ..messages import VerifyXMessages as Msg, render_message
+from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
 from .disk_space import DiskSpaceCheck
 from .network_ema import compute_ema
@@ -430,7 +430,7 @@ class VerifyXCheck:
                     ctx=ctx,
                     check_id=self.check_id,
                     remediation=(
-                        f"Average download speed {ema_download:.1f} Mbps, "
+                        f"Average download speed {shown(ema_download, 1, failed_below=True)} Mbps, "
                         f"{MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:.0f} Mbps required. {_SPEED_NEXT_STEP}"
                     ),
                     what={
@@ -453,7 +453,7 @@ class VerifyXCheck:
                     ctx=ctx,
                     check_id=self.check_id,
                     remediation=(
-                        f"Average upload speed {ema_upload:.1f} Mbps, "
+                        f"Average upload speed {shown(ema_upload, 1, failed_below=True)} Mbps, "
                         f"{MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS:.0f} Mbps required. {_SPEED_NEXT_STEP}"
                     ),
                     what={
