@@ -357,7 +357,33 @@ class ResticStorageRunner:
                 continue
             if isinstance(result, BaseException):
                 raise result
+            if (
+                result.returncode not in (0, 10)
+                and getattr(self._workspace, "image", None)
+                and _dns_lookup_failed(result.stderr or result.stdout)
+            ):
+                return self._run_repository_command_on_default_bridge(restic_arguments)
             return result
+
+    def _run_repository_command_on_default_bridge(
+        self, restic_arguments: list[str]
+    ) -> subprocess.CompletedProcess[str]:
+        # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge
+        # resolves fine; the backup itself already runs in a default-bridge helper.
+        print("Repository DNS lookup failed in the executor; retrying in a helper container", file=sys.stderr, flush=True)
+        return subprocess.run(
+            [
+                *self._docker_helper_base(),
+                "--rm",
+                "--entrypoint",
+                self._restic_binary,
+                self._workspace.image,
+                *self._restic_command(restic_arguments)[1:],
+            ],
+            env=self._environment,
+            capture_output=True,
+            text=True,
+        )
 
     def _redacted_repository_failure_detail(
         self,
@@ -1044,6 +1070,12 @@ def _is_retryable_repository_failure(failure_detail: str) -> bool:
     # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
     normalized_detail = "".join(failure_detail.casefold().split())
     return any(marker in normalized_detail for marker in retryable_failure_markers)
+
+
+def _dns_lookup_failed(failure_detail: str) -> bool:
+    # 6 Nov: hosts whose compose-network resolver SERVFAILs ("lookup ... on 127.0.0.11:53: server misbehaving").
+    detail = failure_detail.casefold()
+    return "dial tcp: lookup " in detail and ("server misbehaving" in detail or "no such host" in detail)
 
 
 def _connection_closed(failure_detail: str) -> bool:
