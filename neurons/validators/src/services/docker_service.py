@@ -5729,16 +5729,24 @@ class DockerService:
                     continue  # no such volume, or not a vloopback one
                 if not declared_gb:
                     continue
+                # fstrim in the host mount namespace: through /proc/1/root it cannot resolve the vloopback mount
+                command = f'( {_wipe_volume_cmd(run_volume, *killed)} && nsenter -t 1 -m -- fstrim "$p" && echo trimmed ) 2>&1'
                 try:
-                    trimmed = await asyncio.wait_for(
-                        ssh_client.run(f'( {_wipe_volume_cmd(run_volume, *killed)} && fstrim "/proc/1/root$p" && echo trimmed )'),
-                        CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
-                    )
+                    trimmed = await asyncio.wait_for(ssh_client.run(command), CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
+                    output = trimmed.stdout or ""
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    continue  # best-effort, as the cache removals
-                if "trimmed" in (trimmed.stdout or "") and fit.fresh_sizing:
+                except Exception as exc:
+                    output = repr(exc)  # best-effort, as the cache removals
+                if "trimmed" not in output:
+                    logger.warning(
+                        _m(
+                            "Could not free a killed filler's run volume",
+                            extra=get_extra_info({**default_extra, "volume": run_volume, "output": output[-2000:]}),
+                        )
+                    )
+                    continue
+                if fit.fresh_sizing:
                     trimmed_gb += declared_gb
             # shortcut: resolve_volume_sizing still counts a trimmed run volume in its pool until the filler's delete
             # removes it (seconds later), so a split node's slice can read up to share x its size high; exclude killed

@@ -690,7 +690,7 @@ async def test_the_killed_filler_run_volume_is_trimmed_and_the_order_keeps_its_s
     assert await docker_service.reclaim_dphn_cache_for_rental(
         ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"]
     ) is True
-    assert any("fstrim" in command and _RUN_VOLUME in command for command in ssh_client.commands)
+    assert any('nsenter -t 1 -m -- fstrim "$p"' in command and _RUN_VOLUME in command for command in ssh_client.commands)
     # the trimmed volume is not counted twice: (262.2 + 74.5 + 37.3 free + 54.5 pod volumes - 74.5) x 242/363
     assert rental.volume_limit_gb == 235  # 95% of 242 is 229.9
 
@@ -705,3 +705,23 @@ async def test_a_run_volume_a_live_container_mounts_is_not_trimmed(docker_servic
     ) is True
     assert ssh_client._free_bytes == int(262.2 * 1024**3)
     assert rental.volume_limit_gb < 242 * 0.95
+
+
+class FailedTrimHost(KilledFillerRunVolumeHost):
+    async def run(self, command: str, *args, **kwargs):
+        if "fstrim" in command:
+            self.commands.append(command)
+            return SimpleNamespace(exit_status=1, stdout="wiped\nfstrim: cannot get realpath\n", stderr="")
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_run_volume_trim_is_logged_with_the_volume_and_its_output(docker_service, monkeypatch, caplog):
+    rental = _full_node_rental(monkeypatch, docker_service)
+    ssh_client = FailedTrimHost(["filler_f9c9d1e7"], free_gb=262.2)
+
+    with caplog.at_level("WARNING"):
+        await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"])
+
+    [record] = [r for r in caplog.records if "run volume" in r.getMessage()]
+    assert record.msg.extra["volume"] == _RUN_VOLUME and "cannot get realpath" in record.msg.extra["output"]
