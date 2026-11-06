@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from clients.compute_client import ComputeClient
+from clients.compute_client import ComputeClient, mark_connector_unready
 
 from core.config import settings
 from core.utils import get_logger, wait_for_services_sync, widen_default_thread_pool
@@ -13,6 +13,7 @@ wait_for_services_sync()
 
 async def run_forever():
     logger.info("Compute app connector started")
+    mark_connector_unready()  # DAH-5177: an in-process restart is not ready until it waits on the lead lock again
     await initiate_services()
     keypair = settings.get_bittensor_wallet().get_hotkey()
     compute_app_client = ComputeClient(

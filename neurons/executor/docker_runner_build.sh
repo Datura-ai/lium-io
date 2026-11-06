@@ -161,11 +161,22 @@ log_kv "Compose file:"  "$(basename "$TEMP_COMPOSE_FILE")"
 log_kv "Build context:" "${SCRIPT_DIR}"
 echo ""
 
-docker build \
-  --file "${SCRIPT_DIR}/Dockerfile.runner" \
-  --build-arg "targetFile=$(basename "$TEMP_COMPOSE_FILE")" \
-  --tag "${IMAGE_NAME}" \
-  "${SCRIPT_DIR}"
+# PLATFORMS: multi-arch to an OCI archive for docker_runner_publish.sh, as in docker_build.sh.
+if [[ -n "${PLATFORMS:-}" ]]; then
+  docker buildx build \
+    --platform "${PLATFORMS}" \
+    --provenance=false \
+    --file "${SCRIPT_DIR}/Dockerfile.runner" \
+    --build-arg "targetFile=$(basename "$TEMP_COMPOSE_FILE")" \
+    --output "type=oci,dest=${RUNNER_OCI_ARCHIVE:-/tmp/executor-runner.oci.tar}" \
+    "${SCRIPT_DIR}"
+else
+  docker build \
+    --file "${SCRIPT_DIR}/Dockerfile.runner" \
+    --build-arg "targetFile=$(basename "$TEMP_COMPOSE_FILE")" \
+    --tag "${IMAGE_NAME}" \
+    "${SCRIPT_DIR}"
+fi
 
 # ── Success summary ────────────────────────────────────────────────────────────
 log_header "${SYM_DONE}  Build Complete"

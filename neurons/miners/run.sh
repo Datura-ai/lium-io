@@ -38,8 +38,14 @@ else
 fi
 
 if [ "$MODE" = "miner" ]; then
-    # db migrate
-    pdm run alembic upgrade head
+    # db migrate, retried while the database is still starting (a first start that races Postgres would
+    # otherwise serve without its tables); after 5 minutes go on, as before, with the tables there are
+    tries=0
+    until pdm run alembic upgrade head; do
+        tries=$((tries + 1))
+        [ "$tries" -ge 30 ] && { echo "alembic upgrade head failed 30 times, starting anyway"; break; }
+        sleep 10
+    done
     # migrate validator hotkey
     pdm run src/cli.py migrate-validator-hotkey
     # run fastapi app

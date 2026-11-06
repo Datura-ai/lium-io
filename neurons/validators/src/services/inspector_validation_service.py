@@ -11,7 +11,16 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import asyncssh
-from core.checksums import sha256_from_executor, sha256_from_path
+from core.checksums import (
+    ARM_VERIFIER_NOT_AVAILABLE,
+    ARM_VERIFIER_NOT_AVAILABLE_ERROR,
+    EXECUTOR_ARCH_UNKNOWN,
+    EXECUTOR_ARCH_UNKNOWN_ERROR,
+    aarch64_lib_path,
+    executor_arch,
+    sha256_from_executor,
+    sha256_from_path,
+)
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.config import settings
@@ -245,7 +254,35 @@ class InspectorValidationService:
         try:
             if not sensor_attested:
                 executor_checksum = await sha256_from_executor(shell, self.lib_path)
-                if self.local_checksum != executor_checksum:
+                # the CPU first: an ARM host holding the x86 build matches the native digest and must not pass
+                arch = await executor_arch(shell)
+                if arch == "aarch64":
+                    # an ARM executor holds the aarch64 build: compare against the validator's copy of that
+                    source = aarch64_lib_path(self.lib_path)
+                    if source is None:
+                        return self._failure_response(
+                            error=ARM_VERIFIER_NOT_AVAILABLE_ERROR,
+                            message=Msg.FAILED_LIB_MISMATCH,
+                            diagnostics={**diagnostics, "library_refresh": ARM_VERIFIER_NOT_AVAILABLE},
+                            default_extra=default_extra,
+                        )
+                    if sha256_from_path(source) != executor_checksum:
+                        # shortcut: no in-place refresh of the aarch64 build, the arm64 executor image carries it;
+                        # thread `source` through _refresh_on_mismatch if ARM hosts need the refresh too
+                        return self._failure_response(
+                            error="Executor libinspector.so is not the validator's aarch64 build; update the executor image",
+                            message=Msg.FAILED_LIB_MISMATCH,
+                            diagnostics={**diagnostics, "executor_sha256": executor_checksum or None},
+                            default_extra=default_extra,
+                        )
+                elif self.local_checksum != executor_checksum and arch is None:
+                    return self._failure_response(
+                        error=EXECUTOR_ARCH_UNKNOWN_ERROR,
+                        message=Msg.FAILED_LIB_MISMATCH,
+                        diagnostics={**diagnostics, "library_refresh": EXECUTOR_ARCH_UNKNOWN},
+                        default_extra=default_extra,
+                    )
+                elif self.local_checksum != executor_checksum:
                     failure = await self._refresh_on_mismatch(
                         shell,
                         executor_checksum,

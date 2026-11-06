@@ -7,7 +7,14 @@ import pytest
 
 from clients.compute_client import ComputeClient, OutgoingMessages
 from core.config import settings
-from payload_models.payloads import ContainerCreateRequest, ContainerCreated
+from payload_models.payloads import (
+    AddSshPublicKeyRequest,
+    ContainerCreateRequest,
+    ContainerCreated,
+    FailedContainerErrorTypes,
+    FailedContainerRequest,
+    SshPubKeyAdded,
+)
 from services.redis_service import BACKEND_COMMAND_PREFIX, RedisService
 
 
@@ -62,6 +69,7 @@ def client(monkeypatch):
     client.lock = asyncio.Lock()
     client.logging_extra = {}
     client.miner_service = MagicMock(redis_service=service)
+    client.deleted_pod_ids = set()
     client._track_backend_create_for_restart_report = AsyncMock()
     client._untrack_backend_create_for_restart_report = AsyncMock()
     client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="127.0.0.1", port=8000))
@@ -207,3 +215,50 @@ async def test_redis_failure_fails_open(client, monkeypatch, operation):
     await client.miner_driver(request())
     assert client.miner_service.handle_container.await_count == 1
     assert len(client.message_queue) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [
+        SshPubKeyAdded(miner_hotkey="miner", executor_id="executor", pod_id="pod", user_public_keys=["k"]),
+        FailedContainerRequest(
+            miner_hotkey="miner",
+            executor_id="executor",
+            pod_id="pod",
+            error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+            msg="failed",
+        ),
+    ],
+)
+async def test_ssh_key_add_answer_echoes_the_request_command_id(client, answer):
+    client.miner_service.handle_container.return_value = answer
+    add = AddSshPublicKeyRequest(
+        command_id="restore:1",
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        container_name="container",
+        user_public_keys=["k"],
+    )
+
+    await client.miner_driver(add)
+
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["restore:1"]
+
+
+@pytest.mark.asyncio
+async def test_a_create_failure_echoes_the_create_command_id(client):
+    """DAH-5592: the backend fences a creation failure on the create it answers (a late failure of a reboot the
+    backend already gave up on must not fail or exempt the reboot that replaced it)."""
+    client.miner_service.handle_container.return_value = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+        msg="failed",
+    )
+
+    await client.miner_driver(request("create-a"))
+
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["create-a"]

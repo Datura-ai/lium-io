@@ -37,6 +37,9 @@ class RentedExecutor(pydantic.BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-5244: a pod on the node has an open rental contracted as a self-rent (the renter is the node's own
+    # operator). Separate from owner_flag, which keeps its GPU-outside-tenant meaning and stays False.
+    self_rent: bool = False
 
 
 class NetworkEMA(pydantic.BaseModel):
@@ -53,6 +56,13 @@ class ManualRentalInfo(pydantic.BaseModel):
 
     gpu_model: str
     gpu_count: int
+
+
+class MaintenanceWindow(pydantic.BaseModel):
+    """A provider maintenance window, UTC, half-open: [starting_at, expiring_at)."""
+
+    starting_at: datetime
+    expiring_at: datetime
 
 
 class FillerRevenueByGpuConfig(pydantic.BaseModel):
@@ -93,8 +103,10 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     provider_discord_connected_executor_ids: list[str] | None = None
     # executor_ids the backend keeps unlisted until the provider confirms an e-mail address
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters
-    renter_hardware_fault_executor_ids: list[str] = []
+    # executor_ids inside a running provider maintenance window: no incentive from either pool, rented or not
+    maintenance_executor_ids: list[str] = []
+    # executor_id → its maintenance window; the validator fails a node whose cycle started inside it
+    maintenance_windows_by_executor: dict[str, MaintenanceWindow] = {}
     default_job_owner_by_executor: dict[str, str] = {}  # executor_id → "miner" | "lium"
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
     # average filler revenue per GPU configuration, read by the spot-node pay and the secure floor
