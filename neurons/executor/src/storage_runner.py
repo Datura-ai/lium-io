@@ -26,7 +26,8 @@ from storage.workspace import WorkspaceResolutionError, WorkspaceResolver
 DOCKER_BINARY = "/usr/bin/docker"
 # Set inside the detached runner container: it runs the operation itself instead of launching another one.
 DETACHED_ENV = "LIUM_STORAGE_DETACHED"
-SPEC_ENV = "LIUM_STORAGE_SPEC"
+# The detached runner prints this once it has read its spec from stdin; the spec is never in argv, env or a file.
+SPEC_RECEIVED = "storage-runner-spec-received"
 
 
 def _cancel_on_sigterm(signum: int, frame: object) -> None:
@@ -41,11 +42,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _cancel_on_sigterm)
     event_writer: JsonEventWriter | None = None
     try:
-        payload = (
-            _parse_object(os.environ.pop(SPEC_ENV, ""))
-            if SPEC_ENV in os.environ
-            else _load_operation(arguments.spec)
-        )
+        payload = _parse_object(
+            sys.stdin.readline()
+        )  # one line: the container's stdin never closes
+        print(SPEC_RECEIVED, flush=True)
         operation = StorageOperationSpec.from_mapping(payload)
         reporter = (
             StorageEventReporter(operation.operation_id, operation.action, operation.reporter)
@@ -123,10 +123,6 @@ def _run_detached(arguments: argparse.Namespace) -> int:
     name = runner_container_name(operation_id)
     started = subprocess.run(
         _runner_container_command(name, operation_id, image),
-        env={
-            **os.environ,
-            SPEC_ENV: json.dumps(payload),
-        },  # by name only: the spec never reaches argv
         capture_output=True,
         text=True,
     )
@@ -134,6 +130,7 @@ def _run_detached(arguments: argparse.Namespace) -> int:
         message = f"storage runner container did not start: {(started.stderr or '').strip()[-500:]}"
         print(json.dumps({"event": "result", "status": "FAILED", "message": message}), flush=True)
         return 1
+    _send_spec(name, payload)
 
     def cancel_requested() -> bool:
         return bool(arguments.cancel_file) and Path(arguments.cancel_file).exists()
@@ -164,6 +161,29 @@ def _run_detached(arguments: argparse.Namespace) -> int:
         return 1
 
 
+def _send_spec(name: str, payload: Mapping[str, object]) -> None:
+    """Write the spec to the runner's stdin and detach once the runner confirms it has read it."""
+    attach = subprocess.Popen(
+        [DOCKER_BINARY, "attach", "--sig-proxy=false", name],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        attach.stdin.write(json.dumps(payload) + "\n")  # type: ignore[union-attr]
+        attach.stdin.flush()  # type: ignore[union-attr]
+        # shortcut: no timeout; a runner that never reads stdin blocks here until it exits (EOF).
+        for line in attach.stdout:  # type: ignore[union-attr]
+            if SPEC_RECEIVED in line:
+                break
+    except BrokenPipeError:
+        pass  # the runner already exited; docker wait reports its status
+    finally:
+        attach.kill()
+        attach.wait()
+
+
 def _forward_cancel(name: str, cancel_requested: object, stop: threading.Event) -> None:
     while not stop.wait(1):
         if cancel_requested():  # type: ignore[operator]
@@ -187,8 +207,7 @@ def _runner_container_command(name: str, operation_id: str, image: str) -> list[
         "host",
         "--volume",
         "/var/run/docker.sock:/var/run/docker.sock",
-        "--env",
-        SPEC_ENV,
+        "--interactive",
         "--env",
         f"{DETACHED_ENV}=1",
         "--env",

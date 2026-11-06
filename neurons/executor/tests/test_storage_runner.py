@@ -2261,19 +2261,28 @@ def test_executor_side_runner_launches_a_detached_runner_that_outlives_it(
     monkeypatch.setenv("LIUM_STORAGE_HELPER_IMAGE", "sha256:" + "c" * 64)
     monkeypatch.delenv(storage_runner.DETACHED_ENV, raising=False)
     calls: list[list[str]] = []
-    launch_env: dict[str, str] = {}
+    launch_kwargs: dict[str, object] = {}
+    sent = io.StringIO()
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
         if command[1] == "run":
-            launch_env.update(kwargs["env"])  # type: ignore[arg-type]
+            launch_kwargs.update(kwargs)
         if command[1] == "wait":
             os.kill(os.getpid(), signal.SIGTERM)  # the executor is stopped while the operation runs
             return SimpleNamespace(returncode=0, stdout="130\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(storage_runner.subprocess, "run", fake_run)
-    monkeypatch.setattr(storage_runner.subprocess, "Popen", lambda *a, **k: SimpleNamespace(wait=lambda timeout: 0))
+    def fake_popen(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        if command[1] == "attach":  # the runner acknowledges the spec it read from stdin
+            return SimpleNamespace(
+                stdin=sent, stdout=iter([storage_runner.SPEC_RECEIVED + "\n"]), kill=lambda: None, wait=lambda: 0
+            )
+        return SimpleNamespace(wait=lambda timeout: 0)
+
+    monkeypatch.setattr(storage_runner.subprocess, "Popen", fake_popen)
     previous = signal.getsignal(signal.SIGTERM)
     try:
         if cancelled:
@@ -2289,19 +2298,26 @@ def test_executor_side_runner_launches_a_detached_runner_that_outlives_it(
     launch = calls[0]
     assert launch[1:3] == ["run", "--detach"] and name in launch and "--privileged" in launch
     assert f"{storage_runner.HELPER_LABEL}={OPERATION_ID}" in launch
-    assert "repository-password" not in " ".join(launch)  # the spec goes by environment, never argv
-    assert json.loads(launch_env[storage_runner.SPEC_ENV])["operation_id"] == str(OPERATION_ID)
-    rest = [command[1:] for command in calls[1:]]
+    # the spec goes on stdin only: never in argv, the container env (--env) or the docker CLI's env
+    assert "--interactive" in launch and "repository-password" not in " ".join(launch)
+    assert "env" not in launch_kwargs
+    assert not any("repository-password" in value for value in os.environ.values())
+    assert json.loads(sent.getvalue())["repository"]["password"] == "repository-password"
+    assert calls[1][1:] == ["attach", "--sig-proxy=false", name]
+    rest = [command[1:] for command in calls[2:] if command[1] != "logs"]
     if cancelled:
         assert ["kill", "--signal", "TERM", name] in rest and rest[-1] == ["rm", "--force", name]
     else:
         assert rest == [["wait", name]]  # never stopped or removed: it keeps running and reporting
 
 
-def test_detached_runner_reads_its_spec_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detached_runner_reads_its_spec_from_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.setattr("sys.argv", ["storage_runner.py"])
     monkeypatch.setenv(storage_runner.DETACHED_ENV, "1")
-    monkeypatch.setenv(storage_runner.SPEC_ENV, json.dumps(_operation_payload()))
+    # one line, and no EOF after it: a detached container's stdin stays open
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_operation_payload()) + "\n"))
     ran: list[StorageOperationSpec] = []
 
     class FakeRunner:
@@ -2319,4 +2335,4 @@ def test_detached_runner_reads_its_spec_from_the_environment(monkeypatch: pytest
     finally:
         signal.signal(signal.SIGTERM, previous)
     assert ran[0].operation_id == OPERATION_ID
-    assert storage_runner.SPEC_ENV not in os.environ  # the secrets leave the process environment
+    assert storage_runner.SPEC_RECEIVED in capsys.readouterr().out
