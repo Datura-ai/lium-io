@@ -1416,3 +1416,45 @@ async def test_the_check_confirms_a_legacy_container_ended_from_the_backends_rec
         backend.get_filler_run_active.assert_awaited_once_with(record_id)
     else:
         backend.get_pod_rental_active.assert_awaited_once_with(record_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drops", [False, True])
+async def test_the_cleanup_runs_once_and_its_removed_filler_stays_excluded_when_the_session_drops(drops):
+    """Review 4491939667 on #2080: a replay finds the filler gone and the exemption spent, and drops the update
+    that removed its processes, so the tenant check would blame the stale busy-GPU reading on outside use."""
+    import asyncssh
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+    from services.task.pipeline import Pipeline
+
+    name = "filler_00000000-0000-4000-8000-0000000000a1"
+    redis = _DictRedis()
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx(
+        [name], [{"pid": 1, "container_name": name}], backend=_ended_here_backend(holder), redis=redis
+    )
+    ssh = MagicMock(spec=asyncssh.SSHClientConnection)
+    ssh.is_closed.return_value = False
+    ctx = holder["ctx"] = ctx.model_copy(update={"ssh": ssh})
+    hset = redis.hset
+
+    async def hset_then_drop(*args):
+        await hset(*args)
+        ssh.is_closed.return_value = drops  # the session closes while the exemption is written
+
+    redis.hset = hset_then_drop
+    check = StaleContainerCleanupCheck()
+    runs = []
+    run = check.run
+
+    async def counted(c):
+        runs.append(1)
+        return await run(c)
+
+    check.run = counted
+    reconnect = AsyncMock()
+
+    _, _, after = await Pipeline([check], AsyncMock(), reconnect=reconnect).run(ctx)
+
+    assert len(runs) == 1 and not reconnect.called
+    assert after.state.gpu_processes == []

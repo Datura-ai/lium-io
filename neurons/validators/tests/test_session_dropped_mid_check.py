@@ -15,6 +15,7 @@ from services.task.checks.gpu_attestation_identity import GpuAttestationIdentity
 from services.task.checks.gpu_fault_probe import GpuFaultProbeCheck
 from services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
+from services.task.checks.hardware_identity import HardwareIdentityCheck
 from services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
 from services.task.checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from services.task.checks.rented_throughput import RentedThroughputCheck
@@ -24,6 +25,7 @@ from services.task.checks.port_connectivity import PortConnectivityCheck
 from services.task.checks.rental_probe import RentalProbeCheck
 from services.task.checks.rented_gpu_drop import RentedGpuDropCheck
 from services.task.checks.rented_machine import TenantEnforcementCheck
+from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
 from services.task.availability import REASONS_THAT_HIDE_AT_ONCE, failed_check_event
 from services.task.models import AVAILABILITY_CATEGORY, ValidationEvent
 from services.task.pipeline import CheckResult, Context, Pipeline
@@ -186,6 +188,8 @@ def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
         GpuAttestationIdentityCheck,
         PostRentalGpuRecheckCheck,
         RentedThroughputCheck,
+        HardwareIdentityCheck,
+        StaleContainerCleanupCheck,
     ):
         assert check.replays_after_session_drop is False
 
