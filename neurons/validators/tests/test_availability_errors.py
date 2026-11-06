@@ -40,6 +40,8 @@ def test_ssh_unreachable_is_an_availability_error() -> None:
     assert event.what_we_saw["ssh_port"] == 2200
     assert "relay, tunnel or Docker userland-proxy" in event.remediation  # the source pin is explained
     assert "EXECUTOR_SSH_SOURCE_PIN=false" in event.remediation  # and the switch that turns it off
+    assert "EXECUTOR_SSH_SOURCE_LIMITS=false" in event.remediation  # and the per-source sshd limits one
+    assert "docker compose up -d --force-recreate" in event.remediation  # .env is bind-mounted into the runner: only a recreate reads it
     assert [e.reason_code for e in availability_errors([event])] == ["EXECUTOR_SSH_UNREACHABLE"]
 
 

@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from core.config import settings
 from core.utils import _m
+from services.gpu_spec_table import H100_PCIE, H100_SXM, is_sxm_on_pcie_adapter, normalize_gpu_model
 from services.redis_service import RedisWrites
 
 from ..messages import GpuAttestationIdentityMessages as Msg, render_message
@@ -176,14 +177,21 @@ def _serial(hw: dict) -> str | None:
     return None if serial in NO_SERIAL else serial
 
 
-def hw_changes(previous: dict, current: dict) -> list[str]:
-    """The pinned fields a UUID changed; a field unknown on either side is not compared."""
+def hw_changes(previous: dict, current: dict, sxm_on_pcie_adapter: bool = False) -> list[str]:
+    """The pinned fields a UUID changed; a field unknown on either side is not compared. On an SXM-on-PCIe adapter
+    build (DAH-5677) the H100 SXM name and the H100 PCIe name it is listed under are the same card (DAH-5684): a pin
+    written as H100 PCIe before the driver name was pinned still matches."""
     changed = []
     for name in PINNED_HW_FIELDS:
         old, new = previous.get(name), current.get(name)
         if name == "serial":
             old, new = _serial(previous), _serial(current)
         if old in (None, "") or new in (None, ""):
+            continue
+        if name == "name" and sxm_on_pcie_adapter and {normalize_gpu_model(old), normalize_gpu_model(new)} <= {
+            H100_SXM,
+            H100_PCIE,
+        }:
             continue
         if name == "capacity":
             if abs(float(old) - float(new)) > CAPACITY_TOLERANCE * max(float(old), float(new)):
@@ -296,13 +304,16 @@ class GpuAttestationIdentityCheck:
             except (AttestationInvalid, binascii.Error) as exc:
                 invalid[gpu_uuid] = str(exc)[:200]
 
+        sxm_on_pcie_adapter = is_sxm_on_pcie_adapter(ctx.state.specs or {})
         hw_by_uuid: dict[str, dict] = {}
         for detail in ctx.state.gpu_details or []:
             gpu_uuid = detail.get("uuid")
             if gpu_uuid in reported:
                 row = by_uuid.get(gpu_uuid) or {}
                 hw_by_uuid[gpu_uuid] = {
-                    "name": detail.get("name"),
+                    # the driver's name, not the listed one: an HGX board that loses NVLink for a cycle is listed as
+                    # H100 PCIe then (DAH-5677), and a pin of that name would flag the board once NVLink is back
+                    "name": H100_SXM if sxm_on_pcie_adapter else detail.get("name"),
                     "capacity": detail.get("capacity"),
                     **{k: row.get(k) for k in ("serial", "vbios", "pci", "board_part")},
                 }
@@ -351,7 +362,7 @@ class GpuAttestationIdentityCheck:
                 hw = hw_by_uuid.get(gpu_uuid)
                 if hw:
                     previous_hw = stored[f"{KEY_HW}:{gpu_uuid}"]
-                    if previous_hw and (fields := hw_changes(json.loads(previous_hw), hw)):
+                    if previous_hw and (fields := hw_changes(json.loads(previous_hw), hw, sxm_on_pcie_adapter)):
                         changed[gpu_uuid] = fields
                     if serial := _serial(hw):
                         owner = stored[f"{KEY_SERIAL}:{serial}"]

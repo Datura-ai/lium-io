@@ -28,6 +28,7 @@ from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
+from .rental_owner import rental_of_this_node
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ class RentalVerificationCheck:
             CheckResult with verification status
         """
         rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
         has_customer_rental = bool(rented_executor and rented_executor.pods)
         # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a

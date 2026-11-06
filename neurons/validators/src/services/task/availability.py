@@ -33,6 +33,8 @@ class ReachTarget(StrEnum):
     EXECUTOR_API = "executor_api"
     # A card on the node (GpuLossHoldCheck): the validator cannot reach it through NVML.
     GPU = "gpu"
+    # The node's renting ports (PortCountCheck): too few answer for every GPU split to be rented.
+    EXECUTOR_PORTS = "executor_ports"
     # The node as a whole: a fatal check failed (failed_check_event).
     NODE = "node"
 
@@ -75,6 +77,24 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
 )
+
+
+def _is_the_nodes_own_fault(error: dict[str, Any]) -> bool:
+    """A lost or broken GPU, or a node that declares fewer ports than it needs (DAH-3698).
+
+    Neither depends on our probe, so neither is counted as our outage or silenced with one. A
+    probe that verified too few of enough declared ports stays a reach failure: counted, silenced.
+    """
+    if error.get("reason_code") in NODE_GPU_FAULT_CODES:
+        return True
+    seen = error.get("what_we_saw") or {}
+    declared, required = seen.get("declared_port_count"), seen.get("required")
+    return (
+        error.get("reason_code") == "INSUFFICIENT_PORTS"
+        and isinstance(declared, int)
+        and isinstance(required, int)
+        and declared < required
+    )
 
 
 def build_availability_event(
@@ -173,7 +193,10 @@ def build_ssh_unreachable_event(
             "and that no firewall or rate limit rejects the connection. Inbound SSH must reach the "
             "executor directly: the validator's keys log in only from the validator's addresses, so "
             "a relay, tunnel or Docker userland-proxy in front of sshd makes every login fail. If your "
-            "host relays inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false in the executor .env and restart it."
+            "host NATs, relays or proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false and "
+            "EXECUTOR_SSH_SOURCE_LIMITS=false in the executor .env and recreate the executor container "
+            "(in ~/compute-subnet/neurons/executor: docker compose up -d --force-recreate; a plain "
+            "docker compose up -d or docker restart keeps the old .env values)."
         ),
         what_we_saw={
             "executor_uuid": executor_uuid,
@@ -269,6 +292,18 @@ def _is_the_validators_own_reading(job_result: JobResult) -> bool:
     return not errors or any(error.get("reach_source") != ReachSource.MINER for error in errors)
 
 
+def _checked_and_unreachable(job_results: list[JobResult]) -> tuple[list[JobResult], list[JobResult]]:
+    """The two sides of the outage share: the validator's own readings, and those that failed at the connect."""
+    checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
+    # the node's own faults are never our outage: not counted in the share
+    unreachable_results = [
+        result
+        for result in checked_results
+        if any(not _is_the_nodes_own_fault(error) for error in result.availability_errors or [])
+    ]
+    return checked_results, unreachable_results
+
+
 def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) -> int:
     """Report nothing about reachability when the cycle looks like our own outage.
 
@@ -276,28 +311,75 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
     trusted and every result keeps what it found. Only the validator's own readings count and
     are silenced (``_is_the_validators_own_reading``).
     """
-    checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
-    # a lost or broken GPU is the node's own fault, never our outage: not counted in the share
-    unreachable_results = [
-        result
-        for result in checked_results
-        if any(
-            error.get("reason_code") not in NODE_GPU_FAULT_CODES
-            for error in result.availability_errors or []
-        )
-    ]
+    checked_results, unreachable_results = _checked_and_unreachable(job_results)
     if not is_our_own_outage(len(unreachable_results), len(checked_results)):
         return 0
     for result in checked_results:
         # None means "this cycle did not check": the backend leaves the stored errors alone.
-        # A lost or broken GPU is the node's own fault: its entry stays, the node stays hidden.
-        node_gpu_fault_entries = [
-            error
-            for error in result.availability_errors or []
-            if error.get("reason_code") in NODE_GPU_FAULT_CODES
+        # The node's own faults stay, the node stays hidden.
+        own_fault_entries = [
+            error for error in result.availability_errors or [] if _is_the_nodes_own_fault(error)
         ]
-        result.availability_errors = node_gpu_fault_entries or None
+        result.availability_errors = own_fault_entries or None
     return len(checked_results)
+
+
+class RunningOutageTally:
+    """DAH-5635: one cycle's outage share so far, fed each miner's results as its job returns.
+
+    An unrented node that failed is published at once, not after the slowest miner in the fleet,
+    but only while the share so far is trusted: at least SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
+    checked results, and not what ``silence_availability_errors_on_our_own_outage`` would call
+    our own outage. A result from another job_batch_id is ignored. The cycle starts a fresh one.
+    """
+
+    def __init__(self, job_batch_id: str, rented_executor_ids: frozenset[str] = frozenset()):
+        self.job_batch_id = job_batch_id
+        # the backend's rented list at cycle start: a failure is built before the result knows its rentals
+        self.rented_executor_ids = rented_executor_ids
+        self.checked_count = 0
+        self.unreachable_count = 0
+        # executor uuids published early this cycle
+        self.published_early: set[str] = set()
+
+    def add(self, job_results: list[JobResult]) -> list[JobResult]:
+        """Count one miner's results; return those that may be published now (none while the share is untrusted)."""
+        checked, unreachable = _checked_and_unreachable(
+            [result for result in job_results if result.job_batch_id == self.job_batch_id]
+        )
+        self.checked_count += len(checked)
+        self.unreachable_count += len(unreachable)
+        if self.checked_count < SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE or is_our_own_outage(
+            self.unreachable_count, self.checked_count
+        ):
+            return []
+        # DAH-5635: a rented node waits for the cycle, so its pod's reboot streak counts once
+        return [
+            result
+            for result in checked
+            if result.availability_errors
+            and not result.is_successful
+            and not result.is_rented
+            and str(result.executor_info.uuid).lower() not in self.rented_executor_ids
+        ]
+
+    def restore_published_early(
+        self, job_results: list[JobResult], published_before: dict[str, list[dict]]
+    ) -> None:
+        """After the cycle-end silencer fired: a node published early gets back the list the last cycle
+        published for it (published_before), so a node hidden before this cycle stays hidden and one
+        listed is listed again. None (stored errors left alone, the early ones included) when this
+        process has not published it yet. The silencer's GPU-fault entries stay on top.
+        """
+        for result in job_results:
+            uuid = str(result.executor_info.uuid)
+            if uuid not in self.published_early:
+                continue
+            before = published_before.get(uuid.lower())
+            if before is None:
+                continue
+            kept = result.availability_errors or []
+            result.availability_errors = kept + [error for error in before if error not in kept]
 
 
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.

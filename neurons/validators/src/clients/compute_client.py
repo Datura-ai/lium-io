@@ -6,7 +6,7 @@ import time
 from contextlib import suppress
 from contextvars import ContextVar
 from typing import NoReturn
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aiohttp
 import bittensor
@@ -40,6 +40,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
     ForcedValidationCycleRequest,
+    RecheckExecutorRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
@@ -74,6 +75,7 @@ from protocol.vc_protocol.validator_requests import (
     RentedMachineRequest,
     ResetVerifiedJobEvidence,
     ResetVerifiedJobRequest,
+    ResumedCreatesReport,
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
@@ -116,6 +118,14 @@ MAX_FRAME_BYTES = 4 * 1024 * 1024
 EVENT_REPORT_MAX_BYTES = MAX_FRAME_BYTES - 64 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
+# DAH-5437: a create cut off by a connector restart runs again this many times; past it (say the create itself
+# kills the connector) it is reported failed
+MAX_CREATE_RESUMES = 1
+# a record older than the longest create (the custom-build budget, past the backend's 1 h PENDING limit with the
+# margin) is one whose removal failed: the create ended long ago, so it is dropped, never run again or reported
+INFLIGHT_CREATE_MAX_AGE_SECONDS = settings.CUSTOM_DOCKERFILE_TOTAL_BUDGET_SECONDS + 600
+
+
 # DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
 # pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
 # so the backend loses the validator for seconds, not the whole startup.
@@ -217,6 +227,12 @@ class ComputeClient:
         self.miner_service = miner_service
         self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
+        # pod id -> resume count of a create the restart sweep runs again, read when that create is tracked
+        self.resume_count_by_pod_id: dict[str, int] = {}
+        # pods deleted while a create of theirs runs: that create's late restart record is not written
+        self.deleted_pod_ids: set[str] = set()
+        # set by a start sweep that read the in-flight records; sent once, first on the next authenticated socket
+        self.resumed_creates_report: ResumedCreatesReport | None = None
 
         self.logging_extra = {
             "validator_hotkey": self.my_hotkey(),
@@ -284,6 +300,10 @@ class ComputeClient:
         await self.take_connector_lead()
 
         try:
+            await self.miner_service.redis_service.clear_running_backend_commands()
+        except Exception:
+            logger.exception("Failed to clear running backend commands on connector start")
+        try:
             await self.fail_creates_cut_off_by_restart()
         except Exception as exc:  # the sweep is best-effort; it must never keep the connector from starting
             logger.error(
@@ -292,10 +312,6 @@ class ComputeClient:
                     extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
                 )
             )
-        try:
-            await self.miner_service.redis_service.clear_running_backend_commands()
-        except Exception:
-            logger.exception("Failed to clear running backend commands on connector start")
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
@@ -381,6 +397,13 @@ class ComputeClient:
             ) from exc
         if response.status != "success":
             raise AuthenticationError("auth request received failed response", response.errors)
+
+        if (report := self.resumed_creates_report) is not None:
+            # once, and before any reply: the backend fails a waiting create sent before THIS socket authenticated
+            # that is not listed, so a report re-sent on a later socket would fail the creates sent on this one
+            report.sent_at = time.time()
+            await ws.send(report.model_dump_json())
+            self.resumed_creates_report = None
 
         self.ws = ws
 
@@ -471,6 +494,7 @@ class ComputeClient:
                             availability_errors=data.get("availability_errors"),
                             pod_states=data.get("pod_states"),
                             pod_ssh=data.get("pod_ssh"),
+                            host_runtime_fault=data.get("host_runtime_fault"),
                             ssh_host_key=data.get("ssh_host_key"),
                         )
 
@@ -876,6 +900,14 @@ class ComputeClient:
             return
 
         try:
+            recheck = pydantic.TypeAdapter(RecheckExecutorRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_recheck_executor(recheck)
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = "Invalid message received from backend"
@@ -974,6 +1006,17 @@ class ComputeClient:
             return
 
         await self.miner_service.request_validation_cycle_now()
+
+    async def handle_recheck_executor(self, req: RecheckExecutorRequest) -> None:
+        """Queue a single-node check of one executor; the express lane picks it up."""
+        extra = {**self.logging_extra, "executor_uuid": req.executor_id}
+        try:
+            executor_id = str(UUID(req.executor_id))
+        except ValueError:
+            logger.warning(_m("Recheck request with an invalid executor id", extra=get_extra_info(extra)))
+            return
+        await self.miner_service.redis_service.request_executor_recheck(executor_id)
+        logger.info(_m("Executor recheck queued", extra=get_extra_info(extra)))
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)
@@ -1083,6 +1126,11 @@ class ComputeClient:
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
         # past it and find nothing to cancel — and the create it raced then orphans its container.
+        if isinstance(job_request, ContainerDeleteRequest):
+            # DAH-5437: the renter deleted this pod; a connector restart must not resume its in-flight create
+            if inflight_creates.is_running(job_request.pod_id):
+                self.deleted_pod_ids.add(job_request.pod_id)
+            await self._untrack_backend_create_for_restart_report(job_request.pod_id)
         if not isinstance(job_request, ContainerCreateRequest):
             return await self._drive_miner_job(job_request)
         with inflight_creates.track(job_request.pod_id):
@@ -1091,12 +1139,20 @@ class ComputeClient:
                 return await self._drive_miner_job(job_request)
             finally:
                 await self._untrack_backend_create_for_restart_report(job_request.pod_id)
+                if inflight_creates.is_only_create(job_request.pod_id):
+                    self.deleted_pod_ids.discard(job_request.pod_id)
 
     async def _track_backend_create_for_restart_report(self, job_request: ContainerCreateRequest) -> None:
+        if job_request.pod_id in self.deleted_pod_ids:
+            return  # a delete that landed first already removed the record; writing it now would undo that
         # best-effort: a Redis error loses only the restart report, never the create itself
         try:
             await self.miner_service.redis_service.add_inflight_backend_create(
-                job_request.pod_id, job_request.miner_hotkey, job_request.executor_id, job_request.workload_kind
+                job_request.pod_id,
+                job_request.miner_hotkey,
+                job_request.executor_id,
+                job_request.workload_kind,
+                resumes=self.resume_count_by_pod_id.pop(job_request.pod_id, 0),
             )
         except Exception as exc:
             self._log_backend_create_tracking_error(job_request.pod_id, exc)
@@ -1159,12 +1215,39 @@ class ComputeClient:
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never
         replied, so the backend kept the pod PENDING / the filler STARTING, and its pending-pod flag refused the
-        delete for 30 min. Each one is reported failed now, which frees the node, and its flag is cleared."""
+        delete for 30 min. DAH-5437: each one is listed in the ResumedCreatesReport and the backend sends it again from
+        its own records (Redis holds no request: it carries the renter's environment and credentials); a re-run
+        replaces what the cut-off attempt left under the pod's names, so the backend still gets one reply. One already
+        resumed MAX_CREATE_RESUMES times is reported failed, which frees the node. Every one's flag is cleared."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
+        rented_pod_ids = await redis_service.rented_pod_ids() if creates else frozenset()
+        resumed: list[str] = []
         for pod_id, create in creates.items():
+            if pod_id in rented_pod_ids or (
+                time.time() - create.started_at_unix_seconds > INFLIGHT_CREATE_MAX_AGE_SECONDS
+            ):
+                # DAH-5437: a create that ended but whose record removal failed; its container runs (or may, past
+                # the longest create), and a re-run would replace it by name
+                await self._untrack_backend_create_for_restart_report(pod_id)
+                continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
+            await redis_service.release_cut_off_create_lock(create.executor_id, pod_id)
+            if create.resumes < MAX_CREATE_RESUMES:
+                # the count survives another restart before the backend's re-send arrives
+                await redis_service.add_inflight_backend_create(
+                    pod_id, create.miner_hotkey, create.executor_id, create.workload_kind, resumes=create.resumes + 1
+                )
+                self.resume_count_by_pod_id[pod_id] = create.resumes + 1
+                resumed.append(pod_id)
+                logger.warning(
+                    _m(
+                        "Create cut off by a connector restart, asking the backend to send it again",
+                        extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, "resumes": create.resumes + 1}),
+                    )
+                )
+                continue
             self.message_queue.append(
                 FailedContainerRequest(
                     miner_hotkey=create.miner_hotkey,
@@ -1181,9 +1264,13 @@ class ComputeClient:
             logger.warning(
                 _m(
                     "Create cut off by a connector restart, reported failed",
-                    extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json")}),
+                    extra=get_extra_info(
+                        {**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json")}
+                    ),
                 )
             )
+        # DAH-5437: only a sweep that read the records reports; an empty list is the point (Redis lost them)
+        self.resumed_creates_report = ResumedCreatesReport(pod_ids=resumed)
 
     async def _drive_miner_job(
         self,
@@ -1240,6 +1327,10 @@ class ComputeClient:
             response: (
                 ContainerCreated | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            if isinstance(response, FailedContainerRequest):
+                # the backend fences a failure on the create it answers: a late failure of an earlier create (a
+                # reboot the backend already gave up on) must not fail or exempt the one that replaced it
+                response.command_id = job_request.command_id
 
             logger.info(
                 _m(

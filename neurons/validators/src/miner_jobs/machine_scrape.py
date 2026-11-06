@@ -683,8 +683,8 @@ VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # the v2 and v3 plugins' DATA_DIRs on the host, under DockerRootDir: loopback_plugin_setup.py uses
 # the same names (v3 = direct I/O; v2 stays for the volumes made on it)
 VLOOPBACK_HOST_DATA_DIR_NAMES = ("vloopback-v2", "vloopback-v3")
-# DAH-5045: the Engy checkpoint cache, reported for its download progress. Like the Dolphin cache it is
-# kept across rentals (Fish 26 Oct), so it reads as used disk: renters are listed the real free space.
+# DAH-5045: the Engy checkpoint cache, reported for its download progress. DAH-5260: unlike the Dolphin cache
+# it reads as free disk, since a customer create removes it when the renter needs the space.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
 # the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
 FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
@@ -892,7 +892,10 @@ def get_docker_disk_usage():
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     # A filler's own run volume is preallocated to its full size, but any rental removes the filler
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
-    # renters were shown half of an idle node's disk. The model caches stay: rentals keep them.
+    # renters were shown half of an idle node's disk. DAH-5260: so does the Engy checkpoint cache
+    # (1561 GB on an 8x B300), which a customer create removes when the renter needs the space.
+    # The Dolphin cache (~40 GB) stays used.
+    engy_cache = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX)
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
     by_volume = {
         str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
@@ -900,6 +903,7 @@ def get_docker_disk_usage():
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
+    volumes -= engy_cache
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
@@ -927,19 +931,19 @@ def get_docker_disk_usage():
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_run_volume_kb": filler_run_volumes // 1024,
+        "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
-        "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
+        "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
         "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
         "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
     }
 
 
 def release_filler_cache(hard_disk):
-    # DAH-5192: report the filler run volumes as free disk (a rental removes them), so the listing floor,
-    # the disk a renter is offered and the filler fit checks see that space. The model caches are not in
-    # it: kept across rentals, they stay used. The key is dropped: not part of the reported block.
-    cache_kb = hard_disk.pop("filler_run_volume_kb", 0)
+    # DAH-5192: report the filler run volumes and the Engy cache as free disk (a rental removes them), so the
+    # listing floor, the disk a renter is offered and the filler fit checks see that space. The Dolphin cache
+    # is not in it: it stays used. The key is dropped: not part of the reported block.
+    cache_kb = hard_disk.pop("filler_released_kb", 0)
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)
@@ -1544,6 +1548,7 @@ class InfinibandPort:
         sm_lid: str,
         pkey: str,
         gids: list[str],
+        driver: str,
     ) -> None:
         self.device = device
         self.port = port
@@ -1557,6 +1562,7 @@ class InfinibandPort:
         self.sm_lid = sm_lid
         self.pkey = pkey
         self.gids = gids
+        self.driver = driver
 
     def as_payload(self) -> dict[str, str | list[str]]:
         return {
@@ -1572,7 +1578,17 @@ class InfinibandPort:
             "ib_sm_lid": self.sm_lid,
             "ib_pkey": self.pkey,
             "ib_gids": self.gids,
+            "ib_driver": self.driver,
         }
+
+
+def read_driver_name(device_path: str) -> str:
+    # The kernel driver behind an RDMA device ("mlx5_core", "efa", ...). AWS EFA reports no
+    # Ethernet or InfiniBand link layer, so the driver is the one fact that names it. "" if unreadable.
+    try:
+        return os.path.basename(os.readlink(f"{device_path}/device/driver"))
+    except Exception:
+        return ""
 
 
 def read_infiniband_port(
@@ -1598,6 +1614,7 @@ def read_infiniband_port(
         read_sysfs_value(f"{port_path}/sm_lid"),
         read_sysfs_value(f"{port_path}/pkeys/0"),
         [gid for gid in gids if gid],
+        read_driver_name(device_path),
     )
 
 
