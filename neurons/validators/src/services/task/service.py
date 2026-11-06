@@ -172,13 +172,23 @@ class TaskService:
                 # G1 invariant: a verified-bad GPU can never surface as passed
                 # (HostPolicyResult.attestation_passed requires tdx ∧ gpu-not-False).
                 attestation_passed = host_policy.attestation_passed
-                if attestation_nonce is not None and attestation_digest is not None:
-                    await self.attestation_service.record_attestation_event(
-                        miner_info.miner_hotkey, attestation_passed
-                    )
+                if attestation_digest is not None:
+                    if attestation_nonce is not None:
+                        await self.attestation_service.record_attestation_event(
+                            miner_info.miner_hotkey, executor_info.uuid, attestation_passed
+                        )
+                    elif not await self.attestation_service.has_recent_nonce_bound_pass(
+                        miner_info.miner_hotkey, executor_info.uuid
+                    ):
+                        await self.attestation_service.record_attestation_event(
+                            miner_info.miner_hotkey, executor_info.uuid, False
+                        )
+                        raise AttestationError("no recent challenged attestation for this executor")
             except AttestationError as exc:
                 if attestation_nonce is not None:
-                    await self.attestation_service.record_attestation_event(miner_info.miner_hotkey, False)
+                    await self.attestation_service.record_attestation_event(
+                        miner_info.miner_hotkey, executor_info.uuid, False
+                    )
                 log_text = _m(
                     "Attestation failed",
                     extra=get_extra_info({

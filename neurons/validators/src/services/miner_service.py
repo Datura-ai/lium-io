@@ -2084,7 +2084,7 @@ class MinerService:
             # Old-axon miners drop the nonce field, so their upload carries none; a due
             # attestation still expects the nonce, so it fails closed instead of downgrading.
             upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
-            attestation_nonce = await self.attestation_service.maybe_issue_nonce(payload.miner_hotkey)
+            attestation_nonce = await self.attestation_service.maybe_issue_nonce(payload.miner_hotkey, executor_id)
             nonce_hex = attestation_nonce.value_hex if attestation_nonce and upload_nonce else upload_nonce
 
             # Prepare request

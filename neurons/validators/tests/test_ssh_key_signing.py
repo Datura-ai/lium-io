@@ -149,7 +149,7 @@ async def test_a_due_attestation_always_expects_the_nonce_but_only_a_trusted_min
     [submitted] = [
         body for name, body in rest_miner_service.rest_calls if name == "ssh-pubkey-submit"
     ]
-    rest_miner_service.attestation_service.maybe_issue_nonce.assert_awaited_once_with("miner-a")
+    rest_miner_service.attestation_service.maybe_issue_nonce.assert_awaited_once_with("miner-a", None)
     [task_call] = rest_miner_service.task_service.create_task.await_args_list
     assert task_call.kwargs["attestation_nonce"] is (attestation if attestation_due else None)
     if not trusted:

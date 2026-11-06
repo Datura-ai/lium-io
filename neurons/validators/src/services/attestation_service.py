@@ -31,6 +31,7 @@ TDX_ATTESTED_EXECUTOR_SET = "tdx_attested_executors"
 # every wave).
 TDX_LAST_ATTESTATION_EVENT_PREFIX = "tdx_last_attestation_event"
 TDX_ATTESTATION_RETRY_PREFIX = "tdx_attestation_retry"
+TDX_EXECUTOR_NONCE_PASS_PREFIX = "tdx_executor_nonce_pass"
 
 
 class AttestationError(RuntimeError):
@@ -118,7 +119,7 @@ class AttestationService:
     def nonce_enabled(self) -> bool:
         return self.enabled
 
-    async def maybe_issue_nonce(self, miner_hotkey: str) -> AttestationNonce | None:
+    async def maybe_issue_nonce(self, miner_hotkey: str, executor_id: str | None = None) -> AttestationNonce | None:
         """Mint a fresh attestation nonce when this miner is due for a
         nonce-bound attestation event.
 
@@ -132,7 +133,8 @@ class AttestationService:
         if not self.nonce_enabled:
             return None
 
-        if self.redis_service is not None:
+        # a request for one executor (the express lane) always carries a challenge: it is one node
+        if self.redis_service is not None and executor_id is None:
             key = f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}"
             try:
                 raw = await self.redis_service.get(key)
@@ -148,7 +150,7 @@ class AttestationService:
 
         return AttestationNonce.issue()
 
-    async def record_attestation_event(self, miner_hotkey: str, passed: bool) -> None:
+    async def record_attestation_event(self, miner_hotkey: str, executor_uuid: str, passed: bool) -> None:
         """Record a nonce-bound event: a pass starts the interval, a failure forces a nonce next wave."""
         if self.redis_service is None:
             return
@@ -156,6 +158,11 @@ class AttestationService:
             if passed:
                 await self.redis_service.set(
                     f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}", str(time.time())
+                )
+                # outlives the interval, so it still stands on the last nonce-free wave before the next challenge
+                await self.redis_service.set(
+                    f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}", "1",
+                    ex=2 * settings.TDX_REATTEST_INTERVAL_SECONDS,
                 )
             else:
                 # outlives the interval, so a sibling executor's later pass cannot cancel it
@@ -168,6 +175,19 @@ class AttestationService:
                 "Failed to record attestation-event cadence",
                 extra=get_extra_info({"miner_hotkey": miner_hotkey, "error": str(exc)}),
             ))
+
+    async def has_recent_nonce_bound_pass(self, miner_hotkey: str, executor_uuid: str) -> bool:
+        """Evidence without a challenge stands only for an executor that recently passed its own."""
+        if self.redis_service is None:
+            return False
+        try:
+            return bool(await self.redis_service.get(f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}"))
+        except Exception as exc:
+            logger.warning(_m(
+                "Failed to read executor attestation pass; treating it as missing",
+                extra=get_extra_info({"miner_hotkey": miner_hotkey, "executor_uuid": executor_uuid, "error": str(exc)}),
+            ))
+            return False
 
     def _expected_report_data(self, host_key: str) -> str:
         digest = hashlib.sha256(self.REPORT_PREFIX +

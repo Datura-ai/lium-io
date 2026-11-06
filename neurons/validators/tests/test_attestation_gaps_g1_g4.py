@@ -410,7 +410,7 @@ async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
 
     # Act
     first = await service.maybe_issue_nonce("miner-hotkey")
-    await service.record_attestation_event("miner-hotkey", passed=True)
+    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
     second = await service.maybe_issue_nonce("miner-hotkey")
 
     # Assert — one passed event per interval per miner
@@ -428,9 +428,9 @@ async def test_g3_a_failed_or_unanswered_event_never_opens_a_nonce_free_interval
     assert await service.maybe_issue_nonce("miner-hotkey") is not None
     assert await service.maybe_issue_nonce("miner-hotkey") is not None
     # a failure wins over a sibling executor's pass in the same wave, whatever the order
-    await service.record_attestation_event("miner-hotkey", passed=True)
-    await service.record_attestation_event("miner-hotkey", passed=False)
-    await service.record_attestation_event("miner-hotkey", passed=True)
+    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
+    await service.record_attestation_event("miner-hotkey", "exec-1", passed=False)
+    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
     assert await service.maybe_issue_nonce("miner-hotkey") is not None
 
 
@@ -801,3 +801,13 @@ async def test_prod_whitelist_rejects_july_staging_runner_compose(service, monke
         await service._check_whitelist(JULY_STAGING_RUNNER_COMPOSE_HASH, os_image, executor)
         is False
     )
+
+
+async def test_g3_a_request_for_one_executor_always_carries_a_challenge(monkeypatch):
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    service = AttestationService(redis_service=FakeRedis())
+    await service.record_attestation_event("miner-hotkey", "exec-1", passed=True)
+
+    assert await service.maybe_issue_nonce("miner-hotkey") is None
+    assert await service.maybe_issue_nonce("miner-hotkey", "exec-2") is not None
+

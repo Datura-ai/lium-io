@@ -7,7 +7,7 @@ import asyncssh
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
-from services.attestation_service import AttestationError, AttestationNonce, HostPolicyResult
+from services.attestation_service import HostPolicyResult
 from services.task import service as task_service_module
 from services.task.availability import (
     AVAILABILITY_CATEGORY,
@@ -418,37 +418,90 @@ def test_the_peer_text_of_an_ssh_failure_is_capped() -> None:
     assert len(event.what_we_saw["error"]) == MAX_PEER_TEXT_LENGTH
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "policy, passed",
-    [
-        (AsyncMock(return_value=HostPolicyResult(attestation_digest="d", gpu_attestation_passed=True)), True),
-        (AsyncMock(return_value=HostPolicyResult(attestation_digest="d", gpu_attestation_passed=False)), False),
-        (AsyncMock(side_effect=AttestationError("quote does not echo the nonce")), False),
-        (AsyncMock(return_value=HostPolicyResult()), None),
-    ],
-    ids=["passed", "gpu-bad", "rejected", "no-evidence"],
-)
-async def test_a_nonce_bound_attestation_records_its_outcome_for_the_miner(policy, passed) -> None:
-    service = _task_service_that_reaches_the_ssh_connect()
-    service.attestation_service.prepare_host_policy = policy
-    service.attestation_service.record_attestation_event = AsyncMock()
-    miner, executor = _a_job_for("node-9")
+class _DictRedis:
+    def __init__(self) -> None:
+        self.kv: dict[str, str] = {}
 
-    with patch.object(task_service_module, "InteractiveShellService", _ShellThatRefusesToConnect):
-        await service.create_task(
-            miner_info=miner,
-            executor_info=executor,
-            keypair=MagicMock(ss58_address="5Val"),
-            private_key="key",
-            public_key="pub",
-            encrypted_files=MagicMock(),
-            rented_data=MagicMock(),
-            default_docker_image_digests={},
-            attestation_nonce=AttestationNonce.issue(),
+    async def get(self, key):
+        return self.kv.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.kv[key] = value
+
+
+_PASSED = HostPolicyResult(attestation_digest="d", gpu_attestation_passed=True)
+_NO_QUOTE = HostPolicyResult()
+
+
+async def _wave(attestation, miner_hotkey, outcomes, executor_id=None) -> dict[str, bool]:
+    """One validation wave of a miner: each executor's policy outcome -> did it get past attestation."""
+    nonce = await attestation.maybe_issue_nonce(miner_hotkey, executor_id)
+    reached = {}
+    for uuid, outcome in outcomes:
+        service = _task_service_that_reaches_the_ssh_connect()
+        service.attestation_service.prepare_host_policy = AsyncMock(
+            **({"side_effect": outcome} if isinstance(outcome, BaseException) else {"return_value": outcome})
         )
+        service.attestation_service.record_attestation_event = attestation.record_attestation_event
+        service.attestation_service.has_recent_nonce_bound_pass = attestation.has_recent_nonce_bound_pass
+        miner, executor = _a_job_for(uuid)
+        miner.miner_hotkey = miner_hotkey
+        dialled = AsyncMock(side_effect=asyncssh.Error(code=1, reason="refused"))
 
-    if passed is None:
-        service.attestation_service.record_attestation_event.assert_not_awaited()
-    else:
-        service.attestation_service.record_attestation_event.assert_awaited_once_with(miner.miner_hotkey, passed)
+        class _Shell(_ShellThatRefusesToConnect):
+            async def __aenter__(self):
+                await dialled()
+
+        with patch.object(task_service_module, "InteractiveShellService", _Shell):
+            await service.create_task(
+                miner_info=miner,
+                executor_info=executor,
+                keypair=MagicMock(ss58_address="5Val"),
+                private_key="key",
+                public_key="pub",
+                encrypted_files=MagicMock(),
+                rented_data=MagicMock(),
+                default_docker_image_digests={},
+                attestation_nonce=nonce,
+            )
+        reached[uuid] = dialled.await_count == 1
+    return reached
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("a_first", [True, False], ids=["A-first", "B-first"])
+@pytest.mark.parametrize(
+    "b_on_the_challenged_wave",
+    [_NO_QUOTE, None, ConnectionRefusedError("verifier timed out")],
+    ids=["missing-quote", "omitted", "verifier-timeout"],
+)
+async def test_a_siblings_pass_never_lets_an_executor_skip_its_own_challenge(
+    monkeypatch, a_first, b_on_the_challenged_wave
+) -> None:
+    from core.config import settings
+    from services.attestation_service import AttestationService
+
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    attestation = AttestationService(redis_service=_DictRedis())
+    first = [("A", _PASSED)] + ([] if b_on_the_challenged_wave is None else [("B", b_on_the_challenged_wave)])
+    await _wave(attestation, "5Miner", first if a_first else first[::-1])
+
+    # the next wave carries no challenge for A; B shows a quote it never bound to one
+    reached = await _wave(attestation, "5Miner", [("A", _PASSED), ("B", _PASSED)])
+
+    assert reached == {"A": True, "B": False}
+    assert await attestation.maybe_issue_nonce("5Miner") is not None
+
+
+@pytest.mark.asyncio
+async def test_an_executor_that_passed_its_own_challenge_skips_the_next_until_due(monkeypatch) -> None:
+    from core.config import settings
+    from services.attestation_service import AttestationService
+
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    attestation = AttestationService(redis_service=_DictRedis())
+    # B is new: the express lane asks for it alone, with a challenge, while the miner is not due
+    await _wave(attestation, "5Miner", [("A", _PASSED)])
+    await _wave(attestation, "5Miner", [("B", _PASSED)], executor_id="B")
+
+    assert await _wave(attestation, "5Miner", [("A", _PASSED), ("B", _PASSED)]) == {"A": True, "B": True}
