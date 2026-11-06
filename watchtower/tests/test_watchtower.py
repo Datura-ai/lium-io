@@ -160,7 +160,7 @@ def test_fetch_verified_digest_returns_digest_on_success(mock_get, mock_verify):
     # Assert — verified digest is returned and the correct URL was used
     assert digest == "sha256:newdigest"
     mock_get.assert_called_once_with(
-        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.0"}, timeout=30
+        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.1"}, timeout=30
     )
     mock_verify.assert_called_once()
 
@@ -423,6 +423,69 @@ def test_pull_image_by_digest_rejects_an_image_without_the_requested_digest():
 
 
 # ── find_runner_container ────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _no_own_container(monkeypatch, tmp_path):
+    """Outside a container by default (CVM stack, `docker run`): the runner lookup is not scoped."""
+    monkeypatch.setattr("watchtower.MOUNTINFO_PATH", str(tmp_path / "absent"))
+
+
+OWN_ID = "e" * 64
+
+
+def _in_project(monkeypatch, tmp_path, client, project):
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        "1 0 0:1 / / rw - overlay overlay rw\n"
+        f"2 1 259:1 /var/lib/docker/containers/{OWN_ID}/hostname /etc/hostname rw - ext4 /dev/root rw\n"
+    )
+    monkeypatch.setattr("watchtower.MOUNTINFO_PATH", str(mountinfo))
+    own = Mock()
+    own.labels = {"com.docker.compose.project": project} if project else {}
+    get = client.containers.get.side_effect
+
+    def containers_get(reference):
+        return own if reference == OWN_ID else get(reference)
+
+    client.containers.get.side_effect = containers_get
+
+
+def test_find_runner_container_is_scoped_to_its_own_compose_project(monkeypatch, tmp_path):
+    """Regression: a host with this stack's runner and a stopped runner from another compose project
+    matched the service label twice, so every cycle raised and the node never updated. The lookup
+    now asks the daemon for this watchtower's own project only."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    _in_project(monkeypatch, tmp_path, client, "executor")
+
+    assert find_runner_container(client) is runner
+    assert client.containers.list.call_args_list[0].kwargs == {
+        "all": True,
+        "filters": {"label": ["com.docker.compose.service=executor-runner", "com.docker.compose.project=executor"]},
+    }
+
+
+def test_find_runner_container_is_not_scoped_without_a_compose_project(monkeypatch, tmp_path):
+    """A watchtower started with `docker run` has no project label: the lookup stays host-wide."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    _in_project(monkeypatch, tmp_path, client, None)
+
+    assert find_runner_container(client) is runner
+    assert client.containers.list.call_args_list[0].kwargs == {
+        "all": True, "filters": {"label": "com.docker.compose.service=executor-runner"}
+    }
+
+
+def test_find_runner_container_prefers_the_cvm_name_inside_a_compose_project(monkeypatch, tmp_path):
+    client = _client_with(None)
+    cvm = _fake_container(name="executor-runner")
+    _in_project(monkeypatch, tmp_path, client, "executor")
+    client.containers.get.side_effect = lambda reference: cvm
+
+    assert find_runner_container(client) is cvm
+    client.containers.list.assert_not_called()
+
 
 def test_find_runner_container_prefers_the_cvm_name():
     """The CVM stack names the container `executor-runner`; that lookup wins and no label query runs."""
