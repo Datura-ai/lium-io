@@ -476,6 +476,7 @@ class BackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        timeout: int = 300,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -498,6 +499,7 @@ class BackendClient:
             loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
                 probes that plugin; without it (or on an older backend, which ignores it) only the
                 legacy plugin is probed. None omits the field.
+            timeout: Seconds to wait; the backend needs time to SSH and verify the container.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -533,7 +535,7 @@ class BackendClient:
             ExecutorHealthCheckResponse,
             json_data=json_data,
             add_signature=True,  # Use standard signature headers
-            timeout=300,  # 5 minutes - backend needs time to SSH and verify container
+            timeout=timeout,
         )
 
     async def report_verification_started(

@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
@@ -53,7 +54,9 @@ class DummyBackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        timeout: int = 300,
     ):
+        self.timeout = timeout
         self.called_with = {
             "miner_address": miner_address,
             "miner_port": miner_port,
@@ -109,6 +112,36 @@ async def test_rental_verification_always_calls_backend(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.VERIFIED.reason
     assert backend_client.called_with is not None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_health_check_waits_no_longer_than_the_task_has_left(context_factory):
+    # Arrange: 100 s before the executor task is cancelled
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    elapsed = settings.JOB_TIME_OUT - 120 - 100
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+
+    # Act
+    await RentalVerificationCheck().run(ctx)
+
+    # Assert: the wait ends before the cancel, leaving the probe cleanup its time
+    assert 65 <= backend.timeout <= 70
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_health_check_keeps_its_full_wait_early_in_the_task(context_factory):
+    # Arrange
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+
+    # Act
+    await RentalVerificationCheck().run(ctx)
+
+    # Assert
+    assert backend.timeout == 300
 
 
 @pytest.mark.asyncio

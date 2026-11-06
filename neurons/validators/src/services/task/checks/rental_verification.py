@@ -29,6 +29,7 @@ from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
 from .rental_owner import rental_of_this_node
+from .task_time import task_seconds_left
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,11 @@ _GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
         score_warning="GPU is not addressable and needs a host reset",
     ),
 }
+
+# The backend's health check may take 5 minutes. It waits no longer than the executor task has left, minus the
+# probe cleanup's time: a wait cut by the task cancel drops the node's whole cycle result (c8c6b803, 6 Nov).
+HEALTH_CHECK_TIMEOUT_SECONDS = 300
+_CLEANUP_RESERVE_SECONDS = 30
 
 # How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
@@ -214,6 +220,9 @@ class RentalVerificationCheck:
                 loopback_plugin=current_loopback_plugin_alias()
                 if settings.LOOPBACK_PLUGIN_V2_ENABLED
                 else LEGACY_LOOPBACK_PLUGIN_ALIAS,
+                timeout=int(
+                    max(1, min(HEALTH_CHECK_TIMEOUT_SECONDS, task_seconds_left(ctx) - _CLEANUP_RESERVE_SECONDS))
+                ),
             )
 
             # Handle API failure (None response) - fail this executor
