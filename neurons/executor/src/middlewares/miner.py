@@ -2,7 +2,7 @@ import asyncio
 import re
 import time
 
-import bittensor
+from bittensor_wallet import Keypair
 from fastapi.responses import JSONResponse
 from payloads.miner import MinerAuthPayload
 from pydantic import ValidationError
@@ -80,7 +80,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
 
             verified = False
             for hotkey in hotkeys_to_verify:
-                keypair = bittensor.Keypair(ss58_address=hotkey)
+                keypair = Keypair(ss58_address=hotkey)
                 try:
                     if keypair.verify(payload.data_to_sign, payload.signature):
                         verified = True

@@ -436,7 +436,7 @@ def _ctx(context_factory, findings: list[dict], *, redis=None, **overrides):
         )
     )
     ctx = context_factory(
-        config=build_context_config(inspector_enabled=True),
+        config=build_context_config(),
         services=build_services(inspector=service, redis=redis),
         state=build_state(rented_data=_rented("executor-123")),
         **overrides,

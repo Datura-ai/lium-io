@@ -23,7 +23,7 @@ from services.local_verify_client import SCHEMA, LocalVerifyUnavailable, parse_a
 from services.task import liumd_shadow
 from services.task import service as task_service_module
 from services.task.checks import verifyx as verifyx_check
-from services.task.checks.verifyx import VerifyXCheck
+from services.task.checks.verifyx import VerifyXCheck, VerifyXColdRetryCheck
 from services.task.liumd_shadow import (
     LIUMD_SHADOW_EVENT,
     TodayStep,
@@ -36,6 +36,7 @@ from services.task.service import TaskService
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
 from tests.test_local_verify import _FakeVerifyXValidator, matmul_service, matmul_stdout
+from tests.test_verifyx_cold_sample_retry import _idle_now
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
 UUID = "exec-shadow"
@@ -170,7 +171,9 @@ def _ctx(keypair, monkeypatch, verifyx_service, *, sealed="challenge", state=Non
         services=build_services(
             validation=matmul_service(monkeypatch, sealed=sealed),
             verifyx=verifyx_service,
-            redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
+            redis=SimpleNamespace(
+                renting_in_progress=AsyncMock(return_value=False), get=AsyncMock(return_value=None)
+            ),
         ),
         config=build_context_config(
             validator_keypair=keypair,
@@ -377,33 +380,32 @@ class _TodaysVerifyX:
         return SimpleNamespace(data=data, error=None, diagnostics=None)
 
 
-def _network_ema(download):
-    return RentedExecutorsResponse(
-        executors={}, network_ema={UUID: NetworkEMA(ema_verifyx_download_speed=download)}
-    )
+def _network_ema(download, upload=None):
+    ema = NetworkEMA(ema_verifyx_download_speed=download, ema_verifyx_upload_speed=upload)
+    return RentedExecutorsResponse(executors={}, network_ema={UUID: ema})
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "prev_ema,network,first_pass,today,retry,prior_fallbacks",
+    "prev_ema,network,first_pass,today,retry,prior_fallbacks,prior_upload_kept",
     [
         # The reviewer's probe: raw success, but the EMA (100 → 75) falls under the floor.
-        (100.0, {"download_speed": 50.0}, False, "fail", None, 0),
-        (100.0, {"download_speed": 50.0}, True, "fail", None, 0),
-        (None, {"download_speed": 50.0}, False, "fail", None, 0),
+        (100.0, {"download_speed": 50.0}, False, "fail", None, 0, 0),
+        (100.0, {"download_speed": 50.0}, True, "fail", None, 0, 0),
+        (None, {"download_speed": 50.0}, False, "fail", None, 0, 0),
         # A first pass on a never-measured host defers the floor to the first scored cycle.
-        (None, {"download_speed": 50.0}, True, "pass", None, 0),
-        (300.0, {"download_speed": 900.0}, False, "pass", None, 0),
+        (None, {"download_speed": 50.0}, True, "pass", None, 0, 0),
+        (300.0, {"download_speed": 900.0}, False, "pass", None, 0, 0),
         # A Cloudflare fallback with no reading keeps the stored EMA, under and over the floor.
-        (80.0, {"download_speed": None, "cloudflare_fallback": True}, False, "fail", None, 0),
-        (150.0, {"download_speed": None, "cloudflare_fallback": True}, False, "pass", None, 0),
+        (80.0, {"download_speed": None, "cloudflare_fallback": True}, False, "fail", None, 0, 0),
+        (150.0, {"download_speed": None, "cloudflare_fallback": True}, False, "pass", None, 0, 0),
         # Nothing stored and nothing read: the EMA stays unseeded and the check passes.
-        (None, {"download_speed": None, "cloudflare_fallback": True}, False, "pass", None, 0),
-        # Cold retries on, never measured: today re-measures 50 then 150 Mbps and passes, where
+        (None, {"download_speed": None, "cloudflare_fallback": True}, False, "pass", None, 0, 0),
+        # Never measured: today re-measures 50 then 150 Mbps and passes, where
         # the shadow's one 50 Mbps sample would fail. Not compared.
-        (None, {"download_speed": 50.0}, False, "pass", {"download_speed": 150.0}, 0),
-        # Cold retries on, but a stored EMA: no retry today, so compared as ever.
-        (100.0, {"download_speed": 50.0}, False, "fail", {"download_speed": 150.0}, 0),
+        (None, {"download_speed": 50.0}, False, "pass", {"download_speed": 150.0}, 0, 0),
+        # A stored EMA: no retry today, so compared as ever.
+        (100.0, {"download_speed": 50.0}, False, "fail", {"download_speed": 150.0}, 0, 0),
         # Past the package-fallback cap today's check scores the package reading as zero (EMA 150 →
         # 75, fail) while the shadow would read 1,000 Mbps and pass. Not compared.
         (
@@ -416,6 +418,18 @@ def _network_ema(download):
             False,
             "fail",
             None,
+            8,
+            0,
+        ),
+        # Past the upload keep cap today's check feeds the 429's 0 (EMA 10 -> 5, fail) while the
+        # shadow's verdict keeps the stored EMA and passes. Not compared.
+        (
+            2000.0,
+            {"download_speed": 2100.0, "upload_speed": None, "cloudflare_upload_fallback": True},
+            False,
+            "fail",
+            None,
+            0,
             8,
         ),
     ],
@@ -431,6 +445,7 @@ def _network_ema(download):
         "cold-retry-not-compared",
         "cold-retry-on-known-host",
         "package-fallback-cap-not-compared",
+        "upload-fallback-cap-not-compared",
     ],
 )
 async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
@@ -443,15 +458,20 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
     today,
     retry,
     prior_fallbacks,
+    prior_upload_kept,
 ):
-    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", retry is not None)
     verifyx_check._package_fallback_probes.clear()
+    verifyx_check._kept_upload_probes.clear()
     if prior_fallbacks:
         verifyx_check._package_fallback_probes[("5Miner", UUID)] = prior_fallbacks
-    judged = {"success": True, "ram": {}, "network": network}
-    retried = [{"success": True, "ram": {}, "network": retry}] if retry else []
+    if prior_upload_kept:
+        verifyx_check._kept_upload_probes[("5Miner", UUID)] = prior_upload_kept
+    # a disk reading that clears the floor: the retry check judges the disk of the sample it keeps (DiskSpaceCheck)
+    retry_disk = {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024}
+    judged = {"success": True, "ram": {}, "hard_disk": retry_disk, "network": network}
+    retried = [{"success": True, "ram": {}, "hard_disk": retry_disk, "network": retry}] if retry else []
     verifyx_service.judged = judged
-    rented = _network_ema(prev_ema)
+    rented = _network_ema(prev_ema, 10.0 if prior_upload_kept else None)
     ctx = _ctx(
         keypair,
         monkeypatch,
@@ -468,7 +488,11 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
         state=build_state(specs=SPECS, rented_data=rented),
     )
     stored_before = rented.network_ema[UUID].model_dump()
+    _idle_now(todays_ctx.services)
     checked = await VerifyXCheck().run(todays_ctx)
+    if checked.passed and checked.updates["state"].verifyx_cold_retry is not None:
+        # the cold retry, last before scoring, gives today's verdict on a cold first sample
+        checked = await VerifyXColdRetryCheck().run(todays_ctx.model_copy(update=checked.updates))
     assert ("pass" if checked.passed else "fail") == today
     events = (
         [checked.event, _event(CAPABILITY, "GPU_VERIFY_OK")] if checked.passed else [checked.event]
@@ -480,15 +504,19 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
 
     entry = record["steps"]["verifyx"]
     assert entry["today"] == today
-    if retry and prev_ema is None:
-        assert checked.passed is True
+    if prev_ema is None:
+        # never measured: today's check may re-measure (DAH-2959), so the shadow does not compare
         assert entry.get("agree") is None
         assert entry["liumd_reason"] == "cold_sample_retry"
         assert "liumd_verdict" not in entry
-        assert fake.intents[0]["steps"]["verifyx"] is None
+        # a failed run with no other GPU step to compare sends no intent at all
+        assert not fake.intents or fake.intents[0]["steps"]["verifyx"] is None
     elif prior_fallbacks:
         assert entry.get("agree") is None
         assert entry["liumd_reason"] == "package_fallback_cap"
+    elif prior_upload_kept:
+        assert entry.get("agree") is None
+        assert entry["liumd_reason"] == "upload_fallback_cap"
     else:
         assert entry["liumd_verdict"] == today
         assert entry["agree"] is True

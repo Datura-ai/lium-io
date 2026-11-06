@@ -1,10 +1,12 @@
 import docker
 import logging
 import json
+import threading
 import time
 from datetime import datetime
 from models.pod_log import PodLog
 from services.pod_log_store import append_pod_log
+from services.stale_task_recovery import recover_stale_executor_task
 
 # Set up logging to a file in JSON format (one JSON object per line)
 logging.basicConfig(filename="container_monitor.log", level=logging.INFO,
@@ -95,9 +97,26 @@ def handle_event(event):
         log_event(pod_log)
 
 
+def recover_executor_forever() -> None:
+    # Restart the executor when a stale containerd task keeps it down; see stale_task_recovery.
+    # Its own client: the events stream holds the main one.
+    client = docker.from_env()
+    while True:
+        try:
+            done = recover_stale_executor_task(client)
+            if done:
+                started, reason = done
+                event = "executor_recovered" if started else "executor_recovery_retry"
+                log_event(PodLog(event=event, reason=reason, created_at=datetime.utcnow()))
+        except Exception as ex:
+            log_event(PodLog(error=f"Executor stale-task recovery failed: {ex}", created_at=datetime.utcnow()))
+        time.sleep(60)
+
+
 def main():
     """Main loop to monitor Docker events."""
     client = docker.from_env()
+    threading.Thread(target=recover_executor_forever, daemon=True).start()
 
     while True:
         try:

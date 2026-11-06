@@ -85,14 +85,26 @@ class PodVerdict:
     findings: list[str]
 
 
+def running_rented_container_names(ctx: Context) -> list[str]:
+    """Container names of this executor's running rented pods, per the backend's rented list."""
+    rented_data = ctx.state.rented_data
+    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    if rented_executor is None or rented_executor.miner_hotkey != ctx.miner_hotkey:
+        return []
+    return [
+        pod.docker_container_name
+        for pod in rented_executor.pods
+        if pod.status in (None, POD_STATUS_RUNNING)
+    ]
+
+
 class RentedPodResourcesCheck:
     """Read each running rented pod's HostConfig and its init PID's oom_score_adj and effective cgroup
     cpuset/cpu.max, and flag a host that cut the renter below MIN_RENTAL_CPU_SHARE of its advertised
     cores (cpuset or quota), by `docker update` or by writing the cgroup directly.
 
     The validator never sets a cpuset and records the --cpus it deployed in an immutable label
-    (RENTAL_CPU_COUNT_LABEL). Non-fatal: shadow always passes, and only
-    RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED lets a cpuset/quota finding fail and zero the score.
+    (RENTAL_CPU_COUNT_LABEL). Non-fatal: a cpuset/quota finding fails the check and zeroes the score.
     Never fails on an inability to measure.
     """
 
@@ -105,15 +117,7 @@ class RentedPodResourcesCheck:
                 passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             )
 
-        rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        if rented_executor is not None and rented_executor.miner_hotkey != ctx.miner_hotkey:
-            rented_executor = None
-        names = [
-            pod.docker_container_name
-            for pod in (rented_executor.pods if rented_executor else [])
-            if pod.status in (None, POD_STATUS_RUNNING)
-        ]
+        names = running_rented_container_names(ctx)
         if not names:
             return CheckResult(
                 passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id)
@@ -135,17 +139,8 @@ class RentedPodResourcesCheck:
         ]
         what = {"executor_uuid": ctx.executor.uuid, "pods": [asdict(o) for o in outcomes]}
         if any(f in SCORED_FINDINGS for o in outcomes for f in o.findings):
-            enforce = settings.RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED
-            event = render_message(
-                Msg.RESOURCES_REDUCED,
-                ctx=ctx,
-                check_id=self.check_id,
-                severity=None if enforce else "warning",
-                impact=None if enforce else "Shadow observation only: score was NOT changed",
-                what=what,
-            )
-            updates = {"rented_pod_resources_passed": False} if enforce else {}
-            return CheckResult(passed=not enforce, event=event, updates=updates)
+            event = render_message(Msg.RESOURCES_REDUCED, ctx=ctx, check_id=self.check_id, what=what)
+            return CheckResult(passed=False, event=event, updates={"rented_pod_resources_passed": False})
 
         event = render_message(Msg.RESOURCES_OK, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
