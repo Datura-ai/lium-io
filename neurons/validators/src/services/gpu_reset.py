@@ -10,7 +10,10 @@ Nothing is ever read from inside the pod (no `docker exec`): the renter controls
 On an NVSwitch node whose Fabric Manager runs (many HGX nodes show no /dev/nvidia-nvswitch*), the driver
 refuses `-r` while Fabric Manager holds the GPUs: a pod that owns every host GPU gets Fabric Manager (and
 the NVLink subnet manager on HGX Blackwell, when it runs) stopped around the reset and always started
-again, all in one host systemd unit that outlives the SSH session (a reset that hangs past its timeout is left
+again. A pod that owns every host GPU also gets the host's other GPU holders stopped the same way (DCGM, a
+dcgm-exporter container, IMEX, nvidia-persistenced, and any other host service still holding /dev/nvidia*): the
+driver refuses `-r` "In use" while any of them holds a GPU. All of it runs in one host systemd unit that
+outlives the SSH session (a reset that hangs past its timeout is left
 to that unit, which starts the fabric when the reset ends; the latch cure and the container start wait until the
 unit is proven gone);
 any other pod is refused (the provider resets).
@@ -19,6 +22,8 @@ Safety invariants, each pinned by a test:
 - the reset set is a subset of BOTH the container's own DeviceRequests GPUs (from the docker
   daemon) and the GPUs the backend holds for the pod;
 - `nvidia-smi -r` never runs without `-i`;
+- a refused `-r` never reports ok: the latch cure alone reads `latch_cleared`, never `reset`;
+- every host GPU holder stopped for the reset is started again, also when the reset fails;
 - the container is always started again once it was stopped (or a stop of it failed), and a reset
   of a pod whose container is not running starts it first.
 """
@@ -59,10 +64,61 @@ HOST_SYSTEMCTL = "nsenter -t 1 -m -- systemctl"
 # the NVSwitch fabric's host services, in stop order (started again in reverse): Fabric Manager, then the
 # NVLink subnet manager it uses on HGX Blackwell
 FABRIC_SERVICES = ("nvidia-fabricmanager", "nvidia-nvlsm")
+# every host service the unit may stop, in stop order: GPU clients first, the fabric, then nvidia-persistenced
+# (it keeps the driver loaded, so it goes last and comes back first)
+HOST_GPU_SERVICES = (
+    "nvidia-dcgm-exporter",
+    "dcgm-exporter",
+    "nvidia-dcgm",
+    "dcgm",
+    "nvidia-imex",
+    *FABRIC_SERVICES,
+    "nvidia-persistenced",
+)
+# id, AutoRemove, image of every running container: a --rm container is deleted by its stop, so it is never stopped
+DOCKER_PS_COMMAND = (
+    f"{DOCKER} inspect --format '{{{{.Id}}}} {{{{.HostConfig.AutoRemove}}}} {{{{.Config.Image}}}}' "
+    f"$({DOCKER} ps -q --no-trunc)"
+)
+# the process names still holding a GPU device (host PID view): what blocked a refused `nvidia-smi -r`.
+# No ${...} in a unit script: systemd expands it in the command line before /bin/sh runs (to "" if unknown)
+GPU_HOLDERS_SCRIPT = (
+    "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do cat /proc/$p/comm; done "
+    "2>/dev/null | sort -u | tr '\\n' ' '"
+)
+# the host services (system.slice) of the processes still holding a GPU device, but the reset unit itself
+GPU_HOLDER_UNITS_SCRIPT = (
+    "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do "
+    "sed -n 's#.*:/system.slice/\\([^/]*\\.service\\)$#\\1#p' /proc/$p/cgroup; done 2>/dev/null "
+    "| grep -vx 'lium-gpu-reset-fabric.service' | sort -u"
+)
 # a fabric reset runs as one host systemd unit, so a dropped SSH session cannot leave Fabric Manager down
 # named, so a reset that outlives its SSH timeout can be stopped (one per host: it owns every host GPU)
 FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
+# starts an exporter that outlived its kill once it exits, after the reset unit has ended. systemd owns the
+# retries: any failed wait or start (a Docker daemon restart included) fails the unit and it runs again; only an
+# observed exit plus a start that is still up ("true false") a few seconds later, or a removed container, ends it.
+# One unit per container ID (the unit name ends in it), so two exporters each get their own
+EXPORTER_RESTART_UNIT = "lium-gpu-reset-exporter-restart"
+EXPORTER_RESTART_SCRIPT = (
+    # every docker call has a deadline (a stalled dockerd): a timeout fails the unit, so systemd runs it again
+    'timeout -k 5 300 docker wait "$0" >/dev/null || '
+    '{ timeout -k 5 30 docker inspect "$0" 2>&1 >/dev/null | grep -q "No such" && exit 0; exit 1; }; '
+    'timeout -k 5 30 docker start "$0" >/dev/null && sleep 5 && '
+    "[ \"$(timeout -k 5 30 docker inspect -f '{{.State.Running}} {{.State.Restarting}}' \"$0\")\" = 'true false' ]"
+)
+EXPORTER_RESTART_RUN = (
+    f'systemd-run --quiet --collect --unit={EXPORTER_RESTART_UNIT}-"$dying" -p Restart=on-failure -p RestartSec=10 '
+    f'/bin/sh -c {shlex.quote(EXPORTER_RESTART_SCRIPT)} "$dying" '
+    # a unit already there for this container (an earlier reset's) starts it already
+    f'|| [ "$(systemctl show -p LoadState --value {EXPORTER_RESTART_UNIT}-"$dying")" = loaded ]'
+)
+# "no-systemd" only when the host proves it has no systemd (not booted with it, no systemd-run): any other answer,
+# a failed probe included, keeps the reset in the host unit
+HOST_SYSTEMD_PROBE = "nsenter -t 1 -m -- sh -c " + shlex.quote(
+    "[ -d /run/systemd/system ] || command -v systemd-run >/dev/null 2>&1 || echo no-systemd"
+)
 # processes left in the reset unit's cgroup (v2, or v1's systemd hierarchy); 0 only for an unloaded unit or an
 # existing, readable, empty cgroup.procs, or a host without systemctl (no unit can have run there). Neither file
 # there, or a failed read, exits 1: unknown, never 0
@@ -74,9 +130,19 @@ FABRIC_RESET_UNIT_PROCS = "nsenter -t 1 -m -- sh -c " + shlex.quote(
     '[ -f "$f" ] || continue; n=$(wc -l < "$f") || exit 1; echo "$n"; exit 0; done; exit 1'
 )
 _FABRIC_STOP_FAILED_EXIT = 97
+# a host GPU holder the unit stopped is not active again after the reset
+_FABRIC_START_FAILED_EXIT = 98
 STOP_GRACE_SECONDS = 10
+# process deadline (plus a 2s kill) on each docker CLI call of the host unit beyond its own grace or wait: a
+# stalled dockerd cannot hold the unit forever. Worst case of the unit's docker calls with one holder container:
+# stop 22 + wait 92 + inspect 12 + kill 12 + wait 32 + start 12 = 182s; each further holder container adds 34s
+_DOCKER_CALL_SECONDS = 10
+# "<running> <restarting>" of a holder container: only "true false" is up
+CONTAINER_STATE_COMMAND = f"{DOCKER} inspect -f '{{{{.State.Running}}}} {{{{.State.Restarting}}}}'"
 # a `docker stop` that got no exit event leaves the container dying: wait this long for it to exit before the start
 EXIT_WAIT_SECONDS = 90
+# after the kill of a container that outlasted EXIT_WAIT_SECONDS
+KILL_WAIT_SECONDS = 30
 _QUERY_TIMEOUT_SECONDS = 30
 _RESET_TIMEOUT_SECONDS = 120
 _DETAIL_TAIL_CHARS = 300
@@ -252,7 +318,12 @@ class _Plan:
     targets: list[str]
     index_by_uuid: dict[str, int]
     widened: bool
-    fabric_services: list[str] = field(default_factory=list)
+    # host services and containers to stop around the reset (only for a pod that owns every host GPU)
+    host_services: list[str] = field(default_factory=list)
+    holder_containers: list[str] = field(default_factory=list)
+    # the pod owns every host GPU (container and backend alike): the reset runs in the host unit, which also
+    # stops host GPU holders the validator does not list
+    owns_host: bool = False
 
 
 async def _precheck(
@@ -318,14 +389,58 @@ async def _precheck(
         raise GpuResetRefused(
             GpuResetErrorCode.GpuInUseOutsidePod, f"processes outside the pod use the GPUs: {outside}"
         )
+    host_services: list[str] = list(fabric_services)
+    holder_containers: list[str] = []
+    # both ownership sources: a `--gpus all` container may see more GPUs than the backend gave the pod
+    owns_host = set(ordered) == set(host_by_uuid) == set(pod_gpu_uuids)
+    if owns_host:
+        holders = await plan_host_holders(runner, fabric_services, container_id)
+        host_services, holder_containers, owns_host = holders.host_services, holders.holder_containers, holders.owns_host
     return _Plan(
         container_id,
         ordered,
         targets,
         index_by_uuid,
         widened=set(targets) != set(requested),
-        fabric_services=fabric_services,
+        host_services=host_services,
+        holder_containers=holder_containers,
+        owns_host=owns_host,
     )
+
+
+@dataclass(frozen=True)
+class HostHolders:
+    host_services: list[str]
+    holder_containers: list[str]
+    owns_host: bool
+
+
+async def plan_host_holders(
+    runner: SSHCommandRunner, fabric_services: list[str], container_id: str | None
+) -> HostHolders:
+    """For a pod that owns every host GPU: the host services and holder containers to stop around its reset, and
+    whether the reset runs in the host unit (False only on a host proven without systemd with nothing to stop)."""
+    host_services = [
+        unit
+        for unit in HOST_GPU_SERVICES
+        if unit in fabric_services or (unit not in FABRIC_SERVICES and await _service_active(runner, unit))
+    ]
+    holder_containers: list[str] = []
+    listed = await _run(runner, DOCKER_PS_COMMAND)
+    for line in (listed.stdout or "").splitlines() if listed.exit_code == 0 else []:
+        cid, auto_remove, image = (line.strip().split(" ", 2) + ["", ""])[:3]
+        if (
+            "dcgm-exporter" in image
+            and auto_remove == "false"
+            and cid != container_id
+            and re.fullmatch(r"[0-9a-f]{12,64}", cid)
+        ):
+            holder_containers.append(cid)
+    if not host_services and not holder_containers:
+        # a host proven without systemd and with nothing to stop resets directly, as before the host unit
+        probe = await _run(runner, HOST_SYSTEMD_PROBE)
+        return HostHolders([], [], not (probe.exit_code == 0 and (probe.stdout or "").strip() == "no-systemd"))
+    return HostHolders(host_services, holder_containers, True)
 
 
 async def _service_active(runner: SSHCommandRunner, unit: str) -> bool:
@@ -368,19 +483,60 @@ async def _widen_targets_to_nvlink_peers(
     return [uuid for uuid in ordered if uuid in targets], []
 
 
-def build_fabric_reset_command(units: list[str], reset_command: str) -> str:
-    """Stop the fabric services, reset, start them again (last stopped first) as one host systemd unit.
+def build_fabric_reset_command(units: list[str], reset_command: str, containers: list[str] = ()) -> str:
+    """Stop the GPU holders (containers, the given services, then any other host service still holding a GPU
+    device), reset, start them all again (the given services last stopped first, then the discovered ones, then the
+    containers) as one host systemd unit. A refused reset prints
+    the processes still holding a GPU.
 
     The unit outlives the SSH session, and SIGPIPE is ignored so a closed pipe cannot kill it before the start."""
-    stop = " ".join(shlex.quote(u) for u in units)
-    start = " ".join(shlex.quote(u) for u in reversed(units))
-    script = (
-        "trap '' PIPE; rc=0; "
-        f'for u in {stop}; do systemctl stop "$u" || {{ echo "could not stop $u" >&2; '
-        f"rc={_FABRIC_STOP_FAILED_EXIT}; break; }}; done; "
-        f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; }}; "
-        f'for u in {start}; do systemctl start "$u"; done; exit $rc'
+    fail = f'|| {{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; break; }}'
+    script = "trap '' PIPE; rc=0; up=''; dying=''; "
+    if containers:
+        ids = " ".join(shlex.quote(c) for c in containers)
+        script += (
+            f'for u in {ids}; do timeout -k 2 {STOP_GRACE_SECONDS + _DOCKER_CALL_SECONDS} '
+            f'docker stop -t {STOP_GRACE_SECONDS} "$u" >/dev/null || '
+            f'{{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; dying="$u"; break; }}; done; '
+        )
+    if units:
+        stop = " ".join(shlex.quote(u) for u in units)
+        script += f'[ $rc -ne 0 ] || for u in {stop}; do systemctl stop "$u" {fail}; done; '
+    script += (
+        f"[ $rc -ne 0 ] || for u in $({GPU_HOLDER_UNITS_SCRIPT}); do "
+        f'echo "stopping GPU holder $u"; up="$u $up"; systemctl stop "$u" {fail}; done; '
+        f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; "
+        f'[ $rc -eq 0 ] || echo "GPU holders left: $({GPU_HOLDERS_SCRIPT})"; }}; '
     )
+    if units:
+        # first: a discovered holder may need them (Fabric Manager, nvidia-persistenced) to start
+        start = " ".join(shlex.quote(u) for u in reversed(units))
+        script += f'for u in {start}; do systemctl start "$u"; done; '
+    script += (
+        # a discovered holder is checked here (the validator knows only the listed ones); the rest still start
+        'for u in $up; do { systemctl start "$u" && systemctl is-active "$u" >/dev/null; } '
+        f'|| {{ echo "could not start $u" >&2; rc={_FABRIC_START_FAILED_EXIT}; }}; done; '
+    )
+    if containers:
+        # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: wait for
+        # the exit (a removed container ends the wait), then kill one still there and wait once more. Bounded, so
+        # the unit always ends inside the validator's wait and the renter pod starts. One that outlives its kill
+        # (stuck in the kernel) still reads running, so the restore check cannot see it: its start goes to a host
+        # unit that outlives this one and starts it once it exits, and the report names it (restart pending)
+        script += (
+            f'[ -z "$dying" ] || until timeout -k 2 {EXIT_WAIT_SECONDS} docker wait "$dying" >/dev/null; do '
+            f'! timeout -k 2 {_DOCKER_CALL_SECONDS} docker inspect "$dying" 2>&1 >/dev/null | grep -q "No such" || break; '
+            'echo "$dying did not exit, killing it" >&2; '
+            f'timeout -k 2 {_DOCKER_CALL_SECONDS} docker kill "$dying" >/dev/null 2>&1; '
+            f'timeout -k 2 {KILL_WAIT_SECONDS} docker wait "$dying" >/dev/null 2>&1 || {{ '
+            f"{{ {EXPORTER_RESTART_RUN}; }} "
+            '>/dev/null 2>&1 && echo "$dying did not exit after a kill: restart pending, it starts once it exits" >&2 '
+            '|| echo "could not start $dying: it did not exit after a kill" >&2; }; break; done; '
+        )
+        ids = " ".join(shlex.quote(c) for c in reversed(containers))
+        # a start that times out reads as not running again in the validator's restore check
+        script += f'for u in {ids}; do timeout -k 2 {_DOCKER_CALL_SECONDS} docker start "$u" >/dev/null; done; '
+    script += "exit $rc"
     return f"{HOST_SYSTEMD_RUN} /bin/sh -c {shlex.quote(script)}"
 
 
@@ -423,9 +579,27 @@ async def _reset_unit_pending(runner: SSHCommandRunner) -> bool:
     return True
 
 
-async def _restore_fabric_services(runner: SSHCommandRunner, units: list[str]) -> str | None:
-    """Starts every fabric service that is not active after the reset; the problem left, else None."""
+async def _restore_fabric_services(
+    runner: SSHCommandRunner, units: list[str], containers: list[str] = (), settle_seconds: float = 0
+) -> str | None:
+    """Starts every stopped host service and holder container that is not up after the reset; the problem left,
+    else None. A container counts as up only when it still runs (not exited, not restarting) after settle_seconds."""
     problems: list[str] = []
+    for cid in reversed(containers):
+        try:
+            started = await _run(runner, f"{DOCKER} start {shlex.quote(cid)}", timeout=_RESET_TIMEOUT_SECONDS)
+            if started.exit_code != 0:
+                problems.append(f"container {cid[:12]} is not running again after the reset: {_tail(started.stderr)}")
+                continue
+            await asyncio.sleep(settle_seconds)
+            state = await _run(runner, f"{CONTAINER_STATE_COMMAND} {shlex.quote(cid)}")
+            answer = (state.stdout or "").strip() if state.exit_code == 0 else ""
+            if answer != "true false":
+                problems.append(
+                    f"container {cid[:12]} is not running again after the reset: {answer or 'state unreadable'}"
+                )
+        except Exception as exc:
+            problems.append(f"container {cid[:12]} state unknown after the reset: {exc}")
     for unit in reversed(units):
         try:
             if await _service_active(runner, unit):
@@ -436,7 +610,7 @@ async def _restore_fabric_services(runner: SSHCommandRunner, units: list[str]) -
         except Exception as exc:
             problems.append(f"{unit} state unknown after the reset: {exc}")
     if problems:
-        logger.error("fabric services down after a GPU reset: %s", "; ".join(problems))
+        logger.error("host GPU services down after a GPU reset: %s", "; ".join(problems))
     return "; ".join(problems) or None
 
 
@@ -552,15 +726,15 @@ async def reset_pod_gpus(
             )
 
         command = build_reset_command(plan.targets, container_uuids=plan.container_uuids, pod_gpu_uuids=pod_gpu_uuids)
-        if not plan.fabric_services:
+        if not plan.owns_host:
             reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
         else:
-            # the driver refuses -r while Fabric Manager holds the GPUs; the pod owns every one of them
+            # the driver refuses -r while Fabric Manager or another host client holds the GPUs; the pod owns them all
             reset = None
             try:
                 reset = await _run(
                     runner,
-                    build_fabric_reset_command(plan.fabric_services, command),
+                    build_fabric_reset_command(plan.host_services, command, plan.holder_containers),
                     timeout=_RESET_TIMEOUT_SECONDS + 120,
                 )
             finally:
@@ -570,13 +744,19 @@ async def reset_pod_gpus(
                     fabric_manager_problem = "the GPU reset is still running on the host"
                 else:
                     # before the latch cure and the container start: CUDA on an NVSwitch node needs Fabric Manager
-                    fabric_manager_problem = await _restore_fabric_services(runner, plan.fabric_services)
+                    fabric_manager_problem = await _restore_fabric_services(
+                        runner, plan.host_services, plan.holder_containers, settle_seconds
+                    )
                 if fabric_manager_problem:
                     notes.append(fabric_manager_problem)
             if fabric_manager_problem:
-                raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "no latch cure while Fabric Manager is down")
-            if reset.exit_code == _FABRIC_STOP_FAILED_EXIT:
-                raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, _tail(reset.stderr) or "could not stop")
+                raise GpuResetRefused(
+                    GpuResetErrorCode.ResetNotSupported, "no latch cure while a host GPU service is down"
+                )
+            if reset.exit_code in (_FABRIC_STOP_FAILED_EXIT, _FABRIC_START_FAILED_EXIT):
+                raise GpuResetRefused(
+                    GpuResetErrorCode.ResetNotSupported, _tail(reset.stderr) or "a host GPU holder did not stop or start"
+                )
         if reset.exit_code == 0:
             report.ok = True
             report.gpus = [GpuResetOutcome(index=plan.index_by_uuid[u], uuid=u, result="reset") for u in plan.targets]
@@ -584,7 +764,7 @@ async def reset_pod_gpus(
             # ~45% of the Blackwell fleet refuses `nvidia-smi -r` (gpu_wedge.py); the context cycle at
             # least clears the DAH-2427 latch, on the pod's GPUs only
             report.error_code = GpuResetErrorCode.ResetNotSupported
-            notes.append(f"nvidia-smi -r refused: {_tail(reset.stdout or reset.stderr)}")
+            notes.append(f"nvidia-smi -r refused, the GPUs were not reset: {_tail(reset.stdout or reset.stderr)}")
             for cure in await cure_wedged_gpus(runner, plan.targets):
                 report.gpus.append(
                     GpuResetOutcome(
@@ -594,9 +774,9 @@ async def reset_pod_gpus(
                         detail=None if cure.cured else _tail(cure.error or cure.output),
                     )
                 )
-            # the fallback is the fix when it cures every target; the refused -r stays in the notes
+            # the latch cure is no reset: the report stays not ok (each GPU reads latch_cleared, never reset)
             if report.gpus and all(gpu.result == "latch_cleared" for gpu in report.gpus):
-                report.ok, report.error_code = True, None
+                notes.append("only the latch clear ran")
     except GpuResetRefused as refused:
         report.error_code = refused.code
         notes.append(refused.detail)

@@ -138,7 +138,7 @@ def test_report_signed_by_a_key_outside_the_chain_is_rejected():
         verify_gpu_evidence(card.pem, _report(card, nonce, signer=ec.generate_private_key(ec.SECP384R1())), nonce, ca.root)
 
 
-def _ctx(context_factory, ca, rows_for, *, gpus=("GPU-a",), redis=None, rented=False, details=None):
+def _ctx(context_factory, ca, rows_for, *, gpus=("GPU-a",), redis=None, rented=False, details=None, specs=None):
     """`rows_for(nonce)` is what the host prints for the validator's nonce (the last arg of the command)."""
 
     async def run(cmd, *args, **kwargs):
@@ -166,6 +166,7 @@ def _ctx(context_factory, ca, rows_for, *, gpus=("GPU-a",), redis=None, rented=F
             gpu_uuids=",".join(gpus),
             rented_data=rented_data,
             gpu_details=details if details is not None else [{"uuid": u, "name": "H100", "capacity": 81559} for u in gpus],
+            **({"specs": specs} if specs is not None else {}),
         ),
         ssh=SimpleNamespace(run=run),
         services=services,
@@ -300,10 +301,14 @@ async def _twice(context_factory, first, second, **kw):
     """Run a clean first cycle, then `second`; each is (rows, gpus, details)."""
     ca = FakeCa()
     rows, gpus, details = first
-    ctx = _ctx(context_factory, ca, lambda n: rows, gpus=gpus, details=details)
+    specs = kw.pop("specs", None)
+    first_specs, second_specs = specs if isinstance(specs, tuple) else (specs, specs)
+    ctx = _ctx(context_factory, ca, lambda n: rows, gpus=gpus, details=details, specs=first_specs)
     assert (await _run(ctx, ca, enforce=True)).passed is True
     rows, gpus, details = second
-    ctx = _ctx(context_factory, ca, lambda n: rows, gpus=gpus, details=details, redis=ctx.services.redis)
+    ctx = _ctx(
+        context_factory, ca, lambda n: rows, gpus=gpus, details=details, redis=ctx.services.redis, specs=second_specs
+    )
     return await _run(ctx, ca, **kw)
 
 
@@ -442,6 +447,44 @@ async def test_uuid_changing_model_across_cycles_is_inconsistent(context_factory
     assert result.passed is False
     assert result.event.reason_code == Msg.INCONSISTENT.reason
     assert result.event.what_we_saw["hardware_changed"] == {"GPU-a": ["name", "capacity"]}
+
+
+ADAPTER_SPECS = {
+    "gpu": {"count": 2, "details": [{"name": "NVIDIA H100 80GB HBM3"}] * 2},
+    "interconnect": {"nvlink": False, "nvlink_pairs": 0},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("specs", "passed"), [(ADAPTER_SPECS, True), (None, False)])
+async def test_an_adapter_build_listed_as_h100_pcie_is_not_a_hardware_change(context_factory, specs, passed):
+    # DAH-5684: the DAH-5677 rename of an SXM-on-PCIe adapter build flagged every such card as changed hardware
+    gpus = ("GPU-a", "GPU-b")
+    result = await _twice(
+        context_factory,
+        ([_hw(u) for u in gpus], gpus, [{"uuid": u, "name": "NVIDIA H100 80GB HBM3", "capacity": 81559} for u in gpus]),
+        ([_hw(u) for u in gpus], gpus, [{"uuid": u, "name": "NVIDIA H100 PCIe", "capacity": 81559} for u in gpus]),
+        enforce=True,
+        specs=specs,
+    )
+    assert result.passed is passed
+    assert bool(result.event.what_we_saw["hardware_changed"]) is not passed
+
+
+@pytest.mark.asyncio
+async def test_an_hgx_board_back_from_a_cycle_without_nvlink_is_not_a_hardware_change(context_factory):
+    # DAH-5684: the cycle without NVLink lists the board as H100 PCIe; its pin keeps the driver's H100 SXM name
+    gpus = ("GPU-a", "GPU-b")
+    hgx_specs = {**ADAPTER_SPECS, "interconnect": {"nvlink": True, "nvlink_pairs": 1}}
+    result = await _twice(
+        context_factory,
+        ([_hw(u) for u in gpus], gpus, [{"uuid": u, "name": "NVIDIA H100 PCIe", "capacity": 81559} for u in gpus]),
+        ([_hw(u) for u in gpus], gpus, [{"uuid": u, "name": "NVIDIA H100 80GB HBM3", "capacity": 81559} for u in gpus]),
+        enforce=True,
+        specs=(ADAPTER_SPECS, hgx_specs),
+    )
+    assert result.passed is True
+    assert result.event.what_we_saw["hardware_changed"] == {}
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,6 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import (
     classify_gpu_model,
-    is_sxm_on_pcie_adapter,
     list_sxm_on_pcie_adapter_as_pcie,
     reference_gpu_model,
 )
@@ -291,7 +290,6 @@ class ResultHandler:
             has_lium_filler=has_lium_filler,
             filler_revenue_per_gpu_hour=filler_revenue_per_gpu_hour,
             filler_revenue_usd_per_hour=filler_revenue_usd_per_hour,
-            sxm_on_pcie_adapter=is_sxm_on_pcie_adapter(context.state.specs or {}),
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,
@@ -299,6 +297,7 @@ class ResultHandler:
             # DAH-3338: the whole list; MinerService.publish_machine_specs bounds the spec's copy
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
+            host_runtime_fault=context.state.host_runtime_fault,
         )
 
     @staticmethod
