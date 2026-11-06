@@ -219,7 +219,8 @@ def attach_measurement(
     kept: list[dict] = [
         entry
         for entry in result.spec.get(spec_key) or []
-        if entry.get("peer_address") != measurement.peer_address
+        # by identity, not address: hosts in different networks can share a private address
+        if entry.get("peer_executor_uuid") != measurement.peer_executor_uuid
     ]
     result.spec[spec_key] = kept + [measurement.model_dump(mode="json")]
 

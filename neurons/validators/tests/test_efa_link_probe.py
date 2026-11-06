@@ -1,5 +1,8 @@
+import asyncio
+import shlex
 import time
-from unittest.mock import AsyncMock
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -55,28 +58,61 @@ def test_the_rate_is_read_from_fi_pingpongs_table_and_a_run_without_one_measures
     assert efa_link_probe.measured_gigabits_per_second("fi_getinfo(): No data available\n") is None
 
 
+@pytest.mark.parametrize("c_address", ["10.0.1.3", "10.0.1.2"])
 @pytest.mark.asyncio
-async def test_each_pair_is_recorded_on_both_hosts_under_its_own_spec_key(monkeypatch):
-    a, b = host("a", [EFA_PORT]), host("b", [EFA_PORT])
+async def test_each_pair_is_recorded_on_both_hosts_under_its_own_spec_key(monkeypatch, c_address):
+    a, b, c = [host(uuid, [EFA_PORT]) for uuid in "abc"]
 
     async def measure(server, client, key, addresses):
-        addresses.update({"a": "10.0.1.1", "b": "10.0.1.2"})
-        return 10.0
+        addresses.update({"a": "10.0.1.1", "b": "10.0.1.2", "c": c_address})
+        return 10.0 if (server.executor_info.uuid, client.executor_info.uuid) == ("a", "b") else None
 
-    monkeypatch.setattr(efa_link_probe, "_measure_pair", AsyncMock(side_effect=measure))
+    monkeypatch.setattr(efa_link_probe, "_measure_pair", measure)
 
-    await efa_link_probe.measure_and_attach([a, b], "key", {}, time.monotonic())
+    await efa_link_probe.measure_and_attach([a, b, c], "key", {}, time.monotonic())
 
-    assert [(m["peer_executor_uuid"], m["gigabits_per_second"]) for m in a.spec["efa_link_measurements"]] == [("b", 10.0)]
-    assert [(m["peer_executor_uuid"], m["peer_address"]) for m in b.spec["efa_link_measurements"]] == [("a", "10.0.1.1")]
-    assert "roce_link_measurements" not in a.spec
+    for node, expected in [(a, {"b": 10.0, "c": None}), (b, {"a": 10.0, "c": None}), (c, {"a": None, "b": None})]:
+        assert {m["peer_executor_uuid"]: m["gigabits_per_second"] for m in node.spec["efa_link_measurements"]} == expected
+        assert "roce_link_measurements" not in node.spec
+    assert [(m["peer_executor_uuid"], m["peer_address"]) for m in b.spec["efa_link_measurements"]][0] == ("a", "10.0.1.1")
 
 
+@pytest.mark.parametrize("failure", ["ssh_closed", "blackhole"])
 @pytest.mark.asyncio
-async def test_a_probe_error_records_a_failed_pair_and_never_reaches_the_miners_job(monkeypatch):
-    a, b = host("a", [EFA_PORT]), host("b", [EFA_PORT])
-    monkeypatch.setattr(efa_link_probe, "_measure_pair", AsyncMock(side_effect=OSError("ssh closed")))
+async def test_an_unreachable_host_is_recorded_as_failed_and_the_healthy_pair_is_still_measured(monkeypatch, failure):
+    a, b, c = [host(uuid, [EFA_PORT]) for uuid in "abc"]
+    ips = {"a": "10.1.0.1", "b": "10.2.0.1", "c": "10.2.0.2"}
 
-    await efa_link_probe.measure_and_attach([a, b], "key", {}, time.monotonic())
+    @asynccontextmanager
+    async def connected(info, key):
+        async def run(command, **kwargs):
+            if command.endswith(" address"):
+                return SimpleNamespace(stdout=ips[info.uuid])
+            if " client " in command:
+                if command.endswith(ips["a"]):
+                    if failure == "ssh_closed":
+                        raise OSError("ssh closed")
+                    if "--entrypoint timeout" in command:
+                        words = shlex.split(command)
+                        await asyncio.sleep(float(words[words.index(efa_link_probe.EFA_PROBE_IMAGE) + 1]) / 1000)
+                        return SimpleNamespace(stdout="")
+                    await asyncio.sleep(kwargs["timeout"] / 1000)
+                    raise asyncio.TimeoutError()
+                return SimpleNamespace(stdout=FI_PINGPONG_OUTPUT)
+            return SimpleNamespace(stdout="")
 
-    assert a.spec["efa_link_measurements"][0]["gigabits_per_second"] is None
+        yield SimpleNamespace(run=run)
+
+    monkeypatch.setattr(efa_link_probe, "_connected", connected)
+    monkeypatch.setattr(efa_link_probe.asyncssh, "import_private_key", lambda _: None)
+    # the real 180 s budget and 120 s ssh timeout, scaled by 1000
+    monkeypatch.setattr(efa_link_probe, "budget_left_for_probe", lambda _: 0.18)
+    monkeypatch.setattr(efa_link_probe, "PROBE_MINIMUM_BUDGET_SECONDS", 0)
+    monkeypatch.setattr(efa_link_probe, "CLIENT_RETRY_DELAY_SECONDS", 0.002)
+
+    await efa_link_probe.measure_and_attach([a, b, c], "key", {}, time.monotonic())
+
+    assert {m["peer_executor_uuid"]: m["gigabits_per_second"] for m in b.spec["efa_link_measurements"]} == {
+        "a": None,
+        "c": 10.0,
+    }

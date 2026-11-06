@@ -44,6 +44,8 @@ SPEC_KEY = "efa_link_measurements"
 # The server container starts detached, so the first client can knock before it listens.
 CLIENT_ATTEMPTS = 2
 CLIENT_RETRY_DELAY_SECONDS = 2
+# The transfer takes well under a second; an unreachable peer must not eat the sweep's budget.
+CLIENT_DEADLINE_SECONDS = 10
 
 
 def has_live_efa_port(result: JobResult) -> bool:
@@ -127,7 +129,8 @@ async def _measure_pair(
                         await asyncio.sleep(CLIENT_RETRY_DELAY_SECONDS)
                     completed = await client_ssh.run(
                         _docker_run(
-                            f"--entrypoint {EFA_PROBE_ENTRYPOINT} {EFA_PROBE_IMAGE} client "
+                            f"--entrypoint timeout {EFA_PROBE_IMAGE} {CLIENT_DEADLINE_SECONDS} "
+                            f"{EFA_PROBE_ENTRYPOINT} client "
                             f"{PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS} {shlex.quote(server_address)}"
                         ),
                         check=False,
