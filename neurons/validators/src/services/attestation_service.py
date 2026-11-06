@@ -177,17 +177,13 @@ class AttestationService:
             ))
 
     async def has_recent_nonce_bound_pass(self, miner_hotkey: str, executor_uuid: str) -> bool:
-        """Evidence without a challenge stands only for an executor that recently passed its own."""
+        """Evidence without a challenge stands only for an executor that recently passed its own.
+
+        A Redis error propagates: the run ends as VALIDATOR_REDIS_UNAVAILABLE (withheld), not as a node failure.
+        """
         if self.redis_service is None:
             return False
-        try:
-            return bool(await self.redis_service.get(f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}"))
-        except Exception as exc:
-            logger.warning(_m(
-                "Failed to read executor attestation pass; treating it as missing",
-                extra=get_extra_info({"miner_hotkey": miner_hotkey, "executor_uuid": executor_uuid, "error": str(exc)}),
-            ))
-            return False
+        return bool(await self.redis_service.get(f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}"))
 
     def _expected_report_data(self, host_key: str) -> str:
         digest = hashlib.sha256(self.REPORT_PREFIX +

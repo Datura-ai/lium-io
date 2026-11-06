@@ -505,3 +505,23 @@ async def test_an_executor_that_passed_its_own_challenge_skips_the_next_until_du
     await _wave(attestation, "5Miner", [("B", _PASSED)], executor_id="B")
 
     assert await _wave(attestation, "5Miner", [("A", _PASSED), ("B", _PASSED)]) == {"A": True, "B": True}
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_attestation_record_withholds_the_run_instead_of_failing_the_node() -> None:
+    import redis.exceptions
+
+    from services.task.models import VALIDATOR_REDIS_UNAVAILABLE
+
+    service = _task_service_that_reaches_the_ssh_connect()
+    service.attestation_service.prepare_host_policy = AsyncMock(return_value=_PASSED)
+    service.attestation_service.has_recent_nonce_bound_pass = AsyncMock(
+        side_effect=redis.exceptions.ConnectionError("max number of clients reached")
+    )
+    service.attestation_service.record_attestation_event = AsyncMock()
+    miner, executor = _a_job_for("node-9")
+
+    result = await _run_cycle(service, miner, executor)
+
+    assert result.failure_reason_code == VALIDATOR_REDIS_UNAVAILABLE
+    service.attestation_service.record_attestation_event.assert_not_awaited()
