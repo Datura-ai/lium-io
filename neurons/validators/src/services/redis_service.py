@@ -616,6 +616,15 @@ class RedisService:
         """Remove a key from Redis."""
         await self.redis.delete(key)
 
+    async def getdel(self, key: str):
+        """Read a key and remove it in one transaction: of two callers racing for it, one gets the value."""
+        async with self.lock:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                pipe.get(key)
+                pipe.delete(key)
+                value, _ = await pipe.execute()
+            return value
+
     async def expire(self, key: str, seconds: int):
         """Set (or refresh) a key's time to live."""
         await self.redis.expire(key, seconds)
