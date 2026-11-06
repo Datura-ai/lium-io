@@ -3462,9 +3462,10 @@ class DockerService:
             flat_image = await flatten_image_on_host(
                 ssh_client, image, lease=lease, reserved_bytes=reserved_bytes, sized_mark=sized_mark.strip()
             )
-        except ImageFlattenNoDisk:
-            logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info({**default_extra, "image": image})))
-            await self.stream_log(FLATTEN_NO_DISK_RENTER_SENTENCE, "error", log_tag)
+        except ImageFlattenNoDisk as exc:
+            extra = {**default_extra, "image": image, "short_bytes": exc.short_bytes}
+            logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info(extra)))
+            await self.stream_log(exc.renter_sentence, "error", log_tag)
             raise
         except Exception as exc:
             logger.warning(

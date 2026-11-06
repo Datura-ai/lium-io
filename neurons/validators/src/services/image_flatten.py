@@ -10,6 +10,7 @@ shell-form health check instead) and ONBUILD (build-time only) are not carried o
 """
 
 import json
+import re
 import shlex
 
 import asyncssh
@@ -52,7 +53,19 @@ FLATTEN_NO_DISK_RENTER_SENTENCE = (
 
 
 class ImageFlattenNoDisk(RuntimeError):
-    renter_sentence = FLATTEN_NO_DISK_RENTER_SENTENCE
+    def __init__(self, renter_sentence: str = FLATTEN_NO_DISK_RENTER_SENTENCE, short_bytes: int | None = None):
+        super().__init__(renter_sentence)
+        self.renter_sentence = renter_sentence
+        self.short_bytes = short_bytes
+
+
+def flatten_no_disk_sentence(short_bytes: int) -> str:
+    """The refusal with the measured shortfall; a bigger node grows the pod disk too, so only the image can shrink it."""
+    gb = -(-short_bytes // 1024**3)
+    return (
+        f"not enough free disk on this node to prepare this image beside this pod's disk ({gb} GB short); "
+        "use a smaller image or one with fewer layers"
+    )
 
 
 class FlattenMeasureFailed(RuntimeError):
@@ -183,7 +196,7 @@ def _flatten_command(
         "else echo 'flatten: lease dir unreadable, cleanup skipped' >&2; fi; flock -u 8; "
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
-        f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
+        f'[ "$avail" -ge {int(need_bytes)} ] || {{ echo "flatten avail=$avail" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
         # the ID, not the tag: a pull may move the tag after inspect and the copy would not match its name
         f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {mounts} {shlex.quote(image_id)}) || exit 97; "
         'st=$(mktemp); '
@@ -310,18 +323,23 @@ async def flatten_image_on_host(
     if existing.exit_status == 0:
         return tag
     config = info.get("Config") or {}
+    need_bytes = int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes
     command = _flatten_command(
         info["Id"],
         tag,
         image_flatten_changes(config),
         sorted(config.get("Volumes") or ()),
-        int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
+        need_bytes,
         lease,
         sized_mark,
     )
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
     if result.exit_status == FLATTEN_NO_DISK_EXIT:
+        avail = re.search(r"flatten avail=(\d+)", str(result.stderr or ""))
+        if avail and int(avail.group(1)) < need_bytes:
+            short = need_bytes - int(avail.group(1))
+            raise ImageFlattenNoDisk(flatten_no_disk_sentence(short), short_bytes=short)
         raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
     if result.exit_status != 0:
         raise RuntimeError(f"flatten exited {result.exit_status}: {str(result.stderr or '')[-2000:]}")
