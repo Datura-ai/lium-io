@@ -644,3 +644,84 @@ async def test_a_fresh_sized_rental_fits_only_under_the_df_guard_too(docker_serv
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
     assert _removed_volumes(ssh_client) == removed
+
+
+_RUN_VOLUME = "volume_f9c9d1e7"
+
+
+class KilledFillerRunVolumeHost(HostSshClient):
+    """prod 5 Nov 05:03Z, full node: the killed filler survived `rm -fv` and still mounts its own preallocated 80 GB
+    run volume and both Dolphin volumes. A Dolphin wipe frees 20 GB each (the set's 40 GB; not logged there); the run
+    volume's wipe plus fstrim frees its 80 GB. Either only when every user is in the wipe's allowed list."""
+
+    def __init__(self, users: list[str], **kwargs):
+        super().__init__([*_DPHN, _RUN_VOLUME], **kwargs)
+        self.users = users
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume inspect" in command and "size-max" in command:
+            self.commands.append(command)
+            stdout = "80000000000|80g\n" if _RUN_VOLUME in command else ""
+            return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+        if "/proc/1/root" in command:
+            allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
+            if all(user in allowed for user in self.users):
+                if "fstrim" in command:
+                    self.commands.append(command)
+                    self._free_bytes += 80 * 10**9
+                    return SimpleNamespace(exit_status=0, stdout="wiped\ntrimmed\n", stderr="")
+                self._free_bytes += 20 * 10**9
+        return await super().run(command, *args, **kwargs)
+
+
+def _full_node_rental(monkeypatch, docker_service):
+    # 242 + 121 GB ordered beside the 80 GB run volume: needs 308.5 GiB free, 262.2 free
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=80 * 10**9))
+    rental = _rental(242, 121)
+    rental.disk_share = 1.0
+    return rental
+
+
+@pytest.mark.asyncio
+async def test_the_killed_filler_run_volume_is_trimmed_and_the_order_keeps_its_share(docker_service, monkeypatch):
+    rental = _full_node_rental(monkeypatch, docker_service)
+    ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7"], free_gb=262.2)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"]
+    ) is True
+    assert any('nsenter -t 1 -m -- fstrim "$p"' in command and _RUN_VOLUME in command for command in ssh_client.commands)
+    # the trimmed volume is not counted twice: (262.2 + 74.5 + 37.3 free + 54.5 pod volumes - 74.5) x 242/363
+    assert rental.volume_limit_gb == 235  # 95% of 242 is 229.9
+
+
+@pytest.mark.asyncio
+async def test_a_run_volume_a_live_container_mounts_is_not_trimmed(docker_service, monkeypatch):
+    rental = _full_node_rental(monkeypatch, docker_service)
+    ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7", "filler_live"], free_gb=262.2)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"]
+    ) is True
+    assert ssh_client._free_bytes == int(262.2 * 1024**3)
+    assert rental.volume_limit_gb < 242 * 0.95
+
+
+class FailedTrimHost(KilledFillerRunVolumeHost):
+    async def run(self, command: str, *args, **kwargs):
+        if "fstrim" in command:
+            self.commands.append(command)
+            return SimpleNamespace(exit_status=1, stdout="wiped\nfstrim: cannot get realpath\n", stderr="")
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_run_volume_trim_is_logged_with_the_volume_and_its_output(docker_service, monkeypatch, caplog):
+    rental = _full_node_rental(monkeypatch, docker_service)
+    ssh_client = FailedTrimHost(["filler_f9c9d1e7"], free_gb=262.2)
+
+    with caplog.at_level("WARNING"):
+        await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"])
+
+    [record] = [r for r in caplog.records if "run volume" in r.getMessage()]
+    assert record.msg.extra["volume"] == _RUN_VOLUME and "cannot get realpath" in record.msg.extra["output"]

@@ -46,6 +46,7 @@ from services.docker_service import (
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
+from core.docker_utils import df_command
 from services.image_flatten import flatten_wait_command
 from services.nvidia_devices import (
     MissingRentedGpuError,
@@ -605,6 +606,8 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
         "cat /proc/sys/kernel/pid_max",
         "cat /proc/meminfo",
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
+        # a killed filler's run volume may be freed for the rental (DAH-5798): the disk is read first
+        *([] if removal_lost_its_channel else _RECLAIM_DISK_READ),
         # the sizing measures the disk under the node flatten lock
         next((c for c in _cmds(ssh_client) if c.startswith(flatten_wait_command()[:40])), "no flatten wait"),
     ]
@@ -617,6 +620,8 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
 
 
 _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
+# the stub host answers no docker root dir, so the reclaim's df reads ''
+_RECLAIM_DISK_READ = ["/usr/bin/docker info --format '{{.DockerRootDir}}'", df_command("''")]
 _POD_OLD_REMOVAL = _remove_and_list_containers_command(["pod_old"], ["volume_old"])
 
 
@@ -828,7 +833,7 @@ async def test_a_create_cancelled_at_ssh_connect_never_starts_the_filler_removal
         # volume sweep lists the filler-labelled volumes, which the probe's listing cannot tell apart
         ("filler_sibling", {"workload_kind": WorkloadKind.FILLER, "active_container_names": ["filler_sibling"], "active_volume_names": ["volume_sibling"]}, False, [DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD]),
         # a bootstrap restore removes the filler at the cleanup step
-        ("filler_x", {"active_volume_names": ["volume_x"]}, True, [_FILLER_X_REMOVAL]),
+        ("filler_x", {"active_volume_names": ["volume_x"]}, True, [_FILLER_X_REMOVAL, *_RECLAIM_DISK_READ]),
     ],
     ids=["customer_without_a_filler", "filler_create", "bootstrap_restore"],
 )
