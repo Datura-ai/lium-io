@@ -278,7 +278,12 @@ class TaskService:
                     # they re-read (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones
                     # alone. DAH-5792: any check, not only the port check (the pipeline ends a dead session the same way)
                     result.session_lost_in_port_check = last_event.check_id == PortConnectivityCheck.check_id
-                    if any(event.reason_code == GpuLossHoldMessages.CLEAN_AGAIN.reason for event in events):
+                    reasons = {event.reason_code for event in events}
+                    # a recheck that already passed cleared the marker: nothing is waiting for a load test
+                    if (
+                        GpuLossHoldMessages.CLEAN_AGAIN.reason in reasons
+                        and PostRentalGpuRecheckMessages.PASSED.reason not in reasons
+                    ):
                         # review 4469609761: this scrape ended a GPU-loss hold but its load test never ran, so the
                         # hold is published from here, not from the last published list a restart has emptied
                         waiting = render_message(
@@ -289,7 +294,7 @@ class TaskService:
                                 "reach_source": str(ReachSource.VALIDATOR),
                                 "reach_target": str(ReachTarget.GPU),
                                 "executor_uuid": executor_info.uuid,
-                                "load_test": "not run: the SSH session closed during the port check",
+                                "load_test": "not run: the SSH session closed first",
                             },
                         )
                         result.availability_errors += [

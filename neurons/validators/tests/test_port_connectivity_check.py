@@ -30,6 +30,7 @@ from neurons.validators.src.services.task.checks.port_count import PortCountChec
 from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
 from neurons.validators.src.services.task.messages import (
     GpuLossHoldMessages,
+    PostRentalGpuRecheckMessages,
     GpuMemoryHealthMessages,
     TenantEnforcementMessages,
     render_message,
@@ -1872,6 +1873,16 @@ class _CleanScrapeAfterDropout:
         return CheckResult(passed=True, event=event)
 
 
+class _RecheckPassed:
+    # PostRentalGpuRecheckCheck after the hold ended: every card passed its load test and the marker is cleared
+    check_id = "gpu.post_rental_recheck"
+    fatal = False
+
+    async def run(self, ctx):
+        event = render_message(PostRentalGpuRecheckMessages.PASSED, ctx=ctx, check_id=self.check_id)
+        return CheckResult(passed=True, event=event)
+
+
 async def _create_task_on_a_session_lost_in_the_port_check(context_factory, monkeypatch, *first_checks):
     class _DropsTheSession(DummyConnectivityService):
         # the session dies during the port check, so the earlier checks ran on a live one
@@ -1947,6 +1958,16 @@ async def test_a_session_lost_after_a_clean_scrape_ended_a_gpu_loss_hold_publish
 
     expected = [GpuMemoryHealthMessages.FAILED.reason] if with_gpu_finding else []
     assert [e["reason_code"] for e in result.availability_errors] == [*expected, "GPU_LOST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recheck_ran", [False, True], ids=["drop-before-recheck", "drop-after-recheck-passed"])
+async def test_a_session_lost_after_the_recheck_passed_publishes_no_hold(context_factory, monkeypatch, recheck_ran):
+    # review 4491529165: a recovery whose load test already passed is not published as still waiting for it
+    checks = [_CleanScrapeAfterDropout(), *([_RecheckPassed()] if recheck_ran else [])]
+    result = await _create_task_on_a_session_lost_in_the_port_check(context_factory, monkeypatch, *checks)
+
+    assert [e["reason_code"] for e in (result.availability_errors or [])] == ([] if recheck_ran else ["GPU_LOST"])
 
 
 @pytest.mark.asyncio

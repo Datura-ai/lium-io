@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import asyncssh
 import pytest
+from services.task.checks.gpu_attestation_identity import GpuAttestationIdentityCheck
 from services.task.checks.gpu_fault_probe import GpuFaultProbeCheck
 from services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
@@ -182,6 +183,7 @@ def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
         MachineSpecScrapeCheck,
         VerifyXCheck,
         VerifyXColdRetryCheck,
+        GpuAttestationIdentityCheck,
         PostRentalGpuRecheckCheck,
         RentedThroughputCheck,
     ):
@@ -285,3 +287,28 @@ async def test_a_fault_read_before_the_drop_is_not_replayed_away(reconnect_outco
 
     assert not ok and events[-1].reason_code == "NVLINK_FAULT" and check.runs == 1
     assert failed_check_event(ok, events).what_we_saw["failed_reason"] == "NVLINK_FAULT"
+
+
+async def test_a_gpu_loss_in_a_failed_checks_extra_events_stays_the_verdict_when_the_session_drops():
+    # review 4491529157: the recheck's failure carries GPU_LOST as an extra event; the run must end on that failure,
+    # which no rollout window withholds, not on the transport failure
+    from services.executor_rollout import ROLLOUT_FAILURE_REASONS
+
+    class _RecheckFailsThenDrops:
+        check_id = "gpu.post_rental_recheck"
+        fatal = True
+
+        async def run(self, ctx: Context) -> CheckResult:
+            ctx.ssh.is_closed.return_value = True
+            lost = _event("GPU_LOST").model_copy(update={"category": AVAILABILITY_CATEGORY})
+            return CheckResult(
+                passed=False, event=_event("POST_RENTAL_GPU_RECHECK_FAILED"), fatal=True, extra_events=[lost]
+            )
+
+    ok, events, _ = await Pipeline([_RecheckFailsThenDrops()], _NullSink(), reconnect=AsyncMock()).run(
+        _ctx(_session())
+    )
+
+    assert not ok and events[-1].reason_code == "POST_RENTAL_GPU_RECHECK_FAILED"
+    assert "GPU_LOST" in [e.reason_code for e in events] and TRANSPORT not in [e.reason_code for e in events]
+    assert "POST_RENTAL_GPU_RECHECK_FAILED" not in ROLLOUT_FAILURE_REASONS and TRANSPORT in ROLLOUT_FAILURE_REASONS

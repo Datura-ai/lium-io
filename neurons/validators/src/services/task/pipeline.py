@@ -583,9 +583,12 @@ def _not_terminal(ran: _RanCheck) -> _RanCheck:
 
 
 def _a_finding(ran: _RanCheck) -> bool:
-    # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event
-    event = ran.result.event
-    return event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE
+    # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event;
+    # its extra events count too (the GPU recheck's failure carries GPU_LOST there)
+    return any(
+        event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE
+        for event in [ran.result.event, *ran.result.extra_events]
+    )
 
 
 def _session_lost(ran: list[_RanCheck], ctx: Context) -> _RanCheck:
