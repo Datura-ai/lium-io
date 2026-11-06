@@ -29,6 +29,7 @@ from neurons.validators.src.services.task.messages import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
+from services.task.result_handler import pods_rented_gpu_count
 from services.executor_connectivity.models import BatchResult, DindProbeResult, PortPair
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
@@ -139,7 +140,7 @@ class RentalsBackendClient(DummyBackendClient):
         return self.rented_data
 
 
-def rented_with_pods(*pod_ids: str) -> RentedExecutorsResponse:
+def rented_with_pods(*pod_ids: str, gpu_count: int | None = None) -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             EXECUTOR_UUID: RentedExecutor(
@@ -147,7 +148,9 @@ def rented_with_pods(*pod_ids: str) -> RentedExecutorsResponse:
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="8001",
                 pods=[
-                    RentedPod(pod_id=pod_id, container_name=f"container_{pod_id}", rented_ports=[65000 + i])
+                    RentedPod(
+                        pod_id=pod_id, container_name=f"container_{pod_id}", rented_ports=[65000 + i], gpu_count=gpu_count
+                    )
                     for i, pod_id in enumerate(pod_ids)
                 ],
             )
@@ -332,14 +335,15 @@ async def test_stale_pod_with_enough_ports_is_unchanged(context_factory, monkeyp
     [("pod-live", "pod-stale"), ("pod-stale", "pod-live")],
     ids=["live-then-stale", "stale-then-live"],
 )
+@pytest.mark.parametrize("enforce_port_floor_on_stale_pod", [True, False], ids=["flag-on", "flag-off"])
 async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enforcement_flag(
-    context_factory, monkeypatch, pod_order
+    context_factory, monkeypatch, pod_order, enforce_port_floor_on_stale_pod
 ):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", enforce_port_floor_on_stale_pod)
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
-        rented_data=rented_with_pods(*pod_order),
+        rented_data=rented_with_pods(*pod_order, gpu_count=2),
         ssh=PerPodSSHClient(running={"container_pod-live"}),
         backend=PerPodBackendClient(active={"pod-live"}),
     )
@@ -350,10 +354,16 @@ async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enf
 
     assert ctx.state.specs["available_port_count"] == 2
     assert count_result.passed is True
-    # main's verdict for this node, flag or no flag: the stale pod is reported and the run goes on
+    # flag or no flag, the live rental keeps the node rented: the run stops here, so no check that loads every
+    # card runs beside the renter (aa801f3e, 31 Oct-3 Nov), and the stale pod is noted
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
-    assert tenant_result.event.what_we_saw["pod_id"] == "pod-stale"
+    assert tenant_result.halt is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
+    assert tenant_result.updates["rented"] is True
+    assert tenant_result.updates["default_extra"]["stale_pods"] == ["pod-stale"]
+    # the closed pod's GPUs are free, so only the live pod's count as rented (pay and idle gates)
+    assert tenant_result.updates["default_extra"]["rented_gpu_count"] == 2
+    assert pods_rented_gpu_count(tenant_result.updates["state"].rented_data, EXECUTOR_UUID) == 2
 
 
 @pytest.mark.asyncio
@@ -399,6 +409,7 @@ async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced
 
 @pytest.mark.asyncio
 async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enforced(context_factory, monkeypatch):
+    # the running container is still on its card, so the node stays rented this cycle
     monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
     ctx = run_context(
         context_factory,
@@ -413,7 +424,8 @@ async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enfo
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    assert tenant_result.halt is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
 
 
 @pytest.mark.asyncio

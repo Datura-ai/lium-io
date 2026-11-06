@@ -216,7 +216,7 @@ class TenantEnforcementCheck:
         state_by_pod_id: dict[str, ContainerState] = {}
 
         def with_pod_states(result: CheckResult) -> CheckResult:
-            return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
+            return _with_pod_states(result, ctx, rented_pods, state_by_pod_id, extra.get("stale_pods", []))
 
         # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
         # is the provider's work, not POD_NOT_RUNNING, and is not recovered.
@@ -336,6 +336,14 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
                             )
                         )
+                    if await _another_listed_pod_running(ctx, rented_pods, state_by_pod_id, pod_index):
+                        # a split node with another rental still running: this pod's rental closed, the node is
+                        # still rented, so it must not go on as unrented to the checks that load every card
+                        extra.setdefault("stale_pods", []).append(pod_id)
+                        if "rented_gpu_count" in extra:
+                            extra["rented_gpu_count"] -= pod.gpu_count
+                        ssh_pub_keys = []
+                        continue
                     impact = None
                     if port_count_below_floor is not None:
                         stale_what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
@@ -687,6 +695,7 @@ def _with_pod_states(
     ctx: Context,
     rented_pods: list[RentedPod],
     state_by_pod_id: dict[str, ContainerState],
+    stale_pod_ids: list[str],
 ) -> CheckResult:
     # DAH-3338: every verdict of the check carries one state per rented pod into ctx.state, on top
     # of what StaleContainerCleanupCheck reaped earlier in the cycle. A pod without an observation
@@ -705,6 +714,12 @@ def _with_pod_states(
     ]
     # a re-probe's state (DAH-3698) is carried, not the one the check started from
     state = replace(result.updates.get("state", ctx.state), pod_states=pod_states)
+    rented_executor = state.rented_data.executors.get(ctx.executor.uuid) if state.rented_data else None
+    if stale_pod_ids and rented_executor:
+        # a closed pod skipped beside a live sibling: its GPUs are free, not rented (pods_rented_gpu_count)
+        kept = [pod for pod in rented_executor.pods if pod.pod_id not in stale_pod_ids]
+        executors = {**state.rented_data.executors, ctx.executor.uuid: rented_executor.model_copy(update={"pods": kept})}
+        state = replace(state, rented_data=state.rented_data.model_copy(update={"executors": executors}))
     return result.model_copy(
         update={"updates": {**result.updates, "state": state}}
     )
@@ -881,6 +896,25 @@ async def _reprobe_split_shortfall(
         _, updates = published(fresh.get_filler_ports(ctx.executor.uuid))
         return None, {**updates, "rented_data": fresh.model_copy(update={"executors": executors})}
     return published(fresh.get_filler_ports(ctx.executor.uuid))
+
+
+async def _another_listed_pod_running(
+    ctx: Context, rented_pods: list[RentedPod], state_by_pod_id: dict[str, ContainerState], stale_pod_index: int
+) -> bool:
+    """True when a listed pod other than the stale one has its container running (aa801f3e, 31 Oct-3 Nov: a
+    sibling rental closing sent a node with a live rental on as unrented). A pod that cannot be read is not."""
+    if any(state_by_pod_id.get(pod.pod_id) == ContainerState.RUNNING for pod in rented_pods[:stale_pod_index]):
+        return True
+    for other in rented_pods[stale_pod_index + 1 :]:
+        try:
+            other_state = await _check_pod_running_and_read_authorized_keys(
+                ctx.ssh, other.docker_container_name, ctx.default_extra
+            )
+        except (asyncssh.Error, OSError):
+            continue
+        if other_state.running:
+            return True
+    return False
 
 
 async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:
