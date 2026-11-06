@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from datetime import datetime, timedelta
@@ -128,6 +129,39 @@ async def test_rental_verification_health_check_waits_no_longer_than_the_task_ha
 
     # Assert: the wait ends before the cancel, leaving the probe cleanup its time
     assert 65 <= backend.timeout <= 70
+
+
+class StalledCleanup(ContainerCleanup):
+    """A cleanup whose ssh call never returns."""
+
+    async def force_remove_health_checks(self, ssh_client, executor_uuid):
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_left, cleanup_timeout", [(100, 20), (15, 5), (5, 1)])
+async def test_rental_verification_stalled_cleanup_is_cut_and_the_result_kept(context_factory, seconds_left, cleanup_timeout):
+    # Arrange: a cleanup that hangs, with 100 s left, then inside the 30 s reserve
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=StalledCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    elapsed = settings.JOB_TIME_OUT - 120 - seconds_left
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+    waits = []
+    real_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(aw, timeout):
+        waits.append(timeout)
+        return await real_wait_for(aw, timeout=0.01)
+
+    # Act
+    with patch("neurons.validators.src.services.task.checks.rental_verification.asyncio.wait_for", recording_wait_for):
+        result = await RentalVerificationCheck().run(ctx)
+
+    # Assert: the cleanup wait is bounded and leaves time for the result, which still arrives
+    assert result.passed is True
+    assert len(waits) == 1 and cleanup_timeout - 1 <= waits[0] <= cleanup_timeout
+    assert backend.timeout == 1 or seconds_left == 100
 
 
 @pytest.mark.asyncio

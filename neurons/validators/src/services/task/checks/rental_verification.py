@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -55,6 +56,9 @@ _GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
 # probe cleanup's time: a wait cut by the task cancel drops the node's whole cycle result (c8c6b803, 6 Nov).
 HEALTH_CHECK_TIMEOUT_SECONDS = 300
 _CLEANUP_RESERVE_SECONDS = 30
+# The cleanup's ssh call has no timeout of its own; 10 s of the reserve stay for writing the result.
+_CLEANUP_TIMEOUT_SECONDS = 20
+_RESULT_RESERVE_SECONDS = 10
 
 # How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
@@ -346,9 +350,13 @@ class RentalVerificationCheck:
         finally:
             # DAH-1991: force-remove the health_check_* probe the backend just
             # spawned so it cannot race a subsequent rental on this executor.
-            await ctx.services.container_cleanup.force_remove_health_checks(
-                ctx.ssh, ctx.executor.uuid
-            )
+            try:
+                await asyncio.wait_for(
+                    ctx.services.container_cleanup.force_remove_health_checks(ctx.ssh, ctx.executor.uuid),
+                    timeout=max(1, min(_CLEANUP_TIMEOUT_SECONDS, task_seconds_left(ctx) - _RESULT_RESERVE_SECONDS)),
+                )
+            except TimeoutError:
+                pass  # best effort: the 15-min stale sweep removes a probe left behind
 
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
