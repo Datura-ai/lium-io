@@ -8,7 +8,7 @@ RUN apt-get update \
   && apt-get install -y wget git \
   && rm -rf /var/lib/apt/lists/*
 
-RUN pip install -U pdm
+RUN pip install "pdm==2.29.3" "unearth<0.19"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./
@@ -21,5 +21,7 @@ COPY . .
 
 ENV ENV=prod
 ENV PYTHONUNBUFFERED=1
+# a crash in native code prints the Python stack instead of a bare exit code
+ENV PYTHONFAULTHANDLER=1
 
 CMD ["bash", "run.sh"]

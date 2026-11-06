@@ -8,6 +8,7 @@ import asyncio
 import logging
 import hashlib
 from core.utils import _m, get_extra_info
+from services.node_host import public_host_sock
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +87,14 @@ class InteractiveShellService:
             raise Exception("i-ssh connection EOF error")
 
     async def connect_asyncssh(self):
+        # a hostname is resolved afresh on every connect, so a node whose IP changed is the same
+        # node; the dial goes to the address that was checked, not to a second lookup
+        dial_to_checked_address = await public_host_sock(self.host, self.port)
         pkey = asyncssh.import_private_key(self.private_key)
         self.ssh_client = await asyncssh.connect(
             host=self.host,
             port=self.port,
+            **dial_to_checked_address,
             username=self.username,
             client_keys=[pkey],
             known_hosts=self.known_hosts,

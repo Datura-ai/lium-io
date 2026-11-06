@@ -1,7 +1,17 @@
 from __future__ import annotations
 
-from ..messages import GpuModelMessages as Msg, render_message
+from collections import Counter
+
+from services.gpu_spec_table import reference_gpu_model
+from services.redis_service import GPU_ANCHOR_KEY
+
+from ..messages import GpuModelMessages as Msg
+from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .banned_provider import has_live_rental
+from .gpu_fingerprint import split_uuids
+from .post_rental_gpu_recheck import record_gpu_drop
+from .rented_gpu_drop import _listed_uuids
 
 
 class GpuModelValidCheck:
@@ -16,7 +26,11 @@ class GpuModelValidCheck:
     node reports, which is what a card that fell off the bus looks like. The check is fatal and
     runs before SpecChangeCheck, so the reset has to happen here; the node then leaves the market
     through the same path banned_gpu, gpu_fingerprint, duplicate_executor and spec_change use,
-    rented or idle, and is verified again on the first cycle whose scrape lists every card.
+    rented or idle, and is verified again on the first cycle whose scrape lists every card. The drop also
+    owes a post-rental recheck (post_rental_gpu_recheck.py).
+
+    Every card is read, not only the first (DAH-4304): each must be a supported model, and a node
+    whose cards are more than one model fails with GPU_MODEL_MIXED.
     """
 
     check_id = "gpu.validate.model"
@@ -41,27 +55,22 @@ class GpuModelValidCheck:
         if not gpu_details:
             gpu_details = specs.get("gpu", {}).get("details", [])
 
-        gpu_model = None
-        if gpu_count > 0 and len(gpu_details) > 0:
-            gpu_model = gpu_details[0].get("name", None)
+        card_models = []
+        card_references = []
+        if gpu_count > 0:
+            card_models = [detail.get("name", None) for detail in gpu_details]
+            # DAH-5088: an unknown NVIDIA model passes, scored as its reference model
+            card_references = [
+                model
+                if model in gpu_model_rates_map
+                else reference_gpu_model(model, detail.get("capacity"))
+                for model, detail in zip(card_models, gpu_details)
+            ]
+        gpu_model = card_models[0] if card_models else None
+        reference = card_references[0] if card_references else None
 
-        if gpu_model not in gpu_model_rates_map:
-            supported_models = list(gpu_model_rates_map.keys())
-            event = render_message(
-                Msg.MODEL_UNSUPPORTED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "gpu_model": gpu_model,
-                    "gpu_count": gpu_count,
-                    "supported_models": supported_models,
-                },
-                remediation=(
-                    "Use a supported GPU model. Supported models: "
-                    f"{', '.join(supported_models[:5])}{'...' if len(supported_models) > 5 else ''}"
-                ),
-            )
-            return CheckResult(passed=False, event=event)
+        if reference not in gpu_model_rates_map:
+            return self._unsupported_model_result(ctx, gpu_model, gpu_count, fatal=True)
 
         if gpu_count == 0:
             event = render_message(
@@ -79,12 +88,84 @@ class GpuModelValidCheck:
                 check_id=self.check_id,
                 what={"gpu_count": gpu_count, "details_len": len(gpu_details)},
             )
+            anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+            await record_gpu_drop(ctx, sorted(set(anchor) - set(_listed_uuids(gpu_details))))
             return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
+
+        card_mismatch = self._mixed_or_unsupported_card_result(
+            ctx, card_models, card_references, gpu_count
+        )
+        if card_mismatch is not None:
+            return card_mismatch
 
         event = render_message(
             Msg.MODEL_OK,
             ctx=ctx,
             check_id=self.check_id,
-            what={"gpu_model": gpu_model, "gpu_count": gpu_count},
+            what={
+                "gpu_model": gpu_model,
+                "gpu_count": gpu_count,
+                **({"reference_gpu_model": reference} if reference != gpu_model else {}),
+            },
         )
         return CheckResult(passed=True, event=event)
+
+    def _mixed_or_unsupported_card_result(
+        self,
+        ctx: Context,
+        card_models: list[str | None],
+        card_references: list[str | None],
+        gpu_count: int,
+    ) -> CheckResult | None:
+        """DAH-4304: a node is listed, priced and rented as one model, so every GPU on it must be
+        the same supported model. A live rental is not cut, as with a GPU ban."""
+        fatal = not has_live_rental(ctx)
+        unsupported = [
+            model
+            for model, reference in zip(card_models, card_references)
+            if reference not in ctx.config.gpu_model_rates
+        ]
+        if unsupported:
+            return self._unsupported_model_result(ctx, unsupported[0], gpu_count, fatal=fatal)
+
+        # DAH-5088: one unknown name with different memory gets different references, so key by both
+        model_counts = dict(
+            Counter(
+                model if model == reference else f"{model} (as {reference})"
+                for model, reference in zip(card_models, card_references)
+            )
+        )
+        if len(model_counts) == 1:
+            return None
+        models_found = ", ".join(f"{count}x {model}" for model, count in model_counts.items())
+        event = render_message(
+            Msg.MODEL_MIXED,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={"gpu_models": model_counts, "gpu_count": gpu_count},
+            remediation=(
+                "Every GPU on a node must be the same model. Models found on this node: "
+                f"{models_found}."
+            ),
+        )
+        return CheckResult(passed=False, event=event, fatal=fatal)
+
+    def _unsupported_model_result(
+        self, ctx: Context, gpu_model: str | None, gpu_count: int, *, fatal: bool
+    ) -> CheckResult:
+        supported_models = list(ctx.config.gpu_model_rates.keys())
+        event = render_message(
+            Msg.MODEL_UNSUPPORTED,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "gpu_model": gpu_model,
+                "gpu_count": gpu_count,
+                "supported_models": supported_models,
+            },
+            remediation=(
+                "Use a supported GPU model. Supported models: "
+                f"{', '.join(supported_models[:5])}{'...' if len(supported_models) > 5 else ''}"
+            ),
+        )
+        return CheckResult(passed=False, event=event, fatal=fatal)

@@ -9,18 +9,19 @@ the answer with the same two functions those checks use on SSH output (`evaluate
 `evaluate_verifyx_capture`). A judged, passing step is left in `ctx.state.local_verify`;
 `CapabilityCheck` and `VerifyXCheck` consume it and skip their SSH run.
 
-Everything else — flag off, capability or port absent, refusal, a tunnel nobody answers, timeout, a
+Everything else — capability or port absent, refusal, a tunnel nobody answers, timeout, a
 mismatched answer, a step that did not run, a step that ran and FAILED the judgement, or a pass
 that arrived later than the SSH
 path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the validator's clock) — leaves
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
-matmul path and a consumed local pass must not skip it), nor when VerifyX runs full size and in
-series with it (`ctx.config.first_pass` off, VerifyX on): the round trip then measures both steps
-and is no bound on the matmul alone, see `_matmul_ssh_reason`. Every outcome is one
-`[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
-Off by default (VALIDATOR_LOCAL_VERIFY_ENABLED).
+matmul path and a consumed local pass must not skip it). Nothing is sent outside the first pass
+(`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's timeout and then run
+again over SSH, past `JOB_TIME_OUT`; the check is skipped and both steps stay on SSH. The call's
+timeout is at most half the time the job has left, so a slow `/verify` still leaves the SSH
+fallback room. Every outcome is one `[local_verify] outcome` log line with `outcome`, `step` and
+`reason` (the per-outcome metric).
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from services.local_verify_client import (
     executor_deadline_s,
 )
 from services.matrix_validation_service import (
+    ELAPSED_SOURCE_EXECUTOR,
     MATRIX_VERIFY_TIMEOUT_SECONDS,
     MatmulChallenge,
 )
@@ -56,7 +58,8 @@ from core.utils import _m, get_extra_info
 from ..messages import LocalVerifyMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .capability import _get_filler_only_container
+from .capability import get_filler_only_container
+from .task_time import task_seconds_left
 from .verifyx import _first_pass_challenge_config
 
 logger = logging.getLogger(__name__)
@@ -85,26 +88,16 @@ def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
     return answer.round_trip_ms > ROUND_TRIP_CAP_MS_BY_STEP[name]
 
 
-def _matmul_ssh_reason(ctx: Context) -> str | None:
+def _matmul_ssh_reason() -> str | None:
     """Why the matmul is not asked for in the one call, or None when it is.
 
-    `allcards_ssh` (DAH-2671 item 3): the all-cards work-proof (`_probe_all_claimed_cards`, one
+    `allcards_ssh` (DAH-2671 item 3): the all-cards work-proof (`probe_all_claimed_cards`, one
     pinned run per card) lives inside the SSH matmul path only. While that check is on, the matmul
     stays on SSH so a consumed local pass can never skip the probe or its enforcement; phase 2
     carries `devices` in the intent and judges the per-card output here.
-
-    `scored_ssh`: with `ctx.config.first_pass` off (a scored cycle, or any cycle while
-    FIRST_PASS_FAST_PATH_ENABLED is off) VerifyX is full size and the two GPU steps run one after
-    the other (`parallel_gpu` off). The round trip is the only clock the validator holds, and it
-    then holds the whole VerifyX run (80 s p50, 149 s p90 in SWEEP_provider_verify) on top of the
-    matmul, so `ROUND_TRIP_CAP_MS_BY_STEP["matmul"]` (120 s) fails a passing matmul on a large
-    share of hosts and measures it on none. The matmul is not asked for; the executor does not run
-    it twice. With VerifyX off the call carries the matmul alone and the bound is fair.
     """
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         return "allcards_ssh"
-    if ctx.config.verifyx_enabled and not ctx.config.first_pass:
-        return "scored_ssh"
     return None
 
 
@@ -134,10 +127,6 @@ class LocalVerifyCheck:
         )
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.VALIDATOR_LOCAL_VERIFY_ENABLED:
-            return CheckResult(
-                passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
-            )
         try:
             return await self._run(ctx)
         except Exception as exc:  # noqa: BLE001 — the pipeline has no guard; a bug here must not end the node's cycle
@@ -147,21 +136,21 @@ class LocalVerifyCheck:
         specs = ctx.state.specs
         if not specs:
             return self._skipped(ctx, "no specs")
-        if _get_filler_only_container(ctx):
+        if get_filler_only_container(ctx):
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
+        if not ctx.config.first_pass:
+            # a full-size VerifyX can time out on /verify, then run again over SSH past JOB_TIME_OUT
+            return self._skipped(ctx, "not the first pass")
         if ctx.config.validator_keypair is None:
             return self._fallback(
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
             )
 
-        matmul_ssh_reason = _matmul_ssh_reason(ctx)
-        if matmul_ssh_reason is not None and not ctx.config.verifyx_enabled:
-            return self._fallback(
-                ctx, "call", matmul_ssh_reason, "matmul on SSH and VerifyX off: nothing to run"
-            )
-
+        matmul_ssh_reason = _matmul_ssh_reason()
         client = self._client_factory(ctx)
+        # half the time the job has left: a /verify that runs out leaves the SSH fallback as much
+        client.timeout_s = max(1, min(client.timeout_s, int(task_seconds_left(ctx) / 2)))
         advertised = await client.advertised(ctx.executor)
         if CAPABILITY not in advertised.capabilities:
             self._metric(ctx, "fallback", "call", "not_advertised")
@@ -202,12 +191,11 @@ class LocalVerifyCheck:
 
     def _prepare_challenges(
         self, ctx: Context, specs: dict, *, matmul_on_ssh: bool
-    ) -> tuple[MatmulChallenge | None, VerifyXChallenge | None]:
+    ) -> tuple[MatmulChallenge | None, VerifyXChallenge]:
         """The same challenges the SSH checks would build, sized the same way (DAH-3011 first pass).
         Raises _NothingToSend when they cannot be built; a matmul challenge built by then is closed."""
         first_pass = ctx.config.first_pass
         matmul_challenge = None
-        verifyx_challenge = None
         try:
             if not matmul_on_ssh:
                 matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
@@ -215,14 +203,11 @@ class LocalVerifyCheck:
                     ctx.default_extra,
                     vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
                 )
-            if ctx.config.verifyx_enabled:
-                verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
-                    specs,
-                    ctx.default_extra,
-                    challenge_config_overrides=(
-                        _first_pass_challenge_config() if first_pass else None
-                    ),
-                )
+            verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
+                specs,
+                ctx.default_extra,
+                challenge_config_overrides=(_first_pass_challenge_config() if first_pass else None),
+            )
         except Exception as exc:  # a native library error is ours, not the node's
             if matmul_challenge is not None:
                 matmul_challenge.close()
@@ -239,7 +224,7 @@ class LocalVerifyCheck:
         client: LocalVerifyClient,
         local_verify_port: int,
         matmul_challenge: MatmulChallenge | None,
-        verifyx_challenge: VerifyXChallenge | None,
+        verifyx_challenge: VerifyXChallenge,
         *,
         matmul_ssh_reason: str | None,
     ) -> CheckResult:
@@ -257,10 +242,8 @@ class LocalVerifyCheck:
             executor_uuid=ctx.executor.uuid,
             miner_hotkey=ctx.miner_hotkey,
             matmul=matmul_step,
-            verifyx=(
-                VerifyXStep(seed=verifyx_challenge.seed, cipher_text=verifyx_challenge.cipher_text)
-                if verifyx_challenge is not None
-                else None
+            verifyx=VerifyXStep(
+                seed=verifyx_challenge.seed, cipher_text=verifyx_challenge.cipher_text
             ),
             # Side by side only at first-pass sizes: a full-size VerifyX beside the matmul OOMs
             # 64–128 GB hosts (SWEEP_provider_verify §3 #6).
@@ -268,7 +251,7 @@ class LocalVerifyCheck:
             # Shorter than the client's whole-call timeout by a margin, so an answer the
             # executor cut at its deadline (`deadline_hit`, finished steps inside) still arrives
             # before the client gives up and is consumed step by step.
-            deadline_s=executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS),
+            deadline_s=executor_deadline_s(client.timeout_s),
         )
 
         try:
@@ -303,7 +286,7 @@ class LocalVerifyCheck:
         ctx: Context,
         answer: LocalVerifyAnswer,
         matmul_challenge: MatmulChallenge | None,
-        verifyx_challenge: VerifyXChallenge | None,
+        verifyx_challenge: VerifyXChallenge,
         *,
         matmul_ssh_reason: str | None,
     ) -> LocalVerifyOutcome:
@@ -334,6 +317,10 @@ class LocalVerifyCheck:
                 matmul_challenge, stdout=step.stdout, stderr=step.stderr_tail or ""
             )
             if result.success:
+                # The step time is the executor's own word; the speed log labels it as such.
+                if step.ms:
+                    result.elapsed_seconds = step.ms / 1000
+                    result.elapsed_source = ELAPSED_SOURCE_EXECUTOR
                 outcome.matmul = result
                 self._metric(ctx, "consumed", "matmul", "ok", step_ms=step.ms, **common)
             else:
@@ -344,8 +331,6 @@ class LocalVerifyCheck:
                     ctx, "fallback", "matmul", "local_failed", detail=result.error_message, **common
                 )
 
-        if verifyx_challenge is None:
-            return outcome
         step = answer.step("verifyx")
         if step.status != "ok" or step.stdout is None:
             reason = _step_reason(step)
@@ -371,9 +356,10 @@ class LocalVerifyCheck:
                 self._metric(ctx, "consumed", "verifyx", "ok", step_ms=step.ms, **common)
             else:
                 outcome.fallbacks["verifyx"] = "local_failed"
-                self._metric(
-                    ctx, "fallback", "verifyx", "local_failed", detail=str(response.error), **common
-                )
+                # a verdict that decrypts but fails (RAM, disk) has no `error`, only `errors`
+                verdict_errors = (response.data or {}).get("errors") or []
+                detail = response.error or "; ".join(str(e) for e in verdict_errors)
+                self._metric(ctx, "fallback", "verifyx", "local_failed", detail=detail, **common)
         return outcome
 
     def _skipped(self, ctx: Context, why: str) -> CheckResult:

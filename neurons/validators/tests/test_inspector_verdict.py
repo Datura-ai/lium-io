@@ -436,7 +436,7 @@ def _ctx(context_factory, findings: list[dict], *, redis=None, **overrides):
         )
     )
     ctx = context_factory(
-        config=build_context_config(inspector_enabled=True),
+        config=build_context_config(),
         services=build_services(inspector=service, redis=redis),
         state=build_state(rented_data=_rented("executor-123")),
         **overrides,
@@ -541,7 +541,17 @@ def test_no_scoring_or_enforcement_path_reads_inspector_findings():
 
     scoring = [src / "services/task/score_calculator.py", src / "services/task/checks/score.py", *sorted((src / "incentive").rglob("*.py"))]
     assert all(path.exists() for path in scoring)
-    assert [str(path.relative_to(src)) for path in scoring if "inspector" in path.read_text(encoding="utf-8").lower()] == []
+    # DAH-4271: the one inspector name scoring may read is the blind-streak flag, which says only
+    # whether the sensor saw the rental at all, never what it found
+    texts = {
+        path: path.read_text(encoding="utf-8")
+        .replace("inspector_blind_streak_passed", "")
+        .replace("inspector_host_write_passed", "")  # DAH-4548: host wrote into a rented pod
+        for path in scoring
+    }
+    assert [
+        str(path.relative_to(src)) for path in scoring if "inspector" in texts[path].lower()
+    ] == []
     assert "inspector_passed" not in Context.model_fields
     assert not hasattr(settings, "INSPECTOR_ENFORCE_ENABLED")
 

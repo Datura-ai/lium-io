@@ -12,6 +12,7 @@ from typing import NamedTuple
 
 from protocol.vc_protocol.validator_requests import PodSshResult
 
+from ...node_host import open_public_connection
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 
 
@@ -37,7 +38,7 @@ async def tcp_connect_fault(host: str, port: int, timeout: float) -> ConnectOutc
     deadline = asyncio.get_running_loop().time() + timeout
     try:
         async with asyncio.timeout_at(deadline):
-            reader, writer = await asyncio.open_connection(host, port, limit=SSH_ID_LINE_MAX)
+            reader, writer = await open_public_connection(host, port, limit=SSH_ID_LINE_MAX)
     except TimeoutError:
         return ConnectOutcome(PodSshResult.TIMEOUT)
     except OSError as exc:

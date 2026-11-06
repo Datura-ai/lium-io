@@ -77,7 +77,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     echo -e "    ${RED}•  ${var}${RESET}" >&2
   done
   echo -e "\n${YELLOW}  Usage example:${RESET}"
-  echo -e "  ${DIM}TAG=latest [VALIDATOR_HOTKEY_SS58=<hotkey> [VALIDATOR_NEXT_HOTKEY_SS58=<hotkey>]] bash docker_build.sh${RESET}\n"
+  echo -e "  ${DIM}TAG=latest [VALIDATOR_HOTKEY_SS58=<hotkey> [VALIDATOR_NEXT_HOTKEY_SS58=<hotkey>] [VALIDATOR_SSH_SOURCES=<ip,ip>]] bash docker_build.sh${RESET}\n"
   exit 1
 fi
 
@@ -110,6 +110,11 @@ if [[ -n "${VALIDATOR_HOTKEY_SS58:-}" || -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" ]]
     echo "_VALIDATOR_NEXT_HOTKEY_SS58 = \"${VALIDATOR_NEXT_HOTKEY_SS58}\"" >> "${CONFIG_OVERRIDE_FILE}"
     log_kv "Next validator hotkey:" "${VALIDATOR_NEXT_HOTKEY_SS58}"
   fi
+  # I-78: the non-prod validator's egress addresses (comma-separated); unset = no ssh source pin
+  if [[ -n "${VALIDATOR_SSH_SOURCES:-}" ]]; then
+    echo "_VALIDATOR_SSH_SOURCES = \"${VALIDATOR_SSH_SOURCES}\"" >> "${CONFIG_OVERRIDE_FILE}"
+    log_kv "Validator ssh sources:" "${VALIDATOR_SSH_SOURCES}"
+  fi
   log_success "Generated: ${CONFIG_OVERRIDE_FILE}"
 else
   log_warn "Neither VALIDATOR_HOTKEY_SS58 nor VALIDATOR_NEXT_HOTKEY_SS58 is set — skipping config_override.py generation"
@@ -129,10 +134,23 @@ log_kv "Dockerfile:"    "Dockerfile"
 log_kv "Build context:" "${SCRIPT_DIR}"
 echo ""
 
-docker build \
-  --build-context datura=../../datura \
-  --tag "${IMAGE_NAME}" \
-  "${SCRIPT_DIR}"
+# PLATFORMS (e.g. linux/amd64,linux/arm64) builds one multi-arch image with buildx, published as an OCI index (the validator
+# digest reader accepts it). CD does not set it yet: ARM nodes still need the blockers listed in lium-io#1838.
+# buildx cannot load a multi-platform image into the local store, so it goes to an OCI archive that
+# docker_publish.sh pushes; unset, a plain single-arch build as before.
+if [[ -n "${PLATFORMS:-}" ]]; then
+  docker buildx build \
+    --platform "${PLATFORMS}" \
+    --provenance=false \
+    --build-context datura=../../datura \
+    --output "type=oci,dest=${OCI_ARCHIVE:-/tmp/executor.oci.tar}" \
+    "${SCRIPT_DIR}"
+else
+  docker build \
+    --build-context datura=../../datura \
+    --tag "${IMAGE_NAME}" \
+    "${SCRIPT_DIR}"
+fi
 
 # ── Success summary ────────────────────────────────────────────────────────────
 log_header "${SYM_DONE}  Build Complete"

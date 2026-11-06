@@ -12,6 +12,7 @@ from core.logger import get_logger
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
+from services.heartbeat_service import run_node_heartbeat
 from services.ssh_service import run_uploaded_key_purge
 from vast_api.wiring import attach_vast_api
 
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
     # Watch the nested dockerd for Vast contract start/end edges and report
     # them to the backend (no-op until the machine is enrolled and configured).
     events_task = asyncio.create_task(app.state.vast_events_poller.run_forever())
+    heartbeat_task = asyncio.create_task(run_node_heartbeat())
     try:
         yield
     finally:
@@ -52,6 +54,7 @@ async def lifespan(app: FastAPI):
             ("cache template pre-pull", prefetch_task),
             ("uploaded ssh key purge", key_purge_task),
             ("vast contract events", events_task),
+            ("node heartbeat", heartbeat_task),
         ):
             task.cancel()
             try:

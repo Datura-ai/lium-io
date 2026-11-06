@@ -235,6 +235,15 @@ def get_balance_of_eth_address(private_key: str):
         sys.exit(1)
 
 
+# the backend lists a new node on Spot, except one deleted in the Provider Portal at the same IP and port within 7 days,
+# which keeps its old tier; the CLI cannot pick a tier
+ADD_EXECUTOR_TIER_NOTICE = (
+    "Note: this node starts on the Spot tier, unless you deleted it in the Provider Portal in the last 7 days "
+    "and add it again at the same IP and port; then it keeps its earlier tier. To move it to Secure, open the "
+    "node's page in the Provider Portal and click Change Tier once the node has been listed for 7 days."
+)
+
+
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
@@ -250,11 +259,12 @@ def add_executor(
     price: float,
     validator: str | None = None,
 ):
-    """Add executor machine to the database"""
+    """Add executor machine to the database. A new node starts on the Spot tier (see the notice it prints)."""
     cli_service = CliService(with_executor_db=True)
     success = asyncio.run(cli_service.add_executor(address, port, price, validator))
     if success:
         logger.info("✅ Added executor successfully.")
+        click.echo(ADD_EXECUTOR_TIER_NOTICE)
     else:
         logger.error("❌ Failed to add executor.")
 
@@ -364,7 +374,7 @@ def update_executor_price(address: str, port: int, price: float):
     cli_service = CliService(with_executor_db=True)
     success = asyncio.run(cli_service.update_executor_price(address, port, price_per_gpu=price))
     if success:
-        logger.info("✅ Successfully updated executor price.")
+        logger.info("✅ Price update saved. Check the marketplace after the next sync for the listed price.")
     else:
         logger.error("❌ Failed to update executor price.")
 
@@ -442,31 +452,40 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract
         sys.exit(1)
         
 @cli.command()
-def migrate_validator_hotkey():
-    from core.config import settings
+@click.option(
+    "--from-hotkey",
+    "old_hotkey",
+    default=None,
+    help="The validator hotkey the rows are keyed to today. Default: VALIDATOR_NEXT_HOTKEY, which after the "
+    "swap-day pair swap (DEFAULT_VALIDATOR_HOTKEY=<new>, VALIDATOR_NEXT_HOTKEY=<old>) is the previous hotkey.",
+)
+@click.option(
+    "--to-hotkey",
+    "new_hotkey",
+    default=None,
+    help="The validator hotkey the rows move to. Default: DEFAULT_VALIDATOR_HOTKEY (the active one).",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Count the rows that would move; change nothing.")
+def migrate_validator_hotkey(old_hotkey: str | None, new_hotkey: str | None, dry_run: bool):
+    """Re-key this miner's executor rows from one validator hotkey to another (the validator hotkey rotation:
+    run once per miner DB after the config pair swap; the central miner has no rows of its own)."""
     from core.db import get_db
-    from models.executor import Executor
-    from sqlmodel import func, select, update
+    from daos.executor import ExecutorDao
+    from services.validator_service import migrate_validator_hotkey_rows
 
-    old_validator_hotkey = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
+    old_hotkey = old_hotkey or settings.VALIDATOR_NEXT_HOTKEY
+    new_hotkey = new_hotkey or settings.DEFAULT_VALIDATOR_HOTKEY
+    executor_dao = ExecutorDao(session=next(get_db()))
+    try:
+        result = migrate_validator_hotkey_rows(executor_dao, old_hotkey, new_hotkey, dry_run=dry_run)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
 
-    session = next(get_db())
-    filters = [
-        Executor.validator == old_validator_hotkey,
-    ]
-    select_stmt = select(func.count(Executor.uuid)).where(*filters)
-    count = session.exec(select_stmt).one()
-    logger.info(f"Found {count} miners with validator {old_validator_hotkey}")
-    
-    update_stmt = (
-        update(Executor)
-        .where(*filters)
-        .values(validator=settings.DEFAULT_VALIDATOR_HOTKEY)
-    )
-    result = session.exec(update_stmt)
-    updated_count = result.rowcount
-    session.commit()
-    logger.info(f"Migration completed. Updated {updated_count} miners")
+    logger.info(f"Found {result.found} executor rows keyed to validator {old_hotkey}")
+    if dry_run:
+        logger.info(f"Dry run: {result.found} rows would move to validator {new_hotkey}; nothing changed")
+    else:
+        logger.info(f"Migration completed. Moved {result.updated} executor rows to validator {new_hotkey}")
 
 
 if __name__ == "__main__":

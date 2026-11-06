@@ -1465,7 +1465,7 @@ async def test_set_weights_floors_live_miner_on_a_retired_burner_uid(
     mock_subtensor_client,
     create_neuron_info,
 ):
-    # BURNERS holds the pre-DAH-2274 slots; with the new burn logic on they receive nothing
+    # BURNERS holds the pre-DAH-2274 slots; they receive no burn (only NEW_BURNERS do)
     # and are ordinary miner uids, so a live miner sitting there still deserves the floor.
     miners = [
         create_neuron_info(uid=100, hotkey="burner"),
