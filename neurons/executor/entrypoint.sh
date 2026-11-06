@@ -8,10 +8,13 @@ set -eu
 # TEE) is left alone. If the new updater cannot start, the old one is put back.
 UPDATER_IMAGE="daturaai/lium-watchtower:1.2.0"
 ensure_updater() {
-    # The runner is found by its compose service label, not $HOSTNAME: an updater that recreates the runner
-    # copies the old container's hostname, which then names no container.
-    project=$(docker ps --filter label=com.docker.compose.service=executor-runner --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null) || return 0
-    case "$project" in "" | *[[:space:]]*) return 0 ;; esac
+    # The runner's own container, by the ID in its mount paths (/var/lib/docker/containers/<id>/hostname), not
+    # $HOSTNAME (an updater that recreates the runner copies the old hostname) and not a label lookup (that can
+    # find another stack's runner on the same host).
+    own=$(sed -n 's#.*/containers/\([0-9a-f]\{64\}\)/.*#\1#p' "${RUNNER_MOUNTINFO:-/proc/self/mountinfo}" 2>/dev/null | head -n 1) || return 0
+    [ -n "$own" ] || return 0
+    project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$own" 2>/dev/null) || return 0
+    [ -n "$project" ] || return 0
     updater=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=watchtower 2>/dev/null) || return 0
     case "$updater" in "" | *[[:space:]]*) return 0 ;; esac
     current=$(docker inspect --format '{{.Config.Image}}' "$updater" 2>/dev/null) || return 0

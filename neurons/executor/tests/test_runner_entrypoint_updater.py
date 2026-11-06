@@ -17,6 +17,12 @@ HERE = os.path.dirname(__file__)
 EXECUTOR = os.path.abspath(os.path.join(HERE, "..", "entrypoint.sh"))
 MINER = os.path.abspath(os.path.join(HERE, "..", "..", "miners", "entrypoint.sh"))
 NICKFEDOR = "nickfedor/watchtower:1.24.0@sha256:e96976bcbeaf0a9adeddc9016a539c27a2245ef6bb7d3ca97ed106783350d387"
+OWN_ID = "f" * 64
+MOUNTINFO = (
+    "1 0 0:1 / / rw - overlay overlay rw\n"
+    f"2 1 259:1 /var/lib/docker/containers/{OWN_ID}/resolv.conf /etc/resolv.conf rw - ext4 /dev/root rw\n"
+    f"3 1 259:1 /var/lib/docker/containers/{OWN_ID}/hostname /etc/hostname rw - ext4 /dev/root rw\n"
+)
 COMPOSE_LABELS = (
     " --label com.docker.compose.config-hash=abc --label com.docker.compose.oneoff=False"
     " --label com.docker.compose.project=executor --label com.docker.compose.service=watchtower"
@@ -27,7 +33,7 @@ DOCKER_STUB = textwrap.dedent(
     #!/bin/sh
     echo "$*" >> "$STUB_CALLS"
     case "$*" in
-        "ps --filter label=com.docker.compose.service="*-runner" --format "*) printf "${STUB_PROJECT-executor}" ;;
+        *com.docker.compose.project\\"}}\\ "$OWN_ID") echo "${STUB_PROJECT-executor}" ;;
         "ps --all --quiet --filter label=com.docker.compose.project="*) echo "${STUB_UPDATER-wt1}" ;;
         "inspect --format {{.Config.Image}} wt1") echo "$STUB_UPDATER_IMAGE" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
@@ -50,14 +56,23 @@ def run(tmp_path, script, **env):
     # the log-follow loop never ends; a `sleep` that fails ends the script after one round
     (bin_dir / "sleep").write_text("#!/bin/sh\nexit 7\n")
     (bin_dir / "sleep").chmod(0o755)
-    for tool in ("sh", "tail", "timeout"):
+    for tool in ("sh", "tail", "timeout", "sed", "head"):
         os.symlink(shutil.which(tool), bin_dir / tool)
     calls = tmp_path / "calls"
     calls.touch()
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(env.pop("MOUNTINFO", MOUNTINFO))
     result = subprocess.run(
         ["sh", script],
         # a recreated runner keeps the hostname of the container it replaced, which names no container
-        env={"PATH": str(bin_dir), "STUB_CALLS": str(calls), "HOSTNAME": "0123456789ab", **env},
+        env={
+            "PATH": str(bin_dir),
+            "STUB_CALLS": str(calls),
+            "HOSTNAME": "0123456789ab",
+            "RUNNER_MOUNTINFO": str(mountinfo),
+            "OWN_ID": OWN_ID,
+            **env,
+        },
         capture_output=True,
         text=True,
         timeout=30,
@@ -118,7 +133,14 @@ def test_a_current_updater_is_left_alone(tmp_path, script, current):
 
 
 @pytest.mark.parametrize(
-    "env", [{"STUB_UPDATER": ""}, {"STUB_UPDATER": "wt1 wt2"}, {"STUB_PROJECT": ""}, {"STUB_PROJECT": "executor\\nother"}]
+    "env",
+    [
+        {"STUB_UPDATER": ""},
+        {"STUB_UPDATER": "wt1 wt2"},
+        # started by `docker run`: the runner's own container has no compose project
+        {"STUB_PROJECT": ""},
+        {"MOUNTINFO": "1 0 0:1 / / rw - overlay overlay rw\n"},
+    ],
 )
 def test_no_single_updater_in_the_runners_project_means_nothing_is_created(tmp_path, env):
     _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="nickfedor/watchtower", **env)
@@ -173,10 +195,12 @@ def test_only_the_dev_runner_build_sets_the_staging_updater():
     assert "ENV UPDATER_STAGING=${updaterStaging}" in dockerfile
 
 
-@pytest.mark.parametrize("script, service", [(EXECUTOR, "executor-runner"), (MINER, "miner-runner")])
-def test_the_runner_is_found_by_its_service_label_not_its_hostname(tmp_path, script, service):
+@pytest.mark.parametrize("script", [EXECUTOR, MINER])
+def test_only_the_runners_own_stack_is_touched(tmp_path, script):
     _, calls = run(tmp_path, script, STUB_UPDATER_IMAGE="containrrr/watchtower:latest")
 
-    assert calls[0] == f'ps --filter label=com.docker.compose.service={service} --format {{{{.Label "com.docker.compose.project"}}}}'
+    # the project comes from the runner's own container, never from a label lookup that can find another stack
+    assert calls[0] == f'inspect --format {{{{index .Config.Labels "com.docker.compose.project"}}}} {OWN_ID}'
+    assert not any(c.startswith("ps --filter label=com.docker.compose.service=") for c in calls)
     assert not any("0123456789ab" in c for c in calls)
     assert updater_run(calls)
