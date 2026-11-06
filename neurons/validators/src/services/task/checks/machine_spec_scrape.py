@@ -20,7 +20,7 @@ from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .task_time import task_seconds_left
-from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
+from .upload_files import UPLOAD_TIMEOUT, UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
 
@@ -414,17 +414,22 @@ class MachineSpecScrapeCheck:
 
         # DAH-5899: the cycle builds its binary only now, once for every node that needs it; the build counts
         # against the task's time, and a retry whose scrape would no longer fit keeps the stdin verdict
+        # (upload up to UPLOAD_TIMEOUT, then the scrape's own timeout)
         if ctx.config.machine_scrape_binary is not None:
+            retry_seconds = timeout + UPLOAD_TIMEOUT
+            wait_seconds = task_seconds_left(ctx) - retry_seconds
+            if wait_seconds <= 0:
+                return result
             try:
-                await ctx.config.machine_scrape_binary.ensure()
+                await ctx.config.machine_scrape_binary.ensure(wait_seconds)
             except Exception as exc:
                 logger.error(
-                    _m("[scrape] binary build failed; keeping the stdin result", extra=get_extra_info(
-                        {**ctx.default_extra, "error": str(exc)[:400]}
+                    _m("[scrape] binary not ready; keeping the stdin result", extra=get_extra_info(
+                        {**ctx.default_extra, "error": repr(exc)[:400]}
                     ))
                 )
                 return result
-            if task_seconds_left(ctx) < timeout:
+            if task_seconds_left(ctx) < retry_seconds:
                 return result
 
         return await self._retry_scrape_with_uploaded_binary(

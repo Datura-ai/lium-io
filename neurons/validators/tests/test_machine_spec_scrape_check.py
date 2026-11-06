@@ -931,9 +931,11 @@ class FakeBinaryBuild:
     def __init__(self, error: Exception | None = None):
         self.error = error
         self.ensure_calls = 0
+        self.wait_seconds = None
 
-    async def ensure(self) -> None:
+    async def ensure(self, wait_seconds: float) -> None:
         self.ensure_calls += 1
+        self.wait_seconds = wait_seconds
         if self.error:
             raise self.error
 
@@ -983,10 +985,30 @@ async def test_a_failed_stdin_scrape_builds_the_binary_before_its_upload_retry(c
 
 
 @pytest.mark.asyncio
-async def test_a_retry_that_no_longer_fits_after_the_build_keeps_the_stdin_verdict(context_factory, mocker):
-    # the build counts against the 780 s task budget; a retry whose 300 s scrape cannot finish is not started
+async def test_the_build_wait_leaves_time_for_the_upload_and_the_scrape(context_factory, mocker):
     mocker.patch(
-        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", return_value=299
+        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", return_value=700
+    )
+    binary_build = FakeBinaryBuild(TimeoutError())
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
+    )
+    ssh_client = DummySSHClient()
+    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, binary_build)
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert binary_build.wait_seconds == 700 - 300 - 300
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert ssh_client.sftp_client.put_called_with is None
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_no_longer_fits_after_the_build_keeps_the_stdin_verdict(context_factory, mocker):
+    # the build counts against the 780 s task budget; a retry whose upload (300 s) plus scrape cannot finish
+    # is not started, even when the scrape alone would fit
+    mocker.patch(
+        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", return_value=599
     )
     runner = DummySSHCommandRunner(
         result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)

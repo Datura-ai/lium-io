@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import os
+import re
 import secrets
 import shutil
 import string
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Annotated
@@ -462,7 +464,7 @@ class FileEncryptService:
         for entry in root.iterdir():
             if entry.is_dir() and entry.resolve() not in kept and not any(entry.iterdir()):
                 entry.rmdir()
-        directory = Path(tempfile.mkdtemp(prefix="cycle-", dir=root))
+        directory = Path(tempfile.mkdtemp(prefix=f"cycle-{time.time_ns():020d}-", dir=root))
         source, all_keys, encryption_key = self._obfuscated_scrape()
         file_name = f"tmp{secrets.token_hex(4)}"
         return MinerJobEnryptedFiles(
@@ -546,6 +548,12 @@ def _pyinstaller_command(source_path: str, dist_directory: str, work_directory: 
     ]
 
 
+def _cycle_started_ns(path: Path) -> int:
+    """The creation time in a `cycle-<ns>-*` name; 0 for any other entry (an older name format)."""
+    match = re.match(r"cycle-(\d{20})-", path.name)
+    return int(match.group(1)) if match else 0
+
+
 class ScrapeBinaryBuild:
     """DAH-5899: one cycle's frozen scrape, built at most once, on the first call to `ensure`."""
 
@@ -556,13 +564,13 @@ class ScrapeBinaryBuild:
         self.keep_directories = keep_directories
         self._build: asyncio.Task | None = None
 
-    async def ensure(self) -> None:
+    async def ensure(self, wait_seconds: float) -> None:
         """Returns once the binary is in `directory`; concurrent callers wait on the same build, and a failed
-        build fails every caller of this cycle."""
+        build fails every caller of this cycle. Raises TimeoutError after `wait_seconds`; the build goes on."""
         if self._build is None:
             self._build = asyncio.create_task(self._run())
         # shielded: one verification giving up must not cancel the build the others wait on
-        await asyncio.shield(self._build)
+        await asyncio.wait_for(asyncio.shield(self._build), wait_seconds)
 
     async def _run(self) -> None:
         started = asyncio.get_running_loop().time()
@@ -578,17 +586,19 @@ class ScrapeBinaryBuild:
             _, stderr = await process.communicate()
         if process.returncode != 0:
             raise RuntimeError(f"scrape build exited {process.returncode}: {stderr.decode(errors='replace')[-400:]}")
-        await asyncio.to_thread(self._remove_earlier_directories)
+        kept = {Path(path).resolve() for path in self.keep_directories()}
+        await asyncio.to_thread(self._remove_earlier_directories, kept)
         logger.info(
             "[job-files] scrape binary built in %.1fs for %s",
             asyncio.get_running_loop().time() - started,
             self.directory.name,
         )
 
-    def _remove_earlier_directories(self) -> None:
-        kept = {Path(path).resolve() for path in self.keep_directories()} | {self.directory.resolve()}
+    def _remove_earlier_directories(self, kept: set[Path]) -> None:
+        # only older cycles: a late build of the last cycle must not remove the new cycle's directory
+        own = _cycle_started_ns(self.directory)
         for entry in JOB_FILES_ROOT.iterdir():
-            if entry.resolve() in kept:
+            if entry.resolve() in kept or _cycle_started_ns(entry) >= own:
                 continue
             if entry.is_dir():
                 shutil.rmtree(entry, ignore_errors=True)

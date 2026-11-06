@@ -17,6 +17,12 @@ def job_files_root(monkeypatch, tmp_path):
     return tmp_path
 
 
+def cycle_dir(root: Path, started_ns: int) -> Path:
+    directory = root / f"cycle-{started_ns:020d}-x"
+    directory.mkdir()
+    return directory
+
+
 @pytest.fixture
 def builds(monkeypatch):
     started = []
@@ -31,12 +37,11 @@ def builds(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_concurrent_stdin_failures_wait_on_one_build(job_files_root, builds):
-    directory = job_files_root / "cycle-now"
-    directory.mkdir()
+    directory = cycle_dir(job_files_root, 1)
     build = ScrapeBinaryBuild(directory, "tmpabc", "print(1)", lambda: ())
 
-    await asyncio.gather(*(build.ensure() for _ in range(5)))
-    await build.ensure()
+    await asyncio.gather(*(build.ensure(5) for _ in range(5)))
+    await build.ensure(5)
 
     assert builds == ["tmpabc"]
     assert (directory / "tmpabc").read_text() == "bin"
@@ -44,20 +49,43 @@ async def test_concurrent_stdin_failures_wait_on_one_build(job_files_root, build
 
 @pytest.mark.asyncio
 async def test_earlier_job_files_go_only_after_the_build(job_files_root, builds):
-    old, held, current = (job_files_root / name for name in ("cycle-old", "cycle-held", "cycle-now"))
-    for directory in (old, held, current):
-        directory.mkdir()
+    legacy = job_files_root / "cycle-abc123"
+    legacy.mkdir()
+    old, held, current = (cycle_dir(job_files_root, started) for started in (1, 2, 3))
+    for directory in (legacy, old, held, current):
         (directory / "binary").write_text("bin")
     build = ScrapeBinaryBuild(current, "tmpabc", "print(1)", lambda: {str(held)})
 
-    pending = asyncio.ensure_future(build.ensure())
+    pending = asyncio.ensure_future(build.ensure(5))
     await asyncio.sleep(0.05)
     still_there_while_building = old.exists()
     await pending
 
     assert still_there_while_building
-    assert not old.exists()
+    assert not old.exists() and not legacy.exists()
     assert held.exists() and current.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_late_build_of_the_last_cycle_keeps_the_new_cycles_directory(job_files_root, builds):
+    last, new = cycle_dir(job_files_root, 1), cycle_dir(job_files_root, 2)
+
+    await ScrapeBinaryBuild(last, "tmpabc", "print(1)", lambda: ()).ensure(5)
+
+    assert last.exists() and new.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_wait_past_its_limit_gives_up_but_the_build_goes_on(job_files_root, builds):
+    directory = cycle_dir(job_files_root, 1)
+    build = ScrapeBinaryBuild(directory, "tmpabc", "print(1)", lambda: ())
+
+    with pytest.raises(TimeoutError):
+        await build.ensure(0.01)
+    await build.ensure(5)
+
+    assert builds == ["tmpabc"]
+    assert (directory / "tmpabc").read_text() == "bin"
 
 
 def test_preparing_a_cycle_builds_nothing(job_files_root, monkeypatch):
