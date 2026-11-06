@@ -28,9 +28,11 @@ from ..messages import RentedThroughputMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
+from . import container_download_speed as download_speed
 from .container_download_speed import (
     _FETCH_SCRIPT,
     _TIMEOUT_EXITS,
+    ENDPOINTS,
     NODE_SIDE_ERRORS,
     ContainerDownloadSpeedCheck,
     download_speed_command,
@@ -373,11 +375,8 @@ def slow_detail(state: _State) -> str:
     parts = []
     if state.net_failures >= READINGS_BEFORE_VERDICT:
         need = reading.get("min_mbps")
-        slow = [
-            f"{e['endpoint']} {e['mbps']:.1f} Mbps" if e.get("mbps") is not None else f"{e['endpoint']} {e.get('error')}"
-            for e in reading.get("endpoints") or []
-            if (e.get("mbps") is not None and need is not None and e["mbps"] < need) or e.get("error") in NODE_SIDE_ERRORS
-        ]
+        # only what this reading's network verdict confirmed; a later unjudged reading names no endpoint
+        slow = reading.get("net_failed") or []
         parts.append(f"network: {', '.join(slow)} measured, {need:g} Mbps required" if slow and need else "network")
     if state.disk_failures >= READINGS_BEFORE_VERDICT:
         mb, need = (reading.get("disk") or {}).get("mb_per_s"), reading.get("disk_min_mb_per_s")
@@ -659,6 +658,15 @@ class RentedThroughputCheck:
             "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,
             "disk_min_mb_per_s": settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S,
         }
+        if net == "fail":
+            # the endpoints _judge fails on: slow, or cut while the validator reaches them (each checked, no short-circuit)
+            urls = dict(ENDPOINTS)
+            reading["net_failed"] = [
+                f"{r.endpoint} {r.mbps:.1f} Mbps" if r.mbps is not None else f"{r.endpoint} {r.error}"
+                for r in endpoints
+                if (r.mbps is not None and r.mbps < settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS)
+                or (r.error in NODE_SIDE_ERRORS and await download_speed.validator_reaches(urls[r.endpoint]))
+            ]
         if pressure is not None:
             # shadow: what the disk side would be with the gate enforced, next to what it is
             reading["disk_pressure"] = pressure.as_spec()

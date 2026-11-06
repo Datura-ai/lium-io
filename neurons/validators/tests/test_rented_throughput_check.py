@@ -1342,3 +1342,28 @@ async def test_a_slow_verdict_names_the_failed_side_with_measured_and_required_v
     ctx = ctx.model_copy(update=slow.updates)
     _, _, warning = calculate_scores(ctx, rented=True)
     assert f"network or disk throughput ({slow.updates['rented_throughput_slow_detail']})" in warning
+
+
+# the standing verdict names only endpoints a failing reading confirmed: an HF cut the validator also sees is never
+# the failure, whether it rides beside a slow PyPI or arrives on a later no-verdict reading
+HF_CUT = line("hf", 1024, 0.2, 1, "wget: connection closed prematurely")
+SLOW_PYPI_HF_CUT = snaps() + disk() + RENTALS + line("pypi", 1_800_000, 30.0, 143) + HF_CUT
+PYPI_OK_HF_CUT = snaps() + disk() + RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + HF_CUT
+
+
+@pytest.mark.parametrize(
+    "answers, detail",
+    [
+        ((SLOW_PYPI_HF_CUT, SLOW_PYPI_HF_CUT), r"network: pypi \d+\.\d Mbps measured, 10 Mbps required"),
+        ((SLOW_NET, SLOW_NET, PYPI_OK_HF_CUT), "network"),
+    ],
+    ids=["unconfirmed-hf-beside-slow-pypi", "later-no-verdict-reading"],
+)
+async def test_a_slow_verdict_names_only_confirmed_endpoints(answers, detail):
+    with flags(reachable=False) as clock:
+        ctx, _ = make_ctx(*answers)
+        check = RentedThroughputCheck()
+        for _ in answers:
+            slow = await check.run(ctx)
+            clock.now += 31 * 60
+    assert re.fullmatch(detail, slow.updates["rented_throughput_slow_detail"])
