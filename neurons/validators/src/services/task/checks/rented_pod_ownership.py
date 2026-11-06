@@ -103,11 +103,17 @@ class RentedPodOwnershipCheck:
         except (asyncssh.Error, OSError, TimeoutError) as exc:
             return self._event(ctx, Msg.UNREAD, {"reason": "ssh error", "error": repr(exc)})
         name_by_pid = {pid: name for name, pid in pid_by_name.items()}
-        pods = {}
+        pods, empty_reads = {}, {}
         for line in (res.stdout or "").splitlines():
             pod = judge(line)
             if pod and pod["pid"] in name_by_pid:
                 pods[pod["pid"]] = {"container": name_by_pid[pod["pid"]], **pod}
+            elif pod is None and _num(line.split("|")[0]) in name_by_pid:
+                # which read came back empty: tells a pod with no user namespace from a /proc root not stat-able here
+                fields = (line.split("|") + ["", "", ""])[1:4]
+                empty_reads[name_by_pid[_num(line.split("|")[0])]] = [
+                    name for name, field in zip(("uid_map", "/", "/root"), fields) if not field.strip()
+                ]
         # a requested pod not read back (missing from inspect, restarted before the read, or a garbled line)
         # is unknown, not healthy
         unread = sorted(set(names) - {p["container"] for p in pods.values()})
@@ -117,6 +123,8 @@ class RentedPodOwnershipCheck:
         elif unread:
             template = Msg.UNREAD
             what.update(reason="pod not read back", unread=unread, exit_status=res.exit_status)
+            if empty_reads:
+                what["empty_reads"] = empty_reads
         else:
             template = Msg.OK
         if unread:
