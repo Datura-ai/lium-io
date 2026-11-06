@@ -30,6 +30,10 @@ class MixedFormulaInputs(BaseModel):
     unrented: dict[str, Any]
 
 
+# DAH-5805: a run the validator's own Redis ended (no pooled connection, a timeout) says nothing about the node
+VALIDATOR_REDIS_UNAVAILABLE = "VALIDATOR_REDIS_UNAVAILABLE"
+
+
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
