@@ -9,11 +9,13 @@ top-N official templates as well (entries carrying ``pre_pull: true``) and hands
 to :func:`PrePuller.sweep` once per refresh sweep, which pulls AT MOST ONE missing image,
 digest-pinned, and only if
 
-* the node is idle — no ``pod_*`` container exists and no validator docker-over-ssh
-  session is open (that is how a rental's own pull and ``docker run`` reach this host);
-  a pull already running is cancelled the moment either appears;
-* the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — least-recently-used
-  pre-pulled images are evicted first to make room, nothing else is ever removed;
+* the node is idle — no ``pod_*`` container exists (in any state), no validator docker-over-ssh
+  session is open (that is how a rental's own pull and ``docker run`` reach this host) and the
+  validator's VerifyX bandwidth sample and container download probe are not running; a pull
+  already running is cancelled within 10 s when any of them appears (2 s for the two samples);
+* the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — pre-pulled images that left
+  the current top-N are evicted, least recently used first, to make room; nothing else is ever
+  removed, and a pull that would not fit without evicting a served image is skipped;
 * it finishes within ``PRE_PULL_TIMEOUT_SECONDS`` and before the next mandatory refresh
   is due: the start delay and the pull are both capped at the refresh deadline the loop
   hands in, and a pull that would not fit waits for the next sweep. The loop starts the
@@ -33,7 +35,10 @@ import asyncio
 import json
 import os
 import random
+import socket
+import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import docker
@@ -60,6 +65,17 @@ RENTAL_CONTAINER_PREFIX = "pod_"
 # The validator drives rental docker operations through docker-py over SSH, which runs
 # this on the executor for the whole operation (visible thanks to `pid: host`).
 DOCKER_OVER_SSH_MARKER = "dial-stdio"
+# The validator's VerifyX probe, whose download sample feeds the 100 Mbps EMA gate: it runs as
+# `python …/verifyx_executor.py --seed …`, over SSH or as the `/verify` subprocess
+# (local_verify_service). A pull sharing the link would lower that sample.
+BANDWIDTH_TEST_MARKER = "verifyx_executor.py"
+# The validator's idle-node download probe (container_download_speed): one SSH shell command
+# whose script echoes `lium_dl …` lines, so the marker is in the shell's and `docker run`'s
+# cmdline for the whole scored fetch. A pull sharing the link would lower that sample too.
+DOWNLOAD_TEST_MARKER = "lium_dl"
+# How often a running pull re-checks for the probe alone (a process scan, no docker call): a
+# sample lasts tens of seconds, so the full idle check's cadence would share too much of it.
+BANDWIDTH_TEST_CHECK_SECONDS = 2
 # Compressed size → on-disk estimate; same factor cache_template_service uses.
 ON_DISK_MULTIPLIER = 3.0
 DISK_PATH = "/"
@@ -76,15 +92,26 @@ GIB = 1024**3
 def rental_activity(client: "docker.DockerClient") -> str | None:
     """Why the node is not idle right now, or ``None``.
 
-    A rental container that is not finished counts, whatever its state: one still in
-    ``created`` is a rental starting. Exited/dead leftovers awaiting cleanup do not.
+    Any rental container counts until it is removed, whatever its state: ``created`` is a
+    rental starting, ``exited`` may be a stopped rental that can start again. The validator
+    removes an ended rental's container (orphans at its next cleanup cycle).
     """
     for container in client.containers.list(all=True):
-        if (container.name or "").startswith(RENTAL_CONTAINER_PREFIX) and container.status not in ("exited", "dead"):
+        if (container.name or "").startswith(RENTAL_CONTAINER_PREFIX):
             return f"rental container {container.name}"
+    return host_activity()
+
+
+def host_activity() -> str | None:
+    """Validator work on this host that a pull must not overlap, or ``None``."""
     for proc in psutil.process_iter(["cmdline"]):
-        if any(DOCKER_OVER_SSH_MARKER in part for part in (proc.info.get("cmdline") or [])):
+        cmdline = proc.info.get("cmdline") or []
+        if any(DOCKER_OVER_SSH_MARKER in part for part in cmdline):
             return "docker-over-ssh session"
+        if any(part.endswith(BANDWIDTH_TEST_MARKER) for part in cmdline):
+            return "validator bandwidth test"
+        if any(DOWNLOAD_TEST_MARKER in part for part in cmdline):
+            return "validator download test"
     return None
 
 
@@ -167,11 +194,13 @@ def _pull_pinned(
     registry, _ = docker.auth.resolve_repository_name(repo)
     auth_header = docker.auth.get_config_header(api, registry)
     headers = {"X-Registry-Auth": auth_header} if auth_header else {}
-    deadline = time.monotonic() + timeout_seconds
-    next_check = time.monotonic() + ACTIVITY_CHECK_SECONDS
-    # The deadline and the idle check run per stream event, so the read timeout is what
-    # bounds a stream that goes silent: without it a stalled registry would hold this thread
-    # (and the pull lock) for the whole budget past the caller's refresh deadline.
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    # The deadline and the idle checks run on their own thread, not per stream event: Docker
+    # can go quiet for long stretches (a big layer extracting, a slow registry), and a check
+    # that waits for the next event could let a pull share the link with the bandwidth sample
+    # for up to the read timeout. Shutting the stream's socket from the watcher ends the read.
+    # The read timeout still bounds a silent stream when nothing else ends it.
     response = api._post(
         api._url("/images/create"),
         params={"fromImage": repo, "tag": digest},
@@ -179,28 +208,70 @@ def _pull_pinned(
         stream=True,
         timeout=(CONNECT_TIMEOUT_SECONDS, STREAM_READ_TIMEOUT_SECONDS),
     )
+    stop = threading.Event()
+    watcher_stop_outcome: list[tuple[str, str]] = []
+
+    def watch() -> None:
+        next_check = started + ACTIVITY_CHECK_SECONDS
+        while not stop.wait(BANDWIDTH_TEST_CHECK_SECONDS):
+            now = time.monotonic()
+            try:
+                if now > deadline:
+                    reason = ("timeout", f"exceeded {timeout_seconds:.0f}s")
+                elif now >= next_check:
+                    next_check = now + ACTIVITY_CHECK_SECONDS
+                    busy = rental_activity(client)
+                    reason = ("preempted", busy) if busy else None
+                else:
+                    busy = host_activity()
+                    reason = ("preempted", busy) if busy else None
+            except Exception as e:
+                logger.info(f"pre-pull idle check failed, retrying: {type(e).__name__}")
+                continue
+            if reason and not stop.is_set():
+                watcher_stop_outcome.append(reason)
+                _abort_stream(api, response)
+                return
+
+    watcher = threading.Thread(target=watch, name="pre-pull-watch", daemon=True)
     try:
         api._raise_for_status(response)
+        watcher.start()
         for event in api._stream_helper(response, decode=True) or ():
+            if watcher_stop_outcome:
+                break
             if isinstance(event, dict) and event.get("error"):
                 return "pull_failed", str(event["error"])
-            now = time.monotonic()
-            if now > deadline:
-                return "timeout", f"exceeded {timeout_seconds:.0f}s"
-            if now >= next_check:
-                next_check = now + ACTIVITY_CHECK_SECONDS
-                busy = rental_activity(client)
-                if busy:
-                    return "preempted", busy
     except (requests.exceptions.Timeout, urllib3.exceptions.TimeoutError):
-        # docker-py reads the chunked stream off `response.raw`, so a silent stream surfaces as
-        # urllib3's ReadTimeoutError, not requests' (requests only remaps inside iter_content).
-        return "timeout", f"no stream event for {STREAM_READ_TIMEOUT_SECONDS}s"
+        if not watcher_stop_outcome:
+            # docker-py reads the chunked stream off `response.raw`, so a silent stream surfaces
+            # as urllib3's ReadTimeoutError, not requests' (requests only remaps inside iter_content).
+            return "timeout", f"no stream event for {STREAM_READ_TIMEOUT_SECONDS}s"
+    except Exception:
+        if not watcher_stop_outcome:
+            raise
+        # reading a stream the watcher shut down raises whatever the transport raises
     finally:
+        stop.set()
+        if watcher.is_alive():
+            watcher.join()
+        # closing the stream is what makes the daemon abandon an unfinished pull
         response.close()
+    if watcher_stop_outcome:
+        return watcher_stop_outcome[0]
     # A digest pull leaves the tag untouched; rentals look the image up by repo:tag.
     client.images.get(f"{repo}@{digest}").tag(repo, tag)
     return "pull_ok", None
+
+
+def _abort_stream(api: docker.APIClient, response: requests.Response) -> None:
+    """Wake the thread blocked reading the pull stream. On Linux a close() from another thread
+    does not wake a blocked recv(), and closing the buffered reader waits for that read to end;
+    a shutdown() of the socket ends the read at once."""
+    with suppress(Exception):
+        sock = api._get_raw_response_socket(response)
+        # docker's unix-socket stream hands back the makefile's SocketIO, which wraps the socket
+        getattr(sock, "_sock", sock).shutdown(socket.SHUT_RDWR)
 
 
 class PrePuller:
@@ -236,6 +307,8 @@ class PrePuller:
         for image_ref in protected & self.state.images.keys():
             self.state.forget(image_ref)
             logger.info(f"pre-pull: {image_ref} is now a mandatory image; no longer tracked for eviction")
+        served = {f"{data.get('docker_image')}:{data.get('docker_image_tag')}" for data in entries}
+        await self._evict_unlisted(served, protected)
         if not entries:
             self.state.flush()
             return
@@ -285,7 +358,7 @@ class PrePuller:
                 break
 
             started = time.monotonic()
-            room, detail = await self._make_room(image_ref, int(size * ON_DISK_MULTIPLIER))
+            room, detail = await self._make_room(image_ref, int(size * ON_DISK_MULTIPLIER), served)
             # The budget is measured after eviction, which takes time of its own: the pull's
             # clock starts below, so this is what cuts it at the deadline.
             budget = float(settings.PRE_PULL_TIMEOUT_SECONDS)
@@ -324,6 +397,39 @@ class PrePuller:
 
         self.state.flush()
 
+    async def _evict_unlisted(self, served: set[str], protected: frozenset[str]) -> None:
+        """Remove a pre-pulled image once the backend has stopped serving it for
+        ``PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS`` (0 keeps it until the disk floor needs the room).
+
+        The clock starts at the first sweep that no longer lists it and resets if it comes back,
+        so a template that drifts in and out at the edge of the top-N is not pulled and removed
+        in turn. Only images this puller tracks are candidates, and only on an idle node: a rental
+        may be starting on the image. An image docker refuses to remove stays tracked for the next sweep."""
+        after = settings.PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS
+        now = time.time()
+        due: list[str] = []
+        for image_ref, record in self.state.images.items():
+            if image_ref in served or image_ref in protected or image_ref in self.protected:
+                record.pop("unlisted_since", None)
+                continue
+            since = record.setdefault("unlisted_since", now)
+            if after > 0 and now - since >= after:
+                due.append(image_ref)
+        for image_ref in due:
+            # Both re-checked per image: a rental may start, or the loop may make the image
+            # mandatory, while docker removes the previous one.
+            if await asyncio.to_thread(rental_activity, self.client):
+                return
+            if image_ref in self.protected:
+                continue
+            record = self.state.images[image_ref]
+            hours_unlisted = (now - record["unlisted_since"]) / 3600
+            if await self._remove_tracked_image(image_ref):
+                logger.info(
+                    f"pre_pull image={image_ref} digest={record.get('digest')} outcome=evicted_unlisted "
+                    f"detail=not served for {hours_unlisted:.1f}h"
+                )
+
     async def _retire_superseded(self, image_ref: str, repo: str, digest: str) -> None:
         """When a tracked tag moved to a new digest, drop the old ``repo@<digest>`` reference:
         the re-tag leaves it behind as neither dangling nor a tag, so the disk guard could never
@@ -333,10 +439,16 @@ class PrePuller:
             if await asyncio.to_thread(_remove_ref, self.client, f"{repo}@{old}"):
                 logger.info(f"pre-pull: retired superseded {repo}@{old} for {image_ref}")
 
-    async def _make_room(self, keep_ref: str, need_bytes: int) -> tuple[bool, str | None]:
-        """Keep ``PRE_PULL_MIN_FREE_GB`` free after the pull, evicting LRU pre-pulled images first."""
+    async def _make_room(
+        self, keep_ref: str, need_bytes: int, served: set[str]
+    ) -> tuple[bool, str | None]:
+        """Keep ``PRE_PULL_MIN_FREE_GB`` free after the pull, evicting LRU pre-pulled images first.
+
+        Only images that left the backend's current top-N (``served``) are evictable: evicting a
+        served one to fit another would re-pull the two alternately every sweep on a node whose
+        free space fits either but not both. Such a node keeps what it has and skips the pull."""
         floor = settings.PRE_PULL_MIN_FREE_GB * GIB
-        skip = {keep_ref}
+        skip = served | {keep_ref}
         while True:
             free = psutil.disk_usage(DISK_PATH).free
             if free - need_bytes >= floor:
@@ -349,11 +461,16 @@ class PrePuller:
                     f"free {free / GIB:.0f} GiB < need {need_bytes / GIB:.0f} GiB + floor {floor / GIB:.0f} GiB"
                 )
             skip.add(victim)
-            digest = self.state.images[victim].get("digest")
-            removed = await asyncio.to_thread(_remove_ref, self.client, victim)
-            if digest:
-                digest_ref = f"{victim.rpartition(':')[0]}@{digest}"
-                removed = await asyncio.to_thread(_remove_ref, self.client, digest_ref) and removed
-            if removed:
+            if await self._remove_tracked_image(victim):
                 logger.info(f"pre-pull: evicted {victim} (least recently used) to keep disk headroom")
-                self.state.forget(victim)
+
+    async def _remove_tracked_image(self, image_ref: str) -> bool:
+        """Remove a tracked image's tag and pinned digest, and stop tracking it; False if docker refused."""
+        digest = self.state.images[image_ref].get("digest")
+        removed = await asyncio.to_thread(_remove_ref, self.client, image_ref)
+        if digest:
+            digest_ref = f"{image_ref.rpartition(':')[0]}@{digest}"
+            removed = await asyncio.to_thread(_remove_ref, self.client, digest_ref) and removed
+        if removed:
+            self.state.forget(image_ref)
+        return removed

@@ -1,7 +1,7 @@
 """DAH-3011: the fast first pass for a never-validated executor.
 
 Only a caller that passes `first_pass=True` (the express lane, DAH-2958 — spec-only, never scored)
-with FIRST_PASS_FAST_PATH_ENABLED on gets it: the capability matmul is sized from a VRAM budget,
+gets it: the capability matmul is sized from a VRAM budget,
 VerifyX writes less RAM/disk, and a cold bandwidth sample is published but not enforced. The wave
 never sets `first_pass`, so a scored verification is byte-for-byte today's.
 """
@@ -22,6 +22,7 @@ from neurons.validators.src.services.task.pipeline_factory import PipelineFactor
 from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
+from tests.test_verifyx_cold_sample_retry import _run as _verifyx_then_cold_retry
 from tests.helpers import build_context_config, build_services, build_state
 from tests.test_capability_check import DummyValidationService
 from tests.test_verifyx_check import MockVerifyXResponse
@@ -29,21 +30,12 @@ from tests.test_verifyx_check import MockVerifyXResponse
 EXECUTOR = "executor-123"
 
 
-@pytest.fixture
-def fast_path_on(monkeypatch):
-    monkeypatch.setattr(settings, "FIRST_PASS_FAST_PATH_ENABLED", True)
-
-
-# --- plumbing: the flag AND the caller's first_pass are both needed ---------------------------
+# --- plumbing: the caller's first_pass reaches the context ------------------------------------
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "flag,first_pass,expected",
-    [(False, False, False), (False, True, False), (True, False, False), (True, True, True)],
-)
-async def test_context_first_pass_needs_the_flag_and_the_caller(monkeypatch, flag, first_pass, expected):
-    monkeypatch.setattr(settings, "FIRST_PASS_FAST_PATH_ENABLED", flag)
+@pytest.mark.parametrize("first_pass,expected", [(False, False), (True, True)])
+async def test_context_first_pass_follows_the_caller(monkeypatch, first_pass, expected):
     # Context validates a live asyncssh connection; what is under test is the ContextConfig
     # build_context assembles, so capture the kwargs instead of constructing the model.
     monkeypatch.setattr(pipeline_factory_module, "Context", lambda **kw: SimpleNamespace(**kw))
@@ -87,11 +79,12 @@ async def test_context_first_pass_needs_the_flag_and_the_caller(monkeypatch, fla
         rented_data=None,
         default_docker_image_digests={},
         first_pass=first_pass,
+        task_started_at=123.0,
     )
 
     assert ctx.config.first_pass is expected
-    # the raw express-lane flag reaches the context whatever the fast-path flag says (DAH-4258)
-    assert ctx.config.express_first_pass is first_pass
+    # DAH-5320: the task budget counts from the task start, not from the context build
+    assert ctx.started_at_monotonic == 123.0
 
 
 def test_context_config_default_is_not_a_first_pass():
@@ -110,7 +103,7 @@ class _SizingAwareValidationService(DummyValidationService):
 
 
 @pytest.mark.asyncio
-async def test_scored_capability_call_passes_no_sizing(fast_path_on, context_factory):
+async def test_scored_capability_call_passes_no_sizing(context_factory):
     service = _SizingAwareValidationService(success=True)
     ctx = context_factory(
         services=build_services(validation=service),
@@ -126,7 +119,7 @@ async def test_scored_capability_call_passes_no_sizing(fast_path_on, context_fac
 
 
 @pytest.mark.asyncio
-async def test_first_pass_capability_call_sizes_the_matmul_from_the_budget(fast_path_on, context_factory):
+async def test_first_pass_capability_call_sizes_the_matmul_from_the_budget(context_factory):
     service = _SizingAwareValidationService(success=True, metrics={"fp32_tflops": 1.0})
     ctx = context_factory(
         services=build_services(validation=service),
@@ -198,7 +191,9 @@ class _ConfigAwareVerifyX:
         self._response = response
         self.kwargs: dict = {}
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec, **kw):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **kw
+    ):
         self.kwargs = kw
         return self._response
 
@@ -221,10 +216,10 @@ def _never_measured():
 
 
 @pytest.mark.asyncio
-async def test_scored_verifyx_call_passes_no_overrides_and_keeps_the_gate(fast_path_on, context_factory):
+async def test_scored_verifyx_call_passes_no_overrides_and_keeps_the_gate(context_factory):
     service = _ConfigAwareVerifyX(_probe(59.9))
 
-    result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=False, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=False, rented_data=_never_measured()))
 
     assert service.kwargs == {}
     assert result.passed is False
@@ -232,7 +227,7 @@ async def test_scored_verifyx_call_passes_no_overrides_and_keeps_the_gate(fast_p
 
 
 @pytest.mark.asyncio
-async def test_first_pass_verifyx_uses_the_smaller_challenge_config(fast_path_on, context_factory):
+async def test_first_pass_verifyx_uses_the_smaller_challenge_config(context_factory):
     service = _ConfigAwareVerifyX(_probe(500.0))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
@@ -250,7 +245,7 @@ async def test_first_pass_verifyx_uses_the_smaller_challenge_config(fast_path_on
 
 
 @pytest.mark.asyncio
-async def test_first_pass_cold_sample_is_published_but_the_gate_is_deferred(fast_path_on, context_factory):
+async def test_first_pass_cold_sample_is_published_but_the_gate_is_deferred(context_factory):
     service = _ConfigAwareVerifyX(_probe(59.9))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
@@ -267,7 +262,7 @@ async def test_first_pass_cold_sample_is_published_but_the_gate_is_deferred(fast
 
 
 @pytest.mark.asyncio
-async def test_first_pass_failed_network_probe_is_deferred_too(fast_path_on, context_factory):
+async def test_first_pass_failed_network_probe_is_deferred_too(context_factory):
     result = await VerifyXCheck().run(
         _ctx(context_factory, _ConfigAwareVerifyX(_probe(None)), first_pass=True, rented_data=_never_measured())
     )
@@ -284,21 +279,25 @@ class _ConfigAwareSequence:
         self._responses = list(responses)
         self.kwargs_per_call: list[dict] = []
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec, **kw):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **kw
+    ):
         self.kwargs_per_call.append(kw)
         return self._responses.pop(0)
 
 
 @pytest.mark.asyncio
 async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_config(
-    fast_path_on, monkeypatch, context_factory
+    monkeypatch, context_factory
 ):
-    """DAH-2959 + DAH-3011 compose: with both flags on, the cold-sample retry is a first-pass
+    """DAH-2959 + DAH-3011 compose: with the retry flag on, the cold-sample retry is a first-pass
     probe too — the 128 GB / 5 GB write must not come back on the second sample."""
-    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
-    service = _ConfigAwareSequence(_probe(59.9), _probe(500.0))
+    retry = _probe(500.0)
+    # the adopted retry's disk reading is judged again (DiskSpaceCheck): give it one that clears the floor
+    retry.data["hard_disk"] = {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024}
+    service = _ConfigAwareSequence(_probe(59.9), retry)
 
-    result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 
     first_pass_overrides = {"challenge_config_overrides": {"memory_max_test_gb": 16, "storage_throughput_test_gb": 1}}
     assert service.kwargs_per_call == [first_pass_overrides, first_pass_overrides]
@@ -308,7 +307,7 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
 
 
 @pytest.mark.asyncio
-async def test_first_pass_on_a_host_with_an_ema_keeps_the_gate(fast_path_on, context_factory):
+async def test_first_pass_on_a_host_with_an_ema_keeps_the_gate(context_factory):
     known = RentedExecutorsResponse(
         executors={}, banned_guids=[],
         network_ema={EXECUTOR: NetworkEMA(ema_verifyx_download_speed=110.0, ema_verifyx_upload_speed=40.0)},
@@ -321,7 +320,7 @@ async def test_first_pass_on_a_host_with_an_ema_keeps_the_gate(fast_path_on, con
 
 
 @pytest.mark.asyncio
-async def test_first_pass_ram_or_disk_failure_still_fails(fast_path_on, context_factory):
+async def test_first_pass_ram_or_disk_failure_still_fails(context_factory):
     failed = MockVerifyXResponse(data={"success": False, "errors": ["Insufficient memory: 6 GB allocated, 8 GB required"]})
 
     result = await VerifyXCheck().run(_ctx(context_factory, _ConfigAwareVerifyX(failed), first_pass=True, rented_data=_never_measured()))
@@ -331,12 +330,10 @@ async def test_first_pass_ram_or_disk_failure_still_fails(fast_path_on, context_
 
 
 @pytest.mark.asyncio
-async def test_flag_off_first_pass_is_todays_behaviour(monkeypatch, context_factory):
-    monkeypatch.setattr(settings, "FIRST_PASS_FAST_PATH_ENABLED", False)
-    # The flag is resolved in build_context, so ContextConfig.first_pass is False; here we assert
-    # the checks themselves also do nothing special when it is False.
+async def test_scored_pass_is_todays_behaviour(context_factory):
+    # A scored cycle has ContextConfig.first_pass False; the checks do nothing special then.
     verifyx = _ConfigAwareVerifyX(_probe(59.9))
-    result = await VerifyXCheck().run(_ctx(context_factory, verifyx, first_pass=False, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, verifyx, first_pass=False, rented_data=_never_measured()))
     assert verifyx.kwargs == {}
     assert result.passed is False
 

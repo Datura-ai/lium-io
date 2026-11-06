@@ -1,7 +1,7 @@
 """Every reason a node earns 0 is recorded, not only the first one found.
 
-A node blocked by one rule used to hide every later rule: an 8x flagship with no Discord
-learned about the flagship gate only after connecting Discord. And a node whose validation
+A node blocked by one rule used to hide every later rule: an 8x node with no Discord
+learned about the full 8x gate only after connecting Discord. And a node whose validation
 failed earned 0 with an empty reason list. Both cases now reach the backend as data.
 """
 import logging
@@ -21,15 +21,17 @@ from services.task.models import build_msg
 from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
-# a scrape without the NCU observation: the flagship gate reads it as "not unrestricted"
-FLAGSHIP_SPEC: dict = {"hard_disk": {"total": 200 * 1024**2}, "gpu": {"details": [{"capacity": 141 * 1024}] * 8}}
+# a scrape without the NCU observation: the full 8x gate reads it as "not unrestricted"
+FULL_8X_SPEC: dict = {"hard_disk": {"total": 2000 * 1024**2}, "gpu": {"details": [{"capacity": 141 * 1024}] * 8}}
+# the always-enforced disk/VRAM gate fires only on this one
+SHORT_DISK_SPEC: dict = {**FULL_8X_SPEC, "hard_disk": {"total": 200 * 1024**2}}
 
 
 def _incentive() -> RentalPriceIncentive:
     return RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
 
 
-def _idle_flagship(**overrides) -> JobResult:
+def _idle_full_8x(**overrides) -> JobResult:
     fields: dict = dict(
         executor_info=ExecutorSSHInfo(
             uuid="exec-1",
@@ -41,7 +43,7 @@ def _idle_flagship(**overrides) -> JobResult:
             root_dir="/tmp",
             price_per_gpu=1.0,
         ),
-        spec=dict(FLAGSHIP_SPEC),
+        spec=dict(FULL_8X_SPEC),
         score=1.0,
         job_score=1.0,
         job_batch_id="2026-09-24 00:00:00",
@@ -57,7 +59,7 @@ def _idle_flagship(**overrides) -> JobResult:
 
 
 def _failed(**overrides) -> JobResult:
-    return _idle_flagship(
+    return _idle_full_8x(
         spec=None, score=0, job_score=0, log_status="error", gpu_model=None, gpu_count=0, **overrides
     )
 
@@ -72,10 +74,9 @@ def discord_cutoff_passed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_flagship_gate_is_recorded_even_when_discord_blocks(monkeypatch, discord_cutoff_passed):
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", True)
+async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch, discord_cutoff_passed):
 
-    result = await _incentive().calculate_executor_score(_idle_flagship(provider_discord_connected=False))
+    result = await _incentive().calculate_executor_score(_idle_full_8x(provider_discord_connected=False))
 
     # the first entry is the one the old first-match evaluation reported
     assert _codes(result) == ["provider_discord_not_connected", "flagship_without_ncu_or_split"]
@@ -87,17 +88,13 @@ async def test_flagship_gate_is_recorded_even_when_discord_blocks(monkeypatch, d
 async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order(
     monkeypatch, discord_cutoff_passed
 ):
-    for flag in (
-        "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT",
-        "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT",
-        "ENABLE_UNRENTED_SOFT_PRICE_LIMIT",
-    ):
-        monkeypatch.setattr(settings, flag, True)
     new_cfg = shared_client.config.model_copy(update={"machine_prices_p90": {H200: 0.5}})
     monkeypatch.setattr(shared_client, "_config", new_cfg)
 
     result = await _incentive().calculate_executor_score(
-        _idle_flagship(provider_discord_connected=False, is_new_rentals_paused=True, is_spot=True)
+        _idle_full_8x(
+            provider_discord_connected=False, is_new_rentals_paused=True, is_spot=True, spec=dict(SHORT_DISK_SPEC)
+        )
     )
 
     assert _codes(result) == [
@@ -114,12 +111,10 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
 @pytest.mark.asyncio
 async def test_two_idle_pool_gates_are_both_recorded(monkeypatch):
     # price used to stop the chain: a node over the price limit never heard about its disk
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", True)
     new_cfg = shared_client.config.model_copy(update={"machine_prices_p90": {H200: 0.5}})
     monkeypatch.setattr(shared_client, "_config", new_cfg)
 
-    result = await _incentive().calculate_executor_score(_idle_flagship(gpu_count=4))
+    result = await _incentive().calculate_executor_score(_idle_full_8x(gpu_count=4, spec=dict(SHORT_DISK_SPEC)))
 
     assert _codes(result) == ["price_above_market_p90_soft_limit", "insufficient_disk_for_vram"]
     assert result.eligible_for_rental_share is False
@@ -129,19 +124,19 @@ def _logged(caplog, reason: str) -> int:
     return sum(1 for record in caplog.records if getattr(record.msg, "extra", {}).get("reason") == reason)
 
 
-# (the gate's flag, the node, the reason it records when enforced, the reason its log line carries).
+# (the gate's flag or None when the gate is always enforced, the node, the reason it records when enforced, the reason its log line carries).
 # The last two are the probes' "cannot measure ...; unrented incentive kept" lines: no reason, and
 # the sentence is false for a node that is already excluded.
 GATE_LOG_CASES = [
-    ("ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", {}, "flagship_without_ncu_or_split", "flagship_without_ncu_or_split"),
-    ("ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", {"gpu_count": 4}, "insufficient_disk_for_vram", "insufficient_disk_for_vram"),
+    (None, {}, "flagship_without_ncu_or_split", "flagship_without_ncu_or_split"),
+    (None, {"gpu_count": 4, "spec": SHORT_DISK_SPEC}, "insufficient_disk_for_vram", "insufficient_disk_for_vram"),
     (
-        "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT",
+        None,
         {"gpu_count": 4, "spec": {"gpu": {"details": []}}},
         None,
         "insufficient_disk_unmeasured",
     ),
-    ("ENABLE_UNRENTED_POWER_CAP_LIMIT", {"gpu_count": 4}, None, "power_cap_capability_unmeasured"),
+    (None, {"gpu_count": 4}, None, "power_cap_capability_unmeasured"),  # power cap gate: no flag
 ]
 
 
@@ -153,11 +148,14 @@ async def test_a_gate_logs_only_while_the_node_is_still_eligible(
 ):
     # the gate lines count eligible nodes only, as before every reason was recorded; an enforced
     # gate still records its reason on the blocked node
-    monkeypatch.setattr(settings, flag, enforced)
+    if flag is None and not enforced:
+        pytest.skip("the gate is always enforced")
+    if flag:
+        monkeypatch.setattr(settings, flag, enforced)
 
     with caplog.at_level(logging.INFO):
         blocked = await _incentive().calculate_executor_score(
-            _idle_flagship(provider_discord_connected=False, **node)
+            _idle_full_8x(provider_discord_connected=False, **node)
         )
 
     assert _logged(caplog, log_reason) == 0
@@ -166,7 +164,7 @@ async def test_a_gate_logs_only_while_the_node_is_still_eligible(
     # the same node, not blocked: the line is there, so the zero above is not a blind caplog
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        await _incentive().calculate_executor_score(_idle_flagship(**node))
+        await _incentive().calculate_executor_score(_idle_full_8x(**node))
     assert _logged(caplog, log_reason) == 1
 
 
@@ -178,7 +176,7 @@ async def test_driver_and_sysbox_are_recorded_on_a_node_blocked_before_pricing(
     monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 1)
 
     result = await _incentive().calculate_executor_score(
-        _idle_flagship(
+        _idle_full_8x(
             gpu_count=4,
             provider_discord_connected=False,
             nvidia_driver_version="470.0.1",
@@ -197,7 +195,7 @@ async def test_driver_and_sysbox_are_recorded_on_a_node_blocked_before_pricing(
 @pytest.mark.asyncio
 async def test_an_eligible_node_whose_rate_collapses_on_two_factors_gets_both(monkeypatch):
     incentive = _incentive()
-    job = _idle_flagship(gpu_count=1)
+    job = _idle_full_8x(gpu_count=1)
     job.eligible_for_rental_share = True
     job.hourly_rate = 5.0
     job.sysbox_multiplier = 0.0
@@ -217,7 +215,7 @@ async def test_an_eligible_node_whose_rate_collapses_on_two_factors_gets_both(mo
 
 @pytest.mark.asyncio
 async def test_a_healthy_idle_node_has_no_reason():
-    result = await _incentive().calculate_executor_score(_idle_flagship(gpu_count=4, spec=None))
+    result = await _incentive().calculate_executor_score(_idle_full_8x(gpu_count=4, spec=None))
 
     assert result.zero_incentive_reasons == []
     assert result.eligible_for_rental_share is True
@@ -281,7 +279,7 @@ async def test_failed_validation_without_any_code_is_never_empty():
 @pytest.mark.asyncio
 async def test_a_full_cycle_publishes_the_failed_node_reason_once(monkeypatch):
     failed = _failed(failure_reason_code="RECOMMENDED_IMAGE_NOT_CACHED")
-    healthy = _idle_flagship(
+    healthy = _idle_full_8x(
         gpu_count=4, spec=None, executor_info=failed.executor_info.model_copy(update={"uuid": "exec-2"})
     )
     redis = AsyncMock()
@@ -319,7 +317,7 @@ def _passed_but_zero(event_reason: str, remediation: str, **overrides) -> JobRes
         remediation=remediation,
         check_id="pipeline.finalize",
     )
-    return _idle_flagship(
+    return _idle_full_8x(
         score=0, job_score=0, log_status="warning", validation_event=event, failure_reason_code=event_reason, **overrides
     )
 
@@ -359,7 +357,7 @@ async def test_a_run_that_passed_every_check_gets_no_validation_failed(engine, e
 )
 async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine, failure_reason_code, overrides):
     monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-    result = _idle_flagship(
+    result = _idle_full_8x(
         score=0,
         job_score=0,
         log_status="error",
@@ -380,13 +378,13 @@ async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exclusion", [{"is_spot": True}, {"is_provider_banned": True}], ids=["spot", "banned"])
 async def test_a_rented_excluded_node_scores_zero(exclusion):
-    rented_healthy = _idle_flagship(gpu_count=4, spec=None, is_rented=True)
+    rented_healthy = _idle_full_8x(gpu_count=4, spec=None, is_rented=True)
     redis = AsyncMock(get_portion_per_gpu_type=AsyncMock(return_value=0.3))
     incentive = RentalPriceIncentive(IncentiveConfig(), redis, {"hk": [rented_healthy]}, {H200: 4})
     assert (await incentive.calculate_executor_score(rented_healthy)).mining_score > 0
 
     result = await incentive.calculate_executor_score(
-        _idle_flagship(gpu_count=4, spec=None, is_rented=True, **exclusion)
+        _idle_full_8x(gpu_count=4, spec=None, is_rented=True, **exclusion)
     )
 
     assert result.mining_score == 0
@@ -397,7 +395,7 @@ async def test_a_rented_excluded_node_scores_zero(exclusion):
 @pytest.mark.asyncio
 async def test_an_excluded_node_with_a_model_the_validator_does_not_know_scores_zero():
     # get_base_model_for_gpu raises on an unknown model; the exclusion is its reason, not a crash
-    result = await _incentive().calculate_executor_score(_idle_flagship(gpu_model="NVIDIA FAKE 9000", is_spot=True))
+    result = await _incentive().calculate_executor_score(_idle_full_8x(gpu_model="NVIDIA FAKE 9000", is_spot=True))
 
     assert _codes(result) == ["spot_tier"]
     assert result.mining_score == 0
@@ -408,7 +406,7 @@ async def test_an_excluded_node_with_a_model_the_validator_does_not_know_scores_
 
 
 def _rented(**overrides) -> JobResult:
-    return _idle_flagship(
+    return _idle_full_8x(
         gpu_count=4, spec=None, is_rented=True, rental_created_at=datetime(2030, 1, 1), **overrides
     )
 
@@ -450,9 +448,21 @@ async def test_a_rented_node_with_confirmed_sysbox_has_no_reason(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_idle_node_without_sysbox_keeps_only_the_idle_reason(monkeypatch):
     monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 1)
-    idle = _idle_flagship(gpu_count=4, spec=None, sysbox_runtime=False)
+    idle = _idle_full_8x(gpu_count=4, spec=None, sysbox_runtime=False)
 
     result = await _score_one_cycle(idle)
 
     # unchanged: the idle reasons only, never the rented one
     assert _codes(result) == ["no_unrented_capacity_for_gpu_count", "sysbox_not_enabled"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_rented", [False, True])
+async def test_a_node_in_a_maintenance_window_earns_nothing_rented_or_not(is_rented):
+    result = await _incentive().calculate_executor_score(
+        _idle_full_8x(gpu_count=4, is_rented=is_rented, is_in_maintenance=True)
+    )
+
+    assert _codes(result)[0] == "provider_maintenance"
+    assert result.mining_score == 0
+    assert result.eligible_for_rental_share is False

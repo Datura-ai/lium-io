@@ -27,7 +27,6 @@ jobs:
           cd neurons/validators
           bash ./docker_build.sh
           bash ./docker_runner_build.sh
-          docker build -f Dockerfile.preflight -t "daturaai/lium-validator:$TAG" .
 
       - name: Log in to Docker Hub (OIDC, no stored token)
         uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
@@ -43,5 +42,3 @@ jobs:
         run: |
           docker push "daturaai/compute-subnet-validator:$TAG"
           docker push "daturaai/compute-subnet-validator-runner:$TAG"
-          # last, so a missing Docker Hub scope cannot block the validator images
-          docker push "daturaai/lium-validator:$TAG"
