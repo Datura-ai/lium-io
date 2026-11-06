@@ -14,8 +14,16 @@ ensure_updater() {
     updater=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=watchtower 2>/dev/null) || return 0
     case "$updater" in "" | *[[:space:]]*) return 0 ;; esac
     current=$(docker inspect --format '{{.Config.Image}}' "$updater" 2>/dev/null) || return 0
-    # a dev stack runs the -staging build of the same updater (docker-compose.dev.yml)
-    case "$current" in *-staging) want="$UPDATER_IMAGE-staging" ;; *) want="$UPDATER_IMAGE" ;; esac
+    # A dev stack runs the -staging build of the same updater (docker-compose.dev.yml). A dev stack still on an
+    # older updater is told apart by the runner's own image, which that updater pulled by its `dev` tag.
+    case "$current" in
+        *-staging) want="$UPDATER_IMAGE-staging" ;;
+        daturaai/lium-watchtower:*) want="$UPDATER_IMAGE" ;;
+        *) case "$(docker inspect --format '{{.Config.Image}}' "$HOSTNAME" 2>/dev/null)" in
+               *:dev | *-dev | *-dev:* | *-dev@*) want="$UPDATER_IMAGE-staging" ;;
+               *) want="$UPDATER_IMAGE" ;;
+           esac ;;
+    esac
     [ "$current" != "$want" ] || return 0
     name=$(docker inspect --format '{{.Name}}' "$updater" 2>/dev/null) || return 0
     name=${name#/}

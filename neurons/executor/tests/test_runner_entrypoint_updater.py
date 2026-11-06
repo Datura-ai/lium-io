@@ -30,6 +30,7 @@ DOCKER_STUB = textwrap.dedent(
         *com.docker.compose.project\\"}}\\ runnerhost) echo "${STUB_PROJECT-executor}" ;;
         "ps --all --quiet --filter label=com.docker.compose.project="*) echo "${STUB_UPDATER-wt1}" ;;
         "inspect --format {{.Config.Image}} wt1") echo "$STUB_UPDATER_IMAGE" ;;
+        "inspect --format {{.Config.Image}} runnerhost") echo "${STUB_RUNNER_IMAGE:-daturaai/compute-subnet-executor-runner:latest}" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
         "inspect --format {{range "*" wt1") printf '%s\\n' com.docker.compose.config-hash=abc \\
             com.docker.compose.oneoff=False com.docker.compose.project=executor \\
@@ -89,6 +90,20 @@ def test_an_old_updater_is_replaced_before_the_stack_starts(tmp_path, script, ol
     assert "rm --force wt1" in calls
     assert calls.index(updater_run(calls)[0]) < calls.index("compose up --pull always --detach --wait --force-recreate")
     assert f"Updater replaced: executor-watchtower-1 now runs {new}" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "runner_image, want",
+    [
+        ("daturaai/compute-subnet-executor-runner:dev", "daturaai/lium-watchtower:1.2.0-staging"),
+        ("daturaai/compute-subnet-executor-runner-dev:feature", "daturaai/lium-watchtower:1.2.0-staging"),
+        ("daturaai/compute-subnet-executor-runner:latest", "daturaai/lium-watchtower:1.2.0"),
+    ],
+)
+def test_an_old_updater_on_a_dev_stack_gets_the_staging_updater(tmp_path, runner_image, want):
+    _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="nickfedor/watchtower", STUB_RUNNER_IMAGE=runner_image)
+
+    assert updater_run(calls)[0].endswith(f" {want}")
 
 
 @pytest.mark.parametrize(
