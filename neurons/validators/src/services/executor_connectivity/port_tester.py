@@ -17,7 +17,7 @@ PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 # DAH-5888: every node port-checks in the same few minutes of a cycle, and ~9k probes in flight held the event
 # loop at 99%, stretching a 0.2 s probe to 3-4 s. One cap for the whole process; a probe takes its slot before its
 # timeouts start, so time queued for a slot is never counted as a dead port
-MAX_CONCURRENT_PROBES = 1024  # peak ~170 failed probes/s hold a slot 3 s each; leaves room for the live ones
+MAX_CONCURRENT_PROBES = 2048  # 2 h of prod logs replayed: the longest slot wait is 6.4 s, and a fallback container lives 10 s
 _probe_slots = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
 

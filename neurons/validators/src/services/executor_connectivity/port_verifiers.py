@@ -143,12 +143,12 @@ class BatchVerifier:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
         sample = random.sample(ports, min(EXTERNAL_PROBE_SAMPLE, len(ports))) if self.external_probe else []
-        outside_started = asyncio.get_running_loop().time()
+        outside_stage_started = asyncio.get_running_loop().time()
         reached, first_round = await self._outside_reading(sample, token, ssh_client, host, log_ctx, start_watch)
         if sample:
             # DAH-5888: the outside stage's share of the 60 s attempt, measured in Loki before and after the probe cap
-            outside_sec = asyncio.get_running_loop().time() - outside_started
-            logger.info(_m(f"outside stage took {outside_sec:.1f}s", extra=get_extra_info(log_ctx)))
+            outside_stage_sec = asyncio.get_running_loop().time() - outside_stage_started
+            logger.info(_m(f"outside stage took {outside_stage_sec:.1f}s", extra=get_extra_info(log_ctx)))
         sampled_ok = [p for p in sample if p in (reached or []) or p in first_round]
         ports_left = [p for p in ports if p not in sampled_ok]
         external_blocked = reached == [] and all(p in first_round for p in sample)
