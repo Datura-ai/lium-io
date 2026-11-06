@@ -235,6 +235,7 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
         25536,
     )
     assert (what["listing_check"], what["port_range"]) == ("INSUFFICIENT_PORTS", DECLARED_RANGE)
+    assert count_result.event.remediation.startswith(f"2 renting ports answered, {MIN_PORT_COUNT} required.")
 
 
 @pytest.mark.asyncio

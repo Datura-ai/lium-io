@@ -403,6 +403,7 @@ async def test_verifyx_success_ema_below_threshold_fails_check(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(55.0)
+    assert result.event.remediation.startswith("Average download speed 55.0 Mbps, 100 Mbps required.")
 
 
 @pytest.mark.asyncio

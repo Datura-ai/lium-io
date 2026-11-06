@@ -90,6 +90,7 @@ def split_ports_event(
             **(what or {}),
         },
         remediation=(
+            f"{port_count} renting ports answered, {required} required. "
             f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
             f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
             "then run `docker compose restart executor-runner` in neurons/executor. Edit .env with nano: "
@@ -231,7 +232,7 @@ class PortCountCheck:
                     "the validator retries every cycle; a host reboot frees them at once."
                 )
                 if orphaned
-                else None,
+                else f"{port_count} renting ports answered, {MIN_PORT_COUNT} required. {Msg.INSUFFICIENT_PORTS.remediation}",
             )
             return CheckResult(
                 passed=False,

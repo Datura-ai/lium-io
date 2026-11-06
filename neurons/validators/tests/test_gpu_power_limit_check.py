@@ -333,3 +333,12 @@ async def test_an_unreadable_power_limit_under_a_lium_filler_passes(context_fact
     result = await GpuPowerLimitCheck().run(ctx)
 
     assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_low_power_limit_names_each_gpu_measured_and_required(context_factory, read_records_mock) -> None:
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.event.remediation.startswith("GPU 0: 105 W limit, default 350 W (30%); required at least 90%")

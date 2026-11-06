@@ -332,3 +332,19 @@ async def test_a_zero_floor_asks_no_disk_of_a_split(context_factory, monkeypatch
     assert result.passed is True
     split = result.updates["state"].specs["split_disk"]
     assert split["listable_split_count"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "specs, measured",
+    [
+        (_disk(95, 500), f"Disk 95% full, at most {MAX_DISK_UTILIZATION_PERCENT}% allowed."),
+        (_disk(50, 12.34), f"12.3 GB free, {settings.MIN_FREE_DISK_GB} GB required."),
+    ],
+)
+async def test_a_failed_disk_floor_names_the_measured_and_required_value(context_factory, specs, measured):
+    ctx = context_factory(state=build_state(specs=specs))
+
+    result = await DiskSpaceCheck().run(ctx)
+
+    assert result.event.remediation.startswith(measured)

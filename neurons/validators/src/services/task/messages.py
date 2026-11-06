@@ -1327,8 +1327,9 @@ class TenantEnforcementMessages:
         category="transport",
         impact="No verdict for this cycle - pod state unknown",
         remediation=(
-            "Transient SSH transport failure (network blip, conntrack flush). "
-            "Persistent unreachability is handled by the stale-executor sweep."
+            "The validator's SSH session to the node dropped mid-check (`transport_error` names how), so this "
+            "cycle has no verdict and the next one retries. If it repeats, check that the node's SSH port answers "
+            "from outside and that the executor container is running."
         ),
     )
     GPU_OUTSIDE_TENANT = MessageTemplate(
@@ -1560,7 +1561,10 @@ class PortCountMessages:
         severity="warning",
         category="runtime",
         impact="Score set to 0",
-        remediation="Increase port range or check port mappings configuration.",
+        remediation=(
+            "Widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS so enough renting ports answer from outside, "
+            "then run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
 
 
@@ -2239,7 +2243,10 @@ class RentalVerificationMessages:
         severity="error",
         category="policy",
         impact="Validation halted",
-        remediation="Check executor health with backend or review rental status",
+        remediation=(
+            "The rental check could not confirm this node; `error` in this event names what failed. If it "
+            "repeats, run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
     # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
     GPU_LIST_EMPTY = MessageTemplate(

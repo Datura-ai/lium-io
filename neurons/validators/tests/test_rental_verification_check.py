@@ -130,6 +130,7 @@ async def test_rental_verification_no_ports():
     assert result.passed is False
     assert result.event.reason_code == Msg.FAILED.reason
     assert "No verified ports available" in result.event.what_we_saw["error"]
+    assert result.event.remediation.startswith("No renting port answered the validator from outside.")
     # Should not call API when no ports
     assert backend_client.called_with is None
 
