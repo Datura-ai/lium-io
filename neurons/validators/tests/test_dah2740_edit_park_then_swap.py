@@ -21,6 +21,7 @@ from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _s
 
 from core.docker_utils import DockerCommand
 from core.utils import retry_ssh_command
+from services import docker_service
 from services.docker_service import (
     EDIT_PARKED_SUFFIX,
     DockerService,
@@ -1275,18 +1276,20 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
 
 
 @pytest.mark.parametrize(
-    ("created_ago", "store", "kept"),
+    ("created_ago", "store", "kept", "started_ago"),
     [
-        (0, "overlay2", False),  # written by the image's startup, before the first mount: not the renter's
-        (3600, "overlay2", True),  # written an hour after creation: an unmounted restart, the renter's
-        (0, "containerd", False),  # no UpperDir in inspect: the running container's root mount names it
-        (3600, "containerd", True),
-        (0, "given", False),  # stopped on the containerd store: the upper dir the running read used
-        (0, "none", True),  # no upper dir anywhere: docker diff decides, and lists the startup file
-        (0, "kept", True),  # a copy already kept: the age bound never releases it, only docker diff decides
+        (0, "overlay2", False, None),  # written by the image's startup, before the first mount: not the renter's
+        (3600, "overlay2", True, None),  # written an hour after creation: an unmounted restart, the renter's
+        (3600, "overlay2", False, 0),  # just after a start the validator made and remounted: its entrypoint
+        (3600, "overlay2", True, 3600),  # long after the validator's last start: an unmounted restart by Docker
+        (0, "containerd", False, None),  # no UpperDir in inspect: the running container's root mount names it
+        (3600, "containerd", True, None),
+        (0, "given", False, None),  # stopped on the containerd store: the upper dir the running read used
+        (0, "none", True, None),  # no upper dir anywhere: docker diff decides, and lists the startup file
+        (0, "kept", True, None),  # a copy already kept: the age bound never releases it, only docker diff decides
     ],
 )
-def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, store, kept):
+def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, monkeypatch, created_ago, store, kept, started_ago):
     # the SSH session is the executor's container: the host's files are only under /proc/1/root
     import subprocess
     import time
@@ -1308,18 +1311,41 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        f'case "$3" in *Created*) echo "{inspect}"; exit;; esac\n'
+        f'case "$3" in *Created*) echo "{inspect}"; exit;; *.Id*) echo cid; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         # docker diff lists the same file: only the upper-dir read can tell it is startup noise
         '[ "$1" = diff ] && { printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }\n'
         "exit 2\n"
     )
     docker.chmod(0o755)
+    starts = tmp_path / "starts"
+    starts.mkdir()
+    if started_ago is not None:
+        (starts / "cid").write_text(f"{int(time.time()) - started_ago}\n")
+    monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(starts))
     command = _layer_data_check("pod_x", "/root", host_upper if store == "given" else None, store != "kept")
     command = command.replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
     out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout.strip().splitlines()
     assert (out[-1:] != ["drop"]) is kept
     assert (f"upper {host_upper}" in out) is (store not in ("none", "kept"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remount", [True, False])
+async def test_the_validator_records_its_start_only_after_remounting(svc, remount):
+    # the layer read trusts a start's entrypoint writes only on a start the validator made and remounted
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=True)
+    ssh = Mock(run=AsyncMock())
+
+    await svc._restore_mount_and_sshd_after_start(
+        docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+        pod_id="x", default_extra={}, remount=remount,
+    )
+
+    recorded = [c for c in ssh.run.await_args_list if docker_service._VALIDATOR_STARTS_DIR in c.args[0]]
+    assert len(recorded) == remount
 
 
 @pytest.mark.asyncio

@@ -1724,9 +1724,11 @@ KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 _DROP_MARK = "drop"
 # The image's entrypoint writes under the plaintext path before the first gocryptfs mount: those layer files
 # carry an inode change time within this long of the container's creation and are not the renter's.
-# Not also after a restart: Docker's start time cannot tell our start from an unmounted restart by Docker.
+# A restart reruns the entrypoint too: only one the validator made and remounted counts, by the start time it
+# recorded under _VALIDATOR_STARTS_DIR (keyed by container id), never Docker's own, which an unmounted restart moves.
 # shortcut: a fixed bound, not the recorded first-mount time; a create whose mount came later keeps the container.
 _STARTUP_WRITE_SECONDS = 300
+_VALIDATOR_STARTS_DIR = "/var/tmp/lium_validator_starts"
 
 
 def _layer_data_check(
@@ -1763,7 +1765,10 @@ def _layer_data_check(
         f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && c=\"${{c#* }}\" && p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
         f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
         f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
+        f"&& {{ s=$(cat {_VALIDATOR_STARTS_DIR}/\"$(/usr/bin/docker inspect -f '{{{{.Id}}}}' {name})\" 2>/dev/null); "
+        "case \"$s\" in ''|*[!0-9]*) s=0;; esac; } "
         f"&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
+        f"! \\( -newerct \"@$s\" ! -newerct \"@$((s + {_STARTUP_WRITE_SECONDS}))\" \\) "
         "-print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
     return (
@@ -11925,6 +11930,15 @@ class DockerService:
                 log_extra=default_extra,
                 allow_init=False,
             )
+            # the start just made is ours and now remounted: the layer read counts its entrypoint writes as startup
+            name = shlex.quote(container_name)
+            with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):  # without it the read keeps, never drops
+                await ssh_client.run(
+                    f"i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name}) && mkdir -p "
+                    f"{_VALIDATOR_STARTS_DIR} && date -d \"${{i#* }}\" +%s > {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
+                    check=False,
+                    timeout=30,
+                )
         ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
             docker_client=docker_client,
             container_name=container_name,
