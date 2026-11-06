@@ -41,6 +41,7 @@ def test_a_rental_container_log_is_capped_so_stdout_cannot_fill_the_host_disk(sv
         (128, None, 128),  # host count unknown: the backend's value
         (None, 128, None),  # no per-pod cap (CVM) stays uncapped
         (2, 1, 2),  # a host too small for the reserve keeps the backend's value
+        (4, 2, 4 - settings.RENTAL_HOST_CPU_RESERVE),  # a low host count never cuts more than the reserve
     ],
 )
 def test_rental_cpu_count_leaves_the_host_reserve(cpu_count, host_cpus, expected):
@@ -51,6 +52,15 @@ def test_a_whole_host_rental_does_not_get_every_host_core(svc):  # noqa: F811
     run_spec = _run_spec(svc, 30, cpu_count=64, host_cpu_count=64)
 
     assert run_spec.cpu_count == 64 - settings.RENTAL_HOST_CPU_RESERVE
+
+
+def test_the_cvm_quote_broker_log_is_capped_like_a_rental():
+    from services.cvm_quote_broker import quote_broker_run_spec
+
+    assert quote_broker_run_spec().log_opts == {
+        "max-size": settings.RENTAL_LOG_MAX_SIZE,
+        "max-file": str(settings.RENTAL_LOG_MAX_FILE),
+    }
 
 
 def test_read_host_cpu_count_counts_the_processors(svc):  # noqa: F811

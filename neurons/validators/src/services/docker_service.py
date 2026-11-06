@@ -3885,8 +3885,10 @@ class DockerService:
         unread host count or no per-pod cap (None) keep the value as sent."""
         if not cpu_count or not host_cpu_count:
             return cpu_count
-        room = host_cpu_count - settings.RENTAL_HOST_CPU_RESERVE
-        return min(cpu_count, room) if room >= 1 else cpu_count
+        reserve = settings.RENTAL_HOST_CPU_RESERVE
+        room = host_cpu_count - reserve
+        # a host count read below the backend's never cuts the pod by more than the reserve
+        return max(cpu_count - reserve, min(cpu_count, room)) if room >= 1 else cpu_count
 
     async def _read_host_cpu_count(self, ssh_client) -> int | None:
         """The executor host's CPU count from /proc/cpuinfo, or None when unreadable. Best effort: a
