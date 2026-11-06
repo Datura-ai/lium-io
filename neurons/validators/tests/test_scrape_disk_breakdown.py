@@ -779,6 +779,18 @@ def test_a_containerd_root_flag_does_not_skip_a_config_that_moves_the_snapshots(
         scrape["containerd_store_root"](_SNAPSHOTTER_INFO, _OVERLAYFS)
 
 
+def test_a_containerd_whose_explicit_config_is_gone_is_unknown(scrape: dict, monkeypatch) -> None:
+    # started with --config, then the file deleted: the daemon still runs on what it loaded, never the built-in folder
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["run_cmd"] = _no_ctr
+    scrape["running_containerd_argv"] = lambda address: ["containerd", "--config=/etc/containerd/custom.toml"]
+    scrape["open"] = _containerd_config(None)
+    _stub_filesystem(scrape, monkeypatch, host_dirs={_SNAPSHOTS}, usage_by_path={_SNAPSHOTS: _BIG})
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["containerd_store_root"](_SNAPSHOTTER_INFO, _OVERLAYFS)
+
+
 def _proc(scrape: dict, monkeypatch, processes: dict, namespaces: dict, configs: dict | None = None) -> None:
     """/proc with these pid -> argv, pid -> mount namespace links (a pid left out cannot be read), host path -> config."""
     cmdlines = {f"/proc/{pid}/cmdline": "\0".join(argv).encode() + b"\0" for pid, argv in processes.items()}

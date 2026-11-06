@@ -562,7 +562,11 @@ resolve_disk_dir() {
         # none on Docker's socket: the built-in folder may be a leftover of a containerd that is not Docker's
         [ "${#CTRD_ARGV[@]}" -gt 0 ] || return 1
         # read first: a snapshotter root_path or imports in the config still move the store under a --root
-        config=$(ctrd_flag config c "${CTRD_ARGV[@]}") || config=/etc/containerd/config.toml
+        if config=$(ctrd_flag config c "${CTRD_ARGV[@]}"); then
+            [ -f "$(host_path "$config")" ] || return 1   # its --config file is gone: the daemon keeps what it loaded
+        else
+            config=/etc/containerd/config.toml
+        fi
         ctrd_config_moves_root "$config" && return 1
         if flag_root=$(ctrd_flag root "" "${CTRD_ARGV[@]}"); then
             [ -n "$flag_root" ] || return 1

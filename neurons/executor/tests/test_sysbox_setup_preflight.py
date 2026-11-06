@@ -555,6 +555,8 @@ def test_a_host_containerd_whose_config_serves_another_address_is_not_read_as_do
         {f"{SNAPSHOTS}/.keep": ""},
         # the only one on Docker's socket is a rental's, in its own mount namespace
         {f"{SNAPSHOTS}/.keep": "", **_containerd_process(mnt="mnt:[7]")},
+        # started with --config, then the file deleted: the daemon still runs on what it loaded
+        {f"{SNAPSHOTS}/.keep": "", **_containerd_process("--config=/etc/containerd/custom.toml")},
     ],
 )
 def test_a_host_without_ctr_reads_the_running_containerds_flags_or_skips(tmp_path, files):

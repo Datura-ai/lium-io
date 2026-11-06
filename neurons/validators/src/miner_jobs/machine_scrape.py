@@ -962,7 +962,7 @@ def containerd_store_root(info, plugin):
         if argv is None:  # the built-in folder may be a leftover of a containerd that is not Docker's
             raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no host containerd serves {address}")
         # read first: a snapshotter root_path or imports in the config still move the store under a --root
-        named = containerd_config_root(containerd_flag(argv, "config", "c") or "/etc/containerd/config.toml", data_root)
+        named = containerd_config_root(containerd_flag(argv, "config", "c"), data_root)
         flag_root = containerd_flag(argv, "root")
         if flag_root:
             root = host_realpath(flag_root.rstrip("/"))
@@ -988,13 +988,15 @@ def containerd_store_root(info, plugin):
 
 
 def containerd_config_root(config, data_root):
-    # the built-in root containerd's config names ("" when none); unknown when it names any other root, a snapshotter
-    # root_path or more config files, as a built-in folder may then be a leftover
+    # the built-in root containerd's config (its --config, else the default file) names ("" when none); unknown when
+    # it names any other root, a snapshotter root_path or more config files, as a built-in folder may then be a leftover
     try:
         # a stray non-UTF-8 byte must not end the read: the lines that matter are still parsed
-        with open(f"/proc/1/root{config}", errors="replace") as f:
+        with open(f"/proc/1/root{config or '/etc/containerd/config.toml'}", errors="replace") as f:
             text = f.read()
     except OSError:
+        if config is not None:  # its --config file is gone: the daemon still runs on what it loaded
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and containerd's --config cannot be read")
         return ""
     built_in, named = ("/var/lib/containerd", f"{data_root.rstrip('/')}/containerd/daemon"), ""
     for line in text.splitlines():
