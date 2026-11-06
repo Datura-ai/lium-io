@@ -11,7 +11,7 @@ from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
-from incentive.config import BASE_GPU_MAP
+from incentive.config import BASE_GPU_MAP, PARITY_PRICE_ALIASES
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
@@ -1428,6 +1428,12 @@ class Validator:
             for name, rate in rented_executors.secure_idle_rate_by_gpu_model.items()
             if name in BASE_GPU_MAP
         }
+        # a parity alias always takes its source's rate, as in the table (incentive/config.py)
+        for alias, source in PARITY_PRICE_ALIASES.items():
+            if source in rates:
+                rates[alias] = rates[source]
+            else:
+                rates.pop(alias, None)
         self.incentive.market_rental_prices_per_hour = rates
         logger.info(
             _m(

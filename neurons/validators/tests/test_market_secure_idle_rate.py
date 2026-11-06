@@ -92,3 +92,22 @@ def test_the_payout_log_names_the_rate_source() -> None:
     job.hourly_rate = 2.35
     line = MinerLogLine.rental_incentive_calculated("hk", job, 8, hourly_rate_source="market")
     assert line.fields["hourly_rate_source"] == "market"
+
+
+def test_a_parity_alias_follows_its_source_names_market_rate(config, monkeypatch) -> None:
+    fake = SimpleNamespace(incentive=config, default_extra={})  # the real BASE_GPU_MAP knows these names
+    reply = RentedExecutorsResponse.model_validate(
+        {
+            "executors": {},
+            "secure_idle_rate_by_gpu_model": {
+                "NVIDIA B300 SXM6 AC": 5.77,
+                "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 1.3,
+                "NVIDIA GB300": 9.0,  # sent apart from its source: parity wins
+            },
+        }
+    )
+    validator_module.Validator.apply_market_secure_rates(fake, reply)
+    rates = config.market_rental_prices_per_hour
+    assert rates["NVIDIA B300 SXM6 PC"] == rates["NVIDIA GB300"] == 5.77
+    assert rates["NVIDIA RTX PRO 6000 Blackwell Server Edition"] == 1.3
+    assert rates["NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"] == 1.3
