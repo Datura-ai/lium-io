@@ -464,74 +464,12 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
-CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (Docker names no containerd address, or that running containerd does not report its root). Without containerd's ctr CLI on the host, containerd must run with an explicit --root."
+CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (Docker names no containerd address, or that running containerd does not report its root). The check needs containerd's ctr CLI on the host to ask it: install containerd's ctr (the containerd package ships it)."
 
 ctrd_export_root() {
     # the root the running containerd ($1: its plugin listing) reports for plugin $2; its config files may name a
     # root it has not restarted onto
     awk -v want="$2" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF == 2 && $1 == "root" {print $2; exit}' <<<"$1"
-}
-
-ctrd_flag() {
-    # the value of flag -$1/--$1 (or short -$2/--$2) in the rest of the arguments, as "x" or "=x"; fails when absent
-    local name=$1 short=$2 arg n
-    shift 2
-    while [ $# -gt 0 ]; do
-        arg=$1
-        shift
-        for n in "$name" ${short:+"$short"}; do
-            case "$arg" in
-                -"$n"=* | --"$n"=*) echo "${arg#*=}"; return 0 ;;
-                -"$n" | --"$n") echo "${1:-}"; return 0 ;;
-            esac
-        done
-    done
-    return 1
-}
-
-ctrd_running_argv() {
-    # CTRD_ARGV: the command line of the host containerd process serving address $1; empty when none is visible.
-    # Fails when such a process's mount namespace cannot be read, when more than one host containerd serves $1,
-    # or when a containerd's address may be set in a file its config imports.
-    local f addr config argv ns host_ns
-    CTRD_ARGV=()
-    for f in "$(host_path /proc)"/[0-9]*/cmdline; do
-        [ -r "$f" ] || continue
-        mapfile -d '' -t argv 2>/dev/null <"$f" || continue
-        [ "${#argv[@]}" -gt 0 ] && [ "${argv[0]##*/}" = containerd ] || continue
-        # without --address the config's [grpc] address counts (Docker's own containerd sets it there)
-        config=$(ctrd_flag config c "${argv[@]}") || config=/etc/containerd/config.toml
-        # status 3: no address in the config but imports that may set one, so which daemon serves $1 is unknown
-        if ! addr=$(ctrd_flag address a "${argv[@]}"); then addr=$(ctrd_config_address "$config") || [ $? -ne 3 ] || return 1; fi
-        [ -n "$addr" ] || addr=/run/containerd/containerd.sock
-        [ "${addr#/var}" = "${1#/var}" ] || continue   # /var/run is /run
-        # a containerd inside a rental serves the same path in its own mount namespace: only the host's counts
-        ns=$(readlink "${f%/cmdline}/ns/mnt") && host_ns=$(readlink "$(host_path /proc)/1/ns/mnt") || return 1
-        [ "$ns" = "$host_ns" ] || continue
-        [ "${#CTRD_ARGV[@]}" -eq 0 ] || return 1
-        CTRD_ARGV=("${argv[@]}")
-    done
-    return 0
-}
-
-ctrd_config_address() {
-    # the [grpc] address containerd's config ($1) serves on; empty when it sets none or cannot be read.
-    # Status 3 when it sets none but imports more files, which may set it.
-    awk '{sub(/#.*/, "")} /^[ \t]*\[/ {s = $0; gsub(/[][ \t]/, "", s); next}
-        s == "" && match($0, /^[ \t]*imports[ \t]*=/) {v = $0; sub(/^[^=]*=/, "", v); gsub(/[ \t"\047]/, "", v); imp = v != "" && v != "[]"}
-        s == "grpc" && match($0, /^[ \t]*address[ \t]*=/) {v = $0; sub(/^[^=]*=[ \t]*/, "", v); gsub(/[ \t"\047]/, "", v); print v; done = 1; exit}
-        END {if (!done && imp) exit 3}' \
-        "$(host_path "$1")" 2>/dev/null
-}
-
-ctrd_config_moves_root() {
-    # containerd's config ($1) names a root other than its built-in one, a snapshotter root_path, or more config files
-    awk '{sub(/#.*/, "")} match($0, /^[ \t]*(root|root_path|imports)[ \t]*=/) {
-        key = $0; sub(/[ \t]*=.*/, "", key); gsub(/[ \t]/, "", key)
-        value = $0; sub(/^[^=]*=[ \t]*/, "", value); gsub(/[ \t"\047]/, "", value); sub(/\/$/, "", value)
-        if (value == "" || value == "[]" || (key == "root" && value == "/var/lib/containerd")) next
-        found = 1; exit
-    } END {exit !found}' "$(host_path "$1")" 2>/dev/null
 }
 
 resolve_disk_dir() {
@@ -553,28 +491,11 @@ resolve_disk_dir() {
     [ -n "$address" ] || return 1
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
-    if ! command -v ctr &>/dev/null; then
-        # no ctr (a Docker install without containerd's CLI): only the running daemon's own --root counts. A config file
-        # on disk may not be what it loaded (rewritten or deleted since), so without --root the store is unknown
-        local flag_root config
-        ctrd_running_argv "$address" || return 1
-        # none on Docker's socket: the built-in folder may be a leftover of a containerd that is not Docker's
-        [ "${#CTRD_ARGV[@]}" -gt 0 ] || return 1
-        flag_root=$(ctrd_flag root "" "${CTRD_ARGV[@]}") && [ -n "$flag_root" ] || return 1
-        # a snapshotter root_path or imports in the config still move the store under a --root
-        if config=$(ctrd_flag config c "${CTRD_ARGV[@]}"); then
-            [ -f "$(host_path "$config")" ] || return 1   # its --config file is gone: the daemon keeps what it loaded
-        else
-            config=/etc/containerd/config.toml
-        fi
-        ctrd_config_moves_root "$config" && return 1
-        DISK_DIR=$(host_path "${flag_root%/}/$plugin")
-        listing=""
-    else
-        # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it
-        listing=$(ctr --address "$address" plugins ls -d 2>/dev/null) || return 1
-        DISK_DIR=$(ctrd_export_root "$listing" "$plugin")
-    fi
+    # without ctr only files on disk are left, and they cannot show what the running daemon loaded: unknown
+    command -v ctr &>/dev/null || return 1
+    # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it
+    listing=$(ctr --address "$address" plugins ls -d 2>/dev/null) || return 1
+    DISK_DIR=$(ctrd_export_root "$listing" "$plugin")
     # a root that is not there is unknown, not the data-root
     [ -n "$DISK_DIR" ] && [ -d "$DISK_DIR" ] || return 1
     # pulled image layers land in the content store first, which may be another filesystem than the snapshots

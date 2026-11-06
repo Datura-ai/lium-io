@@ -223,15 +223,8 @@ def _host_root(tmp_path: Path, files: dict[str, str | None] | None = None) -> Pa
             continue
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, Link):
-            path.symlink_to(content)
-        else:
-            path.write_text(content)
+        path.write_text(content)
     return root
-
-
-class Link(str):
-    """A fixture entry that is a symlink to this target (as /proc/<pid>/ns/mnt reads)."""
 
 
 def _script_copy(tmp_path: Path) -> Path:
@@ -467,106 +460,31 @@ def test_an_unknown_containerd_root_is_skipped_not_read_as_the_leftover(tmp_path
     assert "SKIP" in out and "is below" not in out
 
 
-def _containerd_process(*flags: str, pid: int = 4242, mnt: str = "mnt:[1]") -> dict[str, str]:
-    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads, in mount namespace mnt
-    return {f"proc/{pid}/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0",
-            f"proc/{pid}/ns/mnt": Link(mnt), "proc/1/ns/mnt": Link("mnt:[1]")}
+def _containerd_process(*flags: str, pid: int = 4242) -> dict[str, str]:
+    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads
+    return {f"proc/{pid}/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0"}
 
 
 _NO_CTR_DISKS = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+_SMALL_STORE = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": ""}
 
 
 @pytest.mark.parametrize(
     "files",
     [
-        # the root moved: the built-in folder is a leftover and the 14 TB data-root says nothing of the store
-        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'root = "/small/containerd"\n'},
-        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": '  root_path = "/small/snapshots"\n'},
-        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'imports = ["/opt/containerd/*.toml"]\n'},
         {},  # no store at a built-in root
-        # no --root: the config file on disk may not be what the daemon loaded (rewritten or deleted since)
         {f"{SNAPSHOTS}/.keep": "", **_containerd_process()},
-        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'version = 2\nroot = "/var/lib/containerd"\n',
-         **_containerd_process()},
-        {f"{SNAPSHOTS}/.keep": "", "opt/ctrd.toml": 'root = "/var/lib/containerd"\n', **_containerd_process("-c", "/opt/ctrd.toml")},
+        # files on disk cannot show what the daemon loaded, even under --root: a config rewritten since it started
+        {**_SMALL_STORE, "etc/containerd/config.toml": 'version = 2\n', **_containerd_process("--root", "/small/containerd")},
+        # ... or the default config deleted since it started
+        {**_SMALL_STORE, **_containerd_process("--root", "/small/containerd")},
     ],
 )
-def test_a_host_without_ctr_whose_store_cannot_be_told_is_skipped_not_passed(tmp_path, files):
+def test_a_host_without_ctr_is_skipped_not_measured(tmp_path, files):
     rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
     assert rc == 0, out
-    assert "SKIP" in out and "PASS=1" not in out
-
-
-def test_a_host_without_ctr_is_measured_at_the_running_containerds_root_flag(tmp_path):
-    # --root on the command line moves the store; the stale built-in folder must not be measured instead
-    files = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
-             **_containerd_process("--root", "/small/containerd")}
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
-    assert f"/small/containerd/{_OVERLAYFS}" in out, out
-
-
-def test_a_rentals_containerd_on_the_same_socket_path_is_not_read_as_dockers(tmp_path):
-    # a rental's own containerd names a small --root in its own mount namespace; the host's has no flags
-    files = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
-             **_containerd_process("--root", "/small/containerd", pid=300, mnt="mnt:[7]"),
-             **_containerd_process("--root", "/var/lib/containerd")}
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
-    assert f"/small/containerd/{_OVERLAYFS}" not in out, out
-    assert SNAPSHOTS in out, out
-
-
-def test_a_host_containerd_whose_config_serves_another_address_is_not_read_as_dockers(tmp_path):
-    # Docker's own containerd sets its socket in its config, not on the command line: it is not the one on Docker's
-    files = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
-             "run/docker/containerd/containerd.toml": '[grpc]\n  address = "/run/docker/containerd/containerd.sock"\n',
-             **_containerd_process("--config", "/run/docker/containerd/containerd.toml", "--root", "/small/containerd",
-                                   pid=300),
-             **_containerd_process("--root", "/var/lib/containerd")}
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
-    assert f"/small/containerd/{_OVERLAYFS}" not in out, out
-    assert SNAPSHOTS in out, out
-
-
-@pytest.mark.parametrize(
-    "files",
-    [
-        {f"{SNAPSHOTS}/.keep": "", **_containerd_process("--root=/gone/containerd")},  # its --root holds no store
-        # --root names the big disk while the config's root_path puts the snapshots on a small one
-        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml":
-         '[plugins."io.containerd.snapshotter.v1.overlayfs"]\n  root_path = "/small/snapshots"\n',
-         **_containerd_process("--root", "/var/lib/containerd")},
-        # a containerd on Docker's socket whose mount namespace cannot be read
-        {f"{SNAPSHOTS}/.keep": "", "proc/4242/cmdline": "/usr/bin/containerd\0"},
-        # its --config moves the root while /etc/containerd/config.toml is at the default
-        {f"{SNAPSHOTS}/.keep": "", "opt/ctrd.toml": 'root = "/small/containerd"\n',
-         **_containerd_process("-c", "/opt/ctrd.toml")},
-        # two host containerds on Docker's socket: which one Docker talks to cannot be told
-        {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": "",
-         **_containerd_process("--root", "/small/containerd", pid=300), **_containerd_process()},
-        # no containerd process on Docker's socket at all: the built-in folder may be a leftover
-        {f"{SNAPSHOTS}/.keep": ""},
-        # the only one on Docker's socket is a rental's, in its own mount namespace
-        {f"{SNAPSHOTS}/.keep": "", **_containerd_process(mnt="mnt:[7]")},
-        # started with --config, then the file deleted: the daemon still runs on what it loaded
-        {f"{SNAPSHOTS}/.keep": "", **_containerd_process("--config=/etc/containerd/custom.toml")},
-    ],
-)
-def test_a_host_without_ctr_reads_the_running_containerds_flags_or_skips(tmp_path, files):
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
-    assert rc == 0, out
-    assert "SKIP" in out and "PASS=1" not in out
-
-
-def test_a_containerd_whose_address_may_be_imported_is_skipped(tmp_path):
-    # Docker's containerd sets its custom address in an imported file: which daemon serves it cannot be told
-    files = {f"{SNAPSHOTS}/.keep": "", "etc/containerd/custom.toml": 'imports = ["/etc/containerd/conf.d/*.toml"]\n',
-             **_containerd_process("--config", "/etc/containerd/custom.toml", "--root", "/small/containerd")}
-    env = {**_NO_CTR_DISKS, "STUB_CONTAINERD_ADDRESS": "/run/custom/containerd.sock"}
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files, without=("ctr",))
-    assert rc == 0, out
-    assert "SKIP" in out and "PASS=1" not in out
-    assert rc == 0, out
-    assert "SKIP" in out and "PASS=1" not in out
+    assert "SKIP" in out and "PASS=1" not in out and "/small/containerd" not in out
+    assert "install containerd's ctr" in out, out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────
