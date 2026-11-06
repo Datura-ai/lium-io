@@ -8,9 +8,10 @@ set -eu
 # TEE) is left alone. If the new updater cannot start, the old one is put back.
 UPDATER_IMAGE="daturaai/lium-watchtower:1.2.0"
 ensure_updater() {
-    [ -n "${HOSTNAME:-}" ] || return 0
-    project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$HOSTNAME" 2>/dev/null) || return 0
-    [ -n "$project" ] || return 0
+    # The runner is found by its compose service label, not $HOSTNAME: an updater that recreates the runner
+    # copies the old container's hostname, which then names no container.
+    project=$(docker ps --filter label=com.docker.compose.service=executor-runner --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null) || return 0
+    case "$project" in "" | *[[:space:]]*) return 0 ;; esac
     updater=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=watchtower 2>/dev/null) || return 0
     case "$updater" in "" | *[[:space:]]*) return 0 ;; esac
     current=$(docker inspect --format '{{.Config.Image}}' "$updater" 2>/dev/null) || return 0

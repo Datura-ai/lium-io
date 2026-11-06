@@ -27,7 +27,7 @@ DOCKER_STUB = textwrap.dedent(
     #!/bin/sh
     echo "$*" >> "$STUB_CALLS"
     case "$*" in
-        *com.docker.compose.project\\"}}\\ runnerhost) echo "${STUB_PROJECT-executor}" ;;
+        "ps --filter label=com.docker.compose.service="*-runner" --format "*) printf "${STUB_PROJECT-executor}" ;;
         "ps --all --quiet --filter label=com.docker.compose.project="*) echo "${STUB_UPDATER-wt1}" ;;
         "inspect --format {{.Config.Image}} wt1") echo "$STUB_UPDATER_IMAGE" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
@@ -56,7 +56,8 @@ def run(tmp_path, script, **env):
     calls.touch()
     result = subprocess.run(
         ["sh", script],
-        env={"PATH": str(bin_dir), "STUB_CALLS": str(calls), "HOSTNAME": "runnerhost", **env},
+        # a recreated runner keeps the hostname of the container it replaced, which names no container
+        env={"PATH": str(bin_dir), "STUB_CALLS": str(calls), "HOSTNAME": "0123456789ab", **env},
         capture_output=True,
         text=True,
         timeout=30,
@@ -116,7 +117,9 @@ def test_a_current_updater_is_left_alone(tmp_path, script, current):
     assert not any(c.startswith(("pull", "rename", "stop")) for c in calls)
 
 
-@pytest.mark.parametrize("env", [{"STUB_UPDATER": ""}, {"STUB_UPDATER": "wt1 wt2"}, {"STUB_PROJECT": ""}, {"HOSTNAME": ""}])
+@pytest.mark.parametrize(
+    "env", [{"STUB_UPDATER": ""}, {"STUB_UPDATER": "wt1 wt2"}, {"STUB_PROJECT": ""}, {"STUB_PROJECT": "executor\\nother"}]
+)
 def test_no_single_updater_in_the_runners_project_means_nothing_is_created(tmp_path, env):
     _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="nickfedor/watchtower", **env)
 
@@ -168,3 +171,12 @@ def test_only_the_dev_runner_build_sets_the_staging_updater():
     dockerfile = open(os.path.join(HERE, "..", "Dockerfile.runner")).read()
     assert build.count('--build-arg "updaterStaging=$([[ "$TAG" == dev ]] && echo 1 || true)"') == 2
     assert "ENV UPDATER_STAGING=${updaterStaging}" in dockerfile
+
+
+@pytest.mark.parametrize("script, service", [(EXECUTOR, "executor-runner"), (MINER, "miner-runner")])
+def test_the_runner_is_found_by_its_service_label_not_its_hostname(tmp_path, script, service):
+    _, calls = run(tmp_path, script, STUB_UPDATER_IMAGE="containrrr/watchtower:latest")
+
+    assert calls[0] == f'ps --filter label=com.docker.compose.service={service} --format {{{{.Label "com.docker.compose.project"}}}}'
+    assert not any("0123456789ab" in c for c in calls)
+    assert updater_run(calls)

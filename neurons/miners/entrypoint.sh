@@ -9,9 +9,10 @@ set -eu
 # Pinned by digest: the updater holds the host's Docker socket, so a re-pushed tag must not reach it.
 UPDATER_IMAGE="nickfedor/watchtower:1.24.0@sha256:e96976bcbeaf0a9adeddc9016a539c27a2245ef6bb7d3ca97ed106783350d387"
 ensure_updater() {
-    [ -n "${HOSTNAME:-}" ] || return 0
-    project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$HOSTNAME" 2>/dev/null) || return 0
-    [ -n "$project" ] || return 0
+    # The runner is found by its compose service label, not $HOSTNAME: an updater that recreates the runner
+    # copies the old container's hostname, which then names no container.
+    project=$(docker ps --filter label=com.docker.compose.service=miner-runner --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null) || return 0
+    case "$project" in "" | *[[:space:]]*) return 0 ;; esac
     updater=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=watchtower 2>/dev/null) || return 0
     case "$updater" in "" | *[[:space:]]*) return 0 ;; esac
     current=$(docker inspect --format '{{.Config.Image}}' "$updater" 2>/dev/null) || return 0
