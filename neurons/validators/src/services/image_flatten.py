@@ -360,8 +360,34 @@ def containerd_daemons_command() -> str:
     return f"/usr/bin/docker run --rm --pid=host {ALPINE_HELPER_IMAGE} sh -c {shlex.quote(each)}"
 
 
-# the running daemon's plugins and the roots they export: containerd reads its config only at startup
-CONTAINERD_PLUGINS_COMMAND = "/usr/bin/ctr plugins ls -d"
+_CONTAINERD_DEFAULT_ADDRESS = "/run/containerd/containerd.sock"
+# where containerd.io and older Docker bundles install ctr
+_CTR_PATHS = ("/usr/bin/ctr", "/usr/local/bin/ctr", "/usr/bin/docker-containerd-ctr")
+# the executor container has neither ctr nor the containerd socket; it runs privileged with pid: host, so PID 1's
+# mount namespace reaches the host's
+HOST_NSENTER = "nsenter -t 1 -m -- "
+
+
+def containerd_address(config: str | None) -> str | None:
+    """containerd's socket from its config text (None: no config file, so the default), or None when unreadable."""
+    if config is None:
+        return _CONTAINERD_DEFAULT_ADDRESS
+    try:
+        grpc = tomllib.loads(config).get("grpc") or {}
+    except tomllib.TOMLDecodeError:
+        return None
+    address = grpc.get("address") or _CONTAINERD_DEFAULT_ADDRESS if isinstance(grpc, dict) else None
+    return address if isinstance(address, str) and address.startswith("/") else None
+
+
+def containerd_plugins_command(address: str) -> str:
+    """Lists the running daemon's plugins and the roots they export, with the host's ctr on the host's socket
+    (exit 127 when the host has no ctr): containerd reads its config only at startup."""
+    script = (
+        f"for c in {' '.join(_CTR_PATHS)}; do "
+        f'[ -x "$c" ] && exec "$c" --address {shlex.quote(address)} plugins ls -d; done; exit 127'
+    )
+    return f"{HOST_NSENTER}sh -c {shlex.quote(script)}"
 
 
 def containerd_running_roots(listing: str) -> dict[str, str]:
@@ -449,11 +475,14 @@ async def containerd_store_on_data_root(ssh_client: asyncssh.SSHClientConnection
     read = await ssh_client.run(containerd_config_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
     if read.exit_status not in (0, _CONTAINERD_NO_CONFIG_EXIT):
         return False
-    root = containerd_root(str(read.stdout) if read.exit_status == 0 else None)
-    if root is None:
+    config = str(read.stdout) if read.exit_status == 0 else None
+    root, address = containerd_root(config), containerd_address(config)
+    if root is None or address is None:
         return False
     # a config rewritten since the daemon started names a root it does not use
-    plugins = await ssh_client.run(CONTAINERD_PLUGINS_COMMAND, check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
+    plugins = await ssh_client.run(
+        containerd_plugins_command(address), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
+    )
     if plugins.exit_status != 0 or not containerd_runs_on_root(str(plugins.stdout), root):
         return False
     same = await ssh_client.run(

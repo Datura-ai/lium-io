@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -66,7 +67,7 @@ def _ssh(
             return Mock(exit_status=0, stdout=f"{docker_version}\n")
         if "--pid=host" in command:
             return Mock(exit_status=0, stdout="/usr/bin/containerd \n")
-        if command == image_flatten.CONTAINERD_PLUGINS_COMMAND:
+        if command == image_flatten.containerd_plugins_command("/run/containerd/containerd.sock"):
             return Mock(exit_status=0, stdout=_plugins("/var/lib/containerd"))
         if command.startswith("/usr/bin/docker info --format '{{json .DriverStatus}}'"):
             return Mock(exit_status=same_disk_rc, stdout="version = 3\n")
@@ -197,7 +198,8 @@ def _same_disk_rc(
     )
     fake.chmod(0o755)
     async def run(command, check=False, timeout=None):
-        if command == image_flatten.CONTAINERD_PLUGINS_COMMAND:
+        # only the host-side command answers: run in the executor container, ctr is missing and this check refuses
+        if command == image_flatten.containerd_plugins_command(image_flatten.containerd_address(config)):
             live = running_root or image_flatten.containerd_root(config)
             return Mock(exit_status=0 if live != "unavailable" else 1, stdout=_plugins(live))
         done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", str(fake))], capture_output=True, text=True)
@@ -330,6 +332,27 @@ def test_a_config_rewritten_without_a_containerd_restart_is_refused(tmp_path, ru
     config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
     live = {"same": str(tmp_path / "ctrd"), "other": "/mnt/b/containerd", "unavailable": "unavailable"}[running]
     assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config, running_root=live) == 0) is expected
+
+
+def test_the_running_root_check_runs_the_hosts_ctr_on_the_configured_socket(tmp_path):
+    command = image_flatten.containerd_plugins_command("/run/containerd/containerd.sock")
+    # the executor container has no ctr and no containerd socket: the check must enter the host's mount namespace
+    assert command.startswith("nsenter -t 1 -m -- sh -c ")
+    script = command.removeprefix("nsenter -t 1 -m -- ")
+    log = tmp_path / "ctr.log"
+    for path in image_flatten._CTR_PATHS:
+        script = script.replace(path, str(tmp_path / path.lstrip("/")))
+    bundled = tmp_path / "usr/bin/docker-containerd-ctr"
+    bundled.parent.mkdir(parents=True)
+    run = lambda: subprocess.run(["sh", "-c", script], env={"PATH": os.environ["PATH"]}).returncode  # noqa: E731
+    assert run() == 127  # no ctr on the host: the caller refuses
+    bundled.write_text(f'#!/bin/sh\necho "$*" > {log}\n')
+    bundled.chmod(0o755)
+    assert run() == 0 and log.read_text() == "--address /run/containerd/containerd.sock plugins ls -d\n"
+    assert image_flatten.containerd_address(None) == "/run/containerd/containerd.sock"
+    assert image_flatten.containerd_address("version = 2\n[grpc]\n  address = '/run/c/c.sock'\n") == "/run/c/c.sock"
+    assert image_flatten.containerd_address("version = 3\n[grpc]\n  uid = 0\n") == "/run/containerd/containerd.sock"
+    assert image_flatten.containerd_address("grpc = 'x'\n") is None
 
 
 def test_a_snapshotter_root_path_elsewhere_refuses_the_flatten():
@@ -604,12 +627,18 @@ def test_counting_and_copying_share_one_deadline(tmp_path, monkeypatch, export_f
     # limit the waiters (flatten lock wait, flatten_wait_command) allow for
     monkeypatch.setattr(image_flatten, "FLATTEN_TIMEOUT_SECONDS", 2)
     argv = _flatten_script(tmp_path, export_sleep=1.5, export_factor=export_factor)
-    start = time.monotonic()
-    rc = subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode
-    elapsed = time.monotonic() - start
-    assert elapsed < 2.7
-    # one pass fits; the count plus the copy does not
-    assert rc == (98 if export_factor else 0)
+    # a logging timeout: the limit each pass gets, not wall-clock time, so a loaded host cannot flake it
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "timeout").write_text(f'#!/bin/sh\necho "$1" >> {tmp_path}/limits\nexec {shutil.which("timeout")} "$@"\n')
+    (shim / "timeout").chmod(0o755)
+    rc = subprocess.run(argv, capture_output=True, env={"PATH": f"{shim}:{os.environ['PATH']}"}).returncode
+    limits = [int(n) for n in (tmp_path / "limits").read_text().split()] if (tmp_path / "limits").exists() else []
+    if export_factor:
+        # the count used 1.5 of the 2 seconds: the copy gets at most what is left, or does not start
+        assert limits[0] == 2 and all(n <= 1 for n in limits[1:]) and rc in (0, 98)
+    else:
+        assert limits == [2, 2] and rc == 0
     assert "rm -fv cid1" in _calls(tmp_path)
 
 
