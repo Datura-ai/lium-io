@@ -477,14 +477,52 @@ def test_find_runner_container_is_not_scoped_without_a_compose_project(monkeypat
     }
 
 
-def test_find_runner_container_prefers_the_cvm_name_inside_a_compose_project(monkeypatch, tmp_path):
-    client = _client_with(None)
+@pytest.mark.parametrize(
+    "project, listed, expected, removed",
+    [
+        # scoped: the daemon answers only this project's runner; a foreign CVM-named container and a
+        # foreign `executor-runner-previous-*` are never looked up, so never returned or removed
+        ("executor", ["runner"], "runner", []),
+        # scoped, this project's own leftover beside its runner: cleared as before
+        ("executor", ["runner", "own_leftover"], "runner", ["own_leftover"]),
+        # unscoped (CVM / docker run): the CVM name wins, as before
+        (None, [], "cvm", []),
+        # unscoped, no CVM runner: the CVM leftover is found by name and restored, as before
+        (None, [], "cvm_leftover", []),
+    ],
+)
+def test_find_runner_container_name_lookups_only_outside_a_project(monkeypatch, tmp_path, project, listed, expected, removed):
+    runner = _fake_container()
+    own_leftover = _fake_container(name="executor-executor-runner-1-previous-abc123", status="exited")
     cvm = _fake_container(name="executor-runner")
-    _in_project(monkeypatch, tmp_path, client, "executor")
-    client.containers.get.side_effect = lambda reference: cvm
+    cvm_leftover = _fake_container(name="executor-runner-previous-abcd", status="exited")
+    by_name = {"runner": runner, "own_leftover": own_leftover, "cvm": cvm, "cvm_leftover": cvm_leftover}
+    client = _client_with(None)
+    _in_project(monkeypatch, tmp_path, client, project)
+    get = client.containers.get.side_effect
 
-    assert find_runner_container(client) is cvm
-    client.containers.list.assert_not_called()
+    def containers_get(reference):
+        if reference == "executor-runner" and expected == "cvm":
+            return cvm
+        if reference == "executor-runner":
+            raise docker.errors.NotFound("no CVM runner")
+        return get(reference)
+
+    client.containers.get.side_effect = containers_get
+
+    def containers_list(all=False, filters=None):
+        if "name" in (filters or {}):
+            return [cvm_leftover] if expected == "cvm_leftover" else []
+        return [by_name[n] for n in listed]
+
+    client.containers.list.side_effect = containers_list
+
+    assert find_runner_container(client) is by_name[expected]
+    if project:
+        assert not any("name" in (c.kwargs.get("filters") or {}) for c in client.containers.list.call_args_list)
+        assert not any(c.args == ("executor-runner",) for c in client.containers.get.call_args_list)
+    for name, container in by_name.items():
+        assert container.remove.called == (name in removed)
 
 
 def test_find_runner_container_prefers_the_cvm_name():

@@ -137,8 +137,8 @@ def own_compose_project(client: docker.DockerClient) -> Optional[str]:
 
 def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
     """
-    Find the executor-runner container: by the CVM name first, then by the compose service label,
-    within this watchtower's own compose project when it has one.
+    Find the executor-runner container. Inside a compose project: by the service label within that
+    project only. Outside one (the CVM stack, `docker run`): by the CVM name first, then by the label.
 
     A container named `<runner>-previous-<id>` is a leftover of an interrupted
     `recreate_container` (the daemon or this process died between the rename and the
@@ -156,15 +156,18 @@ def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
             more than one leftover and no live runner, or the listing failed. The caller
             must not pull or create anything in that state.
     """
-    container = find_container_by_name(client, EXECUTOR_RUNNER_CONTAINER_NAME)
-    if container is not None:
-        return container
+    # Inside a compose project only that project's labelled containers count: a container named
+    # `executor-runner` or `executor-runner-previous-*` on the same host can belong to another stack.
+    project = own_compose_project(client)
+    if not project:
+        container = find_container_by_name(client, EXECUTOR_RUNNER_CONTAINER_NAME)
+        if container is not None:
+            return container
     try:
-        project = own_compose_project(client)
         label = [EXECUTOR_RUNNER_SERVICE_LABEL, f"{COMPOSE_PROJECT_LABEL}={project}"] if project else EXECUTOR_RUNNER_SERVICE_LABEL
         matches = client.containers.list(all=True, filters={"label": label})
         # the CVM runner carries no compose label: its leftover is found by name
-        cvm_leftovers = client.containers.list(
+        cvm_leftovers = [] if project else client.containers.list(
             all=True, filters={"name": f"^/?{EXECUTOR_RUNNER_CONTAINER_NAME}{PREVIOUS_RUNNER_SUFFIX}"}
         )
     except Exception as e:

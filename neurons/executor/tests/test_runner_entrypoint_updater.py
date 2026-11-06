@@ -42,6 +42,8 @@ DOCKER_STUB = textwrap.dedent(
             com.docker.compose.oneoff=False com.docker.compose.project=executor \\
             com.docker.compose.service=watchtower org.opencontainers.image.title=watchtower ;;
         "pull "*) exit "${STUB_PULL_EXIT:-0}" ;;
+        "image inspect --format {{.Os}}/{{.Architecture}} "*) echo "${STUB_IMAGE_PLATFORM-linux/amd64}" ;;
+        "version --format {{.Server.Os}}/{{.Server.Arch}}") echo "linux/amd64" ;;
         "run --detach "*) exit "${STUB_RUN_EXIT:-0}" ;;
     esac
     exit 0
@@ -252,3 +254,14 @@ def test_a_replaced_updater_next_to_an_unrelated_container_is_left_alone(tmp_pat
     _, calls = run(tmp_path, script, STUB_UPDATERS=found, STUB_UPDATER_IMAGE="containrrr/watchtower:latest")
 
     assert not any(c.startswith(("start", "rm", "rename", "stop", "pull", "run --detach")) for c in calls)
+
+
+@pytest.mark.parametrize("script", [EXECUTOR, MINER])
+@pytest.mark.parametrize("platform", ["linux/arm64", ""])
+def test_an_updater_image_for_another_platform_is_not_installed(tmp_path, script, platform):
+    # an amd64-only updater on an arm64 host (or an image whose platform cannot be read) never starts there
+    result, calls = run(tmp_path, script, STUB_UPDATER_IMAGE="containrrr/watchtower:latest", STUB_IMAGE_PLATFORM=platform)
+
+    assert any(c.startswith("pull ") for c in calls)
+    assert not any(c.startswith(("rename ", "stop ", "run --detach ")) for c in calls)
+    assert "not built for this host's platform" in result.stdout

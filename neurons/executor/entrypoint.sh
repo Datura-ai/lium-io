@@ -68,6 +68,12 @@ LABELS
         echo "Updater kept: $want cannot be pulled; retrying at the next runner start."
         return 0
     fi
+    # An image built for another architecture (an amd64-only updater on an arm64 host) would never start.
+    if [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$want" 2>/dev/null)" != \
+        "$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/dev/null)" ]; then
+        echo "Updater kept: $want is not built for this host's platform; retrying at the next runner start."
+        return 0
+    fi
     docker rename "$updater" "$name-replaced" >/dev/null 2>&1 || return 0
     docker stop "$updater" >/dev/null 2>&1 || true
     if docker run --detach --name "$name" --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock \
