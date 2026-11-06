@@ -30,7 +30,6 @@ DOCKER_STUB = textwrap.dedent(
         *com.docker.compose.project\\"}}\\ runnerhost) echo "${STUB_PROJECT-executor}" ;;
         "ps --all --quiet --filter label=com.docker.compose.project="*) echo "${STUB_UPDATER-wt1}" ;;
         "inspect --format {{.Config.Image}} wt1") echo "$STUB_UPDATER_IMAGE" ;;
-        "inspect --format {{.Config.Image}} runnerhost") echo "${STUB_RUNNER_IMAGE:-daturaai/compute-subnet-executor-runner:latest}" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
         "inspect --format {{range "*" wt1") printf '%s\\n' com.docker.compose.config-hash=abc \\
             com.docker.compose.oneoff=False com.docker.compose.project=executor \\
@@ -93,15 +92,15 @@ def test_an_old_updater_is_replaced_before_the_stack_starts(tmp_path, script, ol
 
 
 @pytest.mark.parametrize(
-    "runner_image, want",
+    "staging, current, want",
     [
-        ("daturaai/compute-subnet-executor-runner:dev", "daturaai/lium-watchtower:1.2.0-staging"),
-        ("daturaai/compute-subnet-executor-runner-dev:feature", "daturaai/lium-watchtower:1.2.0-staging"),
-        ("daturaai/compute-subnet-executor-runner:latest", "daturaai/lium-watchtower:1.2.0"),
+        ("1", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.0-staging"),
+        ("1", "daturaai/lium-watchtower:1.2.0", "daturaai/lium-watchtower:1.2.0-staging"),
+        ("", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.0"),
     ],
 )
-def test_an_old_updater_on_a_dev_stack_gets_the_staging_updater(tmp_path, runner_image, want):
-    _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="nickfedor/watchtower", STUB_RUNNER_IMAGE=runner_image)
+def test_a_dev_runner_installs_the_staging_updater_whatever_its_stack_runs(tmp_path, staging, current, want):
+    _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE=current, UPDATER_STAGING=staging)
 
     assert updater_run(calls)[0].endswith(f" {want}")
 
@@ -162,3 +161,10 @@ def test_the_entrypoint_installs_the_updater_the_compose_file_pins(script, compo
     pinned = re.search(r"image: (\S*watchtower\S*)", open(compose).read()).group(1)
     entrypoint_image = re.search(r'UPDATER_IMAGE="([^"]+)"', open(script).read()).group(1)
     assert pinned in (entrypoint_image, f"{entrypoint_image}-staging")
+
+
+def test_only_the_dev_runner_build_sets_the_staging_updater():
+    build = open(os.path.join(HERE, "..", "docker_runner_build.sh")).read()
+    dockerfile = open(os.path.join(HERE, "..", "Dockerfile.runner")).read()
+    assert build.count('--build-arg "updaterStaging=$([[ "$TAG" == dev ]] && echo 1 || true)"') == 2
+    assert "ENV UPDATER_STAGING=${updaterStaging}" in dockerfile
