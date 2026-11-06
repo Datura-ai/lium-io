@@ -425,9 +425,9 @@ def test_the_peer_text_of_an_ssh_failure_is_capped() -> None:
         (AsyncMock(return_value=HostPolicyResult(attestation_digest="d", gpu_attestation_passed=True)), True),
         (AsyncMock(return_value=HostPolicyResult(attestation_digest="d", gpu_attestation_passed=False)), False),
         (AsyncMock(side_effect=AttestationError("quote does not echo the nonce")), False),
-        (AsyncMock(return_value=HostPolicyResult()), True),
+        (AsyncMock(return_value=HostPolicyResult()), None),
     ],
-    ids=["passed", "gpu-bad", "rejected", "no-tdx"],
+    ids=["passed", "gpu-bad", "rejected", "no-evidence"],
 )
 async def test_a_nonce_bound_attestation_records_its_outcome_for_the_miner(policy, passed) -> None:
     service = _task_service_that_reaches_the_ssh_connect()
@@ -448,4 +448,7 @@ async def test_a_nonce_bound_attestation_records_its_outcome_for_the_miner(polic
             attestation_nonce=AttestationNonce.issue(),
         )
 
-    service.attestation_service.record_attestation_event.assert_awaited_once_with(miner.miner_hotkey, passed)
+    if passed is None:
+        service.attestation_service.record_attestation_event.assert_not_awaited()
+    else:
+        service.attestation_service.record_attestation_event.assert_awaited_once_with(miner.miner_hotkey, passed)
