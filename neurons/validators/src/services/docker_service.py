@@ -167,6 +167,8 @@ from services.redis_service import (
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
+    PAUSED_BY_RECOVERY_PREFIX,
+    PAUSED_BY_RECOVERY_TTL_SECONDS,
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
@@ -2538,7 +2540,7 @@ _unmarked_recovery_stop_dao = UnmarkedRecoveryStopDao()
 _UNMARKED_RECOVERY_STOP_DB_TIMEOUT_SEC = 5
 # pod_id -> outcome of its last unmounted-pod stop, popped by the rented-machine check: only a confirmed stop defers
 _UNMOUNTED_STOP_OUTCOMES: dict[str, str] = {}
-# pods this process paused itself: only these are unpaused, never a pause the provider made
+# pods this process paused itself, until their Redis key is written: a pause made while Redis is down
 _PAUSED_BY_RECOVERY: set[str] = set()
 
 
@@ -12487,6 +12489,7 @@ class DockerService:
                 )
                 if getattr(paused, "exit_status", 1) == 0:
                     _PAUSED_BY_RECOVERY.add(pod_id)
+                    await self.paused_by_recovery(pod_id)  # written to Redis now if it is back
                 logger.error(
                     _m(
                         "POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD",
@@ -12520,8 +12523,24 @@ class DockerService:
         return getattr(probed, "exit_status", 1) == 0 and (probed.stdout or "").strip() == "true"
 
     async def paused_by_recovery(self, pod_id: str) -> bool:
-        # shortcut: in-process only, so a validator restart leaves our own pause in place for a person to lift
-        return pod_id in _PAUSED_BY_RECOVERY
+        """True when this validator paused the pod itself; Redis keeps that across a restart. Unknown (Redis down,
+        nothing in this process) is not ours: the pod is left alone."""
+        key = f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}"
+        try:
+            if pod_id in _PAUSED_BY_RECOVERY:
+                await asyncio.wait_for(
+                    self.redis_service.set(key, "1", ex=PAUSED_BY_RECOVERY_TTL_SECONDS),
+                    timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+                )
+                _PAUSED_BY_RECOVERY.discard(pod_id)
+                return True
+            return (
+                await asyncio.wait_for(self.redis_service.get(key), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
+                is not None
+            )
+        except Exception:
+            logger.warning(_m("POD_RECOVERY_PAUSE_RECORD_UNAVAILABLE", extra=get_extra_info({"pod_id": pod_id})))
+            return pod_id in _PAUSED_BY_RECOVERY
 
     async def resume_paused_unmounted_pod(
         self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
@@ -12541,6 +12560,13 @@ class DockerService:
             _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
             return False
         _PAUSED_BY_RECOVERY.discard(pod_id)
+        try:
+            await asyncio.wait_for(
+                self.redis_service.delete(f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}"),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+        except Exception:  # left to its expiry
+            logger.warning(_m("POD_RECOVERY_PAUSE_RECORD_UNAVAILABLE", extra=get_extra_info({"pod_id": pod_id})))
         return True
 
     async def _kill_orphaned_task_shim(

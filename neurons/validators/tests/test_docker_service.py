@@ -8716,6 +8716,48 @@ async def test_an_unmarked_stop_needs_its_db_record_before_the_park(docker_servi
 
 
 @pytest.mark.asyncio
+async def test_a_pod_paused_by_the_recovery_is_still_lifted_after_a_validator_restart(
+    docker_service, monkeypatch, unmarked_recovery_stop_db
+):
+    # lio#1827: a pause the restart forgot would leave the rented pod paused until a person lifts it
+    monkeypatch.setattr(unmarked_recovery_stop_db, "add", AsyncMock(side_effect=ConnectionError("DB down")))
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    monkeypatch.setattr(docker_service_module, "_PAUSED_BY_RECOVERY", set())
+    store: dict[str, str] = {}
+    redis_up = {"up": False}
+
+    async def redis_set(key, value, ex=None):
+        if not redis_up["up"]:
+            raise ConnectionError("Redis down")
+        store[key] = value
+
+    async def redis_get(key):
+        if not redis_up["up"]:
+            raise ConnectionError("Redis down")
+        return store.get(key)
+
+    docker_service.redis_service.set = AsyncMock(side_effect=redis_set)
+    docker_service.redis_service.get = AsyncMock(side_effect=redis_get)
+    docker_service.redis_service.delete = AsyncMock(side_effect=lambda key: store.pop(key, None))
+    ssh_client = AsyncMock()
+    ssh_client.run.return_value = Mock(exit_status=0, stdout="", stderr="")
+    assert await docker_service._mark_and_stop_unmounted_pod(ssh_client, "pod_pod-1", "pod-1") is False
+    docker_service_module._UNMOUNTED_STOP_OUTCOMES.pop("pod-1", None)
+    assert await docker_service.paused_by_recovery("pod-1")  # Redis down: this process still knows
+    redis_up["up"] = True
+    assert await docker_service.paused_by_recovery("pod-1")  # written to Redis now it is back
+
+    monkeypatch.setattr(docker_service_module, "_PAUSED_BY_RECOVERY", set())  # restart
+
+    assert await docker_service.paused_by_recovery("pod-1")
+    assert not await docker_service.paused_by_recovery("pod-2")  # a pause we never made
+    assert await docker_service.resume_paused_unmounted_pod(ssh_client, "pod_pod-1", "pod-1") is True
+    assert not await docker_service.paused_by_recovery("pod-1")
+    redis_up["up"] = False
+    assert not await docker_service.paused_by_recovery("pod-3")  # unknown: treated as not ours
+
+
+@pytest.mark.asyncio
 async def test_a_failed_record_delete_stays_pending_until_it_lands(docker_service, monkeypatch, unmarked_recovery_stop_db):
     # lio#1827 review 4484261750: the record leaves memory only with its DB row, so the next healthy check retries
     monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
