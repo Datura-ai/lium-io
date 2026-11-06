@@ -53,17 +53,18 @@ FLATTEN_NO_DISK_RENTER_SENTENCE = (
 
 
 class ImageFlattenNoDisk(RuntimeError):
-    def __init__(self, renter_sentence: str = FLATTEN_NO_DISK_RENTER_SENTENCE):
+    def __init__(self, renter_sentence: str = FLATTEN_NO_DISK_RENTER_SENTENCE, short_bytes: int | None = None):
         super().__init__(renter_sentence)
         self.renter_sentence = renter_sentence
+        self.short_bytes = short_bytes
 
 
 def flatten_no_disk_sentence(short_bytes: int) -> str:
-    """The refusal with the disk to give up: the copy fits once the order is that much smaller."""
+    """The refusal with the measured shortfall; a renter cannot size the pod disk, only pick the node."""
     gb = -(-short_bytes // 1024**3)
     return (
-        "not enough free disk on this node to prepare this image beside the disk you ordered; "
-        f"order at least {gb} GB less disk, choose another node or a smaller image"
+        f"not enough free disk on this node to prepare this image beside this pod's disk ({gb} GB short); "
+        f"choose a node with at least {gb} GB more free disk, or a smaller image"
     )
 
 
@@ -337,7 +338,8 @@ async def flatten_image_on_host(
     if result.exit_status == FLATTEN_NO_DISK_EXIT:
         avail = re.search(r"flatten avail=(\d+)", str(result.stderr or ""))
         if avail and int(avail.group(1)) < need_bytes:
-            raise ImageFlattenNoDisk(flatten_no_disk_sentence(need_bytes - int(avail.group(1))))
+            short = need_bytes - int(avail.group(1))
+            raise ImageFlattenNoDisk(flatten_no_disk_sentence(short), short_bytes=short)
         raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
     if result.exit_status != 0:
         raise RuntimeError(f"flatten exited {result.exit_status}: {str(result.stderr or '')[-2000:]}")

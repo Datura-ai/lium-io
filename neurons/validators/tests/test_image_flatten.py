@@ -94,7 +94,9 @@ async def test_the_no_disk_refusal_names_the_disk_to_give_up():
     ssh = _ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT, stderr=f"flatten avail={need - 5 * 1024**3}\n")
     with pytest.raises(ImageFlattenNoDisk) as exc:
         await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=reserved)
-    assert "order at least 5 GB less disk" in exc.value.renter_sentence
+    assert "(5 GB short); choose a node with at least 5 GB more free disk" in exc.value.renter_sentence
+    assert "order" not in exc.value.renter_sentence
+    assert exc.value.short_bytes == 5 * 1024**3
     assert 'echo "flatten avail=$avail" >&2' in ssh.run.await_args_list[-1].args[0]
 
 
