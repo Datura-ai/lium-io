@@ -48,6 +48,9 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # `NVIDIA GB300` is priced like B300 for now. A different card from the B300, so its own base
 # model and idle tier (it never fills the B300 cap), at the B300 rate and caps.
 RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]  # mirrors B300; revisit when GB300 market data exists
+# DAH-5508: the RTX 4090 48GB, its own model and idle tier; only reachable with RTX_4090_48GB_MODEL_ENABLED on.
+# Anchor = the backend's MACHINE_PRICES: RTX 4090 0.30 x the same-chip Quadro RTX 8000/6000 ratio (0.21/0.13), 0.48.
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.48
 
 # Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
 # price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.
@@ -136,7 +139,8 @@ RENTAL_PRICES_PER_HOUR.update({
 # `gpu_count`. Cap dilution is computed independently per `(base_model, bucket)`.
 #
 # An empty dict `{}` means the base model is known but not eligible for rental
-# subsidy (no buckets → no subsidy path). Since DAH-5070 every base model has buckets.
+# subsidy (no buckets → no subsidy path). Since DAH-5070 every base model has buckets,
+# except V100 (DAH-5611).
 #
 # The cap is expressed in GPUs (the per-bucket sum of executor `gpu_count`), so a
 # bucket cap equals `machines × gpus_per_machine`. Eligible families default to
@@ -205,7 +209,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "A10": {1: 10, 8: 64},
     "RTX A2000": {1: 10, 8: 64},
     "T4": {1: 10, 8: 64},
-    "V100": {1: 10, 8: 64},
+    "V100": {},  # DAH-5611: no idle pay; renters rent none and no filler can run on it
     "TITAN V": {1: 10, 8: 64},
     "RTX 3090 Ti": {1: 10, 8: 64},
     "RTX 3080 Ti": {1: 10, 8: 64},
@@ -240,6 +244,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "Tesla M40": {1: 10, 8: 64},
 }
 MAX_UNRENTED_GPUS_BY_TYPE["GB300"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B300"])  # mirrors B300; revisit when GB300 market data exists
+MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] = {1: 10, 8: 64}  # DAH-5508: the default tier (DAH-5070)
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
@@ -363,6 +368,7 @@ BASE_GPU_MAP = {
 }
 BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
 BASE_GPU_MAP["NVIDIA GB300"] = "GB300"  # own family, see RENTAL_PRICES_PER_HOUR
+BASE_GPU_MAP["NVIDIA GeForce RTX 4090 48GB"] = "RTX 4090 48GB"  # own family, never fills the RTX 4090 tier
 
 
 class IncentiveConfig(BaseModel):

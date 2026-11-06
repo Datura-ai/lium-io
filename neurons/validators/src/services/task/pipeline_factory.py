@@ -38,6 +38,7 @@ from .checks import (
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
+    SplitDiskCheck,
     DuplicateExecutorCheck,
     ExecutorImageCheck,
     FinalizeCheck,
@@ -49,6 +50,7 @@ from .checks import (
     GpuKernelCountCheck,
     GpuLossHoldCheck,
     GpuModelValidCheck,
+    GpuClockLockCheck,
     GpuPowerLimitCheck,
     GpuThermalThrottleCheck,
     GpuUsageCheck,
@@ -58,6 +60,7 @@ from .checks import (
     InspectorRentedCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
+    NodeAccountCheck,
     NvlinkFaultCheck,
     NvmlDigestCheck,
     PinnedMemoryProbeCheck,
@@ -71,6 +74,7 @@ from .checks import (
     RentalVerificationCheck,
     RentedGpuDropCheck,
     RentedPodNetworkCheck,
+    RentedPodOwnershipCheck,
     RentedPodResourcesCheck,
     RentedThroughputCheck,
     ScoreCheck,
@@ -86,6 +90,7 @@ from .checks import (
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
+    VerifyXColdRetryCheck,
 )
 from .pipeline import (
     Check,
@@ -302,6 +307,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # DAH-5729: before any work on the node, the node must be the registering account's
+                NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -318,6 +325,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
                 # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
                 # the published specs had no tdx_host_supported key and the backend stored false,
@@ -403,9 +412,12 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
+                # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
+                GpuClockLockCheck(),
                 GpuUsageCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
@@ -440,6 +452,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -492,6 +506,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # DAH-5729: before any work on the node, the node must be the registering account's
+                NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -500,6 +516,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
@@ -529,9 +547,12 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
+                # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
+                GpuClockLockCheck(),
                 GpuUsageCheck(),
                 LocalVerifyCheck(),
                 VerifyXCheck(),
@@ -560,6 +581,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -592,6 +615,8 @@ class PipelineFactory:
                 GpuThermalThrottleCheck(),
                 # a renter filling a node with no per-container disk limit fills the host (18 Oct): pure data, before the rented halt
                 StorageLimitCheck(),
+                # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
+                SplitDiskCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
                 GpuCountCheck(),
@@ -608,6 +633,7 @@ class PipelineFactory:
                 # DAH-4564: read-only docker inspect + /proc read — safe in dry run.
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),

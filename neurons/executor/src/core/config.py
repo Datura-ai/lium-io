@@ -122,6 +122,11 @@ class Settings(BaseSettings):
         env="DEFAULT_MINER_HOTKEY",
         default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
     )
+    # DAH-5296: a provider moved to Lium-held payouts is served under the Lium pool hotkey, so
+    # validators bind SSH keys and /verify intents to it. Empty = accept only the own hotkey.
+    LIUM_POOL_HOTKEY: str = Field(
+        env="LIUM_POOL_HOTKEY", default="5DksAY4DE3Xo9LCa4XvGM9T4Eq3Zi9jZjGXfNtuHfqMB24NM"
+    )
 
     RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
@@ -202,13 +207,11 @@ class Settings(BaseSettings):
     EXECUTOR_SSH_SOURCE_PIN: bool = Field(env="EXECUTOR_SSH_SOURCE_PIN", default=False)
 
     # liumd phase 1 (DAH-2834): `POST /verify` runs the verification suite locally from one
-    # validator-signed intent instead of 25–40 SSH commands. Off: the route answers 404 and
-    # `/version` does not advertise it, so validators keep the SSH path. On: only the signed,
-    # nonce'd, time-windowed intent of the pinned validator hotkey is accepted, and only through
-    # the validator's SSH tunnel to this process's loopback port (a network peer is refused).
-    # On a CVM the three settings reach the executor through dstacktee/app/init_script.sh's
-    # whitelist; a name missing there is dropped at CVM start.
-    EXECUTOR_LOCAL_VERIFY_ENABLED: bool = Field(env="EXECUTOR_LOCAL_VERIFY_ENABLED", default=False)
+    # validator-signed intent instead of 25–40 SSH commands; `/version` advertises it. Only the
+    # signed, nonce'd, time-windowed intent of the pinned validator hotkey is accepted, and only
+    # through the validator's SSH tunnel to this process's loopback port (a network peer is
+    # refused). On a CVM the settings below reach the executor through
+    # dstacktee/app/init_script.sh's whitelist; a name missing there is dropped at CVM start.
     # Longest a single /verify call may run before answering with what finished (seconds).
     LOCAL_VERIFY_MAX_DEADLINE_SECONDS: int = Field(env="LOCAL_VERIFY_MAX_DEADLINE_SECONDS", default=600)
     # How far the intent's issued_at may be from this host's clock (seconds, either way).

@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import asyncssh
 import pytest
+from core.config import settings
 from neurons.validators.src.core.docker_utils import ContainerDeathDiagnostics
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
@@ -68,17 +69,23 @@ class DummyBackendClient:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enabled, alias", [(True, "vloopback:v2"), (False, "vloopback")])
-async def test_rental_verification_selects_loopback_alias_from_v2_switch(context_factory, enabled, alias):
+@pytest.mark.parametrize(
+    "v2_enabled, v3_enabled, alias",
+    [(True, False, "vloopback:v2"), (True, True, "vloopback:v3"), (False, True, "vloopback")],
+    ids=["v2", "v3", "legacy-when-v2-switch-off"],
+)
+async def test_rental_verification_selects_loopback_alias_from_the_switches(
+    context_factory, monkeypatch, v2_enabled, v3_enabled, alias
+):
     # Arrange
     backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
     services = build_services(backend=backend, container_cleanup=ContainerCleanup())
     ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V2_ENABLED", v2_enabled)
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V3_ENABLED", v3_enabled)
 
     # Act
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as config:
-        config.LOOPBACK_PLUGIN_V2_ENABLED = enabled
-        result = await RentalVerificationCheck().run(ctx)
+    result = await RentalVerificationCheck().run(ctx)
 
     # Assert: the backend probes the plugin selected for new rental volumes by this validator.
     assert result.passed is True
@@ -765,6 +772,37 @@ async def test_rental_verification_flag_false_when_no_customer_rental():
     assert result.passed is True
     assert backend_client.called_with["rental_in_progress"] is False
 
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_flag_false_for_another_miners_rental():
+    """DAH-5548: the rental hint is this miner's node's rental only, as in TenantEnforcementCheck."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="other-miner-hotkey",
+                    executor_ip_address="127.0.0.1",
+                    executor_ip_port="2222",
+                    pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+                )
+            }
+        ),
+    )
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        await RentalVerificationCheck().run(ctx)
+
+    assert backend_client.called_with["rental_in_progress"] is False
 
 # ---------------------------------------------------------------- GPU-split nodes (DAH-2465 bundles)
 

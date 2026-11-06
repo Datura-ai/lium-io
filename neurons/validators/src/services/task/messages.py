@@ -627,6 +627,31 @@ class PostRentalGpuRecheckMessages:
     )
 
 
+class GpuClockLockMessages:
+    OK = MessageTemplate(
+        event="No stuck GPU clock lock",
+        reason="GPU_CLOCK_LOCK_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    RESET = MessageTemplate(
+        event="A GPU clock lock left by an ended rental was reset",
+        reason="GPU_CLOCK_LOCK_RESET",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    STUCK = MessageTemplate(
+        event="GPU clocks an ended rental locked could not be reset",
+        reason="GPU_CLOCK_LOCK_STUCK",
+        severity="warning",
+        category="env",
+        impact="Job skipped; score set to 0 until the clock reset succeeds",
+        remediation="Make sure nvidia-smi -i <uuid> -rgc succeeds on every GPU of the host.",
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",
@@ -807,7 +832,7 @@ class BannedProviderMessages:
         impact="Proceed",
     )
     # DAH-2662: a mount that is not procfs sits on /proc/driver/nvidia/gpus, so the kernel's GPU
-    # list cannot be read (the 2026-08-19 kit). Emitted only when KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # list cannot be read (the 2026-08-19 kit).
     KERNEL_GPU_VIEW_OVERLAID = MessageTemplate(
         event="A foreign mount covers the kernel's GPU list",
         reason="KERNEL_GPU_VIEW_OVERLAID",
@@ -1022,6 +1047,31 @@ class CollateralStatusMessages:
         severity="info",
         category="policy",
         impact="None; the last known collateral status is reported, or none deposited when there is none",
+    )
+
+
+class NodeAccountMessages:
+    MATCH = MessageTemplate(
+        event="Node is the one its account registered",
+        reason="NODE_ACCOUNT_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Node account check not applicable",
+        reason="NODE_ACCOUNT_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Node at this address is not the one its account registered",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Verification failed; verification cleared",
+        remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
     )
 
 
@@ -1424,6 +1474,20 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    SKIPPED_ALL_PORTS_RENTED = MessageTemplate(
+        event="Port verification skipped: the rental holds every port",
+        reason="PORT_CHECK_SKIPPED_ALL_PORTS_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed; the ports are checked again once one is free",
+    )
+    VERIFY_DEFERRED = MessageTemplate(
+        event="Port verification deferred: the Docker filesystem is backed up with a tenant's writes",
+        reason="PORT_VERIFY_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
 
 
 class DiskSpaceMessages:
@@ -1459,6 +1523,13 @@ class DiskSpaceMessages:
         impact="Score set to 0",
         remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
         "longer need, or grow the disk. The next validation reads the disk again.",
+    )
+    SPLIT_DISK = MessageTemplate(
+        event="Disk space per free split inspected",
+        reason="SPLIT_DISK_SIZED",
+        severity="info",
+        category="env",
+        impact="Proceed",
     )
 
 
@@ -1738,6 +1809,13 @@ class VerifyXMessages:
         category="env",
         impact="Proceed",
     )
+    COLD_RETRY = MessageTemplate(
+        event="VerifyX second download sample",
+        reason="VERIFYX_COLD_RETRY",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
     VERIFY_FAILED = _verify_failed(
         label="",
         reason_suffix="",
@@ -1783,7 +1861,8 @@ class VerifyXMessages:
         label="network speed too slow",
         reason_suffix="NETWORK_SPEED_TOO_SLOW",
         remediation=(
-            "EMA download speed is below the minimum threshold. "
+            "EMA download speed (100 Mbps) or upload speed (10 Mbps) is below the minimum "
+            "threshold. "
             "Improve the executor's network connection or wait for the EMA to recover "
             "once speeds improve."
         ),
@@ -2069,7 +2148,7 @@ class PinnedMemoryProbeMessages:
 
 class NvlinkFaultMessages:
     """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED fails
-    the node until a probe passes again."""
+    the node until a probe passes again; MISSING fails a full SXM board that reports no NVLink at all."""
 
     PROBE_OK = MessageTemplate(
         event="NVLink multicast probe passed",
@@ -2097,6 +2176,21 @@ class NvlinkFaultMessages:
             "Stop the workloads, reset the GPUs (`nvidia-smi -r`) and restart nvidia-fabricmanager, or "
             "reboot. Then restart the executor container (`docker restart executor-executor-1`) so it "
             "sees the GPUs again. If the errors come back, service the board."
+        ),
+    )
+    MISSING = MessageTemplate(
+        event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
+        reason="NVLINK_MISSING",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink works again",
+        remediation=(
+            "These GPUs ship only as SXM modules on an NVLink baseboard, but `nvidia-smi topo -m` shows "
+            "PCIe paths (PIX/NODE/SYS) instead of NV links between them, so multi-GPU jobs run over PCIe. "
+            "On an HGX board, start nvidia-fabricmanager (`systemctl enable --now nvidia-fabricmanager`, "
+            "same version as the driver), check `nvidia-smi nvlink -s`, then restart the executor container "
+            "(`docker restart executor-executor-1`). If the links stay down, service the board. H100 "
+            "modules on SXM-to-PCIe adapter boards never get this: they are listed as H100 PCIe."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2360,6 +2454,17 @@ class GpuKernelCountMessages:
         category="env",
         impact="Shadow observation only: the validation result was NOT changed",
     )
+    UNATTACHABLE = MessageTemplate(
+        event="A reported GPU cannot be attached to a container",
+        reason="GPU_KERNEL_UNATTACHABLE",
+        severity="error",
+        category="env",
+        impact="Validation failed; score set to 0",
+        remediation=(
+            "Every rent on the listed GPU fails. Restart the executor container, or reboot the host "
+            "if the GPU is still missing."
+        ),
+    )
     NOT_EVALUATED = MessageTemplate(
         event="Kernel GPU list not available; reported GPU count not evaluated",
         reason="GPU_KERNEL_COUNT_NOT_EVALUATED",
@@ -2507,13 +2612,6 @@ class CachedTemplateMessages:
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 
-    DISABLED = MessageTemplate(
-        event="Local verification disabled",
-        reason="LOCAL_VERIFY_DISABLED",
-        severity="info",
-        category="transport",
-        impact="None — every check runs over SSH as before",
-    )
     SKIPPED = MessageTemplate(
         event="Local verification skipped",
         reason="LOCAL_VERIFY_SKIPPED",
@@ -2527,7 +2625,7 @@ class LocalVerifyMessages:
         severity="info",
         category="transport",
         impact="None — the matmul and VerifyX run over SSH as before",
-        remediation="Update the executor image and set EXECUTOR_LOCAL_VERIFY_ENABLED=true to take the one-call path.",
+        remediation="Update the executor image to take the one-call path.",
     )
     FALLBACK = MessageTemplate(
         event="Local verification not used, SSH path taken",
@@ -2623,6 +2721,42 @@ class RentedPodNetworkMessages:
     )
 
 
+class RentedPodOwnershipMessages:
+    OK = MessageTemplate(
+        event="Rented pod files are owned inside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SHIFTED = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; root login and sudo fail inside the pod until its files are repaired",
+        remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
+        "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
+        "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
+        "(only ids inside the old range; keep setuid bits and file capabilities). Shut the host down "
+        "cleanly to avoid this.",
+    )
+    UNREAD = MessageTemplate(
+        event="Rented pod file ownership not read",
+        reason="RENTED_POD_OWNERSHIP_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented pod file ownership skipped: no running rental",
+        reason="RENTED_POD_OWNERSHIP_NOT_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 class GpuAttestationIdentityMessages:
     # DAH-4551: warning in shadow; fails the node under GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED.
     MISMATCH = MessageTemplate(
@@ -2660,6 +2794,16 @@ class GpuAttestationIdentityMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    # Fails the node only under CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; in shadow it is a log line.
+    CC_VBIOS_BELOW_MINIMUM = MessageTemplate(
+        event="GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing",
+        reason="CC_VBIOS_BELOW_MINIMUM",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 while the finding stands",
+        remediation="Pause new rentals and wait for running ones to end, since the update restarts the host. Then "
+        "update every GPU's VBIOS to at least NVIDIA's minimum for CC in R595 (B200 97.00.E4.00.xx, B300 97.10.64.00.xx).",
     )
     OK = MessageTemplate(
         event="GPU identity verified against NVIDIA's root",

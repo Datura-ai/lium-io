@@ -145,7 +145,7 @@ class ContextState:
     gpu_uuids: Optional[str] = None
     # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
     # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
-    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # attempted once per cycle. Bans match against these too.
     kernel_gpu_uuids: list[str] | None = None
     kernel_gpu_uuids_read_attempted: bool = False
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
@@ -165,6 +165,9 @@ class ContextState:
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
+    # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
+    # not measured; a consumer that keeps "last good ports" must not store them as fresh.
+    port_check_deferred: bool = False
     # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
     # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.
@@ -173,6 +176,11 @@ class ContextState:
     dind_probe_error: DindLogCause | None = None
     # the outside prober could not reach the ports: our filler's ports are behind the same firewall
     externally_unreachable: bool = False
+    # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
+    # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
+    host_runtime_fault: bool = False
+    # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
+    external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
@@ -195,6 +203,8 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
+    verifyx_cold_retry: Any = None
 
 
 class CheckResult(BaseModel):
@@ -281,6 +291,9 @@ class Context(BaseModel):
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
+    # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
+    # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
+    cc_vbios_passed: bool = True
     # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
     # rented-pod checks still run; the run still ends as that failure (_ended).
     gpu_fingerprint_passed: bool = True
@@ -290,6 +303,12 @@ class Context(BaseModel):
     # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
     # rented pod under enforcement.
     inspector_host_write_passed: bool = True
+    # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
+    # non-fatal on a live rental, so the score gate lives in calculate_scores.
+    kernel_gpu_view_passed: bool = True
+    # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_kernel_count_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -639,9 +658,13 @@ class Pipeline:
                 )
                 last_of_run = index == last_index and position == len(ran_checks) - 1
                 if failed or res.halt or last_of_run:
+                    # the failed event's own check: a composite check (the cold retry's disk judgement) fails
+                    # with another check's event, and the provider timeline names the step from this
                     res.event.what_we_saw.update(
                         summarize_steps(
-                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                            steps,
+                            elapsed_time_ms,
+                            failed_check_id=(res.event.check_id or chk.check_id) if failed else None,
                         )
                     )
 

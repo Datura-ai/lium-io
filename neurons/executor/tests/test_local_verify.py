@@ -8,10 +8,12 @@ publishing one host port of the renting range.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import sys
 import textwrap
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -151,7 +153,6 @@ def _app(validator_keypair, monkeypatch) -> FastAPI:
     monkeypatch.setattr(
         "dependencies.auth.VALIDATOR_HOTKEYS_SS58", {"current": validator_keypair.ss58_address}
     )
-    monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_ENABLED", True)
     monkeypatch.setattr(settings, "RENTING_PORT_RANGE", "40000-40009")
     # The configured miner and the shared portal hotkey are two different keys here, so the
     # "portal hotkey binds nothing" refusal is tested against a real difference, not conftest's.
@@ -238,6 +239,19 @@ def test_an_intent_for_another_miners_executor_is_401_and_not_burnt(client, vali
     assert client.post("/verify", json=_signed(body, validator_keypair)).status_code == 200
 
 
+def test_an_intent_for_the_pool_hotkey_runs(client, validator_keypair, monkeypatch):
+    """DAH-5296: a provider moved to Lium-held payouts is reached by the validator as the Lium
+    pool hotkey; its executor runs that intent too, and still refuses a stranger's."""
+    pool = Keypair.create_from_uri("//Pool").ss58_address
+    monkeypatch.setattr(settings, "LIUM_POOL_HOTKEY", pool)
+    steps = VerifySteps(inspector=True)
+    intent = _signed(_body(miner_hotkey=pool, steps=steps), validator_keypair)
+    assert client.post("/verify", json=intent).status_code == 200
+    stranger = Keypair.create_from_uri("//Stranger").ss58_address
+    refused = client.post("/verify", json=_signed(_body(miner_hotkey=stranger), validator_keypair))
+    assert refused.status_code == 401
+
+
 def test_replayed_nonce_is_refused(client, validator_keypair):
     intent = _signed(_body(steps=VerifySteps(inspector=True)), validator_keypair)
     assert client.post("/verify", json=intent).status_code == 200
@@ -245,3 +259,16 @@ def test_replayed_nonce_is_refused(client, validator_keypair):
     assert replay.status_code == 409 and "nonce" in replay.text
 
 
+
+
+def test_version_advertises_local_verify_and_its_port(client):
+    body = client.get("/version").json()
+
+    assert "local_verify/1" in body["capabilities"]
+    assert body["local_verify_port"] == settings.INTERNAL_PORT
+
+
+def test_a_script_runs_in_the_home_dir_like_an_ssh_session():
+    result = asyncio.run(lvs.run_script([sys.executable, "-c", "import os; print(os.getcwd())"], timeout=10))
+
+    assert result.stdout.strip() == str(Path.home())

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import shlex
@@ -17,20 +18,32 @@ from .capability import get_filler_only_container
 # The probe runs on the executor's own interpreter, standard library only, and ships over stdin the way
 # the scrape source does (DAH-2794): nothing to upload, nothing the miner has to update.
 PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "gpu_fault_probe.py"
-PROBE_SOURCE = PROBE_SOURCE_PATH.read_text()
+
+
+# read on first use, not at import
+@functools.cache
+def probe_source() -> str:
+    return PROBE_SOURCE_PATH.read_text()
+
+
 PROBE_JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
 # Measured on a healthy 1x RTX 4090 (driver 580): 5.3 s in-script, 6.6 s over SSH, 7 rounds on a 2 GB
 # working set. A hung card is caught INSIDE the probe: the workers share one wall-clock budget (--seconds
 # + 30 s + 5 s per extra GPU) and are drained together, so every card gets the whole budget and a verdict —
-# a hang in setup is an error (scored UNKNOWN), a hang in the kernels is a fault. This cap sits above the
-# largest budget (8 GPUs: 4 + 65 s) plus the parent's bounded tail after the drain (one reap grace, two NVML
-# snapshots in a fork with their own deadline, two dmesg reads: 47 s when everything hangs at once) —
+# a worker still running at the deadline is an error (scored UNKNOWN), one that crashes in its kernels is a
+# fault (on the post-rental recheck a hang in the kernels is a fault too). This cap sits above the device
+# count's fork (30 s poll + two 5 s joins), the largest budget (MAX_GPU_COUNT = 14
+# GPUs: 4 + 95 s) and the parent's bounded tail after the drain (one reap grace, two NVML snapshots in a fork
+# with their own deadline, two dmesg reads: 47 s when everything hangs at once): 186 s —
 # test_the_ssh_cap_sits_above_the_probes_own_largest_deadline adds it up — and only catches
 # an interpreter that never printed or an SSH channel that stalled;
 # the runner sets error_type "timeout" for any asyncio.TimeoutError around ssh.run, so that path cannot
 # tell a transport stall from a hung host and is scored UNKNOWN, like the other no-report outcomes.
-PROBE_TIMEOUT_SECONDS = 150
+PROBE_TIMEOUT_SECONDS = 195
 PROBE_SECONDS = 4
+# the probe's setup error for a card whose memory is taken (miner_jobs/gpu_fault_probe.py): the card is busy, a
+# renter's pod on a split node or another process, so the probe never started on it; not a silent card
+BUSY_VRAM_ERROR_PREFIX = "not enough free VRAM"
 OUTPUT_TAIL_CHARS = 800
 # the report is executor-controlled: bound what is copied into the event
 MAX_FAULT_LINES = 16
@@ -94,8 +107,11 @@ class GpuFaultProbeCheck:
             return CheckResult(passed=True, event=event)
 
         command = f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS}"
+        if self.enforce:
+            # the recheck after a rental: a card that hangs its kernels every cycle must not list again
+            command += " --hang-in-kernels-is-fault"
         run = await ctx.runner.run(
-            command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=PROBE_SOURCE
+            command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
         )
         report = _parse_report(run.stdout)
         what: dict[str, Any] = {
@@ -141,13 +157,16 @@ class GpuFaultProbeCheck:
             )
             return self._fault_verdict(ctx, what, error=error or "fault", report=report)
         what["error"] = _cap(report.get("error")) or f"probe status {_cap(status)!r}"
-        return self._no_verdict(ctx, what)
+        return self._no_verdict(ctx, what, counts_toward_streak=not _only_busy_vram(report))
 
-    def _no_verdict(self, ctx: Context, what: dict[str, Any]) -> CheckResult:
+    def _no_verdict(
+        self, ctx: Context, what: dict[str, Any], counts_toward_streak: bool = True
+    ) -> CheckResult:
         """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is logged, and under
         GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. An enforce run is a
-        second probe in the same cycle, so it does not count."""
-        if self.enforce:
+        second probe in the same cycle, and a card too busy to probe (counts_toward_streak=False) is not
+        a silent one, so neither counts: the streak is left as it was."""
+        if self.enforce or not counts_toward_streak:
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
@@ -190,6 +209,23 @@ class GpuFaultProbeCheck:
             what=what,
         )
         return CheckResult(passed=not enforce, event=event)
+
+
+def _only_busy_vram(report: dict[str, Any]) -> bool:
+    """True when every card that gave no verdict could not get the memory to start (a busy card): a healthy
+    node under a 3-day split rental ran 4 cycles of that (aa801f3e, 31 Oct-3 Nov)."""
+    devices = report.get("devices")
+    cards_without_verdict = (
+        [d for d in devices if isinstance(d, dict) and d.get("status") != "ok"]
+        if isinstance(devices, list)
+        else []
+    )
+    return bool(cards_without_verdict) and all(
+        d.get("status") == "error"
+        and isinstance(d.get("error"), str)
+        and d["error"].startswith(BUSY_VRAM_ERROR_PREFIX)
+        for d in cards_without_verdict
+    )
 
 
 def _parse_report(stdout: str) -> dict[str, Any] | None:
