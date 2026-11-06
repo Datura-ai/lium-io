@@ -251,6 +251,24 @@ async def test_a_resubmit_after_a_refused_submit_still_runs_the_miners_rental_ho
 
 
 @pytest.mark.asyncio
+async def test_a_create_waits_out_a_connect_nobody_answers_while_the_miner_redeploys(mocker, miner_service):
+    # 5 Nov 08:09Z: the stopped central miner's address answered no SYN for about 80 s; those creates timed out
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
+    miner_service._make_rest_request.side_effect = [aiohttp.ConnectionTimeoutError(), accepted]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    create_mock.assert_awaited_once()
+    calls = miner_service._make_rest_request.await_args_list
+    # it never reached the miner, so the resubmit still runs the rental hook
+    assert [c.kwargs["json_data"]["is_rental_request"] for c in calls] == [True, True]
+
+
+@pytest.mark.asyncio
 async def test_a_create_that_keeps_timing_out_names_the_exception_type(mocker, miner_service):
     # str(asyncio.TimeoutError()) is empty, so the logged error used to be blank
     executor_id = str(uuid4())
@@ -357,3 +375,34 @@ async def test_a_failed_report_under_the_new_gpu_uuid_does_not_hide_the_recovery
     )
     published = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
     assert [spec["executor_uuid"] for spec in published] == [node]
+
+
+# DAH-5510: the backend stops a moved pod's old container on the node it left
+
+
+@pytest.mark.asyncio
+async def test_a_stop_request_runs_the_docker_stop_and_returns_its_reply(mocker, miner_service):
+    from payload_models.payloads import ContainerStopRequest
+
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    stopped = Mock()
+    stop_mock = mocker.patch("services.miner_service.DockerService.stop_container", AsyncMock(return_value=stopped))
+    payload = ContainerStopRequest(
+        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="10.0.0.1", miner_port=8000,
+        pod_id=str(uuid4()), container_name="pod_old",
+    )
+
+    assert await miner_service._handle_container(payload) is stopped
+    assert stop_mock.await_args.args[0] is payload
+
+
+def test_a_failed_stop_request_is_reported_as_a_stop_failure(miner_service):
+    from payload_models.payloads import ContainerStopRequest, FailedContainerErrorTypes
+
+    payload = ContainerStopRequest(miner_hotkey="m", executor_id="e", pod_id="p", container_name="pod_p")
+
+    result = miner_service._handle_container_error(payload, "Error", FailedContainerErrorCodes.UnknownError)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerStopFailed

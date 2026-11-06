@@ -12,7 +12,11 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
-from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
+from services.gpu_spec_table import (
+    classify_gpu_model,
+    list_sxm_on_pcie_adapter_as_pcie,
+    reference_gpu_model,
+)
 from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
@@ -36,11 +40,17 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
         return specs
 
     canonical_details = [
-        {**detail, "name": normalize_gpu_model(detail.get("name"))}
+        {
+            **detail,
+            "name": classify_gpu_model(
+                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
+            ),
+        }
         if isinstance(detail, dict) and detail.get("name")
         else detail
         for detail in details
     ]
+    canonical_details = list_sxm_on_pcie_adapter_as_pcie(specs, canonical_details)
     if canonical_details == details:
         return specs
 
@@ -180,7 +190,9 @@ class ResultHandler:
         )
         filler_revenue_per_gpu_hour = (
             rented_data.get_filler_revenue_per_gpu_hour(
-                BASE_GPU_MAP.get(gpu_model or ""), gpu_count, settings.FILLER_REVENUE_MIN_GPU_HOURS
+                BASE_GPU_MAP.get(gpu_model or ""),
+                gpu_count,
+                settings.get_filler_revenue_min_gpu_hours(is_spot),
             )
             if rented_data
             else None
@@ -285,6 +297,7 @@ class ResultHandler:
             # DAH-3338: the whole list; MinerService.publish_machine_specs bounds the spec's copy
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
+            host_runtime_fault=context.state.host_runtime_fault,
         )
 
     @staticmethod
@@ -405,10 +418,12 @@ class ResultHandler:
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                 )
             else:
+                # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle
+                reanchor_uuids = (context.state.gpu_uuids or '') if context.gpu_reanchor else ''
                 await self.redis_service.set_verified_job_info(
                     miner_hotkey=miner_hotkey,
                     executor_id=executor_id,
-                    prev_info=verified_job_info,
+                    prev_info={**verified_job_info, GPU_ANCHOR_KEY: reanchor_uuids} if reanchor_uuids else verified_job_info,
                     success=False,
                 )
 

@@ -259,6 +259,7 @@ def make_probe_context(
     images=(IMAGE,),
     rented_now=None,
     first_pass: bool = False,
+    port_check_deferred: bool = False,
 ):
     docker = docker or FakeDocker()
     redis = redis or FakeRedis()
@@ -289,6 +290,7 @@ def make_probe_context(
         sysbox_runtime=True,
         verified_port_pairs=list(port_pairs),
         rented_data=rented if rented is not None else rented_data(),
+        port_check_deferred=port_check_deferred,
     )
     ctx = make_context(
         services=services,
@@ -551,6 +553,10 @@ async def test_a_failed_probe_clears_an_earlier_pass_stamp_and_records_the_faile
         (
             lambda redis: make_probe_context(redis=redis, image_present=False),
             "skipped: default renter image is not pulled on the node",
+        ),
+        (
+            lambda redis: make_probe_context(redis=redis, port_check_deferred=True),
+            "skipped: port check deferred for disk pressure",
         ),
         (
             lambda redis: make_probe_context(redis=redis, rented_now=[None]),
@@ -1501,7 +1507,9 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     assert ids.index("RentalProbeCheck") == ids.index("RentalVerificationCheck") + 1
     # DAH-5320: only the shadow idle disk write sits between the probe and scoring
     assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
-    assert ids.index("IdleDiskWriteCheck") == ids.index("ScoreCheck") - 1
+    # DAH-5462: then VerifyX's cold-sample retry, in the time every other check left
+    assert ids.index("IdleDiskWriteCheck") == ids.index("VerifyXColdRetryCheck") - 1
+    assert ids.index("VerifyXColdRetryCheck") == ids.index("ScoreCheck") - 1
     assert ids.index("RentalProbeCheck") > ids.index("PortConnectivityCheck")
     assert ids.index("RentalProbeCheck") > ids.index("TenantEnforcementCheck")
     dry = [
@@ -1509,7 +1517,7 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     ]
     assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
     fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
-    assert fast[-4:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck"]
+    assert fast[-5:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
 
 
 @pytest.mark.asyncio
@@ -1710,8 +1718,23 @@ async def test_a_filler_node_is_probed_beside_its_filler():
         result = await RentalProbeCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
-    assert docker.create_options == [{"beside_fillers": True}]
+    assert docker.create_options == [{"beside_fillers": True, "synthetic_probe": True}]
     assert redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_whose_port_check_was_deferred_for_disk_pressure_rents_nothing():
+    """Regression (DAH-5244 review): the port check kept its memory instead of a container on a Docker root
+    whose sync stalls, and the probe then started one on the same root: its create waited in that sync and
+    failed the filler node at container_start."""
+    fillers = rented_data(fillers=1)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers, port_check_deferred=True)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+    assert result.event.what_we_saw["reason"] == "port check deferred for disk pressure"
+    assert docker.create_calls == [] and not redis.stamped()
 
 
 @pytest.mark.asyncio
@@ -1720,7 +1743,7 @@ async def test_a_probe_on_a_node_without_a_filler_creates_with_beside_fillers_of
     with probe_settings(), renter_path():
         await RentalProbeCheck().run(ctx)
 
-    assert docker.create_options == [{"beside_fillers": False}]
+    assert docker.create_options == [{"beside_fillers": False, "synthetic_probe": True}]
 
 
 @pytest.mark.asyncio
@@ -1750,3 +1773,19 @@ async def test_a_filler_given_during_a_probe_beside_another_is_no_verdict():
     assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert result.event.what_we_saw["reason"] == "node was given a filler during the probe"
     assert redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_another_miners_rental_neither_skips_the_probe_nor_excuses_its_failure():
+    """DAH-4263 review round 2: the re-reads under the create lock and after the probe go through
+    rental_of_this_node, so a rental the backend lists under this UUID for another miner on another
+    endpoint is not this node's."""
+    theirs = rented_data(pods=1)
+    theirs.executors[EXECUTOR.uuid] = theirs.executors[EXECUTOR.uuid].model_copy(
+        update={"miner_hotkey": "other-miner-hotkey", "executor_ip_port": "2222"}
+    )
+    ctx, docker, _ = make_probe_context(rented_now=[theirs, theirs])
+    with probe_settings(deadline=1), renter_path(sshd_listens=False):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert len(docker.create_calls) == 1
