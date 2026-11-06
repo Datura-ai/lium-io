@@ -1,0 +1,174 @@
+"""DAH-5951: on a host whose Docker cannot limit a container's disk, a rented pod filling the Docker disk is
+paused (never deleted) and resumed once the disk has room; a host with the limit is never touched."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from types import SimpleNamespace
+
+import asyncssh
+import pytest
+from neurons.validators.src.services.task.checks.rented_pod_disk import (
+    PodLayer,
+    RentedPodDiskCheck,
+    parse_reading,
+    plan,
+    read_command,
+)
+from neurons.validators.src.services.task.messages import RentedPodDiskMessages as Msg
+from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+
+from tests.helpers import build_state
+
+GB = 1024**3
+DISK = 1000 * GB
+
+
+def _ssh(stdout="", raise_exc=None):
+    calls = []
+
+    async def run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if raise_exc is not None:
+            raise raise_exc
+        return SimpleNamespace(exit_status=0, stdout=stdout if "inspect" in cmd else "", stderr="")
+
+    return SimpleNamespace(run=run, calls=calls)
+
+
+def _ctx(context_factory, ssh, supported=False):
+    rented = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=[RentedPod(pod_id="1", container_name="pod_1", status="RUNNING")],
+            )
+        }
+    )
+    state = build_state(specs={"storage_limit_supported": supported}, rented_data=rented)
+    return context_factory(state=state, ssh=ssh)
+
+
+def _reading(free_gb, *pods):
+    return "\n".join([f"DF {DISK} {free_gb * GB}", *pods])
+
+
+def test_a_full_disk_pauses_only_a_pod_holding_a_large_share_of_it_volume_included():
+    pods = [
+        PodLayer("big_layer", "running", 300 * GB, 0),
+        PodLayer("big_volume", "running", 1 * GB, 400 * GB),
+        PodLayer("small", "running", 20 * GB, 30 * GB),
+    ]
+    assert plan(DISK, 40 * GB, pods) == (["big_layer", "big_volume"], [])
+
+
+def test_a_disk_the_host_filled_itself_pauses_nobody():
+    assert plan(DISK, 10 * GB, [PodLayer("pod_1", "running", 5 * GB, 50 * GB)]) == ([], [])
+
+
+def test_a_paused_pod_resumes_only_once_a_tenth_of_the_disk_is_free():
+    pods = [PodLayer("pod_1", "paused", 300 * GB, 0)]
+    assert plan(DISK, 70 * GB, pods) == ([], [])
+    assert plan(DISK, 100 * GB, pods) == ([], ["pod_1"])
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_the_disk_limit_is_never_touched(context_factory):
+    ssh = _ssh()
+    result = await RentedPodDiskCheck().run(_ctx(context_factory, ssh, supported=True))
+    assert result.event.reason_code == Msg.LIMITED.reason
+    assert ssh.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_pod_filling_a_no_limit_host_is_paused_not_removed(context_factory):
+    ssh = _ssh(_reading(20, f"/pod_1 running {500 * GB} 0"))
+    result = await RentedPodDiskCheck().run(_ctx(context_factory, ssh))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.PAUSED.reason
+    assert ssh.calls[-1] == "/usr/bin/docker pause pod_1"
+    assert not any("rm" in c.split() for c in ssh.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_room_left_pod_is_resumed_and_an_unreadable_host_passes(context_factory):
+    ssh = _ssh(_reading(200, f"/pod_1 paused {500 * GB} 0"))
+    result = await RentedPodDiskCheck().run(_ctx(context_factory, ssh))
+    assert result.event.reason_code == Msg.RESUMED.reason
+    assert ssh.calls[-1] == "/usr/bin/docker unpause pod_1"
+
+    for ssh in (_ssh(""), _ssh(raise_exc=asyncssh.ConnectionLost("gone"))):
+        result = await RentedPodDiskCheck().run(_ctx(context_factory, ssh))
+        assert (result.passed, result.event.reason_code) == (True, Msg.UNKNOWN.reason)
+        assert len(ssh.calls) == 1
+
+
+def test_the_read_command_reports_the_disk_and_counts_the_local_volume(tmp_path):
+    volume = tmp_path / "volumes" / "v1"
+    volume.mkdir(parents=True)
+    (volume / "data").write_bytes(b"x" * 3 * 1024 * 1024)
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'[ "$1" = info ] && {{ echo {tmp_path}; exit 0; }}\n'
+        f'echo "/pod_1 running 4096 {volume}"\n'
+    )
+    docker.chmod(0o755)
+    out = subprocess.run(
+        ["sh", "-c", read_command(["pod_1"]).replace("/usr/bin/docker", str(docker))],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={"PATH": os.environ["PATH"]},
+    ).stdout
+    size, free, pods = parse_reading(out)
+    assert size and free is not None and free <= size
+    assert len(pods) == 1 and pods[0].container == "pod_1" and pods[0].size_rw == 4096
+    assert pods[0].volume_bytes >= 3 * 1024 * 1024
+
+
+def test_runs_in_the_validation_pipelines_but_never_in_the_dry_run():
+    def has(checks):
+        return any(isinstance(c, RentedPodDiskCheck) for c in checks)
+
+    assert has(PipelineFactory.build_checks())
+    assert has(PipelineFactory.build_fast_path_checks())
+    assert not has(PipelineFactory.build_dry_run_checks())
+
+
+@pytest.mark.asyncio
+async def test_the_backend_is_told_of_each_pause_and_resume_so_a_paused_pod_is_not_billed(
+    context_factory,
+):
+    paused = _ctx(context_factory, _ssh(_reading(20, f"/pod_1 running {500 * GB} 0")))
+    still = _ctx(context_factory, _ssh(_reading(70, f"/pod_1 paused {500 * GB} 0")))
+    resumed = _ctx(context_factory, _ssh(_reading(200, f"/pod_1 paused {500 * GB} 0")))
+
+    for ctx in (paused, still, resumed):
+        await RentedPodDiskCheck().run(ctx)
+
+    def told(ctx):
+        return [
+            c.kwargs["paused"] for c in ctx.services.backend.report_pod_disk_pause.call_args_list
+        ]
+
+    assert (told(paused), told(still), told(resumed)) == ([True], [True], [False])
+    assert paused.services.backend.report_pod_disk_pause.call_args.args == ("1",)
+    assert (
+        paused.services.backend.report_pod_disk_pause.call_args.kwargs["executor_id"]
+        == "executor-123"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_backend_report_still_pauses_the_pod(context_factory):
+    ctx = _ctx(context_factory, _ssh(_reading(20, f"/pod_1 running {500 * GB} 0")))
+    ctx.services.backend.report_pod_disk_pause.side_effect = RuntimeError("backend down")
+
+    result = await RentedPodDiskCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (True, Msg.PAUSED.reason)

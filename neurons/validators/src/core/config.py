@@ -957,6 +957,21 @@ class Settings(BaseSettings):
         env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
         description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
     )
+    RENTAL_HOST_CPU_RESERVE: int = Field(
+        env="RENTAL_HOST_CPU_RESERVE", default=1, ge=0,
+        description=(
+            "CPUs kept back for the host (sshd, dockerd, the executor): a rental's --cpus is at most "
+            "the host's CPU count minus this, so a whole-host rental cannot take every core."
+        ),
+    )
+    RENTAL_LOG_MAX_SIZE: str = Field(
+        env="RENTAL_LOG_MAX_SIZE", default="100m",
+        description="json-file max-size of a rental container's log, so its stdout cannot fill the host disk.",
+    )
+    RENTAL_LOG_MAX_FILE: int = Field(
+        env="RENTAL_LOG_MAX_FILE", default=3, gt=0,
+        description="json-file max-file of a rental container's log (see RENTAL_LOG_MAX_SIZE).",
+    )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
         description=(

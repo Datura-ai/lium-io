@@ -42,6 +42,7 @@ from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_pod_network import RentedPodNetworkCheck
 from .rented_pod_ownership import RentedPodOwnershipCheck
+from .rented_pod_disk import RentedPodDiskCheck
 from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
@@ -120,6 +121,7 @@ __all__ = [
     "SysboxRequiredCheck",
     "SpecChangeCheck",
     "StorageLimitCheck",
+    "RentedPodDiskCheck",
     "SshdBootstrapCheck",
     "UploadFilesCheck",
     "VerifyXCheck",
