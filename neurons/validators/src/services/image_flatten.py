@@ -60,11 +60,11 @@ class ImageFlattenNoDisk(RuntimeError):
 
 
 def flatten_no_disk_sentence(short_bytes: int) -> str:
-    """The refusal with the measured shortfall; a renter cannot size the pod disk, only pick the node."""
+    """The refusal with the measured shortfall; a bigger node grows the pod disk too, so only the image can shrink it."""
     gb = -(-short_bytes // 1024**3)
     return (
         f"not enough free disk on this node to prepare this image beside this pod's disk ({gb} GB short); "
-        f"choose a node with at least {gb} GB more free disk, or a smaller image"
+        "use a smaller image or one with fewer layers"
     )
 
 
