@@ -56,7 +56,7 @@ def test_changes_refuse_an_env_value_with_a_line_break():
         image_flatten_changes({"Env": ["A=1\n2"]})
 
 
-def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2"):
+def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", stderr: str = "boom"):
     async def run(command, check=False, timeout=None):
         if command.startswith("/usr/bin/docker info --format '{{.Driver}}'"):
             return Mock(exit_status=0, stdout=f"{driver}\n")
@@ -64,7 +64,7 @@ def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver:
             return Mock(exit_status=0, stdout=json.dumps({"Id": _IMAGE_ID, "Size": size, "Config": _CONFIG}))
         if "docker create" not in command and f"/usr/bin/docker image inspect {_TAG}" in command:
             return Mock(exit_status=0 if exists else 1, stdout="")
-        return Mock(exit_status=flatten_rc, stdout="", stderr="boom")
+        return Mock(exit_status=flatten_rc, stdout="", stderr=stderr)
 
     ssh = Mock()
     ssh.run = AsyncMock(side_effect=run)
@@ -85,6 +85,17 @@ async def test_the_no_disk_exit_raises_the_renter_sentence_and_other_failures_ra
     assert "not enough free disk" in exc.value.renter_sentence
     with pytest.raises(RuntimeError, match="boom"):
         await flatten_image_on_host(_ssh(exists=False, flatten_rc=98), "lmsysorg/sglang:dev", lease="r1")
+
+
+@pytest.mark.asyncio
+async def test_the_no_disk_refusal_names_the_disk_to_give_up():
+    reserved = 79 * 1024**3
+    need = 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + reserved
+    ssh = _ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT, stderr=f"flatten avail={need - 5 * 1024**3}\n")
+    with pytest.raises(ImageFlattenNoDisk) as exc:
+        await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=reserved)
+    assert "order at least 5 GB less disk" in exc.value.renter_sentence
+    assert 'echo "flatten avail=$avail" >&2' in ssh.run.await_args_list[-1].args[0]
 
 
 @pytest.mark.asyncio
