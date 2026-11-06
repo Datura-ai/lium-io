@@ -1286,6 +1286,8 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
         (3600, "overlay2", False, ((0, -60), (-600, -660)), -600),
         # after an earlier start's remount, Docker restarted it unseen before the latest start: the renter's
         (3600, "overlay2", True, ((200, 190), (-100, -110)), -100),
+        # Docker restarted it in the same second as the validator's start, after the remount: the renter's
+        (3600, "overlay2", True, ((0.5, 0.4),), 0.2),
         (0, "containerd", False, None, None),  # no UpperDir in inspect: the running container's root mount names it
         (3600, "containerd", True, None, None),
         # Docker restarted it inside the validator start's window: files since then are the renter's
@@ -1302,6 +1304,7 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(
     import subprocess
     import time
 
+    now = time.time_ns()  # before the file below: the windows are in nanoseconds, like the records
     host_upper = "/var/lib/docker/x/diff"
     proc = tmp_path / "proc"
     upper = proc / "1" / "root" / host_upper.lstrip("/")
@@ -1319,7 +1322,9 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(
     docker_started = (
         "0001-01-01T00:00:00Z"
         if docker_started_ago is None
-        else time.strftime("%Y-%m-%dT%H:%M:%S.1Z", time.gmtime(int(time.time()) - docker_started_ago))
+        else (lambda ns: f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(ns // 10**9))}.{ns % 10**9:09d}Z")(
+            now - int(docker_started_ago * 10**9)
+        )
     )
     docker = tmp_path / "docker"
     docker.write_text(
@@ -1334,8 +1339,9 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(
     starts = tmp_path / "starts"
     starts.mkdir()
     if started_ago is not None:
-        now = int(time.time())
-        (starts / "cid").write_text("".join(f"{now - start} {now - end}\n" for start, end in started_ago))
+        (starts / "cid").write_text(
+            "".join(f"{now - int(start * 10**9)} {now - int(end * 10**9)}\n" for start, end in started_ago)
+        )
     monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(starts))
     command = _layer_data_check("pod_x", "/root", host_upper if store == "given" else None, store != "kept")
     command = command.replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
@@ -1388,13 +1394,14 @@ async def test_each_validator_start_is_kept_next_to_the_earlier_ones(svc, tmp_pa
         subprocess.run(["sh", "-c", record.replace("/usr/bin/docker", str(docker))])
 
     lines = [line.split() for line in (starts / "cid").read_text().splitlines()]
-    assert [line[0] for line in lines] == ["1793959200", "1793961000"]
+    assert [line[0] for line in lines] == ["1793959200100000000", "1793961000100000000"]
     assert all(int(end) > int(start) for start, end in lines)
 
 
 @pytest.mark.asyncio
 async def test_a_remount_within_the_start_second_still_leaves_a_window(svc, tmp_path, monkeypatch):
-    # both times are whole seconds: a start at T.010 remounted by T.950 must not record "T T", an empty window
+    # a start at T.010 remounted by T.950: in whole seconds "T T" is an empty window, and padding the end a second
+    # would cover a restart of Docker's own later in that second, so both times are nanoseconds
     import subprocess
     import time
 
@@ -1417,8 +1424,8 @@ async def test_a_remount_within_the_start_second_still_leaves_a_window(svc, tmp_
     subprocess.run(["sh", "-c", record.replace("/usr/bin/docker", str(docker))], check=True)
 
     start, end = (int(v) for v in (starts / "cid").read_text().split())
-    assert start == now
-    assert end > start
+    assert start == now * 10**9 + 10_000_000
+    assert start < end < (now + 60) * 10**9
 
 
 @pytest.mark.asyncio
