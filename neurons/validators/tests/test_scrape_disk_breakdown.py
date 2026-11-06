@@ -61,6 +61,9 @@ DISK_HELPERS = {
     "on_one_filesystem",
     "hard_disk_reading",
     "report_tighter_store",
+    "get_content_store_usage",
+    "get_docker_root_disk_type",
+    "HOST_MOUNTS_PATH",
 }
 
 
@@ -936,6 +939,63 @@ def test_the_fuller_of_the_store_and_data_root_is_the_reported_utilization(scrap
 
     assert hard_disk["hard_disk_utilization"] == pytest.approx(13 / 14 * 100)
     assert hard_disk["hard_disk_total"] == 400 * 1024**2
+
+
+_FULL = _Usage(400 * _GiB, 400 * _GiB, 0)
+_CTRD = "/proc/1/root/var/lib/containerd"
+_SNAPSHOTS = f"{_CTRD}/io.containerd.snapshotter.v1.overlayfs"
+_CONTENT = f"{_CTRD}/io.containerd.content.v1.content"
+
+
+@pytest.mark.parametrize(
+    "full, expected_total_gib",
+    [
+        # pulled layers land in the content store: a full one fails a pull, but its size is not the disk gate's
+        (_CONTENT, 14 * 1024),
+        (_SNAPSHOTS, 400),
+        ("/proc/1/root/data/docker", 400),
+    ],
+)
+def test_a_full_filesystem_leaves_no_free_room_whichever_it_is(scrape: dict, monkeypatch, full, expected_total_gib) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["open"] = lambda path: io.StringIO("")  # no root in the containerd config: its default
+    paths = {_SNAPSHOTS: _BIG, _CONTENT: _BIG, "/proc/1/root/data/docker": _BIG, full: _FULL}
+    _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, *paths}, usage_by_path=paths)
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=hash(path))
+
+    store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
+    hard_disk = scrape["hard_disk_reading"](data_root_usage)
+    scrape["report_tighter_store"](hard_disk, store_usage)
+    scrape["report_tighter_store"](hard_disk, scrape["get_content_store_usage"](), False)
+
+    assert hard_disk["hard_disk_free"] == 0
+    assert hard_disk["hard_disk_utilization"] == 100
+    assert hard_disk["hard_disk_total"] == expected_total_gib * 1024**2
+
+
+def test_a_content_store_on_the_snapshots_filesystem_is_not_read_twice(scrape: dict, monkeypatch) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["open"] = lambda path: io.StringIO("")
+    asked = _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, _SNAPSHOTS, _CONTENT}, usage_by_path={})
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=1)
+
+    assert scrape["get_content_store_usage"]() is None
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    "snapshots_device, data_root_device, expected",
+    [("nvme0n1p1", "sdb1", "hdd"), ("sdb1", "nvme0n1p1", "nvme")],
+)
+def test_disk_type_is_data_roots_where_rental_volumes_live(scrape: dict, monkeypatch, snapshots_device, data_root_device, expected) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["open"] = lambda path: io.StringIO("")
+    _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, _SNAPSHOTS, "/proc/1/root/data/docker"}, usage_by_path={})
+    devices = {"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs": snapshots_device, "/data/docker": data_root_device}
+    scrape["block_device_holding"] = lambda mounts_text, path: devices[path]
+    scrape["disk_type_of"] = {"nvme0n1p1": "nvme", "sdb1": "hdd"}.get
+
+    assert scrape["get_docker_root_disk_type"]() == expected
 
 
 def test_disk_usage_falls_back_to_root_without_a_reachable_docker_root(scrape: dict, monkeypatch) -> None:

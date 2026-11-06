@@ -519,6 +519,7 @@ resolve_disk_dir() {
     [ -d "$DISK_DIR" ] || DISK_DIR=/
     data_root=$DISK_DIR
     DATA_ROOT=$DISK_DIR
+    CONTENT_DIR=""
     SNAPSHOTTER_FIX=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
     docker_containerd || return 1
@@ -542,6 +543,8 @@ resolve_disk_dir() {
     # a root that is not there is unknown, not the data-root
     [ -d "$ctrd_root" ] || return 1
     DISK_DIR=$ctrd_root
+    # pulled image layers land in the content store first, which may be another filesystem than the snapshots
+    [ ! -d "$ctrd_root/io.containerd.content.v1.content" ] || CONTENT_DIR=$ctrd_root/io.containerd.content.v1.content
     # the snapshotter's root_path, when set, is where the snapshots really are; else its directory in the root,
     # which may be a mount of another disk
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
@@ -561,10 +564,12 @@ resolve_disk_dir() {
 }
 
 tighter_df_kb() {
-    # "<kB> <dir>": df column $1 (2 total, 4 available) of DISK_DIR or DATA_ROOT, whichever is smaller. The validator
-    # reports the tighter of the two filesystems (machine_scrape report_tighter_store); empty when DISK_DIR is unreadable
-    local dir kb best="" where=""
-    for dir in "$DISK_DIR" "$DATA_ROOT"; do
+    # "<kB> <dir>": df column $1 (2 total, 4 available) of DISK_DIR or DATA_ROOT, whichever is smaller; free space
+    # also counts the containerd content store. The validator reports the tighter filesystem (machine_scrape
+    # report_tighter_store); empty when DISK_DIR is unreadable
+    local dir kb best="" where="" dirs=("$DISK_DIR" "$DATA_ROOT")
+    [ "$1" != 4 ] || [ -z "${CONTENT_DIR:-}" ] || dirs+=("$CONTENT_DIR")
+    for dir in "${dirs[@]}"; do
         kb=$(df -Pk "$dir" 2>/dev/null | awk -v c="$1" 'NR == 2 {print $c}')
         # 0 available is a reading (a full disk), not a missing one
         if ! [[ "$kb" =~ ^[0-9]+$ ]]; then

@@ -117,6 +117,7 @@ ORIGINAL_KEYS = {
     'hard_disk_volumes': "volumes",
     'hard_disk_scrape_error': "hard_disk_scrape_error",
     'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
+    'hard_disk_content_scrape_error': "hard_disk_content_scrape_error",
     # DAH-3674: nvme | ssd | hdd | unknown for the disk under docker's data root
     'hard_disk_disk_type': "disk_type",
     # DAH-5045: used size of the engy_cache_* volumes, in GB
@@ -336,6 +337,7 @@ class FileEncryptService:
             'hard_disk_volumes': "",
             'hard_disk_scrape_error': "",
             'hard_disk_docker_scrape_error': "",
+            'hard_disk_content_scrape_error': "",
             'hard_disk_disk_type': "",
             'hard_disk_engy_cache_used_gb': "",
             'hard_disk_engy_cache_released_gb': "",

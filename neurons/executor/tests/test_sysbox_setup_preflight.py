@@ -165,6 +165,7 @@ STUBS = {
         echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
         case "${!#}" in   # STUB_DATA_DF_TOTAL_KB: a data-root on its own big disk, the rest on the root disk
             */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 ${STUB_DATA_DF_AVAIL_KB:-$STUB_DATA_DF_TOTAL_KB} 1% /data"; exit 0; } ;;
+            *.content) [ -z "${STUB_CONTENT_DF_AVAIL_KB:-}" ] || { echo "/dev/sdb1 $((14 * 1024 ** 3)) 1 $STUB_CONTENT_DF_AVAIL_KB 1% /content"; exit 0; } ;;
         esac
         echo "${STUB_DF_SOURCE:-/dev/nvme0n1p1} ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
         """
@@ -396,6 +397,29 @@ def test_a_full_filesystem_fails_the_free_disk_check(tmp_path, store_avail_kb, d
     rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files={"var/lib/containerd/.keep": ""})
     assert rc == 1, out
     assert "FIX  Free disk 0.0 GB on " in out and f"{limiting} is below" in out, out
+
+
+CONTENT_STORE = "var/lib/containerd/io.containerd.content.v1.content/.keep"
+
+
+# pulled layers land in the content store, which may be its own filesystem: free space counts it, the total does not
+@pytest.mark.parametrize("check, full, expected_rc, limiting", [
+    ("check_free_disk_for_node", "content", 1, "/var/lib/containerd/io.containerd.content.v1.content"),
+    ("check_free_disk_for_node", "snapshots", 1, "/var/lib/containerd"),
+    ("check_free_disk_for_node", "data-root", 1, "/var/lib/docker"),
+    ("check_free_disk_for_node", None, 0, None),
+    ("check_total_disk_for_vram", "content", 0, None),
+])
+def test_free_disk_counts_whichever_filesystem_is_full(tmp_path, check, full, expected_rc, limiting):
+    big = str(900 * 1024**2)
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3),
+           "STUB_DF_AVAIL_KB": "0" if full == "snapshots" else big,
+           "STUB_DATA_DF_AVAIL_KB": "0" if full == "data-root" else big,
+           "STUB_CONTENT_DF_AVAIL_KB": "0" if full == "content" else big}
+    rc, out, _ = run_check(tmp_path, check, env=env, files={"var/lib/containerd/.keep": "", CONTENT_STORE: ""})
+    assert rc == expected_rc, out
+    if limiting:
+        assert f"{limiting} is below" in out, out
 
 
 @pytest.mark.parametrize("quote", ['"', "'"])

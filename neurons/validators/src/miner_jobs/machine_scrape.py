@@ -904,7 +904,7 @@ def hard_disk_reading(usage):
     }
 
 
-def report_tighter_store(hard_disk, store_usage):
+def report_tighter_store(hard_disk, store_usage, size_too=True):
     # hard_disk is data-root's reading after its filler run volumes are released; a rental also needs room in
     # the containerd store on its other filesystem, so the tighter of the two is what a renter can get:
     # the smaller filesystem's size (what the disk gate measures), the least free room and the fuller of the two
@@ -917,7 +917,7 @@ def report_tighter_store(hard_disk, store_usage):
         lost_gb = -(-(hard_disk["hard_disk_free"] - free_kb) * 1024 // 10**9)
         hard_disk["hard_disk_engy_cache_released_gb"] = max(hard_disk["hard_disk_engy_cache_released_gb"] - lost_gb, 0)
     utilization = max(store["hard_disk_utilization"], hard_disk["hard_disk_utilization"])
-    if store["hard_disk_total"] < hard_disk["hard_disk_total"]:
+    if size_too and store["hard_disk_total"] < hard_disk["hard_disk_total"]:
         hard_disk.update(store)
     hard_disk["hard_disk_free"] = free_kb
     hard_disk["hard_disk_utilization"] = utilization
@@ -930,6 +930,19 @@ def disk_root_dir(info):
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return docker_root_dir
     return containerd_root(*docker_containerd(info), info.get("Driver") or "overlayfs")
+
+
+def get_content_store_usage():
+    # pulled image layers land in containerd's content store before they unpack: on its own filesystem, its free
+    # room limits a rental too (its size does not: the disk gate measures where containers live)
+    info = docker_api_get("/info") or {}
+    if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        return None
+    content = containerd_root(*docker_containerd(info), "overlayfs", True)  # positional: the obfuscator renames parameters
+    data_root = info.get("DockerRootDir") or "/var/lib/docker"
+    if not os.path.isdir(f"/proc/1/root{content}") or any(on_one_filesystem(content, d) for d in (disk_root_dir(info), data_root)):
+        return None
+    return shutil.disk_usage(f"/proc/1/root{content}")
 
 
 def containerd_processes():
@@ -1015,7 +1028,7 @@ def containerd_dump(binary, config_path):
         return {}
 
 
-def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, root=None, snapshotter="overlayfs"):
+def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, root=None, snapshotter="overlayfs", content=False):
     # where containerd's snapshotter keeps container filesystems on the host: its root_path, else its directory in
     # containerd's effective root (a mount there counts), else that root. A leftover /var/lib/containerd proves
     # nothing: a root moved in an imported config file leaves it behind, so the default is used only when no config
@@ -1066,6 +1079,8 @@ def containerd_root(binary="containerd", config_path=CONTAINERD_CONFIG_PATH, roo
     root = host_realpath(root or dumped or (roots[-1] if roots else "/var/lib/containerd"))
     if not os.path.isdir(f"/proc/1/root{root}"):
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
+    if content:  # the content store has no root_path of its own: it always sits in the effective root
+        return host_realpath(f"{root}/io.containerd.content.v1.content")
     if not dump:  # a dump that ran is the merged config: its empty root_path is the default, not a gap to fill
         root_path = sections[-1] if sections else None
     if isinstance(root_path, str) and root_path:
@@ -2385,9 +2400,9 @@ def disk_type_of(device_name: str | None) -> str:
 
 
 def get_docker_root_disk_type() -> str:
-    """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
+    """The disk type under docker's data root, where rental volumes live."""
     try:
-        docker_root_dir = disk_root_dir(docker_api_get("/info") or {})
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     except Exception:
         docker_root_dir = "/var/lib/docker"
     with open(HOST_MOUNTS_PATH) as mounts_file:
@@ -2680,6 +2695,10 @@ def get_machine_specs():
         # node that loses only the breakdown must keep reporting total/used/free.
         data["hard_disk_docker_scrape_error"] = repr(exc)
     report_tighter_store(data["data_hard_disk"], store_usage)
+    try:
+        report_tighter_store(data["data_hard_disk"], get_content_store_usage(), False)
+    except Exception as exc:
+        data["hard_disk_content_scrape_error"] = repr(exc)
 
     try:
         data["data_hard_disk"]["hard_disk_disk_type"] = get_docker_root_disk_type()
