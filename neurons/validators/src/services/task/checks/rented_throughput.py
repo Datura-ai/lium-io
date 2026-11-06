@@ -31,6 +31,7 @@ from ..runner import SSHCommandResult
 from .container_download_speed import (
     _FETCH_SCRIPT,
     _TIMEOUT_EXITS,
+    NODE_SIDE_ERRORS,
     ContainerDownloadSpeedCheck,
     download_speed_command,
     parse_download_speed,
@@ -365,6 +366,25 @@ def _step(failures: int, side: str) -> int:
     return failures + 1 if side == "fail" else (0 if side == "pass" else failures)
 
 
+def slow_detail(state: _State) -> str:
+    """Which confirmed side failed and the values behind it, e.g. "network: pypi 1.5 Mbps measured, 10 Mbps
+    required". Read by the score warning and the provider portal, so no "|" (the warning separator)."""
+    reading = state.reading
+    parts = []
+    if state.net_failures >= READINGS_BEFORE_VERDICT:
+        need = reading.get("min_mbps")
+        slow = [
+            f"{e['endpoint']} {e['mbps']:.1f} Mbps" if e.get("mbps") is not None else f"{e['endpoint']} {e.get('error')}"
+            for e in reading.get("endpoints") or []
+            if (e.get("mbps") is not None and need is not None and e["mbps"] < need) or e.get("error") in NODE_SIDE_ERRORS
+        ]
+        parts.append(f"network: {', '.join(slow)} measured, {need:g} Mbps required" if slow and need else "network")
+    if state.disk_failures >= READINGS_BEFORE_VERDICT:
+        mb, need = (reading.get("disk") or {}).get("mb_per_s"), reading.get("disk_min_mb_per_s")
+        parts.append(f"disk: {mb:.1f} MB/s measured, {need:g} MB/s required" if mb is not None and need else "disk")
+    return "; ".join(parts)
+
+
 @dataclass
 class _State:
     at: float
@@ -674,10 +694,17 @@ class RentedThroughputCheck:
         slow = state.failures_in_a_row >= READINGS_BEFORE_VERDICT
         if slow or state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
             template = Msg.SLOW if slow else Msg.NOT_RUN
-            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
+            detail = slow_detail(state) if slow else ""
+            event = render_message(
+                template,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what, "failed": detail} if detail else what,
+                remediation=f"failed: {detail}. {template.remediation}" if detail else None,
+            )
             # NOT_RUN measured nothing, so scoring and the portal must not call it slow
             updates = (
-                {"rented_throughput_passed": False}
+                {"rented_throughput_passed": False, "rented_throughput_slow_detail": detail}
                 if slow
                 else {
                     "rented_throughput_passed": False,

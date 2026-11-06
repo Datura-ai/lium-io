@@ -278,7 +278,7 @@ async def test_two_slow_readings_zero_the_score_until_that_side_passes(answer, r
         clock.now += 31 * 60
         second = await check.run(ctx)
         assert not second.passed and second.event.reason_code == Msg.SLOW.reason
-        assert second.updates == {"rented_throughput_passed": False}
+        assert second.updates["rented_throughput_passed"] is False
         assert "on that resource stayed under its busy threshold" in second.event.remediation
         clock.now += 60  # the finding stands between readings
         assert (await check.run(ctx)).passed is False and len(runner.commands) == 2
@@ -823,7 +823,7 @@ async def test_only_a_reading_on_the_rentals_network_judges_the_network(network,
         clock.now += 31 * 60
         third = await check.run(ctx)
     assert third.passed is (on_rentals and fast)
-    assert third.updates == ({} if on_rentals and fast else {"rented_throughput_passed": False})
+    assert third.updates.get("rented_throughput_passed", True) is (on_rentals and fast)
     with flags() as clock:  # two slow bridge readings never zero the score
         ctx, _ = make_ctx(answer, answer)
         check = RentedThroughputCheck()
@@ -1306,3 +1306,26 @@ async def test_a_slow_redis_save_after_a_reading_never_drops_the_cycle():
             result = await asyncio.wait_for(RentedThroughputCheck().run(ctx), 5)
         assert result.passed and len(runner.commands) == 1
         assert module._UNSAVED[EXECUTOR.uuid].reading
+
+
+@pytest.mark.parametrize(
+    "answer, detail",
+    [
+        (SLOW_NET, r"network: pypi \d+\.\d Mbps measured, 10 Mbps required"),
+        (SLOW_DISK, r"disk: \d+\.\d MB/s measured, 50 MB/s required"),
+        (SLOW_BOTH, r"network: pypi \d+\.\d Mbps measured, 10 Mbps required; disk: \d+\.\d MB/s measured, 50 MB/s required"),
+    ],
+    ids=["network", "disk", "both"],
+)
+async def test_a_slow_verdict_names_the_failed_side_with_measured_and_required_values(answer, detail):
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        slow = await check.run(ctx)
+    assert re.fullmatch(detail, slow.updates["rented_throughput_slow_detail"])
+    assert slow.event.remediation.startswith(f"failed: {slow.updates['rented_throughput_slow_detail']}. ")
+    ctx = ctx.model_copy(update=slow.updates)
+    _, _, warning = calculate_scores(ctx, rented=True)
+    assert f"network or disk throughput ({slow.updates['rented_throughput_slow_detail']})" in warning
