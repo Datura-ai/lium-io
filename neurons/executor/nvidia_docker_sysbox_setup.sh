@@ -988,11 +988,12 @@ step 2 7 "Checking running containers"
 EXECUTOR_COMPOSE_DIR=""
 all_containers=$(docker ps --format "{{.Names}}" 2>/dev/null || true)
 has_validator=false has_executor=false has_unknown=false
-unknown_list=""
+unknown_list="" filler_list=""
 
 for name in $all_containers; do
     case "$name" in
         pod_*)       ;;  # handled by abort_on_active_rentals below
+        filler_*)    filler_list="$filler_list $name" ;;  # Lium's Default Job: stopped here, started again after setup
         container_*|lium_storage_check_*) has_validator=true ;;  # a validator's scrape or its vloopback test
         executor-*|executor_*)
             has_executor=true
@@ -1055,8 +1056,15 @@ if [ "$has_executor" = true ]; then
     fi
 fi
 
-# Check for stopped containers (sysbox requires zero containers)
-stopped=$(docker ps -a -q 2>/dev/null || true)
+if [ -n "$filler_list" ]; then
+    warn "Lium's Default Job will be stopped and started again after setup (do not remove it)."
+    # shellcheck disable=SC2086  # one name per word
+    docker stop $filler_list > /dev/null 2>&1 || true
+fi
+
+# Remove stopped containers so Docker can restart cleanly; keep Lium's Default Job (filler_*), which the
+# validator would otherwise report as missing and stop idle pay for until it starts a new one
+stopped=$(docker ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 !~ /^filler_/ {print $1}' || true)
 if [ -n "$stopped" ]; then
     warn "Removing stopped containers (sysbox requires none)..."
     # shellcheck disable=SC2086  # one id per word
@@ -1136,6 +1144,14 @@ systemctl restart docker
 for _ in $(seq 1 30); do docker ps &>/dev/null && break; sleep 1; done
 docker ps &>/dev/null || { fail "Docker failed to restart. Check: journalctl -u docker.service"; exit 1; }
 ok "Docker is running."
+if [ -n "$filler_list" ]; then
+    # shellcheck disable=SC2086  # one name per word
+    if docker start $filler_list > /dev/null 2>&1; then
+        ok "Lium's Default Job started again."
+    else
+        warn "Lium's Default Job did not start again; the validator starts a new one on its next check."
+    fi
+fi
 
 # ── 7. Verify ──────────────────────────────────────────
 
