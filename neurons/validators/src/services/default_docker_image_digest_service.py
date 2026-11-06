@@ -205,6 +205,7 @@ async def executor_build_published(digest: str | None) -> bool | None:
                 elif response.status == 200:
                     published = True
                 else:
+                    logger.warning("Executor build lookup for %s got HTTP %s", digest, response.status)
                     return None
     except Exception as exc:
         logger.warning("Executor build lookup for %s failed: %s", digest, exc)

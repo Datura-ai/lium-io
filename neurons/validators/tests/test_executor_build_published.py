@@ -56,6 +56,15 @@ async def test_registry_answer_decides_whether_the_build_is_ours(monkeypatch, he
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("head_status", [401, 429])
+async def test_a_refused_registry_answer_is_logged_and_left_open(monkeypatch, caplog, head_status):
+    fake_registry(monkeypatch, head_status)
+
+    assert await service.executor_build_published(DIGEST) is None
+    assert f"HTTP {head_status}" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_no_digest_is_not_ours_without_asking(monkeypatch):
     heads = fake_registry(monkeypatch, 200)
 

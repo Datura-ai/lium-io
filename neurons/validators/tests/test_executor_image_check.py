@@ -13,6 +13,7 @@ from services.executor_image_policy import (
     ExpectedImageSnapshot,
     ImageVerdict,
 )
+from services.default_docker_image_digest_service import executor_build_published as real_executor_build_published
 from services.task.checks.executor_image import ExecutorImageCheck
 from services.task.score_calculator import calculate_scores
 
@@ -88,7 +89,8 @@ async def test_unrented_outdated_executor_fails_validation(enforce):
 
 
 @pytest.mark.asyncio
-async def test_unobservable_executor_digest_is_outdated(enforce):
+async def test_unobservable_executor_digest_is_unofficial(enforce, no_registry_lookup_for_executor_build):
+    no_registry_lookup_for_executor_build.side_effect = real_executor_build_published
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(
@@ -99,9 +101,9 @@ async def test_unobservable_executor_digest_is_outdated(enforce):
 
     result = await ExecutorImageCheck().run(context)
 
-    assert result.passed is True
-    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
-    assert result.event.reason_code == "EXECUTOR_IMAGE_OUTDATED"
+    assert result.passed is True  # rented: the rental stays, the score path zeroes the incentive
+    assert result.updates["state"].executor_image_report.status is ImageVerdict.UNOFFICIAL
+    assert result.event.reason_code == "EXECUTOR_IMAGE_UNOFFICIAL"
 
 
 @pytest.mark.parametrize(
