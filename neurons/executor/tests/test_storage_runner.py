@@ -376,6 +376,32 @@ def test_dns_fallback_helper_heartbeats_and_is_reused(monkeypatch: pytest.Monkey
     assert commands[2][-2:] == ["init", "--json"]
 
 
+def test_cancel_during_repository_helper_stops_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace"),
+        read_only=True,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+    runner._repository_via_helper = True
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if "snapshots" in command:
+            time.sleep(1.5)
+        return _repository_command_result(0, standard_output="[]")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", run)
+    monkeypatch.setattr(type(runner._events), "cancellation_requested", property(lambda _: True))
+    with pytest.raises(StorageOperationCancelled):
+        runner._run_repository_command(["snapshots", "--json"])
+
+    assert commands[-1][1:3] == ["stop", "--time"]
+
+
 def test_backup_repository_initialization_retries_transient_access_denied(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

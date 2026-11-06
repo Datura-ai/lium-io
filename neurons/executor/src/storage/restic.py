@@ -332,7 +332,7 @@ class ResticStorageRunner:
 
     def _run_repository_command(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
         if self._repository_via_helper:
-            return self._supervised_run(self._repository_helper_command(restic_arguments))
+            return self._run_repository_helper(restic_arguments)
         result = self._supervised_run(self._restic_command(restic_arguments))
         if (
             result.returncode not in (0, 10)
@@ -343,8 +343,15 @@ class ResticStorageRunner:
             # resolves fine; the backup itself already runs in a default-bridge helper.
             print("Repository DNS lookup failed in the executor; using a helper container", file=sys.stderr, flush=True)
             self._repository_via_helper = True
-            return self._supervised_run(self._repository_helper_command(restic_arguments))
+            return self._run_repository_helper(restic_arguments)
         return result
+
+    def _run_repository_helper(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return self._supervised_run(self._repository_helper_command(restic_arguments))
+        except StorageOperationCancelled:
+            self._stop_helper_container()  # else it keeps the repository credentials until restic exits
+            raise
 
     def _repository_helper_command(self, restic_arguments: list[str]) -> list[str]:
         return [
