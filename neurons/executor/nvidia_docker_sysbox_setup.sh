@@ -988,12 +988,12 @@ step 2 7 "Checking running containers"
 EXECUTOR_COMPOSE_DIR=""
 all_containers=$(docker ps --format "{{.Names}}" 2>/dev/null || true)
 has_validator=false has_executor=false has_unknown=false
-unknown_list="" filler_list=""
+unknown_list=""
 
 for name in $all_containers; do
     case "$name" in
         pod_*)       ;;  # handled by abort_on_active_rentals below
-        filler_*)    filler_list="$filler_list $name" ;;  # Lium's Default Job: stopped here, started again after setup
+        filler_*)    ;;  # Lium's Default Job: kept through setup, see filler_list below
         container_*|lium_storage_check_*) has_validator=true ;;  # a validator's scrape or its vloopback test
         executor-*|executor_*)
             has_executor=true
@@ -1056,6 +1056,8 @@ if [ "$has_executor" = true ]; then
     fi
 fi
 
+# every Default Job, also one already stopped (by hand or an earlier run): all are kept and started after setup
+filler_list=$(docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^filler_/ {printf "%s ", $1}' || true)
 if [ -n "$filler_list" ]; then
     warn "Lium's Default Job will be stopped and started again after setup (do not remove it)."
     # shellcheck disable=SC2086  # one name per word
