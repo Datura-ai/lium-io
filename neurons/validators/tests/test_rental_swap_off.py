@@ -32,7 +32,7 @@ def test_host_config_never_sends_memory_swap_without_memory():
     assert "mem_limit" not in kwargs and "memswap_limit" not in kwargs
 
 
-def _run_spec(docker_service, memory_gb):
+def _run_spec(docker_service, memory_gb, cpu_count=None, host_cpu_count=None):
     from payload_models.payloads import ContainerCreateRequest, CustomOptions
     from services.rental_docker_sdk import GpuDockerConfig
 
@@ -55,7 +55,8 @@ def _run_spec(docker_service, memory_gb):
         external_volume_name=None,
         gpu_devices=GpuDockerConfig(),
         effective_storage_limit_gb=None,
-        cpu_count=None,
+        cpu_count=cpu_count,
+        host_cpu_count=host_cpu_count,
     )
 
 
