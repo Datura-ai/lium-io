@@ -3113,6 +3113,58 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repaired, starts", [("volume_x", 2), (None, 1)])
+async def test_start_existing_container_repairs_a_stale_vloopback_mountpoint_and_starts_again(
+    docker_service, monkeypatch, repaired, starts
+):
+    # 5 Nov: a GPU reset's start of a stopped pod failed on "file exists" with no repair, so the pod stayed down
+    stale = RuntimeError(
+        "Docker SDK start failed: 500 Server Error: error while mounting volume '': VolumeDriver.Mount: 01M6: "
+        "cannot create mount point dir '/mnt/volume_x': mkdir /mnt/volume_x: file exists"
+    )
+    ssh_client = AsyncMock()
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect", Mock(return_value=DummySSHConnectionManager(ssh_client))
+    )
+    client = docker_service.rental_docker_client_factory.client
+    client.start = AsyncMock(side_effect=[stale, None])
+    docker_service._repair_stale_mountpoint_of_container_volume = AsyncMock(return_value=repaired)
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    async def start():
+        await docker_service.start_existing_container(
+            executor_info=executor_info,
+            private_key="private-key",
+            known_hosts_policy=None,
+            container_name="pod_test",
+            local_volume_path="/root",
+            pod_id="pod-id",
+            default_extra={},
+        )
+
+    if repaired:
+        await start()
+        docker_service._restore_mount_and_sshd_after_start.assert_awaited_once()
+    else:
+        with pytest.raises(RuntimeError, match="file exists"):
+            await start()
+        docker_service._restore_mount_and_sshd_after_start.assert_not_awaited()
+    assert client.start.await_count == starts
+    docker_service._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh_client, "pod_test", {})
+
+
+@pytest.mark.asyncio
 async def test_start_container_remounts_when_container_state_is_encrypted(docker_service, monkeypatch):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))
