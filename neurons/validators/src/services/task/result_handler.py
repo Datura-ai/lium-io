@@ -166,6 +166,11 @@ class ResultHandler:
             is_spot
             and executor_info.uuid in context.state.rented_data.provider_spot_executor_ids
         )
+        spot_pay_drop_limited_until = (
+            context.state.rented_data.spot_pay_drop_limited_until.get(executor_info.uuid)
+            if is_spot
+            else None
+        )
         is_new_rentals_paused = bool(
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
@@ -280,6 +285,7 @@ class ResultHandler:
             rented_gpu_count=self._get_rented_gpu_count(context),
             is_spot=is_spot,
             is_on_spot_pay_list=is_on_spot_pay_list,
+            spot_pay_drop_limited_until=spot_pay_drop_limited_until,
             is_new_rentals_paused=is_new_rentals_paused,
             is_in_maintenance=is_in_maintenance,
             is_provider_banned=context.is_provider_banned,

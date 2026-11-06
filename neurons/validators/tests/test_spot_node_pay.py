@@ -11,6 +11,7 @@ burn-capped rental share, up to the whole incentive pool.
 import json
 import logging
 import math
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -1305,6 +1306,42 @@ async def test_only_a_spot_node_on_the_pay_list_is_paid(
     assert result.incentive == 0
     assert result.spot_pay_candidate is False
     assert _codes(result) == expected_codes
+
+
+_UNTIL = "2026-11-12T10:15:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_a_spot_node_left_off_for_drops_names_the_drop_limit_and_the_date(context_factory):
+    result = await _handled(
+        context_factory, _spot_reply(spot_pay_drop_limited_until={_EXECUTOR_ID: _UNTIL})
+    )
+
+    await _run([result, _node("secure-1")])
+    assert result.incentive == 0
+    assert _codes(result) == [ZeroIncentiveReason.SPOT_PAY_DROP_LIMIT]
+    reason = result.zero_incentive_reasons[0]
+    assert reason.context["excluded_until"] == _UNTIL
+    assert any("2026-11-12 10:15 UTC" in log for log in result.incentive_logs)
+
+
+@pytest.mark.asyncio
+async def test_a_rented_spot_node_left_off_for_drops_names_the_drop_limit(spot_rental_on):
+    spot = _spot(
+        is_rented=True,
+        is_on_spot_pay_list=False,
+        spot_pay_drop_limited_until=datetime.fromisoformat(_UNTIL),
+    )
+
+    await _run([spot, _node("secure-1", is_rented=True)])
+
+    assert spot.incentive == 0
+    assert _codes(spot) == [ZeroIncentiveReason.SPOT_PAY_DROP_LIMIT]
+
+
+@pytest.mark.parametrize("value", [None, [], {"x": "not a date"}, "junk"])
+def test_a_malformed_drop_limit_map_reads_as_empty(value):
+    assert _spot_reply(spot_pay_drop_limited_until=value).spot_pay_drop_limited_until == {}
 
 
 @pytest.mark.asyncio

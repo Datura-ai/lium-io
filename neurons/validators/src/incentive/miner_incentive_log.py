@@ -21,7 +21,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
    because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
    Group A — earns nothing in EITHER pool (built by `_reasons_excluded_from_both_pools`):
-     spot tier, provider e-mail not confirmed, Discord not connected, paused for new
+     spot tier (or, for a Spot node that dropped out 3+ times in 7 days, the drop limit
+     with the time it is paid again), provider e-mail not confirmed, Discord not connected, paused for new
      rentals, running own default job, hotkey excluded from scoring by the validator's
      SCORING_EXCLUDED_HOTKEYS setting
    Group B — idle but does not qualify for the unrented pool:
@@ -130,6 +131,8 @@ class ZeroIncentiveReason(StrEnum):
     RENTED_SYSBOX_NOT_CONFIRMED = "rented_sysbox_not_confirmed"
     # Group B (appended): free splits of a partly rented split node without disk room for their share (DAH-4961)
     DISK_LIMITED_REMAINDER = "disk_limited_remainder"
+    # Group A (appended): a Spot node that dropped out 3+ times in 7 days, in place of spot_tier (DAH-5919)
+    SPOT_PAY_DROP_LIMIT = "spot_pay_drop_limit"
 
 
 # The reason code a failed run carries when no check produced one (an exception in the pipeline).
@@ -251,6 +254,22 @@ class MinerLogLine(BaseModel):
                 "spot-rated executors do not earn subnet incentive."
             ),
             internal_message="Executor excluded from both pools - spot tier",
+        )
+
+    @staticmethod
+    def no_payout_because_spot_drop_limit(result: JobResult) -> MinerLogLine:
+        until = result.spot_pay_drop_limited_until
+        until_text = until.strftime("%Y-%m-%d %H:%M UTC") if until else "after 7 days without a drop"
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_PAY_DROP_LIMIT,
+            message=(
+                "No subnet incentive: this Spot node dropped out 3 or more times in 7 days, so it "
+                "gets neither idle pay nor the rented Spot incentive. It is paid again after 7 days "
+                f"without a drop: {until_text}."
+            ),
+            extra_fields={"excluded_until": until.isoformat() if until else None},
+            internal_message="Executor excluded from both pools - spot pay drop limit",
         )
 
     @staticmethod

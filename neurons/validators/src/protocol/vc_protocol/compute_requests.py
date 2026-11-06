@@ -3,7 +3,7 @@ import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, RootModel, ValidationError, field_validator
+from pydantic import BaseModel, RootModel, TypeAdapter, ValidationError, field_validator
 
 from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
@@ -188,6 +188,9 @@ class RentedExecutorsResponse(BaseModel):
     # demoted for penalties; never a banned hotkey, pin or no-incentive rental. Defaults
     # to empty so a backend that does not send it pays no spot node.
     provider_spot_executor_ids: list[str] = []
+    # DAH-5919: Spot ids left off provider_spot_executor_ids only because they dropped out 3+ times
+    # in 7 days, each with the time it is paid again. Absent from an older backend: no such reason.
+    spot_pay_drop_limited_until: dict[str, datetime] = {}
     new_rentals_paused_executor_ids: list[str] = []  # executor_ids paused from unrented incentives
     # DAH-2703: executor_ids whose Lium filler container is destroyed during create (see
     # FillerRunDao.CREATE_KILL_*). Such a run never reaches RUNNING, so the ISSUE-050 liveness
@@ -309,6 +312,18 @@ class RentedExecutorsResponse(BaseModel):
             )
             return []
         return [item for item in value if isinstance(item, str)]
+
+    @field_validator("spot_pay_drop_limited_until", mode="before")
+    @classmethod
+    def read_malformed_drop_limited_as_empty(cls, value: Any) -> dict[str, Any]:
+        # Only names a reason, so a malformed map is dropped rather than failing the reply.
+        if not isinstance(value, dict):
+            return {}
+        try:
+            return TypeAdapter(dict[str, datetime]).validate_python(value)
+        except ValidationError:
+            logger.warning("spot_pay_drop_limited_until is malformed; read as empty")
+            return {}
 
     @field_validator("filler_containers_by_executor")
     @classmethod

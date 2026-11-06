@@ -704,7 +704,11 @@ class RentalPriceIncentive(DefaultIncentive):
         if job_result.is_spot and not (
             self._on_spot_pay_path(job_result) or earns_spot_rental_incentive(job_result)
         ):
-            exclusions.append(MinerLogLine.no_payout_because_spot_tier(job_result))
+            exclusions.append(
+                MinerLogLine.no_payout_because_spot_drop_limit(job_result)
+                if job_result.spot_pay_drop_limited_until
+                else MinerLogLine.no_payout_because_spot_tier(job_result)
+            )
         if job_result.is_provider_email_held:
             exclusions.append(MinerLogLine.no_payout_because_email_not_confirmed(job_result))
         # A held new node has no listing row, so its Discord state is unknown; one reason is enough.

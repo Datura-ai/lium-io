@@ -68,6 +68,8 @@ class JobResult(BaseModel):
     # in the backend's provider_spot_executor_ids, the spot pay list: set to Spot by its provider, or
     # force-spot by a penalty demotion; not a banned hotkey, pin or no-incentive rental. Gates spot-node pay.
     is_on_spot_pay_list: bool = False
+    # DAH-5919: off the spot pay list only because it dropped out 3+ times in 7 days; paid again from this time
+    spot_pay_drop_limited_until: datetime | None = None
     is_new_rentals_paused: bool = False
     is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False

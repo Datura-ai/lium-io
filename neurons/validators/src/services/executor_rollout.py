@@ -503,6 +503,7 @@ def _held_for_renter_gpu_reset(result: JobResult) -> bool:
 _FRESH_PAY_FIELDS = (
     "is_spot",
     "is_on_spot_pay_list",
+    "spot_pay_drop_limited_until",
     "is_provider_email_held",
     "provider_discord_connected",
     "is_new_rentals_paused",
