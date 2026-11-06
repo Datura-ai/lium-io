@@ -7,7 +7,7 @@ import asyncssh
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
-from services.attestation_service import HostPolicyResult
+from services.attestation_service import AttestationError, AttestationNonce, HostPolicyResult
 from services.task import service as task_service_module
 from services.task.availability import (
     AVAILABILITY_CATEGORY,
@@ -416,3 +416,36 @@ def test_the_peer_text_of_an_ssh_failure_is_capped() -> None:
 
     # Assert
     assert len(event.what_we_saw["error"]) == MAX_PEER_TEXT_LENGTH
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy, passed",
+    [
+        (AsyncMock(return_value=HostPolicyResult(attestation_digest="d", gpu_attestation_passed=True)), True),
+        (AsyncMock(return_value=HostPolicyResult(attestation_digest="d", gpu_attestation_passed=False)), False),
+        (AsyncMock(side_effect=AttestationError("quote does not echo the nonce")), False),
+        (AsyncMock(return_value=HostPolicyResult()), True),
+    ],
+    ids=["passed", "gpu-bad", "rejected", "no-tdx"],
+)
+async def test_a_nonce_bound_attestation_records_its_outcome_for_the_miner(policy, passed) -> None:
+    service = _task_service_that_reaches_the_ssh_connect()
+    service.attestation_service.prepare_host_policy = policy
+    service.attestation_service.record_attestation_event = AsyncMock()
+    miner, executor = _a_job_for("node-9")
+
+    with patch.object(task_service_module, "InteractiveShellService", _ShellThatRefusesToConnect):
+        await service.create_task(
+            miner_info=miner,
+            executor_info=executor,
+            keypair=MagicMock(ss58_address="5Val"),
+            private_key="key",
+            public_key="pub",
+            encrypted_files=MagicMock(),
+            rented_data=MagicMock(),
+            default_docker_image_digests={},
+            attestation_nonce=AttestationNonce.issue(),
+        )
+
+    service.attestation_service.record_attestation_event.assert_awaited_once_with(miner.miner_hotkey, passed)
