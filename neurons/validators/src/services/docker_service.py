@@ -1724,9 +1724,9 @@ KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 _DROP_MARK = "drop"
 # The image's entrypoint writes under the plaintext path before the first gocryptfs mount: those layer files
 # carry an inode change time within this long of the container's creation and are not the renter's.
-# A restart reruns the entrypoint too: only one the validator made and remounted counts, by the start time it
-# recorded under _VALIDATOR_STARTS_DIR (one line per start, keyed by container id), never Docker's own, which an
-# unmounted restart moves.
+# A restart reruns the entrypoint too: only one the validator made and remounted counts, from its start to the end
+# of its remount as recorded under _VALIDATOR_STARTS_DIR (one "start end" line per start, keyed by container id).
+# A window never outlives the remount, so files after a later restart of Docker's own (unseen) always keep the copy.
 # shortcut: a fixed bound, not the recorded first-mount time; a create whose mount came later keeps the container.
 _STARTUP_WRITE_SECONDS = 300
 _VALIDATOR_STARTS_DIR = "/var/tmp/lium_validator_starts"
@@ -1769,10 +1769,10 @@ def _layer_data_check(
         # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
         f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
         "g=$(date -d \"${i#* }\" +%s 2>/dev/null) || g=0; w=; "
-        f"for s in $(cat {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\" 2>/dev/null); "
-        f"do case \"$s\" in *[!0-9]*) continue;; esac; e=$((s + {_STARTUP_WRITE_SECONDS})); "
+        "while read -r s e; do [ -n \"$e\" ] || continue; case \"$s$e\" in *[!0-9]*) continue;; esac; "
         "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
-        "w=\"$w ! ( -newerct @$s ! -newerct @$e )\"; done; true; } "
+        "w=\"$w ! ( -newerct @$s ! -newerct @$e )\"; "
+        f"done 2>/dev/null < {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"; true; }} "
         f"&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
         "$w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
@@ -11935,12 +11935,15 @@ class DockerService:
                 log_extra=default_extra,
                 allow_init=False,
             )
-            # the start just made is ours and now remounted: the layer read counts its entrypoint writes as startup
+            # the start just made is ours and now remounted: the layer read counts its entrypoint writes as startup;
+            # RestartCount (reset by our start) above 0 means Docker restarted it during the remount: record nothing
             name = shlex.quote(container_name)
             with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):  # without it the read keeps, never drops
                 await ssh_client.run(
-                    f"i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name}) && mkdir -p "
-                    f"{_VALIDATOR_STARTS_DIR} && date -d \"${{i#* }}\" +%s >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
+                    "i=$(/usr/bin/docker inspect -f "
+                    f"'{{{{.Id}}}} {{{{.RestartCount}}}} {{{{.State.StartedAt}}}}' {name}) "
+                    f"&& r=\"${{i#* }}\" && [ \"${{r%% *}}\" = 0 ] && s=$(date -d \"${{r#* }}\" +%s) && mkdir -p "
+                    f"{_VALIDATOR_STARTS_DIR} && echo \"$s $(date +%s)\" >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
                     check=False,
                     timeout=30,
                 )

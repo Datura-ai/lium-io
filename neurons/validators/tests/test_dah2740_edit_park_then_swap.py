@@ -1280,13 +1280,16 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
     [
         (0, "overlay2", False, None, None),  # written by the image's startup, before the first mount: not the renter's
         (3600, "overlay2", True, None, None),  # written an hour after creation: an unmounted restart, the renter's
-        (3600, "overlay2", False, (0,), 0),  # just after a start the validator made and remounted: its entrypoint
-        (3600, "overlay2", True, (3600,), 0),  # long after the validator's last start: an unmounted restart by Docker
-        (3600, "overlay2", False, (0, -600), -600),  # after an earlier validator start, not the latest: still its entrypoint
+        (3600, "overlay2", False, ((0, -60),), 0),  # during a start the validator made and remounted: its entrypoint
+        (3600, "overlay2", True, ((3600, 3590),), 0),  # long after the validator's last start: Docker's own restart
+        # during an earlier validator start, not the latest: still its entrypoint
+        (3600, "overlay2", False, ((0, -60), (-600, -660)), -600),
+        # after an earlier start's remount, Docker restarted it unseen before the latest start: the renter's
+        (3600, "overlay2", True, ((200, 190), (-100, -110)), -100),
         (0, "containerd", False, None, None),  # no UpperDir in inspect: the running container's root mount names it
         (3600, "containerd", True, None, None),
         # Docker restarted it inside the validator start's window: files since then are the renter's
-        (3600, "overlay2", True, (120,), 60),
+        (3600, "overlay2", True, ((120, -60),), 60),
         (0, "given", False, None, None),  # stopped on the containerd store: the upper dir the running read used
         (0, "none", True, None, None),  # no upper dir anywhere: docker diff decides, and lists the startup file
         (0, "kept", True, None, None),  # a copy already kept: the age bound never releases it, only docker diff decides
@@ -1331,7 +1334,8 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(
     starts = tmp_path / "starts"
     starts.mkdir()
     if started_ago is not None:
-        (starts / "cid").write_text("".join(f"{int(time.time()) - ago}\n" for ago in started_ago))
+        now = int(time.time())
+        (starts / "cid").write_text("".join(f"{now - start} {now - end}\n" for start, end in started_ago))
     monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(starts))
     command = _layer_data_check("pod_x", "/root", host_upper if store == "given" else None, store != "kept")
     command = command.replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
@@ -1375,13 +1379,17 @@ async def test_each_validator_start_is_kept_next_to_the_earlier_ones(svc, tmp_pa
     )
     record = next(c.args[0] for c in ssh.run.await_args_list if str(starts) in c.args[0])
 
-    for started in ("2026-11-06T10:00:00.1Z", "2026-11-06T10:30:00.1Z"):
+    # the middle start's RestartCount says Docker restarted it during the remount: no window for it
+    runs = ((0, "2026-11-06T10:00:00.1Z"), (1, "2026-11-06T10:15:00.1Z"), (0, "2026-11-06T10:30:00.1Z"))
+    for restarts, started in runs:
         docker = tmp_path / "docker"
-        docker.write_text(f'#!/bin/sh\necho "cid {started}"\n')
+        docker.write_text(f'#!/bin/sh\necho "cid {restarts} {started}"\n')
         docker.chmod(0o755)
-        subprocess.run(["sh", "-c", record.replace("/usr/bin/docker", str(docker))], check=True)
+        subprocess.run(["sh", "-c", record.replace("/usr/bin/docker", str(docker))])
 
-    assert (starts / "cid").read_text().split() == ["1793959200", "1793961000"]
+    lines = [line.split() for line in (starts / "cid").read_text().splitlines()]
+    assert [line[0] for line in lines] == ["1793959200", "1793961000"]
+    assert all(int(end) >= int(start) for start, end in lines)
 
 
 @pytest.mark.asyncio
