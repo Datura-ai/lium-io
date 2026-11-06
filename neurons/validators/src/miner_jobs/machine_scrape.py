@@ -956,12 +956,17 @@ def containerd_store_root(info, plugin):
             raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
         # no ctr on the host (a Docker install without containerd's CLI): the built-in root of the system
         # containerd, else of Docker's own one; unknown when containerd's config moves the root, as the built-in
-        # folder may be a leftover. shortcut: a root set by containerd's --root flag is not seen; read the process
-        # if such hosts turn up
-        if containerd_config_moves_root():
-            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and containerd's config moves its root")
+        # folder may be a leftover. The running daemon's own --root and --config flags are read off its process.
         data_root = info.get("DockerRootDir") or "/var/lib/docker"
-        for root in (f"/var/lib/containerd/{plugin}", f"{data_root}/containerd/daemon/{plugin}"):
+        argv = running_containerd_argv(address) or []
+        flag_root = containerd_flag(argv, "root")
+        if flag_root:
+            root = host_realpath(flag_root.rstrip("/"))
+            if not os.path.isdir(f"/proc/1/root{root}/{plugin}"):
+                raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no {plugin} under containerd's --root")
+            return f"{root}/{plugin}"
+        named = containerd_config_root(containerd_flag(argv, "config", "c") or "/etc/containerd/config.toml", data_root)
+        for root in [f"{named}/{plugin}"] if named else (f"/var/lib/containerd/{plugin}", f"{data_root}/containerd/daemon/{plugin}"):
             if os.path.isdir(f"/proc/1/root{root}"):
                 return root
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no containerd store at its built-in root")
@@ -979,21 +984,55 @@ def containerd_store_root(info, plugin):
     raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: containerd reports no root for {plugin}")
 
 
-def containerd_config_moves_root():
-    # containerd's config names a root other than its built-in one, a snapshotter root_path, or more config files
+def containerd_config_root(config, data_root):
+    # the built-in root containerd's config names ("" when none); unknown when it names any other root, a snapshotter
+    # root_path or more config files, as a built-in folder may then be a leftover
     try:
-        with open("/proc/1/root/etc/containerd/config.toml") as f:
+        # a stray non-UTF-8 byte must not end the read: the lines that matter are still parsed
+        with open(f"/proc/1/root{config}", errors="replace") as f:
             text = f.read()
     except OSError:
-        return False
+        return ""
+    built_in, named = ("/var/lib/containerd", f"{data_root.rstrip('/')}/containerd/daemon"), ""
     for line in text.splitlines():
         match = re.match(r"\s*(root|root_path|imports)\s*=(.*)", line.split("#", 1)[0])
         if not match:
             continue
         value = re.sub(r"[\s\"']", "", match.group(2)).rstrip("/")
-        if value not in ("", "[]") and not (match.group(1) == "root" and value == "/var/lib/containerd"):
-            return True
-    return False
+        if value in ("", "[]"):
+            continue
+        if not (match.group(1) == "root" and value in built_in):
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and containerd's config moves its root")
+        named = value
+    return named
+
+
+def running_containerd_argv(address):
+    # the command line of the containerd process serving address, or None when none is visible
+    def same(a, b):
+        return a.removeprefix("/var") == b.removeprefix("/var")  # /var/run is /run
+
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if os.path.basename(argv[0]) == "containerd" and same(
+            containerd_flag(argv, "address", "a") or "/run/containerd/containerd.sock", address
+        ):
+            return argv
+    return None
+
+
+def containerd_flag(argv, name, short=None):
+    # a flag's value as containerd parses it: -name, --name, either as "x" or "=x"
+    names = {f"-{name}", f"--{name}"} | ({f"-{short}", f"--{short}"} if short else set())
+    for i, arg in enumerate(argv):
+        key, eq, value = arg.partition("=")
+        if key in names:
+            return value if eq else (argv[i + 1] if i + 1 < len(argv) else "")
+    return None
 
 
 def host_realpath(path):

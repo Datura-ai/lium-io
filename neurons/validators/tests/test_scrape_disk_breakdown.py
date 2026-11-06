@@ -48,7 +48,9 @@ DISK_HELPERS = {
     "release_filler_cache",
     "disk_root_dir",
     "containerd_store_root",
-    "containerd_config_moves_root",
+    "containerd_config_root",
+    "running_containerd_argv",
+    "containerd_flag",
     "host_realpath",
     "CONTAINERD_ROOT_UNKNOWN",
     "on_one_filesystem",
@@ -94,6 +96,7 @@ def scrape() -> dict:
         {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket,
          "run_cmd": _ctr(_running_root("/var/lib/containerd"))},
     )
+    namespace["running_containerd_argv"] = lambda address: None  # no containerd process visible unless a test says
     return namespace
 
 
@@ -680,11 +683,12 @@ def _no_ctr(cmd):
 _DAEMON_SNAPSHOTS = f"/proc/1/root/data/docker/containerd/daemon/{_OVERLAYFS}"
 
 
-def _containerd_config(text):
-    def fake_open(path):
-        if path != "/proc/1/root/etc/containerd/config.toml" or text is None:
-            raise FileNotFoundError(path)
-        return io.StringIO(text)
+def _containerd_config(text, path="/etc/containerd/config.toml"):
+    def fake_open(asked, errors="strict"):
+        if asked != f"/proc/1/root{path}" or text is None:
+            raise FileNotFoundError(asked)
+        raw = text if isinstance(text, bytes) else text.encode()
+        return io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8", errors=errors)
 
     return fake_open
 
@@ -717,6 +721,8 @@ def test_a_host_without_ctr_is_measured_at_containerds_built_in_root(
         ('[plugins."io.containerd.snapshotter.v1.overlayfs"]\n  root_path = "/small/snapshots"\n', {_SNAPSHOTS}),
         ('imports = ["/opt/containerd/*.toml"]\n', {_SNAPSHOTS}),
         (None, {"/proc/1/root/data/docker"}),  # no store at a built-in root: never the data-root instead
+        # a non-UTF-8 byte appended to a comment must not hide the moved root
+        (b'root = "/small/containerd"\n# \xff\n', {_SNAPSHOTS, "/proc/1/root/data/docker"}),
     ],
 )
 def test_a_host_without_ctr_whose_store_cannot_be_told_is_unknown(scrape: dict, monkeypatch, config, host_dirs) -> None:
@@ -728,6 +734,35 @@ def test_a_host_without_ctr_whose_store_cannot_be_told_is_unknown(scrape: dict, 
 
     with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
         scrape["containerd_store_root"](_SNAPSHOTTER_INFO, _OVERLAYFS)
+
+
+_GiB = 1024**3
+_SMALL = _Usage(400 * _GiB, 350 * _GiB, 50 * _GiB)
+_BIG = _Usage(14 * 1024 * _GiB, 1024 * _GiB, 13 * 1024 * _GiB)
+_SMALL_SNAPSHOTS = f"/proc/1/root/small/containerd/{_OVERLAYFS}"
+
+
+@pytest.mark.parametrize(
+    "argv, config, expected",
+    [
+        # started with --root and no config: its flag root is measured, never the stale built-in folder
+        (["/usr/bin/containerd", "--root", "/small/containerd"], None, _SMALL),
+        (["containerd", "--root=/small/containerd"], None, _SMALL),
+        # Docker's own containerd, whose generated --config names data-root's daemon folder
+        (["containerd", "--config", "/run/docker/containerd/containerd.toml"], 'root = "/data/docker/containerd/daemon"\n',
+         _DOCKER_PARTITION),
+    ],
+)
+def test_a_host_without_ctr_reads_the_running_containerds_flags(scrape: dict, monkeypatch, argv, config, expected) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["run_cmd"] = _no_ctr
+    scrape["running_containerd_argv"] = lambda address: argv
+    scrape["open"] = _containerd_config(config, "/run/docker/containerd/containerd.toml")
+    paths = {_SNAPSHOTS: _BIG, _SMALL_SNAPSHOTS: _SMALL, _DAEMON_SNAPSHOTS: _DOCKER_PARTITION}
+    host_dirs = {_SNAPSHOTS, _SMALL_SNAPSHOTS, _DAEMON_SNAPSHOTS, "/proc/1/root/data/docker"}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=host_dirs, usage_by_path={**paths, "/proc/1/root/data/docker": _DOCKER_PARTITION})
+
+    assert scrape["get_host_disk_usage"]() == expected
 
 
 @pytest.mark.parametrize(
@@ -750,9 +785,6 @@ def test_an_undeterminable_containerd_root_is_not_measured(scrape: dict, monkeyp
     assert asked == []
 
 
-_GiB = 1024**3
-_SMALL = _Usage(400 * _GiB, 350 * _GiB, 50 * _GiB)
-_BIG = _Usage(14 * 1024 * _GiB, 1024 * _GiB, 13 * 1024 * _GiB)
 
 
 @pytest.mark.parametrize(
