@@ -472,6 +472,16 @@ ctrd_export_root() {
     awk -v want="$2" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF == 2 && $1 == "root" {print $2; exit}' <<<"$1"
 }
 
+ctrd_config_moves_root() {
+    # containerd's config names a root other than its built-in one, a snapshotter root_path, or more config files
+    awk '{sub(/#.*/, "")} match($0, /^[ \t]*(root|root_path|imports)[ \t]*=/) {
+        key = $0; sub(/[ \t]*=.*/, "", key); gsub(/[ \t]/, "", key)
+        value = $0; sub(/^[^=]*=[ \t]*/, "", value); gsub(/[ \t"\047]/, "", value); sub(/\/$/, "", value)
+        if (value == "" || value == "[]" || (key == "root" && value == "/var/lib/containerd")) next
+        found = 1; exit
+    } END {exit !found}' "$(host_path /etc/containerd/config.toml)" 2>/dev/null
+}
+
 resolve_disk_dir() {
     # DISK_DIR: where container root filesystems live. That is Docker's data-root, except under Docker's
     # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
@@ -492,10 +502,12 @@ resolve_disk_dir() {
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
     if ! command -v ctr &>/dev/null; then
-        # no ctr (a Docker install without containerd's CLI): containerd's built-in root when it is there, else
-        # data-root as before, so the host is not failed for a missing tool
+        # no ctr (a Docker install without containerd's CLI): the built-in root of the system containerd, else of
+        # Docker's own one; unknown when containerd's config moves the root, as the built-in folder may be a leftover
+        # shortcut: a root set by containerd's --root flag is not seen; read the process if such hosts turn up
+        ctrd_config_moves_root && return 1
         DISK_DIR=$(host_path "/var/lib/containerd/$plugin")
-        [ -d "$DISK_DIR" ] || { DISK_DIR=$data_root; return 0; }
+        [ -d "$DISK_DIR" ] || DISK_DIR=$data_root/containerd/daemon/$plugin
         listing=""
     else
         # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it

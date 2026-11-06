@@ -954,10 +954,17 @@ def containerd_store_root(info, plugin):
     except Exception as exc:
         if "proc.returncode=127" not in str(exc):
             raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
-        # no ctr on the host (a Docker install without containerd's CLI): containerd's built-in root when it is
-        # there, else data-root as before the containerd store was measured, so the node is not failed for it
-        default = f"/var/lib/containerd/{plugin}"
-        return default if os.path.isdir(f"/proc/1/root{default}") else info.get("DockerRootDir") or "/var/lib/docker"
+        # no ctr on the host (a Docker install without containerd's CLI): the built-in root of the system
+        # containerd, else of Docker's own one; unknown when containerd's config moves the root, as the built-in
+        # folder may be a leftover. shortcut: a root set by containerd's --root flag is not seen; read the process
+        # if such hosts turn up
+        if containerd_config_moves_root():
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and containerd's config moves its root")
+        data_root = info.get("DockerRootDir") or "/var/lib/docker"
+        for root in (f"/var/lib/containerd/{plugin}", f"{data_root}/containerd/daemon/{plugin}"):
+            if os.path.isdir(f"/proc/1/root{root}"):
+                return root
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr, and no containerd store at its built-in root")
     kind = name = None
     for words in (line.split() for line in listing.splitlines()):
         if words[:1] == ["Type:"]:
@@ -970,6 +977,23 @@ def containerd_store_root(info, plugin):
                 raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
             return root
     raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: containerd reports no root for {plugin}")
+
+
+def containerd_config_moves_root():
+    # containerd's config names a root other than its built-in one, a snapshotter root_path, or more config files
+    try:
+        with open("/proc/1/root/etc/containerd/config.toml") as f:
+            text = f.read()
+    except OSError:
+        return False
+    for line in text.splitlines():
+        match = re.match(r"\s*(root|root_path|imports)\s*=(.*)", line.split("#", 1)[0])
+        if not match:
+            continue
+        value = re.sub(r"[\s\"']", "", match.group(2)).rstrip("/")
+        if value not in ("", "[]") and not (match.group(1) == "root" and value == "/var/lib/containerd"):
+            return True
+    return False
 
 
 def host_realpath(path):

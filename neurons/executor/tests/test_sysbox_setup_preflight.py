@@ -460,14 +460,36 @@ def test_an_unknown_containerd_root_is_skipped_not_read_as_the_leftover(tmp_path
     assert "SKIP" in out and "is below" not in out
 
 
-@pytest.mark.parametrize("store_there, expected_rc", [(True, 1), (False, 0)])
-def test_a_host_without_ctr_is_measured_not_failed(tmp_path, store_there, expected_rc):
-    # no ctr on the host: containerd's built-in root when it is there (436 GB root disk), else the 14 TB data-root
-    env = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
-    files = {f"{SNAPSHOTS}/.keep": ""} if store_there else {}
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files, without=("ctr",))
-    assert rc == expected_rc, out
+_NO_CTR_DISKS = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {f"{SNAPSHOTS}/.keep": ""},  # the system containerd's built-in root, on the 436 GB root disk
+        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'version = 2\nroot = "/var/lib/containerd"\n'},
+    ],
+)
+def test_a_host_without_ctr_is_measured_at_containerds_built_in_root(tmp_path, files):
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert rc == 1, out
     assert "SKIP " not in out
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        # the root moved: the built-in folder is a leftover and the 14 TB data-root says nothing of the store
+        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'root = "/small/containerd"\n'},
+        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": '  root_path = "/small/snapshots"\n'},
+        {f"{SNAPSHOTS}/.keep": "", "etc/containerd/config.toml": 'imports = ["/opt/containerd/*.toml"]\n'},
+        {},  # no store at a built-in root
+    ],
+)
+def test_a_host_without_ctr_whose_store_cannot_be_told_is_skipped_not_passed(tmp_path, files):
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert rc == 0, out
+    assert "SKIP" in out and "PASS=1" not in out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────
