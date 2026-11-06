@@ -1276,21 +1276,25 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
 
 
 @pytest.mark.parametrize(
-    ("created_ago", "store", "kept", "started_ago"),
+    ("created_ago", "store", "kept", "started_ago", "docker_started_ago"),
     [
-        (0, "overlay2", False, None),  # written by the image's startup, before the first mount: not the renter's
-        (3600, "overlay2", True, None),  # written an hour after creation: an unmounted restart, the renter's
-        (3600, "overlay2", False, (0,)),  # just after a start the validator made and remounted: its entrypoint
-        (3600, "overlay2", True, (3600,)),  # long after the validator's last start: an unmounted restart by Docker
-        (3600, "overlay2", False, (0, -600)),  # after an earlier validator start, not the latest: still its entrypoint
-        (0, "containerd", False, None),  # no UpperDir in inspect: the running container's root mount names it
-        (3600, "containerd", True, None),
-        (0, "given", False, None),  # stopped on the containerd store: the upper dir the running read used
-        (0, "none", True, None),  # no upper dir anywhere: docker diff decides, and lists the startup file
-        (0, "kept", True, None),  # a copy already kept: the age bound never releases it, only docker diff decides
+        (0, "overlay2", False, None, None),  # written by the image's startup, before the first mount: not the renter's
+        (3600, "overlay2", True, None, None),  # written an hour after creation: an unmounted restart, the renter's
+        (3600, "overlay2", False, (0,), 0),  # just after a start the validator made and remounted: its entrypoint
+        (3600, "overlay2", True, (3600,), 0),  # long after the validator's last start: an unmounted restart by Docker
+        (3600, "overlay2", False, (0, -600), -600),  # after an earlier validator start, not the latest: still its entrypoint
+        (0, "containerd", False, None, None),  # no UpperDir in inspect: the running container's root mount names it
+        (3600, "containerd", True, None, None),
+        # Docker restarted it inside the validator start's window: files since then are the renter's
+        (3600, "overlay2", True, (120,), 60),
+        (0, "given", False, None, None),  # stopped on the containerd store: the upper dir the running read used
+        (0, "none", True, None, None),  # no upper dir anywhere: docker diff decides, and lists the startup file
+        (0, "kept", True, None, None),  # a copy already kept: the age bound never releases it, only docker diff decides
     ],
 )
-def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, monkeypatch, created_ago, store, kept, started_ago):
+def test_the_layer_read_skips_files_the_image_wrote_at_startup(
+    tmp_path, monkeypatch, created_ago, store, kept, started_ago, docker_started_ago
+):
     # the SSH session is the executor's container: the host's files are only under /proc/1/root
     import subprocess
     import time
@@ -1309,10 +1313,15 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, monkeyp
     inspect = {"overlay2": f"{created} 4242 {host_upper}", "containerd": f"{created} 4242 <no value>"}.get(
         store, f"{created} 0 <no value>"
     )
+    docker_started = (
+        "0001-01-01T00:00:00Z"
+        if docker_started_ago is None
+        else time.strftime("%Y-%m-%dT%H:%M:%S.1Z", time.gmtime(int(time.time()) - docker_started_ago))
+    )
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        f'case "$3" in *Created*) echo "{inspect}"; exit;; *.Id*) echo cid; exit;; esac\n'
+        f'case "$3" in *Created*) echo "{inspect}"; exit;; *StartedAt*) echo "cid {docker_started}"; exit;; *.Id*) echo cid; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         # docker diff lists the same file: only the upper-dir read can tell it is startup noise
         '[ "$1" = diff ] && { printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }\n'

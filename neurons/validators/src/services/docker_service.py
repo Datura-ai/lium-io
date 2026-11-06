@@ -1766,10 +1766,13 @@ def _layer_data_check(
         f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && c=\"${{c#* }}\" && p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
         f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
         f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
-        # one window per recorded start: entrypoint files from every start the validator remounted are startup writes
-        f"&& {{ w=; for s in $(cat {_VALIDATOR_STARTS_DIR}/\"$(/usr/bin/docker inspect -f '{{{{.Id}}}}' {name})\" 2>/dev/null); "
-        "do case \"$s\" in *[!0-9]*) continue;; esac; "
-        f"w=\"$w ! ( -newerct @$s ! -newerct @$((s + {_STARTUP_WRITE_SECONDS})) )\"; done; true; }} "
+        # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
+        f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
+        "g=$(date -d \"${i#* }\" +%s 2>/dev/null) || g=0; w=; "
+        f"for s in $(cat {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\" 2>/dev/null); "
+        f"do case \"$s\" in *[!0-9]*) continue;; esac; e=$((s + {_STARTUP_WRITE_SECONDS})); "
+        "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
+        "w=\"$w ! ( -newerct @$s ! -newerct @$e )\"; done; true; } "
         f"&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
         "$w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
