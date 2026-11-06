@@ -669,7 +669,27 @@ def test_the_running_containerds_root_is_measured_not_its_config(scrape: dict, m
 
 
 def _ctr_fails(cmd):
-    raise RuntimeError("chroot: failed to run command 'ctr': No such file or directory")
+    raise RuntimeError("run_cmd error proc.returncode=1 proc.stderr='ctr: connection refused'")
+
+
+def _no_ctr(cmd):
+    raise RuntimeError("run_cmd error proc.returncode=127 proc.stderr=\"chroot: failed to run command 'ctr'\"")
+
+
+@pytest.mark.parametrize(
+    "host_dirs, expected",
+    [
+        ({_SNAPSHOTS, "/proc/1/root/data/docker"}, _ROOT_PARTITION),  # containerd's built-in root
+        ({"/proc/1/root/data/docker"}, _DOCKER_PARTITION),  # no such root: data-root, as before the store was measured
+    ],
+)
+def test_a_host_without_ctr_is_measured_not_failed(scrape: dict, monkeypatch, host_dirs, expected) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["run_cmd"] = _no_ctr
+    paths = {_SNAPSHOTS: _ROOT_PARTITION, "/proc/1/root/data/docker": _DOCKER_PARTITION}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=host_dirs, usage_by_path=paths)
+
+    assert scrape["get_host_disk_usage"]() == expected
 
 
 @pytest.mark.parametrize(

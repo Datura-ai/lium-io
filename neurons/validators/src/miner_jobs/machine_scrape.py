@@ -952,7 +952,12 @@ def containerd_store_root(info, plugin):
     try:
         listing = run_cmd(f"timeout 20 chroot /proc/1/root ctr --address {address} plugins ls -d")
     except Exception as exc:
-        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
+        if "proc.returncode=127" not in str(exc):
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
+        # no ctr on the host (a Docker install without containerd's CLI): containerd's built-in root when it is
+        # there, else data-root as before the containerd store was measured, so the node is not failed for it
+        default = f"/var/lib/containerd/{plugin}"
+        return default if os.path.isdir(f"/proc/1/root{default}") else info.get("DockerRootDir") or "/var/lib/docker"
     kind = name = None
     for words in (line.split() for line in listing.splitlines()):
         if words[:1] == ["Type:"]:

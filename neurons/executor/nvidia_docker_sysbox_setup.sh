@@ -489,11 +489,19 @@ resolve_disk_dir() {
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
     address=$(docker info --format '{{with .Containerd}}{{.Address}}{{end}}' 2>/dev/null)
     [ -n "$address" ] || return 1
-    # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it
-    listing=$(ctr --address "$address" plugins ls -d 2>/dev/null) || return 1
     plugin=io.containerd.snapshotter.v1.$(docker info --format '{{.Driver}}' 2>/dev/null)
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
-    DISK_DIR=$(ctrd_export_root "$listing" "$plugin")
+    if ! command -v ctr &>/dev/null; then
+        # no ctr (a Docker install without containerd's CLI): containerd's built-in root when it is there, else
+        # data-root as before, so the host is not failed for a missing tool
+        DISK_DIR=$(host_path "/var/lib/containerd/$plugin")
+        [ -d "$DISK_DIR" ] || { DISK_DIR=$data_root; return 0; }
+        listing=""
+    else
+        # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it
+        listing=$(ctr --address "$address" plugins ls -d 2>/dev/null) || return 1
+        DISK_DIR=$(ctrd_export_root "$listing" "$plugin")
+    fi
     # a root that is not there is unknown, not the data-root
     [ -n "$DISK_DIR" ] && [ -d "$DISK_DIR" ] || return 1
     # pulled image layers land in the content store first, which may be another filesystem than the snapshots

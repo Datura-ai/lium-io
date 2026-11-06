@@ -460,6 +460,16 @@ def test_an_unknown_containerd_root_is_skipped_not_read_as_the_leftover(tmp_path
     assert "SKIP" in out and "is below" not in out
 
 
+@pytest.mark.parametrize("store_there, expected_rc", [(True, 1), (False, 0)])
+def test_a_host_without_ctr_is_measured_not_failed(tmp_path, store_there, expected_rc):
+    # no ctr on the host: containerd's built-in root when it is there (436 GB root disk), else the 14 TB data-root
+    env = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+    files = {f"{SNAPSHOTS}/.keep": ""} if store_there else {}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files, without=("ctr",))
+    assert rc == expected_rc, out
+    assert "SKIP " not in out
+
+
 # ── free disk for the node's images and VerifyX's storage test ───────────────
 
 
