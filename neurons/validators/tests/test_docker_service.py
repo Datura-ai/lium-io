@@ -9462,6 +9462,52 @@ async def test_fresh_sizing_leaves_room_for_the_flatten_it_admits(
             await create
 
 
+@pytest.mark.asyncio
+async def test_fresh_sizing_leaves_the_flatten_room_for_what_the_create_writes_before_it(docker_service):
+    """Regression (4 Nov, a 16 TiB node): the grant's GiB floors left the flatten ~65 MB, and what the create wrote
+    before the flatten's disk check (its container, its volumes) used that up: the copy was refused."""
+    avail = 200 * _GIB
+    sizing = await docker_service.resolve_volume_sizing(
+        _make_sizing_ssh_client(df_avail_bytes=avail),
+        _make_sizing_payload(disk_share=1.0, storage_limit_gb=1, volume_limit_gb=None, min_volume_gb=None),
+        "tag",
+        {},
+        locked_df_avail_bytes=avail,
+        flatten_copy_bytes=_COPY,
+    )
+    client = _SysboxFailingRentalClient({"sglang"})
+    create = _create_with_flatten(
+        docker_service,
+        client,
+        _flatten_on_disk(avail - 2 * _GIB, 24 * _GIB),  # 2 GiB written between the sizing and the copy
+        reserved_bytes=docker_service_module._flatten_reserved_bytes(
+            sizing.storage_limit_gb, sizing.volume_limit_gb, 1.0
+        ),
+    )
+
+    assert await create == "cid"
+    assert client.events[-1] == "run lium-flattened:abc"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "copy, layers, expected",
+    [
+        (None, "/pod_old 5g 0\n", None),  # no copy to budget: nothing read
+        (_COPY, "", _COPY),
+        # the flatten's check keeps a neighbour's unwritten layer free: the sizing budgets it too
+        (_COPY, "/pod_old 5g 1073741824\n/filler 2g 0\n", _COPY + 6 * _GIB),
+        (_COPY, "garbled", _COPY),  # unreadable: the copy alone, the flatten's own check still guards
+    ],
+    ids=["no_copy", "no_neighbours", "neighbours", "unreadable"],
+)
+async def test_flatten_sizing_budget_adds_the_neighbours_unwritten_layers(copy, layers, expected):
+    ssh = _node_ssh(layers)
+    with patch.object(docker_service_module, "flatten_copy_bytes", AsyncMock(return_value=copy)):
+        assert await docker_service_module._flatten_sizing_budget(ssh, "sglang", "pod_x") == expected
+    assert ssh.run.await_count == (0 if copy is None else 1)
+
+
 def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
     registry = docker_service_module._CustomerCreateRegistry()
     own, other = (Mock(miner_hotkey="hk", executor_id="ex", workload_kind=WorkloadKind.CUSTOMER_RENTAL) for _ in range(2))

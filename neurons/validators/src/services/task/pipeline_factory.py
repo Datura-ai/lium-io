@@ -60,6 +60,7 @@ from .checks import (
     InspectorRentedCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
+    NodeAccountCheck,
     NvlinkFaultCheck,
     NvmlDigestCheck,
     PinnedMemoryProbeCheck,
@@ -73,6 +74,7 @@ from .checks import (
     RentalVerificationCheck,
     RentedGpuDropCheck,
     RentedPodNetworkCheck,
+    RentedPodOwnershipCheck,
     RentedPodResourcesCheck,
     RentedThroughputCheck,
     ScoreCheck,
@@ -88,6 +90,7 @@ from .checks import (
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
+    VerifyXColdRetryCheck,
 )
 from .pipeline import (
     Check,
@@ -304,6 +307,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # DAH-5729: before any work on the node, the node must be the registering account's
+                NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -407,6 +412,7 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
@@ -446,6 +452,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -498,6 +506,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # DAH-5729: before any work on the node, the node must be the registering account's
+                NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -537,6 +547,7 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
@@ -570,6 +581,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -620,6 +633,7 @@ class PipelineFactory:
                 # DAH-4564: read-only docker inspect + /proc read — safe in dry run.
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
+                RentedPodOwnershipCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),

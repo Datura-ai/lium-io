@@ -110,6 +110,14 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     # the external volume is attached, nested Docker is turned off for it on this node
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    # DAH-5301: a reboot found a pod GPU hung and reset it before the new container started
+    HungGpuReset = "HungGpuReset"
+    # ...or found one hung and could not reset it: MIG, an NVLink peer outside the pod, a process
+    # outside the pod on it, or the driver refused the reset
+    HungGpuNotResetMig = "HungGpuNotResetMig"
+    HungGpuNotResetNvlinkShared = "HungGpuNotResetNvlinkShared"
+    HungGpuNotResetInUse = "HungGpuNotResetInUse"
+    HungGpuNotResetUnsupported = "HungGpuNotResetUnsupported"
 
 
 class ValidatorMessage(Message, DeliveryStamps):
@@ -316,6 +324,9 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None = the
     # publisher does not probe; [] = it probed and the node has no pod to probe.
     pod_ssh: list[PodSshObservation] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
+    # This cycle's DinD test container started on the host and its sshd never answered (a failing container
+    # runtime). None from a publisher that predates the field.
+    host_runtime_fault: bool | None = None
 
 
 @VALIDATOR_MESSAGES.register
