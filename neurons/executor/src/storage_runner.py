@@ -28,6 +28,7 @@ DOCKER_BINARY = "/usr/bin/docker"
 DETACHED_ENV = "LIUM_STORAGE_DETACHED"
 # The detached runner prints this once it has read its spec from stdin; the spec is never in argv, env or a file.
 SPEC_RECEIVED = "storage-runner-spec-received"
+SPEC_HANDOFF_TIMEOUT_SECONDS = 60
 
 
 def _cancel_on_sigterm(signum: int, frame: object) -> None:
@@ -130,7 +131,13 @@ def _run_detached(arguments: argparse.Namespace) -> int:
         message = f"storage runner container did not start: {(started.stderr or '').strip()[-500:]}"
         print(json.dumps({"event": "result", "status": "FAILED", "message": message}), flush=True)
         return 1
-    _send_spec(name, payload)
+    if not _send_spec(name, payload):
+        subprocess.run([DOCKER_BINARY, "rm", "--force", name], capture_output=True)
+        message = (
+            f"storage runner container did not read its spec within {SPEC_HANDOFF_TIMEOUT_SECONDS}s"
+        )
+        print(json.dumps({"event": "result", "status": "FAILED", "message": message}), flush=True)
+        return 1
 
     def cancel_requested() -> bool:
         return bool(arguments.cancel_file) and Path(arguments.cancel_file).exists()
@@ -161,8 +168,8 @@ def _run_detached(arguments: argparse.Namespace) -> int:
         return 1
 
 
-def _send_spec(name: str, payload: Mapping[str, object]) -> None:
-    """Write the spec to the runner's stdin and detach once the runner confirms it has read it."""
+def _send_spec(name: str, payload: Mapping[str, object]) -> bool:
+    """Write the spec to the runner's stdin; False when the runner neither confirms nor exits in time."""
     attach = subprocess.Popen(
         [DOCKER_BINARY, "attach", "--sig-proxy=false", name],
         stdin=subprocess.PIPE,
@@ -170,18 +177,25 @@ def _send_spec(name: str, payload: Mapping[str, object]) -> None:
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    try:
-        attach.stdin.write(json.dumps(payload) + "\n")  # type: ignore[union-attr]
-        attach.stdin.flush()  # type: ignore[union-attr]
-        # shortcut: no timeout; a runner that never reads stdin blocks here until it exits (EOF).
-        for line in attach.stdout:  # type: ignore[union-attr]
-            if SPEC_RECEIVED in line:
-                break
-    except BrokenPipeError:
-        pass  # the runner already exited; docker wait reports its status
-    finally:
-        attach.kill()
-        attach.wait()
+    finished = threading.Event()
+
+    def hand_over() -> None:
+        try:
+            attach.stdin.write(json.dumps(payload) + "\n")  # type: ignore[union-attr]
+            attach.stdin.flush()  # type: ignore[union-attr]
+            for line in attach.stdout:  # type: ignore[union-attr]
+                if SPEC_RECEIVED in line:
+                    break
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        # a confirmation or an exited runner (EOF; docker wait then reports its status) both end the handoff
+        finished.set()
+
+    threading.Thread(target=hand_over, daemon=True).start()
+    in_time = finished.wait(SPEC_HANDOFF_TIMEOUT_SECONDS)
+    attach.kill()
+    attach.wait()
+    return in_time
 
 
 def _forward_cancel(name: str, cancel_requested: object, stop: threading.Event) -> None:

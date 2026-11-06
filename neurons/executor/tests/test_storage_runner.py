@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -2336,3 +2337,42 @@ def test_detached_runner_reads_its_spec_from_stdin(
         signal.signal(signal.SIGTERM, previous)
     assert ran[0].operation_id == OPERATION_ID
     assert storage_runner.SPEC_RECEIVED in capsys.readouterr().out
+
+
+def test_spec_handoff_timeout_removes_the_runner_and_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    spec = tmp_path / "op.json"
+    spec.write_text(json.dumps(_operation_payload()))
+    spec.chmod(0o600)
+    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec)])
+    monkeypatch.setenv("LIUM_STORAGE_HELPER_IMAGE", "sha256:" + "c" * 64)
+    monkeypatch.delenv(storage_runner.DETACHED_ENV, raising=False)
+    monkeypatch.setattr(storage_runner, "SPEC_HANDOFF_TIMEOUT_SECONDS", 0.2)
+    calls: list[list[str]] = []
+    killed = threading.Event()
+
+    def never_confirms() -> Iterator[str]:
+        killed.wait(5)  # a stuck runner: no output until the attach client is killed
+        return
+        yield
+
+    def fake_popen(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(stdin=io.StringIO(), stdout=never_confirms(), kill=killed.set, wait=lambda: 0)
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(storage_runner.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(storage_runner.subprocess, "run", fake_run)
+    started = time.monotonic()
+    assert storage_runner.main() == 1
+    assert time.monotonic() - started < 3
+    name = storage_runner.runner_container_name(str(OPERATION_ID))
+    assert killed.is_set() and calls[-1][1:] == ["rm", "--force", name]
+    assert not any(command[1] == "wait" for command in calls)
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert result["status"] == "FAILED" and "did not read its spec" in result["message"]
+    assert "repository-password" not in result["message"]
