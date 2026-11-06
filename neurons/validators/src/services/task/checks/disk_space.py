@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import replace
 from typing import Any
@@ -23,6 +24,13 @@ async def _any_listed_rental_active(ctx: Context, pods: list) -> bool:
         if not rental_active or rental_active.active:
             return True
     return False
+
+
+async def _rental_active(ctx: Context, pods: list, limit_s: float | None) -> bool:
+    try:
+        return await asyncio.wait_for(_any_listed_rental_active(ctx, pods), timeout=limit_s)
+    except TimeoutError:
+        return True
 
 
 def _as_float(value: Any) -> float:
@@ -97,7 +105,9 @@ class DiskSpaceCheck:
     check_id = "executor.validate.disk_space"
     fatal = True
 
-    async def run(self, ctx: Context) -> CheckResult:
+    async def run(self, ctx: Context, rental_lookup_timeout: float | None = None) -> CheckResult:
+        """`rental_lookup_timeout` caps the backend's per-pod rental lookup; a slower answer counts as
+        a live rental, like an unknown one (VerifyXColdRetryCheck, which runs this near the deadline)."""
         hard_disk = (ctx.state.specs or {}).get("hard_disk")
         what: dict[str, Any] = {
             "max_utilization_percent": MAX_DISK_UTILIZATION_PERCENT,
@@ -122,6 +132,16 @@ class DiskSpaceCheck:
                     passed=True,
                     event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what),
                 )
+        # DAH-5462: a cold retry may replace these readings; VerifyXColdRetryCheck judges the sample it keeps
+        if ctx.state.verifyx_cold_retry is not None:
+            event = render_message(
+                template,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what, "judged_after_cold_retry": True},
+                impact="Proceed; judged again on the VerifyX sample the cold retry keeps",
+            )
+            return CheckResult(passed=True, event=event)
         # same ownership rule as TenantEnforcementCheck: another miner's rental on a different
         # endpoint does not exempt this node
         rental = rental_of_this_node(ctx)
@@ -130,7 +150,7 @@ class DiskSpaceCheck:
         if (
             rental
             and rental.pods
-            and (ctx.rented or await _any_listed_rental_active(ctx, rental.pods))
+            and (ctx.rented or await _rental_active(ctx, rental.pods, rental_lookup_timeout))
         ):
             # the free splits are listed only while the host keeps the whole-host floor
             per_split = split_disk(ctx, rental.pods, free_kb) if math.isfinite(free_kb) else None
