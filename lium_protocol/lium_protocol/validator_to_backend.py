@@ -58,6 +58,10 @@ class ValidatorMessageType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
     # 1.16.0: the answer to ResetPodGpuRequest
     PodGpuResetResult = "PodGpuResetResult"
+    # 2.4.0: the answer to LockPodGpuClocksRequest
+    PodGpuClocksResult = "PodGpuClocksResult"
+    # 2.5.0: after its start sweep, the creates a new connector runs again (DAH-5437)
+    ResumedCreatesReport = "ResumedCreatesReport"
 
 
 VALIDATOR_MESSAGES: Registry[ValidatorMessage] = Registry(ValidatorMessageType)
@@ -106,6 +110,14 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     # the external volume is attached, nested Docker is turned off for it on this node
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    # DAH-5301: a reboot found a pod GPU hung and reset it before the new container started
+    HungGpuReset = "HungGpuReset"
+    # ...or found one hung and could not reset it: MIG, an NVLink peer outside the pod, a process
+    # outside the pod on it, or the driver refused the reset
+    HungGpuNotResetMig = "HungGpuNotResetMig"
+    HungGpuNotResetNvlinkShared = "HungGpuNotResetNvlinkShared"
+    HungGpuNotResetInUse = "HungGpuNotResetInUse"
+    HungGpuNotResetUnsupported = "HungGpuNotResetUnsupported"
 
 
 class ValidatorMessage(Message, DeliveryStamps):
@@ -246,6 +258,19 @@ class PodStatesReport(ValidatorMessage):
 
 
 @VALIDATOR_MESSAGES.register
+class ResumedCreatesReport(ValidatorMessage):
+    """2.5.0 (DAH-5437): sent once, first on the connector's first authenticated socket after its start sweep.
+    `pod_ids` are the creates the previous connector was running that were cut off; the validator keeps no copy
+    of a create request, so the backend sends each listed create again from its own records, and each gets its
+    own reply. A create sent before this socket authenticated, still waiting and not listed, was lost with the
+    old connector: the backend fails it at once. An older validator never sends this, and the backend then
+    changes nothing."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.ResumedCreatesReport
+    pod_ids: list[str] = pydantic.Field(default_factory=list)
+
+
+@VALIDATOR_MESSAGES.register
 class ExecutorSpecRequest(ValidatorMessage):
     """One executor's result for one cycle. `specs` is the scraped machine description; the backend types
     it as its `MachineSpecs`, the validator sends whatever the scraper produced, so the wire type is a
@@ -299,6 +324,9 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None = the
     # publisher does not probe; [] = it probed and the node has no pod to probe.
     pod_ssh: list[PodSshObservation] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
+    # This cycle's DinD test container started on the host and its sshd never answered (a failing container
+    # runtime). None from a publisher that predates the field.
+    host_runtime_fault: bool | None = None
 
 
 @VALIDATOR_MESSAGES.register
@@ -451,7 +479,8 @@ class SshPubKeyRemoved(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
-    # the failed request's command_id; echoed for an AddSshPublicKeyRequest, empty otherwise
+    # the failed request's command_id, echoed for an AddSshPublicKeyRequest and (since lium-io#2028) a
+    # ContainerCreateRequest; empty otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None
@@ -532,6 +561,8 @@ class GpuResetErrorCode(enum.Enum):
     ContainerNotFound = "ContainerNotFound"
     OperationInProgress = "OperationInProgress"
     ExecutorUnreachable = "ExecutorUnreachable"
+    # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
+    ClockLockNotSupported = "ClockLockNotSupported"
 
 
 class GpuResetOutcome(pydantic.BaseModel):
@@ -553,4 +584,27 @@ class PodGpuResetResult(PodContainerResponse):
     error_code: GpuResetErrorCode | None = None
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
+    detail: str | None = None
+
+
+class GpuClockOutcome(pydantic.BaseModel):
+    index: int
+    uuid: str
+    result: Literal["locked", "reset", "failed"]
+    applied_min_mhz: int | None = None
+    applied_max_mhz: int | None = None
+    detail: str | None = None
+
+
+@VALIDATOR_MESSAGES.register
+class PodGpuClocksResult(PodContainerResponse):
+    """2.4.0: the answer to `backend_to_validator.LockPodGpuClocksRequest`, same `request_id`.
+    `gpus` is one outcome per GPU touched, with the clamped range applied; empty when a precheck refused
+    before anything changed, when `detail` says why. `error_code` reuses `GpuResetErrorCode`."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.PodGpuClocksResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    gpus: list[GpuClockOutcome] = []
     detail: str | None = None

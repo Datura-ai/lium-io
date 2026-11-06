@@ -8,7 +8,8 @@ RUN apt-get update \
 
 WORKDIR /app
 
-RUN pip install -U pdm
+# pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
+RUN pip install "pdm[locked]==2.29.3" "unearth<0.19"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./

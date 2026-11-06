@@ -6,6 +6,7 @@ from typing import Annotated
 
 import asyncssh
 import bittensor
+import redis.exceptions
 from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
@@ -23,10 +24,15 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import MAX_PEER_TEXT_LENGTH, availability_errors, build_ssh_unreachable_event
+from .availability import (
+    MAX_PEER_TEXT_LENGTH,
+    availability_errors,
+    build_ssh_unreachable_event,
+    failed_check_event,
+)
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
-from .models import JobResult, ValidationEvent, build_msg
+from .models import VALIDATOR_REDIS_UNAVAILABLE, JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
@@ -206,6 +212,7 @@ class TaskService:
                     gpu_attestation_passed=gpu_attestation_passed,
                     first_pass=first_pass,
                     encrypted_private_key=encrypted_private_key,
+                    task_started_at=task_started_at,
                 )
 
                 # Build and run validation pipeline
@@ -245,8 +252,11 @@ class TaskService:
                 result.ssh_host_key_verified = known_hosts_policy is not None
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
+                # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
+                failed = failed_check_event(ok, events)
                 result.availability_errors = [
-                    error.model_dump(mode="json") for error in availability_errors(events)
+                    error.model_dump(mode="json")
+                    for error in availability_errors([*events, failed] if failed else events)
                 ]
                 # DAH-3405: the last event is the one that ended the run — the failed fatal check,
                 # the finalize event of a run that completed without a score, or the rented halt
@@ -291,6 +301,9 @@ class TaskService:
                 if has_reached_the_node and _is_ssh_transport_failure(e):
                     event = _transport_unreachable_event(executor_uuid=executor_info.uuid, error=e)
                     failure_reason_code = event.reason_code
+                elif isinstance(e, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):
+                    # DAH-5805: the validator's own Redis ended the run; the cycle withholds it instead of scoring 0
+                    failure_reason_code = VALIDATOR_REDIS_UNAVAILABLE
                 log_text = _m(
                     "Pipeline validation error",
                     extra=get_extra_info({
@@ -307,7 +320,7 @@ class TaskService:
                 # A cycle that opened the shell proves the node is reachable, so it reports an
                 # empty list and re-lists a node an earlier cycle hid. A cycle that never got
                 # there says nothing, and must not clear what the cycle before it found.
-                availability_problems = [] if has_reached_the_node else None
+                availability_problems = [] if has_reached_the_node and failure_reason_code != VALIDATOR_REDIS_UNAVAILABLE else None
             logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,

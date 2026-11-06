@@ -95,6 +95,9 @@ class RentedExecutor(BaseModel):
     owner_flag: bool = False
     # DAH-2348: volumes of the node's paused pods, which are not in `pods`; never swept. Empty from an older backend.
     kept_volume_names: list[str] = []
+    # DAH-5244 (protocol 2.1.0): a pod on the node has an open rental contracted as a self-rent. A backend
+    # before 2.1.0 omits it, so every rental reads as a third party's - today's behaviour.
+    self_rent: bool = False
 
     def get_rented_ports(self) -> list[int]:
         """Aggregate rented ports from all pods."""
@@ -154,6 +157,13 @@ class FillerRevenueByGpuConfig(BaseModel):
     gpu_hours: float  # the filler GPU-hours the average was taken over
 
 
+class MaintenanceWindow(BaseModel):
+    """A provider maintenance window, UTC, half-open: [starting_at, expiring_at)."""
+
+    starting_at: datetime
+    expiring_at: datetime
+
+
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
@@ -191,9 +201,12 @@ class RentedExecutorsResponse(BaseModel):
     # and rentals are untouched. A held new node is also absent from the Discord list above.
     # Additive with an empty default: an older backend names nobody.
     provider_email_held_executor_ids: list[str] = []
-    # executor_ids whose rentals drew hardware-fault reports from at least two distinct renters in the
-    # backend's report window (DAH-4482): each owes a post-rental GPU recheck. Additive with an empty default.
-    renter_hardware_fault_executor_ids: list[str] = []
+    # executor_ids inside a running provider maintenance window (DAH-4709): no incentive from either pool,
+    # rented or not. Additive with an empty default: an older backend names nobody.
+    maintenance_executor_ids: list[str] = []
+    # executor_id → its maintenance window (DAH-4709): a node whose cycle started inside it fails
+    # PROVIDER_MAINTENANCE. Additive with an empty default: an older backend names no window.
+    maintenance_windows_by_executor: dict[str, MaintenanceWindow] = {}
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).
     default_job_owner_by_executor: dict[str, str] = {}
@@ -228,6 +241,10 @@ class RentedExecutorsResponse(BaseModel):
         return (executor.kept_volume_names if executor else []) or self.kept_volume_names_by_executor.get(
             str(executor_uuid), []
         )
+    # DAH-5510: old containers of pods moved off a down node, which the backend keeps on that node until their
+    # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
+    # and its volume_<pod_id>. An older backend names none.
+    retained_container_names: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

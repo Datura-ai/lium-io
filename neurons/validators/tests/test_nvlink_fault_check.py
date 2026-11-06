@@ -1,12 +1,10 @@
 import json
 from datetime import UTC, datetime
-from unittest.mock import patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX
 from neurons.validators.src.services.task import pipeline_factory
-from neurons.validators.src.services.task.checks import nvlink_fault
 from neurons.validators.src.services.task.checks.nvlink_fault import (
     PROBE_JSON_MARKER,
     PROBE_SOURCE,
@@ -72,31 +70,14 @@ FAULT = report(status="fault", error="gpu 0: cuMulticastBindMem -> CUresult 401"
 
 
 @pytest.mark.asyncio
-async def test_a_board_whose_nvlink_multicast_cannot_bind_fails_when_enforced(context_factory):
-    with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", True):
-        result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
+async def test_a_board_whose_nvlink_multicast_cannot_bind_fails(context_factory):
+    result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
 
     assert result.passed is False
     assert NvlinkFaultCheck.fatal is True
     assert result.event.reason_code == "NVLINK_FAULT"
     assert result.event.severity == "error"
     assert "401" in result.event.what_we_saw["probe"]["error"]
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_logs_the_fault_and_the_node_passes(context_factory):
-    # shadow first (taiberium, 23 Oct): ~100 all-NVLink nodes, false-fail count unknown until the logs show it
-    assert (
-        type(nvlink_fault.settings).model_fields["NVLINK_FAULT_ENFORCEMENT_ENABLED"].default
-        is False
-    )
-    with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", False):
-        result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
-
-    assert result.passed is True
-    assert result.event.reason_code == "NVLINK_FAULT"
-    assert result.event.severity == "warning"
-    assert "NOT changed" in result.event.impact
 
 
 @pytest.mark.asyncio
@@ -211,7 +192,7 @@ def test_probe_reports_any_other_error_as_could_not_measure():
 
 
 @pytest.mark.asyncio
-async def test_active_filler_skips_the_probe(context_factory):
+async def test_the_probe_runs_beside_an_active_filler_and_a_fault_fails(context_factory):
     rented_data = RentedExecutorsResponse(
         executors={},
         banned_guids=[],
@@ -220,6 +201,111 @@ async def test_active_filler_skips_the_probe(context_factory):
 
     result, runner = await run_check(context_factory, NVLINK_BOARD, FAULT, rented_data=rented_data)
 
-    assert result.passed is True
-    assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert runner.calls[0]["stdin_text"] == PROBE_SOURCE
+
+
+def sxm_board(name="NVIDIA H100 80GB HBM3", count=8, nvlink=False, nvlink_pairs=0):
+    return {
+        "gpu": {"count": count, "details": [{"name": name} for _ in range(count)]},
+        "interconnect": {
+            "nvlink": nvlink,
+            "nvlink_pairs": nvlink_pairs,
+            "nvlink_active_links": 0,
+            "pcie_class": "SYS",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_full_sxm_board_without_nvlink_fails_without_probing(context_factory):
+    result, runner = await run_check(context_factory, sxm_board(name="NVIDIA H200"))
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVLINK_MISSING"
+    assert result.event.severity == "error"
+    assert result.event.what_we_saw["gpu_name"] == "NVIDIA H200"
+    assert result.event.what_we_saw["gpu_count"] == 8
     assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_h100_sxm_without_nvlink_is_an_adapter_build_and_passes(context_factory):
+    # DAH-5677: H100 SXM modules on PCIe adapter boards are listed as H100 PCIe, at any GPU count
+    for specs in (sxm_board(), sxm_board(name="Tesla H100 80GB HBM3"), sxm_board(count=2)):
+        result, runner = await run_check(context_factory, specs)
+
+        assert result.passed is True
+        assert result.event.reason_code == Msg.SKIPPED.reason
+        assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_hgx_h100_board_with_some_nvlink_pairs_down_still_fails(context_factory):
+    result, _ = await run_check(context_factory, sxm_board(nvlink_pairs=20))
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVLINK_MISSING"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "specs",
+    [
+        sxm_board(count=4),  # a VM slice of a baseboard can lack NVLink
+        sxm_board(name="NVIDIA H100 PCIe"),
+        sxm_board(name="NVIDIA H200 NVL"),
+        {"gpu": sxm_board()["gpu"]},  # no interconnect scrape: unknown, not a fault
+        {**sxm_board(), "interconnect": {"pcie_class": "SYS"}},
+    ],
+)
+async def test_boards_that_may_lack_nvlink_are_skipped(context_factory, specs):
+    result, runner = await run_check(context_factory, specs)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SKIPPED.reason
+    assert runner.calls == []
+
+
+def test_an_adapter_build_is_listed_and_published_as_h100_pcie():
+    from neurons.validators.src.services.gpu_spec_table import (
+        is_sxm_on_pcie_adapter,
+        list_sxm_on_pcie_adapter_as_pcie,
+    )
+    from neurons.validators.src.services.task.result_handler import _canonicalize_published_gpu_names
+
+    adapter = sxm_board(name="Tesla H100 80GB HBM3")
+    assert is_sxm_on_pcie_adapter(adapter)
+    assert {gpu["name"] for gpu in _canonicalize_published_gpu_names(adapter)["gpu"]["details"]} == {
+        "NVIDIA H100 PCIe"
+    }
+    # an HGX board, one GPU (nvlink None), another SXM-only model and an old executor keep their name
+    for specs in (
+        sxm_board(nvlink=True),
+        sxm_board(nvlink_pairs=20),  # an HGX board with some pairs down
+        {**sxm_board(), "interconnect": {"nvlink": False}},  # no pair count: not judged
+        {**sxm_board(count=1), "interconnect": {"nvlink": None}},
+        sxm_board(name="NVIDIA H200"),
+        {"gpu": sxm_board()["gpu"]},
+    ):
+        assert not is_sxm_on_pcie_adapter(specs)
+        details = specs["gpu"]["details"]
+        assert list_sxm_on_pcie_adapter_as_pcie(specs, details) is details
+
+
+@pytest.mark.asyncio
+async def test_an_adapter_node_verified_under_its_sxm_name_keeps_its_verification(context_factory):
+    from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
+
+    for previous, current, passed in (
+        ("NVIDIA H100 80GB HBM3:8", "NVIDIA H100 PCIe:8", True),
+        ("NVIDIA H100 PCIe:8", "NVIDIA H100 80GB HBM3:8", True),
+        ("NVIDIA H100 80GB HBM3:8", "NVIDIA H100 PCIe:4", False),
+        ("NVIDIA H200:8", "NVIDIA H100 PCIe:8", False),
+    ):
+        context = context_factory(state=build_state(gpu_model_count=current), verified={"spec": previous})
+
+        result = await SpecChangeCheck().run(context)
+
+        assert result.passed is passed, (previous, current)

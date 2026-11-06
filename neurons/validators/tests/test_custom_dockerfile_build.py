@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import subprocess
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -35,7 +36,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     PayloadPortMapping,
 )
-from services.docker_service import DockerService
+from services.docker_service import DockerService, custom_build_export_timeout
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -488,6 +489,205 @@ async def test_A12_sysbox_unavailable_aborts_before_build(svc, monkeypatch):
     assert not any("docker build" in c for c in esl.seen)
 
 
+@pytest.mark.asyncio
+async def test_A6_build_timeout_carries_the_step_that_was_running(svc, monkeypatch):
+    """A timed-out build ships no tail itself; the renter still gets the last lines from the build
+    log in the DinD container, then the timeout line."""
+    ssh_client = _make_dind_ssh()
+    base_run = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if "tail -n" in cmd and "/tmp/lium-build.log" in cmd:
+            ssh_client.calls.append(cmd)
+            return _ssh_result(stdout="#5 [2/3] RUN pip install flash-attn\n#5 12.3 Building wheel\n")
+        return await base_run(cmd, **kw)
+
+    ssh_client.run = _run
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN pip install flash-attn\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert ok is False
+    assert step == "build_timeout"
+    assert tail.startswith("#5 [2/3] RUN pip install flash-attn")
+    assert tail.endswith("docker build exceeded 1200 s")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("only_create", [True, False])
+async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_attempt_left(svc, monkeypatch, only_create):
+    """DAH-5437: a create run again after a connector restart meets the DinD (and helpers) of the
+    attempt the restart cut off; it removes them first, but never while another create of the pod runs."""
+    from services.docker_service import inflight_creates
+
+    ssh_client = _make_dind_ssh()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    dind = svc._dind_container_name(payload.pod_id)
+
+    with inflight_creates.track(payload.pod_id):
+        if not only_create:
+            inflight_creates._creates_by_pod_id[payload.pod_id].running += 1  # a second live create
+        await svc._custom_build_image(
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+        )
+        inflight_creates._creates_by_pod_id[payload.pod_id].running = 1
+
+    run_at = next(i for i, c in enumerate(ssh_client.calls) if "run -d --runtime=sysbox-runc" in c)
+    before = ssh_client.calls[:run_at]
+    # the full teardown: the old DinD's egress rules (by its IP) go too, not only the container
+    assert any("--network=host" in c and "-D DOCKER-USER" in c and "172.20.0.2" in c for c in before) is only_create
+    assert any(c.startswith(f"/usr/bin/docker rm -fv {dind} ") for c in before) is only_create
+
+
+@pytest.mark.asyncio
+async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_stops_early(svc, monkeypatch):
+    """DAH-5666: the old DinD still holds the name, so the create stops before `docker run --name` fails on it."""
+    from services.docker_service import inflight_creates
+
+    ssh_client = _make_dind_ssh()
+    inner = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if cmd.startswith("/usr/bin/docker pause "):
+            ssh_client.calls.append(cmd)
+            return _ssh_result(exit_status=1)
+        return await inner(cmd, **kw)
+
+    ssh_client.run = _run
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+
+    with inflight_creates.track(payload.pod_id):
+        ok, step, _ = await svc._custom_build_image(
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+        )
+
+    assert (ok, step) == (False, "build_dind_start")
+    assert not any("run -d --runtime=sysbox-runc" in c for c in ssh_client.calls)
+    # neither stop (the resumed one nor the finally's retry) confirmed it, so its rules and container stay
+    assert not any("-D DOCKER-USER" in c or c.startswith("/usr/bin/docker rm -fv") for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_rules_go(svc):
+    """DAH-5437: a cut-off attempt's build may still run in its DinD; it must never run without the rules."""
+    ssh_client = _make_dind_ssh()
+    await svc._teardown_dind_build(
+        ssh_client=ssh_client,
+        dind_name="dind_x",
+        dind_image="img",
+        dind_ip="172.20.0.2",
+        cidrs=["10.0.0.0/8"],
+        default_extra={},
+    )
+
+    def first(pred):
+        return next(i for i, c in enumerate(ssh_client.calls) if pred(c))
+
+    paused = first(lambda c: c.startswith("/usr/bin/docker pause dind_x "))
+    _, remove_helper = svc._dind_firewall_helper_names("dind_x")
+    assert paused < first(lambda c: f"--name {remove_helper} " in c)
+    assert paused < first(lambda c: c.startswith("/usr/bin/docker rm -fv dind_x "))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "before_kill, after_kill, ps, killed, confirmed",
+    [
+        ("truetrue", "", "printf abc", False, True),  # paused
+        ("falsefalse", "", "printf abc", False, True),  # stopped
+        ("Error: No such object: dind_x", "", "exit 0", False, True),  # gone
+        ("error: no such object: dind_x", "", "exit 0", False, True),  # gone, another docker's wording
+        ("Error response from daemon: No such container: dind_x", "", "exit 0", False, True),  # gone, daemon text
+        ("", "", "exit 0", False, True),  # gone, inspect printed nothing
+        ("[]", "", "exit 0", False, True),  # gone, inspect printed an empty list
+        ("unexpected state", "", "printf abc", False, False),  # unknown wording but ps still lists it
+        ("truefalse", "falsefalse", "printf abc", True, True),  # the pause did not freeze it: killed
+        ("truefalse", "truefalse", "printf abc", True, False),  # the kill did not stop it either
+        ("Cannot connect to the Docker daemon", "", "exit 1", False, False),  # state unknown
+    ],
+)
+async def test_A27c_a_build_container_the_pause_did_not_freeze_is_killed_before_its_rules_go(
+    svc, tmp_path, before_kill, after_kill, ps, killed, confirmed
+):
+    """DAH-5437: the pause command, run by a shell against a fake docker, kills a DinD it left running
+    and exits 0 only once the DinD is confirmed paused, stopped or gone (DAH-5666)."""
+    ssh_client = _make_dind_ssh()
+    await svc._teardown_dind_build(
+        ssh_client=ssh_client, dind_name="dind_x", dind_image="img", dind_ip=None, cidrs=[], default_extra={}
+    )
+    cmd = next(c for c in ssh_client.calls if c.startswith("/usr/bin/docker pause dind_x "))
+    log = tmp_path / "log"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f'#!/bin/sh\necho "$@" >> {log}\n[ "$1" = pause ] && exit 1\n'
+        f'[ "$1" = inspect ] && {{ grep -q "^kill" {log} && printf "{after_kill}" || printf "{before_kill}"; }}\n'
+        f'[ "$1" = ps ] && {{ {ps}; }}\n'
+        "exit 0\n"
+    )
+    docker.chmod(0o755)
+    res = subprocess.run(["sh", "-c", cmd.replace("/usr/bin/docker", str(docker))], capture_output=True)
+    assert (res.returncode == 0) is confirmed
+    assert ("kill dind_x" in log.read_text()) is killed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "exit"])
+async def test_A27d_the_rules_stay_while_the_build_container_is_not_confirmed_stopped(svc, failure):
+    """DAH-5666: a pause/kill that times out (or cannot confirm the DinD stopped) is retried; until it
+    succeeds neither the remove helper nor the helper/DinD rm runs, so the build keeps its rules."""
+    ssh_client = _make_dind_ssh()
+    inner = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if cmd.startswith("/usr/bin/docker pause dind_x "):
+            ssh_client.calls.append(cmd)
+            if failure == "timeout":
+                raise asyncio.TimeoutError()
+            return _ssh_result(exit_status=1)
+        return await inner(cmd, **kw)
+
+    ssh_client.run = _run
+    confirmed = await svc._teardown_dind_build(
+        ssh_client=ssh_client,
+        dind_name="dind_x",
+        dind_image="img",
+        dind_ip="172.20.0.2",
+        cidrs=["10.0.0.0/8"],
+        default_extra={},
+    )
+
+    assert confirmed is False
+    assert len(ssh_client.calls) == 3
+    assert all(c.startswith("/usr/bin/docker pause dind_x ") for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_A6b_a_lost_node_connection_mid_build_says_so(svc, monkeypatch):
+    """The SSH connection dropping during the build is not the renter's Dockerfile failing."""
+    import asyncssh
+
+    async def _esl(**kwargs):
+        if "docker build" in kwargs.get("command", ""):
+            raise asyncssh.ConnectionLost("Connection lost")
+        return (True, "")
+
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=_make_dind_ssh(), payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert (ok, step, tail) == (False, "build_ssh_lost", "the connection to the node was lost during the build; please retry")
+
+
 # ------------------------------------------------------------------
 # A.13 — egress firewall failure → build_egress_setup, NO build attempted
 # ------------------------------------------------------------------
@@ -653,3 +853,120 @@ def test_A17e_a_stack_trace_longer_than_the_tail_still_reaches_the_renter_with_i
         "#5 [2/3] RUN pip install nope",
         "ERROR: failed to solve: pip install nope did not complete",
     ]
+
+
+# ------------------------------------------------------------------
+# The build exec ends with its exit status: a DinD removed mid-build kills the
+# exec silently (exit 137, nothing on stderr), which is no success.
+# ------------------------------------------------------------------
+
+
+def _make_exit_status_esl(*, build_exit: int, build_stderr: str = ""):
+    """Like `_make_esl`, but the build step answers as the real streamer does: stderr fails it, and
+    a non-zero exit fails it only when the caller asked for `check_exit_status`."""
+
+    async def _esl(**kwargs):
+        cmd = kwargs.get("command", "")
+        if "docker build" not in cmd:
+            return (True, "")
+        err = build_stderr
+        if build_exit != 0 and kwargs.get("check_exit_status"):
+            err += f"Process exited with status {build_exit}\n"
+        return (not err, err)
+
+    return _esl
+
+
+async def _build(svc, monkeypatch, esl):
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    return await svc._custom_build_image(
+        ssh_client=_make_dind_ssh(),
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_build_exec_killed_with_its_dind_is_an_interrupted_build(
+    svc, monkeypatch
+):
+    from services.docker_service import CUSTOM_BUILD_INTERRUPTED_REASON
+
+    ok, step, reason = await _build(
+        svc, monkeypatch, _make_exit_status_esl(build_exit=137)
+    )
+
+    assert ok is False
+    assert step == "docker_build"
+    assert reason == CUSTOM_BUILD_INTERRUPTED_REASON
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_tail_carries_no_streamer_exit_status_line(
+    svc, monkeypatch
+):
+    esl = _make_exit_status_esl(
+        build_exit=1,
+        build_stderr="ERROR: failed to solve: bad RUN\nBUILD_FAILED_RC=1\n",
+    )
+
+    ok, step, reason = await _build(svc, monkeypatch, esl)
+
+    assert ok is False
+    assert step == "docker_build"
+    assert reason == "ERROR: failed to solve: bad RUN"
+
+
+# ------------------------------------------------------------------
+# A.20 — the image export's timeout follows the built image's size
+# ------------------------------------------------------------------
+
+
+def test_A20_export_timeout_scales_with_image_size_within_the_pending_budget():
+    gib = 1024**3
+    # unknown or small image: the build timeout, as before
+    assert custom_build_export_timeout(None, 1200, 950, 10 * 1024**2, 3300) == 1200
+    assert custom_build_export_timeout(2 * gib, 1200, 950, 10 * 1024**2, 3300) == 1200
+    # a 20 GiB image at 10 MiB/s needs 2048 s, more than the build timeout
+    assert custom_build_export_timeout(20 * gib, 1200, 950, 10 * 1024**2, 3300) == 2048
+    # never past what is left of the budget, even when that is below the build timeout
+    assert custom_build_export_timeout(40 * gib, 1200, 950, 10 * 1024**2, 3300) == 2350
+    assert custom_build_export_timeout(40 * gib, 1200, 3000, 10 * 1024**2, 3300) == 300
+    assert custom_build_export_timeout(None, 1200, 3000, 10 * 1024**2, 3300) == 300
+    # budget spent: 1 s, never 0 (the streamer reads 0 as no timeout)
+    assert custom_build_export_timeout(None, 1200, 3400, 10 * 1024**2, 3300) == 1
+
+
+@pytest.mark.asyncio
+async def test_A20b_a_large_image_gets_a_size_scaled_export_timeout(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    inner_run = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if "docker image inspect -f" in cmd:
+            ssh_client.calls.append(cmd)
+            return _ssh_result(stdout=str(20 * 1024**3))
+        return await inner_run(cmd, **kw)
+
+    ssh_client.run = _run
+    timeouts = {}
+    esl = _make_esl()
+
+    async def _esl(**kwargs):
+        if "docker save" in kwargs["command"]:
+            timeouts["export"] = kwargs["timeout"]
+        return await esl(**kwargs)
+
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step, _tail = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+    )
+    assert ok is True and step is None
+    assert any("docker image inspect -f" in c for c in ssh_client.calls)
+    assert timeouts["export"] == 2048  # 20 GiB at the default 10 MiB/s, not the 1200 s build timeout

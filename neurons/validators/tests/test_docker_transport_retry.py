@@ -12,10 +12,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from docker.errors import NotFound
+from docker.errors import APIError, NotFound
 from services.node_host import node_owner
 from services.rental_docker_sdk import (
     ContainerExecSpec,
+    ContainerNameTakenOnRetry,
     ContainerRunSpec,
     RentalDockerConnectionError,
     RentalDockerOperationError,
@@ -174,11 +175,86 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
     api.existing_containers["pod_test"] = {"Config": {"Image": "someone/else:latest"}}
 
     with pytest.raises(
-        RentalDockerOperationError, match="already exists with image 'someone/else:latest'"
+        ContainerNameTakenOnRetry, match="already exists with image 'someone/else:latest'"
     ):
         await _client(api).run_container(_run_spec())
 
     assert api.calls == ["create_container", "inspect_container"]
+
+
+@pytest.mark.asyncio
+async def test_run_container_retry_adopts_the_first_create_still_running_in_dockerd(monkeypatch):
+    """29 Oct: the first create outlived the 60 s read timeout; dockerd still held the name (409) while
+    inspect said 404. The retry waits for that create to register and adopts it, no third create."""
+    import services.rental_docker_sdk as sdk
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    conflict = APIError(
+        "Conflict",
+        response=Mock(status_code=409, url="containers/create", reason="Conflict"),
+        explanation='Conflict. The container name "/pod_test" is already in use by container "abc".',
+    )
+    api.create_container_errors = [EOFError(), conflict]
+    inspects = iter([_not_found(), _not_found()])
+
+    def inspect_container(name):
+        api.calls.append("inspect_container")
+        error = next(inspects, None)
+        if error is not None:
+            raise error
+        return {"Id": "first", "Config": {"Image": "lium/pod:1"}}
+
+    api.inspect_container = inspect_container
+
+    assert await _client(api).run_container(_run_spec()) == "first"
+    assert api.calls == [
+        "create_container", "inspect_container", "create_container",
+        "inspect_container", "inspect_container", "start",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# pull: the stream cut mid-pull (27 Oct alert ece89) → one re-open and one more pull
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pull_cut_mid_stream_is_retried_once_after_reopen():
+    import http.client
+
+    adapter = _FakeAdapter()
+    client = _client(_FakeApiClient(adapter=adapter))
+    errors = [http.client.IncompleteRead(b"")]
+    pulls = []
+
+    def pull_sync(image):
+        pulls.append(image)
+        if errors:
+            raise errors.pop(0)
+
+    client._pull_sync = pull_sync
+    await client.pull(image="daturaai/pytorch:x")
+
+    assert pulls == ["daturaai/pytorch:x", "daturaai/pytorch:x"]
+    assert adapter.reopen_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pull_refused_by_the_registry_is_not_retried():
+    adapter = _FakeAdapter()
+    client = _client(_FakeApiClient(adapter=adapter))
+    pulls = []
+
+    def pull_sync(image):
+        pulls.append(image)
+        raise RuntimeError("manifest unknown")
+
+    client._pull_sync = pull_sync
+    with pytest.raises(RentalDockerOperationError, match="Docker SDK pull failed: manifest unknown"):
+        await client.pull(image="nope/nope:1")
+
+    assert len(pulls) == 1 and adapter.reopen_calls == 0
 
 
 # ---------------------------------------------------------------------------

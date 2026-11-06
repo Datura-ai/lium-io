@@ -11,6 +11,7 @@ PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
 that a ContainerCreateRequest is delegated to create_container and that
 miner_service no longer makes an early wait_for_port_check_containers call.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
@@ -215,6 +216,92 @@ async def test_a_create_waits_out_a_miner_that_refuses_connections_while_it_rest
 
 
 @pytest.mark.asyncio
+async def test_a_timed_out_key_submit_fails_the_create_instead_of_skipping_the_miners_rental_hook(
+    mocker, miner_service
+):
+    # review: a timeout may or may not have run the miner's rental hook (it stops other workloads), so neither a
+    # resubmit with the hook nor one without it is safe
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
+    miner_service._make_rest_request.side_effect = [asyncio.TimeoutError(), accepted]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    create_mock.assert_not_awaited()
+    assert miner_service._make_rest_request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_resubmit_after_a_refused_submit_still_runs_the_miners_rental_hook(mocker, miner_service):
+    # a refused submit never reached the miner, so the hook has not run yet
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
+    miner_service._make_rest_request.side_effect = [_refused(), accepted]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    calls = miner_service._make_rest_request.await_args_list
+    assert [c.kwargs["json_data"]["is_rental_request"] for c in calls] == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_a_create_waits_out_a_connect_nobody_answers_while_the_miner_redeploys(mocker, miner_service):
+    # 5 Nov 08:09Z: the stopped central miner's address answered no SYN for about 80 s; those creates timed out
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    accepted = (200, {"message_type": "AcceptSSHKeyRequest"})
+    miner_service._make_rest_request.side_effect = [aiohttp.ConnectionTimeoutError(), accepted]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    create_mock.assert_awaited_once()
+    calls = miner_service._make_rest_request.await_args_list
+    # it never reached the miner, so the resubmit still runs the rental hook
+    assert [c.kwargs["json_data"]["is_rental_request"] for c in calls] == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_a_create_that_keeps_timing_out_names_the_exception_type(mocker, miner_service):
+    # str(asyncio.TimeoutError()) is empty, so the logged error used to be blank
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    miner_service._make_rest_request.side_effect = asyncio.TimeoutError()
+    mocker.patch("services.miner_service.MINER_RESTART_WAIT_S", 0)
+
+    result = await miner_service._handle_container(_make_create_payload(executor_id))
+
+    assert result.msg == "Resulted in an exception"
+    assert "TimeoutError" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_create_re_signs_when_the_restarted_miner_says_the_signature_is_too_old(mocker, miner_service):
+    # 27 Oct pod 7a6ae1fc: the submit reached the redeployed miner 17 s after signing and got 401
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    too_old = (401, {"detail": "Authentication message too old. Timestamp is outside the allowed 10-second window"})
+    miner_service._make_rest_request.side_effect = [too_old, (200, {"message_type": "AcceptSSHKeyRequest"})]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    stamps = iter(range(100))
+    mocker.patch.object(miner_service, "_generate_auth_headers", side_effect=lambda *_: {"X-Timestamp": next(stamps)})
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    create_mock.assert_awaited_once()
+    sent = [c.kwargs["headers"]["X-Timestamp"] for c in miner_service._make_rest_request.await_args_list[:2]]
+    assert sent == [0, 1]
+
+
+@pytest.mark.asyncio
 async def test_a_create_gives_up_once_the_miner_stays_unreachable_past_the_wait(mocker, miner_service):
     executor_id = str(uuid4())
     _wire_common_mocks(mocker, miner_service, executor_id)
@@ -288,3 +375,34 @@ async def test_a_failed_report_under_the_new_gpu_uuid_does_not_hide_the_recovery
     )
     published = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
     assert [spec["executor_uuid"] for spec in published] == [node]
+
+
+# DAH-5510: the backend stops a moved pod's old container on the node it left
+
+
+@pytest.mark.asyncio
+async def test_a_stop_request_runs_the_docker_stop_and_returns_its_reply(mocker, miner_service):
+    from payload_models.payloads import ContainerStopRequest
+
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    stopped = Mock()
+    stop_mock = mocker.patch("services.miner_service.DockerService.stop_container", AsyncMock(return_value=stopped))
+    payload = ContainerStopRequest(
+        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="10.0.0.1", miner_port=8000,
+        pod_id=str(uuid4()), container_name="pod_old",
+    )
+
+    assert await miner_service._handle_container(payload) is stopped
+    assert stop_mock.await_args.args[0] is payload
+
+
+def test_a_failed_stop_request_is_reported_as_a_stop_failure(miner_service):
+    from payload_models.payloads import ContainerStopRequest, FailedContainerErrorTypes
+
+    payload = ContainerStopRequest(miner_hotkey="m", executor_id="e", pod_id="p", container_name="pod_p")
+
+    result = miner_service._handle_container_error(payload, "Error", FailedContainerErrorCodes.UnknownError)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerStopFailed

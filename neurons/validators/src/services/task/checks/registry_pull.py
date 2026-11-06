@@ -15,10 +15,12 @@ import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.redis_service import get_or_adopt_legacy
 
 from ..messages import RegistryPullMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +95,8 @@ Outcome = Literal[
     "not_run",
 ]
 # what fails a node (twice in a row): the registry path is broken, the way it broke the ticket-0361 node's rents.
-# `unreachable` is a firewall or proxy that rejects the connection rather than dropping it; a renter's
-# uncached pull fails on it just the same
+# `unreachable` is a firewall or proxy that rejects or resets the connection rather than dropping it; a
+# renter's uncached pull fails on it just the same
 FAILING_OUTCOMES = frozenset({"timeout", "dns_error", "unreachable", "manifest_unknown"})
 # no verdict either way: a Docker Hub 429 says the IP's anonymous quota is spent, not that the path is
 # broken, and an auth or unclassified error, or a probe that did not run, measured nothing about it
@@ -119,9 +121,11 @@ _AUTH_MARKERS = ("unauthorized", "authentication required", "is denied", "access
 # a TCP connect to the registry, or to the daemon's proxy (`proxyconnect tcp: dial tcp ...`), that was
 # rejected: a REJECT --reject-with tcp-reset, icmp-host-unreachable or icmp-net-unreachable, or no route.
 # Only `dial tcp`: the CLI failing to reach dockerd's own socket is `dial unix ...`, which says nothing
-# about the registry path
+# about the registry path. A TCP connection to the registry that the path resets (`read tcp ...: read:
+# connection reset by peer`) fails a renter's uncached pull the same way, so it counts too
 _UNREACHABLE_RX = re.compile(
     r"dial tcp [^\s]+: connect: (connection refused|no route to host|network is unreachable)"
+    r"|(dial|read|write) tcp [^\s]+: (connect|read|write): connection reset by peer"
 )
 _TIMEOUT_MARKERS = (
     "i/o timeout",
@@ -548,7 +552,11 @@ class RegistryPullCheck:
 
     async def _load(self, ctx: Context) -> _ProbeState | None:
         try:
-            raw = await ctx.services.redis.get(f"{_REDIS_PREFIX}:{ctx.executor.uuid}")
+            raw = await get_or_adopt_legacy(
+                ctx.services.redis,
+                _state_key(ctx),
+                f"{_REDIS_PREFIX}:{ctx.executor.uuid}",
+            )
         except Exception as exc:
             logger.warning(
                 _m(
@@ -563,7 +571,7 @@ class RegistryPullCheck:
     async def _save(self, ctx: Context, state: _ProbeState) -> None:
         try:
             await ctx.services.redis.set(
-                f"{_REDIS_PREFIX}:{ctx.executor.uuid}", state.as_json(), ex=_REDIS_TTL_SECONDS
+                _state_key(ctx), state.as_json(), ex=_REDIS_TTL_SECONDS
             )
         except Exception:
             logger.warning(
@@ -584,7 +592,11 @@ class RegistryPullCheck:
         return CheckResult(passed=True, event=event)
 
 
+def _state_key(ctx: Context) -> str:
+    # with the hotkey: a node copying another miner's UUID cannot overwrite the owner's last pull
+    return f"{_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
 def _is_rented(ctx: Context) -> bool:
-    rented_data = ctx.state.rented_data
-    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    rented_executor = rental_of_this_node(ctx)
     return rented_executor is not None and len(rented_executor.pods) > 0

@@ -35,6 +35,9 @@ _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
 # A dropped SSH transport under a Docker SDK call costs one re-open (bounded by these paramiko
 # timeouts) plus one more attempt of the same call with its own timeout; there is no third try.
 _DOCKER_SSH_REOPEN_TIMEOUT_SECONDS = 15
+# a create that outlived the client's read timeout holds its name in dockerd until it registers the container
+_INFLIGHT_CREATE_WAIT_SECONDS = 60
+_INFLIGHT_CREATE_POLL_SECONDS = 2
 TRANSPORT_ERROR_CLASS = "transport"
 # The texts docker-py/urllib3/paramiko produce when the SSH channel under a Docker call is gone.
 # Plain substrings, matched against every exception text in the cause chain.
@@ -99,6 +102,10 @@ class ContainerCreateRefused(Exception):
 
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
+
+
+class ContainerNameTakenOnRetry(RentalDockerOperationError):
+    """A transport retry of `run_container` found the spec's name already held by a container on another image."""
 
 
 class RentalDockerTransportDropped(RentalDockerConnectionError):
@@ -255,6 +262,14 @@ class VolumeMount:
 
 
 @dataclass(slots=True)
+class DriverVolumeMount:
+    """An anonymous volume Docker creates from ``driver`` at create and removes with the container (`rm -v`)."""
+    target: str
+    driver: str
+    driver_opts: dict[str, str]
+
+
+@dataclass(slots=True)
 class DeviceMount:
     path_on_host: str
     path_in_container: str | None = None
@@ -289,6 +304,7 @@ class ContainerRunSpec:
     environment: dict[str, str] = field(default_factory=dict)
     ports: tuple[PortBinding, ...] = ()
     volumes: tuple[VolumeMount, ...] = ()
+    driver_volumes: tuple[DriverVolumeMount, ...] = ()
     restart_policy: str | None = "unless-stopped"
     runtime: str | None = None
     cap_add: tuple[str, ...] = ()
@@ -301,7 +317,7 @@ class ContainerRunSpec:
     # --memory-swap; equal to memory_gb means the container gets no swap
     memory_swap_gb: int | None = None
     oom_score_adj: int | None = None
-    storage_limit_gb: int | None = None
+    storage_limit_gb: float | None = None  # fractional when a sysbox pod shares it with DinD
     # cgroup pids.max for the container. Caps total tasks (processes + threads) so a tenant fork
     # bomb cannot exhaust the host's global PID space and starve the executor/sshd of forks. None
     # keeps the daemon default (unlimited); the memory cgroup is no ceiling here because on a
@@ -311,6 +327,8 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # DAH-5117: LIUM_POD_ID_LABEL for a pod or filler, so the stale cleanup knows the container is Lium's
+    labels: dict[str, str] = field(default_factory=dict)
     # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
     before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     # runs in the Docker thread between the create and the start call with the names of every container
@@ -431,7 +449,11 @@ class RentalDockerSdkClient:
     async def pull(self, *, image: str) -> None:
         timeout_seconds = self._normalized_pull_timeout_seconds()
         try:
-            pull_call = _in_docker_thread(self._pull_sync, image)
+            # a pull is idempotent (dockerd keeps finished layers), so a dropped SSH channel
+            # mid-stream gets the same one re-open + retry as other calls, inside the one deadline
+            pull_call = self._retry_once_on_transport_drop(
+                operation="pull", attempt=lambda: _in_docker_thread(self._pull_sync, image)
+            )
             if timeout_seconds is not None:
                 await asyncio.wait_for(
                     pull_call,
@@ -673,6 +695,18 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
+
+    async def container_log_tail(self, *, container_name: str, lines: int) -> str:
+        """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
+        try:
+            raw = await _in_docker_thread(
+                self._api_client.logs, container_name, stdout=True, stderr=True, tail=lines
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK container logs failed", exc)
+            ) from exc
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
 
     async def container_image_id(self, *, container: str) -> str:
         """The image ID (`sha256:…`) the container was created from; a later tag move does not change it."""
@@ -1016,18 +1050,31 @@ class RentalDockerSdkClient:
             )
             if spec.before_create is not None:
                 spec.before_create()
-            created = self._api_client.create_container(
-                image=spec.image,
-                command=list(spec.command) or None,
-                detach=True,
-                ports=_container_ports(spec.ports) or None,
-                environment=spec.environment or None,
-                volumes=_container_volumes(spec.volumes) or None,
-                name=spec.name,
-                entrypoint=spec.entrypoint or None,
-                host_config=host_config,
-                labels={RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else None,
-            )
+            try:
+                created = self._api_client.create_container(
+                    image=spec.image,
+                    command=list(spec.command) or None,
+                    detach=True,
+                    ports=_container_ports(spec.ports) or None,
+                    environment=spec.environment or None,
+                    volumes=_container_volumes(spec.volumes) or None,
+                    name=spec.name,
+                    entrypoint=spec.entrypoint or None,
+                    host_config=host_config,
+                    labels={
+                        **spec.labels,
+                        **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
+                    }
+                    or None,
+                )
+            except Exception as exc:
+                # The first attempt's create timed out on the client but still runs in dockerd: it holds
+                # the name (409) while inspect answers 404 until it registers the container. Adopt it then.
+                if not adopt_existing or f'"/{spec.name}" is already in use' not in str(exc):
+                    raise
+                adopted_id = self._wait_for_inflight_create_sync(spec)
+                if adopted_id is None:
+                    raise
         if spec.before_start is not None:
             spec.before_start(
                 [
@@ -1042,6 +1089,16 @@ class RentalDockerSdkClient:
         # Others keep the name: a failed start leaves no ID for the cleanup, which then removes by name.
         self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
         return container_id
+
+    def _wait_for_inflight_create_sync(self, spec: ContainerRunSpec) -> str | None:
+        """The adopted ID once the in-flight create of `spec.name` registers; None after the wait."""
+        deadline = time.monotonic() + _INFLIGHT_CREATE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(_INFLIGHT_CREATE_POLL_SECONDS)
+            adopted_id = self._adopt_container_by_name_sync(spec)
+            if adopted_id is not None:
+                return adopted_id
+        return None
 
     def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:
         """The idempotency check before a retried `containers/create`.
@@ -1062,7 +1119,7 @@ class RentalDockerSdkClient:
         if existing_image == spec.image:
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""
-        raise RentalDockerOperationError(
+        raise ContainerNameTakenOnRetry(
             "Docker SDK run container refused after a transport retry: a container named "
             f"{spec.name} already exists with image {existing_image!r}, not {spec.image!r}"
         )
@@ -1737,6 +1794,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
     kwargs = {
         "port_bindings": _port_bindings(spec.ports),
         "binds": _binds(spec.volumes),
+        "mounts": _driver_mounts(spec.driver_volumes),
         "restart_policy": _restart_policy(spec.restart_policy),
         "runtime": spec.runtime,
         "cap_add": list(spec.cap_add) or None,
@@ -1753,7 +1811,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "oom_score_adj": spec.oom_score_adj,
         "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
-            {"size": f"{spec.storage_limit_gb}g"}
+            {"size": f"{spec.storage_limit_gb:.10g}g"}
             if spec.storage_limit_gb
             else None
         ),
@@ -1802,6 +1860,17 @@ def _container_volumes(volumes: tuple[VolumeMount, ...]) -> list[str]:
 def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
     return [
         f"{volume.source}:{volume.target}:{'ro' if volume.read_only else 'rw'}"
+        for volume in volumes
+    ]
+
+
+def _driver_mounts(volumes: tuple[DriverVolumeMount, ...]) -> list | None:
+    if not volumes:
+        return None
+    from docker.types import DriverConfig, Mount
+
+    return [
+        Mount(target=volume.target, source=None, driver_config=DriverConfig(volume.driver, volume.driver_opts))
         for volume in volumes
     ]
 

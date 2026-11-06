@@ -13,11 +13,13 @@ import aiohttp
 from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE
 from core.utils import _m, get_extra_info
+from services.redis_service import get_or_adopt_legacy
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 
 from ..messages import ContainerDownloadSpeedMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,7 @@ _TAIL_CHARS = 200
 # busybox timeout's TERM/KILL exits: the fetch ran out of time, whatever it read by then is the reading
 _TIMEOUT_EXITS = frozenset({124, 143, 137})
 # the container could not reach the endpoint at all: a renter's pip/hf download fails the same way
-NODE_SIDE_ERRORS = frozenset({"dns_failed", "unreachable", "timeout"})
+NODE_SIDE_ERRORS = frozenset({"dns_failed", "unreachable", "timeout", "connection_reset"})
 
 # busybox sh in alpine (the port check's helper image, already on the node). /proc/uptime is the clock: busybox
 # date has no sub-second format everywhere. Exit 0 always: the marker lines are the answer.
@@ -87,7 +89,7 @@ class EndpointReading:
     bytes: int = 0
     seconds: float | None = None
     mbps: float | None = None
-    # None = measured; else why not: dns_failed, unreachable, timeout, http_error, no_output, other
+    # None = measured; else why not: dns_failed, unreachable, timeout, connection_reset, http_error, no_output, other
     error: str | None = None
     detail: str | None = None
     network: str | None = None
@@ -106,6 +108,9 @@ def _error_kind(stderr: str) -> str:
         return "http_error"
     if "refused" in text or "unreachable" in text or "no route" in text:
         return "unreachable"
+    # the connection opened but was cut mid-handshake or mid-transfer, while DNS and routing still work
+    if "reset by peer" in text or "eof" in text or "handshake" in text or "closed prematurely" in text:
+        return "connection_reset"
     return "other"
 
 
@@ -225,16 +230,18 @@ class ContainerDownloadSpeedCheck:
         if not settings.CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED:
             return self._skipped(ctx, "CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED is off")
         rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
         if rented_executor is not None and rented_executor.pods:
             return self._skipped(ctx, "rented")
         if rented_data is not None and rented_data.get_filler_containers(ctx.executor.uuid):
             return self._skipped(ctx, "filler running")
 
-        key = f"{_REDIS_PREFIX}:{ctx.executor.uuid}"
+        # with the hotkey: a node copying another miner's UUID cannot write a slow streak onto the owner's
+        key = f"{_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
         redis = ctx.services.redis
         try:
-            raw = await redis.get(key)
+            legacy_key = f"{_REDIS_PREFIX}:{ctx.executor.uuid}"
+            raw = await get_or_adopt_legacy(redis, key, legacy_key)
         except Exception:
             # without the last reading the interval cannot be kept; measuring every cycle is the cost to avoid
             logger.warning(_m("Container download speed: Redis unreadable", extra=get_extra_info(ctx.default_extra)))

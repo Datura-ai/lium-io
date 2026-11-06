@@ -345,6 +345,44 @@ check_fuse3() {
         "or by hand: sudo apt-get install -y fuse3"
 }
 
+# Ubuntu 26.04 confines fusermount3 with an AppArmor profile that allows FUSE mounts only under $HOME,
+# /mnt, /media, /tmp and /run/user: sysbox-fs mounts under /var/lib/sysboxfs and every sysbox container
+# fails with "failed to pre-register with sysbox-fs" (fusermount3: mount failed: Permission denied)
+FUSERMOUNT3_PROFILE=/etc/apparmor.d/fusermount3
+FUSERMOUNT3_LOCAL=/etc/apparmor.d/local/fusermount3
+FUSERMOUNT3_RULE='mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,'
+
+# the profile only binds when AppArmor is on: with apparmor=0 there is nothing to fix and apparmor_parser fails
+fusermount3_profile_enforced() {
+    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] && grep -q Y "$(host_path /sys/module/apparmor/parameters/enabled)" 2>/dev/null
+}
+
+fusermount3_needs_sysboxfs_rule() {
+    fusermount3_profile_enforced && ! grep -qF "$FUSERMOUNT3_RULE" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null
+}
+
+check_fusermount3_apparmor() {
+    if ! fusermount3_needs_sysboxfs_rule; then
+        pf_pass "fusermount3 may mount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or the rule is in $FUSERMOUNT3_LOCAL)."
+        return 0
+    fi
+    pf_fix "The AppArmor profile $FUSERMOUNT3_PROFILE (Ubuntu 26.04) stops sysbox-fs mounting under /var/lib/sysboxfs — every sysbox container fails." \
+        "$(self_cmd)   # adds the rule below and reloads the profile" \
+        "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' 'umount /var/lib/sysboxfs/**,' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
+}
+
+allow_sysboxfs_in_fusermount3_apparmor() {
+    fusermount3_profile_enforced || return 0
+    if fusermount3_needs_sysboxfs_rule; then
+        mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
+        printf '%s\n' "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs" \
+            "$FUSERMOUNT3_RULE" 'umount /var/lib/sysboxfs/**,' >> "$(host_path "$FUSERMOUNT3_LOCAL")"
+    fi
+    # reload even when the rule was already on disk: an earlier run may have written it and then failed to reload
+    apparmor_parser -r "$FUSERMOUNT3_PROFILE" || { fail "Could not reload $FUSERMOUNT3_PROFILE with the sysbox-fs rule."; return 1; }
+    ok "AppArmor: fusermount3 may mount sysbox-fs under /var/lib/sysboxfs."
+}
+
 nvidia_driver_package() {
     # Blackwell (RTX 50xx, RTX PRO 6000 Blackwell, B200, B300) runs only the open kernel module, and a host already on
     # the open module would otherwise be switched to the closed one by the FIX command
@@ -448,6 +486,26 @@ check_total_disk_for_vram() {
     fi
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
         "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+}
+
+check_data_root_loop_dio() {
+    # DAH-5150: a data-root on a buffered loop image caches every pod write twice; a renter writing ~480 GB/h
+    # stalled host writeback, `docker run` hung ~8 minutes and the node was delisted. Direct I/O on that loop
+    # fixed it in the lab (worst `docker run` 20 s). A data-root on a real disk is not checked.
+    local data_root src loop dio
+    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
+    [ -d "$data_root" ] || data_root=/
+    src=$(df -P "$data_root" 2>/dev/null | awk 'NR == 2 {print $1}')
+    case "$src" in /dev/loop[0-9]*) loop=${src#/dev/} ;; *) return 0 ;; esac
+    dio=$(cat "$(host_path "/sys/block/$loop/loop/dio")" 2>/dev/null)
+    if [ "$dio" = 1 ]; then
+        pf_pass "Docker's data-root $data_root is on $src with direct I/O."
+        return 0
+    fi
+    pf_fix "Docker's data-root $data_root is on the loop device $src without direct I/O — a rented pod's heavy writes can stall Docker for minutes and the node gets delisted." \
+        "With no rental running: sudo losetup --direct-io=on $src" \
+        "Keep it across reboots: https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#docker-data-root-on-a-loop-image, or move the data-root to a real disk."
 }
 
 check_free_disk_for_node() {
@@ -803,6 +861,7 @@ preflight_advisory() {
     check_iptables_modules || true
     check_total_disk_for_vram || true
     check_free_disk_for_node || true
+    check_data_root_loop_dio || true
     check_ports || true
 }
 
@@ -817,6 +876,7 @@ preflight_stack() {
     check_nvidia_toolkit || true
     check_docker_features || true
     check_fuse3 || true
+    check_fusermount3_apparmor || true
     check_sysbox || true
     check_vloopback || true
 }
@@ -1015,6 +1075,7 @@ apt_install update -qq || exit 1
 # fuse3 before the .deb: its postinst starts sysbox-fs, which needs fusermount3 (see check_fuse3)
 apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1
 ok "nvidia-container-toolkit, jq, fuse3"
+allow_sysboxfs_in_fusermount3_apparmor || exit 1
 
 if [ "$SKIP_INSTALL" = false ]; then
     LOCAL_DEB="./${SYSBOX_DEB_NAME}"

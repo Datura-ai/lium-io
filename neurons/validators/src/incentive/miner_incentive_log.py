@@ -35,7 +35,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
        marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
-   Spot-node pay (ENABLE_SPOT_NODE_PAY on) — an idle spot node earns only while it runs
+   Spot-node pay — an idle spot node earns only while it runs
      Lium fillers and its GPU configuration has an average filler revenue:
      spot node without a Lium filler, no filler revenue average for the GPU configuration,
      no room left in the incentive pool because the rental share is at the burn cap
@@ -77,13 +77,16 @@ from pydantic import BaseModel, Field
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from services.executor_image_policy import outdated_image_remediation
+from services.const import MIN_PORT_COUNT
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
+        DiskLimitedRemainder,
         InsufficientDisk,
         MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
+        PowerCapReverted,
     )
     from services.task_service import JobResult
 
@@ -100,6 +103,7 @@ class ZeroIncentiveReason(StrEnum):
     SPOT_TIER = "spot_tier"
     PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
     NEW_RENTALS_PAUSED = "new_rentals_paused"
+    PROVIDER_MAINTENANCE = "provider_maintenance"
     MINER_DEFAULT_JOB = "miner_default_job"
     HOTKEY_EXCLUDED_FROM_SCORING = "hotkey_excluded_from_scoring"
     # Group B: idle but not qualified for the unrented pool
@@ -113,7 +117,8 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
-    # Spot-node pay (ENABLE_SPOT_NODE_PAY): an idle spot node that is not paid
+    REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
+    # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
     SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
     SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
@@ -123,6 +128,8 @@ class ZeroIncentiveReason(StrEnum):
     PROVIDER_EMAIL_NOT_CONFIRMED = "provider_email_not_confirmed"
     # Rented: in the mining pool, but the Sysbox portion zeroed the mining score
     RENTED_SYSBOX_NOT_CONFIRMED = "rented_sysbox_not_confirmed"
+    # Group B (appended): free splits of a partly rented split node without disk room for their share (DAH-4961)
+    DISK_LIMITED_REMAINDER = "disk_limited_remainder"
 
 
 # The reason code a failed run carries when no check produced one (an exception in the pipeline).
@@ -286,6 +293,18 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
+    def no_payout_because_provider_maintenance(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PROVIDER_MAINTENANCE,
+            message=(
+                "No subnet incentive: this executor is in a maintenance window and earns nothing "
+                "until the window ends or you click I have finished."
+            ),
+            internal_message="Executor excluded from both pools - provider maintenance window",
+        )
+
+    @staticmethod
     def no_payout_because_running_own_default_job(result: JobResult) -> MinerLogLine:
         return MinerLogLine._no_payout(
             result,
@@ -350,9 +369,10 @@ class MinerLogLine(BaseModel):
             result,
             reason=ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
             message=(
-                f"No unrented incentive: your price ${price_per_gpu}/GPU/h is above the market "
-                f"soft price limit ${soft_limit} (90th-percentile market rate ${market_p90} x "
-                f"{rate}). Lower the price to ${soft_limit} or below to earn the unrented incentive."
+                f"No unrented incentive: your price ${price_per_gpu}/GPU/h is above the "
+                f"soft price limit ${soft_limit} (configured base price for this GPU model "
+                f"${market_p90} x {rate}). Lower the price to ${soft_limit} or below to earn the "
+                "unrented incentive."
             ),
             extra_fields={
                 "price_per_gpu": price_per_gpu,
@@ -483,23 +503,102 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
+    def no_payout_because_reverts_gpu_power_cap(
+        result: JobResult, reverted: PowerCapReverted
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
+            message=(
+                f"No unrented incentive: this executor raised the GPU power limit back "
+                f"{reverted.revert_count} times in the last {reverted.window_hours} hours while a "
+                f"Lium idle job was running. Lium caps the limit for the length of that job only, "
+                f"and restores your own value when it ends. Putting the limit back kills the job, "
+                f"so the node earns the unrented incentive without doing the work. Stop the script "
+                f"or service on the host that re-runs 'nvidia-smi -pl', or rent this executor out "
+                f"to earn."
+            ),
+            extra_fields={
+                "power_cap_revert_count": reverted.revert_count,
+                "power_cap_revert_window_hours": reverted.window_hours,
+                "capped_to_watts": reverted.capped_to_watts,
+                "found_watts": reverted.found_watts,
+            },
+        )
+
+    @staticmethod
     def no_payout_because_port_limited_remainder(
         result: JobResult, port_limited: PortLimitedRemainder
     ) -> MinerLogLine:
-        # `result` is the free portion: gpu_count is the number of free GPUs the message names.
+        # `result` is the free portion; the message names the GPUs the missing ports leave unpaid.
+        unpaid: int = port_limited.unpaid_gpu_count
+        if port_limited.free_split_count == 0:
+            # fewer free GPUs than the minimum rental: no port change makes them rentable
+            return MinerLogLine._no_payout(
+                result,
+                reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+                message=(
+                    f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: "
+                    "they are fewer than its minimum rental, so nobody can rent them. The rented GPUs "
+                    "keep earning. Idle pay resumes when the rental ends."
+                ),
+                extra_fields={
+                    "gpu_count": unpaid,
+                    "available_port_count": port_limited.available_port_count,
+                    "required_port_count": port_limited.required_port_count,
+                    "free_split_count": 0,
+                    "paid_split_count": 0,
+                },
+            )
+        if port_limited.paid_split_count:
+            lead = (
+                f"No unrented incentive for {unpaid} of the free GPUs on this partially rented node: "
+                f"it has {port_limited.available_port_count} free port(s) for "
+                f"{port_limited.free_split_count} free GPU split(s), and each split needs its own port "
+                f"for a renter, so {port_limited.paid_split_count} split(s) keep earning. "
+            )
+        else:
+            lead = (
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: "
+                f"it has {port_limited.available_port_count} free port(s) and needs at least "
+                f"{MIN_PORT_COUNT} to list and rent them, so nobody can rent these GPUs right now. "
+            )
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
             message=(
-                f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
-                f"rented node: it has {port_limited.available_port_count} free port(s) and the "
-                f"marketplace needs at least {port_limited.required_port_count} to list and rent them, so nobody "
-                "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
-                "when the rental ends or the node gets more open ports."
+                lead + "The rented GPUs keep earning. Full idle pay resumes when the rental ends or the "
+                f"node has {port_limited.required_port_count} open free ports."
             ),
             extra_fields={
+                "gpu_count": unpaid,
                 "available_port_count": port_limited.available_port_count,
                 "required_port_count": port_limited.required_port_count,
+                "free_split_count": port_limited.free_split_count,
+                "paid_split_count": port_limited.paid_split_count,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_disk_limited_remainder(
+        result: JobResult, disk_limited: DiskLimitedRemainder
+    ) -> MinerLogLine:
+        # `result` is the free portion; the message names the GPUs the missing disk room leaves unpaid
+        unpaid: int = disk_limited.unpaid_gpu_count
+        floor: str = f"{settings.MIN_FREE_DISK_GB} GB"
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
+            message=(
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: it has less "
+                f"than {floor} free disk, so they are not listed. The rented GPUs keep earning. Idle pay resumes "
+                f"when the node has {floor} free."
+            ),
+            extra_fields={
+                "gpu_count": unpaid,
+                "free_split_count": disk_limited.free_split_count,
+                "paid_split_count": disk_limited.paid_split_count,
+                "required_free_gb": settings.MIN_FREE_DISK_GB,
             },
         )
 

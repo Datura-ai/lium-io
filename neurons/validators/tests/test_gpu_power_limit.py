@@ -4,12 +4,15 @@ from unittest.mock import AsyncMock
 import pytest
 from neurons.validators.src.services.gpu_power_limit import (
     POWER_STATE_CMD,
+    GpuPowerCapResult,
     GpuPowerRestoreRecord,
     GpuPowerRestoreStateError,
     _pod_index_key,
     _restore_key,
+    apply_filler_gpu_power_limits,
     restore_filler_pod_gpu_power_limits,
 )
+from payload_models.payloads import GpuPowerLimit
 
 
 def _record(gpu_uuid: str, watts: int, executor_id: str = "executor-1") -> str:
@@ -45,7 +48,7 @@ class FakeRedis:
     def __init__(self, initial: dict[str, str] | None = None):
         self.store: dict[str, str] = dict(initial or {})
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.store[key] = value
 
     async def get(self, key: str) -> str | None:
@@ -109,6 +112,31 @@ async def test_strict_pod_restore_requires_every_record_to_be_restored(failure):
 
 
 @pytest.mark.asyncio
+async def test_strict_pod_restore_accepts_a_record_already_restored():
+    # Arrange: the customer create's pre-run restore already restored GPU-a and cleared its record,
+    # leaving the filler's index (prod 28 Oct 2026, failure_step gpu_power_restore_state).
+    redis = FakeRedis({_pod_index_key(POD_ID): '["GPU-a", "GPU-b"]', _restore_key("GPU-b"): _record("GPU-b", 250)})
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\nGPU-b, 175, 250, 100, 250\n"), *_set_ok(250))
+    # Act / Assert: GPU-a reads its default, so the create goes on; GPU-b is restored; nothing is left.
+    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True) == 1
+    assert not redis.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("current_watts", "accepted"), [(800, False), (899, False), (900, True)])
+async def test_strict_pod_restore_without_record_holds_the_rented_floor(current_watts, accepted):
+    # Arrange: GPU-a's record is gone; only its live limit can show it was restored.
+    redis = FakeRedis({_pod_index_key(POD_ID): '["GPU-a"]'})
+    ssh = fake_ssh(FakeRun(stdout=f"GPU-a, {current_watts}, 1000, 100, 1000\n"))
+    # Act / Assert: below the rented-start floor fails the create.
+    if accepted:
+        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True) == 0
+    else:
+        with pytest.raises(GpuPowerRestoreStateError):
+            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("require_complete", [True, False])
 async def test_pod_index_delete_failure_after_successful_restore(require_complete):
     # Arrange: only the final index deletion fails; the GPU record can be cleared.
@@ -130,3 +158,37 @@ async def test_pod_index_delete_failure_after_successful_restore(require_complet
         assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID) == 1
     # Assert: the record was deleted after restoration, but the stale index remains visible.
     assert redis.store == {_pod_index_key(POD_ID): '["GPU-a"]'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (None, GpuPowerCapResult.APPLIED),
+        ("nonzero", GpuPowerCapResult.HOST_REFUSED),
+        ("not_stuck", GpuPowerCapResult.HOST_REFUSED),
+        ("timeout", GpuPowerCapResult.FAILED),
+        ("redis", GpuPowerCapResult.FAILED),
+    ],
+)
+async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
+    # Arrange: one GPU to cap at 200 W; the host's -pl fails or does not stick, or our SSH or Redis fails.
+    redis = FakeRedis()
+    if failure == "redis":
+        redis.set = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout=STATE_CSV)
+        if " -pl 200" in command:
+            if failure == "timeout":
+                raise TimeoutError("hung")
+            return FakeRun(exit_status=1 if failure == "nonzero" else 0)
+        return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    # Act / Assert: only the host's own refusal reads HOST_REFUSED.
+    result = await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=200)], redis, POD_ID, "executor-1"
+    )
+    assert result is expected

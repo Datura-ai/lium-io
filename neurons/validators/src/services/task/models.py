@@ -30,6 +30,10 @@ class MixedFormulaInputs(BaseModel):
     unrented: dict[str, Any]
 
 
+# DAH-5805: a run the validator's own Redis ended (no pooled connection, a timeout) says nothing about the node
+VALIDATOR_REDIS_UNAVAILABLE = "VALIDATOR_REDIS_UNAVAILABLE"
+
+
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
@@ -58,14 +62,17 @@ class JobResult(BaseModel):
     # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
+    # DAH-3698: free GPUs of the remainder left out of the idle pool for want of a free port per split
+    port_unpaid_gpu_count: int = 0
     is_spot: bool = False
     # in the backend's provider_spot_executor_ids, the spot pay list: set to Spot by its provider, or
     # force-spot by a penalty demotion; not a banned hotkey, pin or no-incentive rental. Gates spot-node pay.
     is_on_spot_pay_list: bool = False
     is_new_rentals_paused: bool = False
+    is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False
-    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS: no incentive from any pool, set
-    # by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
+    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS (or, while unrented, in
+    # IDLE_INCENTIVE_EXCLUDED_HOTKEYS): no incentive from any pool, set by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
     is_hotkey_excluded_from_scoring: bool = False
     provider_discord_connected: bool = True
     is_provider_email_held: bool = False
@@ -91,6 +98,8 @@ class JobResult(BaseModel):
     # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
     # None when the node has no rented pod with an ssh_port or the probe did not run.
     pod_ssh: list[PodSshObservation] | None = None
+    # DAH-5651: ContextState.host_runtime_fault, this cycle's DinD test container on the host never answered
+    host_runtime_fault: bool = False
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False

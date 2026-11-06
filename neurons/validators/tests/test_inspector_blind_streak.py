@@ -21,7 +21,7 @@ async def _run_cycles(context_factory, redis, *responses):
     results = []
     for response in responses:
         ctx = context_factory(
-            config=build_context_config(inspector_enabled=True),
+            config=build_context_config(),
             services=build_services(inspector=DummyInspectorService(response), redis=redis),
             state=build_state(rented_data=_rented_data("executor-123")),
         )

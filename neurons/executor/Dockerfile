@@ -69,7 +69,9 @@ RUN arch="${TARGETARCH:-amd64}" \
 
 # pdm downloads Python 3.11.11 here (the base ships another 3.11 patch); pbs-installer 2026.10.25
 # moved that download to httpx2 and fails with "You must install httpx2 to use this function"
-RUN pip install -U pdm "pbs-installer<2026.10.25"
+# pdm/unearth pinned: unearth 0.19 (httpx2) breaks pdm install (executor-v1.157 build).
+# pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
+RUN pip install "pdm[locked]==2.29.3" "unearth<0.19" "pbs-installer<2026.10.25"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./
@@ -120,7 +122,7 @@ RUN useradd -m -s /bin/bash liumuser && \
 RUN echo 'AcceptEnv CONTAINER_NAME' >>/etc/ssh/sshd_config && \
     printf 'Match User liumuser\n    ForceCommand bash -c '"'"'[ -n "$CONTAINER_NAME" ] && exec docker exec -it "$CONTAINER_NAME" bash || { echo "CONTAINER_NAME not set"; exit 1; }'"'"'\n' >>/etc/ssh/sshd_config
 
-# PerSourcePenalties off via /etc/ssh/sshd_config.d/lium.conf when this sshd knows the directive,
+# sshd limits (grace time, MaxStartups, per-source limits run.sh can turn off) via /etc/ssh/sshd_config.d/lium.conf,
 # then `sshd -T` must accept the whole rendered config or the build fails (sshd_setup.sh says why).
 RUN sh sshd_setup.sh
 

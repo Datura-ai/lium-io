@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ class ProgressState:
     total_bytes: int | None = None
     processed_bytes: int | None = None
     stage: str | None = None
+    summary: dict[str, int] | None = None
 
 
 class StorageEventReporter:
@@ -52,6 +54,8 @@ class StorageEventReporter:
         self._state = ProgressState(stage=initial_stage)
         self._cancel_requested = False
         self._restic_failure_detail: str | None = None
+        self._restore_counts: tuple[int, int] | None = None  # (files_restored, total_files) from restic's summary
+        self._failed_items: dict[str, None] = {}  # distinct restic error items, first-seen order
         self._diagnostic_detail: str | None = None
         self._next_progress_at = self._clock()
         self._progress_failures = 0
@@ -74,18 +78,31 @@ class StorageEventReporter:
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
-            if self._state.stage == "PREPARING" and self._restore_has_started():
+            if (
+                payload.get("message_type") == "summary"
+                and self._spec.resource is ReporterResource.BACKUP
+            ):
+                self._state.summary = _summary_counts(payload)
+            self._remember_restore_counts(payload)
+            if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
+            elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
+                # restic is running and scanning the snapshot; no file restored yet.
+                self._state.stage = "SCANNING"
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
+            return
+        if event_type == "rerun":
+            self._restic_failure_detail = self._diagnostic_detail = self._restore_counts = None
+            self._failed_items = {}
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
-        if event_type == "diagnostic":
+        if event_type in ("diagnostic", "log"):
             message = event.get("message")
             if isinstance(message, str) and message:
-                if self._diagnostic_detail is None:
+                if event_type == "diagnostic" and self._diagnostic_detail is None:
                     self._diagnostic_detail = message[:2000]
                 # Kept until a PUT succeeds, so throttled or failed updates do not drop them.
                 self._pending_logs = _newest_within_bytes(
@@ -103,19 +120,21 @@ class StorageEventReporter:
                 if result_quality == "FULL":
                     self._state.processed_files = self._state.total_files
                     self._state.processed_bytes = self._state.total_bytes
-            self._put(
-                self._progress_payload(
-                    status=status,
-                    result_quality=result_quality,
-                    snapshot_id=_optional_string(event.get("snapshot_id")),
-                    exit_code=_optional_integer(event.get("exit_code")),
-                    error_code=_optional_string(event.get("error_code")),
-                    error_message=(self._restic_failure_detail or self._diagnostic_detail)
-                    if status != "COMPLETED"
-                    else None,
-                ),
-                terminal=True,
+            if self._spec.resource is not ReporterResource.BACKUP and self._restore_counts is not None:
+                self._state.processed_files = self._present_counts()[0]
+            payload = self._progress_payload(
+                status=status,
+                result_quality=result_quality,
+                snapshot_id=_optional_string(event.get("snapshot_id")),
+                exit_code=_optional_integer(event.get("exit_code")),
+                error_code=_optional_string(event.get("error_code")),
+                error_message=self._failure_message()
+                if status != "COMPLETED"
+                else self._partial_restore_warning(result_quality),
             )
+            if status == "COMPLETED" and self._state.summary:
+                payload.update(self._state.summary)
+            self._put(payload, terminal=True)
 
     def _apply_progress(self, event: Mapping[str, object]) -> None:
         percent_done = event.get("percent_done")
@@ -165,6 +184,44 @@ class StorageEventReporter:
         message = _optional_string(event.get("message"))
         if message:
             self._restic_failure_detail = message[:2000]
+
+    def _remember_restore_counts(self, event: Mapping[str, object]) -> None:
+        if self._spec.resource is ReporterResource.BACKUP:
+            return
+        if event.get("message_type") in ("error", "exit_error"):
+            item = _optional_string(event.get("item"))
+            if item:
+                self._failed_items[item] = None
+        elif event.get("message_type") == "summary":
+            restored = _optional_integer(event.get("files_restored"))
+            total = _optional_integer(event.get("total_files"))
+            if restored is not None and total is not None:
+                self._restore_counts = (restored, total)
+
+    def _failure_message(self) -> str | None:
+        detail = _renter_paths(self._restic_failure_detail or self._diagnostic_detail)
+        if self._restore_counts is None:
+            return detail
+        restored = "restored {} of {} files".format(*self._present_counts())
+        return f"{detail}; {restored}"[:2000] if detail else restored.capitalize()
+
+    def _partial_restore_warning(self, result_quality: str | None) -> str | None:
+        if result_quality != "PARTIAL" or self._spec.resource is ReporterResource.BACKUP:
+            return None
+        if self._restore_counts is None or not self._failed_items:
+            return "Restored with errors; some files were not restored"
+        restored, total = self._present_counts()
+        first = _renter_paths(next(iter(self._failed_items)))
+        return (
+            f"Restored {restored} of {total} files; {len(self._failed_items)} were removed on the pod "
+            f"during the restore, first: {first}"
+        )[:2000]
+
+    def _present_counts(self) -> tuple[int, int]:
+        """(files left on the pod, snapshot files): restic's files_restored counts writes, including files that
+        failed or were removed afterwards, so the distinct failed items come off the total"""
+        restored, total = self._restore_counts or (0, 0)
+        return max(0, min(restored, total - len(self._failed_items))), total
 
     def _restore_has_started(self) -> bool:
         return bool(
@@ -290,9 +347,26 @@ def _first_integer(value: Mapping[str, object], *keys: str) -> int | None:
     return None
 
 
+def _summary_counts(summary: Mapping[str, object]) -> dict[str, int]:
+    """restic's final backup summary, under the backup_log column names"""
+    counts = {
+        "data_added_bytes": _first_integer(summary, "data_added"),
+        "data_added_packed_bytes": _first_integer(summary, "data_added_packed"),
+        "files_new": _first_integer(summary, "files_new"),
+        "files_changed": _first_integer(summary, "files_changed"),
+        "files_unmodified": _first_integer(summary, "files_unmodified"),
+    }
+    return {field: value for field, value in counts.items() if value is not None}
+
+
 def _updated_integer(value: Mapping[str, object], current: int | None, *keys: str) -> int | None:
     updated = _first_integer(value, *keys)
     return current if updated is None else updated
+
+
+def _renter_paths(message: str | None) -> str | None:
+    # The restore writes through /proc/<pid>/root of the live container; the renter knows only the path inside it.
+    return re.sub(r"/proc/\d+/root(?=/)", "", message) if message else message
 
 
 def _optional_string(value: object) -> str | None:

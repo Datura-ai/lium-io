@@ -8,14 +8,15 @@ rental; on the node's next unrented cycle this check runs the all-cards matmul a
 on every card, whatever the MATMUL_ALLCARDS_* / GPU_FAULT_PROBE_* flags say. A failure fails the node and keeps the marker; a pass
 clears it.
 
-A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker, and so
-does the backend's renter_hardware_fault_executor_ids (hardware-fault reports from two distinct renters):
-a GeForce card has no ECC or row-remap counters, so a renter's report is the only signal it gives.
-A pass sets a cleared key for MARKER_TTL_SECONDS: the backend list cannot tell a new report from the
-old one, so new renter reports on that node go unseen until the cleared key expires.
+A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker.
 
 A cycle with a filler skips the recheck; after FILLER_SKIP_LIMIT such skips the check removes the
 node's Lium fillers and probes anyway, so a node that always runs a filler cannot skip it for good.
+
+GpuLossHoldCheck sets the marker too (source `gpu_loss_hold`) on the first clean read after a GPU dropout. For that
+marker only a pass lets the node list: a failure, a filler skip or a cycle with no verdict fails the node with a
+GPU_LOST availability entry (WAITING_AFTER_GPU_LOSS: the backend hides the node, which a failed cycle alone does not
+do while the row is still active) and keeps the marker, where a post-rental recheck lets the node proceed on a skip.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from services.redis_service import POST_RENTAL_GPU_RECHECK_PREFIX
 from core.config import settings
 from core.utils import _m, get_extra_info
 
+from ..availability import ReachSource, ReachTarget
 from ..messages import GpuFaultProbeMessages, render_message
 from ..messages import PostRentalGpuRecheckMessages as Msg
 from ..pipeline import CheckResult, Context
@@ -49,6 +51,8 @@ MARKER_TTL_SECONDS = 3 * 24 * 3600
 MAX_MARKED_CARDS = 16
 # filler cycles the recheck waits out before it removes the fillers and probes anyway
 FILLER_SKIP_LIMIT = 3
+# GpuLossHoldCheck's marker: a node back from a GPU dropout lists only on a pass, never on a skip or no verdict
+SOURCE_GPU_LOSS_HOLD = "gpu_loss_hold"
 
 
 @dataclass(frozen=True)
@@ -82,24 +86,6 @@ class RecheckMarker:
 
 def marker_key(miner_hotkey: str, executor_uuid: str) -> str:
     return f"{POST_RENTAL_GPU_RECHECK_PREFIX}:{miner_hotkey}:{executor_uuid}"
-
-
-def cleared_key(miner_hotkey: str, executor_uuid: str) -> str:
-    return f"{POST_RENTAL_GPU_RECHECK_PREFIX}_cleared:{miner_hotkey}:{executor_uuid}"
-
-
-def _renter_reported(ctx: Context) -> bool:
-    """Listed by the backend for renter hardware-fault reports, under this hotkey."""
-    rented_data = ctx.state.rented_data
-    uuid = str(ctx.executor.uuid)
-    if not rented_data or uuid not in rented_data.renter_hardware_fault_executor_ids:
-        return False
-    rented = rented_data.executors.get(uuid)
-    owner = rented_data.executor_owner_hotkeys.get(uuid) or (
-        rented.miner_hotkey if rented else None
-    )
-    # an unknown owner applies nothing: a report must not land on a node listed under another hotkey
-    return owner == ctx.miner_hotkey
 
 
 async def record_marker(ctx: Context, marker: RecheckMarker) -> None:
@@ -148,7 +134,7 @@ class PostRentalGpuRecheckCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         key = marker_key(ctx.miner_hotkey, ctx.executor.uuid)
-        marker = await self._find_marker(ctx, key)
+        marker = await self._read_marker(ctx, key)
         if marker is None:
             return CheckResult(
                 passed=True, event=render_message(Msg.NO_MARKER, ctx=ctx, check_id=self.check_id)
@@ -159,21 +145,13 @@ class PostRentalGpuRecheckCheck:
             if marker.filler_skips < FILLER_SKIP_LIMIT:
                 # both probes would compete with the filler for VRAM; the marker waits for an idle cycle
                 await record_marker(ctx, replace(marker, filler_skips=marker.filler_skips + 1))
-                return CheckResult(
-                    passed=True,
-                    event=render_message(
-                        Msg.FILLER_SKIPPED, ctx=ctx, check_id=self.check_id, what=what
-                    ),
-                )
+                return self._not_run(ctx, marker, Msg.FILLER_SKIPPED, what)
             what["removed_fillers"] = await self._remove_fillers(ctx)
             if not what["removed_fillers"]:
                 # the filler still holds VRAM: a probe OOM here would fail a healthy card
                 await self._refresh_marker(ctx, key, what)
                 self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
-                return CheckResult(
-                    passed=True,
-                    event=render_message(Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what),
-                )
+                return self._not_run(ctx, marker, Msg.INCONCLUSIVE, what)
 
         probes = await self._run_every_card_probes(ctx, what)
         if probes.failures:
@@ -183,6 +161,7 @@ class PostRentalGpuRecheckCheck:
             return CheckResult(
                 passed=False,
                 event=render_message(Msg.FAILED, ctx=ctx, check_id=self.check_id, what=what),
+                extra_events=[self._unlisted(ctx, what, Msg.FAILED)] if marker.source == SOURCE_GPU_LOSS_HOLD else [],
             )
         if (
             probes.fault_probe.event.reason_code != GpuFaultProbeMessages.PROBE_OK.reason
@@ -192,10 +171,7 @@ class PostRentalGpuRecheckCheck:
             # the marker stays
             await self._refresh_marker(ctx, key, what)
             self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
-            return CheckResult(
-                passed=True,
-                event=render_message(Msg.INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=what),
-            )
+            return self._not_run(ctx, marker, Msg.INCONCLUSIVE, what)
         await self._clear_marker(ctx, key, what)
         self._log(ctx, "POST_RENTAL_GPU_RECHECK_PASSED", what, logging.INFO)
         return CheckResult(
@@ -203,22 +179,26 @@ class PostRentalGpuRecheckCheck:
             event=render_message(Msg.PASSED, ctx=ctx, check_id=self.check_id, what=what),
         )
 
-    @staticmethod
-    async def _recently_cleared(ctx: Context) -> bool:
-        try:
-            return (
-                await ctx.services.redis.get(cleared_key(ctx.miner_hotkey, ctx.executor.uuid))
-                is not None
-            )
-        except Exception:  # noqa: BLE001 — unreadable: do not re-mark a node that may have just passed
-            return True
+    def _not_run(self, ctx: Context, marker: RecheckMarker, msg, what: dict[str, Any]) -> CheckResult:
+        """No pass this cycle (a filler skip or no verdict): the marker stays. A post-rental recheck lets the node
+        proceed; a node back from a GPU dropout stays unlisted until the test has passed on every card."""
+        if marker.source != SOURCE_GPU_LOSS_HOLD:
+            return CheckResult(passed=True, event=render_message(msg, ctx=ctx, check_id=self.check_id, what=what))
+        return CheckResult(passed=False, event=self._unlisted(ctx, what, msg))
 
-    async def _find_marker(self, ctx: Context, key: str) -> RecheckMarker | None:
-        """The stored marker, else a new one for a renter report not already cleared by a pass."""
-        marker = await self._read_marker(ctx, key)
-        if marker is None and _renter_reported(ctx) and not await self._recently_cleared(ctx):
-            marker = await self._record_renter_report_marker(ctx)
-        return marker
+    def _unlisted(self, ctx: Context, what: dict[str, Any], msg):
+        """The GPU_LOST availability entry that keeps a node back from a dropout off the market."""
+        return render_message(
+            Msg.WAITING_AFTER_GPU_LOSS,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "reach_source": str(ReachSource.VALIDATOR),
+                "reach_target": str(ReachTarget.GPU),
+                "executor_uuid": ctx.executor.uuid,
+                "load_test": msg.reason,
+            },
+        )
 
     @staticmethod
     async def _remove_fillers(ctx: Context) -> list[str]:
@@ -229,13 +209,6 @@ class PostRentalGpuRecheckCheck:
         ):
             return []
         return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
-
-    @staticmethod
-    async def _record_renter_report_marker(ctx: Context) -> RecheckMarker:
-        marker = RecheckMarker(source="renter_report", verdict="renter_reported")
-        await record_marker(ctx, marker)
-        # DRY_RUN writes nothing: the recheck still sees what it would require this cycle
-        return marker
 
     @staticmethod
     async def _read_marker(ctx: Context, key: str) -> RecheckMarker | None:
@@ -257,10 +230,6 @@ class PostRentalGpuRecheckCheck:
             return
         try:
             await ctx.services.redis.delete(key)
-            # the backend keeps listing a node for its whole report window: a pass holds off re-marking
-            await ctx.services.redis.set(
-                cleared_key(ctx.miner_hotkey, ctx.executor.uuid), "1", ex=MARKER_TTL_SECONDS
-            )
         except Exception as exc:  # noqa: BLE001 — the pass stands; the recheck repeats next cycle
             what["marker_clear_error"] = str(exc)
 
