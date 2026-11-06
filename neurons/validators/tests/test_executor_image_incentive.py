@@ -1,21 +1,10 @@
 from unittest.mock import AsyncMock
 
 import pytest
-from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task.models import JobResult
-
-
-@pytest.fixture
-def enforce(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-
-
-@pytest.fixture
-def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
 def failed_idle_result() -> JobResult:
@@ -44,7 +33,7 @@ def failed_idle_result() -> JobResult:
 
 
 @pytest.mark.asyncio
-async def test_rented_outdated_executor_keeps_job_result_but_gets_zero_mining_score(enforce):
+async def test_rented_outdated_executor_keeps_job_result_but_gets_zero_mining_score():
     result = failed_idle_result().model_copy(
         update={
             "job_score": 1.0,

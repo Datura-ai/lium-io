@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -19,16 +18,6 @@ from tests.helpers import build_context_config, build_state, make_context
 
 EXECUTOR_DIGEST = f"sha256:{'a' * 64}"
 STALE_DIGEST = f"sha256:{'c' * 64}"
-
-
-@pytest.fixture
-def enforce(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-
-
-@pytest.fixture
-def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
 def policy() -> ExpectedImageSnapshot:
@@ -67,7 +56,7 @@ def specs(*, executor_digest: str = EXECUTOR_DIGEST) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_unrented_outdated_executor_fails_validation(enforce):
+async def test_unrented_outdated_executor_fails_validation():
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(
@@ -87,7 +76,7 @@ async def test_unrented_outdated_executor_fails_validation(enforce):
 
 
 @pytest.mark.asyncio
-async def test_unobservable_executor_digest_is_outdated(enforce):
+async def test_unobservable_executor_digest_is_outdated():
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(
@@ -108,7 +97,6 @@ async def test_unobservable_executor_digest_is_outdated(enforce):
     [(False, 0.0), (True, 1.0)],
 )
 def test_score_calculator_zeroes_outdated_executor(
-    enforce,
     rented: bool,
     expected_job_score: float,
 ):
@@ -129,7 +117,7 @@ def test_score_calculator_zeroes_outdated_executor(
 
 
 @pytest.mark.asyncio
-async def test_outdated_executor_under_another_miners_rental_on_a_different_endpoint_fails(enforce):
+async def test_outdated_executor_under_another_miners_rental_on_a_different_endpoint_fails():
     # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),

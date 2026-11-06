@@ -356,7 +356,6 @@ async def test_a_run_that_passed_every_check_gets_no_validation_failed(engine, e
     ids=["rented-halt", "image-check-failed"],
 )
 async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine, failure_reason_code, overrides):
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
     result = _idle_full_8x(
         score=0,
         job_score=0,
