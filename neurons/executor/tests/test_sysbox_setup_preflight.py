@@ -24,7 +24,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir"]
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir", "readlink"]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
@@ -71,6 +71,8 @@ STUBS = {
             "info --format")
                 case "$3" in
                     *DockerRootDir*) echo "$root" ;;
+                    *DriverStatus*) echo "${STUB_DRIVER_STATUS:-[[\\"Backing Filesystem\\",\\"extfs\\"]]}" ;;
+                    *Containerd*) echo "${STUB_CONTAINERD_ADDRESS-/run/containerd/containerd.sock}" ;;
                     *Runtimes*) echo "${STUB_DOCKER_RUNTIMES:-\\"runc\\", \\"sysbox-runc\\"}" ;;
                 esac ;;
             "plugin inspect")
@@ -161,7 +163,21 @@ STUBS = {
         """\
         #!/bin/bash
         echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+        case "${!#}" in   # STUB_DATA_DF_TOTAL_KB: a data-root on its own big disk, the rest on the root disk
+            */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 ${STUB_DATA_DF_AVAIL_KB:-$STUB_DATA_DF_TOTAL_KB} 1% /data"; exit 0; } ;;
+            *.content) [ -z "${STUB_CONTENT_DF_AVAIL_KB:-}" ] || { echo "/dev/sdb1 $((14 * 1024 ** 3)) 1 $STUB_CONTENT_DF_AVAIL_KB 1% /content"; exit 0; } ;;
+        esac
         echo "${STUB_DF_SOURCE:-/dev/nvme0n1p1} ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
+        """
+    ),
+    # `ctr --address <socket> plugins ls -d` of the running containerd: its content and snapshotter roots
+    "ctr": textwrap.dedent(
+        """\
+        #!/bin/bash
+        [ "$3 $4 $5" = "plugins ls -d" ] && [ -z "${STUB_CTR_FAILS:-}" ] || exit 1
+        r=${STUB_CTR_ROOT:-$SYSBOX_SETUP_HOST_ROOT/var/lib/containerd}
+        printf '\\tType:\\tio.containerd.content.v1\\n\\tID:\\tcontent\\n\\tExports:\\t\\n\\t\\troot\\t%s\\n\\n' "$r/io.containerd.content.v1.content"
+        printf '\\tType:\\tio.containerd.snapshotter.v1\\n\\tID:\\toverlayfs\\n\\tExports:\\t\\n\\t\\troot\\t%s\\n' "$r/io.containerd.snapshotter.v1.overlayfs"
         """
     ),
 }
@@ -325,6 +341,150 @@ def test_blackwell_without_a_driver_gets_the_open_module_from_pci(tmp_path):
 
 
 # ── disk >= 1.5x VRAM (validators' MIN_DISK_TO_VRAM_RATE) ────────────────────
+
+
+SNAPSHOTTER = {"STUB_DRIVER_STATUS": '[["driver-type","io.containerd.snapshotter.v1"]]'}
+_OVERLAYFS = "io.containerd.snapshotter.v1.overlayfs"
+SNAPSHOTS = f"var/lib/containerd/{_OVERLAYFS}"
+
+
+def test_disk_is_measured_where_the_containerd_image_store_keeps_containers(tmp_path):
+    # webg8845, 27 Oct 2026: data-root on a 14 TB disk, but Docker 29's containerd image store kept the
+    # containers on the 436 GB root disk; the check read the data-root and passed
+    env = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+    files = {f"{SNAPSHOTS}/.keep": ""}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files)
+    assert rc == 1, out
+    assert "FIX  Disk 436.0 GB on " in out and f"/{SNAPSHOTS} is below" in out
+    assert '"features": {"containerd-snapshotter": false}' in out
+
+
+def test_disk_follows_the_data_root_without_the_containerd_image_store(tmp_path):
+    env = {"STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files={f"{SNAPSHOTS}/.keep": ""})
+    assert rc == 0, out
+    assert "containerd" not in out
+
+
+# the validator reports the tighter of the containerd store and data-root (rental volumes stay in data-root):
+# preflight must fail whichever filesystem is the limiting one, for the total and for the free space
+TIGHTER_STORE_CASES = [
+    # (check, store df kB, data-root df kB, expected rc, limiting dir suffix)
+    ("check_total_disk_for_vram", 436 * 1024**2, 14 * 1024**3, 1, f"/{SNAPSHOTS}"),
+    ("check_total_disk_for_vram", 14 * 1024**3, 436 * 1024**2, 1, "/var/lib/docker"),
+    ("check_total_disk_for_vram", 14 * 1024**3, 14 * 1024**3, 0, None),
+    ("check_free_disk_for_node", 50 * 1024**2, 14 * 1024**3, 1, f"/{SNAPSHOTS}"),
+    ("check_free_disk_for_node", 14 * 1024**3, 50 * 1024**2, 1, "/var/lib/docker"),
+    ("check_free_disk_for_node", 14 * 1024**3, 14 * 1024**3, 0, None),
+]
+
+
+@pytest.mark.parametrize("check, store_kb, data_root_kb, expected_rc, limiting", TIGHTER_STORE_CASES)
+def test_disk_checks_measure_the_tighter_of_the_store_and_data_root(tmp_path, check, store_kb, data_root_kb, expected_rc, limiting):
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": str(store_kb), "STUB_DF_AVAIL_KB": str(store_kb),
+           "STUB_DATA_DF_TOTAL_KB": str(data_root_kb)}
+    rc, out, _ = run_check(tmp_path, check, env=env, files={f"{SNAPSHOTS}/.keep": ""})
+    assert rc == expected_rc, out
+    if limiting:
+        assert f"{limiting} is below" in out, out
+
+
+@pytest.mark.parametrize("store_avail_kb, data_root_avail_kb, limiting", [
+    (0, 900 * 1024**2, f"/{SNAPSHOTS}"),
+    (900 * 1024**2, 0, "/var/lib/docker"),
+])
+def test_a_full_filesystem_fails_the_free_disk_check(tmp_path, store_avail_kb, data_root_avail_kb, limiting):
+    env = {**SNAPSHOTTER, "STUB_DF_AVAIL_KB": str(store_avail_kb), "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3),
+           "STUB_DATA_DF_AVAIL_KB": str(data_root_avail_kb)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files={f"{SNAPSHOTS}/.keep": ""})
+    assert rc == 1, out
+    assert "FIX  Free disk 0.0 GB on " in out and f"{limiting} is below" in out, out
+
+
+CONTENT_STORE = "var/lib/containerd/io.containerd.content.v1.content/.keep"
+
+
+# pulled layers land in the content store, which may be its own filesystem: free space counts it, the total does not
+@pytest.mark.parametrize("check, full, expected_rc, limiting", [
+    ("check_free_disk_for_node", "content", 1, "/var/lib/containerd/io.containerd.content.v1.content"),
+    ("check_free_disk_for_node", "snapshots", 1, f"/{SNAPSHOTS}"),
+    ("check_free_disk_for_node", "data-root", 1, "/var/lib/docker"),
+    ("check_free_disk_for_node", None, 0, None),
+    ("check_total_disk_for_vram", "content", 0, None),
+])
+def test_free_disk_counts_whichever_filesystem_is_full(tmp_path, check, full, expected_rc, limiting):
+    big = str(900 * 1024**2)
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3),
+           "STUB_DF_AVAIL_KB": "0" if full == "snapshots" else big,
+           "STUB_DATA_DF_AVAIL_KB": "0" if full == "data-root" else big,
+           "STUB_CONTENT_DF_AVAIL_KB": "0" if full == "content" else big}
+    rc, out, _ = run_check(tmp_path, check, env=env, files={f"{SNAPSHOTS}/.keep": "", CONTENT_STORE: ""})
+    assert rc == expected_rc, out
+    if limiting:
+        assert f"{limiting} is below" in out, out
+
+
+@pytest.mark.parametrize(
+    "config_root, running_root",
+    [
+        ("var/lib/containerd", "var/lib/containerd"),  # unchanged configuration
+        # root moved to the big disk in the config, containerd not restarted: it still writes to the root disk
+        ("nvme/containerd", "var/lib/containerd"),
+        ("nvme/containerd", "nvme/containerd"),  # restarted onto it
+    ],
+)
+def test_free_disk_is_read_where_the_running_containerd_keeps_containers(tmp_path, config_root, running_root):
+    root = tmp_path / "root"
+    files = {f"{d}/{_OVERLAYFS}/.keep": "" for d in ("var/lib/containerd", "nvme/containerd")}
+    files["etc/containerd/config.toml"] = f'version = 2\nroot = "{root}/{config_root}"\n'
+    env = {**SNAPSHOTTER, "STUB_CTR_ROOT": f"{root}/{running_root}", "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3),
+           "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/{running_root}/{_OVERLAYFS} is below" in out
+    assert "containerd-snapshotter" in out
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"STUB_CTR_FAILS": "1"},  # the running containerd cannot be asked: never its config files instead
+        {"STUB_CONTAINERD_ADDRESS": ""},  # Docker names no containerd
+        {"STUB_CTR_ROOT": "/gone/containerd"},  # the reported root is not on the host
+    ],
+)
+def test_an_unknown_containerd_root_is_skipped_not_read_as_the_leftover(tmp_path, env):
+    files = {f"{SNAPSHOTS}/.keep": ""}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={**SNAPSHOTTER, **env, "STUB_DF_AVAIL_KB": str(50 * 1024**2)}, files=files)
+    assert rc == 0, out
+    assert "SKIP" in out and "is below" not in out
+
+
+def _containerd_process(*flags: str, pid: int = 4242) -> dict[str, str]:
+    # a running containerd serving Docker's socket, as its /proc/<pid>/cmdline reads
+    return {f"proc/{pid}/cmdline": "\0".join(("/usr/bin/containerd", *flags)) + "\0"}
+
+
+_NO_CTR_DISKS = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+_SMALL_STORE = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep": ""}
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {},  # no store at a built-in root
+        {f"{SNAPSHOTS}/.keep": "", **_containerd_process()},
+        # files on disk cannot show what the daemon loaded, even under --root: a config rewritten since it started
+        {**_SMALL_STORE, "etc/containerd/config.toml": 'version = 2\n', **_containerd_process("--root", "/small/containerd")},
+        # ... or the default config deleted since it started
+        {**_SMALL_STORE, **_containerd_process("--root", "/small/containerd")},
+    ],
+)
+def test_a_host_without_ctr_is_skipped_not_measured(tmp_path, files):
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
+    assert rc == 0, out
+    assert "SKIP" in out and "PASS=1" not in out and "/small/containerd" not in out
+    assert "install containerd's ctr" in out, out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────

@@ -389,18 +389,28 @@ class MinerLogLine(BaseModel):
         # takes the measurement whole: the two totals are interchangeable floats, and swapping
         # them would quietly tell the miner to add disk he already has
         required_disk_gb: float = round(measured.vram_gb * measured.rate, 1)
-        return MinerLogLine._no_payout(
-            result,
-            reason=ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
-            message=(
+        if measured.disk_unknown:
+            # no reading: "0 GB of total disk" would be false
+            message = (
+                f"No unrented incentive: this executor's disk could not be measured, because the validator could not "
+                f"find where Docker's containerd image store keeps containers. An idle executor must have at least "
+                f"{measured.rate}x its {measured.vram_gb} GB of GPU VRAM ({required_disk_gb} GB) in total disk. Run "
+                "one containerd with a readable config, or rent it out to earn."
+            )
+        else:
+            message = (
                 f"No unrented incentive: this executor has {measured.disk_gb} GB of total disk but "
                 f"{measured.vram_gb} GB of GPU VRAM. An idle executor must have at least "
                 f"{measured.rate}x its GPU VRAM in disk to earn the unrented incentive. Give it at "
                 f"least {required_disk_gb} GB of total disk, or rent it out to earn."
-            ),
+            )
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
+            message=message,
             extra_fields={
                 "total_vram_gb": measured.vram_gb,
-                "total_disk_gb": measured.disk_gb,
+                "total_disk_gb": None if measured.disk_unknown else measured.disk_gb,
                 "min_disk_to_vram_rate": measured.rate,
                 "required_disk_gb": required_disk_gb,
             },

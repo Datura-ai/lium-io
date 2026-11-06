@@ -12,6 +12,7 @@ import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from incentive.config import IncentiveConfig
+from incentive.miner_incentive_log import MinerLogLine
 from incentive.rental_price import RentalPriceIncentive
 from neurons.validators.tests.helpers import build_scrape_namespace
 from services.task_service import JobResult
@@ -148,3 +149,42 @@ def test_a_node_whose_filler_run_volume_reads_as_free_disk_still_clears_the_gate
     assert hard_disk["hard_disk_free"] == 1761 * KB_PER_GB
     assert hard_disk["hard_disk_total"] == 2000 * KB_PER_GB
     assert _build_incentive()._insufficient_disk(_make_job(spec=spec)) is None
+
+
+def test_an_unknown_containerd_root_fails_the_gate_closed():
+    # the scrape could not tell where Docker's containerd store keeps containers, so it reported no
+    # disk: that must not keep the incentive, or hiding the store's root would pass the gate
+    spec = {
+        "gpu": {"details": [{"capacity": 141 * MB_PER_GB} for _ in range(8)]},
+        "hard_disk": {},
+        "hard_disk_scrape_error": "RuntimeError(\"containerd root unknown: '/gone' is not on the host\")",
+    }
+
+    measured = _build_incentive()._insufficient_disk(_make_job(spec=spec))
+
+    assert measured is not None
+    assert (measured.vram_gb, measured.disk_gb, measured.disk_unknown) == (1128.0, 0.0, True)
+    # the provider is told the disk could not be measured, not that it has 0 GB
+    line = MinerLogLine.no_payout_because_insufficient_disk_for_vram(_make_job(spec=spec), measured)
+    assert "0.0 GB of total disk" not in line.message
+    assert "could not be measured" in line.message
+    assert line.fields["total_disk_gb"] is None
+    # switching image stores hides the node's existing containers, so the line never suggests it
+    assert "containerd-snapshotter" not in line.message
+
+
+def test_an_unknown_containerd_root_stays_closed_after_verifyx_fills_the_totals():
+    # VerifyX merges its own df totals under the scrape's ({**verifyx, **scraped}): the scrape
+    # omitted totals, so a big other filesystem lands in hard_disk. The unknown-root marker still wins
+    scraped_hard_disk: dict = {}
+    verifyx_hard_disk = {"total": 14 * 1024 * KB_PER_GB, "free": 13 * 1024 * KB_PER_GB}
+    spec = {
+        "gpu": {"details": [{"capacity": 141 * MB_PER_GB} for _ in range(8)]},
+        "hard_disk": {**verifyx_hard_disk, **scraped_hard_disk},
+        "hard_disk_scrape_error": "RuntimeError(\"containerd root unknown: '/gone' is not on the host\")",
+    }
+
+    measured = _build_incentive()._insufficient_disk(_make_job(spec=spec))
+
+    assert measured is not None
+    assert (measured.disk_gb, measured.disk_unknown) == (0.0, True)
