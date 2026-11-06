@@ -942,6 +942,8 @@ class VerifyXColdRetryCheck:
     first sample stands, and a gate it failed fails the node here."""
 
     check_id = "gpu.validate.verifyx_cold_retry"
+    # a replay would benchmark again from the first sample and could throw away a retry that passed
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

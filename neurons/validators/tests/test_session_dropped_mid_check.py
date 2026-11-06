@@ -17,7 +17,7 @@ from services.task.checks.gpu_memory_health import GpuMemoryHealthCheck
 from services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
 from services.task.checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from services.task.checks.rented_throughput import RentedThroughputCheck
-from services.task.checks.verifyx import VerifyXCheck
+from services.task.checks.verifyx import VerifyXCheck, VerifyXColdRetryCheck
 from services.task.checks.inspector import InspectorRentedCheck
 from services.task.checks.port_connectivity import PortConnectivityCheck
 from services.task.checks.rental_probe import RentalProbeCheck
@@ -181,6 +181,7 @@ def test_checks_that_start_containers_or_recover_pods_are_not_replayable():
         InspectorRentedCheck,
         MachineSpecScrapeCheck,
         VerifyXCheck,
+        VerifyXColdRetryCheck,
         PostRentalGpuRecheckCheck,
         RentedThroughputCheck,
     ):
