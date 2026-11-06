@@ -683,7 +683,7 @@ class AttestationService:
                 extra=get_extra_info({"executor_uuid": executor.uuid, "error": str(exc)}),
             ))
 
-    async def _reject_omitted_quote_if_ratcheted(self, executor: ExecutorSSHInfo) -> None:
+    async def _reject_omitted_quote_if_ratcheted(self, executor: ExecutorSSHInfo, teardown: bool = False) -> None:
         """Minimal-G5 fail-closed: a previously attested executor cannot silently
         drop its quote to skip verification (host-key-only bypass)."""
         if not self.enabled:
@@ -698,6 +698,13 @@ class AttestationService:
             logger.warning(_m(
                 "Failed to check attested-executor ratchet set",
                 extra=get_extra_info({"executor_uuid": executor.uuid, "error": str(exc)}),
+            ))
+            return
+        if is_ratcheted and teardown and self._build_known_hosts(executor) is not None:
+            # stopping or deleting a rental needs only the pinned host key, never unpinned SSH
+            logger.warning(_m(
+                "Previously attested executor omitted its TDX quote; host-key-only teardown",
+                extra=get_extra_info({"executor_uuid": executor.uuid, "reason": "quote_omitted_teardown"}),
             ))
             return
         if is_ratcheted:
@@ -753,7 +760,7 @@ class AttestationService:
         self,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
-        enforce_tcb: bool = True,
+        teardown: bool = False,
     ) -> HostPolicyResult:
         """Verify TDX (and, when supplied, NVIDIA GPU) attestation and build the
         SSH known_hosts policy for the executor.
@@ -768,7 +775,7 @@ class AttestationService:
         All fields are None when attestation is disabled or the executor has no
         host key. Raises AttestationError if verification is enabled but fails.
         """
-        await self._reject_omitted_quote_if_ratcheted(executor)
+        await self._reject_omitted_quote_if_ratcheted(executor, teardown=teardown)
 
         should_verify = self._should_verify(executor)
 
@@ -782,7 +789,7 @@ class AttestationService:
         attestation_digest, tee_type = None, None
         gpu_attestation_passed: bool | None = None
         if should_verify:
-            attestation_digest, tee_type = await self._verify_tdx(executor, nonce=nonce, enforce_tcb=enforce_tcb)
+            attestation_digest, tee_type = await self._verify_tdx(executor, nonce=nonce, enforce_tcb=not teardown)
             await self._record_attested_executor(executor)
 
             gpu_attestation_passed = await self._verify_gpu(executor, nonce)

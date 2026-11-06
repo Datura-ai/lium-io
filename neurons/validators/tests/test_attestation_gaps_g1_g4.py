@@ -133,7 +133,7 @@ def service(monkeypatch):
 
 
 def test_g4_bad_tcb_status_only_warns_on_rental_teardown(service):
-    # Arrange — delete/stop/remove-keys pass enforce_tcb=False: the pinned host key suffices
+    # Arrange — rental teardown verifies with enforce_tcb=False: the pinned host key suffices
     response = _verifier_response()
     response["details"]["tcb_status"] = "OutOfDate"
     expected = "0x" + response["details"]["report_data"][:64]
@@ -638,6 +638,39 @@ async def test_g5_ratcheted_executor_omitting_quote_fails_closed(monkeypatch):
     # Act / Assert
     with pytest.raises(AttestationError, match="omitted its TDX quote"):
         await service.prepare_host_policy(executor)
+
+
+async def test_g5_ratcheted_executor_omitting_quote_can_be_torn_down_on_its_pinned_key(monkeypatch):
+    # Arrange — stop/delete/key removal must still reach a CVM whose quote collection failed
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    import asyncssh
+
+    pinned = object()
+    monkeypatch.setattr(asyncssh, "import_known_hosts", lambda value: pinned)
+    redis = FakeRedis()
+    await redis.sadd(TDX_ATTESTED_EXECUTOR_SET, "test-executor")
+    service = AttestationService(redis_service=redis)
+    executor = _make_executor(tdx_quote=None)
+
+    # Act
+    host_policy = await service.prepare_host_policy(executor, teardown=True)
+
+    # Assert — the host key stays pinned and nothing is claimed as attested
+    assert host_policy.known_hosts is pinned
+    assert host_policy.attestation_digest is None
+
+
+async def test_g5_ratcheted_executor_without_a_host_key_fails_closed_even_on_teardown(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    redis = FakeRedis()
+    await redis.sadd(TDX_ATTESTED_EXECUTOR_SET, "test-executor")
+    service = AttestationService(redis_service=redis)
+    executor = _make_executor(tdx_quote=None, ssh_host_key=None)
+
+    # Act / Assert — no unpinned SSH
+    with pytest.raises(AttestationError, match="omitted its TDX quote"):
+        await service.prepare_host_policy(executor, teardown=True)
 
 
 async def test_g5_unknown_executor_without_quote_unaffected(monkeypatch):

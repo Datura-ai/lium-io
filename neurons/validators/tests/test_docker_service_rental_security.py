@@ -1140,8 +1140,8 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
         ["CONTAINER_MARKER"],
     )
     # start keeps TCB fail-closed; stop and delete only tear down, so a TCB status cannot block them
-    tcb = [c.kwargs.get("enforce_tcb", True) for c in docker_service._prepare_known_hosts_policy.await_args_list]
-    assert tcb == [True, False, False]
+    teardown = [c.kwargs.get("teardown", False) for c in docker_service._prepare_known_hosts_policy.await_args_list]
+    assert teardown == [False, True, True]
     assert docker_client.started_containers == [HOSTILE_CONTAINER_NAME]
     # two stops: the explicit stop_container call + the graceful stop inside
     # delete_container (DAH-2364)
