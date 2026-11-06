@@ -116,17 +116,18 @@ def miner_task_result():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("axon_version", [9_010_001, MIN_DATED_NONCE_MINER_AXON_VERSION])
 @pytest.mark.parametrize("attestation_due", [True, False])
-async def test_attestation_nonce_only_for_a_trusted_miner(
+async def test_a_due_attestation_always_expects_the_nonce_but_only_a_trusted_miner_is_sent_it(
     rest_miner_service, monkeypatch, attestation_due, axon_version
 ):
-    # an old-axon miner drops the nonce field and its upload fails, so it gets no nonce at all
+    # an old-axon miner drops the nonce field, so its upload carries none; its due attestation is
+    # still checked against the issued nonce, so it fails instead of passing on a replayable quote
     trusted = axon_version >= MIN_DATED_NONCE_MINER_AXON_VERSION
     _subtensor(monkeypatch, axon_versions={"miner-a": axon_version})
     attestation = AttestationNonce.issue()
     rest_miner_service.attestation_service.maybe_issue_nonce = AsyncMock(
         return_value=attestation if attestation_due else None
     )
-    rest_miner_service.miner_returns()
+    rest_miner_service.miner_returns("exec-1")
     await rest_miner_service.request_job_to_miner(
         payload=MinerJobRequestPayload(
             job_batch_id="b",
@@ -148,9 +149,11 @@ async def test_attestation_nonce_only_for_a_trusted_miner(
     [submitted] = [
         body for name, body in rest_miner_service.rest_calls if name == "ssh-pubkey-submit"
     ]
+    rest_miner_service.attestation_service.maybe_issue_nonce.assert_awaited_once_with("miner-a")
+    [task_call] = rest_miner_service.task_service.create_task.await_args_list
+    assert task_call.kwargs["attestation_nonce"] is (attestation if attestation_due else None)
     if not trusted:
         assert submitted["nonce"] is None
-        rest_miner_service.attestation_service.maybe_issue_nonce.assert_not_awaited()
     elif attestation_due:
         assert submitted["nonce"] == attestation.value_hex
     else:
