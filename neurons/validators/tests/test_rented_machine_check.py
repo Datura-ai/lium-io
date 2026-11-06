@@ -1651,3 +1651,45 @@ async def test_unnamed_pod_whose_create_is_still_running_after_the_grace_is_not_
 def test_ps_running_matches_the_whole_container_name_only():
     # Docker's name filter is an unanchored regex: `name=pod_1` also listed a `pod_12` container as this pod
     assert DockerCommand.ps_running("pod_1.a") == "/usr/bin/docker ps -q -f 'name=^/?pod_1\\.a$'"
+
+
+async def _rented_cycle_with_filler_process(context_factory, redis, listed_fillers: list[str], filler: str):
+    executor_uuid = "executor-123"
+    pod_container = "tenant-123"
+    rented_data = build_rented_data(
+        executor_uuid,
+        {"containers": [{"name": pod_container, "pod_id": "pod-1"}], "owner_flag": False},
+    )
+    rented_data.all_filler_containers_by_executor[executor_uuid] = listed_fillers
+    state = build_state(
+        gpu_processes=[{"container_name": pod_container, "pid": 1001}, {"container_name": filler, "pid": 1002}],
+        gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=build_services(redis=redis, container_cleanup=MockContainerCleanup()),
+        state=state,
+        ssh=DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."]),
+        collateral_deposited=True,
+        contract_version="v1.0.0",
+    )
+    return await TenantEnforcementCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("listed_last_cycle", "reason"),
+    [(True, Msg.ALREADY_RENTED.reason), (False, Msg.GPU_OUTSIDE_TENANT.reason)],
+    ids=["our-filler-stopping", "never-our-filler"],
+)
+async def test_a_filler_listed_on_this_node_last_cycle_still_counts_as_our_load(
+    context_factory, listed_last_cycle, reason
+):
+    # DAH-5904: a filler preempted by a customer rent leaves the snapshot before its container is gone
+    redis = build_services().redis
+    filler = "filler_885e1616-28e0-4792-9890-47f71893d27f"
+    await _rented_cycle_with_filler_process(context_factory, redis, [filler] if listed_last_cycle else [], filler)
+
+    result = await _rented_cycle_with_filler_process(context_factory, redis, [], filler)
+
+    assert result.event.reason_code == reason
