@@ -6,6 +6,7 @@ DAH-1991: cleanup must pick up `health_check_*` in addition to `pod_*` and
 DAH-2375: prune_dangling_anonymous_volumes must reap orphaned anonymous
 volumes left behind by historical `docker rm` without `-v`.
 """
+import asyncio
 import json
 import logging
 import random
@@ -1416,3 +1417,77 @@ async def test_the_check_confirms_a_legacy_container_ended_from_the_backends_rec
         backend.get_filler_run_active.assert_awaited_once_with(record_id)
     else:
         backend.get_pod_rental_active.assert_awaited_once_with(record_id)
+
+
+@pytest.mark.asyncio
+async def test_a_hung_cleanup_gives_up_at_its_budget_and_the_cycle_goes_on(monkeypatch):
+    """A slow dockerd held this step past the executor task's own timeout, so the cycle had no result."""
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    ctx = _cleanup_check_ctx([], [])
+
+    async def hang(**kwargs):
+        await asyncio.sleep(60)
+
+    ctx.services.container_cleanup.cleanup.side_effect = hang
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.passed is True
+    assert result.event.reason_code == "STALE_CLEANUP_TIMED_OUT"
+    assert not result.updates
+
+
+@pytest.mark.asyncio
+async def test_a_removal_before_a_hang_still_drops_the_removed_containers_gpu_processes(monkeypatch):
+    """Review 4491995517: a timeout after an orphan with a GPU process was removed lost the exemption, so
+    the fatal GPU check judged a container that is gone and a healthy node scored 0 for the cycle."""
+    from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    backend = AsyncMock()
+    reaped = {"pid": 1, "container_name": name}
+    foreign = {"pid": 2, "container_name": "my_miner"}
+    ctx = _cleanup_check_ctx([], [reaped, foreign], backend=backend)
+    backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, rental_closed_at=CLOSED, executor_id=str(ctx.executor.uuid)
+    )
+
+    async def remove_then_hang(**kwargs):
+        assert kwargs["reserve_removal"](name)
+        kwargs["on_removed"](name)
+        await asyncio.sleep(60)  # a later docker call that never answers
+
+    ctx.services.container_cleanup.cleanup.side_effect = remove_then_hang
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.event.reason_code == "STALE_CLEANUP_TIMED_OUT"
+    assert result.updates["state"].gpu_processes == [foreign]
+
+
+@pytest.mark.asyncio
+async def test_a_cache_sweep_cut_by_the_budget_does_not_run_again_next_cycle(monkeypatch):
+    """Review 4491995523: an unstamped sweep repeats on a slow node every cycle and the reclaim after it never runs."""
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    ctx = _cleanup_check_ctx([], [])
+    sweep = ctx.services.container_cleanup.sweep_abandoned_download_temporaries
+
+    async def hang(**kwargs):
+        await asyncio.sleep(60)
+
+    sweep.side_effect = hang
+    check = StaleContainerCleanupCheck()
+
+    await asyncio.wait_for(check.run(ctx), timeout=5)
+    await asyncio.wait_for(check.run(ctx), timeout=5)
+
+    assert sweep.await_count == 1

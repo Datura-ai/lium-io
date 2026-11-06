@@ -240,6 +240,7 @@ class ContainerCleanup:
         on_before_remove: Callable[[str], Awaitable[None]] | None = None,
         lium_workload_ended: Callable[[str], Awaitable[bool]] | None = None,
         reserve_removal: Callable[[str], bool] | None = None,
+        on_removed: Callable[[str], None] | None = None,
     ) -> tuple[int, list[str], list[str]]:
         """Remove Lium's containers whose pod is no longer live and that are older than threshold.
 
@@ -254,6 +255,9 @@ class ContainerCleanup:
 
         ``reserve_removal(container_name)`` is asked before removing a labelled pod_/filler_
         container; False defers it to a later cycle (the caller's per-cycle lookup budget is spent).
+
+        ``on_removed(container_name)`` is called right after each successful removal, so a caller that
+        times out mid-sweep still knows what is gone.
 
         Returns:
             Tuple of (number_removed, removed container names, orphaned containers that survived
@@ -329,6 +333,8 @@ class ContainerCleanup:
                         await on_before_remove(stripped_name)
                     if await self._remove_container(ssh_client, stripped_name):
                         removed_names.append(stripped_name)
+                        if on_removed is not None:
+                            on_removed(stripped_name)
                         logger.info(
                             _m(
                                 f"Removed stale container {stripped_name}",
