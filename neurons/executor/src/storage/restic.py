@@ -220,7 +220,6 @@ class ResticStorageRunner:
         self._workspace = workspace
         self._restic_binary = restic_binary
         self._docker_binary = docker_binary
-        self._repository_via_helper = False
         self._events = event_writer or JsonEventWriter(
             str(operation.operation_id),
             operation.progress_interval_seconds,
@@ -230,8 +229,6 @@ class ResticStorageRunner:
         self._snapshot_empty = False
         self._last_error_text = ""
         self._restore_errors: list[tuple[str, str]] = []  # (item, message without the item)
-        self._helper_state: Mapping[str, object] = {}
-        self._helper_id = ""
 
     def run(self) -> ResticResult:
         if self._operation.engine is StorageEngine.RESTIC:
@@ -338,37 +335,8 @@ class ResticStorageRunner:
             retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
 
     def _run_repository_command(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        if self._repository_via_helper:
-            return self._run_repository_helper(restic_arguments)
-        result = self._supervised_run(self._restic_command(restic_arguments))
-        if (
-            result.returncode not in (0, 10)
-            and getattr(self._workspace, "image", None)
-            and _dns_lookup_failed(result.stderr or result.stdout)
-        ):
-            # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge
-            # resolves fine; the backup itself already runs in a default-bridge helper.
-            print("Repository DNS lookup failed in the executor; using a helper container", file=sys.stderr, flush=True)
-            self._repository_via_helper = True
-            return self._run_repository_helper(restic_arguments)
-        return result
-
-    def _run_repository_helper(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        try:
-            return self._supervised_run(self._repository_helper_command(restic_arguments))
-        except StorageOperationCancelled:
-            self._stop_helper_container()  # else it keeps the repository credentials until restic exits
-            raise
-
-    def _repository_helper_command(self, restic_arguments: list[str]) -> list[str]:
-        return [
-            *self._docker_helper_base(),
-            "--rm",
-            "--entrypoint",
-            self._restic_binary,
-            self._workspace.image,
-            *self._restic_command(restic_arguments)[1:],
-        ]
+        # runs in the helper, on the default bridge: the executor's compose-network DNS is not involved
+        return self._supervised_run(self._restic_command(restic_arguments))
 
     def _supervised_run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         # restic retries S3 for ~15 min on its own; heartbeat meanwhile so the backend does not mark the run stale.
@@ -538,13 +506,6 @@ class ResticStorageRunner:
             self._operation, repository=replace(self._operation.repository, **credentials)
         )
         self._environment = self._build_environment()
-        if self._uses_helper_container():
-            # the stopped helper's --rm removal can lag; the rerun reuses its name
-            subprocess.run(
-                [self._docker_binary, "rm", "-f", self._helper_container_name()],
-                capture_output=True,
-                text=True,
-            )
         self._events.diagnostic("storage credentials expired; renewed them, restarting the backup")
 
     def _restore(self) -> ResticResult:
@@ -617,12 +578,6 @@ class ResticStorageRunner:
         restore_stats: RestoreStats | None = None,
     ) -> tuple[int, Mapping[str, object] | None]:
         started_at = time.monotonic()
-        # The helper runs without --rm so its OOMKilled state can be read after exit, then it is removed.
-        helper = self._uses_helper_container()
-        if helper:
-            self._remove_stopped_helpers()
-            self._remove_helper_container()
-        helper_since = f"{time.time():.6f}"
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -715,13 +670,6 @@ class ResticStorageRunner:
             raise
         finally:
             output_reader.join(timeout=1)
-            if helper:
-                inspection = self._remove_helper_container()
-                state = inspection.get("State")
-                self._helper_state = state if isinstance(state, dict) else {}
-                self._helper_id = str(inspection.get("Id") or "")
-                if not inspection:  # gone before this cleanup: docker's events say who stopped and removed it
-                    self._log_helper_events(helper_since)
 
     def _raise_if_credentials_expired(self, error_text: str) -> None:
         # restic 0.19 retries an expired session for 15 minutes before failing; stop it now
@@ -734,12 +682,7 @@ class ResticStorageRunner:
         self._terminate_process(process)
         raise StorageOperationCancelled("storage operation cancellation requested")
 
-    def _uses_helper_container(self) -> bool:
-        return isinstance(self._workspace, (DockerVolumeWorkspace, DockerUserNamespaceWorkspace))
-
     def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-        if self._uses_helper_container():
-            self._stop_helper_container()
         try:
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=10)
@@ -779,94 +722,14 @@ class ResticStorageRunner:
             if finished_at < cutoff:
                 subprocess.run([self._docker_binary, "rm", "--force", fields[0]], capture_output=True, text=True)
 
-    def _remove_helper_container(self) -> Mapping[str, object]:
-        """Remove the helper container; return its docker inspect object.
-
-        {} when docker has no such container; State.Status "unknown" when inspect failed otherwise.
-        """
-        name = self._helper_container_name()
-        inspection = subprocess.run(
-            [self._docker_binary, "inspect", "--format", "{{json .}}", name],
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run([self._docker_binary, "rm", "--force", name], capture_output=True, text=True)
-        if inspection.returncode != 0 and "no such" in (inspection.stderr or "").lower():
-            return {}
-        try:
-            state = json.loads(inspection.stdout) if inspection.returncode == 0 else None
-        except ValueError:
-            state = None
-        return state if isinstance(state, dict) else {"State": {"Status": "unknown"}}
-
-    def _log_helper_events(self, since: str) -> None:
-        """Log the helper's docker events (kill signal, die exit code, destroy) and take its ID from them."""
-        try:
-            listed = subprocess.run(
-                [self._docker_binary, "events", "--since", since, "--until", str(int(time.time()) + 1),
-                 "--filter", f"container={self._helper_container_name()}", "--format", "{{json .}}"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            self._events.log(f"helper docker events unavailable: {error}")
-            return
-        lines = []
-        for line in listed.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            actor = event.get("Actor") if isinstance(event.get("Actor"), dict) else {}
-            attributes = actor.get("Attributes") if isinstance(actor.get("Attributes"), dict) else {}
-            event_id = str(event.get("id") or actor.get("ID") or "")
-            self._helper_id = self._helper_id or event_id
-            # signal/exitCode/execDuration only: other attributes are image labels
-            kept = {key: attributes[key] for key in ("signal", "exitCode", "execDuration") if key in attributes}
-            lines.append(f"{event.get('time')} {event_id[:12]} {event.get('Action') or event.get('status')} {json.dumps(kept)}")
-        self._events.log("helper docker events: " + (" | ".join(lines) or f"none (exit {listed.returncode})"))
-
     def _killed_helper_message(self, action: str) -> str:
-        """Exit 137: say out of memory only when docker recorded an OOM kill."""
-        if not self._uses_helper_container():
-            # restic was this helper's child: its own cgroup counts the OOM kills
-            try:
-                with open(CGROUP_MEMORY_EVENTS) as events:
-                    oom_kills = int(dict(line.split() for line in events if line.strip()).get("oom_kill", "0"))
-            except (OSError, ValueError):
-                oom_kills = 0
-            return f"{action} ran out of memory" if oom_kills else f"{action} was killed (often out of memory)"
-        state = self._helper_state
-        if state.get("OOMKilled") is True:
-            return f"{action} ran out of memory"
-        fields = ("Status", "OOMKilled", "Dead", "ExitCode", "Error", "StartedAt", "FinishedAt")
-        # a log event, not stderr: detached runs delete their stderr log on exit
-        self._events.log(
-            f"{action} helper exited 137; docker state "
-            + json.dumps({field: state.get(field) for field in fields})
-        )
-        # Docker's OOMKilled can miss a kill; the kernel log settles OOM against an outside SIGKILL
-        note = kernel_kill_note(self._helper_id)
-        self._events.log(note)
-        if "oom-kill:" in note and self._helper_id:  # the kernel's OOM kill that Docker's flag missed
-            return f"{action} ran out of memory"
-        if not state or state.get("Status") == "removing":  # removed mid-run, not an OOM
-            return f"{action} helper container was removed while running"
-        if state.get("Status") == "unknown":  # docker inspect failed for another reason
-            return f"{action} helper was killed (helper state unknown)"
-        if state.get("OOMKilled") is False:
-            return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
-        return f"{action} helper was killed (often out of memory)"
-
-    def _stop_helper_container(self) -> None:
-        subprocess.run(
-            [self._docker_binary, "stop", "--time", "5", self._helper_container_name()],
-            capture_output=True,
-            text=True,
-        )
+        """Exit 137: restic was this helper's child, and the helper's own cgroup counts the OOM kills."""
+        try:
+            with open(CGROUP_MEMORY_EVENTS) as events:
+                oom_kills = int(dict(line.split() for line in events if line.strip()).get("oom_kill", "0"))
+        except (OSError, ValueError):
+            oom_kills = 0
+        return f"{action} ran out of memory" if oom_kills else f"{action} was killed (often out of memory)"
 
     def _execution_command(
         self,
@@ -878,54 +741,19 @@ class ResticStorageRunner:
             cwd = str(self._workspace.path) if working_directory else None
             return restic_command, cwd
 
-        if isinstance(self._workspace, (DockerUserNamespaceWorkspace, NamespaceWorkspace)):
-            if working_directory:
-                namespace_command = [
-                    "/bin/sh",
-                    "-c",
-                    BACKUP_SOURCE_SCRIPT,
-                    "sh",
-                    str(self._workspace.path),
-                    *restic_command,
-                ]
-            else:
-                namespace_command = restic_command
-            if isinstance(self._workspace, NamespaceWorkspace):
-                return self._nsenter_command(namespace_command), None
-            return self._encrypted_helper_command(namespace_command), None
-
-        volume_mode = "ro" if self._workspace.read_only else "rw"
-        command = [
-            *self._docker_helper_base(),
-            "--security-opt",
-            "no-new-privileges",
-            "-v",
-            f"{self._workspace.volume_name}:/workspace:{volume_mode}",
-        ]
+        # an encrypted workspace: restic runs inside the rental's user namespace
         if working_directory:
-            command.extend(
-                [
-                    "--entrypoint",
-                    "/bin/sh",
-                    self._workspace.image,
-                    "-c",
-                    BACKUP_SOURCE_SCRIPT,
-                    "sh",
-                    str(self._workspace.path),
-                    self._restic_binary,
-                    *restic_command[1:],
-                ]
-            )
-            return command, None
-        command.extend(
-            [
-                "--entrypoint",
-                self._restic_binary,
-                self._workspace.image,
-                *restic_command[1:],
+            namespace_command = [
+                "/bin/sh",
+                "-c",
+                BACKUP_SOURCE_SCRIPT,
+                "sh",
+                str(self._workspace.path),
+                *restic_command,
             ]
-        )
-        return command, None
+        else:
+            namespace_command = restic_command
+        return self._nsenter_command(namespace_command), None
 
     def _restore_execution_command(self, snapshot_id: str) -> tuple[list[str], str | None]:
         arguments = [
@@ -935,7 +763,7 @@ class ResticStorageRunner:
             self._workspace_path(),
             "--sparse",
         ]
-        if isinstance(self._workspace, (DockerUserNamespaceWorkspace, NamespaceWorkspace)):
+        if isinstance(self._workspace, NamespaceWorkspace):
             # User xattrs belong to customer data; only host-managed namespaces
             # that cannot be written from the rental user namespace are skipped.
             arguments.extend(["--exclude-xattr", "security.*", "--exclude-xattr", "trusted.*"])
@@ -965,41 +793,7 @@ class ResticStorageRunner:
         ]
         if isinstance(self._workspace, LocalWorkspace):
             return pipeline_command, None
-        if isinstance(self._workspace, NamespaceWorkspace):
-            return self._nsenter_command(pipeline_command), None
-        if isinstance(self._workspace, DockerUserNamespaceWorkspace):
-            return self._encrypted_helper_command(pipeline_command), None
-        return [
-            *self._docker_helper_base(),
-            "--security-opt",
-            "no-new-privileges",
-            "-v",
-            f"{self._workspace.volume_name}:/workspace:rw",
-            "--entrypoint",
-            "/bin/bash",
-            self._workspace.image,
-            *pipeline_command[1:],
-        ], None
-
-    def _encrypted_helper_command(self, namespace_command: list[str]) -> list[str]:
-        if not isinstance(self._workspace, DockerUserNamespaceWorkspace):
-            raise ResticOperationError("encrypted helper requested for a non-encrypted workspace")
-        return [
-            *self._docker_helper_base(),
-            "--pid",
-            "host",
-            "--privileged",
-            "--security-opt",
-            "label=disable",
-            "--entrypoint",
-            "/usr/bin/nsenter",
-            self._workspace.image,
-            "-t",
-            str(self._workspace.pid),
-            "-U",
-            "--",
-            *namespace_command,
-        ]
+        return self._nsenter_command(pipeline_command), None
 
     def _nsenter_command(self, namespace_command: list[str]) -> list[str]:
         assert isinstance(self._workspace, NamespaceWorkspace)
@@ -1023,7 +817,7 @@ class ResticStorageRunner:
             raise ResticOperationError("the storage helper needs a docker volume or encrypted workspace")
         self._remove_stopped_helpers()
         command = [
-            *self._docker_helper_base(wrapper=True),
+            *self._docker_helper_base(),
             *access,
             "--detach",
             "--label",
@@ -1044,14 +838,11 @@ class ResticStorageRunner:
             detail = _redact((started.stderr or "").strip(), self._secret_values())
             raise ResticOperationError(f"storage helper did not start: {_bounded_message(detail, 500)}")
 
-    def _docker_helper_base(self, *, wrapper: bool = False) -> list[str]:
-        # the wrapper helper gets the whole spec (repository credentials and reporter token) in one variable,
+    def _docker_helper_base(self) -> list[str]:
+        # the helper gets the whole spec (repository credentials and reporter token) in one variable,
         # and keeps its (redacted) event log so the validator can read why it failed
-        secrets = ["-e", SPEC_ENV] if wrapper else [
-            "-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY", "-e", "AWS_SESSION_TOKEN",
-            "-e", "AWS_DEFAULT_REGION", "-e", "RESTIC_REPOSITORY", "-e", "RESTIC_PASSWORD",
-        ]
-        logs = ["--log-driver", "json-file", "--log-opt", "max-size=10m"] if wrapper else ["--log-driver", "none"]
+        secrets = ["-e", SPEC_ENV]
+        logs = ["--log-driver", "json-file", "--log-opt", "max-size=10m"]
         return [
             self._docker_binary,
             "run",
@@ -1131,12 +922,6 @@ def _is_retryable_repository_failure(failure_detail: str) -> bool:
     return any(marker in normalized_detail for marker in retryable_failure_markers)
 
 
-def _dns_lookup_failed(failure_detail: str) -> bool:
-    # 6 Nov: hosts whose compose-network resolver SERVFAILs ("lookup ... on 127.0.0.11:53: server misbehaving").
-    detail = failure_detail.casefold()
-    return "dial tcp: lookup " in detail and ("server misbehaving" in detail or "no such host" in detail)
-
-
 def _connection_closed(failure_detail: str) -> bool:
     # 28-29 Oct: 7 auto backups failed the probe on S3 "Connection closed by foreign host" in hourly bursts.
     return "connection closed by foreign host" in failure_detail.casefold()
@@ -1182,37 +967,6 @@ def _error_text(payload: Mapping[str, object]) -> str:
     item = payload.get("item")
     # restic repeats the file name in the message ("open /workspace/ExpiredToken.java: permission denied")
     return message.replace(item, "") if isinstance(item, str) and item else message
-
-
-def kernel_kill_lines(dmesg: str, container_id: str) -> list[str]:
-    """The kernel's OOM kill lines for this container: its oom-kill line (matched by container ID, since docker
-    reports PID 0 after exit) and the "Killed process" line printed right after it."""
-    lines = dmesg.splitlines()
-    found: list[str] = []
-    for index, line in enumerate(lines):
-        if "oom-kill:" in line and container_id in line:
-            found.append(line)
-            if index + 1 < len(lines) and "Killed process" in lines[index + 1]:
-                found.append(lines[index + 1])
-    return found
-
-
-def kernel_kill_note(container_id: str) -> str:
-    """One log line naming the kernel's kill of the helper, or saying there was none; never raises."""
-    if not container_id:
-        # without an ID every host OOM line matches, and these lines reach the renter's logs: other pods' data
-        return "kernel: no helper ID to match"
-    try:
-        dmesg = subprocess.run(["dmesg", "--kernel", "--nopager"], capture_output=True, text=True, timeout=5)
-    except Exception as error:  # noqa: BLE001 - diagnostics only
-        return f"kernel: dmesg unreadable ({type(error).__name__})"
-    if dmesg.returncode != 0:
-        return f"kernel: dmesg unreadable (exit {dmesg.returncode})"
-    # the kill happened seconds ago; a bounded tail keeps a long-running host's ring buffer cheap
-    found = kernel_kill_lines("\n".join(dmesg.stdout.splitlines()[-2000:]), container_id)
-    if not found:
-        return "kernel: no kernel kill line for the helper"
-    return "kernel: " + " | ".join(found)
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:
