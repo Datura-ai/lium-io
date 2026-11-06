@@ -16,6 +16,11 @@ import pytest
 HERE = os.path.dirname(__file__)
 EXECUTOR = os.path.abspath(os.path.join(HERE, "..", "entrypoint.sh"))
 MINER = os.path.abspath(os.path.join(HERE, "..", "..", "miners", "entrypoint.sh"))
+NICKFEDOR = "nickfedor/watchtower:1.24.0@sha256:e96976bcbeaf0a9adeddc9016a539c27a2245ef6bb7d3ca97ed106783350d387"
+COMPOSE_LABELS = (
+    " --label com.docker.compose.config-hash=abc --label com.docker.compose.oneoff=False"
+    " --label com.docker.compose.project=executor --label com.docker.compose.service=watchtower"
+)
 
 DOCKER_STUB = textwrap.dedent(
     """\
@@ -26,6 +31,9 @@ DOCKER_STUB = textwrap.dedent(
         "ps --all --quiet --filter label=com.docker.compose.project="*) echo "${STUB_UPDATER-wt1}" ;;
         "inspect --format {{.Config.Image}} wt1") echo "$STUB_UPDATER_IMAGE" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
+        "inspect --format {{range "*" wt1") printf '%s\\n' com.docker.compose.config-hash=abc \\
+            com.docker.compose.oneoff=False com.docker.compose.project=executor \\
+            com.docker.compose.service=watchtower org.opencontainers.image.title=watchtower ;;
         "pull "*) exit "${STUB_PULL_EXIT:-0}" ;;
         "run --detach "*) exit "${STUB_RUN_EXIT:-0}" ;;
     esac
@@ -65,7 +73,9 @@ def updater_run(calls):
     [
         (EXECUTOR, "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.0", ""),
         (EXECUTOR, "containrrr/watchtower:latest", "daturaai/lium-watchtower:1.2.0", ""),
-        (MINER, "containrrr/watchtower:latest", "nickfedor/watchtower", " --interval 60 --cleanup --label-enable"),
+        (EXECUTOR, "daturaai/lium-watchtower:1.1.0-staging", "daturaai/lium-watchtower:1.2.0-staging", ""),
+        (MINER, "containrrr/watchtower:latest", NICKFEDOR, " --interval 60 --cleanup --label-enable"),
+        (MINER, "nickfedor/watchtower", NICKFEDOR, " --interval 60 --cleanup --label-enable"),
     ],
 )
 def test_an_old_updater_is_replaced_before_the_stack_starts(tmp_path, script, old, new, args):
@@ -73,7 +83,7 @@ def test_an_old_updater_is_replaced_before_the_stack_starts(tmp_path, script, ol
 
     assert updater_run(calls) == [
         "run --detach --name executor-watchtower-1 --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock"
-        f" --label com.docker.compose.project=executor --label com.docker.compose.service=watchtower {new}{args}"
+        f"{COMPOSE_LABELS} {new}{args}"
     ]
     assert calls.index(f"pull --quiet {new}") < calls.index("rename wt1 executor-watchtower-1-replaced")
     assert "rm --force wt1" in calls
@@ -81,7 +91,10 @@ def test_an_old_updater_is_replaced_before_the_stack_starts(tmp_path, script, ol
     assert f"Updater replaced: executor-watchtower-1 now runs {new}" in result.stdout
 
 
-@pytest.mark.parametrize("script, current", [(EXECUTOR, "daturaai/lium-watchtower:1.2.0"), (MINER, "nickfedor/watchtower")])
+@pytest.mark.parametrize(
+    "script, current",
+    [(EXECUTOR, "daturaai/lium-watchtower:1.2.0"), (EXECUTOR, "daturaai/lium-watchtower:1.2.0-staging"), (MINER, NICKFEDOR)],
+)
 def test_a_current_updater_is_left_alone(tmp_path, script, current):
     _, calls = run(tmp_path, script, STUB_UPDATER_IMAGE=current)
 
@@ -107,7 +120,10 @@ def test_an_updater_that_cannot_be_pulled_is_kept(tmp_path):
 def test_an_updater_that_does_not_start_puts_the_old_one_back(tmp_path):
     result, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="nickfedor/watchtower", STUB_RUN_EXIT="125")
 
-    assert calls.index("rename wt1 executor-watchtower-1") > calls.index(updater_run(calls)[0])
+    # the container `docker run` created but could not start is removed before the old one gets its name back
+    assert calls.index(updater_run(calls)[0]) < calls.index("rm --force executor-watchtower-1") < calls.index(
+        "rename wt1 executor-watchtower-1"
+    )
     assert "start wt1" in calls
     assert "rm --force wt1" not in calls
     assert "the old updater runs again" in result.stdout
@@ -118,8 +134,16 @@ def recreated_stack(calls):
     return "compose up --pull always --detach --wait --force-recreate" in calls
 
 
-def test_the_executor_entrypoint_installs_the_updater_the_compose_file_pins():
-    compose = open(os.path.join(HERE, "..", "docker-compose.yml")).read()
-    entrypoint = open(EXECUTOR).read()
-    pinned = re.search(r"image: (daturaai/lium-watchtower:\S+)", compose).group(1)
-    assert f'UPDATER_IMAGE="{pinned}"' in entrypoint
+@pytest.mark.parametrize(
+    "script, compose",
+    [
+        (EXECUTOR, os.path.join(HERE, "..", "docker-compose.yml")),
+        (EXECUTOR, os.path.join(HERE, "..", "docker-compose.dev.yml")),
+        (MINER, os.path.join(HERE, "..", "..", "miners", "docker-compose.yml")),
+        (MINER, os.path.join(HERE, "..", "..", "miners", "docker-compose.dev.yml")),
+    ],
+)
+def test_the_entrypoint_installs_the_updater_the_compose_file_pins(script, compose):
+    pinned = re.search(r"image: (\S*watchtower\S*)", open(compose).read()).group(1)
+    entrypoint_image = re.search(r'UPDATER_IMAGE="([^"]+)"', open(script).read()).group(1)
+    assert pinned in (entrypoint_image, f"{entrypoint_image}-staging")

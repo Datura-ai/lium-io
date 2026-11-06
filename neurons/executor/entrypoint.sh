@@ -13,24 +13,36 @@ ensure_updater() {
     [ -n "$project" ] || return 0
     updater=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=watchtower 2>/dev/null) || return 0
     case "$updater" in "" | *[[:space:]]*) return 0 ;; esac
-    [ "$(docker inspect --format '{{.Config.Image}}' "$updater" 2>/dev/null)" != "$UPDATER_IMAGE" ] || return 0
+    current=$(docker inspect --format '{{.Config.Image}}' "$updater" 2>/dev/null) || return 0
+    # a dev stack runs the -staging build of the same updater (docker-compose.dev.yml)
+    case "$current" in *-staging) want="$UPDATER_IMAGE-staging" ;; *) want="$UPDATER_IMAGE" ;; esac
+    [ "$current" != "$want" ] || return 0
     name=$(docker inspect --format '{{.Name}}' "$updater" 2>/dev/null) || return 0
     name=${name#/}
-    if ! docker pull --quiet "$UPDATER_IMAGE" >/dev/null 2>&1; then
-        echo "Updater kept: $UPDATER_IMAGE cannot be pulled; retrying at the next runner start."
+    # The compose labels go to the new container, so `docker compose` still finds it as the service's container.
+    labels=$(docker inspect --format '{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$updater" 2>/dev/null) || return 0
+    set --
+    while IFS= read -r label; do
+        case "$label" in com.docker.compose.*) set -- "$@" --label "$label" ;; esac
+    done <<LABELS
+$labels
+LABELS
+    if ! docker pull --quiet "$want" >/dev/null 2>&1; then
+        echo "Updater kept: $want cannot be pulled; retrying at the next runner start."
         return 0
     fi
     docker rename "$updater" "$name-replaced" >/dev/null 2>&1 || return 0
     docker stop "$updater" >/dev/null 2>&1 || true
     if docker run --detach --name "$name" --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock \
-        --label "com.docker.compose.project=$project" --label com.docker.compose.service=watchtower \
-        "$UPDATER_IMAGE" >/dev/null 2>&1; then
+        "$@" "$want" >/dev/null 2>&1; then
         docker rm --force "$updater" >/dev/null 2>&1 || true
-        echo "Updater replaced: $name now runs $UPDATER_IMAGE"
+        echo "Updater replaced: $name now runs $want"
     else
+        # a container that was created but did not start holds the name; remove it first
+        docker rm --force "$name" >/dev/null 2>&1 || true
         docker rename "$updater" "$name" >/dev/null 2>&1 || true
         docker start "$updater" >/dev/null 2>&1 || true
-        echo "Updater kept: $UPDATER_IMAGE does not start; the old updater runs again."
+        echo "Updater kept: $want does not start; the old updater runs again."
     fi
 }
 ensure_updater
