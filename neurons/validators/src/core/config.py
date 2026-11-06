@@ -140,6 +140,8 @@ class Settings(BaseSettings):
     BACKEND_COMMAND_CLAIM_TTL_SECONDS: int = Field(default=60, gt=0)
     BACKEND_COMMAND_HEARTBEAT_SECONDS: float = Field(default=20, gt=0)
     BACKEND_COMMAND_ANSWER_TTL_SECONDS: int = Field(default=900, gt=0)
+    # DAH-5592: how long a host-fault create failure is sent again on each new backend socket (redis_service)
+    HOST_FAULT_FAILURE_RESEND_SECONDS: int = Field(default=2 * 3600, gt=0)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
