@@ -303,7 +303,7 @@ class ValidationService:
             return None
 
         gpu_model = details[0].get("name", "") or ""
-        sized_vram_mb = matmul_probe_vram_mb(gpu_model)
+        sized_vram_mb = matmul_probe_vram_mb(gpu_model, details[0].get("capacity"))
         if not sized_vram_mb:
             return None
 

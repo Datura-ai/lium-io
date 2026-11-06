@@ -59,9 +59,17 @@ async def supports_storage_operation(
 # any other status is the probe itself failing (no python at that path = 127, an import error =
 # 1, …) and is reported as such, not read as an old image (review, taiberium).
 # DAH-2002: the same probe for `workspace.exclude_patterns`; an old image would back up what the excludes skip.
+# An image with no `storage` package at all predates every field, so it is an old image too (exit 3);
+# any other import error re-raises, so its traceback reaches the probe's stderr.
 _WORKSPACE_FIELD_PROBE = (
-    "import sys; sys.path.insert(0, '/root/app/src'); "
-    "from storage.models import WorkspaceSpec; "
+    "import sys\n"
+    "sys.path.insert(0, '/root/app/src')\n"
+    "try:\n"
+    "    from storage.models import WorkspaceSpec\n"
+    "except ModuleNotFoundError as e:\n"
+    "    if e.name not in ('storage', 'storage.models'):\n"
+    "        raise\n"
+    "    sys.exit(3)\n"
     "sys.exit(0 if sys.argv[1] in WorkspaceSpec.__dataclass_fields__ else 3)"
 )
 _BOOTSTRAP_PROBE_FIELD_MISSING = 3
@@ -129,6 +137,10 @@ async def start_storage_operation(
                 if existing_state != "STARTING":
                     break
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
+            return files
+        if await _helper_owned_by_live_runner(ssh_client, operation_id, files):
+            # an earlier dispatch's helper is still working; removing it would kill that run.
+            # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
         if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
             ssh_client, files.spec
@@ -311,6 +323,22 @@ async def _remote_file_exists(
     path: PurePosixPath,
 ) -> bool:
     result = await ssh_client.run(f"test -e {shlex.quote(str(path))}", check=False)
+    return result.exit_status == 0
+
+
+async def _helper_owned_by_live_runner(
+    ssh_client: asyncssh.SSHClientConnection,
+    operation_id: UUID,
+    files: StorageOperationFiles,
+) -> bool:
+    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    # "[-]-spec" keeps pgrep from matching this command's own shell
+    runner_pattern = f"[-]-spec {files.spec}"
+    result = await ssh_client.run(
+        f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running"
+        f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
+        check=False,
+    )
     return result.exit_status == 0
 
 
