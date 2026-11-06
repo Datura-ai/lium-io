@@ -1,6 +1,9 @@
 """I-78: a key uploaded through /upload_ssh_key logs in only from the validator's addresses."""
 
+import socket
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -10,6 +13,14 @@ from services.ssh_service import SSHService, purge_expired_uploaded_keys
 
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIValidatorJobKey validator@lium"
 RENTER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRenterOwnKey renter@laptop\n"
+
+
+@pytest.fixture(autouse=True)
+def signed_sources(monkeypatch):
+    """The list /watchtower/ssh-sources signs; a test sets `.value` to change it."""
+    holder = SimpleNamespace(value=config.VALIDATOR_SSH_SOURCES)
+    monkeypatch.setattr(ssh_service._signed_ssh_sources, "get", lambda: holder.value)
+    return holder
 
 
 @pytest.fixture()
@@ -25,12 +36,11 @@ def test_prod_build_pins_the_nat_gateways():
     assert config.VALIDATOR_SSH_SOURCES == "54.163.250.18,13.223.237.157"
 
 
-def test_the_pin_is_off_by_default():
-    assert config.Settings.model_fields["EXECUTOR_SSH_SOURCE_PIN"].default is False
+def test_the_pin_is_on_by_default():
+    assert config.Settings.model_fields["EXECUTOR_SSH_SOURCE_PIN"].default is True
 
 
-def test_upload_is_pinned_and_removal_and_expiry_still_find_it(authorized_keys, monkeypatch):
-    monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", True)
+def test_upload_is_pinned_and_removal_and_expiry_still_find_it(authorized_keys):
     SSHService().add_pubkey_to_host(KEY)
     assert authorized_keys.read_text().startswith(RENTER_KEY + f'from="{config.VALIDATOR_SSH_SOURCES}" {KEY} ')
 
@@ -49,14 +59,97 @@ def test_a_key_pinned_by_an_older_list_is_still_removed(authorized_keys):
 
 
 @pytest.mark.parametrize("sources,pin_on", [("", True), ("54.163.250.18", False)])
-def test_no_pin_without_sources_or_with_the_opt_out(authorized_keys, monkeypatch, sources, pin_on):
+def test_no_pin_without_sources_or_with_the_switch_off(authorized_keys, monkeypatch, sources, pin_on):
     monkeypatch.setattr(ssh_service, "VALIDATOR_SSH_SOURCES", sources)
     monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", pin_on)
     SSHService().add_pubkey_to_host(KEY)
     assert authorized_keys.read_text().startswith(RENTER_KEY + KEY + " ")
 
 
+def test_no_pin_in_a_cvm(authorized_keys, tmp_path, monkeypatch):
+    # QEMU user networking shows sshd 10.0.2.2, never the validator's address
+    sock_path = tmp_path / "dstack.sock"
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(sock_path))
+    monkeypatch.setattr(ssh_service.settings, "DSTACK_SOCKET_PATH", str(sock_path))
+    try:
+        SSHService().add_pubkey_to_host(KEY)
+    finally:
+        sock.close()
+    assert authorized_keys.read_text().startswith(RENTER_KEY + KEY + " ")
+
+
+def test_a_dstack_path_that_is_not_a_socket_still_pins(authorized_keys, tmp_path, monkeypatch):
+    # docker-compose.app.yml bind-mounts the path on every host; without dstack docker makes a directory
+    (tmp_path / "dstack.sock").mkdir()
+    monkeypatch.setattr(ssh_service.settings, "DSTACK_SOCKET_PATH", str(tmp_path / "dstack.sock"))
+    SSHService().add_pubkey_to_host(KEY)
+    assert authorized_keys.read_text().startswith(RENTER_KEY + f'from="{config.VALIDATOR_SSH_SOURCES}" ')
+
+
 def test_a_malformed_source_fails_at_import(monkeypatch):
     monkeypatch.setattr(config, "_BUILTIN_VALIDATOR_SSH_SOURCES", "54.163.250.18,not-an-ip")
     with pytest.raises(ValueError):
         config._resolve_validator_ssh_sources()
+
+
+def test_the_signed_list_is_what_gets_pinned(authorized_keys, signed_sources):
+    signed_sources.value = "198.51.100.7"
+    SSHService().add_pubkey_to_host(KEY)
+    assert authorized_keys.read_text().startswith(RENTER_KEY + 'from="198.51.100.7" ')
+
+
+def test_an_empty_signed_list_keeps_the_pin_off(authorized_keys, signed_sources):
+    signed_sources.value = ""
+    SSHService().add_pubkey_to_host(KEY)
+    assert authorized_keys.read_text().startswith(RENTER_KEY + KEY + " ")
+
+
+@pytest.mark.parametrize(
+    "payload,signed",
+    [
+        ({"sources": "198.51.100.7", "timestamp": 1000, "signature": "0xab"}, False),
+        ({"sources": "198.51.100.7,not-an-ip", "timestamp": 1000, "signature": "0xab"}, True),
+        ({"sources": "198.51.100.7,", "timestamp": 1000, "signature": "0xab"}, True),
+        ({"sources": "198.51.100.7", "timestamp": 1000 - 3600, "signature": "0xab"}, True),
+        ({"timestamp": 1000, "signature": "0xab"}, True),
+    ],
+)
+def test_a_bad_answer_is_refused(monkeypatch, payload, signed):
+    monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: "current" if signed else None)
+    with pytest.raises(ValueError):
+        ssh_service.verify_signed_ssh_sources(payload, now=1000)
+
+
+def test_a_failed_refresh_keeps_the_last_good_list(monkeypatch):
+    monkeypatch.setattr(ssh_service.settings, "COMPUTE_REST_API_URL", "https://backend.test/api")
+    monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: "current")
+    now = int(time.time())
+    good = MagicMock(json=MagicMock(return_value={"sources": "198.51.100.7", "timestamp": now, "signature": "0xab"}))
+    get = MagicMock(side_effect=[good, OSError("down")])
+    monkeypatch.setattr(ssh_service.requests, "get", get)
+    cache = ssh_service.SignedSshSources()
+
+    first = cache.get(now=0)
+    cached = cache.get(now=1)
+    after_failure = cache.get(now=ssh_service.SSH_SOURCES_CACHE_SECONDS + 1)
+
+    assert (first, cached, after_failure) == ("198.51.100.7", "198.51.100.7", "198.51.100.7")
+    assert get.call_count == 2
+    assert get.call_args.args[0] == "https://backend.test/api/watchtower/ssh-sources"
+
+
+def test_a_node_that_never_got_a_list_does_not_pin(monkeypatch):
+    monkeypatch.setattr(ssh_service.settings, "COMPUTE_REST_API_URL", "https://backend.test/api")
+    monkeypatch.setattr(ssh_service.requests, "get", MagicMock(side_effect=OSError("down")))
+    assert ssh_service.SignedSshSources().get(now=0) == ""
+
+
+def test_the_signed_message_carries_the_ssh_sources_prefix(monkeypatch):
+    # a signed digest answer must never read as a signed source list, nor the other way round
+    messages = []
+    monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: messages.append(message) or "current")
+
+    payload = {"sources": "198.51.100.7", "timestamp": 1000, "signature": "0xab"}
+    assert ssh_service.verify_signed_ssh_sources(payload, now=1000) == "198.51.100.7"
+    assert messages == ["ssh-sources:198.51.100.7:1000"]
