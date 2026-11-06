@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.10.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.11.0`) is semver over the wire.
 
 ## Using it
 
@@ -68,6 +68,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.5.0` — `ResumedCreatesReport` (`pod_ids`): sent once by a validator connector after its start sweep, first on its first authenticated socket; the creates the previous connector was running when it was cut off. The validator stores no create request: the backend sends each listed create again from its own records. The backend fails at once a create it sent before that socket authenticated, still waiting and not listed. An older validator never sends it.
 - `2.6.0` — `RecheckExecutorRequest` (backend → validator; `executor_id`): validate one node now, outside the cycle (a provider's "Recheck now" in the portal). A validator that does not list the node ignores it; an older validator ignores the message.
 - `2.9.0` — `ContainerWarningCode.HungGpuReset`, `HungGpuNotResetMig`, `HungGpuNotResetNvlinkShared`, `HungGpuNotResetInUse`, `HungGpuNotResetUnsupported` (on `ContainerCreated.warnings`): a reboot or edit found a pod GPU hung and reset it before starting the new container, or could not reset it and says why.
+- `2.11.0` — `RentedExecutorsResponse.secure_idle_rate_by_gpu_model` (optional, default empty): full GPU name → the idle Secure rate in USD per GPU-hour, set by the backend from the GPU market (DAH-5934); the validator pays idle Secure nodes of that name at it instead of its own table.
 - `2.10.0` — `ExecutorSpecRequest.host_runtime_fault` (optional): this cycle's DinD test container started on the host and its sshd never answered, so the host's container runtime is failing. False for a refused `docker run` or an error on the validator's side; None from an older validator.
 - `1.0.0` — first release.
 

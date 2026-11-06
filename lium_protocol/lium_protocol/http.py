@@ -114,6 +114,9 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     # executor_id → the hotkey its node is listed under (pool hotkey for a custodied account), for
     # every listed executor; the validator's verified record treats a write by any other hotkey as foreign
     executor_owner_hotkeys: dict[str, str] = {}
+    # full GPU name → the idle Secure rate, USD per GPU-hour, the backend set from the GPU market (DAH-5934);
+    # the validator uses it in place of its own table for that name. Empty = the validator's table.
+    secure_idle_rate_by_gpu_model: dict[str, float] = {}
 
 
 class PodRentalActiveResponse(pydantic.BaseModel):

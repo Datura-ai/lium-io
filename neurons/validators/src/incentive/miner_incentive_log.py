@@ -751,7 +751,9 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def rental_incentive_calculated(hotkey: str, result: JobResult, count_bucket: int) -> MinerLogLine:
+    def rental_incentive_calculated(
+        hotkey: str, result: JobResult, count_bucket: int, hourly_rate_source: str = "table"
+    ) -> MinerLogLine:
         return MinerLogLine(
             message=(
                 "Rental price incentive for executor is calculated successfully. Formula: "
@@ -763,6 +765,8 @@ class MinerLogLine(BaseModel):
                 "gpu_model": result.gpu_model,
                 "gpu_count": result.gpu_count,
                 "hourly_rate": result.hourly_rate,
+                # DAH-5934: "market" = the backend's GPU-market rate, "table" = the validator's own
+                "hourly_rate_source": hourly_rate_source,
                 "sysbox_runtime": result.sysbox_runtime,
                 "sysbox_multiplier": result.sysbox_multiplier,
                 "provider_discord_connected": result.provider_discord_connected,

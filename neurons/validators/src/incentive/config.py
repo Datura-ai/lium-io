@@ -408,6 +408,14 @@ class IncentiveConfig(BaseModel):
         description="Rental prices per GPU type in USD/hour"
     )
 
+    market_rental_prices_per_hour: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "DAH-5934: idle Secure rate per full GPU name from the backend (GPU market x 0.6), set every cycle; "
+            "overrides rental_prices_per_hour for that name. Empty: the table applies."
+        ),
+    )
+
     gpu_count_custom_prices: dict[str, dict[str, float | DefaultPrice]] = Field(
         default=GPU_COUNT_CUSTOM_PRICES,
         description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for rental_prices_per_hour fallback."
