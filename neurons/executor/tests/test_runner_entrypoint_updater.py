@@ -238,3 +238,17 @@ def test_a_swap_cut_short_is_finished_at_the_next_start(tmp_path, script, found,
     assert not any(c in calls for c in absent)
     assert "Updater swap finished" in result.stdout
     assert recreated_stack(calls)
+
+
+@pytest.mark.parametrize("script", [EXECUTOR, MINER])
+@pytest.mark.parametrize(
+    "found",
+    [
+        "wt1 executor-watchtower-1-replaced wt3 executor-watchtower-run-0f3a",
+        "wt3 0123abcd_executor-watchtower-1 wt1 executor-watchtower-1-replaced",
+    ],
+)
+def test_a_replaced_updater_next_to_an_unrelated_container_is_left_alone(tmp_path, script, found):
+    _, calls = run(tmp_path, script, STUB_UPDATERS=found, STUB_UPDATER_IMAGE="containrrr/watchtower:latest")
+
+    assert not any(c.startswith(("start", "rm", "rename", "stop", "pull", "run --detach")) for c in calls)

@@ -27,8 +27,9 @@ ensure_updater() {
         set -- "$1" "${2%-replaced}"
     elif [ $# -eq 4 ]; then
         case "$2:$4" in
-            *-replaced:*) old=$1 old_name=$2 new=$3 ;;
-            *:*-replaced) old=$3 old_name=$4 new=$1 ;;
+            # only the pair a swap leaves: <name>-replaced and <name>; any other container is not ours to touch
+            *-replaced:*) [ "$4" = "${2%-replaced}" ] || return 0; old=$1 old_name=$2 new=$3 ;;
+            *:*-replaced) [ "$2" = "${4%-replaced}" ] || return 0; old=$3 old_name=$4 new=$1 ;;
             *) return 0 ;;
         esac
         docker start "$new" >/dev/null 2>&1 || true
