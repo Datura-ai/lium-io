@@ -289,6 +289,8 @@ class Context(BaseModel):
     rented_throughput_passed: bool = True
     # True when that failure is RENTED_THROUGHPUT_NOT_RUN (no reading ran), not a slow reading.
     rented_throughput_not_run: bool = False
+    # which side failed and its measured vs required value (slow_detail), for the score warning
+    rented_throughput_slow_detail: str = ""
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
