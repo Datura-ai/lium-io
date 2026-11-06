@@ -27,12 +27,13 @@ from ...const import (
 )
 from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
-from services.redis_service import RECENT_FILLER_PREFIX
+from services.redis_service import RECENT_FILLER_PREFIX, RECENT_FILLER_TTL_SECONDS
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from . import port_connectivity
+from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .rental_owner import rental_of_this_node
@@ -49,10 +50,6 @@ logger = logging.getLogger(__name__)
 
 # cycle time kept after the rented pod reads, to report the result and close the shell
 POD_READ_RESERVE_SECONDS = 30
-# DAH-5904: a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete
-# lands. One cycle (~17 min) plus RENTAL_TEARDOWN_GRACE_MINUTES, with margin, from the last cycle that listed it.
-RECENT_FILLER_TTL_SECONDS = 45 * 60
-
 
 async def _remember_fillers(ctx: Context, names: list[str]) -> None:
     try:
@@ -74,7 +71,9 @@ async def _recently_listed_fillers(ctx: Context, names: set[str]) -> list[str]:
                 found.append(name)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Recent filler records unreadable for %s: %s", ctx.executor.uuid, exc)
-    return found
+    # the remembered name alone is not enough: a container reusing it must also run the image we started
+    off_image = await _fillers_off_their_image(ctx, set(found)) if found else []
+    return [name for name in found if name not in off_image]
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:

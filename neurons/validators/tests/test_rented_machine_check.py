@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import asyncssh
@@ -13,6 +14,7 @@ from neurons.validators.src.services.task.checks.rented_machine import (
 )
 from neurons.validators.src.services.const import POD_CONTAINER_NAME_GRACE_MINUTES
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
+from neurons.validators.src.services.docker_service import DockerService
 from neurons.validators.src.services.task.pipeline import Context
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 
@@ -1653,7 +1655,9 @@ def test_ps_running_matches_the_whole_container_name_only():
     assert DockerCommand.ps_running("pod_1.a") == "/usr/bin/docker ps -q -f 'name=^/?pod_1\\.a$'"
 
 
-async def _rented_cycle_with_filler_process(context_factory, redis, listed_fillers: list[str], filler: str):
+async def _rented_cycle_with_filler_process(
+    context_factory, redis, listed_fillers: list[str], filler: str, specs: dict | None = None
+):
     executor_uuid = "executor-123"
     pod_container = "tenant-123"
     rented_data = build_rented_data(
@@ -1665,6 +1669,7 @@ async def _rented_cycle_with_filler_process(context_factory, redis, listed_fille
         gpu_processes=[{"container_name": pod_container, "pid": 1001}, {"container_name": filler, "pid": 1002}],
         gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
         rented_data=rented_data,
+        specs=specs or {},
     )
     ctx = context_factory(
         services=build_services(redis=redis, container_cleanup=MockContainerCleanup()),
@@ -1691,5 +1696,32 @@ async def test_a_filler_listed_on_this_node_last_cycle_still_counts_as_our_load(
     await _rented_cycle_with_filler_process(context_factory, redis, [filler] if listed_last_cycle else [], filler)
 
     result = await _rented_cycle_with_filler_process(context_factory, redis, [], filler)
+
+    assert result.event.reason_code == reason
+
+
+@pytest.mark.asyncio
+async def test_a_filler_created_and_stopped_between_two_snapshots_still_counts_as_our_load(context_factory):
+    # DAH-5904 review: the create records the filler, so no cycle snapshot needs to have listed it
+    redis = build_services().redis
+    filler = "filler_0b6e2b1c-6f5e-4c43-9d55-2f6d1f0d7a10"
+    await DockerService._remember_new_filler_best_effort(SimpleNamespace(redis_service=redis), "executor-123", filler)
+
+    result = await _rented_cycle_with_filler_process(context_factory, redis, [], filler)
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("digest", "reason"), [("sha256:aaa", Msg.ALREADY_RENTED.reason), ("sha256:bbb", Msg.GPU_OUTSIDE_TENANT.reason)]
+)
+async def test_a_remembered_filler_name_running_another_image_is_not_our_load(context_factory, digest, reason):
+    redis = build_services().redis
+    filler = "filler_885e1616-28e0-4792-9890-47f71893d27f"
+    await redis.set(f"filler_image_digests:{filler}", '["sha256:aaa"]')
+    await _rented_cycle_with_filler_process(context_factory, redis, [filler], filler)
+    specs = {"docker": {"containers": [{"name": filler, "digest": digest}]}}
+    result = await _rented_cycle_with_filler_process(context_factory, redis, [], filler, specs=specs)
 
     assert result.event.reason_code == reason
