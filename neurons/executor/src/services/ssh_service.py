@@ -89,11 +89,11 @@ def verify_signed_ssh_sources(payload: dict[str, Any], now: int | None = None) -
         now = int(datetime.now(UTC).timestamp())
     if abs(timestamp - now) > SSH_SOURCES_MAX_SKEW_SECONDS:
         raise ValueError(f"ssh-sources answer timestamp out of range (now={now}, ts={timestamp})")
-    if match_validator_hotkey(f"{sources}:{timestamp}", signature) is None:
+    if match_validator_hotkey(f"ssh-sources:{sources}:{timestamp}", signature) is None:
         raise ValueError("ssh-sources answer is not signed by a configured validator hotkey")
     # a malformed from= makes sshd refuse the key: keep the last good list instead
-    for source in filter(None, sources.split(",")):
-        ipaddress.ip_network(source)
+    for source in sources.split(",") if sources else []:
+        ipaddress.ip_network(source)  # an empty entry (`ip,`) is refused too
     return sources
 
 

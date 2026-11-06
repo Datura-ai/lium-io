@@ -110,6 +110,7 @@ def test_an_empty_signed_list_keeps_the_pin_off(authorized_keys, signed_sources)
     [
         ({"sources": "198.51.100.7", "timestamp": 1000, "signature": "0xab"}, False),
         ({"sources": "198.51.100.7,not-an-ip", "timestamp": 1000, "signature": "0xab"}, True),
+        ({"sources": "198.51.100.7,", "timestamp": 1000, "signature": "0xab"}, True),
         ({"sources": "198.51.100.7", "timestamp": 1000 - 3600, "signature": "0xab"}, True),
         ({"timestamp": 1000, "signature": "0xab"}, True),
     ],
@@ -142,3 +143,13 @@ def test_a_node_that_never_got_a_list_does_not_pin(monkeypatch):
     monkeypatch.setattr(ssh_service.settings, "COMPUTE_REST_API_URL", "https://backend.test/api")
     monkeypatch.setattr(ssh_service.requests, "get", MagicMock(side_effect=OSError("down")))
     assert ssh_service.SignedSshSources().get(now=0) == ""
+
+
+def test_the_signed_message_carries_the_ssh_sources_prefix(monkeypatch):
+    # a signed digest answer must never read as a signed source list, nor the other way round
+    messages = []
+    monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: messages.append(message) or "current")
+
+    payload = {"sources": "198.51.100.7", "timestamp": 1000, "signature": "0xab"}
+    assert ssh_service.verify_signed_ssh_sources(payload, now=1000) == "198.51.100.7"
+    assert messages == ["ssh-sources:198.51.100.7:1000"]
