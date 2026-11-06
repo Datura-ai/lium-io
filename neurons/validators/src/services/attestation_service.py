@@ -255,7 +255,7 @@ class AttestationService:
 
         return violations
 
-    def _enforce_tcb(self, details: dict, executor: ExecutorSSHInfo) -> None:
+    def _enforce_tcb(self, details: dict, executor: ExecutorSSHInfo, enforce: bool = True) -> None:
         violations = self._collect_tcb_violations(details)
         if not violations:
             return
@@ -266,6 +266,11 @@ class AttestationService:
                 {"reason": reason, "value": value} for reason, value in violations
             ],
         })
+
+        if not enforce:
+            # teardown of a rental: the pinned host key is enough to remove the renter's container
+            logger.warning(_m("TCB enforcement warning (not enforced on teardown)", extra=extra))
+            return
 
         reason, value = violations[0]
         logger.warning(_m("TCB enforcement rejected TDX quote", extra=extra))
@@ -305,6 +310,7 @@ class AttestationService:
         expected_report_hex: str,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
+        enforce_tcb: bool = True,
     ) -> None:
         details = verifier_payload.get("details")
         if not isinstance(details, dict):
@@ -373,7 +379,7 @@ class AttestationService:
                 )
 
         # G4 — enforce TCB/advisory posture (fail closed).
-        self._enforce_tcb(details, executor)
+        self._enforce_tcb(details, executor, enforce=enforce_tcb)
 
     # ------------------------------------------------------------------
     # G1 — NVIDIA GPU confidential-compute attestation (verification side)
@@ -578,6 +584,7 @@ class AttestationService:
         self,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
+        enforce_tcb: bool = True,
     ) -> tuple[str | None, str | None]:
         """Verify TDX quote and return (attestation_digest, tee_type).
 
@@ -607,7 +614,9 @@ class AttestationService:
                 }),
             ))
             verifier_payload = await self._call_verifier(quote.strip(), executor)
-        self._validate_verifier_response(verifier_payload, expected_report, executor, nonce=nonce)
+        self._validate_verifier_response(
+            verifier_payload, expected_report, executor, nonce=nonce, enforce_tcb=enforce_tcb
+        )
 
         details = verifier_payload.get("details", {})
         app_info = details.get("app_info", {})
@@ -744,6 +753,7 @@ class AttestationService:
         self,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
+        enforce_tcb: bool = True,
     ) -> HostPolicyResult:
         """Verify TDX (and, when supplied, NVIDIA GPU) attestation and build the
         SSH known_hosts policy for the executor.
@@ -772,7 +782,7 @@ class AttestationService:
         attestation_digest, tee_type = None, None
         gpu_attestation_passed: bool | None = None
         if should_verify:
-            attestation_digest, tee_type = await self._verify_tdx(executor, nonce=nonce)
+            attestation_digest, tee_type = await self._verify_tdx(executor, nonce=nonce, enforce_tcb=enforce_tcb)
             await self._record_attested_executor(executor)
 
             gpu_attestation_passed = await self._verify_gpu(executor, nonce)

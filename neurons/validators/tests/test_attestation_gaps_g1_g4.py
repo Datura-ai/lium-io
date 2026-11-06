@@ -132,6 +132,20 @@ def service(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_g4_bad_tcb_status_only_warns_on_rental_teardown(service):
+    # Arrange — delete/stop/remove-keys pass enforce_tcb=False: the pinned host key suffices
+    response = _verifier_response()
+    response["details"]["tcb_status"] = "OutOfDate"
+    expected = "0x" + response["details"]["report_data"][:64]
+
+    # Act — must not raise
+    service._validate_verifier_response(response, expected, _make_executor(), enforce_tcb=False)
+
+    # Assert — the validation path still rejects the same quote
+    with pytest.raises(AttestationError, match="tcb_status_not_allowed"):
+        service._validate_verifier_response(response, expected, _make_executor())
+
+
 @pytest.mark.parametrize("bad_status", ["OutOfDate", "SWHardeningNeeded", "ConfigurationNeeded"])
 def test_g4_bad_tcb_status_rejected_when_enforced(service, monkeypatch, bad_status):
     # Arrange
@@ -643,7 +657,7 @@ async def test_g5_unknown_executor_without_quote_unaffected(monkeypatch):
     assert host_policy.gpu_attestation_passed is None
 
 
-def _score_ctx(tdx_quote, attestation_passed):
+def _score_ctx(tdx_quote, attestation_passed, gpu_attestation_passed=None):
     executor = SimpleNamespace(price_per_gpu=None, tdx_quote=tdx_quote)
     state = SimpleNamespace(
         gpu_model="",
@@ -653,6 +667,7 @@ def _score_ctx(tdx_quote, attestation_passed):
         state=state,
         executor=executor,
         tdx_attestation_passed=attestation_passed,
+        gpu_attestation_passed=gpu_attestation_passed,
         cpu_truth_passed=True,
         provider_side_load_passed=True,
         inspector_blind_streak_passed=True,
@@ -667,7 +682,10 @@ def _score_ctx(tdx_quote, attestation_passed):
     )
 
 
-def test_g5_score_gate_zeroes_failed_cvm():
+def test_g5_score_gate_zeroes_failed_cvm(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+
     # Act
     actual, job, warning = calculate_scores(_score_ctx('{"quote":"00"}', False), rented=False)
 
@@ -675,6 +693,32 @@ def test_g5_score_gate_zeroes_failed_cvm():
     assert actual == 0.0
     assert job == 0.0
     assert "CVM attestation not passed" in warning
+
+
+def test_g5_score_gate_needs_the_tdx_verifier(monkeypatch):
+    # Arrange — plain compose: no verifier, so nothing is attested
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", None)
+
+    # Act
+    actual, _, warning = calculate_scores(_score_ctx('{"quote":"00"}', False), rented=False)
+
+    # Assert
+    assert actual == 1.0
+    assert "CVM attestation not passed" not in warning
+
+
+def test_g5_score_gate_ignores_a_failed_gpu_verdict_alone(monkeypatch):
+    # Arrange — GPU-CC is observe-only while ENABLE_GPU_ATTESTATION_ENFORCEMENT is off
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+
+    # Act
+    actual, _, warning = calculate_scores(
+        _score_ctx('{"quote":"00"}', False, gpu_attestation_passed=False), rented=False
+    )
+
+    # Assert
+    assert actual == 1.0
+    assert "CVM attestation not passed" not in warning
 
 
 def test_g5_score_gate_passes_attested_cvm_and_bare_metal():
