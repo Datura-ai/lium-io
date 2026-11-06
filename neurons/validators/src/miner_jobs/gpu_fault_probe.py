@@ -15,7 +15,8 @@ setup) is an error, not a fault: the validator does not penalise what it could n
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
 `--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
-`flags`) or error, exit 0.
+`flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-seen` (`xid_faults`)
+and the hardware slowdowns and PCIe link downgrades of this read (`card_suspects`); none of those sets the status.
 """
 
 from __future__ import annotations
@@ -766,6 +767,16 @@ def nvml_recovery_action(handle):
     return field.value.uiVal
 
 
+def nvml_clock_event_reasons(handle):
+    import pynvml
+
+    # renamed from "throttle" in newer bindings; the bits are the same
+    read = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None) or getattr(
+        pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons"
+    )
+    return read(handle)
+
+
 def nvml_snapshot() -> dict:
     """Per-GPU counters that move when hardware faults: uncorrected ECC, remapped rows, recovery action."""
     try:
@@ -792,6 +803,12 @@ def nvml_snapshot() -> dict:
                 ),
                 ("remapped_rows", lambda h: list(pynvml.nvmlDeviceGetRemappedRows(h))),
                 ("recovery_action", nvml_recovery_action),
+                ("clock_event_reasons", nvml_clock_event_reasons),
+                ("pcie_gen", lambda h: pynvml.nvmlDeviceGetCurrPcieLinkGeneration(h)),
+                ("pcie_gen_max", lambda h: pynvml.nvmlDeviceGetMaxPcieLinkGeneration(h)),
+                ("pcie_width", lambda h: pynvml.nvmlDeviceGetCurrPcieLinkWidth(h)),
+                ("pcie_width_max", lambda h: pynvml.nvmlDeviceGetMaxPcieLinkWidth(h)),
+                ("pstate", lambda h: pynvml.nvmlDeviceGetPerformanceState(h)),
             ):
                 try:
                     value = read(handle)
@@ -941,6 +958,30 @@ def nvml_health(snapshot: dict) -> tuple[list[str], list[str]]:
     return flags, warnings
 
 
+# nvmlClocksEventReason bits (nvml.h) the hardware sets on its own: HW slowdown, HW thermal slowdown, HW power brake.
+# App-clock settings, the SW power cap and SW thermal slowdown follow what the renter runs and are not read.
+HW_SLOWDOWN_REASONS = {0x8: "HW slowdown", 0x40: "HW thermal slowdown", 0x80: "HW power brake slowdown"}
+
+
+def nvml_card_suspects(snapshot: dict) -> list[str]:
+    """Per card, a hardware slowdown or a PCIe link below what the card and slot can do, in this one read.
+    The validator reports one only once the same reading comes back on the next cycle."""
+    suspects = []
+    for gpu in snapshot.get("gpus") or []:
+        name = f"gpu {gpu.get('index')} ({gpu.get('uuid')})"
+        reasons = gpu.get("clock_event_reasons")
+        if isinstance(reasons, int):
+            suspects += [f"{name}: {what}" for bit, what in HW_SLOWDOWN_REASONS.items() if reasons & bit]
+        width, width_max = gpu.get("pcie_width"), gpu.get("pcie_width_max")
+        if isinstance(width, int) and isinstance(width_max, int) and 0 < width < width_max:
+            suspects.append(f"{name}: PCIe link x{width} of x{width_max}")
+        gen, gen_max = gpu.get("pcie_gen"), gpu.get("pcie_gen_max")
+        # an idle card drops its link speed by design: the generation is only judged at full performance (P0)
+        if gpu.get("pstate") == 0 and isinstance(gen, int) and isinstance(gen_max, int) and 0 < gen < gen_max:
+            suspects.append(f"{name}: PCIe link gen {gen} of gen {gen_max}")
+    return suspects
+
+
 def xid_lines() -> dict:
     """The kernel log's NVRM Xid lines when the container may read it; most cannot, and that is fine."""
     try:
@@ -1072,12 +1113,39 @@ def _exit_code(process):
     return process.exitcode
 
 
-def print_nvml_health_report(mp) -> None:
-    """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults."""
+def card_xid_faults(snapshot: dict, xid: dict, xid_seen: int | None) -> list[str]:
+    """The hardware Xids logged on each card since the validator's last read (`xid_seen` lines in). No
+    baseline yet, or a log shorter than it (rotated, or the host rebooted), flags nothing this time."""
+    if not xid.get("available") or xid_seen is None or xid_seen > xid["count"]:
+        return []
+    before = {"available": True, "lines": xid["lines"][:xid_seen]}
+    faults = []
+    for gpu in snapshot.get("gpus") or []:
+        bus = pci_key(gpu.get("pci_bus_id"))
+        if bus is None:
+            continue
+        for fault in xid_faults(before, xid, {bus})[0]:
+            faults.append(f"gpu {gpu.get('index')} ({gpu.get('uuid')}): {fault}")
+    return faults
+
+
+def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
+    """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults, plus the cards'
+    new hardware Xids and this read's slowdowns and PCIe downgrades."""
     snapshot = nvml_snapshot_forked(mp)
     flags, warnings = nvml_health(snapshot)
     status = "error" if not snapshot.get("available") else "flagged" if flags else "ok"
-    report = {"status": status, "flags": flags, "warnings": warnings, "nvml": snapshot}
+    xid = xid_lines()
+    report = {
+        "status": status,
+        "flags": flags,
+        "warnings": warnings,
+        "nvml": snapshot,
+        "card_suspects": nvml_card_suspects(snapshot),
+        "xid_faults": card_xid_faults(snapshot, xid, xid_seen),
+        # the kernel log is often not readable from the container: then no Xid is judged
+        "xid": {k: v for k, v in xid.items() if k in ("available", "count", "error")},
+    }
     print(JSON_MARKER, json.dumps(report, sort_keys=True))
 
 
@@ -1098,6 +1166,11 @@ def main(argv: list[str]) -> int:
         help="read the cards' standing memory health from NVML; no CUDA, safe beside a rental",
     )
     parser.add_argument(
+        "--xid-seen",
+        type=int,
+        help="with --nvml-only: kernel-log Xid lines already judged; only later ones are new",
+    )
+    parser.add_argument(
         "--hang-in-kernels-is-fault",
         action="store_true",
         help="a worker still in its kernels at the deadline is a fault, not an error (post-rental recheck)",
@@ -1110,7 +1183,7 @@ def main(argv: list[str]) -> int:
     # in the driver takes the worker, not the verdict, and the parent never initialises CUDA itself
     mp = multiprocessing.get_context("fork")
     if args.nvml_only:
-        print_nvml_health_report(mp)
+        print_nvml_health_report(mp, args.xid_seen)
         return 0
     try:
         indices = args.device if args.device else list(range(_device_count(mp)))

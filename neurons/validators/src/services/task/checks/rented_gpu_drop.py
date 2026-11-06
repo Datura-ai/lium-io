@@ -23,6 +23,11 @@ adds no `nvml_error` label. A card NVML still lists but reports its memory broke
 failed row remap: GpuMemoryHealthCheck's NVML read, done here first on a rented node) is
 `ecc_uncorrected`, even when every card is listed; its UUID goes into `missing_uuids` on a part-rented
 node too: the backend knows which cards each pod holds, and a fault naming no card is refused there.
+DAH-5869: a card NVML still lists but that logged a new hardware Xid, or reads a hardware clock slowdown
+or a PCIe link below its maximum on two cycles in a row (the same memory read), is `gpu_hw_fault`, its
+UUID named the same way. A rented node whose scrape timed out SCRAPE_TIMEOUT_CYCLES in a row
+(MachineSpecScrapeCheck) posts `gpu_unverified` with no card seen, and recovers on its next clean scrape.
+The pod is never touched by any of these.
 
 The counts are executor-wide, and a fault is posted for every RUNNING pod on the executor; each post
 carries that pod's own `gpu_count` next to the executor totals so the backend can tell which renters of
@@ -76,7 +81,7 @@ from ..messages import RentedGpuDropMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import split_uuids
-from .gpu_memory_health import flagged_uuids, read_memory_health
+from .gpu_memory_health import card_fault_uuids, flagged_uuids, read_memory_health
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +99,8 @@ FAULT_DETAILS_SHORT = "details_short_of_count"
 FAULT_ANCHORED_MISSING = "anchored_gpu_missing"
 FAULT_NVML_ERROR = "nvml_error"
 FAULT_ECC_UNCORRECTED = "ecc_uncorrected"
+FAULT_GPU_HW = "gpu_hw_fault"
+FAULT_GPU_UNVERIFIED = "gpu_unverified"
 
 # NVML return codes that mean a card is gone or unusable: DRIVER_NOT_LOADED, GPU_IS_LOST, RESET_REQUIRED,
 # GPU_NOT_FOUND, UNKNOWN (what a card that fell off the bus answers). Any other code (NOT_SUPPORTED on
@@ -168,6 +175,7 @@ def judge_rented_gpus(
     listed_count: int,
     scrape_error: object,
     broken_uuids: list[str] | None = None,
+    hw_fault_uuids: list[str] | None = None,
 ) -> GpuDrop | None:
     """The fault this scrape shows on a rented node, or None when every rented card is there.
 
@@ -184,8 +192,9 @@ def judge_rented_gpus(
     code = nvml_error_code(scrape_error)
     missing = sorted(anchor - listed)[:MAX_MISSING_UUIDS] if listed or not listed_count else []
     broken_set = set(broken_uuids or ())
+    hw_set = set(hw_fault_uuids or ())
     # named on a part rental too: the backend maps each UUID to the pod renting it (or to none)
-    named_broken = [uuid for uuid in sorted(broken_set) if uuid not in missing]
+    named_broken = [uuid for uuid in sorted(broken_set | hw_set) if uuid not in missing]
 
     faults: list[str] = []
     if visible < rented:
@@ -198,6 +207,8 @@ def judge_rented_gpus(
         faults.append(FAULT_NVML_ERROR)
     if broken_set:
         faults.append(FAULT_ECC_UNCORRECTED)
+    if hw_set:
+        faults.append(FAULT_GPU_HW)
     if not faults:
         return None
     expected = max(rented, len(anchor), nvml_count)
@@ -237,6 +248,8 @@ class DropMark:
     evidence: list[Any] | None = None
     # the incident named a card with uncorrected ECC, which only the memory read can call healed
     ecc: bool = False
+    # DAH-5869: the incident named a card with a hardware fault, which only an NVML read can call healed
+    hw: bool = False
     # when the clean cycle that owes the recovery was seen: a retried recovery reports this, not its retry time
     observed_at: str | None = None
 
@@ -322,6 +335,8 @@ class BrokenCardsRead:
 
     uuids: list[str] | None
     updates: dict[str, Any]
+    # DAH-5869: the cards with a new hardware Xid or a slowdown / PCIe downgrade read twice in a row
+    hw_uuids: list[str] | None = None
 
 
 async def _read_broken_uuids(ctx: Context) -> BrokenCardsRead:
@@ -334,6 +349,7 @@ async def _read_broken_uuids(ctx: Context) -> BrokenCardsRead:
     status = read.report.get("status")
     if status not in ("ok", "flagged"):
         return BrokenCardsRead(None, updates)
+    hw_uuids = card_fault_uuids(read.report)
     uuids = flagged_uuids(read.report)
     gpus = (read.report.get("nvml") or {}).get("gpus") or []
     ecc_unread = not gpus or any(
@@ -341,8 +357,8 @@ async def _read_broken_uuids(ctx: Context) -> BrokenCardsRead:
     )
     # a flag naming no card, or a card whose ECC NVML could not read, is no proof a broken card healed
     if not uuids and (status == "flagged" or ecc_unread):
-        return BrokenCardsRead(None, updates)
-    return BrokenCardsRead(uuids, updates)
+        return BrokenCardsRead(None, updates, hw_uuids)
+    return BrokenCardsRead(uuids, updates, hw_uuids)
 
 
 class RentedGpuDropCheck:
@@ -354,6 +370,10 @@ class RentedGpuDropCheck:
 
     check_id = "gpu.validate.rented_gpu_drop"
     fatal = False
+
+    def __init__(self, *, unverified: bool = False) -> None:
+        # DAH-5869: the scrape timed out cycle after cycle, so no card was seen at all (MachineSpecScrapeCheck)
+        self.unverified = unverified
 
     async def run(self, ctx: Context) -> CheckResult:
         rented_data = ctx.state.rented_data
@@ -370,7 +390,7 @@ class RentedGpuDropCheck:
             return CheckResult(passed=True, event=event)
         specs = ctx.state.specs or {}
         gpu_details = list(ctx.state.gpu_details or [])
-        if await missing_gpus_under_reset(ctx, gpu_details):
+        if not self.unverified and await missing_gpus_under_reset(ctx, gpu_details):
             event = render_message(Msg.GPU_RESET_IN_PROGRESS, ctx=ctx, check_id=self.check_id)
             return CheckResult(passed=True, event=event)
 
@@ -379,17 +399,32 @@ class RentedGpuDropCheck:
             nvml_count = (specs.get("gpu") or {}).get("count", 0) or 0
         scrape_error = specs.get("gpu_scrape_error")
         rented_total = _rented_gpu_count(all_pods)
-        memory = await _read_broken_uuids(ctx)
-        broken_uuids, updates = memory.uuids, memory.updates
-        drop = judge_rented_gpus(
-            rented_gpu_count=rented_total,
-            anchor_uuids=split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or ""),
-            nvml_count=nvml_count,
-            listed_uuids=_listed_uuids(gpu_details),
-            listed_count=len(gpu_details),
-            scrape_error=scrape_error,
-            broken_uuids=broken_uuids or [],
-        )
+        anchor_uuids = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+        if self.unverified:
+            # no reading at all: nothing is read from the node, and no card is named
+            broken_uuids, hw_uuids, updates = None, None, {}
+            drop: GpuDrop | None = GpuDrop(
+                expected=max(rented_total or 1, len(anchor_uuids)),
+                visible=0,
+                nvml_count=0,
+                missing_uuids=[],
+                nvml_error_code=None,
+                faults=[FAULT_GPU_UNVERIFIED],
+                confirm_first=False,
+            )
+        else:
+            memory = await _read_broken_uuids(ctx)
+            broken_uuids, hw_uuids, updates = memory.uuids, memory.hw_uuids, memory.updates
+            drop = judge_rented_gpus(
+                rented_gpu_count=rented_total,
+                anchor_uuids=anchor_uuids,
+                nvml_count=nvml_count,
+                listed_uuids=_listed_uuids(gpu_details),
+                listed_count=len(gpu_details),
+                scrape_error=scrape_error,
+                broken_uuids=broken_uuids or [],
+                hw_fault_uuids=hw_uuids or [],
+            )
 
         now_iso = datetime.now(UTC).isoformat()
         # A dry run shares Redis with the live validator, so it leaves the live incidents alone.
@@ -397,7 +432,14 @@ class RentedGpuDropCheck:
         if not settings.DRY_RUN:
             for pod in pods:
                 outcome = await self._track_pod(
-                    ctx, pod, drop, rented_total, nvml_count, now_iso, broken_uuids is None
+                    ctx,
+                    pod,
+                    drop,
+                    rented_total,
+                    nvml_count,
+                    now_iso,
+                    broken_uuids is None,
+                    hw_uuids is None,
                 )
                 if outcome is not None:
                     outcomes.append(outcome)
@@ -454,6 +496,7 @@ class RentedGpuDropCheck:
         nvml_count: int,
         now_iso: str,
         memory_unread: bool = False,
+        hw_unread: bool = False,
     ) -> dict[str, Any] | None:
         key = _key(pod.pod_id)
         redis_ok = True
@@ -469,7 +512,7 @@ class RentedGpuDropCheck:
         if drop is None:
             if mark is None:
                 return None
-            if memory_unread and mark.ecc:
+            if (memory_unread and mark.ecc) or (hw_unread and mark.hw):
                 # no memory reading is no proof the broken card healed: keep the incident open, and its
                 # mark alive past the TTL
                 await self._save(ctx, pod.pod_id, mark, redis_ok)
@@ -484,7 +527,11 @@ class RentedGpuDropCheck:
             mark = DropMark(now_iso, recorded=mark.recorded, unanswered=mark.unanswered)
         else:
             mark = replace(mark, consecutive_cycles=mark.consecutive_cycles + 1)
-        mark = replace(mark, ecc=mark.ecc or FAULT_ECC_UNCORRECTED in drop.faults)
+        mark = replace(
+            mark,
+            ecc=mark.ecc or FAULT_ECC_UNCORRECTED in drop.faults,
+            hw=mark.hw or FAULT_GPU_HW in drop.faults,
+        )
         answer: RentedGpuDropResponse | None = None
         posted = False
         held = drop.confirm_first and mark.consecutive_cycles < 2
