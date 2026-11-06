@@ -1366,6 +1366,7 @@ async def test_the_validator_records_its_start_only_after_remounting(svc, remoun
 
     recorded = [c for c in ssh.run.await_args_list if docker_service._VALIDATOR_STARTS_DIR in c.args[0]]
     assert len(recorded) == remount
+    assert docker_service._VALIDATOR_STARTS_DIR.startswith("/proc/1/root/")  # survives an executor recreate
 
 
 @pytest.mark.asyncio

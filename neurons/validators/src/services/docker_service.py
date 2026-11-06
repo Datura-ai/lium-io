@@ -1730,7 +1730,8 @@ _DROP_MARK = "drop"
 # A window never outlives the remount, so files after a later restart of Docker's own (unseen) always keep the copy.
 # shortcut: a fixed bound, not the recorded first-mount time; a create whose mount came later keeps the container.
 _STARTUP_WRITE_SECONDS = 300
-_VALIDATOR_STARTS_DIR = "/var/tmp/lium_validator_starts"
+# on the host disk: the executor container (and its /var/tmp) is recreated on every executor release
+_VALIDATOR_STARTS_DIR = "/proc/1/root/var/lib/lium_validator_starts"
 
 
 def _layer_data_check(
