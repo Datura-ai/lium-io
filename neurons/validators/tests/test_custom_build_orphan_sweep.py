@@ -83,9 +83,11 @@ async def test_a_later_pending_pod_write_keeps_a_build_past_30_minutes():
     service = RedisService.__new__(RedisService)
     service.hget = AsyncMock(return_value=json.dumps([entry, {"time": 0, "pod_id": "pod-other"}]))
     service.hset = AsyncMock()
+    service.write_atomically = AsyncMock()
 
     await service.add_pending_pod("miner", "exec", "pod-new")
-    assert [i["pod_id"] for i in json.loads(service.hset.await_args.args[2])][:2] == [
+    pending_write = service.write_atomically.await_args.args[0].ops[0]
+    assert [i["pod_id"] for i in json.loads(pending_write.args[2])][:2] == [
         "pod-long-build",
         "pod-other",
     ]
