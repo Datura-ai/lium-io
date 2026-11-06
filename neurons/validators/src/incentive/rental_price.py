@@ -1286,7 +1286,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # shortcut: no DAH-2528 split-tier reassignment for spot, extend it if spot split nodes crowd a bucket.
         bucket: int = self._resolve_bucket(result, cap_spec)
         result.count_bucket = bucket
-        result.max_cap = cap_spec.get(bucket, 0)
+        # own fields, not max_cap & co: those mark a Secure tier member for every reader (portal tier breakdown)
+        result.spot_cap = cap_spec.get(bucket, 0)
         result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
         result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
         if base_model not in self.config.rental_incentive_gpu_types:
@@ -1304,7 +1305,7 @@ class RentalPriceIncentive(DefaultIncentive):
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
         )
-        if result.hourly_rate > 0 and result.max_cap > 0:
+        if result.hourly_rate > 0 and result.spot_cap > 0:
             key: tuple[str, int] = (base_model, bucket)
             self.spot_count_by_bucket[key] = (
                 self.spot_count_by_bucket.get(key, 0) + result.gpu_count
@@ -1319,10 +1320,9 @@ class RentalPriceIncentive(DefaultIncentive):
             count: int = self.spot_count_by_bucket.get((base_model, result.count_bucket), 0)
             if count <= 0:
                 continue
-            result.total_unrented_by_gpu_type = count
-            result.cap_dilution_applied = count > result.max_cap
-            result.unrented_cap_multiplier = min(count, result.max_cap) / count
-            result.effective_rate *= result.unrented_cap_multiplier
+            result.spot_gpus_in_bucket = count
+            result.spot_cap_multiplier = min(count, result.spot_cap) / count
+            result.effective_rate *= result.spot_cap_multiplier
 
     def _spot_pay_within_filler_earnings(self) -> float:
         """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;

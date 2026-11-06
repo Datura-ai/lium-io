@@ -369,16 +369,17 @@ async def test_spot_over_its_cap_is_diluted_and_does_not_dilute_secure_nodes():
     assert incentive.unrented_count_by_bucket[("H100", 8)] == 8
     assert incentive.spot_count_by_bucket[("H100", 8)] == 32
     for spot in spots:
-        assert spot.unrented_cap_multiplier == pytest.approx(8 / 32)
-        assert spot.cap_dilution_applied is True
+        assert spot.spot_cap_multiplier == pytest.approx(8 / 32)
+        # the secure tier fields stay unset, so no reader counts a spot node as a secure tier member
+        assert (spot.max_cap, spot.total_unrented_by_gpu_type, spot.unrented_cap_multiplier) == (None, None, None)
         assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 * 8 / 32)
     [line] = _logged(spots[0], SPOT_LINE)
-    assert (line["total_unrented_by_gpu_type"], line["max_cap"], line["count_bucket"]) == (
+    assert (line["spot_gpus_in_bucket"], line["spot_cap"], line["count_bucket"]) == (
         32,
         BUCKET_CAP,
         8,
     )
-    assert line["unrented_cap_multiplier"] == pytest.approx(0.25)
+    assert line["spot_cap_multiplier"] == pytest.approx(0.25)
     assert any("Spot cap dilution applied: 32 idle Spot GPUs" in m for m in _messages(spots[0], SPOT_LINE))
     _assert_pool_pays_exactly(incentive)
 
@@ -389,8 +390,7 @@ async def test_spot_at_its_cap_is_not_diluted():
 
     await _run([spot])
 
-    assert spot.unrented_cap_multiplier == 1.0
-    assert spot.cap_dilution_applied is False
+    assert spot.spot_cap_multiplier == 1.0
     assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
     assert not any("Spot cap dilution applied" in m for m in _messages(spot, SPOT_LINE))
 
@@ -404,7 +404,7 @@ async def test_secure_nodes_over_their_cap_do_not_dilute_spot():
 
     assert secures[0].unrented_cap_multiplier == pytest.approx(8 / 32)
     assert incentive.spot_count_by_bucket[("H100", 8)] == 8
-    assert spot.unrented_cap_multiplier == 1.0
+    assert spot.spot_cap_multiplier == 1.0
     assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
 
 
@@ -419,7 +419,7 @@ async def test_the_filler_earnings_pool_scales_the_cap_diluted_spot_rates():
     incentive = await _run(spots)
 
     for spot in spots:
-        assert spot.unrented_cap_multiplier == pytest.approx(0.5)
+        assert spot.spot_cap_multiplier == pytest.approx(0.5)
         assert spot.spot_pool_multiplier == pytest.approx(4.0 / 16.0)
         assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 * 0.5 * 4.0 / 16.0)
     assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(4.0)
