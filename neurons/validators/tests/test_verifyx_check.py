@@ -332,7 +332,12 @@ async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_reuse(context_f
     clock[0] += day - 1
     assert await reason() == Msg.FILLER_SKIPPED.reason
     # the mark expires on its own if the node stops being checked
-    assert services.redis.ttl[next(iter(services.redis.store))] == 7 * day
+    key = next(iter(services.redis.store))
+    assert services.redis.ttl[key] == 7 * day
+    # r4491079681: every check renews the expiry, so an active node's mark never lapses into a fresh day of reuse
+    services.redis.ttl[key] = 60
+    assert await reason() == Msg.FILLER_SKIPPED.reason
+    assert services.redis.ttl[key] == 7 * day
 
 
 @pytest.mark.asyncio

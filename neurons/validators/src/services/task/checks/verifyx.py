@@ -96,7 +96,7 @@ async def _rented_executors_now_shared(backend) -> tuple[Any, float]:
 # by every validator deploy and a node is skipped far less often than once per job cycle, so it never reached a day.
 MAX_FILLER_REUSE_SECONDS = 24 * 3600
 _FILLER_REUSE_PREFIX = "verifyx:filler_reuse_since"
-# longer than the reuse window, so a key only lapses for a node that stopped being checked
+# renewed on every check, so a key only lapses for a node that stopped being checked for this long
 _FILLER_REUSE_TTL_SECONDS = 7 * 24 * 3600
 
 
@@ -112,6 +112,8 @@ async def _filler_reuse_is_due(ctx: Context, stored: tuple) -> bool:
         if mark is None or tuple(mark.get("stored") or ()) != stored:
             await redis.set(key, json.dumps({"since": now, "stored": list(stored)}), ex=_FILLER_REUSE_TTL_SECONDS)
             return False
+        # renew on every check: an expired mark would look new and grant another day of reuse
+        await redis.expire(key, _FILLER_REUSE_TTL_SECONDS)
         return now - float(mark["since"]) >= MAX_FILLER_REUSE_SECONDS
     except Exception:
         # without the clock the stored EMA is reused, as before DAH-5742; probing every cycle is the cost to avoid
