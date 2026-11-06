@@ -1280,8 +1280,9 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
     [
         (0, "overlay2", False, None),  # written by the image's startup, before the first mount: not the renter's
         (3600, "overlay2", True, None),  # written an hour after creation: an unmounted restart, the renter's
-        (3600, "overlay2", False, 0),  # just after a start the validator made and remounted: its entrypoint
-        (3600, "overlay2", True, 3600),  # long after the validator's last start: an unmounted restart by Docker
+        (3600, "overlay2", False, (0,)),  # just after a start the validator made and remounted: its entrypoint
+        (3600, "overlay2", True, (3600,)),  # long after the validator's last start: an unmounted restart by Docker
+        (3600, "overlay2", False, (0, -600)),  # after an earlier validator start, not the latest: still its entrypoint
         (0, "containerd", False, None),  # no UpperDir in inspect: the running container's root mount names it
         (3600, "containerd", True, None),
         (0, "given", False, None),  # stopped on the containerd store: the upper dir the running read used
@@ -1321,7 +1322,7 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, monkeyp
     starts = tmp_path / "starts"
     starts.mkdir()
     if started_ago is not None:
-        (starts / "cid").write_text(f"{int(time.time()) - started_ago}\n")
+        (starts / "cid").write_text("".join(f"{int(time.time()) - ago}\n" for ago in started_ago))
     monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(starts))
     command = _layer_data_check("pod_x", "/root", host_upper if store == "given" else None, store != "kept")
     command = command.replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
@@ -1346,6 +1347,32 @@ async def test_the_validator_records_its_start_only_after_remounting(svc, remoun
 
     recorded = [c for c in ssh.run.await_args_list if docker_service._VALIDATOR_STARTS_DIR in c.args[0]]
     assert len(recorded) == remount
+
+
+@pytest.mark.asyncio
+async def test_each_validator_start_is_kept_next_to_the_earlier_ones(svc, tmp_path, monkeypatch):
+    # a second start must not erase the first: the first start's entrypoint files are still in the layer
+    import subprocess
+
+    starts = tmp_path / "starts"
+    monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(starts))
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=True)
+    ssh = Mock(run=AsyncMock())
+    await svc._restore_mount_and_sshd_after_start(
+        docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+        pod_id="x", default_extra={}, remount=True,
+    )
+    record = next(c.args[0] for c in ssh.run.await_args_list if str(starts) in c.args[0])
+
+    for started in ("2026-11-06T10:00:00.1Z", "2026-11-06T10:30:00.1Z"):
+        docker = tmp_path / "docker"
+        docker.write_text(f'#!/bin/sh\necho "cid {started}"\n')
+        docker.chmod(0o755)
+        subprocess.run(["sh", "-c", record.replace("/usr/bin/docker", str(docker))], check=True)
+
+    assert (starts / "cid").read_text().split() == ["1793959200", "1793961000"]
 
 
 @pytest.mark.asyncio

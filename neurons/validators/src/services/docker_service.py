@@ -1725,7 +1725,8 @@ _DROP_MARK = "drop"
 # The image's entrypoint writes under the plaintext path before the first gocryptfs mount: those layer files
 # carry an inode change time within this long of the container's creation and are not the renter's.
 # A restart reruns the entrypoint too: only one the validator made and remounted counts, by the start time it
-# recorded under _VALIDATOR_STARTS_DIR (keyed by container id), never Docker's own, which an unmounted restart moves.
+# recorded under _VALIDATOR_STARTS_DIR (one line per start, keyed by container id), never Docker's own, which an
+# unmounted restart moves.
 # shortcut: a fixed bound, not the recorded first-mount time; a create whose mount came later keeps the container.
 _STARTUP_WRITE_SECONDS = 300
 _VALIDATOR_STARTS_DIR = "/var/tmp/lium_validator_starts"
@@ -1765,11 +1766,12 @@ def _layer_data_check(
         f"&& t=$(date -d \"${{c%% *}}\" +%s 2>/dev/null) && c=\"${{c#* }}\" && p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
         f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
         f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
-        f"&& {{ s=$(cat {_VALIDATOR_STARTS_DIR}/\"$(/usr/bin/docker inspect -f '{{{{.Id}}}}' {name})\" 2>/dev/null); "
-        "case \"$s\" in ''|*[!0-9]*) s=0;; esac; } "
+        # one window per recorded start: entrypoint files from every start the validator remounted are startup writes
+        f"&& {{ w=; for s in $(cat {_VALIDATOR_STARTS_DIR}/\"$(/usr/bin/docker inspect -f '{{{{.Id}}}}' {name})\" 2>/dev/null); "
+        "do case \"$s\" in *[!0-9]*) continue;; esac; "
+        f"w=\"$w ! ( -newerct @$s ! -newerct @$((s + {_STARTUP_WRITE_SECONDS})) )\"; done; true; }} "
         f"&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) -newerct \"@$((t + {_STARTUP_WRITE_SECONDS}))\" "
-        f"! \\( -newerct \"@$s\" ! -newerct \"@$((s + {_STARTUP_WRITE_SECONDS}))\" \\) "
-        "-print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
+        "$w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
     return (
         f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
@@ -11935,7 +11937,7 @@ class DockerService:
             with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):  # without it the read keeps, never drops
                 await ssh_client.run(
                     f"i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name}) && mkdir -p "
-                    f"{_VALIDATOR_STARTS_DIR} && date -d \"${{i#* }}\" +%s > {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
+                    f"{_VALIDATOR_STARTS_DIR} && date -d \"${{i#* }}\" +%s >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
                     check=False,
                     timeout=30,
                 )
