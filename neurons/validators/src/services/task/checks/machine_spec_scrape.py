@@ -16,7 +16,7 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
-from services.gpu_spec_table import classify_gpu_model
+from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
@@ -522,13 +522,15 @@ class MachineSpecScrapeCheck:
             specs = _deobfuscate(raw, obfuscation_keys)
             # DAH-3698: PortConnectivityCheck's grace marker is validator-owned; a provider must never report it
             specs.pop("port_verify_first_miss", None)
+            # the disk check writes the split disk sizing; a provider must never report it
+            specs.pop("split_disk", None)
 
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
             raw_gpu_details = gpu_info.get("details", []) or []
             # The native capability challenge derives its key from the raw NVML name in
             # specs. Policy and scoring use the canonicalized state fields below.
-            gpu_details = _normalize_gpu_details(raw_gpu_details)
+            gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
             gpu_model = None
             if gpu_count > 0 and gpu_details:
                 gpu_model = gpu_details[0].get("name")

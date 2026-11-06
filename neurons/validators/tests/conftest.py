@@ -109,6 +109,17 @@ def no_docker_hub_digest_on_rent_path():
 
 
 @pytest.fixture(autouse=True)
+def pod_ssh_answers_on_create_path(request):
+    """create_container connects to the pod's mapped SSH port before ContainerCreated; tests have no pod there.
+    test_pod_ssh_before_created.py covers the check itself (marker real_pod_ssh_check)."""
+    if request.node.get_closest_marker("real_pod_ssh_check"):
+        yield None
+        return
+    with patch("services.docker_service._raise_unless_pod_ssh_answers", AsyncMock(return_value=None)) as check:
+        yield check
+
+
+@pytest.fixture(autouse=True)
 def no_leftover_clock_locks_on_create_path():
     """create_container resets leftover GPU clock locks (Redis + -rgc); test_gpu_clocks.py covers that step."""
     with patch("services.docker_service.reset_leftover_clock_locks", AsyncMock(return_value=[])) as reset:

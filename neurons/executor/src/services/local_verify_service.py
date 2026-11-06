@@ -8,7 +8,7 @@ the raw output back in one document. Nothing here decides pass or fail: the vali
 matmul blob and decrypts the VerifyX response with the keys only it holds, exactly as it does with
 SSH output, so the two paths are judged by one function and stay comparable.
 
-Off unless `EXECUTOR_LOCAL_VERIFY_ENABLED=true`; `/version` advertises `local_verify/1` only then.
+`/version` advertises it as `local_verify/1`.
 """
 
 from __future__ import annotations
@@ -159,6 +159,8 @@ async def run_script(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, **(env or {})},
+            # an SSH session starts in the home dir; the process cwd (/root/app) is the disk-reserve overlay
+            cwd=Path.home(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)

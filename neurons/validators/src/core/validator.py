@@ -475,7 +475,8 @@ class Validator:
                     # cycle started, and the operator's request must survive to the next tick.
                     await self.redis_service.clear_forced_validation_cycle_request()
 
-                if self.first_cycle_started_at is None:
+                first_cycle = self.first_cycle_started_at is None
+                if first_cycle:
                     self.first_cycle_started_at = datetime.now(UTC)
                 # A fresh job-files directory for this cycle; the ones an express verification
                 # still reads are kept (DAH-2958). The express lane uses the new one from here on.
@@ -492,6 +493,18 @@ class Validator:
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
+                if first_cycle and not settings.DRY_RUN:
+                    # Queue the nodes a restart cut off before this wave asks their miners, or the
+                    # wave takes them (minutes slower). The lane launches once each list is in.
+                    try:
+                        await self.express_lane.tick()
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[express] Restart queue pass failed",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
                 # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
                 # where the cycle withholds an unreachable verdict that an early publish would leak.
                 self.miner_service.outage_tally = (

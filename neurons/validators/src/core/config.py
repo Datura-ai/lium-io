@@ -271,6 +271,10 @@ class Settings(BaseSettings):
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
+    # DAH-5301: a reboot resets a hung pod GPU while the pod is stopped. Off = shadow: the hung GPU query runs and
+    # the validator logs the hung GPUs, why, and whether it would reset or refuse; nothing on the host changes and
+    # the backend gets no warning.
+    HUNG_GPU_RESET_ON_REBOOT_ENABLED: bool = Field(env="HUNG_GPU_RESET_ON_REBOOT_ENABLED", default=False)
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
@@ -325,10 +329,8 @@ class Settings(BaseSettings):
     # channel of the pipeline's SSH session to the executor's loopback port (`/version` names it);
     # the executor refuses any other peer. Any refusal, timeout, mismatch or local failure falls
     # back to the SSH path for that step (logged per outcome, `[local_verify]`).
-    # Off by default; the SSH path is unchanged either way.
-    VALIDATOR_LOCAL_VERIFY_ENABLED: bool = Field(env="VALIDATOR_LOCAL_VERIFY_ENABLED", default=False)
-    # Whole-call budget for `POST /verify` (seconds). Sized for the first pass; a full-size VerifyX
-    # may take longer and then falls back, so keep this above VERIFYX first-pass p90 (90 s) + matmul.
+    # Whole-call budget for `POST /verify` (seconds). Only the first pass calls it (a full-size VerifyX
+    # stays on SSH), so keep this above VERIFYX first-pass p90 (90 s) + matmul.
     # The executor is told to stop 30 s earlier (`deadline_s` = this − 30, min 5) so a cut answer
     # with finished steps inside still arrives inside the budget.
     LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)
@@ -367,11 +369,10 @@ class Settings(BaseSettings):
     #
     # Item 1 — surface the kernel (procfs) GPU verdict the validator already computes and throws
     # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
-    # DAH-2662 — match provider/GPU bans against the kernel's GPU UUIDs (/proc/driver/nvidia) as well
-    # as the host-reported ones. Shadow by default: the kernel list is read, recorded on specs and
-    # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
-    # matched on the reported list until this is flipped from a week of clean fleet data.
-    KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
+    # DAH-4891: fail a node whose kernel GPU list is read through a foreign mount over
+    # /proc/driver/nvidia/gpus (KERNEL_GPU_VIEW_OVERLAID). Off: the finding is only recorded on the
+    # banned_provider event (kernel_gpu_foreign_mounts). On only once the honest mount patterns are excluded.
+    KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED", default=False)
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count); a kernel list that is
@@ -646,6 +647,15 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
+
+    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
+    # GPU power limit back while a Lium idle job was running, often enough inside the window,
+    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
+    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
+    # are read first. Set to True to enforce.
+    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
+        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
+    )
 
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a

@@ -35,6 +35,8 @@ class ReachTarget(StrEnum):
     GPU = "gpu"
     # The node's Docker storage (StorageLimitCheck): it cannot cap a container's disk.
     DOCKER_STORAGE = "docker_storage"
+    # The node's renting ports (PortCountCheck): too few answer for every GPU split to be rented.
+    EXECUTOR_PORTS = "executor_ports"
     # The node as a whole: a fatal check failed (failed_check_event).
     NODE = "node"
 
@@ -88,6 +90,24 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
 )
+
+
+def _is_the_nodes_own_fault(error: dict[str, Any]) -> bool:
+    """A lost or broken GPU, or a node that declares fewer ports than it needs (DAH-3698).
+
+    Neither depends on our probe, so neither is counted as our outage or silenced with one. A
+    probe that verified too few of enough declared ports stays a reach failure: counted, silenced.
+    """
+    if error.get("reason_code") in NODE_GPU_FAULT_CODES:
+        return True
+    seen = error.get("what_we_saw") or {}
+    declared, required = seen.get("declared_port_count"), seen.get("required")
+    return (
+        error.get("reason_code") == "INSUFFICIENT_PORTS"
+        and isinstance(declared, int)
+        and isinstance(required, int)
+        and declared < required
+    )
 
 
 def build_availability_event(
@@ -184,8 +204,10 @@ def build_ssh_unreachable_event(
         else (
             "Check that sshd on the node accepts the validator on its management port, "
             "and that no firewall or rate limit rejects the connection. If your host NATs or "
-            "proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false in the executor .env and "
-            "restart the executor."
+            "proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false and EXECUTOR_SSH_SOURCE_LIMITS=false "
+            "in the executor .env and recreate the executor container (in ~/compute-subnet/neurons/executor: "
+            "docker compose up -d --force-recreate; a plain docker compose up -d or docker restart keeps "
+            "the old .env values)."
         ),
         what_we_saw={
             "executor_uuid": executor_uuid,
@@ -284,14 +306,11 @@ def _is_the_validators_own_reading(job_result: JobResult) -> bool:
 def _checked_and_unreachable(job_results: list[JobResult]) -> tuple[list[JobResult], list[JobResult]]:
     """The two sides of the outage share: the validator's own readings, and those that failed at the connect."""
     checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
-    # a lost or broken GPU is the node's own fault, never our outage: not counted in the share
+    # the node's own faults are never our outage: not counted in the share
     unreachable_results = [
         result
         for result in checked_results
-        if any(
-            error.get("reason_code") not in NODE_GPU_FAULT_CODES
-            for error in result.availability_errors or []
-        )
+        if any(not _is_the_nodes_own_fault(error) for error in result.availability_errors or [])
     ]
     return checked_results, unreachable_results
 
@@ -308,13 +327,11 @@ def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) 
         return 0
     for result in checked_results:
         # None means "this cycle did not check": the backend leaves the stored errors alone.
-        # A lost or broken GPU is the node's own fault: its entry stays, the node stays hidden.
-        node_gpu_fault_entries = [
-            error
-            for error in result.availability_errors or []
-            if error.get("reason_code") in NODE_GPU_FAULT_CODES
+        # The node's own faults stay, the node stays hidden.
+        own_fault_entries = [
+            error for error in result.availability_errors or [] if _is_the_nodes_own_fault(error)
         ]
-        result.availability_errors = node_gpu_fault_entries or None
+        result.availability_errors = own_fault_entries or None
     return len(checked_results)
 
 

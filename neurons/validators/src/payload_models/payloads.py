@@ -14,10 +14,11 @@ _BARE_VOLUME_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
 
 class CustomOptions(BaseModel):
     volumes: list[str] | None = None
-    environment: dict[str, str] | None = None
+    # repr=False: every create logs the whole request as `str(payload)`; these hold renter-supplied values
+    environment: dict[str, str] | None = Field(default=None, repr=False)
     entrypoint: str | None = None
     internal_ports: list[int] | None = None
-    startup_commands: str | None = None
+    startup_commands: str | None = Field(default=None, repr=False)
     shm_size: str | None = None
     initial_port_count: int | None = None
 
@@ -226,6 +227,13 @@ class ForcedValidationCycleRequest(BaseModel):
     message_type: Literal["ForcedValidationCycleRequest"]
 
 
+class RecheckExecutorRequest(BaseModel):
+    """Ask the validator to queue a single-node check of one executor (the provider asked)."""
+
+    message_type: Literal["RecheckExecutorRequest"]
+    executor_id: str
+
+
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"
@@ -357,7 +365,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.
-    dockerfile_content: str | None = None
+    dockerfile_content: str | None = Field(default=None, repr=False)
     # a gzipped tar of the build context for `dockerfile_content` and its sha256 (hex); see
     # services/build_context.py. None builds with the Dockerfile as the only file.
     build_context_url: str | None = None
@@ -570,6 +578,14 @@ class BaseValidatorResponse(BaseRequest, DeliveryStamps):
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    # DAH-5301: a reboot found a pod GPU hung and reset it before the new container started
+    HungGpuReset = "HungGpuReset"
+    # ...or found one hung and could not reset it: MIG, an NVLink peer outside the pod, a process
+    # outside the pod on it, or the driver refused the reset
+    HungGpuNotResetMig = "HungGpuNotResetMig"
+    HungGpuNotResetNvlinkShared = "HungGpuNotResetNvlinkShared"
+    HungGpuNotResetInUse = "HungGpuNotResetInUse"
+    HungGpuNotResetUnsupported = "HungGpuNotResetUnsupported"
 
 
 class VolumeEncryptionStatus(str, enum.Enum):

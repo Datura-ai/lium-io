@@ -11,7 +11,7 @@ from ..messages import GpuMemoryHealthMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context, MemoryHealthRead
 from .banned_provider import has_live_rental
-from .gpu_fault_probe import OUTPUT_TAIL_CHARS, PROBE_SOURCE, _cap, _parse_report
+from .gpu_fault_probe import OUTPUT_TAIL_CHARS, _cap, _parse_report, probe_source
 from .post_rental_gpu_recheck import RecheckMarker, record_marker
 
 # one NVML snapshot in a fork with its own 10 s deadline (miner_jobs/gpu_fault_probe.py), plus SSH
@@ -33,7 +33,7 @@ async def read_memory_health(ctx: Context) -> MemoryHealthRead:
         return ctx.state.memory_health
     command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
     run = await ctx.runner.run(
-        command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=PROBE_SOURCE
+        command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
     )
     return MemoryHealthRead(run=run, report=_parse_report(run.stdout) or {})
 
