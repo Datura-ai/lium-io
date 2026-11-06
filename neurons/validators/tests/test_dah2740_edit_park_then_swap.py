@@ -1389,7 +1389,36 @@ async def test_each_validator_start_is_kept_next_to_the_earlier_ones(svc, tmp_pa
 
     lines = [line.split() for line in (starts / "cid").read_text().splitlines()]
     assert [line[0] for line in lines] == ["1793959200", "1793961000"]
-    assert all(int(end) >= int(start) for start, end in lines)
+    assert all(int(end) > int(start) for start, end in lines)
+
+
+@pytest.mark.asyncio
+async def test_a_remount_within_the_start_second_still_leaves_a_window(svc, tmp_path, monkeypatch):
+    # both times are whole seconds: a start at T.010 remounted by T.950 must not record "T T", an empty window
+    import subprocess
+    import time
+
+    starts = tmp_path / "starts"
+    monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(starts))
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=True)
+    ssh = Mock(run=AsyncMock())
+    await svc._restore_mount_and_sshd_after_start(
+        docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+        pod_id="x", default_extra={}, remount=True,
+    )
+    record = next(c.args[0] for c in ssh.run.await_args_list if str(starts) in c.args[0])
+    now = int(time.time())
+    docker = tmp_path / "docker"
+    docker.write_text(f'#!/bin/sh\necho "cid 0 {time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))}.010Z"\n')
+    docker.chmod(0o755)
+
+    subprocess.run(["sh", "-c", record.replace("/usr/bin/docker", str(docker))], check=True)
+
+    start, end = (int(v) for v in (starts / "cid").read_text().split())
+    assert start == now
+    assert end > start
 
 
 @pytest.mark.asyncio

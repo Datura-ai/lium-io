@@ -11936,14 +11936,15 @@ class DockerService:
                 allow_init=False,
             )
             # the start just made is ours and now remounted: the layer read counts its entrypoint writes as startup;
-            # RestartCount (reset by our start) above 0 means Docker restarted it during the remount: record nothing
+            # RestartCount (reset by our start) above 0 means Docker restarted it during the remount: record nothing;
+            # the end rounds up a second, as both times are whole seconds and a fast remount would leave no window
             name = shlex.quote(container_name)
             with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):  # without it the read keeps, never drops
                 await ssh_client.run(
                     "i=$(/usr/bin/docker inspect -f "
                     f"'{{{{.Id}}}} {{{{.RestartCount}}}} {{{{.State.StartedAt}}}}' {name}) "
                     f"&& r=\"${{i#* }}\" && [ \"${{r%% *}}\" = 0 ] && s=$(date -d \"${{r#* }}\" +%s) && mkdir -p "
-                    f"{_VALIDATOR_STARTS_DIR} && echo \"$s $(date +%s)\" >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
+                    f"{_VALIDATOR_STARTS_DIR} && echo \"$s $(($(date +%s) + 1))\" >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
                     check=False,
                     timeout=30,
                 )
