@@ -54,6 +54,7 @@ class NvlinkFaultCheck:
     """
 
     check_id = "gpu.validate.nvlink_fault"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
