@@ -11,6 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import asyncssh
 import pytest
+from services.task.checks.container_download_speed import ContainerDownloadSpeedCheck
+from services.task.checks.custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+from services.task.checks.gpu_thermal_throttle import GpuThermalThrottleCheck
+from services.task.checks.gpu_usage import GpuUsageCheck
+from services.task.checks.idle_disk_write import IdleDiskWriteCheck
+from services.task.checks.registry_pull import RegistryPullCheck
+from services.task.checks.sshd_bootstrap import SshdBootstrapCheck
 from services.task.checks.gpu_attestation_identity import GpuAttestationIdentityCheck
 from services.task.checks.gpu_fault_probe import GpuFaultProbeCheck
 from services.task.checks.gpu_loss_hold import GpuLossHoldCheck
@@ -28,7 +35,7 @@ from services.task.checks.rented_machine import TenantEnforcementCheck
 from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
 from services.task.availability import REASONS_THAT_HIDE_AT_ONCE, failed_check_event
 from services.task.models import AVAILABILITY_CATEGORY, ValidationEvent
-from services.task.pipeline import CheckResult, Context, Pipeline
+from services.task.pipeline import CheckResult, Context, Pipeline, _replays_after_session_drop
 
 from tests.helpers import make_context
 
@@ -70,6 +77,7 @@ class _Check:
 
     check_id = "executor.validate.port_connectivity"
     fatal = True
+    replays_after_session_drop = True
 
     def __init__(self, drops: int, raises: bool = False):
         self.drops = drops
@@ -170,6 +178,26 @@ async def test_a_check_that_leaves_host_state_is_not_replayed():
 
     _ends_on_the_dead_session(*(await Pipeline([check], _NullSink(), reconnect=reconnect).run(_ctx(_session())))[:2])
     assert not calls and len(check.sessions) == 1
+
+
+def test_a_check_that_does_not_opt_in_is_not_replayed():
+    class _Unmarked:
+        check_id = "host.validate.unmarked"
+
+    assert _replays_after_session_drop(_Unmarked()) is False
+
+
+def test_checks_that_write_redis_or_host_state_are_not_replayable():
+    for check in (
+        IdleDiskWriteCheck,
+        GpuThermalThrottleCheck,
+        SshdBootstrapCheck,
+        RegistryPullCheck,
+        ContainerDownloadSpeedCheck,
+        CustomBuildOrphanSweepCheck,
+        GpuUsageCheck,
+    ):
+        assert getattr(check, "replays_after_session_drop", False) is False
 
 
 def test_checks_that_start_containers_or_recover_pods_are_not_replayable():

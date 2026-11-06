@@ -78,6 +78,7 @@ class SplitDiskCheck:
     """
 
     check_id = "executor.validate.split_disk"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -103,6 +104,7 @@ class DiskSpaceCheck:
     """
 
     check_id = "executor.validate.disk_space"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context, rental_lookup_timeout: float | None = None) -> CheckResult:

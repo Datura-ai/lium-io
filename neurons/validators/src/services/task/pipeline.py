@@ -605,9 +605,9 @@ def _session_lost(ran: list[_RanCheck], ctx: Context) -> _RanCheck:
 
 
 def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
-    # a check that starts named containers or recovers a pod on the host leaves state a replay would trip over
+    # opt-in: only a check that writes nothing to Redis or the host before it returns is run again on a new session
     checks = step.checks if isinstance(step, ParallelStage) else [step]
-    return all(getattr(chk, "replays_after_session_drop", True) for chk in checks)
+    return all(getattr(chk, "replays_after_session_drop", False) for chk in checks)
 
 
 class Pipeline:
