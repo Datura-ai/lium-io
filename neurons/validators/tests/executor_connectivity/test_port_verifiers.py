@@ -325,6 +325,7 @@ async def test_batch_is_start_hung_only_when_every_attempt_times_out_inside_the_
     verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
     verifier.runner.run.side_effect = hang
     mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
+    mocker.patch.object(BatchVerifier, "HUNG_START_MIN_SEC", 0.05)
 
     result = await verifier.verify([PortPair(9000, 9000)], ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -346,3 +347,24 @@ async def test_batch_is_not_start_hung_when_the_container_started_and_the_ports_
 
     assert not result.start_hung
     assert result.successful == []
+
+
+@pytest.mark.asyncio
+async def test_batch_is_not_start_hung_when_a_slow_outside_start_left_the_batch_start_no_time(mocker):
+    # DAH-5682: the outside probe's container used most of each attempt; the batch start was cut off seconds in
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    async def slow_then_hang(_ssh, name, *_args):
+        await asyncio.sleep(0.08 if name.startswith("port_test_out_") else 5)
+        return CONTAINER_STARTED
+
+    external = mocker.Mock()
+    external.reached = mocker.AsyncMock(return_value=None)
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed), external)
+    verifier.runner.run.side_effect = slow_then_hang
+    mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
+    mocker.patch.object(BatchVerifier, "HUNG_START_MIN_SEC", 0.05)
+
+    result = await verifier.verify([PortPair(9000 + i, 9000 + i) for i in range(5)], ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert not result.start_hung
