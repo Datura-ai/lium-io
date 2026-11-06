@@ -6,15 +6,19 @@ fails. Such a host also gets the pod's volume from Docker's ``local`` driver, on
 size either. Each validation this check reads the Docker disk's free space and what each rented pod holds on
 it (writable layer plus local volumes, read with ``du``, never changed). When the disk is almost full it
 pauses (``docker pause``) each rented pod holding a large share of the disk: its data and volume are kept.
-Once the disk has room again it resumes them. A host with the limit is never touched.
+Once the disk has room again it resumes them. A host with the limit is never touched. Each pause and resume is
+reported to the backend, which bills a paused pod nothing and tells its renter.
 """
 
 from __future__ import annotations
 
+import logging
 import shlex
 from dataclasses import asdict, dataclass
 
 import asyncssh
+
+from core.utils import _m, get_extra_info
 
 from ..messages import RentedPodDiskMessages as Msg
 from ..messages import render_message
@@ -29,6 +33,8 @@ RESUME_AT_FREE_FRACTION = 0.10
 # Only a pod that itself holds at least this share of the disk is paused: a disk the host filled
 # itself never stops a renter.
 MIN_LAYER_FRACTION = 0.10
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -47,7 +53,7 @@ def read_command(names: list[str]) -> str:
     quoted = " ".join(shlex.quote(n) for n in names)
     return (
         "r=$(/usr/bin/docker info -f '{{.DockerRootDir}}') && "
-        "df -P -B1 \"$r\" | awk 'NR==2{print \"DF\", $2, $4}'; "
+        'df -P -B1 "$r" | awk \'NR==2{print "DF", $2, $4}\'; '
         "/usr/bin/docker inspect --size --format "
         "'{{.Name}} {{.State.Status}} {{.SizeRw}}{{range .Mounts}}{{if eq .Driver \"local\"}} {{.Source}}{{end}}{{end}}' "
         + quoted
@@ -110,20 +116,62 @@ class RentedPodDiskCheck:
                 "pods": [asdict(p) for p in pods],
             }
             if to_pause:
-                await ctx.ssh.run(
+                done = await ctx.ssh.run(
                     "/usr/bin/docker pause " + " ".join(shlex.quote(n) for n in to_pause),
                     timeout=ACT_TIMEOUT_SECONDS,
                 )
+                # a failed pause is read again next cycle; the backend is told only what happened
+                if getattr(done, "exit_status", 0) == 0:
+                    await self._report(ctx, pods, to_pause, [])
                 return self._event(ctx, Msg.PAUSED, paused=to_pause, **what)
             if to_resume:
-                await ctx.ssh.run(
+                done = await ctx.ssh.run(
                     "/usr/bin/docker unpause " + " ".join(shlex.quote(n) for n in to_resume),
                     timeout=ACT_TIMEOUT_SECONDS,
                 )
+                # a failed unpause is read again next cycle; the backend is told only what happened
+                if getattr(done, "exit_status", 0) == 0:
+                    await self._report(ctx, pods, [], to_resume)
                 return self._event(ctx, Msg.RESUMED, resumed=to_resume, **what)
+            await self._report(ctx, pods, [], [])
             return self._event(ctx, Msg.OK, **what)
         except (asyncssh.Error, OSError) as exc:
             return self._event(ctx, Msg.UNKNOWN, reason="ssh transport error", error=repr(exc))
+
+    async def _report(
+        self, ctx: Context, pods: list[PodLayer], to_pause: list[str], to_resume: list[str]
+    ) -> None:
+        """Tell the backend which pods are paused, so it bills them nothing, and which were resumed.
+
+        A pod already paused is reported again each cycle (the backend ignores a state it has), so a lost
+        report does not leave a paused pod billed. Never fatal: the pause protects the host either way.
+        """
+        rented_data = ctx.state.rented_data
+        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        pod_ids = {
+            p.docker_container_name: p.pod_id
+            for p in (rented_executor.pods if rented_executor else [])
+        }
+        paused = (set(to_pause) | {p.container for p in pods if p.status == "paused"}) - set(
+            to_resume
+        )
+        for name, is_paused in [(n, True) for n in sorted(paused)] + [
+            (n, False) for n in to_resume
+        ]:
+            if name not in pod_ids:
+                continue
+            try:
+                await ctx.services.backend.report_pod_disk_pause(
+                    pod_ids[name], paused=is_paused, executor_id=ctx.executor.uuid
+                )
+            except Exception:
+                logger.warning(
+                    _m(
+                        "RENTED_POD_DISK_REPORT_FAILED",
+                        extra=get_extra_info({**ctx.default_extra, "pod_id": pod_ids[name]}),
+                    ),
+                    exc_info=True,
+                )
 
     def _event(self, ctx: Context, template, **what) -> CheckResult:
         what = {"executor_uuid": ctx.executor.uuid, **what}

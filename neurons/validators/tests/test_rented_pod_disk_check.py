@@ -138,3 +138,37 @@ def test_runs_in_the_validation_pipelines_but_never_in_the_dry_run():
     assert has(PipelineFactory.build_checks())
     assert has(PipelineFactory.build_fast_path_checks())
     assert not has(PipelineFactory.build_dry_run_checks())
+
+
+@pytest.mark.asyncio
+async def test_the_backend_is_told_of_each_pause_and_resume_so_a_paused_pod_is_not_billed(
+    context_factory,
+):
+    paused = _ctx(context_factory, _ssh(_reading(20, f"/pod_1 running {500 * GB} 0")))
+    still = _ctx(context_factory, _ssh(_reading(70, f"/pod_1 paused {500 * GB} 0")))
+    resumed = _ctx(context_factory, _ssh(_reading(200, f"/pod_1 paused {500 * GB} 0")))
+
+    for ctx in (paused, still, resumed):
+        await RentedPodDiskCheck().run(ctx)
+
+    def told(ctx):
+        return [
+            c.kwargs["paused"] for c in ctx.services.backend.report_pod_disk_pause.call_args_list
+        ]
+
+    assert (told(paused), told(still), told(resumed)) == ([True], [True], [False])
+    assert paused.services.backend.report_pod_disk_pause.call_args.args == ("1",)
+    assert (
+        paused.services.backend.report_pod_disk_pause.call_args.kwargs["executor_id"]
+        == "executor-123"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_backend_report_still_pauses_the_pod(context_factory):
+    ctx = _ctx(context_factory, _ssh(_reading(20, f"/pod_1 running {500 * GB} 0")))
+    ctx.services.backend.report_pod_disk_pause.side_effect = RuntimeError("backend down")
+
+    result = await RentedPodDiskCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (True, Msg.PAUSED.reason)
