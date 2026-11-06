@@ -15,8 +15,36 @@ ensure_updater() {
     [ -n "$own" ] || return 0
     project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$own" 2>/dev/null) || return 0
     [ -n "$project" ] || return 0
-    updater=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=watchtower 2>/dev/null) || return 0
-    case "$updater" in "" | *[[:space:]]*) return 0 ;; esac
+    found=$(docker ps --all --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=watchtower --format '{{.ID}} {{.Names}}' 2>/dev/null) || return 0
+    # shellcheck disable=SC2086
+    set -- $found
+    # A swap cut short (daemon or host restart) leaves the old updater stopped as <name>-replaced, alone or
+    # next to a new one that never started. Finish it: keep the new updater if it runs, else put the old one back.
+    if [ $# -eq 2 ] && [ "${2%-replaced}" != "$2" ]; then
+        docker rename "$1" "${2%-replaced}" >/dev/null 2>&1 || return 0
+        docker start "$1" >/dev/null 2>&1 || true
+        echo "Updater swap finished after an interruption: ${2%-replaced} runs again."
+        set -- "$1" "${2%-replaced}"
+    elif [ $# -eq 4 ]; then
+        case "$2:$4" in
+            *-replaced:*) old=$1 old_name=$2 new=$3 ;;
+            *:*-replaced) old=$3 old_name=$4 new=$1 ;;
+            *) return 0 ;;
+        esac
+        docker start "$new" >/dev/null 2>&1 || true
+        if [ "$(docker inspect --format '{{.State.Running}}' "$new" 2>/dev/null)" = true ]; then
+            docker rm --force "$old" >/dev/null 2>&1 || true
+            set -- "$new" "${old_name%-replaced}"
+        else
+            docker rm --force "$new" >/dev/null 2>&1 || return 0
+            docker rename "$old" "${old_name%-replaced}" >/dev/null 2>&1 || return 0
+            docker start "$old" >/dev/null 2>&1 || true
+            set -- "$old" "${old_name%-replaced}"
+        fi
+        echo "Updater swap finished after an interruption: ${old_name%-replaced} runs again."
+    fi
+    [ $# -eq 2 ] || return 0
+    updater=$1
     current=$(docker inspect --format '{{.Config.Image}}' "$updater" 2>/dev/null) || return 0
     # A dev stack runs the -staging build of the same updater (docker-compose.dev.yml). The dev runner is
     # built with UPDATER_STAGING=1 (docker_runner_build.sh, TAG=dev), whatever updater its stack runs now.

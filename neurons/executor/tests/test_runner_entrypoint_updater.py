@@ -34,8 +34,9 @@ DOCKER_STUB = textwrap.dedent(
     echo "$*" >> "$STUB_CALLS"
     case "$*" in
         *com.docker.compose.project\\"}}\\ "$OWN_ID") echo "${STUB_PROJECT-executor}" ;;
-        "ps --all --quiet --filter label=com.docker.compose.project="*) echo "${STUB_UPDATER-wt1}" ;;
-        "inspect --format {{.Config.Image}} wt1") echo "$STUB_UPDATER_IMAGE" ;;
+        "ps --all --filter label=com.docker.compose.project="*) echo "${STUB_UPDATERS-wt1 executor-watchtower-1}" ;;
+        "inspect --format {{.Config.Image}} "*) echo "$STUB_UPDATER_IMAGE" ;;
+        "inspect --format {{.State.Running}} "*) echo "${STUB_RUNNING-true}" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
         "inspect --format {{range "*" wt1") printf '%s\\n' com.docker.compose.config-hash=abc \\
             com.docker.compose.oneoff=False com.docker.compose.project=executor \\
@@ -135,8 +136,8 @@ def test_a_current_updater_is_left_alone(tmp_path, script, current):
 @pytest.mark.parametrize(
     "env",
     [
-        {"STUB_UPDATER": ""},
-        {"STUB_UPDATER": "wt1 wt2"},
+        {"STUB_UPDATERS": ""},
+        {"STUB_UPDATERS": "wt1 executor-watchtower-1 wt2 other-watchtower-1"},
         # started by `docker run`: the runner's own container has no compose project
         {"STUB_PROJECT": ""},
         {"MOUNTINFO": "1 0 0:1 / / rw - overlay overlay rw\n"},
@@ -204,3 +205,36 @@ def test_only_the_runners_own_stack_is_touched(tmp_path, script):
     assert not any(c.startswith("ps --filter label=com.docker.compose.service=") for c in calls)
     assert not any("0123456789ab" in c for c in calls)
     assert updater_run(calls)
+
+
+@pytest.mark.parametrize("script", [EXECUTOR, MINER])
+@pytest.mark.parametrize(
+    "found, running, expect, absent",
+    [
+        # cut after the rename, before `docker run`: only the stopped old updater is left
+        ("wt1 executor-watchtower-1-replaced", "true", ["rename wt1 executor-watchtower-1", "start wt1"], []),
+        # cut after `docker run` created the new updater (started or not): it starts and the old one goes
+        (
+            "wt1 executor-watchtower-1-replaced wt2 executor-watchtower-1",
+            "true",
+            ["start wt2", "rm --force wt1"],
+            ["rm --force wt2", "rename wt1 executor-watchtower-1"],
+        ),
+        # the new updater does not run: it goes and the old one comes back
+        (
+            "wt2 executor-watchtower-1 wt1 executor-watchtower-1-replaced",
+            "false",
+            ["start wt2", "rm --force wt2", "rename wt1 executor-watchtower-1", "start wt1"],
+            ["rm --force wt1"],
+        ),
+    ],
+)
+def test_a_swap_cut_short_is_finished_at_the_next_start(tmp_path, script, found, running, expect, absent):
+    current = re.search(r'UPDATER_IMAGE="([^"]+)"', open(script).read()).group(1)
+    result, calls = run(tmp_path, script, STUB_UPDATERS=found, STUB_RUNNING=running, STUB_UPDATER_IMAGE=current)
+
+    positions = [calls.index(c) for c in expect]
+    assert positions == sorted(positions)
+    assert not any(c in calls for c in absent)
+    assert "Updater swap finished" in result.stdout
+    assert recreated_stack(calls)
