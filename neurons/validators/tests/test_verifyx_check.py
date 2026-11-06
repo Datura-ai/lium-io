@@ -323,6 +323,15 @@ async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_reuse(context_f
     # r4472207526: the backend has not stored a new reading (a failed probe stores none), so it probes again
     verifyx_service.called_with = None
     assert await reason() != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
+    # r4491384333: a renewal that fails after the read still probes a due node
+    async def expire_fails(key, seconds):
+        raise ConnectionError("Redis timed out")
+
+    monkeypatch.setattr(services.redis, "expire", expire_fails)
+    verifyx_service.called_with = None
+    assert await reason() != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
+    monkeypatch.undo()
+    monkeypatch.setattr(verifyx_module.time, "time", lambda: clock[0])
 
     # the backend stored the probe's reading: the clock restarts and skipping resumes
     ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(

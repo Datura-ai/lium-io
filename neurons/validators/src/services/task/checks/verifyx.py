@@ -112,13 +112,18 @@ async def _filler_reuse_is_due(ctx: Context, stored: tuple) -> bool:
         if mark is None or tuple(mark.get("stored") or ()) != stored:
             await redis.set(key, json.dumps({"since": now, "stored": list(stored)}), ex=_FILLER_REUSE_TTL_SECONDS)
             return False
-        # renew on every check: an expired mark would look new and grant another day of reuse
-        await redis.expire(key, _FILLER_REUSE_TTL_SECONDS)
-        return now - float(mark["since"]) >= MAX_FILLER_REUSE_SECONDS
+        due = now - float(mark["since"]) >= MAX_FILLER_REUSE_SECONDS
     except Exception:
         # without the clock the stored EMA is reused, as before DAH-5742; probing every cycle is the cost to avoid
         logger.warning(_m("VerifyX filler reuse clock unreadable in Redis", extra=get_extra_info(ctx.default_extra)))
         return False
+    # renew on every check, so an expired mark cannot look new and grant another day of reuse; decided before the
+    # renewal, so a failed renewal never turns a due probe into a skip
+    try:
+        await redis.expire(key, _FILLER_REUSE_TTL_SECONDS)
+    except Exception:
+        logger.warning(_m("VerifyX filler reuse clock not renewed in Redis", extra=get_extra_info(ctx.default_extra)))
+    return due
 
 
 @dataclass(frozen=True)
