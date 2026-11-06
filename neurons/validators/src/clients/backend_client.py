@@ -530,13 +530,23 @@ class BackendClient:
         if executor_id:
             json_data["executor_id"] = executor_id
 
-        return await self.post(
-            path,
-            ExecutorHealthCheckResponse,
-            json_data=json_data,
-            add_signature=True,  # Use standard signature headers
-            timeout=timeout,
-        )
+        try:
+            # the whole call, retries included: a connection retry must not restart the wait
+            return await asyncio.wait_for(
+                self.post(
+                    path,
+                    ExecutorHealthCheckResponse,
+                    json_data=json_data,
+                    add_signature=True,  # Use standard signature headers
+                    timeout=timeout,
+                ),
+                timeout,
+            )
+        except TimeoutError:
+            logger.error(
+                _m("Executor health check timeout", extra=get_extra_info({"path": path, "timeout": timeout}))
+            )
+            return None
 
     async def report_verification_started(
         self, *, job_batch_id: str, miner_hotkey: str, executor_uuids: list[str], started_at: datetime
