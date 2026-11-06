@@ -293,7 +293,7 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
 
 ### Backups and DNS
 
-The executor checks the backup repository from inside its own container, which resolves names through Docker's resolver for the compose network (`127.0.0.11`). When that resolver fails (`lookup ... on 127.0.0.11:53: server misbehaving`), the executor repeats the check in a helper container on Docker's default bridge, the same network the backup itself runs on. If backups still fail with that error, fix the host's upstream DNS in `/etc/resolv.conf` (or `dns` in `/etc/docker/daemon.json`) and restart Docker. Nodes get this through the normal automatic update; nothing to re-pull.
+The executor checks the backup repository (before a backup and before a restore) from inside its own container, which resolves names through Docker's resolver for the compose network (`127.0.0.11`). When that resolver fails (`lookup ... on 127.0.0.11:53: server misbehaving`), the executor repeats the check in a helper container on Docker's default bridge, the same network the backup itself runs on. If backups still fail with that error, fix the host's upstream DNS in `/etc/resolv.conf` (or `dns` in `/etc/docker/daemon.json`) and restart Docker. Nodes get this through the normal automatic update; nothing to re-pull.
 
 ## The executor image
 

@@ -292,6 +292,34 @@ def test_backup_repository_probe_falls_back_to_helper_on_dns_failure(
     assert "--rm" in helper_probe
 
 
+def test_restore_repository_probe_falls_back_to_helper_on_dns_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error="dial tcp: lookup bucket.s3.amazonaws.com on 127.0.0.11:53: server misbehaving",
+            ),
+            _repository_command_result(0, standard_output=json.dumps([{"id": SNAPSHOT_ID}])),
+        ]
+    )
+    monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
+    runner._require_repository_for_restore()
+
+    helper_probe = repository_command_sequence.commands[1]
+    assert helper_probe[:2] == ["/usr/bin/docker", "run"]
+    assert helper_probe[-3:] == ["--json", "--", SNAPSHOT_ID]
+
+
 def test_slow_repository_probe_keeps_heartbeating(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

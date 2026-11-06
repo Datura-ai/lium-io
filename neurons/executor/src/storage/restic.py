@@ -432,12 +432,7 @@ class ResticStorageRunner:
         snapshot_id = self._operation.snapshot_id
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
-        probe = subprocess.run(
-            self._restic_command(["snapshots", "--json", "--", snapshot_id]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
-        )
+        probe = self._run_repository_command(["snapshots", "--json", "--", snapshot_id])
         if probe.returncode == 10:
             raise ResticOperationError(
                 "backup repository does not exist",
