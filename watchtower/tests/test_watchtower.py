@@ -477,6 +477,27 @@ def test_find_runner_container_is_not_scoped_without_a_compose_project(monkeypat
     }
 
 
+@pytest.mark.parametrize("error", [docker.errors.APIError("daemon busy"), docker.errors.NotFound("gone")])
+def test_find_runner_container_fails_closed_when_its_own_container_cannot_be_inspected(monkeypatch, tmp_path, error):
+    """Regression: a failed inspect of its own container read as "not in compose", and the next calls
+    searched every stack on the host by name. It now raises before any lookup, so nothing is touched."""
+    client = _client_with(_fake_container(name="executor-runner"))
+    _in_project(monkeypatch, tmp_path, client, "executor")
+    get = client.containers.get.side_effect
+
+    def containers_get(reference):
+        if reference == OWN_ID:
+            raise error
+        return get(reference)
+
+    client.containers.get.side_effect = containers_get
+
+    with pytest.raises(RunnerLookupError):
+        find_runner_container(client)
+    assert [c.args for c in client.containers.get.call_args_list] == [(OWN_ID,)]
+    client.containers.list.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "project, listed, expected, removed",
     [

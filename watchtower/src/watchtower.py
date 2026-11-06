@@ -120,19 +120,26 @@ def pull_image_by_digest(client: docker.DockerClient, image_name: str, remote_di
 
 def own_compose_project(client: docker.DockerClient) -> Optional[str]:
     """
-    The compose project of this watchtower's own container, or None outside compose (the CVM stack,
-    `docker run`) or when it cannot be read. A host can carry a second executor project (an old
-    checkout, a stopped test stack); the runner lookup by label is scoped to this one.
+    The compose project of this watchtower's own container, or None when it runs in no container or
+    its container has no project (the CVM stack, `docker run`). A host can carry a second executor
+    project (an old checkout, a stopped test stack); the runner lookup by label is scoped to this one.
+
+    Raises:
+        RunnerLookupError: its own container is known but could not be inspected. Read as "no
+            project", that would widen the lookup to every stack on the host for this cycle.
     """
     try:
         with open(MOUNTINFO_PATH) as f:
             match = _OWN_CONTAINER_ID.search(f.read())
-        if not match:
-            return None
-        return client.containers.get(match.group(1)).labels.get(COMPOSE_PROJECT_LABEL) or None
-    except Exception as e:
-        logger.warning(_m("Own compose project not read, runner lookup not scoped", {"error": str(e)}))
+    except OSError:
         return None
+    if not match:
+        return None
+    try:
+        own = client.containers.get(match.group(1))
+    except Exception as e:
+        raise RunnerLookupError(f"inspecting this watchtower's own container failed: {e}") from e
+    return own.labels.get(COMPOSE_PROJECT_LABEL) or None
 
 
 def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
