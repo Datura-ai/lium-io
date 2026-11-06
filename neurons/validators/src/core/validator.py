@@ -27,7 +27,7 @@ from services.executor_rollout import (
     WithheldVerdict,
     carry_renter_gpu_reset_results,
     has_renter_gpu_reset_holds,
-    remember_rented_scored_results,
+    remember_scored_results,
     withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
 )
@@ -672,7 +672,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window
                     )
-                    await remember_rented_scored_results(all_job_results, self.redis_service)
+                    await remember_scored_results(all_job_results, self.redis_service)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
