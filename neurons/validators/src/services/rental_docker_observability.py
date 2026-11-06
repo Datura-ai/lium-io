@@ -5,6 +5,7 @@ from typing import NamedTuple, TypeVar
 
 from core.utils import _m, get_extra_info
 from services.rental_docker_sdk import (
+    ContainerCreateRefused,
     ContainerExecResult,
     ContainerExecSpec,
     ContainerRunSpec,
@@ -31,13 +32,16 @@ def _failure_level_and_reason(operation: str, exc: Exception) -> _FailureLog:
 
     A remove that finds nothing to remove and a workload container that keeps restarting are
     expected outcomes, not validator faults: the first is a delete racing failed-create cleanup
-    (idempotent by design, DAH-2345), the second a renter or filler image that exits at start.
+    (idempotent by design, DAH-2345), the second a renter or filler image that exits at start. A create
+    refused by its spec's `before_create` or `before_start` is the caller's decision, not a fault either.
     Everything else keeps ERROR with no reason (the logger drops None fields).
     """
     if operation.startswith("remove") and is_docker_not_found_error(exc):
         return _FailureLog(logging.INFO, "already_gone")
     if isinstance(exc, RentalDockerContainerRestartingError):
         return _FailureLog(logging.WARNING, "workload_container_restarting")
+    if isinstance(exc, ContainerCreateRefused):
+        return _FailureLog(logging.INFO, "create_refused")
     return _FailureLog(logging.ERROR, None)
 
 
@@ -196,7 +200,8 @@ def rental_run_spec_log_fields(run_spec: ContainerRunSpec) -> dict:
     return {
         "container_name": run_spec.name,
         "image": run_spec.image,
-        "command_argv": list(run_spec.command),
+        # the count only: the command can be the renter's startup_commands
+        "command_argc": len(run_spec.command),
         "environment_keys": sorted(run_spec.environment),
         "ports": [
             {
@@ -240,6 +245,8 @@ def rental_run_spec_log_fields(run_spec: ContainerRunSpec) -> dict:
         ],
         "cpu_count": run_spec.cpu_count,
         "memory_gb": run_spec.memory_gb,
+        "memory_swap_gb": run_spec.memory_swap_gb,
+        "oom_score_adj": run_spec.oom_score_adj,
         "storage_limit_gb": run_spec.storage_limit_gb,
         "shm_size": run_spec.shm_size,
         "entrypoint": run_spec.entrypoint,

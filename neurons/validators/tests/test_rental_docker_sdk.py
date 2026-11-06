@@ -14,6 +14,7 @@ from docker.types import ContainerConfig
 import services.rental_docker_sdk as rental_docker_sdk
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.rental_docker_sdk import (
+    FILLER_VOLUME_LABELS,
     RENTAL_NETWORK_ICC_OPTION,
     RENTAL_NETWORK_LABELS,
     RENTAL_NETWORK_NAME,
@@ -621,6 +622,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
             cpu_count=2,
             memory_gb=8,
             storage_limit_gb=20,
+            pids_limit=8192,
             shm_size="1g",
         )
     )
@@ -645,6 +647,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.host_config_kwargs["nano_cpus"] == 2_000_000_000
     assert api_client.host_config_kwargs["mem_limit"] == "8g"
     assert api_client.host_config_kwargs["storage_opt"] == {"size": "20g"}
+    assert api_client.host_config_kwargs["pids_limit"] == 8192
     assert api_client.started == ["pod_test"]
 
 
@@ -762,6 +765,20 @@ async def test_run_container_refuses_a_same_named_network_that_does_not_isolate(
     # fail closed: no container is created on a network that would let co-tenants talk
     assert api_client.created_container is None
     assert api_client.started == []
+
+
+@pytest.mark.asyncio
+async def test_run_container_creates_the_container_with_the_spec_labels_and_the_cpu_label():
+    api_client = FakeApiClient()
+
+    await RentalDockerSdkClient(api_client).run_container(
+        ContainerRunSpec(image="img", name="pod_t", labels={"io.lium.pod_id": "t"}, cpu_count=4)
+    )
+
+    assert api_client.created_container["labels"] == {
+        "io.lium.pod_id": "t",
+        "io.lium.cpu_count": "4",
+    }
 
 
 @pytest.mark.asyncio
@@ -1218,6 +1235,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         driver="vloopback",
         driver_opts={"size": "23g"},
         timeout=133,
+        labels=FILLER_VOLUME_LABELS,
     )
     await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
@@ -1227,6 +1245,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
             "name": "volume_test",
             "driver": "vloopback",
             "driver_opts": {"size": "23g"},
+            "labels": FILLER_VOLUME_LABELS,
             "client_timeout": 133,
         }
     ]
@@ -1381,6 +1400,10 @@ def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_p
         "key_filename": str(key_path),
         "look_for_keys": False,
         "allow_agent": False,
+        # a (re)connect is bounded: TCP connect, banner, key auth
+        "timeout": 15,
+        "banner_timeout": 15,
+        "auth_timeout": 15,
     }
     assert calls["host_keys_path"] == str(known_hosts_path)
     assert isinstance(calls["policy"], FakeRejectPolicy)
@@ -1514,8 +1537,13 @@ def test_rental_ssh_adapter_sets_a_keepalive_on_its_transport(monkeypatch, tmp_p
         known_hosts_path=known_hosts_path,
     )
     # Through docker-py's own constructor: SSHHTTPAdapter.__init__ is what calls _connect, so the
-    # hook the fix relies on is pinned here, not assumed.
+    # hook the fix relies on is pinned here, not assumed. The adapter defers that connect until the
+    # builder has released the adapter-swap lock.
     adapter = adapter_class("ssh://root@127.0.0.1:2222")
+    assert adapter.ssh_client.connected_with is None
+    assert keepalives == []
+
+    adapter.connect_deferred()
 
     assert adapter.ssh_client.connected_with["hostname"] == "127.0.0.1"
     assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC]
@@ -1593,3 +1621,74 @@ async def test_container_status_raises_on_any_other_inspect_failure():
 
     with pytest.raises(RentalDockerOperationError, match="inspect container failed.*daemon exploded"):
         await client.container_status(container_name="pod_slow")
+
+
+def _executor_info_named(address: str) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid="executor-id",
+        address=address,
+        port=8000,
+        ssh_username="root",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/root",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
+    )
+
+
+@pytest.mark.asyncio
+async def test_factory_refuses_a_hostname_with_a_private_address_before_building_a_client(monkeypatch):
+    # Arrange
+    # the rental connect resolves in node_host's pool (socket.getaddrinfo), not via loop.getaddrinfo
+    def private(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", private)
+    api_client_factory = Mock()
+    factory = RentalDockerSdkClientFactory(api_client_factory=api_client_factory)
+
+    # Act / Assert
+    with pytest.raises(RentalDockerConnectionError, match="non-public"):
+        async with factory.connect(
+            executor_info=_executor_info_named("gpu-node1.example.net"),
+            private_key="PRIVATE KEY",
+        ):
+            pass
+    api_client_factory.assert_not_called()
+
+
+def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_path):
+    # Arrange
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    pinned = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+    connected = {}
+
+    class FakeSSHClient:
+        def connect(self, **params):
+            connected.update(params)
+
+        def get_transport(self):
+            return None
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=tmp_path / "id_executor",
+        known_hosts_path=tmp_path / "known_hosts",
+        pinned_addresses=pinned,
+    )
+    adapter = adapter_class.__new__(adapter_class)
+    adapter.ssh_client = FakeSSHClient()
+    adapter.ssh_params = {"hostname": "gpu-node1.example.net", "port": port}
+
+    # Act
+    adapter._connect()
+
+    # Assert: the name stays the hostname (known_hosts); the socket is to the pinned address
+    try:
+        assert connected["hostname"] == "gpu-node1.example.net"
+        assert connected["sock"].getpeername() == ("127.0.0.1", port)
+    finally:
+        connected["sock"].close()
+        listener.close()

@@ -64,6 +64,12 @@ PROVIDER_STATE = partial(_event, "EXECUTOR_IMAGE_OUTDATED", "warning")
 DONE = partial(_event, "VALIDATION_COMPLETED", check_id="x.finalize", what_we_saw=FINAL)
 
 
+def _scrape_ok(verdict: str, reason_code: str) -> ValidationEvent:
+    vloopback = {"verdict": verdict, "reason_code": reason_code}
+    what_we_saw = {"storage_limit": {"supported": True, "vloopback": vloopback}}
+    return _event("SCRAPE_OK", check_id="gpu.scrape.machine_spec", what_we_saw=what_we_saw)
+
+
 @pytest.fixture
 def durations(monkeypatch):
     stream = io.StringIO()
@@ -115,6 +121,16 @@ async def _levels(caplog, sink: LoggerSink, events) -> list[int]:
             id="same-uuid-two-miners",
         ),
         pytest.param([OK(), OK()], [INFO, INFO], False, id="no-tracker"),
+        pytest.param(
+            [
+                _scrape_ok("pass", ""),
+                _scrape_ok("fail", "VLOOPBACK_MOUNT_FAILED"),
+                _scrape_ok("fail", "VLOOPBACK_MOUNT_FAILED"),
+            ],
+            [INFO, INFO, DEBUG],
+            True,
+            id="vloopback-verdict-change",
+        ),
     ],
 )
 async def test_sink_levels(caplog, durations, events, expected, tracked):

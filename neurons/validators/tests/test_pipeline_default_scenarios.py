@@ -212,6 +212,9 @@ class DummyRedisService:
     async def expire(self, key: str, seconds: int):
         pass
 
+    async def persist(self, key: str):
+        pass
+
     async def write_atomically(self, writes):
         for name, args, kwargs in writes.ops:
             await getattr(self, name)(*args, **kwargs)
@@ -246,7 +249,9 @@ class VerifyXResult:
 class DummyVerifyXService:
     """Mock VerifyX validation service."""
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+    ):
         return VerifyXResult()
 
 
@@ -348,7 +353,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         max_gpu_count=8,
         gpu_model_rates={"NVIDIA RTX 4090": 1.0},
         nvml_digest_map={"535.104.05": "expected_digest_for_535.104.05"},
-        verifyx_enabled=True,
         port_private_key="private_key",
         port_public_key="public_key",
         job_batch_id="batch-123",

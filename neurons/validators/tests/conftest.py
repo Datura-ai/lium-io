@@ -102,6 +102,24 @@ def no_docker_hub_digest_on_rent_path():
 
 
 @pytest.fixture(autouse=True)
+def pod_ssh_answers_on_create_path(request):
+    """create_container connects to the pod's mapped SSH port before ContainerCreated; tests have no pod there.
+    test_pod_ssh_before_created.py covers the check itself (marker real_pod_ssh_check)."""
+    if request.node.get_closest_marker("real_pod_ssh_check"):
+        yield None
+        return
+    with patch("services.docker_service._raise_unless_pod_ssh_answers", AsyncMock(return_value=None)) as check:
+        yield check
+
+
+@pytest.fixture(autouse=True)
+def no_leftover_clock_locks_on_create_path():
+    """create_container resets leftover GPU clock locks (Redis + -rgc); test_gpu_clocks.py covers that step."""
+    with patch("services.docker_service.reset_leftover_clock_locks", AsyncMock(return_value=[])) as reset:
+        yield reset
+
+
+@pytest.fixture(autouse=True)
 def no_kept_upload_probes_carried_between_tests():
     """The VerifyX check counts kept upload probes per (hotkey, uuid) for the process; tests share both."""
     yield
@@ -109,6 +127,20 @@ def no_kept_upload_probes_carried_between_tests():
         module = sys.modules.get(name)
         if module is not None:
             module._kept_upload_probes.clear()
+            module._package_fallback_probes.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_fault_probe_streak_carried_between_tests():
+    """The fault probe counts no-verdict cycles per (hotkey, uuid) for the process; tests share both."""
+    yield
+    for name in (
+        "services.task.checks.gpu_fault_probe",
+        "neurons.validators.src.services.task.checks.gpu_fault_probe",
+    ):
+        module = sys.modules.get(name)
+        if module is not None:
+            module._unknown_streak.clear()
 
 
 @pytest.fixture(autouse=True)

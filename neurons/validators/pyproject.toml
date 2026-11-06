@@ -44,6 +44,7 @@ distribution = true
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 testpaths = ["tests"]
+markers = ["real_pod_ssh_check: run the real pod SSH answer check"]
 
 [dependency-groups]
 dev = [

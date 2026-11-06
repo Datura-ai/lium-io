@@ -135,6 +135,9 @@ class BootstrapHarness:
         self.proc_tcp.write_text(PROC_TCP_WITH_LISTENER)
 
         self.sshd_bin = self.state / "sshd"
+        self.nvidia_lib_dir = tmp_path / "lib"
+        self.nvidia_lib_dir.mkdir()
+        self.vulkan_icd_dir = tmp_path / "icd.d"
 
         for name, body in (
             ("pgrep", PGREP_SHIM),
@@ -190,6 +193,8 @@ class BootstrapHarness:
             "LIUM_PROC_TCP_FILES": str(self.proc_tcp),
             "LIUM_SSHD_VERIFY_SECS": str(verify_secs),
             "LIUM_SSH_LOCK_TIMEOUT_SECS": "1",
+            "LIUM_NVIDIA_LIB_DIRS": str(self.nvidia_lib_dir),
+            "LIUM_VULKAN_ICD_DIR": str(self.vulkan_icd_dir),
         }
         return subprocess.run(
             ["sh", str(SCRIPT), *args],
@@ -270,6 +275,39 @@ def test_no_grace_wait_when_image_ships_no_sshd_binary(harness):
     assert harness.sshd_start_attempts() == ["started"]
 
 
+def test_apt_install_skips_recommended_packages_and_keeps_terminfo_x11_python3_wget_certs(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+
+    result = harness.run()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "install -y --no-install-recommends openssh-server ncurses-term xauth python3 wget ca-certificates"
+        in harness.apt_calls()
+    )
+
+
+def test_install_runs_under_the_setup_lock(harness):
+    """A retried run (one Docker exec retry after a dropped SSH transport) must queue on the
+    lock while the first run is inside `apt-get install`, not race it for the dpkg lock."""
+    harness.stage_sshd_payload(SSHD_STARTS)
+    lock_dir = harness.run_dir / "lium-ssh-setup.lock"
+    harness._write_executable(
+        harness.shims / "apt-get",
+        APT_GET_SHIM.replace(
+            "exit 0",
+            f'if [ -d "{lock_dir}" ]; then echo held; else echo free; fi '
+            '>> "$SHIM_STATE/lock_at_install"\nexit 0',
+        ),
+    )
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (harness.state / "lock_at_install").read_text().split() == ["held", "held"]
+    assert harness.sshd_start_attempts() == ["started"]
+
+
 def test_grace_zero_skips_waiting_even_with_sshd_binary(harness):
     harness.install_sshd_bin(SSHD_STARTS)
 
@@ -342,3 +380,39 @@ def test_lock_timeout_proceeds_instead_of_hanging(harness):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "proceeding without it" in result.stdout
     assert harness.sshd_start_attempts() == ["started"]
+
+
+def test_registers_the_egl_vulkan_driver_when_the_nvidia_egl_library_is_injected(harness):
+    harness.mark_sshd_running()
+    (harness.nvidia_lib_dir / "libEGL_nvidia.so.0").touch()
+
+    result = harness.run()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    icd = (harness.vulkan_icd_dir / "nvidia_egl_icd.json").read_text()
+    assert '"library_path":"libEGL_nvidia.so.0"' in icd
+
+
+def test_leaves_vulkan_alone_without_the_nvidia_egl_library_or_with_an_egl_icd(harness):
+    harness.mark_sshd_running()
+    harness.run()
+    assert not harness.vulkan_icd_dir.exists()
+
+    (harness.nvidia_lib_dir / "libEGL_nvidia.so.0").touch()
+    harness.vulkan_icd_dir.mkdir()
+    (harness.vulkan_icd_dir / "image_icd.json").write_text('{"ICD":{"library_path":"libEGL_nvidia.so.0"}}')
+
+    result = harness.run()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(p.name for p in harness.vulkan_icd_dir.iterdir()) == ["image_icd.json"]
+
+
+def test_vulkan_icd_only_registers_the_driver_and_leaves_sshd_alone(harness):
+    (harness.nvidia_lib_dir / "libEGL_nvidia.so.0").touch()
+
+    result = harness.run("--vulkan-icd-only")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (harness.vulkan_icd_dir / "nvidia_egl_icd.json").exists()
+    assert harness.sshd_start_attempts() == []

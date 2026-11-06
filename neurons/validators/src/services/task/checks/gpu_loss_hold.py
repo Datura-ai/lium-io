@@ -1,0 +1,322 @@
+"""GPU_LOST — a node whose GPU dropped out is hidden and takes no new rentals until every card reads clean again and
+passes a load test on every card.
+
+A card that falls out of NVML ('Unknown Error', lost, fallen off the bus) can read clean on the next scrape and drop
+out again an hour later, while a renter's container on it keeps failing. The fatal GPU checks after the scrape
+(GpuModelValidCheck's DETAILS_MISMATCH, GpuFingerprintCheck) judge only the scrape in front of them, so such a node
+was listed again on its first clean scrape, and a rented one passed the rented check with score 1 in between.
+
+Every cycle this check judges the scrape with `judge_rented_gpus` (the rental's GPU count, the driver's count, the
+anchored UUID set, the NVML error code; an idle node counts as renting one GPU). A full set of other cards
+(`full_set_changed`) is no fault, rented or idle: it is judged without the anchor, a hold an earlier dropout left
+is dropped when no anchored card is left (a partial swap keeps it and still owes the load test below), and
+GpuFingerprintCheck re-anchors it the same cycle. Under a rental, a pod whose container was made
+for the old cards (the host's docker record of it names GPUs the host no longer lists) has no GPU: the cycle fails
+here with a GPU_LOST entry (POD_GPUS_GONE), so the node is hidden, scores 0 and is not re-anchored, until the pod is
+recreated on the new cards or the rental ends. A fault (fewer cards, a card missing, an NVML error) puts the node on a hold; weak
+evidence (`confirm_first`) starts it only when the cycle before also showed a fault. Every held cycle carries a
+GPU_LOST availability entry: the backend hides the node and refuses new rentals, and leaves `active`, billing and a
+rental already on the node alone.
+
+No timer ends the hold. The first unrented cycle whose scrape reads clean ends it and owes the every-card load test
+(PostRentalGpuRecheckCheck: the all-cards matmul and the kernel-fault probe), which runs later in that same cycle: a
+pass lists the node; a failure, a cycle that skips the test (a filler) or gets no verdict fails the cycle and keeps
+the test owed for the next one, and a card that drops again
+starts a new hold. A clean cycle under a live rental keeps the node hidden (the test cannot run beside the renter's
+pod) until a clean unrented cycle.
+
+The check's own verdict: a cycle that shows the fault goes on (the fatal GPU checks after it judge it as before,
+verification reset included), except an NVML loss code over a full card list, which no later check fails: that is
+fatal here on an idle node. Under a live rental a held cycle is not fatal, as BannedGpuCheck, so the renter's pod
+keeps being verified and billed.
+
+The hold is keyed by miner hotkey and executor UUID (the UUID is the miner's word, so one miner cannot hold another's
+node). A dry run reads it and writes nothing. A Redis that cannot be read is no hold: the verdict never rests on Redis
+being up.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import shlex
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+import asyncssh
+from services.gpu_reset import container_gpu_uuids
+from services.redis_service import GPU_ANCHOR_KEY
+
+from core.config import settings
+from core.utils import _m, get_extra_info
+
+from ..availability import ReachSource, ReachTarget
+from ..messages import GpuLossHoldMessages as Msg
+from ..messages import render_message
+from ..pipeline import CheckResult, Context
+from .gpu_fingerprint import full_set_changed, split_uuids
+from .post_rental_gpu_recheck import MARKER_TTL_SECONDS, SOURCE_GPU_LOSS_HOLD, RecheckMarker, record_marker
+from .rented_gpu_drop import (
+    FAULT_NVML_ERROR,
+    GPU_DROP_REDIS_ERRORS,
+    GpuDrop,
+    _listed_uuids,
+    _rented_gpu_count,
+    judge_rented_gpus,
+    missing_gpus_under_reset,
+)
+
+logger = logging.getLogger(__name__)
+
+GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
+# A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
+GPU_LOSS_CONFIRM_SECONDS = 45 * 60
+# shortcut: not a hold window, only how long Redis keeps the mark of a node no cycle sees any more (every held cycle
+# renews it, like the load-test marker); the hold itself ends only on a clean read.
+GPU_LOSS_MARK_TTL_SECONDS = MARKER_TTL_SECONDS
+
+
+def _key(ctx: Context) -> str:
+    return f"{GPU_LOSS_HOLD_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
+@dataclass(frozen=True)
+class DropMark:
+    """The hold as kept in Redis; stored as {"held", "since", "last_seen", "replaced"}."""
+
+    is_held: bool
+    since: str
+    last_seen: str
+    # a hold the retired set-replaced rule started: no hold any more (a full set change is no fault)
+    replaced: bool = False
+
+    @classmethod
+    def load(cls, raw: object) -> DropMark | None:
+        loaded = json.loads(raw) if raw else None
+        if not isinstance(loaded, dict) or not loaded.get("last_seen"):
+            return None
+        last_seen = loaded["last_seen"]
+        return cls(
+            bool(loaded.get("held")), loaded.get("since") or last_seen, last_seen, bool(loaded.get("replaced"))
+        )
+
+    def dump(self) -> str:
+        return json.dumps(
+            {"held": self.is_held, "since": self.since, "last_seen": self.last_seen, "replaced": self.replaced}
+        )
+
+
+def rented_pods(ctx: Context) -> list:
+    """This miner's pods on the executor; a rental under another hotkey is not this node's."""
+    rented_data = ctx.state.rented_data
+    rented = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    if rented is None or rented.miner_hotkey != ctx.miner_hotkey:
+        return []
+    return list(rented.pods)
+
+
+def judge_scrape(ctx: Context, pods: list) -> GpuDrop | None:
+    """The GPU fault this cycle's scrape shows, judged as RentedGpuDropCheck judges a rented node."""
+    specs = ctx.state.specs or {}
+    gpu_details = list(ctx.state.gpu_details or [])
+    nvml_count = ctx.state.gpu_count
+    if nvml_count is None:
+        nvml_count = (specs.get("gpu") or {}).get("count", 0) or 0
+    anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+    if full_set_changed(anchor, sorted(set(_listed_uuids(gpu_details)))):
+        anchor = []  # other cards, not lost ones: GpuFingerprintCheck re-anchors them
+    return judge_rented_gpus(
+        rented_gpu_count=_rented_gpu_count(pods),
+        anchor_uuids=anchor,
+        nvml_count=nvml_count,
+        listed_uuids=_listed_uuids(gpu_details),
+        listed_count=len(gpu_details),
+        scrape_error=specs.get("gpu_scrape_error"),
+    )
+
+
+class GpuLossHoldCheck:
+    """Hide a node whose GPU dropped out, until its cards read clean and pass the every-card load test.
+
+    See the module docstring for the rule. Runs right after the scrape, before the fatal GPU checks and the
+    rented short-circuit, so rented and idle nodes are judged alike.
+    """
+
+    check_id = "gpu.validate.loss_hold"
+    fatal = True
+
+    async def run(self, ctx: Context) -> CheckResult:
+        pods = rented_pods(ctx)
+        gpu_details = list(ctx.state.gpu_details or [])
+        # DAH-4658: the cards leave nvidia-smi while the renter resets them; that cycle neither starts nor clears a hold.
+        # Cards missing then are held as a zero-GPU scrape is (the score carries); GpuFingerprintCheck would zero it.
+        anchored_missing = set(split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")) - set(_listed_uuids(gpu_details))
+        if await missing_gpus_under_reset(ctx, gpu_details):
+            if not anchored_missing:
+                return CheckResult(
+                    passed=True, event=render_message(Msg.GPU_RESET_IN_PROGRESS, ctx=ctx, check_id=self.check_id)
+                )
+            event = render_message(
+                Msg.MISSING_GPUS_UNDER_RESET,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"missing_uuids": sorted(anchored_missing)},
+            )
+            return CheckResult(passed=False, event=event)
+        drop = judge_scrape(ctx, pods)
+        listed = sorted(set(_listed_uuids(gpu_details)))
+        anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+        set_changed = full_set_changed(anchor, listed)
+        # a complete replacement (no anchored card left) ends a dropout hold; a partial swap still owes the load test
+        replaced_all = set_changed and not set(anchor) & set(listed)
+        key = _key(ctx)
+        mark: DropMark | None = None
+        try:
+            mark = DropMark.load(await ctx.services.redis.get(key))
+        except (*GPU_DROP_REDIS_ERRORS, TypeError, ValueError):
+            self._log_redis_unavailable(ctx, "read")
+        now = datetime.now(UTC)
+
+        if drop is not None:
+            mark = DropMark(
+                is_held=mark is not None or not drop.confirm_first,
+                since=mark.since if mark else now.isoformat(),
+                last_seen=now.isoformat(),
+            )
+            await self._save(
+                ctx,
+                key,
+                mark,
+                GPU_LOSS_MARK_TTL_SECONDS if mark.is_held else GPU_LOSS_CONFIRM_SECONDS,
+            )
+            what = {
+                "faults": drop.faults,
+                "missing_uuids": drop.missing_uuids,
+                "nvml_error_code": drop.nvml_error_code,
+                "expected_gpu_count": drop.expected,
+                "visible_gpu_count": drop.visible,
+            }
+            if not mark.is_held:
+                event = render_message(Msg.PENDING, ctx=ctx, check_id=self.check_id, what=what)
+                return CheckResult(passed=True, event=event)
+            # the fatal GPU checks after this one judge the faulty scrape itself, as before; an NVML
+            # loss code over a full card list fails none of them, so on an idle node it is fatal here
+            nvml_only = drop.faults == [FAULT_NVML_ERROR]
+            return self._lost(ctx, mark, what, fatal=nvml_only and not pods)
+
+        if set_changed and pods:
+            # the node may take its new cards, but a pod made for the old ones has no GPU: it stays unavailable
+            stranded = await self._pods_without_their_gpus(ctx, pods, listed)
+            if stranded is not None:
+                if mark is not None and replaced_all:
+                    await self._forget(ctx, key)
+                stamp = now.isoformat()
+                # fatal: the cycle scores 0 (no passing report for a pod with no GPU) and nothing re-anchors yet
+                return self._lost(
+                    ctx,
+                    DropMark(True, stamp, stamp),
+                    {"faults": ["pod_gpus_gone"], **stranded},
+                    fatal=True,
+                    template=Msg.POD_GPUS_GONE,
+                )
+        if mark is None:
+            return CheckResult(
+                passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
+            )
+        if not mark.is_held or mark.replaced or replaced_all:
+            # a weak sighting the next cycle did not confirm, a hold for a changed set (no fault), or a hold an
+            # earlier dropout left on a node now back with a full set of other cards: it re-anchors and lists.
+            # A partial swap goes on below: its remaining old cards still owe the load test.
+            await self._forget(ctx, key)
+            return CheckResult(
+                passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
+            )
+        if pods:
+            # clean, but the load test cannot run beside the renter's pod: hidden until an unrented clean cycle
+            await self._save(ctx, key, mark, GPU_LOSS_MARK_TTL_SECONDS)
+            return self._lost(ctx, mark, {"faults": []}, fatal=False)
+        # the first clean unrented read ends the hold; the every-card load test later in this cycle lists it or not
+        await record_marker(ctx, RecheckMarker(source=SOURCE_GPU_LOSS_HOLD, verdict="gpu_lost"))
+        await self._forget(ctx, key)
+        return CheckResult(
+            passed=True,
+            event=render_message(
+                Msg.CLEAN_AGAIN, ctx=ctx, check_id=self.check_id, what={"since": mark.since}
+            ),
+        )
+
+    @staticmethod
+    async def _pods_without_their_gpus(ctx: Context, pods: list, listed: list[str]) -> dict | None:
+        """The pods whose container still names GPUs the host no longer lists; None when every one is served.
+
+        The host's own docker record of each container (as the GPU reset reads it), never the inside of a pod.
+        A container that cannot be read counts as not served: a recreated pod reads clean on its next cycle.
+        """
+        names = [pod.container_name for pod in pods if pod.container_name]
+        if not names:
+            return None
+        try:
+            res = await ctx.ssh.run(
+                "/usr/bin/docker inspect --format '{{json .Name}} {{json .HostConfig.DeviceRequests}}' "
+                + " ".join(shlex.quote(name) for name in names),
+                timeout=30,
+            )
+        except (asyncssh.Error, OSError):
+            return {"pods_unread": names}
+        read: dict[str, list] = {}
+        for line in (getattr(res, "stdout", "") or "").splitlines():
+            name, _, requests = line.partition(" ")
+            try:
+                read[json.loads(name).lstrip("/")] = json.loads(requests) or []
+            except (ValueError, AttributeError):
+                continue
+        unread = [name for name in names if name not in read]
+        gone = sorted(
+            {uuid for requests in read.values() for uuid in container_gpu_uuids(requests, [])} - set(listed)
+        )
+        if not gone and not unread:
+            return None
+        return {"missing_uuids": gone, "pods_unread": unread}
+
+    def _lost(self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool, template=Msg.LOST) -> CheckResult:
+        event = render_message(
+            template,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "reach_source": str(ReachSource.VALIDATOR),
+                "reach_target": str(ReachTarget.GPU),
+                "executor_uuid": ctx.executor.uuid,
+                **what,
+                "since": mark.since,
+                "last_seen": mark.last_seen,
+            },
+        )
+        return CheckResult(passed=False, event=event, fatal=fatal)
+
+    async def _save(self, ctx: Context, key: str, mark: DropMark, ttl: int) -> None:
+        # A dry run shares Redis with the live validator, so it leaves the live hold alone.
+        if settings.DRY_RUN:
+            return
+        try:
+            await ctx.services.redis.set(key, mark.dump(), ex=ttl)
+        except GPU_DROP_REDIS_ERRORS:
+            self._log_redis_unavailable(ctx, "write")
+
+    async def _forget(self, ctx: Context, key: str) -> None:
+        if settings.DRY_RUN:
+            return
+        try:
+            await ctx.services.redis.delete(key)
+        except GPU_DROP_REDIS_ERRORS:
+            self._log_redis_unavailable(ctx, "delete")
+
+    @staticmethod
+    def _log_redis_unavailable(ctx: Context, on: str) -> None:
+        logger.warning(
+            _m(
+                "GPU_LOSS_HOLD_REDIS_UNAVAILABLE",
+                extra=get_extra_info({**ctx.default_extra, "on": on}),
+            ),
+            exc_info=True,
+        )

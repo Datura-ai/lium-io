@@ -39,6 +39,7 @@ class ReporterResource(StrEnum):
 class OperationResultQuality(StrEnum):
     FULL = "FULL"
     PARTIAL = "PARTIAL"
+    EMPTY = "EMPTY"  # DAH-2002: the backup path is missing or empty, so nothing was uploaded
 
 
 class OperationSpecError(ValueError):
@@ -85,6 +86,8 @@ class WorkspaceSpec:
     # image's entrypoint in the seconds since `docker run`, not by the customer. The restore
     # is allowed to write over it; an online restore (bootstrap=False) still needs an empty target.
     bootstrap: bool = False
+    # restic --exclude patterns of a backup (DAH-2002: the default backup skips caches and keys)
+    exclude_patterns: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> WorkspaceSpec:
@@ -108,6 +111,11 @@ class WorkspaceSpec:
             raise OperationSpecError("workspace.bootstrap must be a boolean")
         if bootstrap and mode is not WorkspaceMode.ENCRYPTED_RUNNING:
             raise OperationSpecError("workspace.bootstrap is only meaningful for encrypted_running")
+        exclude_patterns = value.get("exclude_patterns", [])
+        if not isinstance(exclude_patterns, list) or not all(
+            isinstance(pattern, str) and pattern.strip() for pattern in exclude_patterns
+        ):
+            raise OperationSpecError("workspace.exclude_patterns must be a list of non-empty patterns")
 
         return cls(
             mode=mode,
@@ -116,6 +124,7 @@ class WorkspaceSpec:
             requested_path=_absolute_path(_required_string(value, "requested_path"), "workspace.requested_path"),
             container_name=_safe_identifier(container_name, "workspace.container_name") if container_name else None,
             bootstrap=bootstrap,
+            exclude_patterns=tuple(exclude_patterns),
         )
 
 

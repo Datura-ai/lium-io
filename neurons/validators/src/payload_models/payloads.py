@@ -1,4 +1,5 @@
 import enum
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -6,13 +7,18 @@ from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
+# absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` (the encrypted volume's ciphertext mount) and
+# `/mnt` (where an attached Volume mounts) are reserved
+_BARE_VOLUME_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
+
 
 class CustomOptions(BaseModel):
     volumes: list[str] | None = None
-    environment: dict[str, str] | None = None
+    # repr=False: every create logs the whole request as `str(payload)`; these hold renter-supplied values
+    environment: dict[str, str] | None = Field(default=None, repr=False)
     entrypoint: str | None = None
     internal_ports: list[int] | None = None
-    startup_commands: str | None = None
+    startup_commands: str | None = Field(default=None, repr=False)
     shm_size: str | None = None
     initial_port_count: int | None = None
 
@@ -55,10 +61,20 @@ class CustomOptions(BaseModel):
             # Remove any extra flags or commands
             clean_volume = volume.strip().split()[0]
             
-            # Validate format: must be host_path:container_path
+            # DAH-5426: the backend sends a template's volume as a bare container path ("/workspace"): the
+            # container side of the pod's own named volume. Only a plain absolute path is taken, and one
+            # that came with flags is refused whole rather than stripped.
             if ':' not in clean_volume:
+                # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace"
+                bare = volume.strip().rstrip('/')
+                if (
+                    _BARE_VOLUME_PATH_RE.fullmatch(bare)
+                    and bare.split('/')[1] not in ('lium-cipher', 'mnt')
+                    and not CustomOptions._is_dangerous_path(bare)
+                ):
+                    sanitized.append(bare)
                 continue
-                
+
             host_path, container_path = clean_volume.split(':', 1)
             
             # Basic validation - reject dangerous paths
@@ -197,6 +213,8 @@ class ContainerRequestType(enum.Enum):
     RestoreContainerRequest = "RestoreContainerRequest"
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
+    ResetPodGpuRequest = "ResetPodGpuRequest"
+    LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
 
 
 class ForcedValidationCycleRequest(BaseModel):
@@ -209,12 +227,20 @@ class ForcedValidationCycleRequest(BaseModel):
     message_type: Literal["ForcedValidationCycleRequest"]
 
 
+class RecheckExecutorRequest(BaseModel):
+    """Ask the validator to queue a single-node check of one executor (the provider asked)."""
+
+    message_type: Literal["RecheckExecutorRequest"]
+    executor_id: str
+
+
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"
 
 
 class BaseServerRequest(BaseRequest):
+    command_id: str = ""
     message_type: ContainerRequestType
     miner_hotkey: str
     miner_address: str | None = None
@@ -339,7 +365,11 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.
-    dockerfile_content: str | None = None
+    dockerfile_content: str | None = Field(default=None, repr=False)
+    # a gzipped tar of the build context for `dockerfile_content` and its sha256 (hex); see
+    # services/build_context.py. None builds with the Dockerfile as the only file.
+    build_context_url: str | None = None
+    build_context_sha256: str | None = None
     # DAH-1524 / DAH-2265 (default-image / cached-template deploy): set truthy by the
     # backend when the user selects the default Docker image or default cache template.
     # Such images run their own start.sh, so the validator skips work the image already
@@ -382,6 +412,9 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
     # drops it on deserialization of the backend's request.
     cache_volumes: list[CacheVolume] | None = None
+    # protocol 1.18.0: False when the backend rents the pod part of its host, so it gets no host-wide devices
+    # (RDMA, nvidia-caps) even when every GPU the host shows is requested. None from an older backend.
+    whole_host: bool | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -419,6 +452,33 @@ class InstallJupyterServerRequest(ContainerBaseRequest):
     local_volume_path: str = "/root"
 
 
+class ResetPodGpuRequest(ContainerBaseRequest):
+    """DAH-4658: reset the GPUs of a running pod; answered by PodGpuResetResult (lium_protocol 1.16.0)."""
+
+    message_type: ContainerRequestType = ContainerRequestType.ResetPodGpuRequest
+    container_name: str
+    # every GPU the backend holds for the pod; gpu_indices picks some of them by pod index, None for all
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    request_id: str
+    # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
+    local_volume_path: str | None = None
+
+
+class LockPodGpuClocksRequest(ContainerBaseRequest):
+    """DAH-4663: lock (or with reset, release) a running pod's GPU clocks; answered by PodGpuClocksResult
+    (lium_protocol 2.4.0)."""
+
+    message_type: ContainerRequestType = ContainerRequestType.LockPodGpuClocksRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    min_mhz: int | None = None
+    max_mhz: int | None = None
+    reset: bool = False
+    request_id: str
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -451,6 +511,7 @@ class BackupContainerRequest(ContainerBaseRequest):
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
     failure_timeout_seconds: int = Field(default=600, gt=0)
+    exclude_patterns: list[str] = []
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -470,6 +531,7 @@ class RestoreContainerRequest(ContainerBaseRequest):
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
     failure_timeout_seconds: int = Field(default=600, gt=0)
+    recovery: bool = False  # reconnect re-dispatch: the restore may already be running, so never report it failed
 
 
 class CancelStorageOperationRequest(ContainerBaseRequest):
@@ -495,6 +557,8 @@ class ContainerResponseType(enum.Enum):
     SshPubKeyRemoved = "SshPubKeyRemoved"
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
+    PodGpuResetResult = "PodGpuResetResult"
+    PodGpuClocksResult = "PodGpuClocksResult"
 
 
 class DeliveryStamps(BaseModel):
@@ -513,6 +577,15 @@ class BaseValidatorResponse(BaseRequest, DeliveryStamps):
 
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
+    DockerInDockerDisabled = "DockerInDockerDisabled"
+    # DAH-5301: a reboot found a pod GPU hung and reset it before the new container started
+    HungGpuReset = "HungGpuReset"
+    # ...or found one hung and could not reset it: MIG, an NVLink peer outside the pod, a process
+    # outside the pod on it, or the driver refused the reset
+    HungGpuNotResetMig = "HungGpuNotResetMig"
+    HungGpuNotResetNvlinkShared = "HungGpuNotResetNvlinkShared"
+    HungGpuNotResetInUse = "HungGpuNotResetInUse"
+    HungGpuNotResetUnsupported = "HungGpuNotResetUnsupported"
 
 
 class VolumeEncryptionStatus(str, enum.Enum):
@@ -555,6 +628,9 @@ class ProfilerStepName(str, enum.Enum):
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
+    # DAH-3980: the collector starts after the reply, outside the create's window: this row has
+    # no duration, the log line "Create step after reply finished" carries it
+    INSPECTOR_START_AFTER_REPLY = "Inspector collector start runs after the reply"
     FINISHED_IN_SUBNET = "Finished in subnet."
     # DAH-3980: host work started early that runs beside the steps above; each row is that
     # work's own start->end, overlapping the step rows (which keep only the residual wait),
@@ -684,6 +760,7 @@ class ContainerDeleted(ContainerBaseResponse):
 class SshPubKeyAdded(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
     user_public_keys: list[str] = []
+    command_id: str = ""
 
 
 class SshPubKeyRemoved(ContainerBaseResponse):
@@ -730,6 +807,7 @@ class FailedContainerErrorTypes(enum.Enum):
 
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
+    command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     # Renter-safe HEADLINE only. The backend surfaces this in customer-facing events, so it must never
     # carry executor host details (IP, SSH port/username, hotkey) — those go in `detail`.
@@ -781,6 +859,53 @@ class JupyterServerInstalled(ContainerBaseResponse):
 class JupyterInstallationFailed(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.JupyterInstallationFailed
     msg: str
+
+
+class GpuResetErrorCode(enum.Enum):
+    MigEnabled = "MigEnabled"
+    NvlinkPeersOutsidePod = "NvlinkPeersOutsidePod"
+    GpuInUseOutsidePod = "GpuInUseOutsidePod"
+    ResetNotSupported = "ResetNotSupported"
+    GpuNotInContainer = "GpuNotInContainer"
+    ContainerNotFound = "ContainerNotFound"
+    OperationInProgress = "OperationInProgress"
+    ExecutorUnreachable = "ExecutorUnreachable"
+    ClockLockNotSupported = "ClockLockNotSupported"
+
+
+class GpuResetOutcome(BaseModel):
+    index: int
+    uuid: str
+    result: Literal["reset", "latch_cleared", "failed"]
+    detail: str | None = None
+
+
+class PodGpuResetResult(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodGpuResetResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    container_restarted: bool = False
+    gpus: list[GpuResetOutcome] = []
+    detail: str | None = None
+
+
+class GpuClockOutcome(BaseModel):
+    index: int
+    uuid: str
+    result: Literal["locked", "reset", "failed"]
+    applied_min_mhz: int | None = None
+    applied_max_mhz: int | None = None
+    detail: str | None = None
+
+
+class PodGpuClocksResult(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodGpuClocksResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    gpus: list[GpuClockOutcome] = []
+    detail: str | None = None
 
 
 class GetEstimateRequest(BaseModel):

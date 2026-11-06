@@ -5,8 +5,9 @@ description: >-
   reports on every PR — a required status check that never reports blocks the merge button and
   stalls a merge queue. On a PR the diff is the PR's file list. On a merge-queue entry
   (merge_group) it is base_sha..head_sha, exactly the files the queued PR adds on top of main and
-  the entries ahead of it. Any other event (push to main, workflow_dispatch) has no diff and
-  selects every package. Documentation never selects a package: *.md and .gitignore files
+  the entries ahead of it. On a push to main it is before..after, the commits the push adds: the
+  merged PR already ran its jobs, so main re-runs only the packages it changed (DAH-5201). Any other
+  event (workflow_dispatch, a push whose before-commit is unknown) has no diff and selects every package. Documentation never selects a package: *.md and .gitignore files
   wherever they sit, and the root docs/ tree, are dropped from the file list before routing
   (isDoc), so a PR that only edits neurons/validators/README.md runs no tests and tests-ok still
   reports green — the tests exercise code, and none of those files is code. (A docs/ directory
@@ -22,7 +23,8 @@ description: >-
   only), scripts/, contrib/, watchtower/, tests/ (an empty package) — selects nothing. A fifth
   output, e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds
   every neuron, so it runs whenever one of them could have changed and skips (green, via
-  tests-ok) on a PR that touches none.
+  tests-ok) on a PR that touches none. A file under a neuron's own tests/ directory does not select
+  e2e: the stack runs e2e/tests, never those.
 
 outputs:
   validators:
@@ -64,27 +66,35 @@ runs:
             // a rename out of a package is still a change to that package
             files = listed.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)).filter(f => !isDoc(f));
             why = `PR #${prNumber}: ${files.length} files`;
-          } else if (context.eventName === 'merge_group') {
-            // the checkout is shallow at head_sha; two commits are all a diff needs
+          } else {
+            // merge group: base..head; push: before..after (all zeros on a new branch: no diff, every package)
             const mg = context.payload.merge_group;
-            await exec.exec('git', ['fetch', '--no-tags', '--depth=1', 'origin', mg.base_sha]);
-            // -z: NUL-separated, unquoted paths — with core.quotePath a name holding a byte >= 0x80, `"` or `\`
-            // comes back quoted and would miss every prefix, silently skipping that package
-            const { stdout } = await exec.getExecOutput('git', ['diff', '--name-only', '-z', '--no-renames', mg.base_sha, mg.head_sha]);
-            files = stdout.split('\0').filter(f => f && !isDoc(f));
-            why = `merge group ${mg.base_sha.slice(0, 7)}..${mg.head_sha.slice(0, 7)}: ${files.length} files`;
+            const [base, head] = mg ? [mg.base_sha, mg.head_sha]
+              : context.eventName === 'push' && !/^0+$/.test(context.payload.before || '0') ? [context.payload.before, context.sha]
+              : [null, null];
+            // an unfetchable base (a commit gone from the remote) runs every package, never none
+            if (base && await exec.exec('git', ['fetch', '--no-tags', '--depth=1', 'origin', base], { ignoreReturnCode: true }) === 0) {
+              // the checkout is shallow at head; the base commit is all a diff needs
+              // -z: NUL-separated, unquoted paths — with core.quotePath a name holding a byte >= 0x80, `"` or `\`
+              // comes back quoted and would miss every prefix, silently skipping that package
+              const { stdout } = await exec.getExecOutput('git', ['diff', '--name-only', '-z', '--no-renames', base, head]);
+              files = stdout.split('\0').filter(f => f && !isDoc(f));
+              why = `${context.eventName} ${base.slice(0, 7)}..${head.slice(0, 7)}: ${files.length} files`;
+            }
           }
 
           const rows = [];
+          // the stack never runs a neuron's own tests/, so a change there alone does not select e2e
+          const e2eFiles = files && files.filter(f => !/^neurons\/[^/]+\/tests\//.test(f));
           let anyPackage = false;
           for (const [pkg, prefix] of Object.entries(PACKAGES)) {
             const changed = files ? touches(files, pkg, prefix) : true;
-            anyPackage ||= changed;
+            anyPackage ||= e2eFiles ? touches(e2eFiles, pkg, prefix) : changed;
             core.setOutput(pkg, changed);
             rows.push([pkg, changed ? 'changed' : 'unchanged', why]);
           }
           // the e2e stack is built from every package: it runs when any of them did, or when e2e/ itself changed
-          const e2e = anyPackage || (files ? touches(files, 'e2e', 'e2e/') : true);
+          const e2e = anyPackage || (e2eFiles ? touches(e2eFiles, 'e2e', 'e2e/') : true);
           core.setOutput('e2e', e2e);
           rows.push(['e2e', e2e ? 'changed' : 'unchanged', why]);
           core.summary

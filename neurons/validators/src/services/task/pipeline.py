@@ -27,7 +27,7 @@ from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .models import ValidationEvent
-from .runner import SSHCommandRunner
+from .runner import SSHCommandResult, SSHCommandRunner
 
 @runtime_checkable
 class PodRecoverer(Protocol):
@@ -39,13 +39,16 @@ class PodRecoverer(Protocol):
     # DAH-3436: the rental probe rents the node through the same two entry points a renter's pod
     # takes (miner_service hands the backend's requests to these), so there is one start path and
     # one teardown path to keep correct. `private_key` is the Fernet-encrypted key as the backend
-    # sends it; both decrypt it themselves.
+    # sends it; both decrypt it themselves. `beside_fillers`: the probe's create on a node running
+    # a filler, which leaves the filler and its GPU power cap alone.
     async def create_container(
         self,
         payload: Any,
         executor_info: ExecutorSSHInfo,
         keypair: Any,
         private_key: str,
+        *,
+        beside_fillers: bool = False,
     ) -> Any: ...
 
     async def delete_container(
@@ -104,19 +107,25 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    verifyx_enabled: bool = False
-    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
     # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
     # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
     machine_scrape_source: Optional[str] = None
-    # DAH-3011: True only for a never-validated executor's first, unscored verification AND with
-    # FIRST_PASS_FAST_PATH_ENABLED on (resolved in PipelineFactory.build_context). The capability
+    # DAH-3011: True only for a never-validated executor's first, unscored verification
+    # (set in PipelineFactory.build_context). The capability
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
     # scored cycle; every other check is the same.
     first_pass: bool = False
+
+
+@dataclass(frozen=True)
+class MemoryHealthRead:
+    """One NVML-only memory read (gpu_memory_health.read_memory_health): the SSH run and its report."""
+
+    run: SSHCommandResult
+    report: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -136,7 +145,7 @@ class ContextState:
     gpu_uuids: Optional[str] = None
     # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
     # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
-    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # attempted once per cycle. Bans match against these too.
     kernel_gpu_uuids: list[str] | None = None
     kernel_gpu_uuids_read_attempted: bool = False
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
@@ -156,17 +165,28 @@ class ContextState:
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
+    # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
+    # not measured; a consumer that keeps "last good ports" must not store them as fresh.
+    port_check_deferred: bool = False
     # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
     # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
     # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause.
     dind_probe_error: DindLogCause | None = None
+    # the outside prober could not reach the ports: our filler's ports are behind the same firewall
+    externally_unreachable: bool = False
+    # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
+    # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
+    host_runtime_fault: bool = False
+    # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
+    external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
     pod_states: list[PodContainerState] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
+    memory_health: MemoryHealthRead | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
     # DAH-2265 Plan 2: advisory result of the cached-template verification check.
@@ -183,6 +203,8 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
+    verifyx_cold_retry: Any = None
 
 
 class CheckResult(BaseModel):
@@ -193,12 +215,14 @@ class CheckResult(BaseModel):
     # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
     # when the node has no live rental). None = fall back to the check's class default.
     fatal: bool | None = None
+    # Events of checks this one ran inside itself, reported before its own (the scrape's GPU_LOST hold).
+    extra_events: list[ValidationEvent] = []
 
 
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
-    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
@@ -229,10 +253,9 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
-    # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
-    # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
-    # node scores 0 on every later cycle under this executor id and is never re-anchored.
-    gpu_anchor_broken: bool = False
+    # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
+    # makes this cycle's set the anchor.
+    gpu_reanchor: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
@@ -254,6 +277,38 @@ class Context(BaseModel):
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
+    # False only once InspectorRentedCheck counts a blind streak at the limit under enforcement;
+    # the score gate lives in calculate_scores for the same reason as above.
+    inspector_blind_streak_passed: bool = True
+    # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
+    # enforcement; the score gate lives in calculate_scores for the same reason as above.
+    rented_pod_resources_passed: bool = True
+    # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
+    # score gate lives in calculate_scores.
+    rented_throughput_passed: bool = True
+    # True when that failure is RENTED_THROUGHPUT_NOT_RUN (no reading ran), not a slow reading.
+    rented_throughput_not_run: bool = False
+    # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_attestation_identity_passed: bool = True
+    # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
+    # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
+    cc_vbios_passed: bool = True
+    # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
+    # rented-pod checks still run; the run still ends as that failure (_ended).
+    gpu_fingerprint_passed: bool = True
+    # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    hardware_identity_passed: bool = True
+    # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
+    # rented pod under enforcement.
+    inspector_host_write_passed: bool = True
+    # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
+    # non-fatal on a live rental, so the score gate lives in calculate_scores.
+    kernel_gpu_view_passed: bool = True
+    # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_kernel_count_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -295,10 +350,10 @@ class StatusChangeTracker:
 
     def __init__(self, max_entries: int = 200_000):
         self.max_entries = max_entries
-        self._last: OrderedDict[tuple[str, str, str], tuple[str, str, str]] = OrderedDict()
+        self._last: OrderedDict[tuple[str, str, str], tuple[str, ...]] = OrderedDict()
 
     def changed(
-        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]
+        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, ...]
     ) -> bool:
         # the miner reports its executor UUIDs: keyed without the hotkey, one miner could replay another
         # provider's UUID and move that provider's lines between INFO and DEBUG
@@ -359,10 +414,19 @@ class LoggerSink:
             str(event.context.get("miner_hotkey") or ""),
             executor_uuid,
             event.check_id,
-            (event.event, event.reason_code, event.severity),
+            (event.event, event.reason_code, event.severity, _vloopback_outcome(event)),
         )
         # The run's last event carries the per-step summary; it stays at INFO as one line per run.
         return not changed and "steps_total_s" not in event.what_we_saw
+
+
+def _vloopback_outcome(event: ValidationEvent) -> str:
+    # SCRAPE_OK stays SCRAPE_OK when the vloopback mount test fails, so its verdict joins the outcome
+    storage_limit = event.what_we_saw.get("storage_limit")
+    vloopback = storage_limit.get("vloopback") if isinstance(storage_limit, dict) else None
+    if not isinstance(vloopback, dict):
+        return ""
+    return f"{vloopback.get('verdict')}:{vloopback.get('reason_code')}"
 
 
 def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
@@ -483,6 +547,17 @@ def _stops_run(chk: Check, res: CheckResult) -> bool:
     return (not res.passed and fatal) or res.halt
 
 
+def _ended(events: list[ValidationEvent], ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+    """A run that got through. A GPU set change under a live rental ran on through the rented-pod checks for
+    their reports only: the run still ends as that failure (its event last, score 0, not rented), as it did
+    when the check halted it."""
+    if ctx.gpu_fingerprint_passed:
+        return True, events, ctx
+    failure = next(e for e in events if e.check_id == "gpu.validate.fingerprint")
+    events = [e for e in events if e is not failure] + [failure]
+    return False, events, ctx.model_copy(update={"rented": False, "score": 0.0, "job_score": 0.0, "success": False})
+
+
 class Pipeline:
     def __init__(self, checks: List[Check], sink: EventSink):
         self.checks = checks
@@ -583,12 +658,19 @@ class Pipeline:
                 )
                 last_of_run = index == last_index and position == len(ran_checks) - 1
                 if failed or res.halt or last_of_run:
+                    # the failed event's own check: a composite check (the cold retry's disk judgement) fails
+                    # with another check's event, and the provider timeline names the step from this
                     res.event.what_we_saw.update(
                         summarize_steps(
-                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                            steps,
+                            elapsed_time_ms,
+                            failed_check_id=(res.event.check_id or chk.check_id) if failed else None,
                         )
                     )
 
+                for extra_event in res.extra_events:
+                    await self.sink.emit(extra_event)
+                    events.append(extra_event)
                 await self.sink.emit(res.event)
                 events.append(res.event)
 
@@ -598,6 +680,6 @@ class Pipeline:
                     return False, events, current_ctx
 
                 if res.halt:
-                    return True, events, current_ctx
+                    return _ended(events, current_ctx)
 
-        return True, events, current_ctx
+        return _ended(events, current_ctx)
