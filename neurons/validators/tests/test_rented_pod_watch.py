@@ -489,3 +489,57 @@ async def test_retries_that_outgrow_the_tick_keep_the_short_outcomes_and_go_firs
     probe.retry_batches.clear()
     await watch.tick()
     assert probe.retry_batches[0] <= set(slow) - first
+
+
+class SlowBackend(FakeBackend):
+    """Answers each report after ``delay`` seconds; records the most reports in flight at once."""
+
+    def __init__(self, rented, delay):
+        super().__init__(rented)
+        self.delay = delay
+        self.in_flight = 0
+        self.most_in_flight = 0
+
+    async def report_pod_ssh_reachability(self, pod_id, **fields):
+        self.in_flight += 1
+        self.most_in_flight = max(self.most_in_flight, self.in_flight)
+        try:
+            self.posts.append({"pod_id": pod_id, **fields})
+            await asyncio.sleep(self.delay)
+            return PodSshReachabilityResponse(recorded=True)
+        finally:
+            self.in_flight -= 1
+
+
+# review: a report's request timeout must not run while it queues for a connection
+@pytest.mark.asyncio
+async def test_reports_go_out_report_concurrency_at_a_time(monkeypatch):
+    monkeypatch.setattr(watch_module, "REPORT_CONCURRENCY", 2)
+    pods = {f"p{i}": "RUNNING" for i in range(7)}
+    backend, probe = SlowBackend(_rented(**pods), delay=0.01), FakeProbe()
+    watch = _watch(backend, probe)
+    probe.results = {pod: PodSshResult.BANNER for pod in pods}
+
+    await watch.tick()
+
+    assert backend.most_in_flight == 2
+    assert len(backend.posts) == 7 and not any(watch._pods[pod].posted for pod in pods)
+
+
+# review: the pods a deadline cut off go first next tick instead of the same tail being cut again
+@pytest.mark.asyncio
+async def test_reports_cut_at_the_deadline_go_first_next_tick(monkeypatch):
+    rented = _rented(p1="RUNNING", p2="RUNNING", p3="RUNNING")
+    backend, probe = SlowBackend(rented, delay=0), FakeProbe()
+    watch = await _answered(backend, probe, "p1", "p2", "p3")
+    monkeypatch.setattr(watch_module, "REPORTS_DEADLINE_SECONDS", 0.05)
+    watch._send_slots = asyncio.Semaphore(1)
+    backend.delay = 0.03
+    probe.results = {pod: PodSshResult.REFUSED for pod in ("p1", "p2", "p3")}
+    for _ in range(settings.RENTED_POD_WATCH_MISSES):
+        await watch.tick()  # the last one posts p1 and cuts the rest
+    backend.posts.clear()
+
+    await watch.tick()
+
+    assert [p["pod_id"] for p in backend.posts][:1] == ["p2"]

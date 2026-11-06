@@ -43,6 +43,9 @@ REACHABLE = "reachable"
 REPORTS_DEADLINE_SECONDS = 30
 # kept free at the end of a tick for the reports of the no_banner retries
 RETRY_REPORTS_RESERVE_SECONDS = 5
+# reports in flight at once, below the backend client's 10 connections per host, so a report's
+# request timeout starts when it is sent, never while it queues for a connection
+REPORT_CONCURRENCY = 5
 
 
 @dataclass
@@ -57,6 +60,8 @@ class _PodState:
     announced: bool = False
     # when its no_banner was last re-probed: retries left out of a tick go first in the next one
     retried_at: datetime | None = None
+    # when a report of it last landed: reports cut at a deadline go first in the next tick
+    reported_at: datetime | None = None
 
 
 class RentedPodWatch:
@@ -65,6 +70,7 @@ class RentedPodWatch:
         self.probe = probe
         self._pods: dict[str, _PodState] = {}
         self._route_missing_logged = False
+        self._send_slots = asyncio.Semaphore(REPORT_CONCURRENCY)
 
     async def run(self, should_exit: Callable[[], bool]) -> None:
         loop = asyncio.get_running_loop()
@@ -153,7 +159,7 @@ class RentedPodWatch:
 
     def _observe(self, observations: list[PodSshObservation], probed_at: datetime):
         """Counts each observation into its pod's state; returns the reports owed and the misses."""
-        reports = []  # (state, report coroutine)
+        reports = []  # (state, is it a reachable, report coroutine)
         misses = 0
         for observation in observations:
             state = self._pods.setdefault(observation.pod_id, _PodState())
@@ -163,7 +169,7 @@ class RentedPodWatch:
                 state.announced = False
                 if state.posted:
                     reports.append(
-                        (state, self._post(observation, REACHABLE, probed_at, probed_at))
+                        (state, True, self._post(observation, REACHABLE, probed_at, probed_at))
                     )
                 continue
             if not state.answered:
@@ -179,7 +185,11 @@ class RentedPodWatch:
             if state.announced or state.misses >= needed:
                 state.announced = state.posted = True
                 reports.append(
-                    (None, self._post(observation, UNREACHABLE, state.first_miss_at, probed_at))
+                    (
+                        state,
+                        False,
+                        self._post(observation, UNREACHABLE, state.first_miss_at, probed_at),
+                    )
                 )
         return reports, misses
 
@@ -221,24 +231,29 @@ class RentedPodWatch:
         return retried
 
     async def _send(self, reports, deadline: float = REPORTS_DEADLINE_SECONDS) -> int:
-        """Posts every report at once, within ``deadline`` seconds; returns how many did not land.
-        A reachable that did not land stays owed and goes again next tick."""
+        """Posts the reports, ``REPORT_CONCURRENCY`` at a time and least recently landed first,
+        within ``deadline`` seconds; returns how many did not land. A reachable that did not land
+        stays owed and goes again next tick."""
         if not reports:
             return 0
-        tasks = [asyncio.ensure_future(coro) for _, coro in reports]
+        never = datetime.min.replace(tzinfo=UTC)
+        reports = sorted(reports, key=lambda report: report[0].reported_at or never)
+        tasks = [asyncio.ensure_future(coro) for _, _, coro in reports]
         try:
             done, _ = await asyncio.wait(tasks, timeout=min(deadline, REPORTS_DEADLINE_SECONDS))
         finally:
             for task in tasks:
                 task.cancel()  # no-op on the finished ones; also when the tick deadline cancels us
         failed = 0
-        for (state, _), task in zip(reports, tasks, strict=True):
+        landed_at = datetime.now(UTC)
+        for (state, reachable, _), task in zip(reports, tasks, strict=True):
             ok = (
                 task in done and not task.cancelled() and task.exception() is None and task.result()
             )
             failed += not ok
-            if ok and state is not None:
-                state.posted = False
+            if ok:
+                state.reported_at = landed_at
+                state.posted = state.posted and not reachable
         return failed
 
     async def _post(
@@ -247,15 +262,16 @@ class RentedPodWatch:
         """True when the backend answered; a missing route (older backend, 404) counts as answered."""
         down = state == UNREACHABLE
         try:
-            response = await self.backend_client.report_pod_ssh_reachability(
-                observation.pod_id,
-                state=state,
-                since=since.isoformat(),
-                result=observation.result.value if down else None,
-                errno=observation.errno if down else None,
-                observed_at=observed_at.isoformat(),
-                answered_before=True if down else None,  # misses count only after a banner
-            )
+            async with self._send_slots:
+                response = await self.backend_client.report_pod_ssh_reachability(
+                    observation.pod_id,
+                    state=state,
+                    since=since.isoformat(),
+                    result=observation.result.value if down else None,
+                    errno=observation.errno if down else None,
+                    observed_at=observed_at.isoformat(),
+                    answered_before=True if down else None,  # misses count only after a banner
+                )
         except BackendRejected as exc:
             if exc.status != 404:
                 return False  # only 404 means "no route"; any other rejection is sent again
