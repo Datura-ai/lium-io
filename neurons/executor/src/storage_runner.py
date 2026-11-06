@@ -29,6 +29,8 @@ DETACHED_ENV = "LIUM_STORAGE_DETACHED"
 # The detached runner prints this once it has read its spec from stdin; the spec is never in argv, env or a file.
 SPEC_RECEIVED = "storage-runner-spec-received"
 SPEC_HANDOFF_TIMEOUT_SECONDS = 60
+# A runner container that got no spec in time exits with this (EX_TEMPFAIL); the validator relaunches it.
+SPEC_TIMEOUT_EXIT = 75
 
 
 def _cancel_on_sigterm(signum: int, frame: object) -> None:
@@ -41,11 +43,15 @@ def main() -> int:
     if os.environ.get(DETACHED_ENV) != "1":
         return _run_detached(arguments)
     signal.signal(signal.SIGTERM, _cancel_on_sigterm)
+    spec_line = _read_spec_line(SPEC_HANDOFF_TIMEOUT_SECONDS)
+    if spec_line is None:
+        # the launcher died before the handoff (an executor restart): exit instead of blocking forever
+        message = f"storage runner received no spec within {SPEC_HANDOFF_TIMEOUT_SECONDS}s"
+        print(json.dumps({"event": "result", "status": "FAILED", "message": message}), flush=True)
+        return SPEC_TIMEOUT_EXIT
     event_writer: JsonEventWriter | None = None
     try:
-        payload = _parse_object(
-            sys.stdin.readline()
-        )  # one line: the container's stdin never closes
+        payload = _parse_object(spec_line)
         print(SPEC_RECEIVED, flush=True)
         operation = StorageOperationSpec.from_mapping(payload)
         reporter = (
@@ -166,6 +172,15 @@ def _run_detached(arguments: argparse.Namespace) -> int:
         return int(waited.stdout.strip())
     except ValueError:
         return 1
+
+
+def _read_spec_line(timeout_seconds: float) -> str | None:
+    """One line from stdin (a detached container's stdin never closes), or None if none arrives in time."""
+    lines: list[str] = []
+    reader = threading.Thread(target=lambda: lines.append(sys.stdin.readline()), daemon=True)
+    reader.start()
+    reader.join(timeout_seconds)
+    return lines[0] if lines else None
 
 
 def _send_spec(name: str, payload: Mapping[str, object]) -> bool:

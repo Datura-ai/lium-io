@@ -10268,7 +10268,8 @@ class DockerService:
                     # path is on hold (_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD): the preflight
                     # refused the create before this point.
                     current_step = "bootstrap_restore"
-                    await self._run_bootstrap_restore(
+                    # an executor restart during the restore replaces the session; the rest of the create uses the new one
+                    ssh_client = await self._run_bootstrap_restore(
                         ssh_client=ssh_client,
                         executor_info=executor_info,
                         payload=payload,
@@ -10276,7 +10277,9 @@ class DockerService:
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
                         encrypted=False,
-                        reconnect_ssh=lambda: _connect_own_ssh(executor_info, pkey, known_hosts_policy),
+                        reconnect_ssh=lambda: connections.enter_async_context(
+                            _connect_own_ssh(executor_info, pkey, known_hosts_policy)
+                        ),
                     )
                 # a fresh rental fails before its container exists rather than start without what it asked for
                 is_fresh_create = not payload.local_volume
@@ -10751,7 +10754,7 @@ class DockerService:
                             # fresh mount, but the restore comes first, so it cannot erase the
                             # keys the injection puts under /root.
                             current_step = "bootstrap_restore"
-                            await self._run_bootstrap_restore(
+                            ssh_client = await self._run_bootstrap_restore(
                                 ssh_client=ssh_client,
                                 executor_info=executor_info,
                                 payload=payload,
@@ -10760,7 +10763,9 @@ class DockerService:
                                 local_volume_path=local_volume_path,
                                 encrypted=True,
                                 container_name=container_name,
-                                reconnect_ssh=lambda: _connect_own_ssh(executor_info, pkey, known_hosts_policy),
+                                reconnect_ssh=lambda: connections.enter_async_context(
+                                    _connect_own_ssh(executor_info, pkey, known_hosts_policy)
+                                ),
                             )
 
                     # DAH-2341: inject the customer's public keys before the sshd
@@ -11292,8 +11297,9 @@ class DockerService:
         local_volume_path: str,
         encrypted: bool,
         container_name: str | None = None,
-        reconnect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]] | None = None,
-    ) -> None:
+        reconnect_ssh: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
+    ) -> asyncssh.SSHClientConnection:
+        """Run the restore; return the SSH connection the create continues on (a new one after an executor restart)."""
         if encrypted and not container_name:
             # No mode exists that restores into an encrypted volume without the pod: the
             # only other way is to hand the executor the passphrase, which is the leak this
@@ -11312,7 +11318,7 @@ class DockerService:
                     local_volume=local_volume,
                     local_volume_path=local_volume_path,
                 )
-                return
+                return ssh_client
             raise RuntimeError(
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
@@ -11369,7 +11375,7 @@ class DockerService:
             retain_terminal_artifacts=True,
         )
         # an executor restart drops this SSH session; the restore keeps running and the wait reattaches to it
-        await wait_for_storage_operation(ssh_client, files, reconnect=reconnect_ssh)
+        return await wait_for_storage_operation(ssh_client, files, reconnect=reconnect_ssh)
 
     async def _run_legacy_bootstrap_restore(
         self,

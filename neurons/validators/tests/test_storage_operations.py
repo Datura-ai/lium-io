@@ -1,4 +1,3 @@
-import contextlib
 import subprocess
 import sys
 from pathlib import Path
@@ -112,22 +111,62 @@ async def test_wait_reattaches_after_the_executor_restarts(
 ) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    (tmp_path / f"{OPERATION_ID}.status").write_text(
-        "0\n"
-    )  # what the restarted executor's runner left
-    fake_docker, _ = _fake_docker(tmp_path, None)
+    fake_docker, _ = _fake_docker(
+        tmp_path, "exited 0"
+    )  # the runner container finished after the restart
+    fresh = _local_ssh(fake_docker)
 
     async def dropped(command: str, check: bool = False) -> SimpleNamespace:
         raise asyncssh.ConnectionLost("executor restarted")
 
-    @contextlib.asynccontextmanager
-    async def reconnect():
-        yield _local_ssh(fake_docker)
-
-    await storage_operations.wait_for_storage_operation(
-        SimpleNamespace(run=dropped), files, poll_interval_seconds=0, reconnect=reconnect
+    live = await storage_operations.wait_for_storage_operation(
+        SimpleNamespace(run=dropped),
+        files,
+        poll_interval_seconds=0,
+        reconnect=AsyncMock(return_value=fresh),
     )
-    assert not (tmp_path / f"{OPERATION_ID}.status").exists()
+    assert live is fresh  # the caller continues on the reopened session
+
+
+@pytest.mark.asyncio
+async def test_start_relaunches_a_runner_that_never_received_its_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # an executor restart mid-handoff: the runner container exits with the spec-timeout code; launch afresh
+    executor_runner = Path(__file__).resolve().parents[2] / "executor" / "src" / "storage_runner.py"
+    assert (
+        f"SPEC_TIMEOUT_EXIT = {storage_operations.RUNNER_SPEC_TIMEOUT_EXIT}"
+        in executor_runner.read_text()
+    )
+    monkeypatch.setattr(
+        storage_operations, "supports_storage_operation", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+    commands: list[str] = []
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        commands.append(command)
+        stdout = (
+            f"STATUS:{storage_operations.RUNNER_SPEC_TIMEOUT_EXIT}\n"
+            if "echo STARTING" in command
+            else ""
+        )
+        return SimpleNamespace(
+            exit_status=1 if command.startswith(("test -e", "/usr/bin/docker ps")) else 0,
+            stdout=stdout,
+            stderr="",
+        )
+
+    with pytest.raises(TypeError):  # reaches the sftp spec write: a new launch, not an early return
+        await storage_operations.start_storage_operation(
+            SimpleNamespace(run=run, start_sftp_client=None),
+            "python3",
+            OPERATION_ID,
+            {"engine": "restic"},
+            retain_terminal_artifacts=False,
+        )
+    runner = f"lium-storage-runner-{str(OPERATION_ID)[:12]}"
+    assert any(f"docker rm -f -- {runner}" in command for command in commands)
 
 
 @pytest.mark.parametrize("field", ["bootstrap", "exclude_patterns"])

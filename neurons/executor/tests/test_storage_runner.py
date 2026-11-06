@@ -2376,3 +2376,23 @@ def test_spec_handoff_timeout_removes_the_runner_and_fails(
     result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert result["status"] == "FAILED" and "did not read its spec" in result["message"]
     assert "repository-password" not in result["message"]
+
+
+def test_detached_runner_exits_when_no_spec_arrives(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # the launcher died before the handoff: the runner must not block forever on its open stdin
+    monkeypatch.setattr("sys.argv", ["storage_runner.py"])
+    monkeypatch.setenv(storage_runner.DETACHED_ENV, "1")
+    monkeypatch.setattr(storage_runner, "SPEC_HANDOFF_TIMEOUT_SECONDS", 0.2)
+    blocked = threading.Event()
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(readline=lambda: blocked.wait(5) and ""))
+    previous = signal.getsignal(signal.SIGTERM)
+    started = time.monotonic()
+    try:
+        assert storage_runner.main() == storage_runner.SPEC_TIMEOUT_EXIT
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        blocked.set()
+    assert time.monotonic() - started < 3
+    assert "received no spec" in capsys.readouterr().out

@@ -3,8 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
-from collections.abc import Callable, Mapping
-from contextlib import AbstractAsyncContextManager
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
@@ -14,6 +13,8 @@ import asyncssh
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
+# storage_runner.py's exit code when its container never received the spec on stdin
+RUNNER_SPEC_TIMEOUT_EXIT = 75
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
 
@@ -144,6 +145,10 @@ async def start_storage_operation(
                 existing_state = await _operation_state(ssh_client, files)
                 if existing_state != "STARTING":
                     break
+        if existing_state == f"STATUS:{RUNNER_SPEC_TIMEOUT_EXIT}":
+            # the runner never received its spec (the executor restarted mid-handoff): launch it afresh
+            await _remove_operation_artifacts(ssh_client, files)
+            existing_state = "STARTING"
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
             return files
         if await _helper_owned_by_live_runner(ssh_client, operation_id, files):
@@ -208,17 +213,18 @@ async def wait_for_storage_operation(
     poll_interval_seconds: float = 5.0,
     launch_grace_polls: int = 6,
     *,
-    reconnect: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]] | None = None,
+    reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
     reconnect_window_seconds: float = 600.0,
-) -> None:
-    """Wait for the operation's terminal status.
+) -> asyncssh.SSHClientConnection:
+    """Wait for the operation's terminal status; return the live connection the wait ended on.
 
     With ``reconnect``, a lost SSH connection (the executor container restarting) is reopened and the wait
     reattaches to the operation: its runner container keeps running, and its state is read from that container.
+    The caller owns the reopened connection and continues on it.
     """
     try:
         await _wait_for_storage_operation(ssh_client, files, poll_interval_seconds, launch_grace_polls, False)
-        return
+        return ssh_client
     except (asyncssh.Error, OSError):
         if reconnect is None:
             raise
@@ -226,11 +232,9 @@ async def wait_for_storage_operation(
     while True:
         await asyncio.sleep(poll_interval_seconds)
         try:
-            async with reconnect() as fresh_client:
-                await _wait_for_storage_operation(
-                    fresh_client, files, poll_interval_seconds, launch_grace_polls, True
-                )
-                return
+            fresh_client = await reconnect()
+            await _wait_for_storage_operation(fresh_client, files, poll_interval_seconds, launch_grace_polls, True)
+            return fresh_client
         except (asyncssh.Error, OSError):
             if asyncio.get_running_loop().time() >= deadline:
                 raise
