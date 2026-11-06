@@ -196,6 +196,16 @@ async def test_a_gpu_missing_from_the_listing_is_refused_on_an_nvlink_host_unles
     assert bool(_resets(host)) == (warning == W.HungGpuReset)
 
 
+@pytest.mark.parametrize("nvswitch", [False, True])
+@pytest.mark.asyncio
+async def test_a_pod_whose_gpus_changed_since_the_rent_is_no_hang(nvswitch):
+    # prod 5 Nov: a whole-node pod sent GPU UUIDs the host no longer had; it read as 8 hung GPUs and a shared host
+    host = HungHost(nvswitch=nvswitch)
+    result = await _reset(host, pod=["GPU-aaaaaaaa-0000-4000-8000-000000000000", "GPU-bbbbbbbb-0000-4000-8000-000000000000"])
+    assert (result.hung_uuids, result.warning) == ([], None)
+    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+
+
 class FailedListingHost(HungHost):
     """The host listing fails part way: it names only the pod's GPUs and exits non-zero."""
 

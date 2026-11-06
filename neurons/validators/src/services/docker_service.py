@@ -12965,6 +12965,7 @@ class DockerService:
     ) -> ContainerWarningCode | None:
         """DAH-5301: reset a hung pod GPU while a reboot has the pod's old container parked and stopped.
         Never raises: any error is logged and the reboot goes on as before (None)."""
+        started = time.monotonic()
         try:
             # as _reset_leftover_clock_locks_before_create: a renter's Reset GPU or clock lock never overlaps it
             async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
@@ -12988,6 +12989,15 @@ class DockerService:
         except Exception as exc:
             logger.warning(_m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)})))
             return None
+        # one line per check, hung or not: how often it runs and what it adds to a reboot
+        logger.info(
+            _m(
+                "Hung GPU check on reboot done",
+                extra=get_extra_info(
+                    {**default_extra, "seconds": round(time.monotonic() - started, 2), "hung": len(result.hung_uuids), "shadow": shadow, "detail": result.detail}
+                ),
+            )
+        )
         if shadow:
             if result.hung_uuids:
                 logger.warning(

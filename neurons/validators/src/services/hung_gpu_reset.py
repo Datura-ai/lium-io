@@ -121,6 +121,11 @@ async def reset_hung_pod_gpus(
         # the SSH command itself failed: nothing is known about the GPUs (a hung nvidia-smi is the shell's 124)
         return HungGpuResult()
     gpu_csv, _, apps_csv = (query.stdout or "").partition(_APPS_MARKER)
+    listed = {uuid for line in gpu_csv.splitlines() if (uuid := line.split(",")[0].strip()).startswith("GPU-")}
+    if listed and listed.isdisjoint(pod_gpu_uuids):
+        # the host lists GPUs but none of the pod's: its GPUs changed since the rent, which is no hang and no
+        # NVLink sharing; the reboot goes on as without this check
+        return HungGpuResult(detail="none of the pod's GPUs is on the host")
     latched = set(parse_wedged_gpu_uuids(gpu_csv, apps_csv))
     hung = parse_hung_pod_gpus(gpu_csv, latched, pod_gpu_uuids)
     if not hung:
