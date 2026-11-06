@@ -8706,7 +8706,9 @@ class DockerService:
         stop_cmd = (
             f"/usr/bin/docker pause {dind_q} >/dev/null 2>&1; s=$({inspect_state_cmd}); "
             f"[ \"$s\" = truefalse ] && {{ /usr/bin/docker kill {dind_q} >/dev/null 2>&1; s=$({inspect_state_cmd}); }}; "
-            f'case "$s" in truetrue|false*|*"No such"*) exit 0;; esac; exit 1'
+            f'case "$s" in truetrue|false*|*"No such"*) exit 0;; esac; '
+            # Gone, whatever the docker version's error text says; a daemon error fails `ps` and stays unconfirmed.
+            f'ids=$(/usr/bin/docker ps -aq --filter {shlex.quote(f"name=^/{dind_name}$")}) && [ -z "$ids" ] && exit 0; exit 1'
         )
         for attempt in range(1, _DIND_STOP_ATTEMPTS + 1):
             try:
