@@ -1,31 +1,24 @@
 # CodeQL — advanced setup (DAH-3149). Replaces the "default setup" toggle for this repo.
 #
 # Why a workflow file instead of default setup: default setup analyses only pushes to the default branch and PRs based
-# against it. A PR opened against another PR's branch (a stacked PR) is never analysed; when its parent merges and GitHub
-# retargets it to main, the `code_scanning` ruleset rule waits for an analysis that only a new push would trigger —
-# the PR shows green CI and "BLOCKED" with no visible reason (lium-platform #76/#78/#81, 7 Sep 2026). This workflow:
-#   - analyses every PR whatever its base branch,
-#   - re-analyses on `edited` when the base branch changes (a retarget), so no push is needed,
-#   - runs on merge-queue groups (`merge_group`) and keeps the weekly schedule,
-#   - keeps default setup's languages, `default` query suite and `/language:<lang>` categories, so alerts carry over.
+# against it. Since 6 Nov 2026 (DAH-5832, cost cut) this workflow analyses pushes to main, the weekly schedule and a
+# manual dispatch only, and keeps default setup's languages, `default` query suite and `/language:<lang>` categories,
+# so alerts carry over. The `code_scanning` rule on main's ruleset must be off before the cut-over: with no PR
+# analysis it would block every PR.
 #
 # Cut-over: code scanning rejects SARIF from a workflow while default setup is enabled, so until default setup is
 # switched off this workflow runs only its preflight job and skips the analysis (DAH-5201: default setup already
 # analyses the same commits, so analysing here too was a duplicate that could not upload). Once this
 # file is on main, the loop runs tools/codeql_cutover.sh (disable default setup → dispatch this workflow on main →
-# verify); by hand: Settings → Advanced Security → CodeQL analysis → ⋯ → "Switch to advanced", then Actions → CodeQL →
+# verify → set the repository variable CODEQL_ADVANCED=true, without which push and schedule runs skip every job); by hand: Settings → Advanced Security → CodeQL analysis → ⋯ → "Switch to advanced", then Actions → CodeQL →
 # "Run workflow" on main with force-upload ticked (a plain re-run still sees default setup's last analysis and skips the upload).
 name: CodeQL
 
 on:
+  # Muhammad 6 Nov 2026 (DAH-5832): default-branch commits only, same as lium-platform: no pull_request or merge_group
+  # run. The push to main analyses the merged tree; alerts come from there and from the weekly schedule.
   push:
     branches: [main]
-  pull_request:
-    branches: ['**']
-    # `edited` fires when the base branch changes (a retarget); the job skips title/body-only edits below.
-    types: [opened, synchronize, reopened, ready_for_review, edited]
-  merge_group:
-    types: [checks_requested]
   schedule:
     - cron: '31 4 * * 1'
   workflow_dispatch:
@@ -44,8 +37,10 @@ jobs:
   # when its SARIF can be uploaded, i.e. from the cut-over on; nothing changes for that path.
   preflight:
     name: Preflight (default setup still enabled?)
-    # `edited` also fires on title/body edits; only a base-branch change needs a new analysis.
-    if: github.event.action != 'edited' || github.event.changes.base != null
+    # DAH-5832: while default setup is on, this job only ever answered "skip" (~900 one-minute runs a week). It now runs
+    # on a push or schedule only once the repository variable CODEQL_ADVANCED is "true" (set it at the cut-over);
+    # a manual run (the cut-over dispatch) always runs it.
+    if: vars.CODEQL_ADVANCED == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -86,12 +81,11 @@ jobs:
     if: needs.preflight.outputs.upload == 'always'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # job-level (not workflow-level) so a skipped title/body-edit run never cancels an analysis in progress.
-    # Only PR runs cancel each other: push, schedule and the cut-over dispatch all share the
-    # `codeql-<lang>-refs/heads/main` group, and a push to main must not kill the cut-over run.
+    # push, schedule and the cut-over dispatch share the `codeql-<lang>-refs/heads/main` group and never cancel each
+    # other: a push to main must not kill the cut-over run.
     concurrency:
-      group: codeql-${{ matrix.language }}-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+      group: codeql-${{ matrix.language }}-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       security-events: write
       contents: read
