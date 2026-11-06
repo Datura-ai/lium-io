@@ -1,3 +1,4 @@
+import asyncio
 import ctypes
 import json
 import math
@@ -12,7 +13,16 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
 from core.config import FeatureFlag, settings
 from core.utils import _m, get_extra_info
-from core.checksums import sha256_from_executor, sha256_from_path
+from core.checksums import (
+    ARM_VERIFIER_NOT_AVAILABLE,
+    ARM_VERIFIER_NOT_AVAILABLE_ERROR,
+    EXECUTOR_ARCH_UNKNOWN,
+    EXECUTOR_ARCH_UNKNOWN_ERROR,
+    aarch64_lib_path,
+    executor_arch,
+    sha256_from_executor,
+    sha256_from_path,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +40,8 @@ STDERR_TAIL_BYTES = 2048
 # minutes, so this is generous — it only cuts true hangs (same silent-hang class as the
 # matrix check, DAH-2365) instead of blocking until the outer JOB_TIME_OUT cancellation.
 VERIFYX_COMMAND_TIMEOUT_SECONDS = 600
+# AsyncSSH applies run(timeout=) only once the channel is open, so the cleanup is bounded from outside too
+VERIFYX_KILL_TIMEOUT_SECONDS = 10
 
 # LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
 LIB_PATH = "/usr/lib/libverifyx.so"
@@ -306,8 +318,16 @@ class VerifyXValidationService:
             cipher_text=cipher_text,
             challenge_input=challenge_input,
             log_extra=log_extra,
-            expected_lib_sha256=self.lib_sha256(lib_name),
+            expected_lib_sha256=self.lib_sha256(self._executor_lib_path(lib_name, machine_spec)),
         )
+
+    @staticmethod
+    def _executor_lib_path(lib_name: str, machine_spec: dict) -> str:
+        """The library the executor holds: the aarch64 build on an ARM host (when this validator has it),
+        so `/verify` and the SSH checksum gate accept the same file for one architecture."""
+        if machine_spec.get("machine_arch") == "aarch64":
+            return aarch64_lib_path(lib_name) or lib_name
+        return lib_name
 
     def evaluate_verifyx_capture(
         self,
@@ -366,6 +386,7 @@ class VerifyXValidationService:
         default_extra: dict,
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
+        run_dir: str | None = None,
     ):
         # The SSH transport: library checksum over the shell → prepare_verifyx_challenge → one
         # remote `verifyx_executor.py` run → evaluate_verifyx_capture. The local transport
@@ -373,10 +394,27 @@ class VerifyXValidationService:
         try:
             # Verify checksum before proceeding with validation
             lib_name = self.gated_lib_name()
-            local_checksum = self.lib_sha256(lib_name)
+            source = lib_name
+            # the CPU first: an ARM host holding the x86 build matches the native digest and must not pass as current
+            arch = await executor_arch(shell)
+            if arch == "aarch64":
+                # an ARM executor holds the aarch64 build: check it against (and send) the validator's copy of that
+                source = aarch64_lib_path(lib_name)
+                if source is None:
+                    logger.warning(_m(ARM_VERIFIER_NOT_AVAILABLE, extra=get_extra_info(default_extra)))
+                    return VerifyXResponse(
+                        error=ARM_VERIFIER_NOT_AVAILABLE_ERROR,
+                        diagnostics={"event": ARM_VERIFIER_NOT_AVAILABLE, "executor_arch": "aarch64"},
+                    )
+            local_checksum = self.lib_sha256(source)
             executor_checksum = await sha256_from_executor(shell, lib_name)
 
             if local_checksum != executor_checksum:
+                if arch is None:
+                    logger.warning(_m(EXECUTOR_ARCH_UNKNOWN, extra=get_extra_info(default_extra)))
+                    return VerifyXResponse(
+                        error=EXECUTOR_ARCH_UNKNOWN_ERROR, diagnostics={"event": EXECUTOR_ARCH_UNKNOWN}
+                    )
                 mismatch_extra = {
                     **default_extra,
                     "local_sha256": local_checksum,
@@ -408,7 +446,7 @@ class VerifyXValidationService:
                         diagnostics={"event": "VERIFYX_LIBRARY_WRITE_DENIED"},
                     )
                 refreshed = await self._refresh_executor_library(
-                    shell, local_checksum, default_extra
+                    shell, local_checksum, default_extra, source=source
                 )
                 if not refreshed:
                     return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
@@ -432,7 +470,7 @@ class VerifyXValidationService:
                 machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = self._verifyx_command(executor_info, challenge, lib_name)
+            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir)
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
@@ -472,7 +510,7 @@ class VerifyXValidationService:
         )
 
     async def _refresh_executor_library(
-        self, shell, expected_sha256: str, default_extra: dict
+        self, shell, expected_sha256: str, default_extra: dict, source: str = LIB_PATH
     ) -> bool:
         """One attempt to put the validator's libverifyx.so on the executor.
 
@@ -481,7 +519,8 @@ class VerifyXValidationService:
         upload the validator's own file (the source of truth). Log every outcome,
         including the fetch error. Returns True when the executor hash matches.
         """
-        url = settings.verifyx.LIBRARY_FETCH_URL
+        # the aarch64 build is published next to the x86 one under its own file name
+        url = settings.verifyx.LIBRARY_FETCH_URL.replace(os.path.basename(LIB_PATH), os.path.basename(source))
         tmp = "/tmp/libverifyx.so.fetch"
         curl_cmd = (
             f"curl -fsSL --max-time 60 -o {shlex.quote(tmp)} {shlex.quote(url)}; "
@@ -535,7 +574,7 @@ class VerifyXValidationService:
                 ),
             )
         )
-        put_error = await self._put_validator_library(shell)
+        put_error = await self._put_validator_library(shell, source)
         if put_error:
             logger.warning(
                 _m(
@@ -555,29 +594,80 @@ class VerifyXValidationService:
         )
         return True
 
-    async def _put_validator_library(self, shell) -> str | None:
+    async def _put_validator_library(self, shell, source: str = LIB_PATH) -> str | None:
         """SFTP the validator's libverifyx.so onto the executor. Returns an error string or None."""
         start = getattr(getattr(shell, "ssh_client", None), "start_sftp_client", None)
         if start is None:
             return "no SFTP client"
         try:
             async with start() as sftp:
-                await sftp.put(LIB_PATH, LIB_PATH)
+                await sftp.put(source, LIB_PATH)
         except TypeError:
             try:
                 sftp = start()
-                await sftp.put(LIB_PATH, LIB_PATH)
+                await sftp.put(source, LIB_PATH)
             except Exception as e:
                 return f"{type(e).__name__}: {e}"
         except Exception as e:
             return f"{type(e).__name__}: {e}"
         return None
 
-    def _verifyx_command(self, executor_info, challenge: "VerifyXChallenge", lib_name: str) -> str:
-        return (
+    def _verifyx_command(
+        self, executor_info, challenge: "VerifyXChallenge", lib_name: str, run_dir: str | None = None
+    ) -> str:
+        command = (
             f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py "
             f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
         )
+        if run_dir is None:
+            return command
+        # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
+        # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
+        d = shlex.quote(run_dir)
+        return (
+            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
+            # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
+            f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
+            f"mkdir {d} && cd {d} || exit 1; "
+            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
+            f"cd .. && rm -rf {d}; exit $rc"
+        )
+
+    async def kill_remote_verifyx(self, shell, run_dir: str, default_extra: dict) -> bool:
+        """Kill a VerifyX run started with `run_dir` and cut off by the validator; True once it is gone.
+
+        Kills only the recorded PID's process group (the executor runs with the host PID namespace,
+        so a pattern kill could hit a renter's process), and only while that PID still works in the
+        run's dir (a reused PID is spared), then removes the scratch dir with any half-written
+        disk-test file, which a SIGKILL leaves behind."""
+        d = shlex.quote(run_dir)
+        try:
+            capture = await asyncio.wait_for(
+                self._run_ssh_command(
+                    shell,
+                    f'p=$(cat {d}/pid 2>/dev/null); [ -n "$p" ] && [ /proc/"$p"/cwd -ef {d} ] '
+                    f'&& kill -KILL -"$p" "$p" 2>/dev/null; rm -rf {d} && [ ! -e {d} ]',
+                    timeout=VERIFYX_KILL_TIMEOUT_SECONDS,
+                ),
+                timeout=VERIFYX_KILL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            capture = SSHCapture(transport_error="TimeoutError: cleanup SSH did not finish")
+        if capture.transport_error is None and capture.exit_status == 0:
+            return True
+        logger.warning(
+            _m(
+                "Failed to kill remote VerifyX process",
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "transport_error": capture.transport_error,
+                        "exit_status": capture.exit_status,
+                    }
+                ),
+            )
+        )
+        return False
 
     async def _run_ssh_command(
         self, shell, command: str, timeout: float = VERIFYX_COMMAND_TIMEOUT_SECONDS
@@ -790,7 +880,9 @@ def _package_fallback_stats(
         "success": success,
         "cloudflare_fallback": True,
         "execution_time_ms": network_execution.get("execution_time_ms"),
-        **_cloudflare_upload_mark(network_execution),
+        # the download fell back on a Cloudflare fault, so the verifier never ran the upload: its 0.0
+        # is no measurement (review 5695182456); verifyx.py caps the kept probes at MAX_KEPT_UPLOAD_PROBES
+        **({} if _is_positive_number(upload_speed) else {"cloudflare_upload_fallback": True}),
     }
     return stats, errors
 

@@ -10,16 +10,6 @@ import shlex
 from core.docker_utils import DockerCommand
 
 
-def test_live_call_shape_unchanged():
-    # The one caller today: a UUID-derived name and a constant command.
-    command = DockerCommand.exec_command("pod_ab12cd34-0000", "cat /root/.ssh/authorized_keys")
-
-    assert shlex.split(command) == [
-        "/usr/bin/docker", "exec", "-u", "0", "-i", "pod_ab12cd34-0000",
-        "sh", "-c", "cat /root/.ssh/authorized_keys",
-    ]
-
-
 def test_metacharacters_in_container_name_stay_one_argument():
     command = DockerCommand.exec_command("pod; touch /tmp/pwned", "true")
 

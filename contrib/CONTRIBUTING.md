@@ -232,15 +232,16 @@ Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm proj
 
 These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
 
-- `route` reads the changed files (`.github/actions/changed-packages`), after dropping `*.md`, `.gitignore` and the root `docs/` tree — a README-only PR runs no neuron job.
+- `route` reads the changed files (`.github/actions/changed-packages`) — the PR's files, the merge group's diff, or on a push to `main` the commits the push adds (the merged PR already ran the rest) — after dropping `*.md`, `.gitignore` and the root `docs/` tree; a README-only PR runs no neuron job.
 - Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed; the validators job also runs when `lium_protocol/` changed (its `tests/test_protocol_compat.py` replays the package's recordings).
 - `protocol` (the `lium_protocol` line above, pydantic pinned to `2.13.*` because the snapshot is pydantic's JSON Schema) runs when `lium_protocol/`, `datura/` or `.github/` changed.
 - `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`.
-- `lint` (`ruff format --check`, report-only, not required) runs per changed neuron.
-- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `lium_protocol/`, `datura/`, `.github/` or `e2e/` changed.
+- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `lium_protocol/`, `datura/`, `.github/` or `e2e/` changed; a change only under a neuron's own `tests/` does not count (the stack never runs those).
 - `tests-ok` is the one status check to require; it reports on every PR.
 
-Tests follow Arrange-Act-Assert, one behavior per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+Tests follow Arrange-Act-Assert, one behavior per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`, not run in CI) is the formatter.
+
+Other checks: **image-pins** runs only when a compose file, an env template or its script changes, plus daily on `main`. **CodeQL** comes from default setup while it is on; `.github/workflows/codeql.yml` then runs only its preflight job and analyses once default setup is switched off.
 
 ## Releases
 
@@ -252,4 +253,4 @@ Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` work
 | `validator-v*` | `validator_cd_prod.yml` | `daturaai/compute-subnet-validator`, `daturaai/compute-subnet-validator-runner` |
 | `miner-v*` | `miner_cd_prod.yml` | `daturaai/compute-subnet-miner`, `daturaai/compute-subnet-miner-runner` |
 
-The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); the two `*_cd_staging.yml` use `docker/build-push-action` to publish `ghcr.io/datura-ai/lium-validator:staging` and `ghcr.io/datura-ai/lium-miner:staging`. `packages/lium-core/` has its own CI (`lium-core-ci.yml`) and is released by hand through `lium-core-release.yml`.
+The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); the two `*_cd_staging.yml` use `docker/build-push-action` to publish `ghcr.io/datura-ai/lium-validator:staging` and `ghcr.io/datura-ai/lium-miner:staging`. `lium_preflight_image.yml` publishes `daturaai/compute-subnet-validator:preflight`, the image `lium mine` runs to check a node's GPUs, on every merge to `main` that changes `neurons/validators/Dockerfile.preflight` or what it copies (also startable by hand). `packages/lium-core/` has its own CI (`lium-core-ci.yml`) and is released by hand through `lium-core-release.yml`.

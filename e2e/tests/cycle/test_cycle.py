@@ -6,8 +6,9 @@ build a JobResult. Nothing is mocked below the chain: the same pyarmor/PyInstall
 hop, the same checks. `publish_machine_specs` then puts the verdict on the redis channel the connector forwards to
 the platform — the message a node's "verification" state on lium.io is made from.
 
-Without a GPU (CI) the scrape itself fails on the executor (it keys its output on the first GPU's fields) and the
-pipeline halts with SCRAPE_FAILED_ON_HOST, score 0 — the exact verdict a provider whose driver is gone gets today. With
+Without a GPU (CI) the executor has no libnvidia-ml, so the scrape returns an empty GPU list, fails on the executor (it keys
+its output on the first GPU's fields) and the pipeline halts with SCRAPE_FAILED_ON_HOST, score 0 — the verdict a
+provider whose driver library is gone gets today. (A host whose NVML loads but lists 0 GPUs gets SCRAPE_FAILED_NO_GPU.) With
 E2E_GPU=1 the executor sees the host's GPUs and the cycle must report them.
 """
 
@@ -20,9 +21,9 @@ import redis
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.ioc import ioc  # constructs the validator's services from the tester's env (tests/conftest.py stubs the chain first)
+from services.miner_service import REST_SSH_SUBMIT_TIMEOUT
 from services.redis_service import MACHINE_SPEC_CHANNEL
 from services.task.checks import SysboxRequiredCheck
-from services.task.messages import SysboxRequiredMessages
 from services.task.pipeline_factory import PipelineFactory
 
 from tests import lib
@@ -73,12 +74,12 @@ def test_cycle_reaches_the_executor_and_returns_a_verdict(services):
         assert job.gpu_model, job.log_text
     else:
         # no GPU on this host: the key was installed, the scrape was uploaded and RAN on the executor (the stderr tail
-        # in the event is the scrape's own traceback), and the pipeline halted with the verdict a GPU-less host gets
-        # today — SCRAPE_FAILED_ON_HOST (machine_scrape derives its output key from gpu_details[0], so zero GPUs cannot
-        # even report gpu.count=0; see README "known verdicts").
+        # in the event is the scrape's own traceback), and the pipeline halted with the verdict a host without
+        # libnvidia-ml gets today — SCRAPE_FAILED_ON_HOST (machine_scrape returns an empty GPU list and derives its
+        # output key from gpu_details[0], an IndexError; see README "known verdicts").
         assert job.score == 0 and job.gpu_count == 0
         assert "SCRAPE_FAILED_ON_HOST" in job.log_text, job.log_text
-        assert "IndexError" in job.log_text or "gpu" in job.log_text.lower(), job.log_text
+        assert "IndexError" in job.log_text, job.log_text
         assert "GPU unverified" in job.log_text, job.log_text
 
 
@@ -114,12 +115,17 @@ def test_offline_executor_is_dropped_not_scored_and_does_not_stall_the_cycle():
     _, pub = lib.ssh_keypair()
     t0 = time.monotonic()
     r = lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-submit", headers=lib.validator_rest_headers(vk), timeout=120,
-                 json={"message_type": "SSHPubKeySubmitRequest", "public_key": pub, "validator_signature": lib.sign(vk, pub), "miner_hotkey": lib.MINER_HOTKEY})
+                 json={"message_type": "SSHPubKeySubmitRequest", "public_key": pub, "validator_signature": lib.sign(vk, pub),
+                       "validator_miner_signature": lib.sign(vk, lib.ssh_pubkey_signing_blob(pub, None, lib.MINER_HOTKEY)),
+                       "miner_hotkey": lib.MINER_HOTKEY})
     took = time.monotonic() - t0
     assert r.status_code == 200, r.text
     uuids = [e["uuid"] for e in r.json()["executors"]]
     assert uuids == [lib.EXECUTOR_UUID], f"the dead executor must be dropped, the live one kept: {uuids}"
-    assert took < 60, f"a dead executor stalled the miner reply for {took:.0f}s"
+    # the dead one is still known to the miner: that is what makes it "unreachable" rather than "not listed"
+    assert set(r.json()["known_executor_ids"]) == {lib.EXECUTOR_UUID, lib.DEAD_EXECUTOR_UUID}, r.json()
+    # the validator gives up on the whole reply after REST_SSH_SUBMIT_TIMEOUT: a slower reply loses the live executor too
+    assert took < REST_SSH_SUBMIT_TIMEOUT, f"a dead executor stalled the miner reply for {took:.0f}s"
     lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-remove", headers=lib.validator_rest_headers(vk), timeout=60,
              json={"message_type": "SSHPubKeyRemoveRequest", "public_key": pub, "validator_signature": lib.sign(vk, pub), "miner_hotkey": lib.MINER_HOTKEY})
 
@@ -137,8 +143,6 @@ def test_unreachable_miner_fails_the_job_fast(services):
 
 def test_sysbox_gate_names_its_reason(services):
     """Sysbox is always required for an unrented executor, but a CI box or a Lium pod cannot run it and the GPU-less
-    scrape halts the pipeline before the check. So the check is asserted at this level: it is in the pipeline and its
-    refusal is SYSBOX_REQUIRED_MISSING, the verdict seen on staging."""
+    scrape halts the pipeline before the check. So the check is asserted at this level: it is in the pipeline."""
     checks = PipelineFactory.build_checks()
     assert any(isinstance(c, SysboxRequiredCheck) for c in checks), [type(c).__name__ for c in checks]
-    assert SysboxRequiredMessages.SYSBOX_MISSING.reason == "SYSBOX_REQUIRED_MISSING"

@@ -23,7 +23,12 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import MAX_PEER_TEXT_LENGTH, availability_errors, build_ssh_unreachable_event
+from .availability import (
+    MAX_PEER_TEXT_LENGTH,
+    availability_errors,
+    build_ssh_unreachable_event,
+    failed_check_event,
+)
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
 from .models import JobResult, ValidationEvent, build_msg
@@ -206,6 +211,7 @@ class TaskService:
                     gpu_attestation_passed=gpu_attestation_passed,
                     first_pass=first_pass,
                     encrypted_private_key=encrypted_private_key,
+                    task_started_at=task_started_at,
                 )
 
                 # Build and run validation pipeline
@@ -245,8 +251,11 @@ class TaskService:
                 result.ssh_host_key_verified = known_hosts_policy is not None
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
+                # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
+                failed = failed_check_event(ok, events)
                 result.availability_errors = [
-                    error.model_dump(mode="json") for error in availability_errors(events)
+                    error.model_dump(mode="json")
+                    for error in availability_errors([*events, failed] if failed else events)
                 ]
                 # DAH-3405: the last event is the one that ended the run — the failed fatal check,
                 # the finalize event of a run that completed without a score, or the rented halt
