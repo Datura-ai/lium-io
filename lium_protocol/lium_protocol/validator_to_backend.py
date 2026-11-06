@@ -563,6 +563,8 @@ class GpuResetErrorCode(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
     ClockLockNotSupported = "ClockLockNotSupported"
+    # 2.12.0: an nvidia-smi query the reset needs timed out: the GPUs stopped responding
+    GpuHung = "GpuHung"
 
 
 class GpuResetOutcome(pydantic.BaseModel):

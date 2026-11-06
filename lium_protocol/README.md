@@ -69,6 +69,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.6.0` — `RecheckExecutorRequest` (backend → validator; `executor_id`): validate one node now, outside the cycle (a provider's "Recheck now" in the portal). A validator that does not list the node ignores it; an older validator ignores the message.
 - `2.9.0` — `ContainerWarningCode.HungGpuReset`, `HungGpuNotResetMig`, `HungGpuNotResetNvlinkShared`, `HungGpuNotResetInUse`, `HungGpuNotResetUnsupported` (on `ContainerCreated.warnings`): a reboot or edit found a pod GPU hung and reset it before starting the new container, or could not reset it and says why.
 - `2.10.0` — `ExecutorSpecRequest.host_runtime_fault` (optional): this cycle's DinD test container started on the host and its sshd never answered, so the host's container runtime is failing. False for a refused `docker run` or an error on the validator's side; None from an older validator.
+- `2.12.0` — `GpuResetErrorCode.GpuHung`: an nvidia-smi query the reset needs (GPU list, topology or GPU processes) timed out, so the GPUs stopped responding and the reset cannot run. An older backend does not know the code, so it must take 2.12.0 before a validator sends it.
 - `1.0.0` — first release.
 
 ## Tests

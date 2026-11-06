@@ -287,6 +287,37 @@ async def test_every_precheck_refusal_changes_nothing(host, kwargs, code):
     _no_change(host, start)
 
 
+@pytest.mark.parametrize(
+    "command_prefix", ["nvidia-smi --query-gpu=", "nvidia-smi topo -m", "nvidia-smi --query-compute-apps="]
+)
+@pytest.mark.asyncio
+async def test_a_timed_out_nvidia_smi_query_is_a_hung_gpu(command_prefix):
+    # DAH-5736: a hung GPU makes nvidia-smi time out with empty output; that is not "no GPU on the host"
+    host = FakeHost()
+    real_run = host.run
+
+    async def run(cmd: str, **kwargs):
+        if cmd.startswith(command_prefix):
+            host.commands.append(cmd)
+            return make_command_result(False, exit_code=-1, error_type="timeout")
+        return await real_run(cmd, **kwargs)
+
+    host.run = run
+    report, start = await _reset(host)
+    assert not report.ok and report.error_code == GpuResetErrorCode.GpuHung and report.gpus == []
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_a_finished_nvidia_smi_that_lists_no_gpu_is_still_not_supported():
+    host = FakeHost()
+    host.gpus = ""
+    report, start = await _reset(host)
+    assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert "listed no GPU" in report.detail
+    _no_change(host, start)
+
+
 @pytest.mark.asyncio
 async def test_a_mig_nvlink_peer_refuses_the_reset():
     # pod index 1 is U[0] (bus 1B); its NVLink peer U[1] is MIG, so widening to it must refuse

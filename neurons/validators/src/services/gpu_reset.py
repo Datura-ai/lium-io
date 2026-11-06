@@ -46,7 +46,7 @@ from services.redis_service import RecentGpuReset
 
 if TYPE_CHECKING:
     # Type-only, as in gpu_wedge: services.task at runtime reaches back into the checks.
-    from services.task.runner import SSHCommandRunner
+    from services.task.runner import SSHCommandResult, SSHCommandRunner
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +291,13 @@ def _tail(text: str | None) -> str:
     return (text or "").strip()[-_DETAIL_TAIL_CHARS:]
 
 
+def _refusal_for_failed_query(result: SSHCommandResult, detail: str) -> GpuResetRefused:
+    """A refused nvidia-smi query; one that timed out is a hung GPU, not a node without GPUs (DAH-5736)."""
+    if result.error_type == "timeout":
+        return GpuResetRefused(GpuResetErrorCode.GpuHung, f"nvidia-smi did not answer in {_QUERY_TIMEOUT_SECONDS} s")
+    return GpuResetRefused(GpuResetErrorCode.ResetNotSupported, detail)
+
+
 async def _run(runner: SSHCommandRunner, cmd: str, timeout: int = _QUERY_TIMEOUT_SECONDS):
     return await runner.run(cmd, timeout=timeout, retryable=False)
 
@@ -371,7 +378,7 @@ async def _precheck(
     host_gpus_result = await _run(runner, HOST_GPUS_COMMAND)
     host_gpus = parse_host_gpus(host_gpus_result.stdout or "")
     if host_gpus_result.exit_code != 0 or not host_gpus:
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "nvidia-smi listed no GPU on the host")
+        raise _refusal_for_failed_query(host_gpus_result, "nvidia-smi listed no GPU on the host")
     host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
     gpus = pod_gpus(device_requests, host_gpus, pod_gpu_uuids, gpu_indices)
     ordered, requested, index_by_uuid = gpus.ordered, gpus.requested, gpus.index_by_uuid
@@ -467,7 +474,7 @@ async def _widen_targets_to_nvlink_peers(
         return list(ordered), fabric_services
     topology = await _run(runner, TOPOLOGY_COMMAND)
     if topology.exit_code != 0:
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "could not read the GPU topology")
+        raise _refusal_for_failed_query(topology, "could not read the GPU topology")
     peers = parse_nvlink_peers(topology.stdout or "", host_gpus)
     targets = set(requested)
     frontier = list(requested)
@@ -630,7 +637,7 @@ async def _processes_outside(
     PIDs in ignore_cgroup (the validator's own session) do not count."""
     apps = await _run(runner, COMPUTE_APPS_COMMAND)
     if apps.exit_code != 0:
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "could not list the GPU processes")
+        raise _refusal_for_failed_query(apps, "could not list the GPU processes")
     pids = sorted({pid for pid, uuid in parse_compute_apps(apps.stdout or "") if uuid in targets})
     if container_id is None and ignore_cgroup is None:
         return pids
