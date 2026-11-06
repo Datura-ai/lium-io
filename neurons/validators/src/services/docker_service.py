@@ -399,7 +399,8 @@ _PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
 _LISTENING_PORTS_COMMAND = (
     "{ ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null; docker ps --format '{{.Ports}}' 2>/dev/null; } || true"
 )
-_PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})->")
+# docker ps prints a published block as a range: `0.0.0.0:20040-20049->20040-20049/tcp`
+_PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})(?:-(\d{1,5}))?->[\d-]+/tcp")
 # dockerd's two bind refusals name the host address the bind was for:
 #   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
 #   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
@@ -474,9 +475,12 @@ def _port_collision_candidates(
 
 def _parse_listening_ports(output: str) -> set[int]:
     """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`),
-    plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`)."""
+    plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`, ranges too)."""
     ports: set[int] = {
-        int(port) for port in _PUBLISHED_HOST_PORT_RE.findall(output) if 0 < int(port) <= 65535
+        port
+        for first, last in _PUBLISHED_HOST_PORT_RE.findall(output)
+        for port in range(int(first), int(last or first) + 1)
+        if 0 < port <= 65535
     }
     for line in output.splitlines():
         for column in line.split():
@@ -3536,7 +3540,8 @@ class DockerService:
         spare_port_pairs: list[PayloadPortMapping],
         default_extra: dict,
     ) -> ContainerRunSpec | None:
-        """Move the mapping dockerd could not bind to the next free advertised pair.
+        """Move the mapping dockerd could not bind, and every other mapping of the pod whose host port the
+        host's live listing shows taken, to the next free advertised pairs.
 
         Returns the run spec with the new host port, having rewritten `port_maps` in place and
         taken the pair out of `spare_port_pairs`. Returns None when the refusal names no host port
@@ -3560,42 +3565,52 @@ class DockerService:
                 )
             )
             return None
-        docker_port, old_internal, old_external = port_maps[index]
-        candidates = _port_collision_candidates(spare_port_pairs, after_host_port=bound_port)
         listening = await self._listening_host_ports(ssh_client, default_extra)
-        chosen = next(
-            (pair for pair in candidates if listening is None or pair.internal_port not in listening),
-            None,
-        )
-        if chosen is None:
-            raise RentalPortCollisionError(
-                f"docker run could not bind host port {bound_port} and the next "
-                f"{len(candidates)} advertised port(s) "
-                f"{[pair.internal_port for pair in candidates]} are listening too: {exc}"
-            ) from exc
-        spare_port_pairs.remove(chosen)
-        port_maps[index] = (docker_port, chosen.internal_port, chosen.external_port)
-        logger.warning(
-            _m(
-                "PORT_COLLISION_REMAPPED",
-                extra=get_extra_info({
-                    **default_extra,
-                    "error_class": PORT_COLLISION_ERROR_CLASS,
-                    "docker_port": docker_port,
-                    "old_host_port": old_internal,
-                    "old_external_port": old_external,
-                    "new_host_port": chosen.internal_port,
-                    "new_external_port": chosen.external_port,
-                    "candidates": [pair.internal_port for pair in candidates],
-                    "probe": "listening" if listening is not None else "inconclusive",
-                }),
+        # DAH-5797: a pod being removed (deleted seconds ago, its container still up) holds the whole
+        # block its ports were in; moving one refused port per retry ran out of remaps on a 10-port block
+        to_move = [index] + [
+            i for i, (_, internal, _) in enumerate(port_maps) if i != index and listening and internal in listening
+        ]
+        moved: dict[int, int] = {}
+        for i in to_move:
+            docker_port, old_internal, old_external = port_maps[i]
+            candidates = _port_collision_candidates(spare_port_pairs, after_host_port=old_internal)
+            chosen = next(
+                (pair for pair in candidates if listening is None or pair.internal_port not in listening),
+                None,
             )
-        )
+            if chosen is None:
+                if i != index:
+                    continue  # docker run refuses it next and the following remap tries again
+                raise RentalPortCollisionError(
+                    f"docker run could not bind host port {bound_port} and the next "
+                    f"{len(candidates)} advertised port(s) "
+                    f"{[pair.internal_port for pair in candidates]} are listening too: {exc}"
+                ) from exc
+            spare_port_pairs.remove(chosen)
+            port_maps[i] = (docker_port, chosen.internal_port, chosen.external_port)
+            moved[old_internal] = chosen.internal_port
+            logger.warning(
+                _m(
+                    "PORT_COLLISION_REMAPPED",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error_class": PORT_COLLISION_ERROR_CLASS,
+                        "docker_port": docker_port,
+                        "old_host_port": old_internal,
+                        "old_external_port": old_external,
+                        "new_host_port": chosen.internal_port,
+                        "new_external_port": chosen.external_port,
+                        "candidates": [pair.internal_port for pair in candidates],
+                        "probe": "listening" if listening is not None else "inconclusive",
+                    }),
+                )
+            )
         return dataclasses.replace(
             run_spec,
             ports=tuple(
-                dataclasses.replace(binding, host_port=chosen.internal_port)
-                if binding.protocol == "tcp" and binding.host_port == old_internal
+                dataclasses.replace(binding, host_port=moved[binding.host_port])
+                if binding.protocol == "tcp" and binding.host_port in moved
                 else binding
                 for binding in run_spec.ports
             ),
@@ -4701,6 +4716,8 @@ class DockerService:
           preserved for cross-miner isolation on shared physical hosts)
         - 'health_check_*' — backend executor_health_check probes (hotkey-agnostic,
           backend creates these without a hotkey segment — see DAH-1991)
+        - 'port_test_*' — the validator's port verifier (--network=host, so its host ports
+          are invisible to the listening-port probe)
 
         DAH-2272: rentals take priority over background verification. Rather than
         WAITING for a lingering probe to clear (the old max_retries/retry_delay
