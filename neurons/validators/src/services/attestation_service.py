@@ -150,7 +150,13 @@ class AttestationService:
 
         return AttestationNonce.issue()
 
-    async def record_attestation_event(self, miner_hotkey: str, executor_uuid: str, passed: bool) -> None:
+    @staticmethod
+    def _host_key_digest(host_key: str | None) -> str:
+        return hashlib.sha256((host_key or "").encode("utf-8")).hexdigest()
+
+    async def record_attestation_event(
+        self, miner_hotkey: str, executor_uuid: str, passed: bool, host_key: str | None = None
+    ) -> None:
         """Record a nonce-bound event: a pass starts the interval, a failure forces a nonce next wave."""
         if self.redis_service is None:
             return
@@ -163,8 +169,10 @@ class AttestationService:
                 await self.redis_service.set(cadence_key, str(now), ex=interval, nx=True)
                 raw = await self.redis_service.get(cadence_key)
                 started = float(raw.decode() if isinstance(raw, bytes) else raw) if raw else now
+                # bound to the host key that passed: another key under this uuid has not
                 await self.redis_service.set(
-                    f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}", "1",
+                    f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}",
+                    self._host_key_digest(host_key),
                     ex=max(1, int(started + interval - now)),
                 )
             else:
@@ -179,14 +187,16 @@ class AttestationService:
                 extra=get_extra_info({"miner_hotkey": miner_hotkey, "error": str(exc)}),
             ))
 
-    async def has_recent_nonce_bound_pass(self, miner_hotkey: str, executor_uuid: str) -> bool:
+    async def has_recent_nonce_bound_pass(self, miner_hotkey: str, executor_uuid: str, host_key: str | None) -> bool:
         """Evidence without a challenge stands only for an executor that recently passed its own.
 
         A Redis error propagates: the run ends as VALIDATOR_REDIS_UNAVAILABLE (withheld), not as a node failure.
         """
         if self.redis_service is None:
             return False
-        return bool(await self.redis_service.get(f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}"))
+        raw = await self.redis_service.get(f"{TDX_EXECUTOR_NONCE_PASS_PREFIX}:{miner_hotkey}:{executor_uuid}")
+        stored = raw.decode() if isinstance(raw, bytes) else raw
+        return stored == self._host_key_digest(host_key)
 
     def _expected_report_data(self, host_key: str) -> str:
         digest = hashlib.sha256(self.REPORT_PREFIX +

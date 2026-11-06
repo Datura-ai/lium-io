@@ -176,10 +176,10 @@ class TaskService:
                 if attestation_digest is not None:
                     if attestation_nonce is not None:
                         await self.attestation_service.record_attestation_event(
-                            miner_info.miner_hotkey, executor_info.uuid, attestation_passed
+                            miner_info.miner_hotkey, executor_info.uuid, attestation_passed, executor_info.ssh_host_key
                         )
                     elif not await self.attestation_service.has_recent_nonce_bound_pass(
-                        miner_info.miner_hotkey, executor_info.uuid
+                        miner_info.miner_hotkey, executor_info.uuid, executor_info.ssh_host_key
                     ):
                         await self.attestation_service.record_attestation_event(
                             miner_info.miner_hotkey, executor_info.uuid, False

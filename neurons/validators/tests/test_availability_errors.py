@@ -439,7 +439,7 @@ _PASSED = HostPolicyResult(attestation_digest="d", gpu_attestation_passed=True)
 _NO_QUOTE = HostPolicyResult()
 
 
-async def _wave(attestation, miner_hotkey, outcomes, executor_id=None) -> dict[str, bool]:
+async def _wave(attestation, miner_hotkey, outcomes, executor_id=None, host_keys=None) -> dict[str, bool]:
     """One validation wave of a miner: each executor's policy outcome -> did it get past attestation."""
     nonce = await attestation.maybe_issue_nonce(miner_hotkey, executor_id)
     reached = {}
@@ -452,6 +452,7 @@ async def _wave(attestation, miner_hotkey, outcomes, executor_id=None) -> dict[s
         service.attestation_service.has_recent_nonce_bound_pass = attestation.has_recent_nonce_bound_pass
         miner, executor = _a_job_for(uuid)
         miner.miner_hotkey = miner_hotkey
+        executor.ssh_host_key = (host_keys or {}).get(uuid, f"ssh-ed25519 key-of-{uuid}")
         dialled = AsyncMock(side_effect=asyncssh.Error(code=1, reason="refused"))
 
         class _Shell(_ShellThatRefusesToConnect):
@@ -558,3 +559,19 @@ async def test_an_executor_left_out_of_the_due_challenge_loses_its_earlier_pass(
         "B": True,
         "C": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_another_host_key_under_a_passed_executor_id_has_not_passed(monkeypatch) -> None:
+    from core.config import settings
+    from services.attestation_service import AttestationService
+
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    attestation = AttestationService(redis_service=_DictRedis())
+    await _wave(attestation, "5Miner", [("A", _PASSED), ("B", _PASSED)])
+
+    reached = await _wave(
+        attestation, "5Miner", [("A", _PASSED), ("B", _PASSED)], host_keys={"B": "ssh-ed25519 another-key"}
+    )
+
+    assert reached == {"A": True, "B": False}
