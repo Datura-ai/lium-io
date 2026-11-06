@@ -39,7 +39,15 @@ class DockerUserNamespaceWorkspace:
     read_only: bool
 
 
-ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace
+@dataclass(frozen=True)
+class NamespaceWorkspace:
+    """Inside the helper: an encrypted workspace, reached by running commands under nsenter -t pid -U."""
+
+    pid: int
+    path: PurePosixPath
+
+
+ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace | NamespaceWorkspace
 
 
 @dataclass(frozen=True)

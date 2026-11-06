@@ -9485,6 +9485,9 @@ class DockerService:
                     on_ssh_connected=start_early_probes,
                     log_extra=default_extra,
                 )
+                # sessions reopened after an executor restart (bootstrap restore); entered before the edit swap so
+                # they close after its undo, which runs on them
+                reopened_ssh = await connections.enter_async_context(AsyncExitStack())
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
                     _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
@@ -10270,7 +10273,8 @@ class DockerService:
                     # path is on hold (_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD): the preflight
                     # refused the create before this point.
                     current_step = "bootstrap_restore"
-                    await self._run_bootstrap_restore(
+                    # an executor restart during the restore replaces the session; the rest of the create uses the new one
+                    ssh_client = await self._run_bootstrap_restore(
                         ssh_client=ssh_client,
                         executor_info=executor_info,
                         payload=payload,
@@ -10278,7 +10282,11 @@ class DockerService:
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
                         encrypted=False,
+                        reconnect_ssh=lambda: reopened_ssh.enter_async_context(
+                            _connect_own_ssh(executor_info, pkey, known_hosts_policy)
+                        ),
                     )
+                    edit_swap.ssh_client = ssh_client  # its undo runs on the live session
                 # a fresh rental fails before its container exists rather than start without what it asked for
                 is_fresh_create = not payload.local_volume
                 if external_volume_info:
@@ -10752,7 +10760,7 @@ class DockerService:
                             # fresh mount, but the restore comes first, so it cannot erase the
                             # keys the injection puts under /root.
                             current_step = "bootstrap_restore"
-                            await self._run_bootstrap_restore(
+                            ssh_client = await self._run_bootstrap_restore(
                                 ssh_client=ssh_client,
                                 executor_info=executor_info,
                                 payload=payload,
@@ -10761,7 +10769,11 @@ class DockerService:
                                 local_volume_path=local_volume_path,
                                 encrypted=True,
                                 container_name=container_name,
+                                reconnect_ssh=lambda: reopened_ssh.enter_async_context(
+                                    _connect_own_ssh(executor_info, pkey, known_hosts_policy)
+                                ),
                             )
+                            edit_swap.ssh_client = ssh_client  # its undo runs on the live session
 
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
@@ -11292,7 +11304,9 @@ class DockerService:
         local_volume_path: str,
         encrypted: bool,
         container_name: str | None = None,
-    ) -> None:
+        reconnect_ssh: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
+    ) -> asyncssh.SSHClientConnection:
+        """Run the restore; return the SSH connection the create continues on (a new one after an executor restart)."""
         if encrypted and not container_name:
             # No mode exists that restores into an encrypted volume without the pod: the
             # only other way is to hand the executor the passphrase, which is the leak this
@@ -11311,7 +11325,7 @@ class DockerService:
                     local_volume=local_volume,
                     local_volume_path=local_volume_path,
                 )
-                return
+                return ssh_client
             raise RuntimeError(
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
@@ -11367,7 +11381,8 @@ class DockerService:
             spec,
             retain_terminal_artifacts=True,
         )
-        await wait_for_storage_operation(ssh_client, files)
+        # an executor restart drops this SSH session; the restore keeps running and the wait reattaches to it
+        return await wait_for_storage_operation(ssh_client, files, reconnect=reconnect_ssh, spec=spec)
 
     async def _run_legacy_bootstrap_restore(
         self,

@@ -837,7 +837,7 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
 ):
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers(container))
-    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
+    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock(side_effect=lambda **kwargs: kwargs["ssh_client"]))
     payload = _deploy_payload(**payload_fields)
     payload.bootstrap_restore = Mock(restore_log_id="restore-log") if bootstrap_restore else None
 
@@ -863,7 +863,7 @@ async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
     """DAH-3980: the live power query overlaps the volume create, unless a restore runs first."""
     svc = svc_fixture
     _wire_early_probes(svc, monkeypatch, image_present=True)
-    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
+    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock(side_effect=lambda **kwargs: kwargs["ssh_client"]))
     raise_low = AsyncMock(return_value=0)
     monkeypatch.setattr("services.docker_service.raise_low_power_limits_to_default", raise_low)
     raised_at_volume_creation: list[int] = []
