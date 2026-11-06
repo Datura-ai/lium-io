@@ -161,7 +161,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
     **Optional parameters:**
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
 
-    **Tier:** a node added with this command starts on the **Spot** tier; the command has no tier option. A Secure node you deleted in the Provider Portal and add again at the same IP and port within 7 days stays **Secure**. To move a node to **Secure**, open the node's page in the Provider Portal and click **Change Tier**; Spot to Secure works at any time.
+    **Tier:** a node added with this command starts on the **Spot** tier; the command has no tier option. A node you deleted in the Provider Portal and add again at the same IP and port within 7 days keeps its earlier tier. To move it to **Secure**, open the node's page in the Provider Portal and click **Change Tier**; a node can change tier once every 24 hours.
 
 ### List Executors
 
