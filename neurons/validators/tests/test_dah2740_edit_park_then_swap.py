@@ -1283,6 +1283,7 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
         (3600, "containerd", True),
         (0, "given", False),  # stopped on the containerd store: the upper dir the running read used
         (0, "none", True),  # no upper dir anywhere: docker diff decides, and lists the startup file
+        (0, "kept", True),  # a copy already kept: the age bound never releases it, only docker diff decides
     ],
 )
 def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created_ago, store, kept):
@@ -1314,11 +1315,11 @@ def test_the_layer_read_skips_files_the_image_wrote_at_startup(tmp_path, created
         "exit 2\n"
     )
     docker.chmod(0o755)
-    command = _layer_data_check("pod_x", "/root", host_upper if store == "given" else None)
+    command = _layer_data_check("pod_x", "/root", host_upper if store == "given" else None, store != "kept")
     command = command.replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
     out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout.strip().splitlines()
     assert (out[-1:] != ["drop"]) is kept
-    assert (f"upper {host_upper}" in out) is (store != "none")
+    assert (f"upper {host_upper}" in out) is (store not in ("none", "kept"))
 
 
 @pytest.mark.asyncio
@@ -1335,8 +1336,8 @@ async def test_a_clean_kept_leftover_next_to_the_pod_is_removed_before_parking(s
     assert isinstance(result, ContainerCreated)
     removed = ssh.commands.index(f"/usr/bin/docker rm -fv id-{old}")
     assert removed < ssh.commands.index(f"/usr/bin/docker rename {_pod_name(payload)} {_kept(payload)}")
-    # the same read as any container: a validator restart's clean copy is released, not kept for good
-    assert _layer_data_check(f"id-{old}", "/root") in ssh.commands
+    # an already-kept copy is released by docker diff alone, never by the startup-age bound
+    assert _layer_data_check(f"id-{old}", "/root", startup_shortcut=False) in ssh.commands
 
 
 @pytest.mark.asyncio
