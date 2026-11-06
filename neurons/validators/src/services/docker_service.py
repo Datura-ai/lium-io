@@ -9483,6 +9483,9 @@ class DockerService:
                     on_ssh_connected=start_early_probes,
                     log_extra=default_extra,
                 )
+                # sessions reopened after an executor restart (bootstrap restore); entered before the edit swap so
+                # they close after its undo, which runs on them
+                reopened_ssh = await connections.enter_async_context(AsyncExitStack())
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
                     _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
@@ -10277,10 +10280,11 @@ class DockerService:
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
                         encrypted=False,
-                        reconnect_ssh=lambda: connections.enter_async_context(
+                        reconnect_ssh=lambda: reopened_ssh.enter_async_context(
                             _connect_own_ssh(executor_info, pkey, known_hosts_policy)
                         ),
                     )
+                    edit_swap.ssh_client = ssh_client  # its undo runs on the live session
                 # a fresh rental fails before its container exists rather than start without what it asked for
                 is_fresh_create = not payload.local_volume
                 if external_volume_info:
@@ -10763,10 +10767,11 @@ class DockerService:
                                 local_volume_path=local_volume_path,
                                 encrypted=True,
                                 container_name=container_name,
-                                reconnect_ssh=lambda: connections.enter_async_context(
+                                reconnect_ssh=lambda: reopened_ssh.enter_async_context(
                                     _connect_own_ssh(executor_info, pkey, known_hosts_policy)
                                 ),
                             )
+                            edit_swap.ssh_client = ssh_client  # its undo runs on the live session
 
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
