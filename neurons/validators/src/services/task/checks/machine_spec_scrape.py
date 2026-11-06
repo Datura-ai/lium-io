@@ -19,6 +19,7 @@ from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
+from .task_time import task_seconds_left
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -410,6 +411,21 @@ class MachineSpecScrapeCheck:
         # ran it, so the binary would print the same thing for the price of a 13 MB upload.
         if scrape_run.exit_code != 0 and _scrape_reported_its_own_failure(scrape_run.stdout):
             return result
+
+        # DAH-5899: the cycle builds its binary only now, once for every node that needs it; the build counts
+        # against the task's time, and a retry whose scrape would no longer fit keeps the stdin verdict
+        if ctx.config.machine_scrape_binary is not None:
+            try:
+                await ctx.config.machine_scrape_binary.ensure()
+            except Exception as exc:
+                logger.error(
+                    _m("[scrape] binary build failed; keeping the stdin result", extra=get_extra_info(
+                        {**ctx.default_extra, "error": str(exc)[:400]}
+                    ))
+                )
+                return result
+            if task_seconds_left(ctx) < timeout:
+                return result
 
         return await self._retry_scrape_with_uploaded_binary(
             ctx, timeout, fallback_from=StdinAttempt.from_failed_result(result)

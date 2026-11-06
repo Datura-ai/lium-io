@@ -925,3 +925,93 @@ def test_the_scrape_codes_split_into_host_side_and_undetermined():
         "SCRAPE_FAILED_ON_HOST",
     }
     assert SCRAPE_UNDETERMINED_FAILURE_REASONS == {"SCRAPE_TIMEOUT", "SCRAPE_TRANSPORT_FAILED"}
+
+
+class FakeBinaryBuild:
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        self.ensure_calls = 0
+
+    async def ensure(self) -> None:
+        self.ensure_calls += 1
+        if self.error:
+            raise self.error
+
+
+def _stdin_failure_ctx(context_factory, runner, ssh_client, binary_build):
+    return context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
+        config=build_context_config(machine_scrape_source="print('scrape')", machine_scrape_binary=binary_build),
+        state=build_state(upload_local_dir="/local/validator/files"),
+        runner=runner,
+        ssh=ssh_client,
+        encrypt_key="test-encrypt-key",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_that_passes_over_stdin_never_builds_the_binary(context_factory):
+    # DAH-5899: a normal cycle delivers the source and must not freeze the binary
+    binary_build = FakeBinaryBuild()
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    ctx = _stdin_failure_ctx(context_factory, runner, DummySSHClient(), binary_build)
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is True
+    assert binary_build.ensure_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_stdin_scrape_builds_the_binary_before_its_upload_retry(context_factory):
+    binary_build = FakeBinaryBuild()
+    runner = DummySSHCommandRunner(
+        results=[
+            make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600),
+            make_command_result(success=True, stdout=FERNET_TOKEN),
+        ]
+    )
+    ssh_client = DummySSHClient()
+    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, binary_build)
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["delivery"] == "upload"
+    assert binary_build.ensure_calls == 1
+    assert ssh_client.sftp_client.put_called_with is not None
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_no_longer_fits_after_the_build_keeps_the_stdin_verdict(context_factory, mocker):
+    # the build counts against the 780 s task budget; a retry whose 300 s scrape cannot finish is not started
+    mocker.patch(
+        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", return_value=299
+    )
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
+    )
+    ssh_client = DummySSHClient()
+    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, FakeBinaryBuild())
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert len(runner.calls) == 1
+    assert ssh_client.sftp_client.put_called_with is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_keeps_the_stdin_verdict(context_factory):
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
+    )
+    ssh_client = DummySSHClient()
+    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, FakeBinaryBuild(RuntimeError("exit 1")))
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert ssh_client.sftp_client.put_called_with is None

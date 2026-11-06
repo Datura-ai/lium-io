@@ -480,8 +480,9 @@ class Validator:
                     self.first_cycle_started_at = datetime.now(UTC)
                 # A fresh job-files directory for this cycle; the ones an express verification
                 # still reads are kept (DAH-2958). The express lane uses the new one from here on.
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=self.express_lane.directories_in_use()
+                # DAH-5899: the binary is built later, only if a stdin scrape fails.
+                encrypted_files = self.file_encrypt_service.prepare_cycle_job_files(
+                    keep_directories=self.express_lane.directories_in_use
                 )
                 self.cycle_inputs = CycleInputs(
                     encrypted_files=encrypted_files,
