@@ -65,6 +65,8 @@ class AvailabilityErrorCode(StrEnum):
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
     GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
+    # A reported card the create step cannot attach, so every rent on it fails (GpuKernelCountCheck).
+    GPU_KERNEL_UNATTACHABLE = "GPU_KERNEL_UNATTACHABLE"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
@@ -73,6 +75,7 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_LOST,
         AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
         AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
+        AvailabilityErrorCode.GPU_KERNEL_UNATTACHABLE,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
