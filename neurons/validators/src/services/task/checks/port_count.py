@@ -90,7 +90,7 @@ def split_ports_event(
             **(what or {}),
         },
         remediation=(
-            f"{port_count} renting ports answered, {required} required. "
+            f"{ports_answered_text(state, port_count, required)} "
             f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
             f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
             "then run `docker compose restart executor-runner` in neurons/executor. Edit .env with nano: "
@@ -98,6 +98,13 @@ def split_ports_event(
         ),
         extra=extra,
     )
+
+
+def ports_answered_text(state: ContextState, port_count: int, required: int) -> str:
+    """The measured-vs-required prefix; a deferred cycle has no current reading to state."""
+    if state.port_check_deferred:
+        return "Renting-port check deferred; no current measurement. Wait for the next check."
+    return f"{port_count} renting ports answered, {required} required."
 
 
 def hidden_from_renters_text(available_port_count: int) -> str:
@@ -232,7 +239,7 @@ class PortCountCheck:
                     "the validator retries every cycle; a host reboot frees them at once."
                 )
                 if orphaned
-                else f"{port_count} renting ports answered, {MIN_PORT_COUNT} required. {Msg.INSUFFICIENT_PORTS.remediation}",
+                else f"{ports_answered_text(updated_state, port_count, MIN_PORT_COUNT)} {Msg.INSUFFICIENT_PORTS.remediation}",
             )
             return CheckResult(
                 passed=False,

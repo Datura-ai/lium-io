@@ -341,7 +341,10 @@ async def test_a_low_power_limit_names_each_gpu_measured_and_required(context_fa
 
     result = await GpuPowerLimitCheck().run(ctx)
 
-    assert result.event.remediation.startswith("GPU 0: 105 W limit, default 350 W (30%); required at least 90%")
+    # the requirement is the message's own wording, never a second copy of the threshold
+    assert result.event.remediation.startswith(
+        "GPU 0: 105 W limit, default 350 W (30%). Restore the GPU power limit to at least 90% of the default"
+    )
 
 
 @pytest.mark.asyncio
@@ -350,4 +353,7 @@ async def test_a_power_limit_just_under_the_floor_never_shows_as_meeting_it(cont
 
     result = await GpuPowerLimitCheck().run(ctx)
 
-    assert result.event.remediation.startswith("GPU 0: 315 W limit, default 350 W (89%); required at least 90%")
+    # the requirement is the message's own wording, never a second copy of the threshold
+    assert result.event.remediation.startswith(
+        "GPU 0: 315 W limit, default 350 W (89%). Restore the GPU power limit to at least 90% of the default"
+    )

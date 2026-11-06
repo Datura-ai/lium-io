@@ -7,6 +7,7 @@ probe cascade and checks to show where the 2 comes from and what each run now re
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -237,6 +238,25 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     assert (what["listing_check"], what["port_range"]) == ("INSUFFICIENT_PORTS", DECLARED_RANGE)
     assert count_result.event.remediation.startswith(f"2 renting ports answered, {MIN_PORT_COUNT} required.")
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("deferred", "prefix"),
+    [
+        (False, f"2 renting ports answered, {MIN_PORT_COUNT} required."),
+        (True, "Renting-port check deferred; no current measurement. Wait for the next check."),
+    ],
+)
+async def test_the_port_message_states_a_measurement_only_when_one_was_taken(context_factory, deferred, prefix):
+    ctx = run_context(context_factory, connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()))
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, port_check_deferred=deferred)})
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.remediation.startswith(prefix)
 
 @pytest.mark.asyncio
 async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_completed(context_factory):

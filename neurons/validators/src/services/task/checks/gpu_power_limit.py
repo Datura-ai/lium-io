@@ -123,7 +123,7 @@ class GpuPowerLimitCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 remediation=(
-                    f"{measured}; required at least {MIN_POWER_LIMIT_RATIO:.0%} of the default. Restore it with "
+                    f"{measured}. {Msg.LIMIT_BELOW_DEFAULT.remediation} Restore it with "
                     "`sudo nvidia-smi -i <GPU> -pl <default W>`."
                 ),
                 what={
