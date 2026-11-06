@@ -528,6 +528,10 @@ class MachineSpecScrapeCheck:
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
             raw_gpu_details = gpu_info.get("details", []) or []
+            # DAH-5302: GpuPowerLimitCheck writes the host limit under our Pearl cap; a provider must never report it
+            for detail in raw_gpu_details:
+                if isinstance(detail, dict):
+                    detail.pop("power_host_limit", None)
             # The native capability challenge derives its key from the raw NVML name in
             # specs. Policy and scoring use the canonicalized state fields below.
             gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
