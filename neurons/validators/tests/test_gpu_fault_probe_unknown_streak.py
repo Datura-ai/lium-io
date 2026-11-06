@@ -60,7 +60,7 @@ async def test_a_no_verdict_streak_is_logged_from_the_limit_and_still_passes(
 ):
     with caplog.at_level(logging.WARNING, logger=module.logger.name):
         results = await _cycles(
-            context_factory, [NO_VERDICT] * (UNKNOWN_STREAK_LIMIT + 1), enforce=True
+            context_factory, [NO_VERDICT] * (UNKNOWN_STREAK_LIMIT + 1)
         )
 
     assert all(result.passed for result in results)
@@ -86,7 +86,6 @@ async def test_under_both_switches_a_no_verdict_streak_fails_like_a_fault(contex
     results = await _cycles(
         context_factory,
         [NO_VERDICT] * UNKNOWN_STREAK_LIMIT,
-        enforce=True,
         enforce_unknown_streak=True,
     )
 
@@ -96,25 +95,11 @@ async def test_under_both_switches_a_no_verdict_streak_fails_like_a_fault(contex
 
 
 @pytest.mark.asyncio
-async def test_the_streak_switch_alone_stays_in_shadow(context_factory):
-    results = await _cycles(
-        context_factory,
-        [NO_VERDICT] * UNKNOWN_STREAK_LIMIT,
-        enforce=False,
-        enforce_unknown_streak=True,
-    )
-
-    assert all(result.passed for result in results)
-    assert results[-1].event.reason_code == Msg.PROBE_FAILED.reason
-
-
-@pytest.mark.asyncio
 async def test_a_card_too_busy_to_probe_does_not_count_toward_the_streak(context_factory, caplog):
     with caplog.at_level(logging.WARNING, logger=module.logger.name):
         results = await _cycles(
             context_factory,
             [BUSY] * (UNKNOWN_STREAK_LIMIT + 1),
-            enforce=True,
             enforce_unknown_streak=True,
         )
 
@@ -128,7 +113,6 @@ async def test_a_busy_cycle_neither_counts_nor_ends_a_streak(context_factory):
     results = await _cycles(
         context_factory,
         [NO_VERDICT] * (UNKNOWN_STREAK_LIMIT - 1) + [BUSY, NO_VERDICT],
-        enforce=True,
         enforce_unknown_streak=True,
     )
 
@@ -140,7 +124,6 @@ async def test_a_busy_card_beside_a_silent_one_still_counts(context_factory):
     results = await _cycles(
         context_factory,
         [BUSY_AND_HUNG] * UNKNOWN_STREAK_LIMIT,
-        enforce=True,
         enforce_unknown_streak=True,
     )
 
