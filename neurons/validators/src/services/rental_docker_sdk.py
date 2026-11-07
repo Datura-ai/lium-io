@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import http.client
 import logging
+import re
 import socket as socket_module
 import tempfile
 import threading
@@ -10,7 +11,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import TypeVar
@@ -1068,6 +1069,27 @@ class RentalDockerSdkClient:
                     or None,
                 )
             except Exception as exc:
+                daemon_cpus = _daemon_cpu_count_from_refusal(exc)
+                # The daemon has fewer CPUs than advertised but within the DAH-2671 bound (as the
+                # health probe's retry allows): rent with the daemon's count, label included, once.
+                cpus = spec.cpu_count
+                if cpus and daemon_cpus and daemon_cpus < cpus <= 2 * daemon_cpus + 4:
+                    logger.warning(
+                        _m(
+                            "Docker refused the requested CPUs; retrying with the daemon's count",
+                            extra=get_extra_info(
+                                {
+                                    "container_name": spec.name,
+                                    "requested_cpus": spec.cpu_count,
+                                    "daemon_cpus": daemon_cpus,
+                                }
+                            ),
+                        )
+                    )
+                    return self._run_container_sync(
+                        replace(spec, cpu_count=daemon_cpus, before_create=None),
+                        adopt_existing=adopt_existing,
+                    )
                 # The first attempt's create timed out on the client but still runs in dockerd: it holds
                 # the name (409) while inspect answers 404 until it registers the container. Adopt it then.
                 if not adopt_existing or f'"/{spec.name}" is already in use' not in str(exc):
@@ -2027,6 +2049,12 @@ def _raise_pull_event_error(event) -> None:
 
 def _with_default_tag(driver: str) -> str:
     return driver if ":" in driver else f"{driver}:latest"
+
+
+def _daemon_cpu_count_from_refusal(exc: Exception) -> int | None:
+    """N from dockerd's `range of CPUs is from 0.01 to N.00, as there are only N CPUs available`."""
+    match = re.search(r"there are only (\d+) CPUs available", str(exc))
+    return int(match.group(1)) if match else None
 
 
 def _is_docker_not_found_error(exc: Exception) -> bool:
