@@ -277,15 +277,20 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
         # revisited once per-bucket fill is known. Items: (base_model, result).
         self._split_fallback_candidates: list[tuple[str, JobResult]] = []
-        # Spot-node pay and secure-floor top-ups, in USD/hour. No cap (owner rule): they are paid on
-        # top of the burn-capped rental share, from `unbucketed_share`, and sit in no bucket, so they
-        # neither face nor cause cap dilution and never scale another idle payee.
+        # Spot-node pay and secure-floor top-ups, in USD/hour. No cap on the share (owner rule): they
+        # are paid on top of the burn-capped rental share, from `unbucketed_share`, and sit in no
+        # secure bucket, so they never dilute a secure node. Spot nodes face their own per-bucket
+        # cap at the secure numbers (DAH-5944, spot_count_by_bucket).
         self._unbucketed_rental_cost = 0.0
         self.unbucketed_share = 0.0
         self.unbucketed_share_raw = 0.0
         self.unbucketed_paid_fraction = 1.0
         # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
+        # DAH-5944: idle spot GPUs per (base_model, bucket), a pool of their own under the secure caps.
+        self.spot_count_by_bucket: dict[tuple[str, int], int] = {}
+        # every Spot node counted there, diluted by _dilute_spot_pay_over_cap whichever pay list it is on
+        self._spot_cap_members: list[tuple[str, JobResult]] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
@@ -992,6 +997,7 @@ class RentalPriceIncentive(DefaultIncentive):
         for key, weighted_sum in self._weighted_rate_sum_by_bucket.items():
             cap_mult = self.cap_multiplier_by_bucket.get(key, 0.0)
             self.total_rental_cost += cap_mult * weighted_sum
+        self._dilute_spot_pay_over_cap()
         self._unbucketed_rental_cost += self._spot_pay_within_filler_earnings()
         self._unbucketed_rental_cost += self._secure_floor_top_up()
 
@@ -1232,7 +1238,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _qualify_spot_node(job_result: JobResult, excluded_from_both_pools: bool) -> JobResult:
-        """An idle spot node is never in the mining pool and never in a bucket. It is paid from
+        """An idle spot node is never in the mining pool and never in a secure bucket. It is paid from
         unbucketed_share, on top of the burn-capped rental share, priced in _price_spot_node, only
         while it runs a Lium filler and its GPU configuration has a filler revenue average. The
         idle-pool gates do not apply: the node is paid for the filler work it does, not for being
@@ -1272,13 +1278,18 @@ class RentalPriceIncentive(DefaultIncentive):
         SPOT_IDLE_SECURE_RATE_SHARE x the secure rate for this node).
 
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
-        runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
-        0 where a secure node of this configuration earns no idle pay, so the min() pays 0 there.
+        runtime and driver is listed at, before secure bucket-cap dilution. It is 0 where a secure
+        node of this configuration earns no idle pay, so the min() pays 0 there. Spot GPUs are
+        then capped per (GPU model, bucket) at the secure caps, in a pool of their own
+        (_dilute_spot_pay_over_cap, DAH-5944).
         """
         base_model: str = self.get_base_model_for_gpu(result.gpu_model)
         cap_spec: dict[int, int] = self.config.max_unrented_gpus.get(base_model, {})
+        # shortcut: no DAH-2528 split-tier reassignment for spot, extend it if spot split nodes crowd a bucket.
         bucket: int = self._resolve_bucket(result, cap_spec)
         result.count_bucket = bucket
+        # own fields, not max_cap & co: those mark a Secure tier member for every reader (portal tier breakdown)
+        result.spot_cap = cap_spec.get(bucket, 0)
         result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
         result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
         if base_model not in self.config.rental_incentive_gpu_types:
@@ -1291,12 +1302,29 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         else:
             result.hourly_rate = self._listed_hourly_rate(result)
+        # counted before any rate path below, so every paid Spot GPU sits in the cap pool however its rate is set
+        if result.hourly_rate > 0 and result.spot_cap > 0:
+            key: tuple[str, int] = (base_model, bucket)
+            self.spot_count_by_bucket[key] = (
+                self.spot_count_by_bucket.get(key, 0) + result.gpu_count
+            )
+            self._spot_cap_members.append((base_model, result))
         self._record_zero_driver_and_sysbox_reasons(result, result.driver_multiplier, result.sysbox_multiplier)
         result.effective_rate = min(
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
         )
         self._spot_pay_candidates.append((base_model, result))
+
+    def _dilute_spot_pay_over_cap(self) -> None:
+        """DAH-5944 (Fish): idle spot GPUs of a GPU model and bucket are capped at the secure cap, in a
+        pool of their own (spot never counts against secure caps, nor secure against spot). Above the
+        cap every spot rate there is scaled by min(count, cap) / count, before the DAH-5128 pool."""
+        for base_model, result in self._spot_cap_members:
+            count: int = self.spot_count_by_bucket[(base_model, result.count_bucket)]
+            result.spot_gpus_in_bucket = count
+            result.spot_cap_multiplier = min(count, result.spot_cap) / count
+            result.effective_rate *= result.spot_cap_multiplier
 
     def _spot_pay_within_filler_earnings(self) -> float:
         """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;
