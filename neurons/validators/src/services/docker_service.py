@@ -595,6 +595,45 @@ HOST_KEY_REQUIRED_EXTRA = {
 _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
 _DOCKER_PULL_TIMEOUT_SECONDS = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
+
+
+# DAH-5833: dockerd keeps a download going only while a client watches it, and the SDK pull's client is
+# this connector. A detached host-side pull of the same image shares that download and keeps watching
+# across a connector restart, so the resent create (DAH-5437) joins it instead of starting over.
+def _pull_keeper_pidfile(pod_id: str) -> str:
+    return shlex.quote(f"/tmp/lium-pull-keeper-{pod_id}.pid")
+
+
+def _pull_keeper_marker(pod_id: str) -> str:
+    return shlex.quote(f"LIUM_PULL_KEEPER={pod_id}")
+
+
+def _pull_keeper_alive(pod_id: str) -> str:
+    # the pid is ours only while its environment carries this pod's marker (no kill of a reused pid)
+    return (
+        f'p=$(cat {_pull_keeper_pidfile(pod_id)} 2>/dev/null) && '
+        f'grep -qaF {_pull_keeper_marker(pod_id)} /proc/"$p"/environ 2>/dev/null'
+    )
+
+
+def pull_keeper_start_command(pod_id: str, image: str) -> str:
+    """Start the keeper unless an earlier attempt's keeper for this pod is still pulling."""
+    return (
+        f"{_pull_keeper_alive(pod_id)} || {{ setsid nohup env {_pull_keeper_marker(pod_id)} "
+        f"timeout {int(_DOCKER_PULL_TIMEOUT_SECONDS)} /usr/bin/docker pull {shlex.quote(image)} "
+        f">/dev/null 2>&1 </dev/null & echo $! > {_pull_keeper_pidfile(pod_id)}; }}"
+    )
+
+
+def pull_keeper_wait_command(pod_id: str) -> str:
+    """Block until this pod's keeper exits (at once when there is none)."""
+    return f"while {_pull_keeper_alive(pod_id)}; do sleep 1; done"
+
+
+def pull_keeper_stop_command(pod_id: str) -> str:
+    return f'{_pull_keeper_alive(pod_id)} && kill "$p"; rm -f {_pull_keeper_pidfile(pod_id)}; true'
+
+
 _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # DAH-3257: the pre-run probe carries one nvidia-smi query plus seven docker/procfs listings that
 # take milliseconds, so its bound is the one the per-command path puts on that nvidia-smi query
@@ -9774,6 +9813,47 @@ class DockerService:
                             "success",
                             log_tag,
                         )
+                        # shortcut: no keeper for a pull with registry credentials (the host CLI has none and
+                        # we write none to the host); such a pull still starts over after a restart.
+                        keeper = not has_credentials
+                        if keeper:
+                            with contextlib.suppress(Exception):
+                                await ssh_client.run(
+                                    pull_keeper_start_command(payload.pod_id, payload.docker_image),
+                                    check=False,
+                                    timeout=30,
+                                )
+
+                        async def _stop_keeper() -> None:
+                            if keeper:
+                                with contextlib.suppress(Exception):
+                                    await ssh_client.run(
+                                        pull_keeper_stop_command(payload.pod_id), check=False, timeout=30
+                                    )
+
+                        async def _watched_pull() -> None:
+                            if keeper:
+                                # attach to the keeper, not race it: two concurrent pulls of one image on the
+                                # containerd store fail "failed commit on ref". The SDK pull after it is then a
+                                # no-op, or the real pull (and its error) when the keeper failed.
+                                waited_from = time.monotonic()
+                                with contextlib.suppress(Exception):
+                                    await ssh_client.run(
+                                        pull_keeper_wait_command(payload.pod_id),
+                                        check=False,
+                                        timeout=int(_DOCKER_PULL_TIMEOUT_SECONDS) + 30,
+                                    )
+                                if time.monotonic() - waited_from >= _DOCKER_PULL_TIMEOUT_SECONDS:
+                                    raise RentalDockerOperationError(
+                                        f"Docker SDK pull timed out after {int(_DOCKER_PULL_TIMEOUT_SECONDS)} seconds"
+                                    )
+                            await docker_client.pull(image=payload.docker_image)
+
+                        async def _cancel_pull() -> None:
+                            with contextlib.suppress(Exception):
+                                await docker_client.aclose()
+                            await _stop_keeper()
+
                         try:
                             await self._unless_cancelled_by_delete(
                                 ssh_client,
@@ -9782,14 +9862,16 @@ class DockerService:
                                 run_logged_rental_docker_sdk_operation(
                                     operation="pull",
                                     log_extra=default_extra,
-                                    call=lambda: docker_client.pull(image=payload.docker_image),
+                                    call=_watched_pull,
                                     image=payload.docker_image,
                                 ),
-                                on_cancel=lambda: docker_client.aclose(),
+                                on_cancel=_cancel_pull,
                             )
                         except _CreateCancelledByDelete:
                             raise
                         except Exception as exc:
+                            # not on a cancel: a connector shutdown must leave the keeper running
+                            await _stop_keeper()
                             if login_error is None:
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
@@ -9801,6 +9883,7 @@ class DockerService:
                                 f"Docker login failed: {login_error} (pull without login then failed: {exc})",
                                 login_error,
                             ) from exc
+                        await _stop_keeper()
 
                         # Add profiler for docker pull
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
@@ -12711,6 +12794,10 @@ class DockerService:
                         await clear_filler_pod_applied_caps(
                             self.redis_service, payload.pod_id, log_extra=default_extra
                         )
+
+                # DAH-5833: a create cut off mid-pull leaves its host-side pull running; no-op otherwise.
+                with _best_effort_delete_step(log, "stop_pull_keeper"):
+                    await ssh_client.run(pull_keeper_stop_command(payload.pod_id), check=False, timeout=30)
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.

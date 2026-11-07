@@ -145,6 +145,19 @@ def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
                 stack.append(arg)
 
 
+# DAH-5833: daemon answers to a pull that a retry fixes. "failed commit on ref" is containerd's
+# content-store race between two pulls of one image ("lease does not exist", "rename .../ingest/...:
+# no such file or directory"); the other two are a registry download cut off mid-stream.
+_PULL_TRANSIENT_ERROR_TEXTS = ("failed commit on ref", "connection reset by peer", "unexpected EOF")
+_PULL_TRANSIENT_RETRY_DELAYS_SECONDS = (2, 5)
+
+
+def is_transient_pull_error(exc: BaseException) -> bool:
+    if is_rental_docker_transport_error(exc):
+        return False  # our SSH link, already retried once by _retry_once_on_transport_drop
+    return any(t in str(item) for item in _iter_exception_chain(exc) for t in _PULL_TRANSIENT_ERROR_TEXTS)
+
+
 def is_rental_docker_transport_error(exc: BaseException) -> bool:
     """True when `exc` (or anything in its cause chain) is a dropped-SSH-transport failure.
 
@@ -451,9 +464,7 @@ class RentalDockerSdkClient:
         try:
             # a pull is idempotent (dockerd keeps finished layers), so a dropped SSH channel
             # mid-stream gets the same one re-open + retry as other calls, inside the one deadline
-            pull_call = self._retry_once_on_transport_drop(
-                operation="pull", attempt=lambda: _in_docker_thread(self._pull_sync, image)
-            )
+            pull_call = self._pull_retrying_transient(image)
             if timeout_seconds is not None:
                 await asyncio.wait_for(
                     pull_call,
@@ -471,6 +482,29 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK pull failed", exc)
             ) from exc
+
+    async def _pull_retrying_transient(self, image: str) -> None:
+        # DAH-5833: a concurrent pull of the same image (containerd store) and a registry reset are
+        # transient daemon answers; retry them twice inside the pull deadline, skipping the retry if
+        # the other puller already landed the image.
+        for delay in (*_PULL_TRANSIENT_RETRY_DELAYS_SECONDS, None):
+            try:
+                return await self._retry_once_on_transport_drop(
+                    operation="pull", attempt=lambda: _in_docker_thread(self._pull_sync, image)
+                )
+            except Exception as exc:
+                if delay is None or not is_transient_pull_error(exc):
+                    raise
+                logger.warning(
+                    _m(
+                        "Docker SDK pull retried after a transient daemon error",
+                        extra=get_extra_info({"image": image, "error": _error_text(exc), "delay_s": delay}),
+                    )
+                )
+            await asyncio.sleep(delay)
+            with suppress(Exception):
+                if await self.image_exists(image=image):
+                    return
 
     async def image_exists(self, *, image: str) -> bool:
         return await self._retry_once_on_transport_drop(
