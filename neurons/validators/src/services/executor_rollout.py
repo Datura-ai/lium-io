@@ -42,6 +42,7 @@ from services.task.messages import (
     ExecutorImageMessages,
     FinalizeMessages,
     MachineSpecMessages,
+    PortConnectivityMessages,
     PortCountMessages,
     RentalVerificationMessages,
     SCRAPE_HOST_SIDE_FAILURE_REASONS,
@@ -91,6 +92,8 @@ ROLLOUT_FAILURE_REASONS = frozenset(
         *SCRAPE_HOST_SIDE_FAILURE_REASONS,
         *SCRAPE_UNDETERMINED_FAILURE_REASONS,
         PortCountMessages.INSUFFICIENT_PORTS.reason,
+        # DAH-5981: PortCountCheck's verdict when the SSH connection dropped under the port probe
+        PortConnectivityMessages.VERIFY_FAILED.reason,
         ExecutorImageMessages.OUTDATED.reason,
     }
 )
