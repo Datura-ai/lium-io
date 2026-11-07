@@ -107,6 +107,16 @@ else
 fi
 
 log_step "Building Docker image: ${BOLD}$IMAGE_NAME${NC} (also tagged ${BOLD}$VERSION_IMAGE_NAME${NC})"
-docker build -t "$IMAGE_NAME" -t "$VERSION_IMAGE_NAME" "$SCRIPT_DIR"
+if [ -n "${PLATFORMS:-}" ]; then
+    # Multi-arch (e.g. PLATFORMS=linux/amd64,linux/arm64, needs buildx + QEMU): a multi-platform
+    # image cannot be loaded into the local daemon, so it is written to an OCI archive that the
+    # publish workflow copies to Docker Hub after login (skopeo copy --all oci-archive:...).
+    OCI_ARCHIVE="${OCI_ARCHIVE:-${TMPDIR:-/tmp}/lium-watchtower-$IMAGE_TAG.oci.tar}"  # outside the build context
+    docker buildx build --platform "$PLATFORMS" -t "$IMAGE_NAME" -t "$VERSION_IMAGE_NAME" \
+        --output "type=oci,dest=$OCI_ARCHIVE" "$SCRIPT_DIR"
+    log_info "Wrote $PLATFORMS image to $OCI_ARCHIVE"
+else
+    docker build -t "$IMAGE_NAME" -t "$VERSION_IMAGE_NAME" "$SCRIPT_DIR"
+fi
 
 log_info "Build complete: ${BOLD}$IMAGE_NAME${NC} ${BOLD}$VERSION_IMAGE_NAME${NC}"
