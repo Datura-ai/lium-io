@@ -383,7 +383,7 @@ async def test_batch_is_not_start_hung_when_a_slow_outside_start_left_the_batch_
     ],
 )
 def test_the_provider_sees_the_port_and_why_ssh_failed(error, expected):
-    # ticket-1094: a connect timeout has no text, so the notice read "(ssh: )"
+    # a provider report: a connect timeout has no text, so the notice read "(ssh: )"
     from services.executor_connectivity.dind_probe import describe_ssh_error
 
     assert describe_ssh_error(error, PortPair(22, 20000)) == expected
@@ -391,7 +391,7 @@ def test_the_provider_sees_the_port_and_why_ssh_failed(error, expected):
 
 @pytest.mark.asyncio
 async def test_port_probes_start_staggered_not_all_at_once(mocker):
-    # ticket-1094: a router's port-scan filter dropped the validator after 36 simultaneous connects
+    # a provider report: a router's port-scan filter dropped the validator after 36 simultaneous connects
     import time
 
     from services.executor_connectivity import port_tester

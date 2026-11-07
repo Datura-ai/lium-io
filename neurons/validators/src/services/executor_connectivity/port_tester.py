@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # and was recorded as a dead port without ever putting a packet on the wire
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 
-# ticket-1094: 36 connects in the same instant read as a port scan to a router's DoS filter, which
+# a provider report: 36 connects in the same instant read as a port scan to a router's DoS filter, which
 # then dropped the validator's next SSH connect; starting them this far apart spreads 36 over ~9 s
 PROBE_STAGGER_SEC = 0.25
 

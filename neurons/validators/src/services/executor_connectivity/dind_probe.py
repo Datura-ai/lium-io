@@ -78,9 +78,9 @@ DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_ME
 
 
 def describe_ssh_error(error: Exception, port: PortPair) -> str:
-    """The provider-facing ssh fact; a connect timeout has no text of its own (ticket-1094)."""
+    """The provider-facing ssh fact; a connect timeout has no text of its own."""
     if isinstance(error, TimeoutError):
-        # ticket-1094: a router flood/DoS filter dropped this connect right after the port test
+        # a provider report: a router flood/DoS filter dropped this connect right after the port test
         return (
             f"ssh to port {port.external}: connect timed out; check the forwarding of that port, and that "
             "no router or firewall flood protection blocks our checks"
