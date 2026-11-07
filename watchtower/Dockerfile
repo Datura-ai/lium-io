@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y \
 COPY pyproject.toml pdm.lock* ./
 
 # Install PDM and dependencies
-RUN pip install --no-cache-dir pdm && \
+# pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
+RUN pip install --no-cache-dir "pdm[locked]" && \
     pdm install --prod --no-lock --no-editable
 
 # Copy source code
