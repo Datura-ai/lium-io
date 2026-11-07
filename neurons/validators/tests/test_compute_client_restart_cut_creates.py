@@ -840,6 +840,77 @@ async def test_the_replays_expiry_never_deletes_a_success_a_new_dispatch_saved_a
     assert (await redis_service.unacked_container_created())["pod-1"] == reboot
 
 
+def _success(command_id: str, port: int = 40022) -> ContainerCreated:
+    return ContainerCreated(
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1",
+        container_name="c-1", volume_name="v-1", port_maps=[(22, port)], command_id=command_id,
+    )
+
+
+@pytest.mark.parametrize("b_executor", ["exec-1", "exec-2"])
+@pytest.mark.parametrize("a_fails", ["before_b_saves", "after_b_saves"])
+@pytest.mark.asyncio
+async def test_an_older_dispatchs_create_failure_never_deletes_a_newer_dispatchs_success(b_executor, a_fails) -> None:
+    """lium-io#1952: create_container's failure cleanups name their dispatch, so A's late failure leaves B alone"""
+    redis_service = _redis_service()
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")
+    await redis_service.add_pending_pod("miner-hk", b_executor, "pod-1", command_id="cmd-b")
+    b_report = _success("cmd-b", 40023).model_copy(update={"executor_id": b_executor}).model_dump_json()
+
+    async def b_saves() -> None:
+        assert await redis_service.save_container_created_of_current_dispatch(
+            "miner-hk", b_executor, "pod-1", "cmd-b", b_report
+        )
+
+    if a_fails == "after_b_saves":
+        await b_saves()
+    # what DockerService.create_container's failure cleanup does for A
+    await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")
+    if a_fails == "before_b_saves":
+        await b_saves()
+
+    assert (await redis_service.unacked_container_created())["pod-1"] == b_report
+    left = await redis_service.get_pending_pods("miner-hk", b_executor, max_age_seconds=None)
+    assert [item.get("command_id") for item in left if item["pod_id"] == "pod-1"] == ["cmd-b"]
+
+
+@pytest.mark.asyncio
+async def test_a_success_saved_after_an_older_dispatchs_mark_survives_its_supersession_cleanup() -> None:
+    redis_service = _redis_service()
+    update = redis_service._update_pending_pods
+    b_report = _success("cmd-b", 40023).model_dump_json()
+    landed: list[bool] = []
+
+    async def mark_then_b_adds_and_saves(*args, **kwargs):
+        await update(*args, **kwargs)
+        if not landed:  # A's mark is published; B's create runs to its success before A's cleanup
+            landed.append(True)
+            await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-b")
+            assert await redis_service.save_container_created_of_current_dispatch(
+                "miner-hk", "exec-1", "pod-1", "cmd-b", b_report
+            )
+
+    redis_service._update_pending_pods = mark_then_b_adds_and_saves
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")
+
+    assert landed and (await redis_service.unacked_container_created())["pod-1"] == b_report
+
+
+@pytest.mark.parametrize(("queued", "after"), [(None, ["cmd-b"]), ("cmd-b", ["cmd-b"]), ("cmd-a", ["cmd-a", "cmd-b"])])
+@pytest.mark.asyncio
+async def test_only_the_same_dispatchs_queued_report_stands_in_for_the_replay(queued, after) -> None:
+    redis_service = _redis_service()
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-b")
+    await redis_service.add_unacked_container_created("pod-1", _success("cmd-b", 40023).model_dump_json())
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    client.message_queue = [_success(queued)] if queued else []
+
+    await client.resend_unacked_container_created()
+
+    assert [m.command_id for m in client.message_queue] == after
+
+
 def _fakeredis_service() -> RedisService:
     from fakeredis.aioredis import FakeRedis
 

@@ -9227,7 +9227,7 @@ class DockerService:
             )
             logger.error(log_text)
             await self.redis_service.remove_pending_pod(
-                payload.miner_hotkey, payload.executor_id, payload.pod_id
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
             )
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -11067,6 +11067,7 @@ class DockerService:
                         payload.miner_hotkey,
                         payload.executor_id,
                         payload.pod_id,
+                        command_id=payload.command_id,
                     )
 
                 # DAH-1524: one structured, Loki-queryable summary of the deploy
@@ -11220,7 +11221,10 @@ class DockerService:
                 logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            # this dispatch's mark and report only: a newer dispatch of the pod may have saved its success (lium-io#1952)
+            await self.redis_service.remove_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
+            )
             await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra)
 
             # Port release now handled by backend.
@@ -13127,7 +13131,10 @@ class DockerService:
             if after is not None:
                 await after(report, default_extra)
             try:
-                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+                # only this operation's mark: the pod's create mark and saved report are not its to clear
+                await self.redis_service.remove_pending_pod(
+                    payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=kind
+                )
             except Exception as exc:
                 logger.warning(
                     _m(f"{label}: pending mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))

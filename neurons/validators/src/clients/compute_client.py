@@ -1239,7 +1239,11 @@ class ComputeClient:
                 await ws.send(created.model_dump_json())
             else:
                 async with self.lock:
-                    if any(isinstance(m, ContainerCreated) and m.pod_id == pod_id for m in self.message_queue):
+                    # the same dispatch only: an older create's queued report would not stand in for this one
+                    if any(
+                        isinstance(m, ContainerCreated) and m.pod_id == pod_id and m.command_id == created.command_id
+                        for m in self.message_queue
+                    ):
                         continue  # never left: the queue sends it
                     self.message_queue.append(created)
             sent[pod_id] = created.command_id

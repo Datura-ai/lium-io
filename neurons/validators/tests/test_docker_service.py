@@ -3477,6 +3477,7 @@ async def test_create_container_missing_host_key_reports_sdk_host_key_failure_st
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
     assert docker_service.rental_docker_client_factory.connect_calls == []
     assert connect_mock.call_count == 0
@@ -3926,6 +3927,7 @@ async def test_create_container_clears_pending_pod_after_successful_filler_creat
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
 
 
@@ -4096,6 +4098,7 @@ async def test_create_container_reports_docker_pull_failure_step(
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
 
 
@@ -4526,6 +4529,7 @@ async def test_create_container_reports_set_environment_failure_step(
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
 
 

@@ -291,6 +291,14 @@ class VerifiedPortsMemory(NamedTuple):
     measured_at: float
 
 
+def _saved_command_id(saved: str) -> str:
+    """the command_id of a saved ContainerCreated report; "" when unreadable (never resent anyway)"""
+    try:
+        return json.loads(saved).get("command_id", "")
+    except (ValueError, AttributeError):
+        return ""
+
+
 def _parse_pending_pods(data) -> list[dict]:
     if not data:
         return []
@@ -833,13 +841,15 @@ class RedisService:
                 )
             return writes
 
+        # lium-io#1952: a new dispatch (a reboot, an edit, a retry) supersedes the success saved for an older one;
+        # replayed while this one runs, the backend would complete this one with the old container's ports. Read
+        # before the mark is published: a newer dispatch's success saved after it is never the one deleted
+        superseded = await self.hget(UNACKED_CONTAINER_CREATED_KEY, pod_id) if command_id else None
         # every entry: a write must not drop a build past 30 min that the orphan sweep still spares. One step with
         # the stamp: a marker written without it would abort the caller before its cleanup and leave the marker behind
         await self._update_pending_pods(miner_hotkey, executor_id, lambda pending_pods: [*pending_pods, item], stamp)
-        if command_id:
-            # lium-io#1952: a new dispatch (a reboot, an edit, a retry) supersedes the success saved for an older one;
-            # replayed while this one runs, the backend would complete this one with the old container's ports
-            await self._remove_unacked_container_created_unless(pod_id, lambda saved_id: saved_id == command_id)
+        if superseded is not None and _saved_command_id(superseded) != command_id:
+            await self.remove_unacked_container_created(pod_id, superseded)
 
     async def remove_pending_pod(
         self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str = "", kind: str | None = None
@@ -899,13 +909,7 @@ class RedisService:
         """keep: called with the saved report's command_id. The delete compares the whole saved report, so one a
         newer dispatch saved after the read is never the one deleted."""
         saved = await self.hget(UNACKED_CONTAINER_CREATED_KEY, pod_id)
-        if saved is None:
-            return
-        try:
-            saved_command_id = json.loads(saved).get("command_id", "")
-        except (ValueError, AttributeError):
-            saved_command_id = ""  # unreadable: never resent anyway
-        if keep(saved_command_id):
+        if saved is None or keep(_saved_command_id(saved)):
             return
         await self.remove_unacked_container_created(pod_id, saved)
 
