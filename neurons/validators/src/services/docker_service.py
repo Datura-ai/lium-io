@@ -621,7 +621,9 @@ def pull_keeper_start_command(pod_id: str, image: str) -> str:
     return (
         f"{_pull_keeper_alive(pod_id)} || {{ setsid nohup env {_pull_keeper_marker(pod_id)} "
         f"timeout {int(_DOCKER_PULL_TIMEOUT_SECONDS)} /usr/bin/docker pull {shlex.quote(image)} "
-        f">/dev/null 2>&1 </dev/null & echo $! > {_pull_keeper_pidfile(pod_id)}; }}"
+        f">/dev/null 2>&1 </dev/null & echo $! > {_pull_keeper_pidfile(pod_id)}; "
+        # $! names the fork before env has run: return once the marker shows, or a wait right after sees no keeper
+        f"i=0; until {_pull_keeper_alive(pod_id)} || [ $i -ge 50 ]; do sleep 0.1; i=$((i+1)); done; }}"
     )
 
 
