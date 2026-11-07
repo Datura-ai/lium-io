@@ -168,6 +168,9 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
+    # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
+    port_probe_connection_lost: str | None = None
     # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
     # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.

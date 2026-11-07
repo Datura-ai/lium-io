@@ -9,7 +9,7 @@ from services.const import MIN_PORT_COUNT
 from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..availability import AVAILABILITY_CATEGORY, ReachSource, ReachTarget
-from ..messages import PortCountMessages as Msg, render_message
+from ..messages import PortConnectivityMessages, PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
@@ -207,6 +207,28 @@ class PortCountCheck:
         # below MIN_PORT_COUNT the plain floor below reports it; a rented node keeps its exemption
         if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
             event = split_ports_event(ctx, self.check_id, updated_state, port_count, split_need)
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={"port_count": port_count, "state": updated_state},
+            )
+
+        if not is_rented and port_count < MIN_PORT_COUNT and ctx.state.port_probe_connection_lost:
+            # DAH-5981: the probe lost the node before testing a port, so the count says nothing about the ports
+            event = render_message(
+                PortConnectivityMessages.VERIFY_FAILED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "details": f"Port verification error: {ctx.state.port_probe_connection_lost}",
+                    "available_port_count": port_count,
+                    "probed_port_count": updated_state.probed_port_count,
+                },
+                remediation=(
+                    "The validator lost its connection to the node during the port check, so no port was tested. "
+                    "It checks again next cycle; if this repeats, check the node's network stability."
+                ),
+            )
             return CheckResult(
                 passed=False,
                 event=event,
