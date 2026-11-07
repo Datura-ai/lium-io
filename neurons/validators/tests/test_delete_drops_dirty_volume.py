@@ -16,7 +16,13 @@ from uuid import uuid4
 
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import ContainerDeleted, ContainerDeleteRequest, WorkloadKind
+from payload_models.payloads import (
+    ContainerDeleted,
+    ContainerDeleteRequest,
+    FailedContainerErrorCodes,
+    FailedContainerRequest,
+    WorkloadKind,
+)
 
 import services.docker_service as docker_service_module
 from core.config import settings
@@ -436,3 +442,38 @@ async def test_delete_removes_the_pods_kept_edit_containers_before_its_volume(do
     assert len(rm_kept) == 1
     assert "idkept" in order[rm_kept[0]][1] and "idother" not in order[rm_kept[0]][1]
     assert rm_kept[0] < order.index(("remove_volume", "volume_dirty"))
+
+
+@pytest.mark.asyncio
+async def test_delete_answers_in_progress_until_the_kept_edit_containers_are_removed(docker_service, monkeypatch):
+    # DAH-5773 review: nothing else removes a kept container, so a failed removal must not close the pod
+    rm_exit = iter([1, 0])
+
+    async def answer(command: str):
+        if "docker ps -a" in command and "kept_unmounted_dirty_" in command:
+            return _make_ssh_command_result(stdout="kept_unmounted_dirty_1700 idkept\n")
+        if "docker rm -fv" in command:
+            return _make_ssh_command_result(exit_status=next(rm_exit), stderr="device or resource busy")
+        return await _host_answers()(command)
+
+    order = _wire_delete(docker_service, monkeypatch, answer)
+    client = docker_service.rental_docker_client_factory.client
+    real_remove_volume = client.remove_volume
+
+    async def remove_volume(*, volume_name, force=False):
+        order.append(("remove_volume", volume_name))
+        return await real_remove_volume(volume_name=volume_name, force=force)
+
+    monkeypatch.setattr(client, "remove_volume", remove_volume)
+    payload = _delete_payload()
+
+    first = await _delete(docker_service, payload)
+
+    assert isinstance(first, FailedContainerRequest)
+    assert first.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert ("remove_volume", "volume_dirty") not in order
+
+    retried = await _delete(docker_service, payload)
+
+    assert isinstance(retried, ContainerDeleted)
+    assert ("remove_volume", "volume_dirty") in order

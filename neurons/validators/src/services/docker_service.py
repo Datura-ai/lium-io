@@ -1723,6 +1723,10 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 
 
+class KeptContainersNotRemoved(RuntimeError):
+    """The pod's kept containers were found but `docker rm -fv` failed: they stay until a delete removes them."""
+
+
 def _kept_container_prefix(container_name: str) -> str:
     # kept_unmounted_<pod id>_<time>: the trailing "_" keeps one pod's prefix from matching another's
     return f"{KEPT_UNMOUNTED_PREFIX}{container_name.removeprefix(POD_CONTAINER_PREFIX)}_"
@@ -1748,7 +1752,7 @@ async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, cont
             ssh_client, f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}", _PARK_COMMAND_TIMEOUT_SECONDS
         )
         if removed.exit_status != 0:
-            raise Exception(f"docker rm exited {removed.exit_status}: {(removed.stderr or '').strip()}")
+            raise KeptContainersNotRemoved(f"docker rm exited {removed.exit_status}: {(removed.stderr or '').strip()}")
     return ids
 _DROP_MARK = "drop"
 # The image's entrypoint writes under the plaintext path before each gocryptfs mount. Only a start the validator
@@ -12989,10 +12993,24 @@ class DockerService:
                         )
 
                 # DAH-5773: a kept edit container still references the pod's volume ("volume is in use")
-                # and holds the renter's files; the rental is over, so it goes before the volume does
-                with _best_effort_delete_step(log, "remove_kept_containers"):
+                # and holds the renter's files; the rental is over, so it goes before the volume does. A failed
+                # rm is not best-effort: nothing else ever removes them, so it answers in progress and the re-ask
+                # retries. A failed listing stays best-effort, as the other steps: a pod rarely has kept containers
+                try:
                     if kept := await _remove_kept_containers(ssh_client, payload.container_name):
                         log.info("Removed the pod's kept edit containers", container_ids=kept)
+                except KeptContainersNotRemoved as exc:
+                    log.warning("Could not remove the pod's kept edit containers; retry deletion", error=str(exc))
+                    pending_deletions.mark(payload.pod_id)
+                    return self._deletion_in_progress(
+                        payload, msg="The pod's kept edit containers are not removed yet; retry deletion"
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "delete_container post-teardown step failed (non-fatal)",
+                        step="remove_kept_containers",
+                        error=str(exc),
+                    )
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
