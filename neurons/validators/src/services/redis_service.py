@@ -56,6 +56,11 @@ RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
+RECENT_FILLER_PREFIX = "recent_filler:"
+# a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
+# one cycle (~17 min) plus RENTAL_TEARDOWN_GRACE_MINUTES, with margin, from its create or the last cycle that listed it
+RECENT_FILLER_TTL_SECONDS = 45 * 60
 # set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
@@ -196,7 +201,10 @@ REDIS_PUBSUB_MAX_CONNECTIONS = 8
 # BlockingConnectionPool for this: the default pool raises MaxConnectionsError instead of waiting,
 # and it raises from get_connection() BEFORE the retry wrapper is reached, so a bounded default pool
 # would convert an overload burst into exactly the hard failures this hardening exists to remove.
-REDIS_POOL_WAIT_TIMEOUT_SECONDS = 10
+# DAH-5805: since commands no longer queue on the process-wide lock (DAH-5723), a wave's burst queues
+# here instead; 10 s turned that wait into ~500 "No connection available" failures an hour (whole runs
+# among them). The old lock waited without limit; this waits up to a minute, still well inside a task.
+REDIS_POOL_WAIT_TIMEOUT_SECONDS = 60
 REDIS_SOCKET_TIMEOUT_SECONDS = 10
 REDIS_CONNECT_TIMEOUT_SECONDS = 5
 REDIS_RETRY_ATTEMPTS = 3

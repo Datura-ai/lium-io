@@ -162,6 +162,8 @@ from services.redis_service import (
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
+    RECENT_FILLER_PREFIX,
+    RECENT_FILLER_TTL_SECONDS,
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
@@ -5607,6 +5609,16 @@ class DockerService:
                 )
             )
 
+    async def _remember_new_filler_best_effort(self, executor_uuid: str, container_name: str) -> None:
+        """A filler that starts and stops between two cycle snapshots is never listed there; record it at create
+        so its leftover GPU process still counts as our load (DAH-5904)."""
+        try:
+            await self.redis_service.set(
+                f"{RECENT_FILLER_PREFIX}{executor_uuid}:{container_name}", "1", ex=RECENT_FILLER_TTL_SECONDS
+            )
+        except Exception as exc:
+            logger.warning("Recent filler record not written at create for %s: %s", executor_uuid, exc)
+
     async def _cache_rented_pod_best_effort(
         self,
         executor_info: ExecutorSSHInfo,
@@ -7741,7 +7753,7 @@ class DockerService:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
-        still fits beside it, never below `payload.min_volume_gb`.
+        still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
 
         `locked_df_avail_bytes` (wait_for_node_flatten) replaces any other free-disk measure;
         `locked_df_error` (that measure failed) takes the measurement-failure fallback below.
@@ -7835,8 +7847,10 @@ class DockerService:
             )
         )
         if flatten_copy_bytes is not None:
-            # the flatten keeps this grant free on top of the copy: leave the copy room before granting
-            min_slice_bytes = (payload.min_volume_gb or 0) * _FRESH_SIZING_GB_BYTES * 1.5
+            # the flatten keeps this grant free on top of the copy: leave the copy room before granting, but never
+            # below the ordered volume (the renter gets the disk they rent; a copy that no longer fits is refused)
+            floor_gb = max(payload.min_volume_gb or 0, payload.volume_limit_gb or 0)
+            min_slice_bytes = floor_gb * _FRESH_SIZING_GB_BYTES * 1.5
             slice_candidates.append(
                 (
                     "flatten_copy",
@@ -8706,7 +8720,9 @@ class DockerService:
         stop_cmd = (
             f"/usr/bin/docker pause {dind_q} >/dev/null 2>&1; s=$({inspect_state_cmd}); "
             f"[ \"$s\" = truefalse ] && {{ /usr/bin/docker kill {dind_q} >/dev/null 2>&1; s=$({inspect_state_cmd}); }}; "
-            f'case "$s" in truetrue|false*|*"No such"*) exit 0;; esac; exit 1'
+            f'case "$s" in truetrue|false*|*"No such"*) exit 0;; esac; '
+            # Gone, whatever the docker version's error text says; a daemon error fails `ps` and stays unconfirmed.
+            f'ids=$(/usr/bin/docker ps -aq --filter {shlex.quote(f"name=^/{dind_name}$")}) && [ -z "$ids" ] && exit 0; exit 1'
         )
         for attempt in range(1, _DIND_STOP_ATTEMPTS + 1):
             try:
@@ -10962,6 +10978,7 @@ class DockerService:
                         await self._record_filler_image_best_effort(
                             docker_client, container_id or container_name, container_name, default_extra
                         )
+                        await self._remember_new_filler_best_effort(executor_info.uuid, container_name)
                     # no duration: the collector starts after the reply, its time is logged there
                     profilers.append(
                         ProfilerStep(
