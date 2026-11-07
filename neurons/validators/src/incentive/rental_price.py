@@ -289,6 +289,8 @@ class RentalPriceIncentive(DefaultIncentive):
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
         # DAH-5944: idle spot GPUs per (base_model, bucket), a pool of their own under the secure caps.
         self.spot_count_by_bucket: dict[tuple[str, int], int] = {}
+        # every Spot node counted there, diluted by _dilute_spot_pay_over_cap whichever pay list it is on
+        self._spot_cap_members: list[tuple[str, JobResult]] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
@@ -1300,26 +1302,26 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         else:
             result.hourly_rate = self._listed_hourly_rate(result)
-        self._record_zero_driver_and_sysbox_reasons(result, result.driver_multiplier, result.sysbox_multiplier)
-        result.effective_rate = min(
-            FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
-            self._spot_secure_rate(result),
-        )
+        # counted before any rate path below, so every paid Spot GPU sits in the cap pool however its rate is set
         if result.hourly_rate > 0 and result.spot_cap > 0:
             key: tuple[str, int] = (base_model, bucket)
             self.spot_count_by_bucket[key] = (
                 self.spot_count_by_bucket.get(key, 0) + result.gpu_count
             )
+            self._spot_cap_members.append((base_model, result))
+        self._record_zero_driver_and_sysbox_reasons(result, result.driver_multiplier, result.sysbox_multiplier)
+        result.effective_rate = min(
+            FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
+            self._spot_secure_rate(result),
+        )
         self._spot_pay_candidates.append((base_model, result))
 
     def _dilute_spot_pay_over_cap(self) -> None:
         """DAH-5944 (Fish): idle spot GPUs of a GPU model and bucket are capped at the secure cap, in a
         pool of their own (spot never counts against secure caps, nor secure against spot). Above the
         cap every spot rate there is scaled by min(count, cap) / count, before the DAH-5128 pool."""
-        for base_model, result in self._spot_pay_candidates:
-            count: int = self.spot_count_by_bucket.get((base_model, result.count_bucket), 0)
-            if count <= 0:
-                continue
+        for base_model, result in self._spot_cap_members:
+            count: int = self.spot_count_by_bucket[(base_model, result.count_bucket)]
             result.spot_gpus_in_bucket = count
             result.spot_cap_multiplier = min(count, result.spot_cap) / count
             result.effective_rate *= result.spot_cap_multiplier

@@ -21,7 +21,7 @@ from core.validator import settle_cycle_results
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive import rental_price
-from incentive.miner_incentive_log import ZeroIncentiveReason
+from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceIncentive
 from incentive.utils import log_for_monitoring
 from services.const import FIXED_RATIO, SECONDS_PER_BLOCK, TEMPO
@@ -382,6 +382,20 @@ async def test_spot_over_its_cap_is_diluted_and_does_not_dilute_secure_nodes():
     assert line["spot_cap_multiplier"] == pytest.approx(0.25)
     assert any("Spot cap dilution applied: 32 idle Spot GPUs" in m for m in _messages(spots[0], SPOT_LINE))
     _assert_pool_pays_exactly(incentive)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filler_revenue_per_gpu_hour", [100.0, None], ids=["measured", "unmeasured"])
+async def test_four_8x_spot_nodes_over_the_cap_are_paid_the_capped_total(filler_revenue_per_gpu_hour):
+    # 4 x 8 GPUs at 0.8 x the 10 $/h Secure rate is 256 $/h uncapped; the 8-GPU cap pays 8 x 8 = 64 $/h
+    spots = [_spot(f"spot-{i}", filler_revenue_per_gpu_hour=filler_revenue_per_gpu_hour) for i in range(4)]
+
+    await _run(spots)
+
+    # a node with no measured average is unpaid, or once it is paid at its Secure-side rate it is in the cap pool too
+    seeded: bool = hasattr(MinerLogLine, "spot_rate_seeded_from_secure_rate")
+    paid: float = sum(s.gpu_count * (s.effective_rate or 0.0) for s in spots)
+    assert paid == pytest.approx(64.0 if filler_revenue_per_gpu_hour is not None or seeded else 0.0)
 
 
 @pytest.mark.asyncio
