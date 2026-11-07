@@ -29,6 +29,7 @@ from payload_models.payloads import (
     AddSshPublicKeyRequest,
     RemoveSshPublicKeysRequest,
     ContainerCreated,
+    ContainerRequestType,
     ContainerStarted,
     ContainerStopped,
     SshPubKeyAdded,
@@ -233,6 +234,10 @@ class ComputeClient:
         self.deleted_pod_ids: set[str] = set()
         # set by a start sweep that read the in-flight records; sent once, first on the next authenticated socket
         self.resumed_creates_report: ResumedCreatesReport | None = None
+        # pod id -> command_id of each success replayed ahead of the report and not yet answered by its receipt
+        self.report_awaiting: dict[str, str] = {}
+        # a create the backend sent while the report waited: a later socket's report would fail it as lost
+        self.create_accepted_while_report_pending = False
 
         self.logging_extra = {
             "validator_hotkey": self.my_hotkey(),
@@ -398,17 +403,52 @@ class ComputeClient:
         if response.status != "success":
             raise AuthenticationError("auth request received failed response", response.errors)
 
-        if (report := self.resumed_creates_report) is not None:
-            # once, and before any reply: the backend fails a waiting create sent before THIS socket authenticated
-            # that is not listed, so a report re-sent on a later socket would fail the creates sent on this one
-            report.sent_at = time.time()
-            await ws.send(report.model_dump_json())
+        if self.resumed_creates_report is not None and self.create_accepted_while_report_pending:
+            # the backend fails a waiting create sent before THIS socket authenticated that is not listed, and listing
+            # one still running would start it twice; unsent, the cut-off creates wait for retry_failed_pods as before
+            logger.error(
+                _m(
+                    "Dropping the resumed-creates report: its socket closed before the receipts it waited on",
+                    extra=get_extra_info({**self.logging_extra, "awaiting": sorted(self.report_awaiting)}),
+                )
+            )
             self.resumed_creates_report = None
+        if (report := self.resumed_creates_report) is not None:
+            # DAH-5380: saved successes go first. A delivered frame is not a handled one: a success whose handling
+            # failed would leave its pod waiting and unlisted, so the report goes only once each one's receipt says
+            # the backend applied it. No timeout: unsent, no pod is failed and retry_failed_pods is the backstop.
+            self.report_awaiting = await self.resend_unacked_container_created(ws)
+            await self._send_resumed_creates_report_once_answered(ws)
 
         self.ws = ws
+        if report is None:
+            await self.resend_unacked_container_created()
 
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
+            if self.resumed_creates_report is not None and self._answers_a_replayed_success(raw_msg):
+                await self._send_resumed_creates_report_once_answered(ws)
+
+    def _answers_a_replayed_success(self, raw_msg: str | bytes) -> bool:
+        """pops the success a rent-finished answers; one naming another dispatch of the pod answers nothing"""
+        try:
+            receipt = ExecutorRentFinishedRequest.model_validate_json(raw_msg)
+        except pydantic.ValidationError:
+            return False
+        if receipt.message_type != ContainerRequestType.ExecutorRentFinished or receipt.create_command_id not in (
+            "",
+            self.report_awaiting.get(receipt.pod_id),
+        ):
+            return False
+        return self.report_awaiting.pop(receipt.pod_id, None) is not None
+
+    async def _send_resumed_creates_report_once_answered(self, ws: ClientConnection) -> None:
+        if self.report_awaiting or (report := self.resumed_creates_report) is None:
+            return
+        report.sent_at = time.time()
+        await ws.send(report.model_dump_json())
+        self.resumed_creates_report = None
+        self.create_accepted_while_report_pending = False
 
     async def subscribe_mesages_from_redis(self):
         validator_hotkey = self.my_hotkey()
@@ -925,6 +965,8 @@ class ComputeClient:
             )
             pass
         else:
+            if isinstance(job_request, ContainerCreateRequest) and self.resumed_creates_report is not None:
+                self.create_accepted_while_report_pending = True
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
@@ -1142,6 +1184,85 @@ class ComputeClient:
                 if inflight_creates.is_only_create(job_request.pod_id):
                     self.deleted_pod_ids.discard(job_request.pod_id)
 
+    async def _keep_until_rent_finished(self, created: ContainerCreated) -> None:
+        """DAH-5380: a backend restart can close the socket right after the send, losing the report and leaving the
+        pod PENDING; kept until rent-finished (remove_pending_pod) so the next connection resends it."""
+        redis_service = self.miner_service.redis_service
+        try:
+            # a filler's flag is already cleared here: the backend sends it no rent-finished
+            if await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, created.pod_id):
+                await redis_service.save_container_created_of_current_dispatch(
+                    created.miner_hotkey, created.executor_id, created.pod_id, created.command_id, created.model_dump_json()
+                )
+        except Exception as exc:  # best-effort: losing it only loses the resend
+            self._log_unacked_container_created_error(created.pod_id, exc)
+
+    async def _replayable_success(self, pod_id: str, message_json: str) -> bool:
+        """a saved ContainerCreated the next reconnect will resend: readable and its pod still pending"""
+        try:
+            created = ContainerCreated.model_validate_json(message_json)
+        except pydantic.ValidationError:
+            return False
+        return await self.miner_service.redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id)
+
+    async def resend_unacked_container_created(self, ws=None) -> dict[str, str]:
+        """ws given: each one is sent on it now, not queued, ahead of the ResumedCreatesReport; a Redis error then
+        raises, so the report waits for the next socket instead of failing a create whose replay could not be read.
+        Returns pod id -> command_id of each one sent or queued."""
+        redis_service = self.miner_service.redis_service
+        try:
+            unacked = await redis_service.unacked_container_created()
+        except Exception as exc:
+            self._log_unacked_container_created_error(None, exc)
+            if ws is not None:
+                raise
+            return {}
+        sent: dict[str, str] = {}
+        for pod_id, message_json in unacked.items():
+            try:
+                created = ContainerCreated.model_validate_json(message_json)
+            except pydantic.ValidationError as exc:
+                # unreadable: the startup sweep did not count it as a replay either, so the report lists the create
+                self._log_unacked_container_created_error(pod_id, exc)
+                continue
+            try:
+                if not await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id):
+                    # the pending flag expired or was wiped: the backend no longer waits on this create
+                    await redis_service.remove_unacked_container_created(pod_id, message_json)
+                    continue
+            except Exception as exc:
+                self._log_unacked_container_created_error(pod_id, exc)
+                if ws is not None:
+                    raise
+                continue
+            if ws is not None:
+                await ws.send(created.model_dump_json())
+            else:
+                async with self.lock:
+                    # the same dispatch only: an older create's queued report would not stand in for this one
+                    if any(
+                        isinstance(m, ContainerCreated) and m.pod_id == pod_id and m.command_id == created.command_id
+                        for m in self.message_queue
+                    ):
+                        continue  # never left: the queue sends it
+                    self.message_queue.append(created)
+            sent[pod_id] = created.command_id
+            logger.warning(
+                _m(
+                    "Resending a created-container report the backend did not answer",
+                    extra=get_extra_info({**self.logging_extra, "pod_id": pod_id}),
+                )
+            )
+        return sent
+
+    def _log_unacked_container_created_error(self, pod_id: str | None, exc: Exception) -> None:
+        logger.error(
+            _m(
+                "Failed to keep or resend an unanswered created-container report",
+                extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, "error": str(exc)}),
+            )
+        )
+
     async def _track_backend_create_for_restart_report(self, job_request: ContainerCreateRequest) -> None:
         if job_request.pod_id in self.deleted_pod_ids:
             return  # a delete that landed first already removed the record; writing it now would undo that
@@ -1221,9 +1342,16 @@ class ComputeClient:
         resumed MAX_CREATE_RESUMES times is reported failed, which frees the node. Every one's flag is cleared."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
+        unacked = await redis_service.unacked_container_created() if creates else {}
         rented_pod_ids = await redis_service.rented_pod_ids() if creates else frozenset()
         resumed: list[str] = []
         for pod_id, create in creates.items():
+            if pod_id in unacked and await self._replayable_success(pod_id, unacked[pod_id]):
+                # DAH-5380: it was created, only the report is unanswered; the reconnect replays it ahead of the
+                # ResumedCreatesReport, so its pending flag and saved success stay and only the stale inflight record
+                # goes (no running create owns it: the sweep runs before this connector accepts one)
+                await redis_service.remove_inflight_backend_create(pod_id)
+                continue
             if pod_id in rented_pod_ids or (
                 time.time() - create.started_at_unix_seconds > INFLIGHT_CREATE_MAX_AGE_SECONDS
             ):
@@ -1339,6 +1467,8 @@ class ComputeClient:
                 )
             )
 
+            if isinstance(response, ContainerCreated):
+                await self._keep_until_rent_finished(response)
             async with self.lock:
                 self.message_queue.append(response)
         elif isinstance(job_request, ContainerDeleteRequest):
@@ -1431,7 +1561,10 @@ class ComputeClient:
                 )
             )
 
-            await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id, job_request.pod_id)
+            # DAH-5380: a receipt names the dispatch it answers; a late one for an older create keeps a reboot's state
+            await self.miner_service.redis_service.remove_pending_pod(
+                job_request.miner_hotkey, job_request.executor_id, job_request.pod_id, command_id=job_request.create_command_id
+            )
         elif isinstance(job_request, GetPodLogsRequestFromServer):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
