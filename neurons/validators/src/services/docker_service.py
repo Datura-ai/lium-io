@@ -1721,6 +1721,35 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 # while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
 # after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
 KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
+
+
+def _kept_container_prefix(container_name: str) -> str:
+    # kept_unmounted_<pod id>_<time>: the trailing "_" keeps one pod's prefix from matching another's
+    return f"{KEPT_UNMOUNTED_PREFIX}{container_name.removeprefix(POD_CONTAINER_PREFIX)}_"
+
+
+async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> list[str]:
+    """Remove the pod's kept containers by ID; they still reference the pod's volume, so its removal needs them gone."""
+    prefix = _kept_container_prefix(container_name)
+    listed = await _run_with_host_timeout(
+        ssh_client,
+        f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{shlex.quote(prefix)}',
+        _PARK_COMMAND_TIMEOUT_SECONDS,
+    )
+    if listed.exit_status != 0:
+        raise Exception(f"docker ps exited {listed.exit_status}: {(listed.stderr or '').strip()}")
+    ids = [
+        fields[1]
+        for fields in (line.split() for line in (listed.stdout or "").splitlines())
+        if len(fields) == 2 and fields[0].startswith(prefix)
+    ]
+    if ids:
+        removed = await _run_with_host_timeout(
+            ssh_client, f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}", _PARK_COMMAND_TIMEOUT_SECONDS
+        )
+        if removed.exit_status != 0:
+            raise Exception(f"docker rm exited {removed.exit_status}: {(removed.stderr or '').strip()}")
+    return ids
 _DROP_MARK = "drop"
 # The image's entrypoint writes under the plaintext path before each gocryptfs mount. Only a start the validator
 # itself made (the create, or a start of a stopped container) and then mounted counts as startup, from that start to
@@ -1888,7 +1917,7 @@ class _EditSwap:
 
     async def _park(self) -> str | None:
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
-        kept_prefix = f"{KEPT_UNMOUNTED_PREFIX}{self.container_name.removeprefix(POD_CONTAINER_PREFIX)}_"
+        kept_prefix = _kept_container_prefix(self.container_name)
         listed = await self._run(
             f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
             f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$ "
@@ -12958,6 +12987,12 @@ class DockerService:
                         await clear_filler_pod_applied_caps(
                             self.redis_service, payload.pod_id, log_extra=default_extra
                         )
+
+                # DAH-5773: a kept edit container still references the pod's volume ("volume is in use")
+                # and holds the renter's files; the rental is over, so it goes before the volume does
+                with _best_effort_delete_step(log, "remove_kept_containers"):
+                    if kept := await _remove_kept_containers(ssh_client, payload.container_name):
+                        log.info("Removed the pod's kept edit containers", container_ids=kept)
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.

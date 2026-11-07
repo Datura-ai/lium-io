@@ -407,3 +407,32 @@ async def test_delete_proceeds_as_before_when_the_wipe_fails(
     assert order[0] == ("ssh", _bounded(WIPE_CMD, 0.05))
     # at most a wipe, the wait and the second wipe stand before the removal
     assert ("remove", payload.container_name) in order[:4]
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_the_pods_kept_edit_containers_before_its_volume(docker_service, monkeypatch):
+    # DAH-5773 review: a kept container still references the pod's volume, so `volume rm` failed as "in use"
+    # and the renter's layer and the volume stayed on the host after the rental ended
+    async def answer(command: str):
+        if "docker ps -a" in command and "kept_unmounted_dirty_" in command:
+            # another pod's kept container is never touched, even if a listing carried it
+            return _make_ssh_command_result(stdout="kept_unmounted_dirty_1700 idkept\nkept_unmounted_dirtyx_1 idother\n")
+        return await _host_answers()(command)
+
+    order = _wire_delete(docker_service, monkeypatch, answer)
+    client = docker_service.rental_docker_client_factory.client
+    real_remove_volume = client.remove_volume
+
+    async def remove_volume(*, volume_name, force=False):
+        order.append(("remove_volume", volume_name))
+        return await real_remove_volume(volume_name=volume_name, force=force)
+
+    monkeypatch.setattr(client, "remove_volume", remove_volume)
+
+    result = await _delete(docker_service, _delete_payload())
+
+    assert isinstance(result, ContainerDeleted)
+    rm_kept = [i for i, (kind, command) in enumerate(order) if kind == "ssh" and "docker rm -fv" in command]
+    assert len(rm_kept) == 1
+    assert "idkept" in order[rm_kept[0]][1] and "idother" not in order[rm_kept[0]][1]
+    assert rm_kept[0] < order.index(("remove_volume", "volume_dirty"))
