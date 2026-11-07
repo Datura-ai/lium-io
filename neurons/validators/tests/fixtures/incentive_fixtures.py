@@ -8,6 +8,7 @@ import bittensor
 from core.config import settings
 from core.validator import Validator
 from incentive.config import IncentiveConfig
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.task_service import JobResult
 
 
@@ -159,6 +160,6 @@ def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_se
     validator.express_lane = MagicMock()
     validator.express_lane.directories_in_use = MagicMock(return_value=())
     validator.backend_client = MagicMock()
-    validator.backend_client.get_all_rented_executors = AsyncMock(return_value=[])
+    validator.backend_client.get_all_rented_executors = AsyncMock(return_value=RentedExecutorsResponse(executors={}))
     validator.last_job_run_blocks = 0
     return validator

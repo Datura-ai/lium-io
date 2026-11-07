@@ -225,6 +225,9 @@ class RentedExecutorsResponse(BaseModel):
     # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
     # and its volume_<pod_id>. An older backend names none.
     retained_container_names: list[str] = []
+    # DAH-5934: full GPU name → the idle Secure rate (USD per GPU-hour) the backend set from the GPU market; it
+    # replaces the validator's own table for that name. An older backend sends none: the table applies.
+    secure_idle_rate_by_gpu_model: dict[str, float] = {}
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
@@ -274,6 +277,18 @@ class RentedExecutorsResponse(BaseModel):
         if miner_coldkey and miner_coldkey in self.banned_coldkeys:
             return True
         return any(gpu_uuid in self.banned_provider_guids for gpu_uuid in (gpu_uuids or []))
+
+    @field_validator("secure_idle_rate_by_gpu_model", mode="before")
+    @classmethod
+    def keep_usable_secure_idle_rates(cls, value: Any) -> dict[str, float]:
+        # A bad rate must never fail the whole reply; it only leaves that model on the validator's table.
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(name): float(rate)
+            for name, rate in value.items()
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool) and math.isfinite(rate) and rate > 0
+        }
 
     @field_validator("filler_revenue_by_gpu_config", mode="before")
     @classmethod

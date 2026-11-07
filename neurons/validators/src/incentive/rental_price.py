@@ -182,6 +182,8 @@ class RentalPriceSnapshot(BaseModel):
     burn_share: float
     mining: RentalMiningState
     rental: RentalShareState
+    # DAH-5934: the cycle's GPU-market idle Secure rates, so an estimate in another process prices like the cycle
+    market_rental_prices_per_hour: dict[str, float] = {}
 
 
 class ExecutorEstimateParams(BaseModel):
@@ -1142,7 +1144,10 @@ class RentalPriceIncentive(DefaultIncentive):
         )
 
         # update incentive logs
-        report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
+        report: MinerLogLine = MinerLogLine.rental_incentive_calculated(
+            hotkey, result, bucket,
+            hourly_rate_source="market" if result.gpu_model in self.config.market_rental_prices_per_hour else "table",
+        )
         result.record_incentive_log(report)
 
         top_up_rate: float = (floored_rate - diluted_rate) * result.sysbox_multiplier * result.driver_multiplier
@@ -1362,15 +1367,15 @@ class RentalPriceIncentive(DefaultIncentive):
         rated_gpu_count: int = (
             result.gpu_splitting_min_count if result.is_split_remainder else result.gpu_count
         )
+        # DAH-5934: a rate the backend set from the GPU market replaces the table's for that GPU name
+        prices: dict[str, float] = {**self.config.rental_prices_per_hour, **self.config.market_rental_prices_per_hour}
         hourly_rate: float = get_hourly_rate(
-            result.gpu_model, rated_gpu_count,
-            self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
+            result.gpu_model, rated_gpu_count, self.config.gpu_count_custom_prices, prices,
         )
         # GPU splitting: always pick the best of the bundle rate vs min-count rate
         if result.supports_gpu_splitting and result.gpu_splitting_min_count:
             rate_for_min = get_hourly_rate(
-                result.gpu_model, result.gpu_splitting_min_count,
-                self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
+                result.gpu_model, result.gpu_splitting_min_count, self.config.gpu_count_custom_prices, prices,
             )
             hourly_rate = max(hourly_rate, rate_for_min)
         return hourly_rate
@@ -1836,6 +1841,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 by_bucket=by_bucket,
                 unbucketed_rental_cost=self._unbucketed_rental_cost,
             ),
+            market_rental_prices_per_hour=dict(self.config.market_rental_prices_per_hour),
         )
 
 
@@ -1848,6 +1854,7 @@ async def estimate_executor(
     params: ExecutorEstimateParams,
 ) -> RentalPriceEstimate:
     """Estimate USD/epoch reward for a single hypothetical executor against a snapshot."""
+    config = config.model_copy(update={"market_rental_prices_per_hour": snapshot.market_rental_prices_per_hour})
     estimator = RentalPriceIncentive(
         config,
         redis_service,

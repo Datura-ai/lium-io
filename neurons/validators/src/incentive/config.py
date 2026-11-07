@@ -48,6 +48,14 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # `NVIDIA GB300` is priced like B300 for now. A different card from the B300, so its own base
 # model and idle tier (it never fills the B300 cap), at the B300 rate and caps.
 RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]  # mirrors B300; revisit when GB300 market data exists
+# The names above priced at another name's rate on purpose: alias -> source. A market rate for the source
+# (DAH-5934, core/validator.py apply_market_secure_rates) moves the alias with it, as the table does.
+PARITY_PRICE_ALIASES: dict[str, str] = {
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "NVIDIA B300 SXM6 PC": "NVIDIA B300 SXM6 AC",
+    "NVIDIA GB300": "NVIDIA B300 SXM6 AC",
+}
 # DAH-5508: the RTX 4090 48GB, its own model and idle tier; only reachable with RTX_4090_48GB_MODEL_ENABLED on.
 # Anchor = the backend's MACHINE_PRICES: RTX 4090 0.30 x the same-chip Quadro RTX 8000/6000 ratio (0.21/0.13), 0.48.
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.48
@@ -406,6 +414,14 @@ class IncentiveConfig(BaseModel):
     rental_prices_per_hour: dict[str, float] = Field(
         default=RENTAL_PRICES_PER_HOUR,
         description="Rental prices per GPU type in USD/hour"
+    )
+
+    market_rental_prices_per_hour: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "DAH-5934: idle Secure rate per full GPU name from the backend (GPU market x 0.6), set every cycle; "
+            "overrides rental_prices_per_hour for that name. Empty: the table applies."
+        ),
     )
 
     gpu_count_custom_prices: dict[str, dict[str, float | DefaultPrice]] = Field(

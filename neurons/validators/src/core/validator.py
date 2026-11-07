@@ -11,6 +11,7 @@ from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
+from incentive.config import BASE_GPU_MAP, PARITY_PRICE_ALIASES
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
@@ -449,6 +450,7 @@ class Validator:
                         ),
                     )
                     return
+                self.apply_market_secure_rates(rented_executors)
 
                 # DAH-3405: a push between two cycles opens the grace window here, after the last
                 # early return and before the first job of this cycle runs against the new digest,
@@ -1417,6 +1419,28 @@ class Validator:
         await self.miner_service.publish_new_executors_at_pass(job)
         await self.miner_service.publish_unreachable_early(job)
         return job
+
+    def apply_market_secure_rates(self, rented_executors: RentedExecutorsResponse) -> None:
+        """DAH-5934: this cycle's idle Secure rates are the backend's GPU-market rates where it sends one (names the
+        validator knows only); every other name, and every name when the backend sends none, keeps the table."""
+        rates = {
+            name: rate
+            for name, rate in rented_executors.secure_idle_rate_by_gpu_model.items()
+            if name in BASE_GPU_MAP
+        }
+        # a parity alias always takes its source's rate, as in the table (incentive/config.py)
+        for alias, source in PARITY_PRICE_ALIASES.items():
+            if source in rates:
+                rates[alias] = rates[source]
+            else:
+                rates.pop(alias, None)
+        self.incentive.market_rental_prices_per_hour = rates
+        logger.info(
+            _m(
+                "[sync] Idle secure rates: %d GPU name(s) from the GPU market, the rest from the table" % len(rates),
+                extra=get_extra_info({**self.default_extra, "market_secure_idle_rates": rates}),
+            ),
+        )
 
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""

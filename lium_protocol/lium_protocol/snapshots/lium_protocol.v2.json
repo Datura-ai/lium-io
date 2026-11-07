@@ -5382,6 +5382,14 @@
           "title": "Provider Spot Executor Ids",
           "type": "array"
         },
+        "secure_idle_rate_by_gpu_model": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "default": {},
+          "title": "Secure Idle Rate By Gpu Model",
+          "type": "object"
+        },
         "spot_executor_ids": {
           "default": [],
           "items": {
@@ -6597,7 +6605,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.10.0",
+  "protocol_version": "2.11.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
