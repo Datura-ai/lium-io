@@ -30,6 +30,7 @@ class ContainerStartWatch:
     """DAH-5682: whether `docker run` of an attempt's test container has not returned yet."""
 
     in_progress: bool = False
+    started_at: float = 0.0  # loop time the in-progress start began
 
 
 class BatchVerifier:
@@ -38,6 +39,9 @@ class BatchVerifier:
     REPROBE_DELAY_SEC = 3
     REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
     ATTEMPT_TIMEOUT_SEC = 60
+    # a start the attempt deadline cut off counts as hung only if it had this long: on a slow host the outside
+    # probe's container can use most of the 60 s, leaving the batch start seconds before the deadline
+    HUNG_START_MIN_SEC = 30
 
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
@@ -96,7 +100,9 @@ class BatchVerifier:
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
-                start_hung += start_watch.in_progress
+                start_hung += start_watch.in_progress and (
+                    asyncio.get_running_loop().time() - start_watch.started_at >= self.HUNG_START_MIN_SEC
+                )
                 logger.debug(
                     _m(
                         f"attempt {attempt} timed out after {timeout_sec}s"
@@ -200,7 +206,7 @@ class BatchVerifier:
         timeout: int,
     ) -> ContainerStartResult:
         # no `finally`: a cancelled start must stay marked in progress for the attempt's timeout handler
-        start_watch.in_progress = True
+        start_watch.in_progress, start_watch.started_at = True, asyncio.get_running_loop().time()
         result = await self.runner.run(ssh_client, name, script, network_mode, timeout)
         start_watch.in_progress = False
         return result
