@@ -1380,8 +1380,8 @@ class GpuUsageMessages:
     USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
         "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "
         "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
-        "outside Lium's containers and re-run your node: {processes}. Do not stop filler_* "
-        "containers: Lium runs them."
+        "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
+        "running: {fillers}."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "

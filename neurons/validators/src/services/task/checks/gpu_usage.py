@@ -659,6 +659,11 @@ def _measured_usage_remediation(violation: dict, filler_containers: set[str]) ->
             gpu_limit=GPU_UTILIZATION_LIMIT,
             memory_limit=GPU_MEMORY_UTILIZATION_LIMIT,
             processes=", ".join(_describe_process(p) for p in outside),
+            fillers=", ".join(
+                _describe_process(p)
+                for p in violation["gpu_processes"]
+                if p.get("container_name") in filler_containers
+            ),
         )
     }
 

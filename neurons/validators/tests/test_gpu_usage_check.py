@@ -1843,7 +1843,8 @@ async def test_a_busy_gpu_beside_the_nodes_filler_never_names_the_filler_to_stop
     result = await GpuUsageCheck().run(ctx)
 
     assert result.event.reason_code == Msg.USAGE_HIGH.reason
-    assert "filler_5703" not in result.event.remediation
+    stop = result.event.remediation.split("Leave Lium's own filler running:")[0]
+    assert "filler_5703" not in stop
     assert "must stay below" not in result.event.remediation
     assert "python3 (pid 777)" in result.event.remediation
 
@@ -1888,3 +1889,33 @@ async def test_a_busy_gpu_lists_the_processes_of_every_card_as_the_nodes(context
     assert "On the GPU" not in result.event.remediation
     expected = "GPU processes on the node: python3 (pid 4242), miner (pid 5151)."
     assert expected in result.event.remediation
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [{"pid": 777, "name": "python3"}, {"pid": 778, "container_name": "filler_my_training"}],
+    ids=["host-process", "unmapped-filler-name"],
+)
+@pytest.mark.asyncio
+async def test_only_the_backends_own_filler_is_left_out_of_the_processes_to_stop(
+    context_factory, stray
+):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 3}],
+        gpu_processes=[{"pid": 3217038, "container_name": filler_container}, stray],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    remediation = result.event.remediation
+    stop, keep = remediation.split("Leave Lium's own filler running:")
+    assert f"(pid {stray['pid']})" in stop
+    assert filler_container not in stop
+    assert keep.strip() == f"{filler_container} (pid 3217038)."
+    assert "filler_*" not in remediation
