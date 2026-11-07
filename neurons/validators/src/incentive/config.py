@@ -158,14 +158,18 @@ RENTAL_PRICES_PER_HOUR.update({
 #
 # The A100 and L40S 8-card buckets use lower, demand-based caps than the default
 # 8-card bucket; the values are in the table below.
+#
+# DAH-5971 (Sergej, 7 Nov 2026): RTX PRO 6000, RTX A6000, RTX 4090, RTX 6000 Ada, L40S and
+# RTX A4000 caps = 7-day p90 of rented GPUs minus rented now, at least one machine, never
+# above the previous cap. Rates are unchanged; the caps stop paying idle supply past demand.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
-    "RTX 4090": {1: 10, 8: 64},
+    "RTX 4090": {1: 10, 8: 8},
     "A100": {1: 10, 8: 40},
-    "RTX A6000": {1: 10, 8: 64},
+    "RTX A6000": {1: 1, 8: 8},
     "RTX 3090": {1: 10, 8: 64},
     "H800": {1: 10, 8: 64},
     "A800": {1: 10, 8: 64},
@@ -174,15 +178,15 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "RTX 5090": {1: 10, 8: 64},
     "RTX 5090 D": {1: 10, 8: 64},
     "RTX 4000 Ada Generation": {1: 10, 8: 64},
-    "RTX 6000 Ada Generation": {1: 10, 8: 64},
-    "RTX PRO 6000": {1: 10, 8: 64},
+    "RTX 6000 Ada Generation": {1: 7, 8: 8},
+    "RTX PRO 6000": {1: 10, 8: 16},
     "L4": {1: 10, 8: 64},
-    "L40S": {1: 10, 8: 16},
+    "L40S": {1: 7, 8: 8},
     "L40": {1: 10, 8: 64},
     "RTX 2000 Ada Generation": {1: 10, 8: 64},
     "RTX A5000": {1: 10, 8: 64},
     "RTX A4500": {1: 10, 8: 64},
-    "RTX A4000": {1: 10, 8: 64},
+    "RTX A4000": {1: 1, 8: 8},
     "A40": {1: 10, 8: 64},
     "A30": {1: 10, 8: 64},
     "RTX 5080": {1: 10, 8: 64},

@@ -64,7 +64,7 @@ def test_the_48gb_model_has_its_own_economics():
     assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] == {1: 10, 8: 64}  # the default tier
     # the standard card keeps its numbers
     assert GPU_MODEL_RATES[RTX_4090] == 0.05
-    assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090"] == {1: 10, 8: 64}
+    assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090"] == {1: 10, 8: 8}  # DAH-5971 demand cap
 
 
 @pytest.mark.parametrize("enabled", [False, True])
