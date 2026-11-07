@@ -18,6 +18,8 @@ PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 # a provider report: 36 connects in the same instant read as a port scan to a router's DoS filter, which
 # then dropped the validator's next SSH connect; starting them this far apart spreads 36 over ~9 s
 PROBE_STAGGER_SEC = 0.25
+# the whole spread stays this short so a 300-port batch still fits its 60 s attempt
+MAX_PROBE_SPREAD_SEC = 15.0
 
 
 class PortTester:
@@ -46,8 +48,10 @@ class PortTester:
         """Test multiple ports concurrently."""
         durations: list[float] = []
 
+        gap = min(PROBE_STAGGER_SEC, MAX_PROBE_SPREAD_SEC / max(len(ports), 1))
+
         async def timed(index: int, port: PortPair) -> bool:
-            await asyncio.sleep(index * PROBE_STAGGER_SEC)
+            await asyncio.sleep(index * gap)
             started = time.monotonic()
             try:
                 return await self.test_one(session, host, port, token)

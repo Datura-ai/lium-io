@@ -411,3 +411,27 @@ async def test_port_probes_start_staggered_not_all_at_once(mocker):
     assert len(ok) == 4 and not failed
     gaps = [b - a for a, b in zip(starts, starts[1:])]
     assert all(gap >= 0.04 for gap in gaps)
+
+
+@pytest.mark.asyncio
+async def test_a_wide_batch_spreads_its_probes_over_a_bounded_time(mocker):
+    # review: 300 ports at the full gap would start the last probe after the 60 s attempt ends
+    from services.executor_connectivity import port_tester
+
+    mocker.patch.object(port_tester, "PROBE_STAGGER_SEC", 0.25)
+    mocker.patch.object(port_tester, "MAX_PROBE_SPREAD_SEC", 0.3)
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def record_sleep(seconds):
+        delays.append(seconds)
+        await real_sleep(0)
+
+    mocker.patch.object(port_tester.asyncio, "sleep", side_effect=record_sleep)
+    tester = port_tester.PortTester()
+    mocker.patch.object(tester, "test_one", mocker.AsyncMock(return_value=True))
+
+    ok, _ = await tester.test_many(mocker.Mock(), "host", [PortPair(i, i) for i in range(300)], "t")
+
+    assert len(ok) == 300
+    assert max(delays) <= 0.3
