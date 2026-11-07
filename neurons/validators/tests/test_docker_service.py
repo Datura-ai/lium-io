@@ -8758,6 +8758,38 @@ async def test_a_pod_paused_by_the_recovery_is_still_lifted_after_a_validator_re
 
 
 @pytest.mark.asyncio
+async def test_a_pause_key_that_failed_is_retried_in_the_background_until_it_lands(
+    docker_service, monkeypatch, unmarked_recovery_stop_db
+):
+    # lio#1827 review 4503995042: a restart before the key lands would read the pause as the provider's
+    monkeypatch.setattr(unmarked_recovery_stop_db, "add", AsyncMock(side_effect=ConnectionError("DB down")))
+    monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())
+    monkeypatch.setattr(docker_service_module, "_PAUSED_BY_RECOVERY", set())
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC", 0)
+    store: dict[str, str] = {}
+    redis_up = {"up": False}
+
+    async def redis_set(key, value, ex=None):
+        if not redis_up["up"]:
+            raise ConnectionError("Redis down")
+        store[key] = value
+
+    docker_service.redis_service.set = AsyncMock(side_effect=redis_set)
+    docker_service.redis_service.get = AsyncMock(side_effect=lambda key: store.get(key))
+    ssh_client = AsyncMock()
+    ssh_client.run.return_value = Mock(exit_status=0, stdout="", stderr="")
+    assert await docker_service._mark_and_stop_unmounted_pod(ssh_client, "pod_pod-1", "pod-1") is False
+    docker_service_module._UNMOUNTED_STOP_OUTCOMES.pop("pod-1", None)
+    retry = docker_service_module._RECOVERY_MARK_CLEANUPS["paused_by_recovery:pod-1"]
+    redis_up["up"] = True
+    await asyncio.wait_for(retry, timeout=5)
+    assert store == {"paused_by_recovery:pod-1": "1"}
+
+    monkeypatch.setattr(docker_service_module, "_PAUSED_BY_RECOVERY", set())  # restart
+    assert await docker_service.paused_by_recovery("pod-1")
+
+
+@pytest.mark.asyncio
 async def test_a_failed_record_delete_stays_pending_until_it_lands(docker_service, monkeypatch, unmarked_recovery_stop_db):
     # lio#1827 review 4484261750: the record leaves memory only with its DB row, so the next healthy check retries
     monkeypatch.setattr(docker_service_module, "_UNMARKED_RECOVERY_STOPS", set())

@@ -12507,6 +12507,8 @@ class DockerService:
                 if getattr(paused, "exit_status", 1) == 0:
                     _PAUSED_BY_RECOVERY.add(pod_id)
                     await self.paused_by_recovery(pod_id)  # written to Redis now if it is back
+                    if pod_id in _PAUSED_BY_RECOVERY:
+                        self._retry_pause_key_in_background(pod_id)
                 logger.error(
                     _m(
                         "POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD",
@@ -12559,6 +12561,22 @@ class DockerService:
             logger.warning(_m("POD_RECOVERY_PAUSE_RECORD_UNAVAILABLE", extra=get_extra_info({"pod_id": pod_id})))
             return pod_id in _PAUSED_BY_RECOVERY
 
+    def _retry_pause_key_in_background(self, pod_id: str) -> None:
+        # retried until it lands, like the stop mark: only this process knows the pause until then, so a validator
+        # restart would leave the renter's pod paused for good (lio#1827 review). Its own slot, so the stop mark's
+        # writes and clears of the pod do not cancel it.
+        async def write() -> bool:
+            if pod_id in _PAUSED_BY_RECOVERY:
+                await self.paused_by_recovery(pod_id)
+            return pod_id not in _PAUSED_BY_RECOVERY
+
+        _retry_recovery_mark_in_background(
+            f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}",
+            write,
+            "POD_RECOVERY_PAUSE_KEY_WRITE_FAILED",
+            first_delay=_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC,
+        )
+
     async def resume_paused_unmounted_pod(
         self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
     ) -> bool:
@@ -12577,6 +12595,7 @@ class DockerService:
             _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
             return False
         _PAUSED_BY_RECOVERY.discard(pod_id)
+        await _cancel_recovery_mark_cleanup_and_wait(f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}")  # no write after the delete
         try:
             await asyncio.wait_for(
                 self.redis_service.delete(f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}"),
