@@ -21,6 +21,7 @@ set before the restart is cleared.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -62,6 +63,16 @@ class _PodState:
     retried_at: datetime | None = None
     # when a report of it last landed: reports cut at a deadline go first in the next tick
     reported_at: datetime | None = None
+
+
+def _ok(task: asyncio.Task) -> bool:
+    return not task.cancelled() and task.exception() is None and bool(task.result())
+
+
+def _landed(state: _PodState, reachable: bool, task: asyncio.Task) -> None:
+    if _ok(task):
+        state.reported_at = datetime.now(UTC)
+        state.posted = state.posted and not reachable
 
 
 class RentedPodWatch:
@@ -238,23 +249,18 @@ class RentedPodWatch:
             return 0
         never = datetime.min.replace(tzinfo=UTC)
         reports = sorted(reports, key=lambda report: report[0].reported_at or never)
-        tasks = [asyncio.ensure_future(coro) for _, _, coro in reports]
+        tasks = []
+        for state, reachable, coro in reports:
+            task = asyncio.ensure_future(coro)
+            # recorded as each lands, so a tick cancelled at its own deadline keeps what got through
+            task.add_done_callback(functools.partial(_landed, state, reachable))
+            tasks.append(task)
         try:
             done, _ = await asyncio.wait(tasks, timeout=min(deadline, REPORTS_DEADLINE_SECONDS))
         finally:
             for task in tasks:
                 task.cancel()  # no-op on the finished ones; also when the tick deadline cancels us
-        failed = 0
-        landed_at = datetime.now(UTC)
-        for (state, reachable, _), task in zip(reports, tasks, strict=True):
-            ok = (
-                task in done and not task.cancelled() and task.exception() is None and task.result()
-            )
-            failed += not ok
-            if ok:
-                state.reported_at = landed_at
-                state.posted = state.posted and not reachable
-        return failed
+        return sum(not (task in done and _ok(task)) for task in tasks)
 
     async def _post(
         self, observation: PodSshObservation, state: str, since: datetime, observed_at: datetime

@@ -543,3 +543,27 @@ async def test_reports_cut_at_the_deadline_go_first_next_tick(monkeypatch):
     await watch.tick()
 
     assert [p["pod_id"] for p in backend.posts][:1] == ["p2"]
+
+
+# review: reports that landed before the tick deadline cancelled _send keep their reported_at
+@pytest.mark.asyncio
+async def test_reports_that_landed_before_the_tick_was_cancelled_still_count():
+    rented = _rented(p1="RUNNING", p2="RUNNING", p3="RUNNING")
+    backend, probe = SlowBackend(rented, delay=0), FakeProbe()
+    watch = await _answered(backend, probe, "p1", "p2", "p3")
+    watch._send_slots = asyncio.Semaphore(1)
+    probe.results = {pod: PodSshResult.REFUSED for pod in ("p1", "p2", "p3")}
+    for _ in range(settings.RENTED_POD_WATCH_MISSES - 1):
+        await watch.tick()
+    backend.delay = 0.03
+    before = {pod: state.reported_at for pod, state in watch._pods.items()}
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(watch.tick(), 0.045)  # p1 lands, then the tick is cancelled
+    assert [pod for pod, at in before.items() if watch._pods[pod].reported_at != at] == ["p1"]
+    backend.posts.clear()
+    backend.delay = 0
+
+    await watch.tick()
+
+    assert [p["pod_id"] for p in backend.posts][:1] == ["p2"]
