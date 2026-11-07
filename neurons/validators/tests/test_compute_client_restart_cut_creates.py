@@ -23,11 +23,13 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import Response
+import services.redis_service as redis_service_module
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
     InflightBackendCreate,
     RedisService,
+    create_started_at_key,
 )
 
 
@@ -720,6 +722,38 @@ async def test_a_pending_write_never_loses_one_another_validator_made_after_its_
 
     left = await redis_service.get_pending_pods("miner-hk", "exec-1", max_age_seconds=None)
     assert landed and [item["pod_id"] for item in left] == (["pod-a", "pod-b", "pod-c"] if write == "add" else ["pod-b"])
+
+
+@pytest.mark.asyncio
+async def test_a_retried_pending_write_never_puts_an_older_create_stamp_over_a_newer_one(monkeypatch) -> None:
+    server = FakeServer()
+    redis_service, other = _redis_service(server), _redis_service(server)
+    clock = iter(range(100, 200))
+    monkeypatch.setattr(redis_service_module.time, "time", lambda: next(clock))
+    pipeline = redis_service.redis.pipeline
+    landed: list = []
+
+    def pipeline_where_b_lands_after_the_read(*args, **kwargs):
+        pipe = pipeline(*args, **kwargs)
+        hget = pipe.hget
+
+        async def read_then_b_adds(*hget_args):
+            raw = await hget(*hget_args)
+            if not landed:
+                landed.append(True)
+                await other.add_pending_pod("miner-hk", "exec-1", "pod-b", command_id="cmd-b")
+                landed.append(float(await other.redis.get(create_started_at_key("miner-hk", "exec-1"))))
+            return raw
+
+        pipe.hget = read_then_b_adds
+        return pipe
+
+    redis_service.redis.pipeline = pipeline_where_b_lands_after_the_read
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-a", command_id="cmd-a")
+
+    # A started before B's create; its retry runs after B's EXEC, so it must not put an older stamp over B's
+    stamp = float(await redis_service.redis.get(create_started_at_key("miner-hk", "exec-1")))
+    assert len(landed) == 2 and stamp > landed[1]
 
 
 @pytest.mark.parametrize("failing_read", ["unacked_container_created", "renting_in_progress"])

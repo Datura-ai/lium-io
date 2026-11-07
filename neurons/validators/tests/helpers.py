@@ -230,7 +230,7 @@ class FakeRedis:
 
     async def _update_pending_pods(self, miner_hotkey: str, executor_id: str, change, also=None):
         """`RedisService._update_pending_pods`: read, change and write with no await between, so atomic here;
-        `also` first, so a batch that fails applies none of it"""
+        `also()` first, so a batch that fails applies none of it"""
         import json
 
         from neurons.validators.src.services.redis_service import PENDING_PODS_PREFIX, _parse_pending_pods
@@ -239,7 +239,7 @@ class FakeRedis:
         field = f"{miner_hotkey}:{executor_id}"
         pending_pods = change(_parse_pending_pods(self.hashes.get(PENDING_PODS_PREFIX, {}).get(field)))
         if also:
-            await self.write_atomically(also)
+            await self.write_atomically(also())
         if pending_pods:
             self.hashes.setdefault(PENDING_PODS_PREFIX, {})[field] = json.dumps(pending_pods)
         else:

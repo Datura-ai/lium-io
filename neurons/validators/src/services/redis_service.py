@@ -822,10 +822,17 @@ class RedisService:
             item["gpu_uuids"] = list(gpu_uuids)
         if command_id:
             item["command_id"] = command_id
-        stamp = RedisWrites()
-        if not synthetic_probe:
-            # the validator's own rental probe keeps its marker but leaves no stamp: once done it is no rental
-            stamp.set(create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS)
+
+        def stamp() -> RedisWrites:
+            # read at each try: a retry after a newer create's EXEC must not write an older time over its stamp
+            writes = RedisWrites()
+            if not synthetic_probe:
+                # the validator's own rental probe keeps its marker but leaves no stamp: once done it is no rental
+                writes.set(
+                    create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
+                )
+            return writes
+
         # every entry: a write must not drop a build past 30 min that the orphan sweep still spares. One step with
         # the stamp: a marker written without it would abort the caller before its cleanup and leave the marker behind
         await self._update_pending_pods(miner_hotkey, executor_id, lambda pending_pods: [*pending_pods, item], stamp)
@@ -865,11 +872,11 @@ class RedisService:
         miner_hotkey: str,
         executor_id: str,
         change: Callable[[list[dict]], list[dict]],
-        also: RedisWrites | None = None,
+        also: Callable[[], RedisWrites] | None = None,
     ) -> None:
         """Read, change and write one executor's pending list as one WATCH/MULTI transaction: a concurrent add or
         remove makes EXEC fail and the change rerun on the new list, so neither write is lost (lium-io#1952).
-        `also` is written in the same EXEC."""
+        `also()`, built again at each try, is written in the same EXEC."""
         field = f"{miner_hotkey}:{executor_id}"
         async with self.redis.pipeline(transaction=True) as pipe:
             while True:
@@ -881,7 +888,7 @@ class RedisService:
                         pipe.hset(PENDING_PODS_PREFIX, field, json.dumps(pending_pods))
                     else:
                         pipe.hdel(PENDING_PODS_PREFIX, field)
-                    for write in also.ops if also else ():
+                    for write in also().ops if also else ():
                         getattr(pipe, write.command)(*write.args, **write.kwargs)
                     await pipe.execute()
                     return
