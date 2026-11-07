@@ -373,7 +373,11 @@ async def test_batch_is_not_start_hung_when_a_slow_outside_start_left_the_batch_
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
-        (TimeoutError(), "ssh to port 20000: connect timed out"),
+        (
+            TimeoutError(),
+            "ssh to port 20000: connect timed out; check the forwarding of that port, and that "
+            "no router or firewall flood protection blocks our checks",
+        ),
         (ConnectionRefusedError(), "ssh to port 20000: ConnectionRefusedError"),
         (OSError("Connection lost"), "ssh to port 20000: Connection lost"),
     ],
