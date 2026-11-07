@@ -368,3 +368,18 @@ async def test_batch_is_not_start_hung_when_a_slow_outside_start_left_the_batch_
     result = await verifier.verify([PortPair(9000 + i, 9000 + i) for i in range(5)], ssh_client=mocker.Mock(), host="1.2.3.4")
 
     assert not result.start_hung
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (TimeoutError(), "ssh to port 20000: connect timed out"),
+        (ConnectionRefusedError(), "ssh to port 20000: ConnectionRefusedError"),
+        (OSError("Connection lost"), "ssh to port 20000: Connection lost"),
+    ],
+)
+def test_the_provider_sees_the_port_and_why_ssh_failed(error, expected):
+    # ticket-1094: a connect timeout has no text, so the notice read "(ssh: )"
+    from services.executor_connectivity.dind_probe import describe_ssh_error
+
+    assert describe_ssh_error(error, PortPair(22, 20000)) == expected
