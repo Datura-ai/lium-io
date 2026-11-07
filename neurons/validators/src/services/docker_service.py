@@ -1719,6 +1719,128 @@ _PARK_KILL_WAIT_SECONDS = 30
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
+# A parked container with renter files in its own layer under the encrypted volume's plaintext path (written
+# while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
+# after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
+
+
+class KeptContainersNotRemoved(RuntimeError):
+    """The pod's kept containers were found but `docker rm -fv` failed: they stay until a delete removes them."""
+
+
+def _kept_container_prefix(container_name: str) -> str:
+    # kept_unmounted_<pod id>_<time>: the trailing "_" keeps one pod's prefix from matching another's
+    return f"{KEPT_UNMOUNTED_PREFIX}{container_name.removeprefix(POD_CONTAINER_PREFIX)}_"
+
+
+async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> list[str]:
+    """Remove the pod's kept containers by ID; they still reference the pod's volume, so its removal needs them gone."""
+    prefix = _kept_container_prefix(container_name)
+    listed = await _run_with_host_timeout(
+        ssh_client,
+        f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{shlex.quote(prefix)}',
+        _PARK_COMMAND_TIMEOUT_SECONDS,
+    )
+    if listed.exit_status != 0:
+        raise Exception(f"docker ps exited {listed.exit_status}: {(listed.stderr or '').strip()}")
+    ids = [
+        fields[1]
+        for fields in (line.split() for line in (listed.stdout or "").splitlines())
+        if len(fields) == 2 and fields[0].startswith(prefix)
+    ]
+    if ids:
+        removed = await _run_with_host_timeout(
+            ssh_client, f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}", _PARK_COMMAND_TIMEOUT_SECONDS
+        )
+        if removed.exit_status != 0:
+            raise KeptContainersNotRemoved(f"docker rm exited {removed.exit_status}: {(removed.stderr or '').strip()}")
+    return ids
+_DROP_MARK = "drop"
+# The image's entrypoint writes under the plaintext path before each gocryptfs mount. Only a start the validator
+# itself made (the create, or a start of a stopped container) and then mounted counts as startup, from that start to
+# the end of its mount, as recorded under _VALIDATOR_STARTS_DIR (one "start end" line per start in nanoseconds, keyed
+# by container id). Any other file, a Docker restart's included, keeps the copy.
+# on the host disk: the executor container (and its /var/tmp) is recreated on every executor release
+_VALIDATOR_STARTS_DIR = "/proc/1/root/var/lib/lium_validator_starts"
+
+
+def _layer_data_check(
+    container_name: str, plaintext_path: str, upper_dir: str | None = None, startup_shortcut: bool = True
+) -> str:
+    """Prints _DROP_MARK only when the container is safe to remove: no encrypted volume, or no file its layer
+    added or changed under the plaintext path (``docker diff``). Any other output, an error included, keeps it.
+
+    The layer is read, not the mounts: files written while unmounted stay in the layer after a remount.
+    When the host can read the overlay upper dir, only files changed outside every recorded validator start count
+    (ctime, which a renter cannot set back); otherwise ``docker diff`` decides. The upper dir is the
+    overlay2 one, else (containerd store) the running container's root mount's, else ``upper_dir``, read through
+    /proc/1/root: the SSH session is the executor's container, which runs with the host's PIDs. A line
+    ``upper <dir>`` names the one it used, so a read of the stopped container can be handed it.
+    Without ``startup_shortcut`` only ``docker diff`` decides: a copy already kept (possibly by docker diff alone,
+    when no upper dir was readable) is never released by a startup window."""
+    name = shlex.quote(container_name)
+    under = shlex.quote(f"{plaintext_path.rstrip('/')}/")
+    upper_under = shlex.quote(plaintext_path.rstrip("/"))
+    awk = (
+        '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
+        f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
+    )
+    root_mount_upper = (
+        "awk '$5 == \"/\" {for (i = 7; i < NF; i++) if ($i == \"-\") {n = split($(i + 3), o, \",\"); "
+        "for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) print substr(o[j], 10); exit}}' \"/proc/$p/mountinfo\""
+    )
+    given = f"u={shlex.quote(upper_dir)}; d=$(v \"$u\")" if upper_dir else "false"
+    shortcut = (
+        'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
+        '[ -d "$1" ] && echo "$1"; }; '
+        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
+        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
+        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
+        f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
+        # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
+        f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
+        "g=$(date -d \"${i#* }\" +%s%N 2>/dev/null) || g=0; w=; "
+        "n() { printf '@%d.%09d' $(($1 / 1000000000)) $(($1 % 1000000000)); }; "
+        "while read -r s e; do [ -n \"$e\" ] || continue; case \"$s$e\" in *[!0-9]*) continue;; esac; "
+        "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
+        "w=\"$w ! ( -newerct $(n $s) ! -newerct $(n $e) )\"; "
+        f"done 2>/dev/null < {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"; true; }} "
+        "&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
+    )
+    return (
+        f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
+        f"printf '%s\\n' \"$m\" | grep -qxF {_LIUM_CIPHER_MOUNT} || {{ echo {_DROP_MARK}; exit 0; }}; "
+        f"{shortcut if startup_shortcut else ''}"
+        f"{{ /usr/bin/docker diff {name} || echo diff-failed; }} | awk -v p={under} {shlex.quote(awk)}"
+    )
+
+
+async def _stopped_before_start(docker_client: RentalDockerSdkClient, container_name: str) -> bool:
+    """True only when Docker says the container is stopped: the start that follows is then the validator's. Docker
+    accepts a start of a running container as success, so an unreadable state counts as running."""
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+    except Exception:  # noqa: BLE001 — unknown: no start window, so the layer read keeps the copy
+        return False
+    return state.running is False and state.restarting is False
+
+
+async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> None:
+    """Record [the container's current start, now] as the validator's start window, just after its mount: the layer
+    read counts files changed in it as the entrypoint's. Call only for a start the validator verifiably made itself.
+    RestartCount above 0 means Docker restarted it since that start: nothing is recorded. Nanoseconds: a whole-second
+    end padded up a second would cover a restart of Docker's own later in that second."""
+    name = shlex.quote(container_name)
+    with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):  # without it the read keeps, never drops
+        await ssh_client.run(
+            "i=$(/usr/bin/docker inspect -f "
+            f"'{{{{.Id}}}} {{{{.RestartCount}}}} {{{{.State.StartedAt}}}}' {name}) "
+            f"&& r=\"${{i#* }}\" && [ \"${{r%% *}}\" = 0 ] && s=$(date -d \"${{r#* }}\" +%s%N) && mkdir -p "
+            f"{_VALIDATOR_STARTS_DIR} && echo \"$s $(date +%s%N)\" >> {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"",
+            check=False,
+            timeout=30,
+        )
 
 
 class _UnkillableParkedContainer(Exception):
@@ -1747,8 +1869,10 @@ class _EditSwap:
     destroyed. Entered together with the SSH connection so the undo still has a live session.
     """
 
-    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict):
+    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict, docker_client=None):
         self.ssh_client = ssh_client
+        # the create's Docker SDK connection, independent of the SSH session: stops a renamed pod a dead SSH lost track of
+        self.docker_client = docker_client
         self.container_name = container_name
         self.parked_name: str | None = None
         # the parked container's own Docker ID: its removal after the reply can land after a later edit
@@ -1759,7 +1883,8 @@ class _EditSwap:
         # the pod's volume path: a bare `docker start` drops the gocryptfs plaintext mount and the
         # sshd, so the restore goes through the same steps as start_existing_container
         # (start, remount with allow_init=False, sshd bootstrap). None falls back to `docker start`.
-        self.bring_up: Callable[[str], Awaitable[None]] | None = None
+        # (container name, remount the encrypted volume)
+        self.bring_up: Callable[[str, bool], Awaitable[None]] | None = None
         # set once the reply went to the backend: from then on the edit stands, whatever ends the
         # steps after the reply (a delete's wait timing out cancels them)
         self.replacement_is_up = False
@@ -1768,6 +1893,14 @@ class _EditSwap:
         self.replacement_id: str | None = None
         # set when `docker kill` got no exit event and killing the processes directly did not stop it either
         self.unkillable = False
+        # the pod's plaintext volume path, set with bring_up: the keep check reads the layer under it
+        self.plaintext_path: str | None = None
+        # the parked container's layer holds renter files under the plaintext path: kept, never removed, after a successful edit
+        self.keep_parked = False
+        # the overlay upper dir the last layer read used
+        self._upper_dir: str | None = None
+        # the plaintext path was mounted when parked (None: unknown); a failed edit restores that, kept or not
+        self.was_mounted: bool | None = None
 
     async def __aenter__(self) -> "_EditSwap":
         return self
@@ -1790,9 +1923,11 @@ class _EditSwap:
 
     async def _park(self) -> str | None:
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
+        kept_prefix = _kept_container_prefix(self.container_name)
         listed = await self._run(
             f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
-            f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
+            f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$ "
+            f"--filter name=^{shlex.quote(kept_prefix)}"
         )
         if listed.exit_status != 0:
             # a host timeout (exit 124) prints nothing: read as "no container", the sweep would remove the pod
@@ -1800,37 +1935,84 @@ class _EditSwap:
         listing = [line.split() for line in (listed.stdout or "").splitlines() if line.strip()]
         names = {fields[0] for fields in listing}
         ids_by_name = {fields[0]: fields[1] for fields in listing if len(fields) > 1}
+        kept = sorted(name for name in names if name.startswith(kept_prefix))
+        names -= set(kept)
+        # a crashed edit that parked under the kept name: the newest kept one is then the pod's only copy
+        recover_kept = kept[-1] if self.container_name not in names and parked not in names and kept else None
         # the container this edit parks: the pod's, or the one recovered from a crashed edit below
-        container_id = ids_by_name.get(self.container_name if self.container_name in names else parked)
-        if names and container_id is None:
+        container_id = ids_by_name.get(
+            self.container_name if self.container_name in names else recover_kept or parked
+        )
+        if (names or recover_kept) and container_id is None:
             # its removal after the reply could only go by name, and a later edit may park another container under it
             raise Exception("[park_current_container] docker ps listed the pod without its container ID; the pod was left as it was")
         if self.container_name not in names:
-            if parked in names:
+            if parked in names or recover_kept:
                 # An earlier edit crashed between park and restore: the parked container is the
-                # customer's only copy. Give it its name back and carry on; never remove it.
-                renamed = await self._run(
-                    f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
-                )
-                if renamed.exit_status != 0:
-                    raise Exception(
-                        f"[park_current_container] a parked container from an earlier edit could not be "
-                        f"renamed back: {(renamed.stderr or '').strip()}"
+                # customer's only copy; never remove it. A kept one is reused under its kept name,
+                # so it is never without protection; a __prev one gets its name back.
+                if not recover_kept:
+                    renamed = await self._run(
+                        f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                     )
+                    if renamed.exit_status != 0:
+                        raise Exception(
+                            f"[park_current_container] a parked container from an earlier edit could not be "
+                            f"renamed back: {(renamed.stderr or '').strip()}"
+                        )
                 logger.warning(
-                    _m("Recovered a parked container from an earlier edit", extra=get_extra_info({**self.default_extra, "parked": parked}))
+                    _m(
+                        "Recovered a parked container from an earlier edit",
+                        extra=get_extra_info({**self.default_extra, "parked": recover_kept or parked}),
+                    )
                 )
             else:
                 return None
         elif parked in names:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
-            # the leftover parked one is stale and must not block the rename.
+            # the leftover parked one is stale and must not block the rename. Its layer may hold renter
+            # files (the earlier edit could not rename it to the kept name): then it stays and the edit stops.
+            if not await self._layer_safe_to_remove(ids_by_name.get(parked) or parked):
+                raise Exception(
+                    f"[park_current_container] a parked container from an earlier edit ({parked}) holds renter "
+                    "files under the volume path; the pod was left as it was"
+                )
             await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
-        renamed = await self._run(
-            f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
+        if recover_kept:
+            kept.remove(recover_kept)
+        for leftover in list(kept):
+            # every edit parks under the kept name, so a clean one is an earlier edit's copy whose removal failed
+            if await self._layer_safe_to_remove(ids_by_name.get(leftover) or leftover, already_kept=True):
+                removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)}")
+                if removed.exit_status != 0:
+                    # a clean copy Docker will not remove: parking another under a new name would pile them up
+                    raise Exception(
+                        f"[park_current_container] a clean container from an earlier edit ({leftover}) could not be "
+                        f"removed: {(removed.stderr or '').strip() or f'exit {removed.exit_status}'}; the pod was left as it was"
+                    )
+                kept.remove(leftover)
+        # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
+        # Unknown path or an unreadable diff keeps it.
+        self.keep_parked = not await self._layer_safe_to_remove(
+            recover_kept or self.container_name, already_kept=bool(recover_kept)
         )
-        if renamed.exit_status != 0:
-            raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
+        # the containerd store names the upper dir only in a running container's mounts: the stopped read reuses it
+        upper_dir = self._upper_dir
+        if self.keep_parked and kept:
+            # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
+            raise Exception(
+                f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
+                "and this one holds renter files under the volume path too; the pod was left as it was"
+            )
+        # every candidate is parked under the protected kept name, before the stop: no later rename can fail and leave
+        # renter files written during the shutdown to a sweep; a clean one is removed by ID after the edit
+        parked = recover_kept or f"{kept_prefix}{int(time.time())}"
+        if not recover_kept:
+            self.was_mounted = await self._plaintext_mounted(self.container_name)
+            if self.was_mounted is None and self.plaintext_path:
+                # unknown, an undo could not tell whether to remount the workspace: the running pod stays as it is
+                raise Exception("[park_current_container] the pod's volume mount could not be read; the pod was left as it was")
+            await self._rename_aside(container_id, parked)
         self.parked_name = parked
         self.parked_id = container_id
         stopped = await self._run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
@@ -1852,8 +2034,74 @@ class _EditSwap:
                 "[park_current_container] the running container could not be stopped, the pod was left "
                 f"as it was: {(stopped.stderr or '').strip() or f'exit {stopped.exit_status}'}"
             )
+        if not self.keep_parked and not await self._layer_safe_to_remove(
+            container_id, upper_dir, already_kept=bool(recover_kept)
+        ):
+            # a write between the running read and the stop (or by its shutdown) shows only on the stopped layer:
+            # decided here, before the replacement exists, so the one-kept limit holds; a failed edit brings it back unmounted
+            self.keep_parked = True
+            if kept:
+                raise Exception(
+                    f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
+                    "and this one wrote renter files under the volume path while it stopped; the pod was restored"
+                )
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
+
+    async def _plaintext_mounted(self, container: str) -> bool | None:
+        """Whether the container has a mount at the plaintext path (a stopped one has none); None when that cannot be read."""
+        if not self.plaintext_path:
+            return None
+        read = await self._run(
+            f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container)}) && "
+            f"{{ [ \"$p\" = 0 ] && echo unmounted || {{ [ -r /proc/$p/mountinfo ] && awk -v m={shlex.quote(self.plaintext_path.rstrip('/'))} "
+            "'$5 == m {f=1} END {print f ? \"mounted\" : \"unmounted\"}' /proc/$p/mountinfo; }; }"
+        )
+        out = (read.stdout or "").strip() if read.exit_status == 0 else ""
+        return {"mounted": True, "unmounted": False}.get(out)
+
+    async def _rename_aside(self, container_id: str, parked: str) -> None:
+        """Rename the pod to ``parked``. A failed or timed-out rename may still have been applied: the name Docker
+        now has for the container's ID decides, never the reply."""
+        error = None
+        try:
+            renamed = await self._run(f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}")
+            if renamed.exit_status == 0:
+                return
+            error = (renamed.stderr or "").strip() or f"exit {renamed.exit_status}"
+        except Exception as exc:  # noqa: BLE001 — a lost reply: the state below decides
+            error = f"{type(exc).__name__}: {exc}"
+        name = None
+        with contextlib.suppress(Exception):
+            named = await self._run(f"/usr/bin/docker inspect -f '{{{{.Name}}}}' {shlex.quote(container_id)}")
+            name = (named.stdout or "").strip().lstrip("/") if named.exit_status == 0 else None
+        if name == parked:
+            return
+        if name != self.container_name:
+            # unknown: give it the pod name back by ID (a no-op error when it was never renamed); still running
+            back = None
+            with contextlib.suppress(Exception):
+                back = await self._run(f"/usr/bin/docker rename {shlex.quote(container_id)} {shlex.quote(self.container_name)}")
+            if (back is None or back.exit_status != 0) and self.docker_client is not None:
+                # maybe renamed out of every delete's reach and still running: stop it by ID (its layer stays)
+                with contextlib.suppress(Exception):
+                    await self.docker_client.stop(container_name=container_id)
+        raise Exception(f"[park_current_container] docker rename failed: {error}")
+
+    async def _layer_safe_to_remove(self, container: str, upper_dir: str | None = None, already_kept: bool = False) -> bool:
+        """True only when the layer check says the container holds no renter files under the plaintext path.
+        A copy already under the kept name is read by ``docker diff`` alone: the startup-age bound never releases it.
+        Sets ``_upper_dir`` to the overlay upper dir the read used, or None."""
+        self._upper_dir = None
+        if not self.plaintext_path:
+            return False
+        checked = await self._run(
+            _layer_data_check(container, self.plaintext_path, upper_dir, startup_shortcut=not already_kept)
+        )
+        lines = (checked.stdout or "").strip().splitlines()
+        if lines and lines[0].startswith("upper "):
+            self._upper_dir = lines.pop(0).removeprefix("upper ").strip() or None
+        return lines == [_DROP_MARK]
 
     async def _killed_after_failed_stop(self, parked: str, stopped) -> bool:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
@@ -1896,12 +2144,18 @@ class _EditSwap:
         try:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
-                # stale one. Best effort — a wedged remove is left to the stale-container sweep.
+                # stale one. Best effort — a wedged remove is left to the next edit's clean-leftover removal.
+                if self.keep_parked:
+                    # the renter's files written while the volume was unmounted live only in this container's layer
+                    logger.error(
+                        _m("PARKED_CONTAINER_KEPT_VOLUME_UNMOUNTED", extra=get_extra_info({**self.default_extra, "kept_as": self.parked_name}))
+                    )
+                    return False
                 removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(
-                            "Parked container could not be removed after edit; left for the stale sweep",
+                            "Parked container could not be removed after edit; the next edit removes it or stops",
                             extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": (removed.stderr or "").strip()}),
                         )
                     )
@@ -1923,15 +2177,41 @@ class _EditSwap:
         ``docker start`` would hand the customer ciphertext in the workspace.
 
         ``start=False``: the pod's GPUs are no longer on the node and its device request names the old
-        cards, so it cannot start; the container gets its name back, stopped."""
+        cards, so it cannot start; the container gets its name back, stopped. A kept one (``keep_parked``)
+        is brought up the same way, remounted only if it was mounted when parked, and takes the pod name only once it is seen running."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
         q_replacement = shlex.quote(self.replacement_id) if self.replacement_id else q_name
         await self._run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
-        renamed = await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")
         error: str | None = None
-        if renamed.exit_status != 0:
+        if self.keep_parked and start:
+            # a kept one comes back mounted or not as it was parked, and keeps its kept name until it runs:
+            # stopped, it keeps the kept name's protection
+            try:
+                if self.bring_up is not None:
+                    async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
+                        # mounted when parked: remounted (its older layer files stay, hidden, in the kept copy)
+                        await self.bring_up(self.parked_name, self.was_mounted is True)
+                elif (started := await self._run(f"/usr/bin/docker start {q_parked}")).exit_status != 0:
+                    raise RuntimeError(f"docker start: {(started.stderr or '').strip()}")
+                # a start can return 0 while the entrypoint has already exited; Status is "restarting", not
+                # "running", in restart backoff, where .State.Running still reads true
+                running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Status}}}}' {q_parked}")
+                if running.exit_status != 0 or (running.stdout or "").strip() != "running":
+                    raise RuntimeError("started, but it is not running")
+                if (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
+                    raise RuntimeError(f"docker rename: {(renamed.stderr or '').strip()}")
+            except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
+                error = f"{type(exc).__name__}: {exc}"
+                # left running under its kept name, nothing would ever stop it or free the pod's GPUs: stopped,
+                # the next edit recovers it as the crashed-edit kept copy
+                stopped = await self._run(f"/usr/bin/docker stop -t 10 {q_parked}")
+                if stopped.exit_status != 0:
+                    # a wedged DinD stop (no exit event): the park path's kill and direct-process fallback
+                    await self._killed_after_failed_stop(self.parked_name, stopped)
+        elif not self.keep_parked and (renamed := await self._run(f"/usr/bin/docker rename {q_parked} {q_name}")).exit_status != 0:
             error = f"docker rename: {(renamed.stderr or '').strip()}"
         elif not start:
+            # a kept one stays stopped under its kept name, out of every sweep
             logger.warning(
                 _m(
                     "Edit failed; restore skipped: pod GPUs no longer on node",
@@ -1942,7 +2222,7 @@ class _EditSwap:
         elif self.bring_up is not None:
             try:
                 async with asyncio.timeout(_RESTORE_BRING_UP_TIMEOUT_SECONDS):
-                    await self.bring_up(self.container_name)
+                    await self.bring_up(self.container_name, True)
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
         else:
@@ -9501,7 +9781,7 @@ class DockerService:
                 )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
-                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
+                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra, docker_client=docker_client)
                 )
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
@@ -9877,14 +10157,16 @@ class DockerService:
                     # the sweep below must not treat the parked name as stale. A failed edit brings
                     # the parked container back the way start_container does (remount, sshd), at the
                     # pod's volume path.
-                    edit_swap.bring_up = lambda name: self._bring_up_existing_container(
+                    edit_swap.bring_up = lambda name, remount: self._bring_up_existing_container(
                         docker_client=docker_client,
                         ssh_client=ssh_client,
                         container_name=name,
                         local_volume_path=local_volume_path,
                         pod_id=payload.pod_id,
                         default_extra=default_extra,
+                        remount=remount,
                     )
+                    edit_swap.plaintext_path = local_volume_path
                     current_step = "park_current_container"
                     # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
                     # its removal of the container it parked, by that one's ID (never the one this edit parks)
@@ -10724,6 +11006,8 @@ class DockerService:
                                 allow_init=created_local_volume,
                                 authorized_keys=payload.user_public_keys if keys_in_volume_setup else (),
                             )
+                            # docker run's start is the validator's own: its entrypoint's files up to here are startup
+                            await _record_validator_start(ssh_client, container_name)
                         except AuthorizedKeysWriteFailed as exc:
                             # the mount is up: fail at add_public_keys below, as a separate keys exec did
                             keys_write_failure = exc
@@ -11662,6 +11946,7 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
+            stopped_before = await _stopped_before_start(docker_client, container_name)
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start)
             await run_logged_rental_docker_sdk_operation(
@@ -11689,6 +11974,7 @@ class DockerService:
                     local_volume_path=local_volume_path,
                     pod_id=pod_id,
                     default_extra=default_extra,
+                    record_start=stopped_before,
                 )
 
     async def _bring_up_existing_container(
@@ -11700,6 +11986,7 @@ class DockerService:
         local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
+        remount: bool = True,
     ) -> None:
         """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
         holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
@@ -11714,6 +12001,7 @@ class DockerService:
                 container_name=container_name,
             )
 
+        stopped_before = await _stopped_before_start(docker_client, container_name)
         try:
             await _start()
         except Exception as exc:
@@ -11733,6 +12021,8 @@ class DockerService:
             local_volume_path=local_volume_path,
             pod_id=pod_id,
             default_extra=default_extra,
+            remount=remount,
+            record_start=stopped_before,
         )
 
     async def _restore_mount_and_sshd_after_start(
@@ -11744,11 +12034,16 @@ class DockerService:
         local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
+        remount: bool = True,
+        record_start: bool = False,
     ) -> None:
         """What a bare ``docker start`` drops: the gocryptfs plaintext mount (remounted with
         ``allow_init=False`` — an existing volume is never re-initialised) and the sshd. Shared by
-        ``start_existing_container`` and the undo of a failed edit."""
-        encrypted_volume_name = await self._encrypted_local_volume_name(
+        ``start_existing_container`` and the undo of a failed edit. ``remount=False`` (a kept container that
+        ran unmounted, its files in its own layer) skips the remount, which would hide them. ``record_start``: the
+        caller saw the container stopped before its own start, so this start is the validator's (a no-op start of a
+        running container, or a remount alone, records nothing)."""
+        encrypted_volume_name = remount and await self._encrypted_local_volume_name(
             docker_client,
             container_name,
         )
@@ -11768,6 +12063,8 @@ class DockerService:
                 log_extra=default_extra,
                 allow_init=False,
             )
+            if record_start:
+                await _record_validator_start(ssh_client, container_name)
         ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
             docker_client=docker_client,
             container_name=container_name,
@@ -12711,6 +13008,26 @@ class DockerService:
                         await clear_filler_pod_applied_caps(
                             self.redis_service, payload.pod_id, log_extra=default_extra
                         )
+
+                # DAH-5773: a kept edit container still references the pod's volume ("volume is in use")
+                # and holds the renter's files; the rental is over, so it goes before the volume does. A failed
+                # rm is not best-effort: nothing else ever removes them, so it answers in progress and the re-ask
+                # retries. A failed listing stays best-effort, as the other steps: a pod rarely has kept containers
+                try:
+                    if kept := await _remove_kept_containers(ssh_client, payload.container_name):
+                        log.info("Removed the pod's kept edit containers", container_ids=kept)
+                except KeptContainersNotRemoved as exc:
+                    log.warning("Could not remove the pod's kept edit containers; retry deletion", error=str(exc))
+                    pending_deletions.mark(payload.pod_id)
+                    return self._deletion_in_progress(
+                        payload, msg="The pod's kept edit containers are not removed yet; retry deletion"
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "delete_container post-teardown step failed (non-fatal)",
+                        step="remove_kept_containers",
+                        error=str(exc),
+                    )
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
