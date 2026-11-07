@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 # and was recorded as a dead port without ever putting a packet on the wire
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 
+# ticket-1094: 36 connects in the same instant read as a port scan to a router's DoS filter, which
+# then dropped the validator's next SSH connect; starting them this far apart spreads 36 over ~9 s
+PROBE_STAGGER_SEC = 0.25
+
 
 class PortTester:
     """Tests port connectivity via HTTP. Stateless and easily mockable."""
@@ -42,7 +46,8 @@ class PortTester:
         """Test multiple ports concurrently."""
         durations: list[float] = []
 
-        async def timed(port: PortPair) -> bool:
+        async def timed(index: int, port: PortPair) -> bool:
+            await asyncio.sleep(index * PROBE_STAGGER_SEC)
             started = time.monotonic()
             try:
                 return await self.test_one(session, host, port, token)
@@ -50,7 +55,7 @@ class PortTester:
                 durations.append(time.monotonic() - started)
 
         wall_started = time.monotonic()
-        results = await asyncio.gather(*[timed(p) for p in ports])
+        results = await asyncio.gather(*[timed(i, p) for i, p in enumerate(ports)])
         wall = time.monotonic() - wall_started
 
         successful = [p for p, ok in zip(ports, results) if ok]
