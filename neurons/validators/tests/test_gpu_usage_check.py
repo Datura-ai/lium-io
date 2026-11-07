@@ -1801,3 +1801,23 @@ def test_lium_workload_containers_skips_another_miners_rental_on_a_different_end
     ctx.state.rented_data = rented_data
 
     assert gpu_usage.lium_workload_containers(ctx) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(context_factory):
+    state = build_state(
+        gpu_details=[
+            {"gpu_utilization": 0, "memory_utilization": 0},
+            {"gpu_utilization": 37, "memory_utilization": 12},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.remediation.startswith(
+        "GPU 1: utilization 37% and memory utilization 12%; an idle node must stay below 5% "
+        "utilization and at most 5% memory utilization. On the GPU: python3 (pid 4242)."
+    )

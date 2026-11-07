@@ -281,6 +281,7 @@ class GpuUsageCheck:
             ctx=ctx,
             check_id=self.check_id,
             what=violation,
+            **_measured_usage_remediation(violation),
         )
         return CheckResult(passed=False, event=event)
 
@@ -626,6 +627,24 @@ def _time_since_the_rental_closed(rental_closed_at: datetime) -> timedelta:
     return datetime.now(timezone.utc) - closed_at
 
 
+def _measured_usage_remediation(violation: dict) -> dict:
+    """DAH-5957: the GPU, its measured load against the limit and what runs on it.
+
+    A filler-off-image violation has no load reading and keeps the template's text."""
+    if "gpu_utilization" not in violation:
+        return {}
+    return {
+        "remediation": Msg.USAGE_HIGH_MEASURED_REMEDIATION.format(
+            gpu_index=violation["gpu_index"],
+            gpu_utilization=violation["gpu_utilization"],
+            vram_utilization=violation["vram_utilization"],
+            gpu_limit=GPU_UTILIZATION_LIMIT,
+            memory_limit=GPU_MEMORY_UTILIZATION_LIMIT,
+            processes=", ".join(_describe_process(p) for p in violation["gpu_processes"]),
+        )
+    }
+
+
 def _describe_process(process: dict) -> str:
     owner: str = process.get("container_name") or process.get("name") or "a host process"
     return f"{owner} (pid {process.get('pid')})"
@@ -799,12 +818,13 @@ def _find_violation(gpu_details: list[dict], gpu_processes: list[dict]) -> dict 
     if not gpu_processes:
         return None
 
-    for detail in gpu_details:
+    for gpu_index, detail in enumerate(gpu_details):
         gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
         gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
 
         if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
             return {
+                "gpu_index": gpu_index,
                 "gpu_utilization": f"{gpu_utilization}%",
                 "vram_utilization": f"{gpu_memory_utilization}%",
                 "process_count": len(gpu_processes),
