@@ -1845,3 +1845,27 @@ async def test_a_busy_gpu_beside_the_nodes_filler_never_names_the_filler_to_stop
     assert "filler_5703" not in result.event.remediation
     assert "must stay below" not in result.event.remediation
     assert "python3 (pid 777)" in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_after_a_reset_of_an_earlier_gpu_keeps_its_node_index(
+    context_factory, monkeypatch
+):
+    async def resets(*_args):
+        return [{"gpu_uuids": ["GPU-0"]}]
+
+    monkeypatch.setattr(gpu_usage, "renter_gpu_resets", resets)
+    state = build_state(
+        gpu_details=[
+            {"uuid": "GPU-0", "gpu_utilization": 0, "memory_utilization": 0},
+            {"uuid": "GPU-1", "gpu_utilization": 37, "memory_utilization": 12},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.remediation.startswith("GPU 1: utilization 37%")
+    assert result.event.what_we_saw["gpu_index"] == 1

@@ -236,6 +236,12 @@ class GpuUsageCheck:
         # under the utilization limits
         off_image = await _fillers_off_their_image(ctx, process_names & filler_containers)
         violation = _find_violation(gpu_details, gpu_processes)
+        if violation and "gpu_index" in violation:
+            # the card's index on the node, not in the list left after a reset dropped some
+            busy = gpu_details[violation["gpu_index"]]
+            violation["gpu_index"] = next(
+                i for i, d in enumerate(ctx.state.gpu_details) if d is busy
+            )
         if violation is None and off_image:
             violation = {"filler_containers_off_their_image": off_image}
 
