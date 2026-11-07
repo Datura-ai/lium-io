@@ -1374,8 +1374,8 @@ class GpuUsageMessages:
     USAGE_HIGH_MEASURED_REMEDIATION = (
         "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization {vram_utilization}; "
         "an idle node must stay below {gpu_limit}% utilization and at most {memory_limit}% memory "
-        "utilization. On the GPU: {processes}. Stop these processes and re-run your node. If using "
-        "Docker, ensure no host processes are running."
+        "utilization. GPU processes on the node: {processes}. Stop these processes and re-run your "
+        "node. If using Docker, ensure no host processes are running."
     )
     USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
         "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "

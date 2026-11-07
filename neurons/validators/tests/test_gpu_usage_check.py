@@ -1819,7 +1819,8 @@ async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(co
     assert result.event.reason_code == Msg.USAGE_HIGH.reason
     assert result.event.remediation.startswith(
         "GPU 1: utilization 37% and memory utilization 12%; an idle node must stay below 5% "
-        "utilization and at most 5% memory utilization. On the GPU: python3 (pid 4242)."
+        "utilization and at most 5% memory utilization. GPU processes on the node: python3 "
+        "(pid 4242)."
     )
 
 
@@ -1869,3 +1870,21 @@ async def test_a_busy_gpu_after_a_reset_of_an_earlier_gpu_keeps_its_node_index(
     assert result.event.reason_code == Msg.USAGE_HIGH.reason
     assert result.event.remediation.startswith("GPU 1: utilization 37%")
     assert result.event.what_we_saw["gpu_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_lists_the_processes_of_every_card_as_the_nodes(context_factory):
+    state = build_state(
+        gpu_details=[
+            {"gpu_utilization": 37, "memory_utilization": 12},
+            {"gpu_utilization": 0, "memory_utilization": 0},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}, {"pid": 5151, "name": "miner"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert "On the GPU" not in result.event.remediation
+    expected = "GPU processes on the node: python3 (pid 4242), miner (pid 5151)."
+    assert expected in result.event.remediation
