@@ -1377,6 +1377,12 @@ class GpuUsageMessages:
         "utilization. On the GPU: {processes}. Stop these processes and re-run your node. If using "
         "Docker, ensure no host processes are running."
     )
+    USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "
+        "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
+        "outside Lium's containers and re-run your node: {processes}. Do not stop filler_* "
+        "containers: Lium runs them."
+    )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
         "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "

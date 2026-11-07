@@ -281,7 +281,7 @@ class GpuUsageCheck:
             ctx=ctx,
             check_id=self.check_id,
             what=violation,
-            **_measured_usage_remediation(violation),
+            **_measured_usage_remediation(violation, filler_containers),
         )
         return CheckResult(passed=False, event=event)
 
@@ -627,20 +627,32 @@ def _time_since_the_rental_closed(rental_closed_at: datetime) -> timedelta:
     return datetime.now(timezone.utc) - closed_at
 
 
-def _measured_usage_remediation(violation: dict) -> dict:
+def _measured_usage_remediation(violation: dict, filler_containers: set[str]) -> dict:
     """DAH-5957: the GPU, its measured load against the limit and what runs on it.
 
     A filler-off-image violation has no load reading and keeps the template's text."""
     if "gpu_utilization" not in violation:
         return {}
+    outside = [
+        p for p in violation["gpu_processes"] if p.get("container_name") not in filler_containers
+    ]
+    if not outside:
+        return {}
+    # Lium's filler is on the node: never name it to stop, and the idle limit does not apply to it
+    beside_a_filler = len(outside) < len(violation["gpu_processes"])
+    template = (
+        Msg.USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION
+        if beside_a_filler
+        else Msg.USAGE_HIGH_MEASURED_REMEDIATION
+    )
     return {
-        "remediation": Msg.USAGE_HIGH_MEASURED_REMEDIATION.format(
+        "remediation": template.format(
             gpu_index=violation["gpu_index"],
             gpu_utilization=violation["gpu_utilization"],
             vram_utilization=violation["vram_utilization"],
             gpu_limit=GPU_UTILIZATION_LIMIT,
             memory_limit=GPU_MEMORY_UTILIZATION_LIMIT,
-            processes=", ".join(_describe_process(p) for p in violation["gpu_processes"]),
+            processes=", ".join(_describe_process(p) for p in outside),
         )
     }
 

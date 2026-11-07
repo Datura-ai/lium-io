@@ -1821,3 +1821,27 @@ async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(co
         "GPU 1: utilization 37% and memory utilization 12%; an idle node must stay below 5% "
         "utilization and at most 5% memory utilization. On the GPU: python3 (pid 4242)."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_beside_the_nodes_filler_never_names_the_filler_to_stop(context_factory):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 3}],
+        gpu_processes=[
+            {"pid": 3217038, "container_name": filler_container},
+            {"pid": 777, "name": "python3"},
+        ],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert "filler_5703" not in result.event.remediation
+    assert "must stay below" not in result.event.remediation
+    assert "python3 (pid 777)" in result.event.remediation
