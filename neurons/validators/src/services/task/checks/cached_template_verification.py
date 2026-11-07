@@ -388,11 +388,12 @@ class CachedTemplateVerificationCheck:
         # Bare manifest digest the validator fetched from Docker Hub for this image, if any.
         backend_digest = ctx.config.default_docker_image_digests.get(image_ref)
 
+        inspect_cmd = (
+            '/usr/bin/docker image inspect --format "{{json .RepoDigests}}" '
+            + shlex.quote(image_ref)
+        )
         try:
-            inspect = await ctx.ssh.run(
-                f'/usr/bin/docker image inspect --format "{{{{json .RepoDigests}}}}" {shlex.quote(image_ref)}',
-                check=False,
-            )
+            inspect = await ctx.ssh.run(inspect_cmd, check=False)
         except Exception as exc:
             event = render_message(
                 Msg.SKIPPED,
@@ -407,6 +408,17 @@ class CachedTemplateVerificationCheck:
             return CheckResult(passed=True, event=event)
 
         cached = inspect.exit_status == 0
+        first_inspect_miss = None
+        if not cached:
+            # One failed inspect is not proof the image is gone: a node seen with it before and
+            # after was zeroed on a single miss. Look again, and keep what the miss said.
+            stderr = str(getattr(inspect, "stderr", "") or "")[:_PREFETCH_ERROR_CHARS]
+            first_inspect_miss = {"exit_status": inspect.exit_status, "stderr": stderr}
+            try:
+                inspect = await ctx.ssh.run(inspect_cmd, check=False)
+            except Exception:
+                pass  # the first miss stands
+            cached = inspect.exit_status == 0
         # Local RepoDigest for THIS repo (strict fail-open: any parse/lookup miss → None).
         local_digest = _repo_digest(getattr(inspect, "stdout", None), docker_image) if cached else None
 
@@ -448,6 +460,8 @@ class CachedTemplateVerificationCheck:
             "driver_version": driver_version,
             "after_cutoff": after_cutoff,
         }
+        if first_inspect_miss:
+            what["first_inspect_miss"] = first_inspect_miss
         # DAH-2470: when we are about to zero this node, also carry what the executor's
         # own prefetch loop was doing at the time, so a reader can tell a provider-side
         # cause (registry rate-limits, disk, network) from ours (loop gave up, never
