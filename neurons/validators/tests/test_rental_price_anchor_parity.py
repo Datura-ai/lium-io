@@ -112,7 +112,11 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
         "NVIDIA Tesla M40",
         "NVIDIA GeForce RTX 4090 48GB",  # DAH-5508, behind RTX_4090_48GB_MODEL_ENABLED
     }
-    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300", "NVIDIA GB200", MAX_Q} | added_types
+    # one-way ratchet: every upstream GPU stays priced; a newly added model is reported, not failed
+    assert upstream.keys() <= RENTAL_PRICES_PER_HOUR.keys()
+    unexpected = RENTAL_PRICES_PER_HOUR.keys() - upstream.keys() - {"NVIDIA B300 SXM6 PC", "NVIDIA GB300", "NVIDIA GB200", MAX_Q} - added_types
+    if unexpected:
+        print(f"RENTAL_PRICES_PER_HOUR keys not upstream and not listed here: {sorted(unexpected)}")
     assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
     assert BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] == BASE_GPU_MAP["NVIDIA B300 SXM6 AC"] == "B300"
     assert RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]

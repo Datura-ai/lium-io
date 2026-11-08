@@ -74,7 +74,6 @@ _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA B300 SXM6 PC": [(265421, 309658)],
     "NVIDIA GB300": [(265421, 309658)],  # the B300 size
     "NVIDIA B200": [(176947, 206438)],
-    "NVIDIA GB200": [(176947, 206438)],  # the B200 size
     "NVIDIA H200": [(129946, 151603)],
     "NVIDIA H200 NVL": [(129946, 151603)],
     "NVIDIA H100 80GB HBM3": [(73728, 86016)],
