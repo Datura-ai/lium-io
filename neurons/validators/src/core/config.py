@@ -668,7 +668,7 @@ class Settings(BaseSettings):
     # Spot rental incentive, independent of the flag above. True: a rented spot node the backend
     # lists in provider_spot_executor_ids earns rental incentive at 0.5 x what the same node would
     # earn rented as secure (0.5 = SPOT_RENTAL_INCENTIVE_FACTOR); a node that is spot as a
-    # restriction, and the free remainder of a partially rented spot node, earn 0 as before.
+    # restriction earns 0 as before; the free remainder of a partially rented spot node takes spot idle pay instead.
     # False: every rented spot node earns 0, as before.
     ENABLE_SPOT_RENTAL_INCENTIVE: bool = Field(env="ENABLE_SPOT_RENTAL_INCENTIVE", default=False)
     # A Spot node's configuration filler average is used only when it was taken over at least this
