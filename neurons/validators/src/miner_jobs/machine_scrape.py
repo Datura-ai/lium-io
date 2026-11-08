@@ -977,15 +977,18 @@ def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float
 _DOCKER_SIZE_UNITS = {"B": 1, "kB": 10**3, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12, "PB": 10**15}
 
 
+# Top level, not nested in its caller: obfuscator.py renames a nested function's body and leaves its
+# signature, which broke every row (lium-io#2146 review).
+def docker_size_bytes(size_text: str) -> int:
+    size_text = size_text.strip()
+    number = size_text.rstrip("kKMGTPB")
+    return int(float(number) * _DOCKER_SIZE_UNITS[size_text[len(number):]])
+
+
 def parse_container_net_io(stats_output: str) -> dict[str, tuple[int, int]]:
     # `docker stats` NetIO: "<received> / <sent>" since the container started, in decimal units
     # ("1.23GB / 456MB", 3 significant digits). Keyed by the 12-char id. A row that does not parse
     # is left out: the traffic shown to the provider is informational, it must not void the CPU signal.
-    def to_bytes(text: str) -> int:
-        text = text.strip()
-        number = text.rstrip("kKMGTPB")
-        return int(float(number) * _DOCKER_SIZE_UNITS[text[len(number):]])
-
     net_io_by_short_id = {}
     for line in stats_output.strip().splitlines():
         fields = line.split('|')
@@ -993,7 +996,7 @@ def parse_container_net_io(stats_output: str) -> dict[str, tuple[int, int]]:
             continue
         received, _, sent = fields[2].partition('/')
         try:
-            net_io_by_short_id[fields[0].strip()] = (to_bytes(received), to_bytes(sent))
+            net_io_by_short_id[fields[0].strip()] = (docker_size_bytes(received), docker_size_bytes(sent))
         except (KeyError, ValueError):
             continue
     return net_io_by_short_id

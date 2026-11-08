@@ -21,7 +21,7 @@ from neurons.validators.tests.test_scrape_disk_breakdown import _obfuscation_tab
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
-CPU_HELPERS = {"get_container_cpu_percents", "get_docker_info", "parse_container_net_io", "_DOCKER_SIZE_UNITS"}
+CPU_HELPERS = {"get_container_cpu_percents", "get_docker_info", "parse_container_net_io", "docker_size_bytes", "_DOCKER_SIZE_UNITS"}
 
 RENTER = "aaaaaaaaaaaa" + "0" * 52
 EXECUTOR = "bbbbbbbbbbbb" + "0" * 52
@@ -177,3 +177,50 @@ def test_the_traffic_keys_are_registered_in_both_obfuscation_tables():
 
     assert emitted <= original_keys
     assert emitted <= mapped_keys
+
+
+def test_the_traffic_and_cpu_readings_survive_the_production_obfuscation():
+    # ecrypt_miner_job_files runs obfuscator.py and the key replacement over the whole script before it
+    # ships; a nested helper came out of that with its body renamed and its signature not (lium-io#2146).
+    import ast
+    import contextlib
+    import io
+    import sys
+
+    sys.path.insert(0, str(SRC))
+    from miner_jobs.obfuscator import obfuscate_code
+    from services.file_encrypt_service import FileEncryptService
+
+    source_text = (SRC / "miner_jobs" / "machine_scrape.py").read_text()
+    with contextlib.redirect_stdout(io.StringIO()):
+        obfuscated = obfuscate_code(source_text)
+        key_mapping, _ = FileEncryptService.generate_key_mappings(FileEncryptService.__new__(FileEncryptService))
+    for original_key, random_name in key_mapping.items():
+        obfuscated = obfuscated.replace(original_key, random_name)
+
+    def top_level_name(node: ast.AST) -> str:
+        if isinstance(node, ast.FunctionDef | ast.ClassDef):
+            return node.name
+        if isinstance(node, ast.Assign):
+            return getattr(node.targets[0], "id", "")
+        return ""
+
+    source_tree, obfuscated_tree = ast.parse(source_text), ast.parse(obfuscated)
+    kept = {
+        top_level_name(node): obfuscated_tree.body[index]
+        for index, node in enumerate(source_tree.body)
+        if top_level_name(node) in CPU_HELPERS
+    }
+    namespace = {"json": json, "os": os, "tempfile": tempfile, "psutil": _Psutil(40.0)}
+    exec(ast.unparse(ast.Module(body=list(kept.values()), type_ignores=[])), namespace)  # noqa: S102
+    run_cmd_name = next(
+        obfuscated_tree.body[index].name
+        for index, node in enumerate(source_tree.body)
+        if isinstance(node, ast.FunctionDef) and node.name == "run_cmd"
+    )
+    namespace[run_cmd_name] = _fake_run_cmd({"stats --no-stream": f"{RENTER[:12]}|158.00%|1.23TB / 456MB\n"})
+
+    host, cpu, net_io = namespace[kept["get_container_cpu_percents"].name]("/tmp/docker")
+
+    assert (host, cpu) == (40.0, {RENTER[:12]: 158.0})
+    assert net_io == {RENTER[:12]: (1_230_000_000_000, 456_000_000)}
