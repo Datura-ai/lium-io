@@ -67,7 +67,10 @@
             "plugin": "rclone",
             "iam_user_access_key": "placeholder-access-key",
             "iam_user_secret_key": "placeholder-secret",
-            "session_token": null
+            "session_token": null,
+            "hf_bucket": null,
+            "hf_token": null,
+            "read_only": false
           },
           "snapshot_id": "5f3e2d1c",
           "legacy_object_key": null,
@@ -271,7 +274,10 @@
           "plugin": "rclone",
           "iam_user_access_key": "placeholder-access-key",
           "iam_user_secret_key": "placeholder-secret",
-          "session_token": null
+          "session_token": null,
+          "hf_bucket": null,
+          "hf_token": null,
+          "read_only": false
         },
         "backup_path": "/root",
         "source_volume_path": "/root",
@@ -300,7 +306,10 @@
           "plugin": "rclone",
           "iam_user_access_key": "placeholder-access-key",
           "iam_user_secret_key": "placeholder-secret",
-          "session_token": null
+          "session_token": null,
+          "hf_bucket": null,
+          "hf_token": null,
+          "read_only": false
         },
         "restore_path": "/root",
         "backup_source_path": "backups/0b1c2d3e/2026-09-08T20-40-00Z",

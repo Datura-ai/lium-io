@@ -2738,11 +2738,37 @@
     },
     "ExternalVolumeInfo": {
       "properties": {
+        "hf_bucket": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hf Bucket"
+        },
+        "hf_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hf Token"
+        },
         "iam_user_access_key": {
+          "default": "",
           "title": "Iam User Access Key",
           "type": "string"
         },
         "iam_user_secret_key": {
+          "default": "",
           "title": "Iam User Secret Key",
           "type": "string"
         },
@@ -2753,6 +2779,11 @@
         "plugin": {
           "title": "Plugin",
           "type": "string"
+        },
+        "read_only": {
+          "default": false,
+          "title": "Read Only",
+          "type": "boolean"
         },
         "session_token": {
           "anyOf": [
@@ -2769,9 +2800,7 @@
       },
       "required": [
         "name",
-        "plugin",
-        "iam_user_access_key",
-        "iam_user_secret_key"
+        "plugin"
       ],
       "title": "ExternalVolumeInfo",
       "type": "object"
@@ -6597,7 +6626,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.10.0",
+  "protocol_version": "2.11.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

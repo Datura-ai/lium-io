@@ -83,9 +83,13 @@ class CustomOptions(pydantic.BaseModel):
 class ExternalVolumeInfo(pydantic.BaseModel):
     name: str
     plugin: str
-    iam_user_access_key: str = pydantic.Field(repr=False)
-    iam_user_secret_key: str = pydantic.Field(repr=False)
+    iam_user_access_key: str = pydantic.Field(default="", repr=False)
+    iam_user_secret_key: str = pydantic.Field(default="", repr=False)
     session_token: str | None = pydantic.Field(default=None, repr=False)
+    # a Hugging Face Storage Bucket ("ns/name") mounted with hf-mount instead of an s3fs bucket
+    hf_bucket: str | None = None
+    hf_token: str | None = pydantic.Field(default=None, repr=False)
+    read_only: bool = False
 
 
 class BootstrapRestoreSpec(pydantic.BaseModel):
