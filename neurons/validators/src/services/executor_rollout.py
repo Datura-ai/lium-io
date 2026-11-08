@@ -49,7 +49,7 @@ from services.task.messages import (
     TenantEnforcementMessages,
     UploadFilesMessages,
 )
-from services.task.models import JobResult
+from services.task.models import VALIDATOR_REDIS_UNAVAILABLE, JobResult
 from services.task.result_handler import pods_rented_gpu_count
 
 logger = logging.getLogger(__name__)
@@ -468,6 +468,7 @@ def withhold_renter_gpu_reset_verdicts(
     job_results: dict[str, list[JobResult]],
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
     """DAH-4658: a scrape held for the renter's own GPU reset gets no verdict, as a rollout failure gets none.
+    DAH-5805: neither does a run the validator's own Redis ended; the node is not scored 0 for it.
     DAH-5851: neither does an idle node's port check deferred for disk pressure; it is never carried, so no
     idle pay comes from the republished ports."""
     standing_by_miner: dict[str, list[JobResult]] = {}
@@ -475,14 +476,17 @@ def withhold_renter_gpu_reset_verdicts(
     for miner_hotkey, results in job_results.items():
         standing_by_miner[miner_hotkey] = []
         for result in results:
+            redis_fault = result.failure_reason_code == VALIDATOR_REDIS_UNAVAILABLE
             port_check_deferred = result.failure_reason_code == _PORT_CHECK_DEFERRED
-            if not (port_check_deferred or _held_for_renter_gpu_reset(result)):
+            if not (redis_fault or port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
             withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
             logger.info(
                 _m(
-                    "Verdict withheld: the port check was deferred for disk pressure"
+                    "Verdict withheld: the validator's Redis was unavailable"
+                    if redis_fault
+                    else "Verdict withheld: the port check was deferred for disk pressure"
                     if port_check_deferred
                     else "Verdict withheld: the renter is resetting the node's GPUs",
                     extra={
