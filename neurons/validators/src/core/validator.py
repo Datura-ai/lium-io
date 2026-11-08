@@ -1614,7 +1614,6 @@ class Validator:
         )
         try:
             await self.initiate_services()
-            self.should_exit = False
 
             if not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
@@ -1627,8 +1626,10 @@ class Validator:
 
             while not self.should_exit:
                 await self.sync()
-                self.should_exit = settings.DRY_RUN
-                if not settings.DRY_RUN:
+                # DAH-6011: only set, never cleared here, so a shutdown that lands mid-cycle ends the loop
+                if settings.DRY_RUN:
+                    self.should_exit = True
+                else:
                     await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
