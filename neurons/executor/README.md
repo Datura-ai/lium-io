@@ -11,7 +11,7 @@ Before the first command, the machine needs:
 - **Docker Engine installed and running** — `docker ps` works. The Sysbox installer below refuses to run without it (`lium mine` runs the Docker install script too, but only after this step, and it is a no-op on a machine that already has Docker);
 - **a public IP** with the service port (`8080`) and the node SSH port (`2200`) reachable, and the hotkey (SS58 address) of your registered provider account — see the [Provider Quickstart](https://docs.lium.io/providers/quickstart).
 
-**GB300 and other ARM (Grace) hosts are not supported yet:** validators cannot verify an aarch64 node, so it earns nothing. The installer and the executor image are being made ready for aarch64; this note will say when ARM nodes can be added.
+**GB200 and GB300 (Grace, ARM) hosts:** the executor image is built for arm64 as well, and validators verify aarch64 nodes with their ARM build. A GB200 or GB300 NVL72 compute tray is a 4-GPU host: turn on GPU splitting for idle pay.
 
 RAM, disk (including the 1.5× VRAM rule for the idle incentive) and the recommended XFS storage setup are in the [Node Quickstart requirements](https://docs.lium.io/providers/nodes/quickstart#requirements).
 
