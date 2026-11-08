@@ -259,6 +259,7 @@ class VolumeMount:
     source: str
     target: str
     read_only: bool = False
+    propagation: str | None = None  # a bind's mount propagation, e.g. "rslave" (DAH-5984)
 
 
 @dataclass(slots=True)
@@ -1860,6 +1861,7 @@ def _container_volumes(volumes: tuple[VolumeMount, ...]) -> list[str]:
 def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
     return [
         f"{volume.source}:{volume.target}:{'ro' if volume.read_only else 'rw'}"
+        + (f",{volume.propagation}" if volume.propagation else "")
         for volume in volumes
     ]
 

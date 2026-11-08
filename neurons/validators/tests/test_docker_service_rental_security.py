@@ -24,7 +24,15 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 import services.docker_service as docker_service_module
-from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
+from services.docker_service import (
+    HF_MOUNT_IMAGE,
+    HF_VOLUME_HOST_DIR,
+    LEGACY_S3FS_PLUGIN_ALIAS,
+    DockerService,
+    _is_vloopback_driver,
+    _s3fs_plugin_alias,
+    hf_volume_mount_path,
+)
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -751,10 +759,13 @@ async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
         ssh_client=ssh_client, volume_name="celium-volume-safe"
     )
 
-    assert ssh_client.commands == [
+    assert ssh_client.commands[:2] == [
         "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
         "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
     ]
+    # DAH-5984: and the hf-mount helper, which an S3 volume has none of
+    assert ssh_client.commands[2].startswith("/usr/bin/docker inspect lium-hf-celium-volume-safe >/dev/null 2>&1 || exit 0;")
+    assert len(ssh_client.commands) == 3
 
 
 def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_removed_or_reconfigured():
@@ -1330,3 +1341,110 @@ def test_create_request_str_leaves_out_renter_supplied_values():
         assert marker not in logged
     assert payload.custom_options.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
     assert "HOSTILE_ENV" in payload.model_dump_json()
+
+
+class InputRecordingSSHClient(RecordingSSHClient):
+    async def run(self, command, *args, **kwargs):
+        self.inputs = getattr(self, "inputs", []) + [kwargs.get("input")]
+        return await super().run(command, *args, **kwargs)
+
+
+def _hf_volume_info(**overrides):
+    fields = dict(
+        name="celium-volume-hf",
+        plugin="hf-mount",
+        hf_bucket="someone/my-bucket",
+        hf_token="hf_secret_token",
+    )
+    fields.update(overrides)
+    return ExternalVolumeInfo(**fields)
+
+
+@pytest.mark.asyncio
+async def test_create_hf_volume_mounts_the_bucket_in_a_helper_and_keeps_the_token_off_the_command_line(
+    docker_service,
+):
+    # DAH-5984: the validator's shell is the executor container, so hf-mount runs in a helper container on the
+    # host's Docker, mounting rshared under HF_VOLUME_HOST_DIR for the pod to bind
+    ssh_client = InputRecordingSSHClient()
+
+    ok, _ = await docker_service.create_hf_volume(
+        ssh_client=ssh_client, log_extra={}, volume_info=_hf_volume_info(), log_tag="tag", sysbox_subuid_base=165536
+    )
+
+    assert ok
+    command = ssh_client.commands[0]
+    assert "hf_secret_token" not in command
+    assert ssh_client.inputs[0] == "hf_secret_token\n"
+    assert command.startswith("read -r HF_TOKEN && export HF_TOKEN")
+    assert "--name lium-hf-celium-volume-hf --restart unless-stopped --device /dev/fuse" in command
+    assert f"-v {HF_VOLUME_HOST_DIR}/celium-volume-hf:/hf:rshared" in command
+    assert HF_MOUNT_IMAGE in command and "@sha256:" in HF_MOUNT_IMAGE
+    assert "--uid 165536 --gid 165536" in command
+    assert "bucket someone/my-bucket /hf/mnt" in command
+    assert "--read-only" not in command
+    assert hf_volume_mount_path("celium-volume-hf") == f"{HF_VOLUME_HOST_DIR}/celium-volume-hf/mnt"
+
+
+@pytest.mark.asyncio
+async def test_create_hf_volume_read_only_and_runc_owner(docker_service):
+    ssh_client = InputRecordingSSHClient()
+
+    await docker_service.create_hf_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_hf_volume_info(read_only=True),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert "--uid 0 --gid 0" in ssh_client.commands[0]
+    assert "--read-only bucket someone/my-bucket" in ssh_client.commands[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"hf_bucket": "no-namespace"},
+        {"hf_bucket": "a/b; rm -rf /"},
+        {"hf_bucket": "a/b/c"},
+        {"name": "bad name"},
+        {"hf_token": None},
+    ],
+)
+async def test_create_hf_volume_refuses_unsafe_input_before_any_command(docker_service, overrides):
+    ssh_client = InputRecordingSSHClient()
+
+    ok, _ = await docker_service.create_hf_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_hf_volume_info(**overrides),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert not ok
+    assert ssh_client.commands == []
+
+
+@pytest.mark.asyncio
+async def test_create_hf_volume_that_does_not_mount_removes_its_helper(docker_service):
+    ssh_client = InputRecordingSSHClient(exit_status=1, stdout="mount failed")
+
+    ok, message = await docker_service.create_hf_volume(
+        ssh_client=ssh_client, log_extra={}, volume_info=_hf_volume_info(), log_tag="tag", sysbox_subuid_base=None
+    )
+
+    assert not ok and "mount failed" in message
+    assert ssh_client.commands[1].startswith("/usr/bin/docker inspect lium-hf-celium-volume-hf")
+
+
+def test_hf_volume_binds_into_the_pod_with_rslave_propagation():
+    # a remount of the bucket (helper restart, host reboot) reaches the running pod
+    from services.rental_docker_sdk import VolumeMount, _binds
+
+    assert _binds((VolumeMount(source="/var/lib/lium/hf/v/mnt", target="/mnt", propagation="rslave"),)) == [
+        "/var/lib/lium/hf/v/mnt:/mnt:rw,rslave"
+    ]
+    assert _binds((VolumeMount(source="vol", target="/mnt"),)) == ["vol:/mnt:rw"]

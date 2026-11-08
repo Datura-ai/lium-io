@@ -338,6 +338,15 @@ S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
 
+# DAH-5984: a renter's own Hugging Face Storage Bucket is mounted by Hugging Face's hf-mount in a helper container
+# (FUSE, rshared under HF_VOLUME_HOST_DIR) and bound into the pod; the validator's SSH lands in the executor
+# container, so a mount made there would not reach the host's Docker.
+HF_MOUNT_IMAGE = (
+    "ghcr.io/huggingface/hf-mount-fuse:v0.13.4@sha256:8c1a862656bb87fc6ba88fdfd31669cb0dd53a5c38a50461a1519fc5f81be368"
+)
+HF_VOLUME_HOST_DIR = "/var/lib/lium/hf"
+_HF_BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
 
 def _published_ports(
     port_maps: list[tuple[int, int, int]],
@@ -2510,6 +2519,56 @@ def _orphaned_task_id(error_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def hf_volume_mount_path(volume_name: str) -> str:
+    """The host path a Hugging Face bucket volume is mounted at (DAH-5984)."""
+    return f"{HF_VOLUME_HOST_DIR}/{volume_name}/mnt"
+
+
+def _hf_volume_create_command(volume_info: "ExternalVolumeInfo", sysbox_subuid_base: int | None) -> str:
+    """Start the helper that mounts the bucket and wait up to 60 s for the mount; reads the token from stdin.
+
+    The pod's root owns every entry (the sysbox base under sysbox, as DAH-2496 does for s3fs), and listed entries
+    are 0777/0666 so a non-root pod user can write too (DAH-4636). The helper restarts with Docker, so a host
+    reboot remounts the bucket; the pod's rslave bind sees the new mount."""
+    name = volume_info.name
+    helper = shlex.quote(f"lium-hf-{name}")
+    owner = sysbox_subuid_base or 0
+    mount_args = " ".join(
+        [
+            "--cache-dir /hf/cache",
+            f"--uid {owner} --gid {owner}",
+            "--dir-mode 0777 --file-mode 0666",
+            "--read-only" if volume_info.read_only else "",
+            "bucket",
+            shlex.quote(volume_info.hf_bucket or ""),
+            "/hf/mnt",
+        ]
+    )
+    return (
+        "read -r HF_TOKEN && export HF_TOKEN"
+        f" && (/usr/bin/docker rm -f {helper} >/dev/null 2>&1; true)"
+        f" && /usr/bin/docker run -d --name {helper} --restart unless-stopped --device /dev/fuse --cap-add SYS_ADMIN"
+        " --security-opt apparmor=unconfined -e HF_TOKEN"
+        f" -v {shlex.quote(f'{HF_VOLUME_HOST_DIR}/{name}')}:/hf:rshared --entrypoint sh {HF_MOUNT_IMAGE}"
+        f" -c {shlex.quote('mkdir -p /hf/mnt /hf/cache && exec /usr/local/bin/hf-mount-fuse ' + mount_args)}"
+        " >/dev/null"
+        " && for i in $(seq 1 60); do"
+        f" /usr/bin/docker exec {helper} grep -qs ' /hf/mnt fuse' /proc/mounts && exit 0; sleep 1; done;"
+        f" /usr/bin/docker logs --tail 20 {helper} 2>&1; exit 1"
+    )
+
+
+def _hf_volume_remove_command(volume_name: str) -> str:
+    """Stop the helper (hf-mount flushes pending writes on SIGTERM) and drop its cache; a no-op without one."""
+    helper = shlex.quote(f"lium-hf-{volume_name}")
+    return (
+        f"/usr/bin/docker inspect {helper} >/dev/null 2>&1 || exit 0;"
+        f" /usr/bin/docker stop -t 60 {helper} >/dev/null 2>&1; /usr/bin/docker rm -f {helper} >/dev/null 2>&1;"
+        f" /usr/bin/docker run --rm --entrypoint sh -v {shlex.quote(HF_VOLUME_HOST_DIR)}:/x {HF_MOUNT_IMAGE}"
+        f" -c {shlex.quote(f'rm -rf /x/{volume_name}')} >/dev/null 2>&1; true"
+    )
+
+
 def _is_safe_docker_volume_name(volume_name: str) -> bool:
     return bool(_DOCKER_VOLUME_NAME_RE.fullmatch(volume_name))
 
@@ -3696,7 +3755,9 @@ class DockerService:
         volumes = [VolumeMount(source=local_volume, target=volume_target)]
         occupied_targets = {volume_target}
         if external_volume_name:
-            volumes.append(VolumeMount(source=external_volume_name, target="/mnt"))
+            # DAH-5984: a host path (a Hugging Face bucket) follows a remount of the bucket into the running pod
+            propagation = "rslave" if external_volume_name.startswith("/") else None
+            volumes.append(VolumeMount(source=external_volume_name, target="/mnt", propagation=propagation))
             occupied_targets.add("/mnt")
         # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
         volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
@@ -7245,6 +7306,36 @@ class DockerService:
         plugin_alias: str = _s3fs_plugin_alias(volume_name)
         await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
         await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
+        # DAH-5984: or the hf-mount helper of a Hugging Face bucket volume (none for an S3 volume: a no-op)
+        await ssh_client.run(_hf_volume_remove_command(volume_name))
+
+    async def create_hf_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        log_extra: dict,
+        volume_info: ExternalVolumeInfo,
+        log_tag: str,
+        sysbox_subuid_base: int | None,
+    ) -> tuple[bool, str]:
+        """DAH-5984: mount the renter's Hugging Face bucket on the host; the pod binds hf_volume_mount_path(name)."""
+        if not _is_safe_docker_volume_name(volume_info.name) or not _HF_BUCKET_RE.fullmatch(volume_info.hf_bucket or ""):
+            message = f"Unsafe Hugging Face volume: {volume_info.name!r} {volume_info.hf_bucket!r}"
+            logger.warning(_m(f"hf_volume failed. {message}", extra=get_extra_info({**log_extra})))
+            return False, message
+        if not volume_info.hf_token:
+            return False, "The Hugging Face volume has no token"
+        # the token travels on stdin into the docker CLI's environment (-e HF_TOKEN), never on a command line
+        result = await ssh_client.run(
+            _hf_volume_create_command(volume_info, sysbox_subuid_base), input=volume_info.hf_token + "\n", check=False
+        )
+        if result.exit_status != 0:
+            message = f"hf-mount did not come up: {(result.stdout or '')[-500:]} {(result.stderr or '')[-500:]}"
+            logger.warning(_m(f"hf_volume failed. {message}", extra=get_extra_info({**log_extra})))
+            await ssh_client.run(_hf_volume_remove_command(volume_info.name))
+            return False, message
+        await self.stream_log("Hugging Face bucket mounted", "info", log_tag)
+        logger.info(_m("hf_volume success", extra=get_extra_info({**log_extra})))
+        return True, ""
 
     async def run_jupyter(
         self,
@@ -10275,6 +10366,7 @@ class DockerService:
                     prev_timestamp = now_ms()
 
                 external_volume_name = None
+                external_volume_source = None
                 if payload.bootstrap_restore and not use_encrypted_volume:
                     # A plain volume is restored before the container exists: the data is in
                     # place when the image's entrypoint starts. An encrypted volume cannot be:
@@ -10302,7 +10394,10 @@ class DockerService:
                         sysbox_subuid_base = await self.resolve_sysbox_subuid_base(
                             ssh_client=ssh_client, log_extra=default_extra
                         )
-                    success, msg = await self.create_s3fs_volume(
+                    create_volume = (
+                        self.create_hf_volume if external_volume_info.hf_bucket else self.create_s3fs_volume
+                    )
+                    success, msg = await create_volume(
                         ssh_client=ssh_client,
                         log_extra=default_extra,
                         volume_info=external_volume_info,
@@ -10314,6 +10409,12 @@ class DockerService:
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
                         prev_timestamp = now_ms()
                         external_volume_name = external_volume_info.name
+                        # DAH-5984: a Hugging Face bucket is a host path bound into the pod, an S3 volume a named one
+                        external_volume_source = (
+                            hf_volume_mount_path(external_volume_name)
+                            if external_volume_info.hf_bucket
+                            else external_volume_name
+                        )
                         if payload.is_sysbox and sysbox_subuid_base is None:
                             if is_fresh_create:
                                 current_step = "external_volume_sysbox_owner"
@@ -10469,7 +10570,7 @@ class DockerService:
                     local_volume=local_volume,
                     local_volume_path=local_volume_path,
                     encrypted_local_volume=use_encrypted_volume,
-                    external_volume_name=external_volume_name,
+                    external_volume_name=external_volume_source,
                     gpu_devices=gpu_config,
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,

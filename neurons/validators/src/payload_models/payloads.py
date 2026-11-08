@@ -256,9 +256,13 @@ class ContainerBaseRequest(BaseServerRequest):
 class ExternalVolumeInfo(BaseModel):
     name: str
     plugin: str
-    iam_user_access_key: str = Field(repr=False)
-    iam_user_secret_key: str = Field(repr=False)
+    iam_user_access_key: str = Field(default="", repr=False)
+    iam_user_secret_key: str = Field(default="", repr=False)
     session_token: str | None = Field(default=None, repr=False)
+    # DAH-5984: the renter's own Hugging Face Storage Bucket ("namespace/bucket"), mounted on the host with hf-mount
+    hf_bucket: str | None = None
+    hf_token: str | None = Field(default=None, repr=False)
+    read_only: bool = False
 
 
 class BootstrapRestoreSpec(BaseModel):
