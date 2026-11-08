@@ -1381,9 +1381,10 @@ async def test_create_hf_volume_mounts_the_bucket_in_a_helper_and_keeps_the_toke
     assert f"-v {HF_VOLUME_HOST_DIR}/celium-volume-hf:/hf:rshared" in command
     assert HF_MOUNT_IMAGE in command and "@sha256:" in HF_MOUNT_IMAGE
     assert "--uid 165536 --gid 165536" in command
-    assert "bucket someone/my-bucket /hf/mnt" in command
+    assert "bucket someone/my-bucket /hf/pod/my-bucket" in command
+    assert "umount -l /hf/pod/my-bucket" in command
     assert "--read-only" not in command
-    assert hf_volume_mount_path("celium-volume-hf") == f"{HF_VOLUME_HOST_DIR}/celium-volume-hf/mnt"
+    assert hf_volume_mount_path("celium-volume-hf") == f"{HF_VOLUME_HOST_DIR}/celium-volume-hf/pod"
 
 
 @pytest.mark.asyncio

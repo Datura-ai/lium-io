@@ -2520,8 +2520,10 @@ def _orphaned_task_id(error_text: str) -> str | None:
 
 
 def hf_volume_mount_path(volume_name: str) -> str:
-    """The host path a Hugging Face bucket volume is mounted at (DAH-5984)."""
-    return f"{HF_VOLUME_HOST_DIR}/{volume_name}/mnt"
+    """The host directory a pod binds for a Hugging Face bucket volume (DAH-5984): the bucket is mounted inside it,
+    at <dir>/<bucket name>, so the pod sees /mnt/<bucket name>. Binding the directory, not the FUSE mount itself,
+    lets a remount (helper restart, host reboot) reach a running pod; a bound mount would stay dead."""
+    return f"{HF_VOLUME_HOST_DIR}/{volume_name}/pod"
 
 
 def _hf_volume_create_command(volume_info: "ExternalVolumeInfo", sysbox_subuid_base: int | None) -> str:
@@ -2533,6 +2535,7 @@ def _hf_volume_create_command(volume_info: "ExternalVolumeInfo", sysbox_subuid_b
     name = volume_info.name
     helper = shlex.quote(f"lium-hf-{name}")
     owner = sysbox_subuid_base or 0
+    target = f"/hf/pod/{(volume_info.hf_bucket or '').split('/')[-1]}"
     mount_args = " ".join(
         [
             "--cache-dir /hf/cache",
@@ -2541,19 +2544,21 @@ def _hf_volume_create_command(volume_info: "ExternalVolumeInfo", sysbox_subuid_b
             "--read-only" if volume_info.read_only else "",
             "bucket",
             shlex.quote(volume_info.hf_bucket or ""),
-            "/hf/mnt",
+            target,
         ]
     )
+    # a helper killed without unmounting leaves a dead mount behind; drop it before mounting again
+    start = f"umount -l {target} 2>/dev/null; mkdir -p {target} /hf/cache && exec /usr/local/bin/hf-mount-fuse "
     return (
         "read -r HF_TOKEN && export HF_TOKEN"
         f" && (/usr/bin/docker rm -f {helper} >/dev/null 2>&1; true)"
         f" && /usr/bin/docker run -d --name {helper} --restart unless-stopped --device /dev/fuse --cap-add SYS_ADMIN"
         " --security-opt apparmor=unconfined -e HF_TOKEN"
         f" -v {shlex.quote(f'{HF_VOLUME_HOST_DIR}/{name}')}:/hf:rshared --entrypoint sh {HF_MOUNT_IMAGE}"
-        f" -c {shlex.quote('mkdir -p /hf/mnt /hf/cache && exec /usr/local/bin/hf-mount-fuse ' + mount_args)}"
+        f" -c {shlex.quote(start + mount_args)}"
         " >/dev/null"
         " && for i in $(seq 1 60); do"
-        f" /usr/bin/docker exec {helper} grep -qs ' /hf/mnt fuse' /proc/mounts && exit 0; sleep 1; done;"
+        f" /usr/bin/docker exec {helper} grep -qs ' {target} fuse' /proc/mounts && exit 0; sleep 1; done;"
         f" /usr/bin/docker logs --tail 20 {helper} 2>&1; exit 1"
     )
 
