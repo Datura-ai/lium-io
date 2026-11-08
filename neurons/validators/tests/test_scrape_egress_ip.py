@@ -61,6 +61,8 @@ def test_trace_runs_in_the_host_network_namespace(get_egress_ip) -> None:
     get_egress_ip()
     [(cmd, kwargs)] = _Fake.calls
     assert cmd[:5] == ["nsenter", "-t", "1", "-n", "curl"]
+    # a proxy in the executor (env or ~/.curlrc) would report its own IP again
+    assert cmd[5:8] == ["-q", "--noproxy", "*"]
     assert f"www.cloudflare.com:443:{TRACE_ADDR}" in cmd
     assert cmd[-1] == "https://www.cloudflare.com/cdn-cgi/trace"
     assert kwargs["check"] is True and kwargs["timeout"]

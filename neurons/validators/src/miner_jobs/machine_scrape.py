@@ -1521,7 +1521,7 @@ def get_egress_ip() -> str:
         body = subprocess.run(
             [
                 "nsenter", "-t", "1", "-n",
-                "curl", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
+                "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
                 "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
                 f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
             ],
