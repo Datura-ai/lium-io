@@ -21,7 +21,7 @@ from neurons.validators.tests.test_scrape_disk_breakdown import _obfuscation_tab
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
-CPU_HELPERS = {"get_container_cpu_percents", "get_docker_info"}
+CPU_HELPERS = {"get_container_cpu_percents", "get_docker_info", "parse_container_net_io", "_DOCKER_SIZE_UNITS"}
 
 RENTER = "aaaaaaaaaaaa" + "0" * 52
 EXECUTOR = "bbbbbbbbbbbb" + "0" * 52
@@ -146,3 +146,34 @@ def test_a_container_whose_image_is_gone_is_listed_without_a_digest_and_the_scra
     assert data["docker_containers"][0]["each_digest"] == ""
     assert data["docker_containers"][0]["each_cpu_percent"] == 5.0
     assert data["docker_version"] == "24.0.7"
+
+
+def test_container_traffic_is_attached_in_bytes():
+    # Arrange — docker prints NetIO as "<received> / <sent>" since the container started, decimal units
+    scrape = _scrape(_docker_outputs(f"{RENTER[:12]}|158.00%|1.23TB / 456MB\n", [RENTER]))
+
+    # Act
+    container = scrape["get_docker_info"](b"#!/bin/sh\n")["docker_containers"][0]
+
+    # Assert
+    assert container["each_net_rx_bytes"] == 1_230_000_000_000
+    assert container["each_net_tx_bytes"] == 456_000_000
+    assert container["each_cpu_percent"] == 158.0
+
+
+def test_an_unparsable_traffic_reading_is_left_out_and_keeps_the_cpu_reading():
+    scrape = _scrape(_docker_outputs(f"{RENTER[:12]}|5.00%|-- / --\n", [RENTER]), host_percent=40.0)
+
+    data = scrape["get_docker_info"](b"#!/bin/sh\n")
+
+    assert "each_net_rx_bytes" not in data["docker_containers"][0]
+    assert data["docker_containers"][0]["each_cpu_percent"] == 5.0
+    assert data["docker_host_cpu_percent"] == 40.0
+
+
+def test_the_traffic_keys_are_registered_in_both_obfuscation_tables():
+    original_keys, mapped_keys = _obfuscation_tables()
+    emitted = {"each_net_rx_bytes", "each_net_tx_bytes"}
+
+    assert emitted <= original_keys
+    assert emitted <= mapped_keys
