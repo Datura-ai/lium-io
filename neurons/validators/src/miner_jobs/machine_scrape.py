@@ -927,6 +927,12 @@ def report_tighter_store(hard_disk, store_usage, size_too=True):
     if "hard_disk_used" in hard_disk:
         # data-root's own used bytes, before a store folds in: the docker breakdown is measured there
         hard_disk.setdefault("hard_disk_data_root_used", hard_disk["hard_disk_used"])
+    docker_kb = [hard_disk.get(key) for key in ("hard_disk_images", "hard_disk_containers", "hard_disk_volumes")]
+    if all(isinstance(kb, int) for kb in docker_kb):
+        hard_disk.setdefault("hard_disk_data_root_docker_used", sum(docker_kb))
+        if store_usage:
+            # images and container layers sit in the store on its other filesystem: only volumes are data-root's
+            hard_disk["hard_disk_data_root_docker_used"] = docker_kb[2]
     if not store_usage or "hard_disk_total" not in hard_disk:
         return
     store = hard_disk_reading(store_usage)

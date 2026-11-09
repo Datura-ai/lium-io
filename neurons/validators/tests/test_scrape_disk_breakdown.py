@@ -893,19 +893,19 @@ def test_released_cache_is_taken_off_the_filesystem_that_holds_it(scrape: dict, 
 
 
 @pytest.mark.parametrize(
-    "paths, devices, data_root",
+    "paths, devices, data_root, docker_gib",
     [
-        # the store on its own (smaller) filesystem: the reported reading is the store's
-        ({_SNAPSHOTS: _SMALL, "/proc/1/root/data/docker": _BIG}, {_SNAPSHOTS: 1, "/proc/1/root/data/docker": 2}, _BIG),
-        # the store and data-root on one filesystem
-        ({_SNAPSHOTS: _BIG, "/proc/1/root/data/docker": _BIG}, {_SNAPSHOTS: 1, "/proc/1/root/data/docker": 1}, _BIG),
-        # one filesystem, with a smaller disk mounted on the snapshots dir
+        # the store on its own (smaller) filesystem: images and container layers are there, only volumes come off
+        ({_SNAPSHOTS: _SMALL, "/proc/1/root/data/docker": _BIG}, {_SNAPSHOTS: 1, "/proc/1/root/data/docker": 2}, _BIG, 10),
+        # the store and data-root on one filesystem: the whole breakdown comes off
+        ({_SNAPSHOTS: _BIG, "/proc/1/root/data/docker": _BIG}, {_SNAPSHOTS: 1, "/proc/1/root/data/docker": 1}, _BIG, 35),
+        # one filesystem, with a smaller disk mounted on the snapshots dir: container layers live apart
         ({_SNAPSHOTS: _FULLER, f"{_SNAPSHOTS}/snapshots": _SMALL, "/proc/1/root/data/docker": _FULLER},
-         {_SNAPSHOTS: 1, f"{_SNAPSHOTS}/snapshots": 2, "/proc/1/root/data/docker": 1}, _FULLER),
+         {_SNAPSHOTS: 1, f"{_SNAPSHOTS}/snapshots": 2, "/proc/1/root/data/docker": 1}, _FULLER, 10),
     ],
 )
-def test_provider_side_disk_is_data_roots_own_used_minus_the_docker_breakdown(
-    scrape: dict, monkeypatch, paths, devices, data_root
+def test_provider_side_disk_subtracts_only_docker_bytes_on_data_roots_filesystem(
+    scrape: dict, monkeypatch, paths, devices, data_root, docker_gib
 ) -> None:
     from neurons.validators.src.services.task.checks.provider_side_load import compute_provider_side_load
 
@@ -924,7 +924,14 @@ def test_provider_side_disk_is_data_roots_own_used_minus_the_docker_breakdown(
     scrape["report_tighter_store"](hard_disk, store_usage if data_root_usage else None)
     specs = {"hard_disk": {key.removeprefix("hard_disk_"): value for key, value in hard_disk.items()}}
 
-    assert compute_provider_side_load(specs, None, None).disk_kb == data_root.used // 1024 - 35 * 1024**2
+    assert compute_provider_side_load(specs, None, None).disk_kb == data_root.used // 1024 - docker_gib * 1024**2
+
+
+def test_provider_side_disk_of_an_older_scrape_subtracts_the_breakdown_from_used() -> None:
+    from neurons.validators.src.services.task.checks.provider_side_load import compute_provider_side_load
+
+    specs = {"hard_disk": {"used": 100, "data_root_used": 90, "images": 20, "containers": 5, "volumes": 10}}
+    assert compute_provider_side_load(specs, None, None).disk_kb == 65
 
 
 @pytest.mark.parametrize(
