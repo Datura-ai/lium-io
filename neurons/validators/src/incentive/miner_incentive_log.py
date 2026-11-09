@@ -122,6 +122,8 @@ class ZeroIncentiveReason(StrEnum):
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
     SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
     SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
+    # DAH-6030: the network idle-pay budget (k x Default Job revenue) is zero this cycle
+    IDLE_PAY_BUDGET_ZERO = "idle_pay_budget_zero"
     # Group C: the validation run itself did not pass; context.reason_code names the check
     VALIDATION_FAILED = "validation_failed"
     # Group A (appended): the backend keeps the node unlisted until the provider confirms an e-mail
@@ -645,6 +647,15 @@ class MinerLogLine(BaseModel):
             },
         )
 
+    @staticmethod
+    def no_payout_because_idle_pay_budget_zero(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.IDLE_PAY_BUDGET_ZERO,
+            message="No idle incentive this cycle: the network idle-pay budget is zero.",
+            extra_fields={"effective_rate": result.effective_rate},
+        )
+
     # ── Rented: in the mining pool but scored 0 ──────────────────────────────
 
     @staticmethod
@@ -862,14 +873,18 @@ class MinerLogLine(BaseModel):
 
     @staticmethod
     def secure_filler_revenue_floor_not_paid(
-        result: JobResult, diluted_rate: float, floored_rate: float, floor_factor: float
+        result: JobResult, diluted_rate: float, floored_rate: float, floor_factor: float, budget_zero: bool = False
     ) -> MinerLogLine:
         # report line, not a zero reason: the node keeps the pay in the line above
+        why: str = (
+            "the network idle-pay budget is zero."
+            if budget_zero
+            else "the unrented pool already takes the whole burn emission, and top-ups are paid on top of it."
+        )
         return MinerLogLine(
             message=(
                 f"Unrented incentive: {floor_factor:g} x the average filler revenue for this GPU configuration is "
-                "above this executor's listed or diluted rate, but no top-up is paid this cycle: the "
-                "unrented pool already takes the whole burn emission, and top-ups are paid on top of it."
+                f"above this executor's listed or diluted rate, but no top-up is paid this cycle: {why}"
             ),
             fields={
                 "executor_id": str(result.executor_info.uuid),

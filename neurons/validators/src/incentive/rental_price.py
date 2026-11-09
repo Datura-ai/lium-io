@@ -1069,8 +1069,13 @@ class RentalPriceIncentive(DefaultIncentive):
         k: float | None = settings.IDLE_PAY_BUDGET_K
         revenue, revenue_age_hours = await load_default_job_revenue(self.redis_service)
         share_per_usd_hour: float = self._share_for_rental_cost(1.0)
+        # the weights are normalized to sum 1: with no mining score the mining share is not paid, the vector
+        # sums to the burn emission only, and every idle share is worth 1/mass more than its raw value
+        mass: float = self.total_burn_emission + (self.mining_share if self.total_mining_score > 0 else 0.0)
         uncapped: float = (
-            (self.rental_share + self.unbucketed_share) / share_per_usd_hour if share_per_usd_hour > 0 else 0.0
+            (self.rental_share + self.unbucketed_share) / share_per_usd_hour / (mass if 0 < mass < 1 else 1.0)
+            if share_per_usd_hour > 0
+            else 0.0
         )
         scale: float = idle_pay_scale(k, revenue, uncapped)
         if scale < 1.0:
@@ -1124,7 +1129,9 @@ class RentalPriceIncentive(DefaultIncentive):
         if result.spot_pay_candidate:
             self._set_cycle_formula_context(result)
             result.incentive = self._pay_unbucketed(result, result.effective_rate)
-            if result.effective_rate > 0 and self._unbucketed_clamped_to_zero:
+            if result.effective_rate > 0 and self.idle_pay_scale <= 0:
+                result.record_incentive_log(MinerLogLine.no_payout_because_idle_pay_budget_zero(result))
+            elif result.effective_rate > 0 and self._unbucketed_clamped_to_zero:
                 result.record_incentive_log(
                     MinerLogLine.no_payout_because_spot_no_headroom_at_burn_cap(
                         result, self.unbucketed_paid_fraction
@@ -1197,7 +1204,11 @@ class RentalPriceIncentive(DefaultIncentive):
             elif self._unbucketed_clamped_to_zero:
                 result.record_incentive_log(
                     MinerLogLine.secure_filler_revenue_floor_not_paid(
-                        result, diluted_rate, floored_rate, floor_factor=SECURE_FILLER_REVENUE_FLOOR_FACTOR
+                        result,
+                        diluted_rate,
+                        floored_rate,
+                        floor_factor=SECURE_FILLER_REVENUE_FLOOR_FACTOR,
+                        budget_zero=self.idle_pay_scale <= 0,
                     )
                 )
 

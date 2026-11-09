@@ -46,6 +46,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "spot_without_lium_filler",
         "spot_no_filler_revenue_for_gpu_config",
         "spot_no_headroom_at_burn_cap",
+        "idle_pay_budget_zero",
         "validation_failed",
         "rented_sysbox_not_confirmed",
         "disk_limited_remainder",

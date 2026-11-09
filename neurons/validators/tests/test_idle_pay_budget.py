@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from core.config import settings
-from incentive.idle_pay_budget import store_default_job_revenue
+import json
+import time
+
+from incentive.idle_pay_budget import DJ_REVENUE_KEY, MAX_READING_AGE_HOURS, store_default_job_revenue
+from incentive.miner_incentive_log import ZeroIncentiveReason
 from incentive.rental_price import RentalPriceIncentive
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
@@ -36,7 +40,9 @@ def _paid(incentive: RentalPriceIncentive) -> float:
 
 
 def _usd_per_hour(incentive: RentalPriceIncentive) -> float:
-    return _paid(incentive) / incentive._share_for_rental_cost(1.0)
+    """USD/hour after weight normalization: with no mining score the vector sums to the burn emission only."""
+    mass = incentive.total_burn_emission + (incentive.mining_share if incentive.total_mining_score > 0 else 0.0)
+    return _paid(incentive) / incentive._share_for_rental_cost(1.0) / mass
 
 
 @pytest_asyncio.fixture
@@ -106,12 +112,41 @@ async def test_zero_revenue_pays_no_idle_incentive(uncapped, monkeypatch):
     monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
     redis = _redis()
     await store_default_job_revenue(redis, 0.0)
+    await store_default_job_revenue(redis, 0.0)  # a zero counts on its second reading in a row
 
     capped = await _run(redis)
 
     assert capped.idle_pay_scale == 0.0
     assert _paid(capped) == 0.0
     assert capped.burn_share == pytest.approx(capped.total_burn_emission)
+    spot = next(r for r in capped.job_results["hk"] if r.spot_pay_candidate)
+    assert spot.zero_incentive_reasons[0].reason == ZeroIncentiveReason.IDLE_PAY_BUDGET_ZERO
+
+
+@pytest.mark.asyncio
+async def test_a_single_zero_between_good_readings_does_not_stop_idle_pay(uncapped, monkeypatch):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
+    redis = _redis()
+    budget = 0.25 * _usd_per_hour(uncapped)
+    for reading in (budget / 0.9, 0.0, None):  # positive, then one zero, then unreadable
+        await store_default_job_revenue(redis, reading)
+
+    capped = await _run(redis)
+
+    assert _usd_per_hour(capped) == pytest.approx(budget)
+
+
+@pytest.mark.asyncio
+async def test_a_reading_older_than_a_day_is_no_reading(uncapped, monkeypatch):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
+    redis = _redis()
+    old = time.time() - (MAX_READING_AGE_HOURS + 1) * 3600
+    await redis.set(DJ_REVENUE_KEY, json.dumps({"usd_per_hour": 0.0, "at": old}))
+
+    capped = await _run(redis)
+
+    assert capped.idle_pay_scale == 1.0
+    assert _paid(capped) == pytest.approx(_paid(uncapped))
 
 
 @pytest.mark.asyncio
