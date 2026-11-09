@@ -445,7 +445,18 @@ Components: main
 
 
 @pytest.mark.parametrize("awk", ["mawk", "gawk"])
-def test_sshd_install_reads_only_the_main_package_lists(harness, awk):
+@pytest.mark.parametrize(
+    "sources",
+    [
+        UBUNTU_SOURCES,
+        # deb822 multi-line values: the continuation lines belong to the field above
+        UBUNTU_SOURCES.replace("Types: deb\n", "Types: deb\n deb-src\n", 1).replace(
+            "Components: main restricted universe multiverse", "Components: main\n restricted universe multiverse"
+        ),
+        UBUNTU_SOURCES.replace("Components: main restricted universe multiverse", "Components: restricted\n main universe"),
+    ],
+)
+def test_sshd_install_reads_only_the_main_package_lists(harness, awk, sources):
     if not any(Path(d, awk).exists() for d in os.environ["PATH"].split(":")):
         pytest.skip(f"{awk} not installed")
     os.symlink(next(Path(d, awk) for d in os.environ["PATH"].split(":") if Path(d, awk).exists()), harness.shims / "awk")
@@ -459,7 +470,7 @@ def test_sshd_install_reads_only_the_main_package_lists(harness, awk):
     (harness.apt_etc / "sources.list.d" / "cuda.list").write_text(
         "deb [signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /\n"
     )
-    (harness.apt_etc / "sources.list.d" / "ubuntu.sources").write_text(UBUNTU_SOURCES)
+    (harness.apt_etc / "sources.list.d" / "ubuntu.sources").write_text(sources)
 
     result = harness.run("--grace", "0")
 
@@ -470,6 +481,7 @@ def test_sshd_install_reads_only_the_main_package_lists(harness, awk):
     assert (harness.state / "main_list").read_text() == "deb http://http.kali.org/kali kali-rolling main\n" * 2
     parts = (harness.state / "main_parts").read_text()
     assert parts.count("Components: main\n") == 2 and "universe" not in parts and "deb-src" not in parts
+    assert "restricted" not in parts and parts.count("Types: deb\n") == 2
     assert "Suites: noble noble-updates noble-backports" in parts and "Signed-By:" in parts
     assert harness.sshd_start_attempts() == ["started"]
 

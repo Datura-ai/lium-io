@@ -157,14 +157,23 @@ apt_main_only_dir() {
         # deb822: keep binary stanzas that list main, narrowed to it ([ \t] since old mawk lacks classes)
         awk 'BEGIN { RS = ""; ORS = "" }
         {
-            n = split($0, lines, "\n"); out = ""; main = 0; bin = 0
+            n = split($0, lines, "\n"); out = ""; field = ""; comps = ""; types = ""
             for (i = 1; i <= n; i++) {
                 l = lines[i]
-                if (l ~ /^Components:/) { if (l ~ /[ \t]main([ \t]|$)/) main = 1; l = "Components: main" }
-                else if (l ~ /^Types:/) { if (l ~ /[ \t]deb([ \t]|$)/) bin = 1; l = "Types: deb" }
+                # multi-line values: a continuation line starts with a blank and belongs to the field above
+                if (l ~ /^[ \t]/) {
+                    if (field == "Components") { comps = comps " " l; continue }
+                    if (field == "Types") { types = types " " l; continue }
+                } else if (l ~ /^[A-Za-z][A-Za-z0-9-]*:/) {
+                    field = substr(l, 1, index(l, ":") - 1)
+                    if (field == "Components") { comps = substr(l, 12); out = out "Components: main\n"; continue }
+                    if (field == "Types") { types = substr(l, 7); out = out "Types: deb\n"; continue }
+                } else {
+                    field = ""
+                }
                 out = out l "\n"
             }
-            if (main && bin) print out "\n"
+            if (comps ~ /(^|[ \t])main([ \t]|$)/ && types ~ /(^|[ \t])deb([ \t]|$)/) print out "\n"
         }' "$f" > "$dir/parts/$(basename "$f")"
     done
     if [ -s "$dir/sources.list" ] || [ -n "$(cat "$dir"/parts/* 2>/dev/null)" ]; then
