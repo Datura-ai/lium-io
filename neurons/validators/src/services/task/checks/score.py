@@ -13,6 +13,7 @@ class ScoreCheck:
     """
 
     check_id = "gpu.validate.score"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:

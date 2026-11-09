@@ -71,6 +71,7 @@ class ProviderMaintenanceCheck:
     download-speed probe and the rental probe; a node with a rental passes to TenantEnforcementCheck."""
 
     check_id = "executor.validate.provider_maintenance"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
