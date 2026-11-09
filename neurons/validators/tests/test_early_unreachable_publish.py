@@ -144,16 +144,24 @@ def test_the_cycle_end_silencer_gives_nodes_published_early_their_state_from_bef
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("whole_batch", "recorded"), [(True, True), (False, False)])
-async def test_only_the_cycle_publish_records_what_it_sent(monkeypatch, whole_batch, recorded):
+@pytest.mark.parametrize(
+    ("whole_batch", "express", "publish_fails", "recorded"),
+    [(True, False, False, True), (False, False, False, False), (False, True, False, True), (True, False, True, False)],
+)
+async def test_only_the_cycle_publish_records_what_it_sent(monkeypatch, whole_batch, express, publish_fails, recorded):
+    # review 4510532986: an express publish records its list too, and a failed publish records nothing
     service = MinerService.__new__(MinerService)
     service.cycle_published_availability = {}
     service.redis_service = AsyncMock()
+    if publish_fails:
+        service.redis_service.publish.side_effect = ConnectionError("redis down")
     service._pod_states_capped_for_spec = lambda result, extra: None
     monkeypatch.setattr("services.miner_service.settings.DRY_RUN", False)
     node, unchecked = _result([SSH]), _result(None)
 
-    await service.publish_machine_specs([node, unchecked], "hk", "ck", is_whole_miner_batch=whole_batch)
+    await service.publish_machine_specs(
+        [node, unchecked], "hk", "ck", is_whole_miner_batch=whole_batch, remember_availability=express
+    )
 
     expected = {("hk", str(node.executor_info.uuid).lower()): [SSH]} if recorded else {}
     assert service.cycle_published_availability == expected

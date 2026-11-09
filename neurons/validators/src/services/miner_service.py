@@ -72,13 +72,7 @@ from services.attestation_service import AttestationService
 from services.docker_service import DockerService, create_steps_after_reply, customer_creates, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
-from services.redis_service import (
-    MACHINE_SPEC_CHANNEL,
-    POD_STATES_CHANNEL,
-    PUBLISHED_AVAILABILITY_PREFIX,
-    PUBLISHED_AVAILABILITY_TTL,
-    RedisService,
-)
+from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
 from services.task.checks.duplicate_executor import _gpu_uuids
@@ -387,31 +381,6 @@ class MinerService:
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
         # it; two miners can report one uuid, and the backend tells their nodes apart by hotkey (review 4491025362)
         self.cycle_published_availability: dict[tuple[str, str], list[dict]] = {}
-
-    async def remember_published_availability(self, miner_hotkey: str, executor_uuid: str, errors: list[dict]) -> None:
-        """Kept in Redis too, so a partial publication after a restart still merges with it."""
-        self.cycle_published_availability[(miner_hotkey, executor_uuid)] = errors
-        try:
-            await self.redis_service.set(
-                f"{PUBLISHED_AVAILABILITY_PREFIX}:{miner_hotkey}:{executor_uuid}",
-                json.dumps(errors),
-                ex=PUBLISHED_AVAILABILITY_TTL,
-            )
-        except Exception as exc:  # noqa: BLE001 - the memory copy still serves this process
-            logger.warning(_m("published availability not kept in Redis", extra={"error": str(exc)}))
-
-    async def published_availability(self, miner_hotkey: str, executor_uuid: str) -> list[dict] | None:
-        """What this validator last published for the node, read back from Redis after a restart. None when it cannot
-        be established (no key, expired, unreadable or malformed): that is not proof the backend holds nothing."""
-        if (miner_hotkey, executor_uuid) in self.cycle_published_availability:
-            return self.cycle_published_availability[(miner_hotkey, executor_uuid)]
-        try:
-            stored = await self.redis_service.get(f"{PUBLISHED_AVAILABILITY_PREFIX}:{miner_hotkey}:{executor_uuid}")
-            errors = json.loads(stored) if stored is not None else None
-        except Exception as exc:  # noqa: BLE001 - unknown
-            logger.warning(_m("published availability not read from Redis", extra={"error": str(exc)}))
-            return None
-        return errors if isinstance(errors, list) else None
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -1287,8 +1256,12 @@ class MinerService:
         miner_coldkey: str,
         *,
         is_whole_miner_batch: bool = True,
+        remember_availability: bool = False,
     ):
         """Publish machine specs to compute app connector process.
+
+        `remember_availability` records a partial publish's full availability list (an express run) for the outage
+        restore, as the whole batch's is.
 
         `is_whole_miner_batch` False leaves `batch_total` unset: the backend's delivery metrics
         (DAH-2792) take a miner's expected spec count from the first spec per (validator,
@@ -1317,12 +1290,6 @@ class MinerService:
             ),
         )
         batch_total = len(results) if is_whole_miner_batch else None
-        if is_whole_miner_batch:
-            for result in results:
-                if result.availability_errors is not None:
-                    await self.remember_published_availability(
-                        miner_hotkey, str(result.executor_info.uuid).lower(), list(result.availability_errors)
-                    )
         for result in results:
             try:
                 await self.redis_service.publish(
@@ -1392,6 +1359,11 @@ class MinerService:
                     exc_info=True,
                 )
                 continue
+            # review 4510532986: recorded only once published, so a failed publish leaves the backend's list in place
+            if (is_whole_miner_batch or remember_availability) and result.availability_errors is not None:
+                self.cycle_published_availability[(miner_hotkey, str(result.executor_info.uuid).lower())] = list(
+                    result.availability_errors
+                )
             # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
             if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)

@@ -140,6 +140,8 @@ class _Pending:
     recheck_only: bool = False
     # Picked this tick because a recheck was requested; its run spends the request's budget.
     requested: bool = False
+    # The request generation this run started from; ending it leaves a newer request queued (review 4510532999).
+    recheck_generation: int | None = None
 
 
 class ExpressLane:
@@ -245,6 +247,10 @@ class ExpressLane:
         chosen = self._select(snapshot, validated, inputs.fleet_known_since, rechecks)
         for pending in chosen:
             pending.requested = pending.executor.id in rechecks
+            if pending.requested:
+                pending.recheck_generation = await self.redis_service.get_executor_recheck_generation(
+                    pending.executor.id
+                )
             pending.recheck_deadline = (
                 recheck_deadline if pending.requested and pending.executor.id in validated else None
             )
@@ -547,7 +553,7 @@ class ExpressLane:
             # in-flight entry goes, so no tick starts a further run in between.
             if pending.requested and self._recheck_runs.get(executor_id, 0) >= RECHECK_MAX_RUNS:
                 with suppress(Exception):
-                    await self._end_recheck(executor_id)
+                    await self._end_recheck(pending)
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
             self._rechecks_in_flight.pop(executor_id, None)
@@ -586,7 +592,7 @@ class ExpressLane:
                 self._recheck_runs[executor_id] -= 1
                 if pending.lost_sessions >= SESSION_LOST_MAX_RUNS:
                     with suppress(Exception):
-                        await self._end_recheck(executor_id)
+                        await self._end_recheck(pending)
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
             return
         passed = result.score > 0 or result.job_score > 0
@@ -595,15 +601,16 @@ class ExpressLane:
             and settings.EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED
             and pending.failed_runs + 1 < FIRST_PASS_MAX_RUNS
         )
-        # One node under the cycle's id: never the miner's batch for that id, the wave's is.
+        # One node under the cycle's id: never the miner's batch for that id, the wave's is. Its list is whole, so
+        # the outage restore starts from it (review 4510532986: a recheck that cleared a hold).
         await self.miner_service.publish_machine_specs(
-            results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
+            results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False, remember_availability=True
         )
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.
             with suppress(Exception):
-                await self._end_recheck(executor_id)
+                await self._end_recheck(pending)
         if should_run_first_pass_again:
             # Not recorded as validated, so the lane runs it again; a wave that starts meanwhile
             # claims it through in_flight and its publish records it.
@@ -648,10 +655,11 @@ class ExpressLane:
         self._pending.pop(executor_id, None)
         self._log_published(pending, result, passed, extra, started)
 
-    async def _end_recheck(self, executor_id: str) -> None:
+    async def _end_recheck(self, pending: _Pending) -> None:
+        executor_id = pending.executor.id
         self._recheck_runs.pop(executor_id, None)
         self._recheck_pending.pop(executor_id, None)
-        await self.redis_service.pop_executor_recheck_request(executor_id)
+        await self.redis_service.pop_executor_recheck_request(executor_id, pending.recheck_generation)
 
     def _log_published(
         self,

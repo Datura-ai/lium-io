@@ -28,9 +28,6 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
-# hotkey:executor uuid -> the availability errors last published for it; outlives a restart, a cycle rewrites it
-PUBLISHED_AVAILABILITY_PREFIX = "published_availability"
-PUBLISHED_AVAILABILITY_TTL = 24 * 3600
 # epoch seconds of the node's latest create (add_pending_pod); outlives VERIFYX_COMMAND_TIMEOUT_SECONDS (600) so a
 # VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
 CREATE_STARTED_AT_PREFIX = "create_started_at"
@@ -156,6 +153,8 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# executor id -> how many times it was requested; a run ends only the request it started from (review 4510532999)
+EXPRESS_LANE_RECHECK_GENERATIONS_HASH = "express_lane:recheck_generations"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -461,17 +460,25 @@ class RedisService:
 
     async def request_executor_recheck(self, executor_id: str) -> None:
         async with self.lock:
+            await self.redis.hincrby(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id, 1)
             await self.redis.sadd(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
-            await self.redis.expire(
-                EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS
-            )
+            for key in (EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_GENERATIONS_HASH):
+                await self.redis.expire(key, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS)
 
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
 
-    async def pop_executor_recheck_request(self, executor_id: str) -> None:
+    async def get_executor_recheck_generation(self, executor_id: str) -> int:
+        return int(await self.redis.hget(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id) or 0)
+
+    async def pop_executor_recheck_request(self, executor_id: str, generation: int | None = None) -> None:
+        """Ends the request; with a generation, only if no newer request for the node came in since it was read.
+        shortcut: read-then-remove, not atomic across the two processes; a Lua script if requests ever collide."""
+        if generation is not None and await self.get_executor_recheck_generation(executor_id) != generation:
+            return
         await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
+        await self.redis.hdel(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None

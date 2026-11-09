@@ -1577,11 +1577,12 @@ class Validator:
         pod_ssh: dict[str, list] | None = None,
     ) -> None:
         """DAH-5718: a run whose session died in the port check has no score, but what its finished checks found (a
-        GPU safety failure) still hides the node, together with what the last cycle hid it for, and its rented pods'
-        SSH observations still go out (review 4470167895: billing reads a silent pod from them). Unscored (scored_at
-        None) and not the miner's whole batch, like an early publish; with no finding availability_errors stays None,
-        so the stored reasons are left alone; when the earlier list is unknown the findings go out alone and the backend
-        merges them by reason code (review 4472994399); a run with neither publishes nothing."""
+        GPU safety failure) still hides the node, and its rented pods' SSH observations still go out (review
+        4470167895: billing reads a silent pod from them). Unscored (scored_at None) and not the miner's whole batch,
+        like an early publish; with no finding availability_errors stays None, so the stored reasons are left alone.
+        A finding goes out alone: the backend merges a session-lost report by reason code, and a validator-side copy
+        of the earlier list goes stale (an express recheck clears a hold; review 4510532986). A run with neither
+        publishes nothing."""
         pod_ssh = pod_ssh or {}
         for withheld in withheld_results:
             result = withheld.result
@@ -1590,22 +1591,8 @@ class Validator:
             if not result.session_lost_in_port_check or not miner_coldkey:
                 continue
             result.pod_ssh = pod_ssh.get(executor_uuid, result.pod_ssh)
-            before = (
-                await self.miner_service.published_availability(withheld.miner_hotkey, executor_uuid)
-                if result.availability_errors
-                else None
-            )
             if not result.availability_errors:
                 result.availability_errors = None  # no finding: None leaves the stored reasons alone
-            elif before is not None:
-                found = {error.get("reason_code") for error in result.availability_errors}
-                result.availability_errors += [error for error in before if error.get("reason_code") not in found]
-                # review 4470167912: the next partial publication merges with this one, not with an older list
-                await self.miner_service.remember_published_availability(
-                    withheld.miner_hotkey, executor_uuid, list(result.availability_errors)
-                )
-            # else review 4472994399: the earlier list is unknown; the finding still goes out alone, and the backend
-            # merges a session-lost report by reason code, so the stored codes it did not re-check (GPU_LOST) stay
             # review 4482976707: a reaped container's state (StaleContainerCleanupCheck) goes out too
             if not result.availability_errors and not result.pod_ssh and not result.pod_states:
                 continue

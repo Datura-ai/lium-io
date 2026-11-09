@@ -786,6 +786,35 @@ async def test_a_recheck_survives_a_deferral_and_ends_with_its_run_budget(monkey
 
 
 @pytest.mark.asyncio
+async def test_a_request_made_during_the_budgets_last_run_stays_queued(monkeypatch, wallet):
+    """Review 4510532999: the last run ended the request after it finished, so a provider's new request made while
+    it ran was deleted with it when the run came back with no executor."""
+    import core.express_lane as express_lane
+
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+    harness.job_for = lambda payload, executor_id: {"results": []}  # the miner did not return it
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+    for _ in range(express_lane.RECHECK_MAX_RUNS - 1):
+        assert await harness.tick_and_settle() == 1
+        harness.lane._recheck_pending[node].not_before = 0.0
+
+    harness.release.clear()
+    assert await harness.lane.tick() == 1  # the budget's last run, held open
+    await harness.redis_service.request_executor_recheck(node)
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+    assert await harness.tick_and_settle() == 1  # the new request gets its own runs
+
+
+@pytest.mark.asyncio
 async def test_a_recheck_that_never_starts_keeps_its_request_and_budget(monkeypatch, wallet):
     node = str(uuid4())
     harness = _Harness(
