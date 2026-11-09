@@ -138,7 +138,8 @@ ensure_compose() {
   docker_cmd "docker compose version" && return 0
   log "docker compose plugin missing; installing it"
   # Docker's repo ships docker-compose-plugin; Ubuntu's docker.io pairs with docker-compose-v2
-  $APT_INSTALL docker-compose-plugin >/dev/null 2>&1 || $APT_INSTALL docker-compose-v2 >/dev/null 2>&1 || true
+  # --no-remove: docker-compose-v2 depends on docker.io, and apt would otherwise swap out a docker-ce install
+  $APT_INSTALL --no-remove docker-compose-plugin >/dev/null 2>&1 || $APT_INSTALL --no-remove docker-compose-v2 >/dev/null 2>&1 || true
   docker_cmd "docker compose version" \
     || die "docker compose plugin not available. Install it: 'sudo apt-get install docker-compose-v2' (Ubuntu docker.io) or 'docker-compose-plugin' (Docker's repo)."
 }
@@ -187,6 +188,10 @@ ok "All required executor prerequisites are installed (non-interactive)."
 
 # If we added user to docker group, activate it for the current session
 if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
-  log "Activating docker group for current session..."
-  exec sg docker -c "$SHELL"
+  # a new shell only makes sense at a terminal; under `lium mine` (output captured) it would hang
+  if [[ -t 0 && -t 1 ]]; then
+    log "Activating docker group for current session..."
+    exec sg docker -c "$SHELL"
+  fi
+  log "Your session does not have the docker group yet: run 'newgrp docker' or log in again before using docker."
 fi

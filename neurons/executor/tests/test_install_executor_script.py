@@ -78,6 +78,8 @@ def test_preinstalled_docker_adds_the_user_to_the_docker_group_and_verifies_thro
     assert "Docker already installed" in proc.stdout
     assert "usermod -aG docker u" in log
     assert "Docker daemon reachable & compose available" in proc.stdout
+    # no terminal (lium mine captures the output): no new shell, a re-login hint instead
+    assert "newgrp docker" in proc.stdout and "Activating docker group" not in proc.stdout
 
 
 def test_a_stopped_daemon_is_reported_as_stopped_not_as_a_permission_problem(
@@ -91,7 +93,7 @@ def test_a_stopped_daemon_is_reported_as_stopped_not_as_a_permission_problem(
 def test_missing_compose_plugin_is_installed(tmp_path: Path) -> None:
     proc, log = _run(tmp_path, compose=False, COMPOSE_INSTALLABLE="1")
     assert proc.returncode == 0, proc.stderr
-    assert "install --no-install-recommends docker-compose-plugin" in log
+    assert "install --no-install-recommends --no-remove docker-compose-plugin" in log
 
 
 def test_missing_compose_plugin_that_cannot_be_installed_names_the_package(tmp_path: Path) -> None:
