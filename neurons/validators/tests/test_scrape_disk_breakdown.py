@@ -53,6 +53,7 @@ DISK_HELPERS = {
     "on_one_filesystem",
     "hard_disk_reading",
     "report_tighter_store",
+    "tighter_usage",
     "get_content_store_usage",
     "get_docker_root_disk_type",
     "HOST_MOUNTS_PATH",
@@ -848,6 +849,28 @@ def test_a_full_filesystem_leaves_no_free_room_whichever_it_is(scrape: dict, mon
     assert hard_disk["hard_disk_free"] == 0
     assert hard_disk["hard_disk_utilization"] == 100
     assert hard_disk["hard_disk_total"] == expected_total_gib * 1024**2
+
+
+_FULLER = _Usage(16 * 1024 * _GiB, 15 * 1024 * _GiB, 1024 * _GiB)  # 93.75% used, yet more free room than _SMALL
+
+
+@pytest.mark.parametrize("fuller", [_SNAPSHOTS, f"{_SNAPSHOTS}/snapshots", f"{_CONTENT}/ingest", f"{_CONTENT}/blobs/sha256"])
+def test_a_fuller_filesystem_is_not_hidden_by_a_tighter_one(scrape: dict, monkeypatch, fuller) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    paths = {_SNAPSHOTS: _BIG, f"{_SNAPSHOTS}/snapshots": _BIG, _CONTENT: _BIG, f"{_CONTENT}/ingest": _BIG,
+             f"{_CONTENT}/blobs/sha256": _BIG, "/proc/1/root/data/docker": _BIG}
+    tight = f"{_CONTENT}/blobs/sha256" if fuller.startswith(_SNAPSHOTS) else f"{_SNAPSHOTS}/snapshots"
+    paths.update({fuller: _FULLER, tight: _SMALL})
+    _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, *paths}, usage_by_path=paths)
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=hash(path))
+
+    store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
+    hard_disk = scrape["hard_disk_reading"](data_root_usage)
+    scrape["report_tighter_store"](hard_disk, store_usage)
+    scrape["report_tighter_store"](hard_disk, scrape["get_content_store_usage"](), False)
+
+    assert hard_disk["hard_disk_utilization"] >= 93.75
+    assert hard_disk["hard_disk_free"] == 50 * _GiB // 1024
 
 
 @pytest.mark.parametrize(

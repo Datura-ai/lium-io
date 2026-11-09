@@ -887,9 +887,7 @@ def get_host_disk_usage(data_root_too=False):
     # containers' files land in <store>/snapshots/<id>/fs: a smaller disk mounted there binds the store too
     snapshots = host_realpath(f"{store}/snapshots")
     if os.path.isdir(f"/proc/1/root{snapshots}") and not on_one_filesystem(store, snapshots):
-        other = shutil.disk_usage(f"/proc/1/root{snapshots}")
-        smaller = usage if usage.total <= other.total else other
-        usage = smaller._replace(free=min(usage.free, other.free))
+        usage = tighter_usage(usage, shutil.disk_usage(f"/proc/1/root{snapshots}"))
     if not data_root_too:
         return usage
     # rental volumes stay under data-root whatever store keeps the containers: its own reading when apart
@@ -897,6 +895,16 @@ def get_host_disk_usage(data_root_too=False):
     if on_one_filesystem(store, data_root) or not os.path.isdir(f"/proc/1/root{data_root}"):
         return usage, None
     return usage, shutil.disk_usage(f"/proc/1/root{data_root}")
+
+
+def tighter_usage(a, b):
+    # one reading for two filesystems a rental needs: the smaller size, the least free room and the fuller one's
+    # utilization (its used share of the smaller size), so neither hides the other running full
+    if a is None or b is None:
+        return a or b
+    small = a if a.total <= b.total else b
+    used = max(small.used, -(-a.used * small.total // a.total), -(-b.used * small.total // b.total))
+    return small._replace(used=used, free=min(a.free, b.free))
 
 
 def hard_disk_reading(usage):
@@ -949,9 +957,7 @@ def get_content_store_usage():
     for path in (content, host_realpath(f"{content}/ingest"), host_realpath(f"{content}/blobs/sha256")):
         if not os.path.isdir(f"/proc/1/root{path}") or any(on_one_filesystem(path, d) for d in measured):
             continue
-        usage = shutil.disk_usage(f"/proc/1/root{path}")
-        if tightest is None or usage.free < tightest.free:
-            tightest = usage
+        tightest = tighter_usage(tightest, shutil.disk_usage(f"/proc/1/root{path}"))
     return tightest
 
 
