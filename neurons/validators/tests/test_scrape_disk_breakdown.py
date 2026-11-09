@@ -793,6 +793,35 @@ def test_the_fuller_of_the_store_and_data_root_is_the_reported_utilization(scrap
     assert hard_disk["hard_disk_total"] == 400 * 1024**2
 
 
+@pytest.mark.parametrize(
+    "snapshots_device, expected",
+    [
+        (2, _Usage(400 * _GiB, 350 * _GiB, 50 * _GiB)),  # a smaller disk mounted on <store>/snapshots binds the store
+        (1, _BIG),  # the snapshots dir on the store's own filesystem
+    ],
+)
+def test_a_disk_mounted_on_the_snapshots_dir_is_measured_with_the_store(scrape: dict, monkeypatch, snapshots_device, expected) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    paths = {_SNAPSHOTS: _BIG, f"{_SNAPSHOTS}/snapshots": _SMALL, "/proc/1/root/data/docker": _BIG}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=set(paths), usage_by_path=paths)
+    devices = {_SNAPSHOTS: 1, f"{_SNAPSHOTS}/snapshots": snapshots_device, "/proc/1/root/data/docker": 3}
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=devices[path])
+
+    store_usage, _ = scrape["get_host_disk_usage"](True)
+
+    assert tuple(store_usage) == tuple(expected)
+
+
+def test_a_containerd_root_with_spaces_is_measured(scrape: dict, monkeypatch) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    scrape["run_cmd"] = _ctr(_running_root("/mnt/big disk/containerd"))
+    snapshots = f"/proc/1/root/mnt/big disk/containerd/{_OVERLAYFS}"
+    asked = _stub_filesystem(scrape, monkeypatch, host_dirs={snapshots}, usage_by_path={snapshots: _SMALL})
+
+    assert scrape["get_host_disk_usage"]() == _SMALL
+    assert asked == [snapshots]
+
+
 _FULL = _Usage(400 * _GiB, 400 * _GiB, 0)
 
 

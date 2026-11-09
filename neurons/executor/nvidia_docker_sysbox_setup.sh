@@ -468,8 +468,8 @@ CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (Docker name
 
 ctrd_export_root() {
     # the root the running containerd ($1: its plugin listing) reports for plugin $2; its config files may name a
-    # root it has not restarted onto
-    awk -v want="$2" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF == 2 && $1 == "root" {print $2; exit}' <<<"$1"
+    # root it has not restarted onto; ctr prints the root verbatim, so one with spaces is kept whole
+    awk -v want="$2" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF >= 2 && $1 == "root" {sub(/^[ \t]*root[ \t]+/, ""); print; exit}' <<<"$1"
 }
 
 resolve_disk_dir() {
@@ -486,6 +486,7 @@ resolve_disk_dir() {
     DATA_ROOT=$DISK_DIR
     CONTENT_DIR=""
     SNAPSHOTTER_FIX=""
+    SNAPSHOTTER_STORE=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
     address=$(docker info --format '{{with .Containerd}}{{.Address}}{{end}}' 2>/dev/null)
     [ -n "$address" ] || return 1
@@ -498,6 +499,7 @@ resolve_disk_dir() {
     DISK_DIR=$(ctrd_export_root "$listing" "$plugin")
     # a root that is not there is unknown, not the data-root
     [ -n "$DISK_DIR" ] && [ -d "$DISK_DIR" ] || return 1
+    SNAPSHOTTER_STORE=1
     # pulled image layers land in the content store first, which may be another filesystem than the snapshots
     content=$(ctrd_export_root "$listing" io.containerd.content.v1.content)
     [ -z "$content" ] || [ ! -d "$content" ] || CONTENT_DIR=$content
@@ -512,6 +514,8 @@ tighter_df_kb() {
     # report_tighter_store); empty when DISK_DIR is unreadable
     local dir kb best="" where="" dirs=("$DISK_DIR" "$DATA_ROOT")
     [ "$1" != 4 ] || [ -z "${CONTENT_DIR:-}" ] || dirs+=("$CONTENT_DIR")
+    # containers' files land in <store>/snapshots/<id>/fs: a smaller disk mounted there binds the store too
+    [ -z "${SNAPSHOTTER_STORE:-}" ] || [ ! -d "$DISK_DIR/snapshots" ] || dirs+=("$DISK_DIR/snapshots")
     for dir in "${dirs[@]}"; do
         kb=$(df -Pk "$dir" 2>/dev/null | awk -v c="$1" 'NR == 2 {print $c}')
         # 0 available is a reading (a full disk), not a missing one

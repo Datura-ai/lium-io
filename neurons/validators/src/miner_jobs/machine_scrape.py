@@ -884,6 +884,12 @@ def get_host_disk_usage(data_root_too=False):
     if not os.path.isdir(host_disk_root):
         return (shutil.disk_usage("/"), None) if data_root_too else shutil.disk_usage("/")
     usage = shutil.disk_usage(host_disk_root)
+    # containers' files land in <store>/snapshots/<id>/fs: a smaller disk mounted there binds the store too
+    snapshots = host_realpath(f"{store}/snapshots")
+    if os.path.isdir(f"/proc/1/root{snapshots}") and not on_one_filesystem(store, snapshots):
+        other = shutil.disk_usage(f"/proc/1/root{snapshots}")
+        smaller = usage if usage.total <= other.total else other
+        usage = smaller._replace(free=min(usage.free, other.free))
     if not data_root_too:
         return usage
     # rental volumes stay under data-root whatever store keeps the containers: its own reading when apart
@@ -957,7 +963,8 @@ def containerd_store_root(info, plugin):
         # without ctr only files on disk are left, and they cannot show what the running daemon loaded
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr on the host, so containerd's loaded root cannot be asked")
     kind = name = None
-    for words in (line.split() for line in listing.splitlines()):
+    # maxsplit: ctr prints a root verbatim, and a root may hold spaces
+    for words in (line.split(maxsplit=1) for line in listing.splitlines()):
         if words[:1] == ["Type:"]:
             kind, name = words[-1], None
         elif words[:1] == ["ID:"]:

@@ -166,6 +166,7 @@ STUBS = {
         case "${!#}" in   # STUB_DATA_DF_TOTAL_KB: a data-root on its own big disk, the rest on the root disk
             */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 ${STUB_DATA_DF_AVAIL_KB:-$STUB_DATA_DF_TOTAL_KB} 1% /data"; exit 0; } ;;
             *.content) [ -z "${STUB_CONTENT_DF_AVAIL_KB:-}" ] || { echo "/dev/sdb1 $((14 * 1024 ** 3)) 1 $STUB_CONTENT_DF_AVAIL_KB 1% /content"; exit 0; } ;;
+            */snapshots) [ -z "${STUB_SNAPSHOTS_DF_KB:-}" ] || { echo "/dev/sdc1 $STUB_SNAPSHOTS_DF_KB 1 $STUB_SNAPSHOTS_DF_KB 1% /snap"; exit 0; } ;;
         esac
         echo "${STUB_DF_SOURCE:-/dev/nvme0n1p1} ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
         """
@@ -443,6 +444,30 @@ def test_free_disk_is_read_where_the_running_containerd_keeps_containers(tmp_pat
     assert rc == 1, out
     assert f"FIX  Free disk 50.0 GB on {root}/{running_root}/{_OVERLAYFS} is below" in out
     assert "containerd-snapshotter" in out
+
+
+@pytest.mark.parametrize("check", ["check_total_disk_for_vram", "check_free_disk_for_node"])
+@pytest.mark.parametrize("submount, expected_rc", [(True, 1), (False, 0)])
+def test_a_smaller_disk_mounted_on_the_snapshots_dir_binds_the_store(tmp_path, check, submount, expected_rc):
+    # containerd writes container files under <store>/snapshots: a 50 GiB disk mounted there under a 14 TiB store
+    big = str(14 * 1024**3)
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": big, "STUB_DF_AVAIL_KB": big, "STUB_DATA_DF_TOTAL_KB": big}
+    if submount:
+        env["STUB_SNAPSHOTS_DF_KB"] = str(50 * 1024**2)
+    rc, out, _ = run_check(tmp_path, check, env=env, files={f"{SNAPSHOTS}/snapshots/.keep": ""})
+    assert rc == expected_rc, out
+    if submount:
+        assert f"/{SNAPSHOTS}/snapshots is below" in out, out
+
+
+def test_a_containerd_root_with_spaces_is_measured(tmp_path):
+    root = tmp_path / "root"
+    env = {**SNAPSHOTTER, "STUB_CTR_ROOT": f"{root}/big disk/containerd", "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3),
+           "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    files = {f"big disk/containerd/{_OVERLAYFS}/.keep": ""}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files=files)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {root}/big disk/containerd/{_OVERLAYFS} is below" in out
 
 
 @pytest.mark.parametrize(
