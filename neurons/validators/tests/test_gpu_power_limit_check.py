@@ -510,6 +510,22 @@ async def test_an_unreadable_power_limit_fails(context_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_gb10_without_a_power_limit_passes_and_other_models_still_fail(context_factory) -> None:
+    gb10 = _state(current_limit=None, default_limit=None)
+    gb10.gpu_details[0]["name"] = "NVIDIA GB10"
+    mixed = _state(current_limit=None, default_limit=None, count=2)
+    mixed.gpu_details[0]["name"] = "NVIDIA GB10"
+
+    gb10_result = await GpuPowerLimitCheck().run(context_factory(state=gb10))
+    mixed_result = await GpuPowerLimitCheck().run(context_factory(state=mixed))
+
+    assert gb10_result.passed is True
+    assert gb10_result.event.reason_code == "GPU_POWER_LIMIT_OK"
+    assert mixed_result.passed is False
+    assert mixed_result.event.reason_code == "GPU_POWER_LIMIT_UNREADABLE"
+
+
+@pytest.mark.asyncio
 async def test_an_unreadable_power_limit_under_a_lium_filler_passes(context_factory) -> None:
     ctx = context_factory(
         state=_state(current_limit=None, default_limit=350, default_job_owner="lium")
