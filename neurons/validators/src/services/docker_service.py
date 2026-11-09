@@ -203,6 +203,7 @@ from services.rental_docker_sdk import (
     keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
+    is_rental_docker_transport_error,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     rental_docker_error_class,
@@ -1172,8 +1173,22 @@ _HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags"})
 _RENTAL_PROBE_CONTAINER_START_STEP = "container_start"
 
 
-def is_host_fault_create_failure(current_step: str | None) -> bool:
-    return current_step in _HOST_FAULT_CREATE_STEPS
+# create_container steps before the validator reached the host: a drop there is the validator's own route
+# (rental_probe._CREATE_STEPS_BEFORE_THE_HOST)
+_CREATE_STEPS_BEFORE_THE_HOST = frozenset({"ssh_connect", "docker_sdk_ssh_host_key"})
+
+
+def is_host_fault_create_failure(current_step: str | None, error: BaseException | None = None) -> bool:
+    """A failure on the node itself, or the node's Docker connection over SSH dropping on a step past the connect
+    (after the SDK call's own retry, where it has one): a node whose link keeps dropping fails every create,
+    renter's or filler's, while its checks pass. The probe this stamps decides: one clean create clears it."""
+    if current_step in _HOST_FAULT_CREATE_STEPS:
+        return True
+    return (
+        error is not None
+        and current_step not in _CREATE_STEPS_BEFORE_THE_HOST
+        and is_rental_docker_transport_error(error)
+    )
 
 
 # DAH-5118: once an image has more layers than fit in one page of overlayfs mount options (no fixed count:
@@ -3867,15 +3882,22 @@ class DockerService:
             res = await ssh_client.run(
                 "cat /proc/sys/kernel/pid_max", check=False, timeout=15
             )
-        except (asyncssh.Error, asyncio.TimeoutError, OSError):
-            return None
-        if getattr(res, "exit_status", 1) != 0:
-            return None
-        try:
-            value = int((res.stdout or "").strip())
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
+        except (asyncssh.Error, asyncio.TimeoutError, OSError) as e:
+            why = f"read failed: {type(e).__name__}"
+        else:
+            if getattr(res, "exit_status", 1) != 0:
+                why = f"exit status {getattr(res, 'exit_status', None)}"
+            else:
+                try:
+                    value = int((res.stdout or "").strip())
+                except (TypeError, ValueError):
+                    why = "unparsable output"
+                else:
+                    if value > 0:
+                        return value
+                    why = "not positive"
+        logger.warning(_m(f"Host kernel.pid_max could not be read: {why}"))
+        return None
 
     async def _read_host_ram_kib(self, ssh_client) -> int | None:
         """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
@@ -11221,7 +11243,7 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra)
+            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra, error=e)
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
@@ -11279,14 +11301,14 @@ class DockerService:
             )
 
     async def hold_node_until_probe_passes(
-        self, executor_uuid: str, current_step: str | None, log_extra: dict
+        self, executor_uuid: str, current_step: str | None, log_extra: dict, error: BaseException | None = None
     ) -> None:
         """Stamp a host-fault create failure as the node's standing rental probe failure.
 
         The node then scores 0 every cycle until a rental probe passes on it; the probe's interval stamp
         is dropped so that probe runs on the next idle cycle.
         """
-        if not is_host_fault_create_failure(current_step):
+        if not is_host_fault_create_failure(current_step, error):
             return
         try:
             await self.redis_service.set(

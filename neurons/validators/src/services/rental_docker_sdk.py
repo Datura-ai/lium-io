@@ -149,7 +149,7 @@ def is_rental_docker_transport_error(exc: BaseException) -> bool:
     """True when `exc` (or anything in its cause chain) is a dropped-SSH-transport failure.
 
     Membership is by type (`RentalDockerTransportDropped`, paramiko's `EOFError`, http.client's
-    `RemoteDisconnected`, a reset or broken pipe, a cut-off body, a urllib3 read timeout) and by
+    `RemoteDisconnected`, a reset or broken pipe, a cut-off body, a urllib3 read timeout or protocol error) and by
     the exact texts those errors carry once wrapped into a string by the SDK
     client, so a `RentalDockerOperationError("Docker SDK run container failed: EOFError")` counts
     too. A Docker daemon answer (409, 500, no such image) is never a transport error.
@@ -157,7 +157,10 @@ def is_rental_docker_transport_error(exc: BaseException) -> bool:
     for item in _iter_exception_chain(exc):
         if isinstance(item, (RentalDockerTransportDropped, *_TRANSPORT_ERROR_TYPES)):
             return True
-        if item.__class__.__name__ in {"ReadTimeoutError", "ReadTimeout"}:
+        # urllib3/requests raise these when the reply over the SSH channel is cut off mid-body
+        # ("Connection broken: IncompleteRead", "Response ended prematurely"); by type, as a container's
+        # own output can carry the same words
+        if item.__class__.__name__ in {"ReadTimeoutError", "ReadTimeout", "ProtocolError", "ChunkedEncodingError"}:
             return True
         text = str(item)
         if text == "EOFError" or text.endswith(_TRANSPORT_EOF_SUFFIX):
