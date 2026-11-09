@@ -5773,16 +5773,12 @@ class DockerService:
                 )
             )
 
-    async def _remember_new_filler_best_effort(
-        self, executor_uuid: str, container_name: str, container_id: str | None
-    ) -> None:
+    async def _remember_new_filler_best_effort(self, executor_uuid: str, container_name: str) -> None:
         """A filler that starts and stops between two cycle snapshots is never listed there; record it at create
         so its leftover GPU process still counts as our load (DAH-5904)."""
-        if not container_id:
-            return
         try:
             await self.redis_service.set(
-                f"{RECENT_FILLER_PREFIX}{executor_uuid}:{container_name}", container_id, ex=RECENT_FILLER_TTL_SECONDS
+                f"{RECENT_FILLER_PREFIX}{executor_uuid}:{container_name}", "1", ex=RECENT_FILLER_TTL_SECONDS
             )
         except Exception as exc:
             logger.warning("Recent filler record not written at create for %s: %s", executor_uuid, exc)
@@ -11142,7 +11138,7 @@ class DockerService:
                         await self._record_filler_image_best_effort(
                             docker_client, container_id or container_name, container_name, default_extra
                         )
-                        await self._remember_new_filler_best_effort(executor_info.uuid, container_name, container_id)
+                        await self._remember_new_filler_best_effort(executor_info.uuid, container_name)
                     # no duration: the collector starts after the reply, its time is logged there
                     profilers.append(
                         ProfilerStep(
