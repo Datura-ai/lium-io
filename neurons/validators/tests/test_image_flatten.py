@@ -113,12 +113,6 @@ _NEED = 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + _RESERVED
     [
         # the Size-based check: the need is the one the validator computed
         (f"flatten avail={_NEED - 5 * 1024**3}\n", 5, "5 GB short"),
-        # the containerd export count stops one byte past the free disk: its need is a lower bound
-        (
-            f"flatten need_at_least={_NEED + 7 * 1024**3} avail={_NEED - 2 * 1024**3}\nflatten refused: the export\n",
-            9,
-            "at least 9 GB short",
-        ),
         # another create sized its disk meanwhile, or a count that did not complete: no shortfall to name
         ("flatten refused: another create sized its disk meanwhile\n", None, None),
         ("flatten refused: the export is larger than the free disk allows\n", None, None),
@@ -541,8 +535,9 @@ def test_the_containerd_disk_check_budgets_the_bytes_the_export_really_writes(
     assert result.returncode == expected_rc
     assert sorted(c.split()[0] for c in _calls(tmp_path)) == sorted(expected_calls)
     assert "rm -fv cid1" in _calls(tmp_path)
-    # the count stops one byte past the 45 that fit, so a refusal names a lower bound: twice 46 plus the kept bytes
-    assert (b"flatten need_at_least=102 avail=100" in result.stderr) == (export_bytes == 60)
+    # the count stops one byte past the 45 that fit, so it never learns the real shortfall and names no number
+    assert (b"larger than the free disk allows" in result.stderr) == (export_bytes == 60)
+    assert b"avail=" not in result.stderr
 
 
 def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(tmp_path):
