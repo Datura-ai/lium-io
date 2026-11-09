@@ -20,8 +20,12 @@ from protocol.vc_protocol.compute_requests import (
     NvmlReportAckResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
+    PodSshReachabilityResponse,
+    RentedExecutor,
     RentedExecutorsResponse,
     RentedGpuDropResponse,
+    RentedPod,
+    RentedPodTargets,
     VerificationStartedResponse,
 )
 from pydantic import BaseModel, ValidationError
@@ -213,6 +217,7 @@ class BackendClient:
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
         non_200_log_level: int = logging.ERROR,
+        raise_on_4xx: bool = False,
     ) -> T | None:
         return await self._request(
             "POST",
@@ -223,6 +228,7 @@ class BackendClient:
             timeout=timeout,
             extra_headers=extra_headers,
             non_200_log_level=non_200_log_level,
+            raise_on_4xx=raise_on_4xx,
         )
 
     async def _request(
@@ -448,6 +454,67 @@ class BackendClient:
             },
             timeout=10,
             non_200_log_level=logging.WARNING,
+        )
+
+    async def get_rented_pod_targets(self) -> RentedExecutorsResponse | None:
+        """The watch's per-minute read: only pod_id, ip, miner_hotkey, port and status
+        (`?light=true`), shaped as the rented list the probe takes. A 4xx (a backend without the
+        parameter) falls back to the full list."""
+        try:
+            answer = await self._request(
+                "GET", "/internal/executors/rented?light=true", RentedPodTargets, timeout=30, raise_on_4xx=True
+            )
+        except BackendRejected:
+            return await self.get_rented_executors_now()
+        if answer is None or isinstance(answer.root, RentedExecutorsResponse):
+            return answer and answer.root  # None, or the full list from a backend that ignores the parameter
+        return RentedExecutorsResponse(
+            executors={
+                row.pod_id: RentedExecutor(
+                    miner_hotkey=row.miner_hotkey,
+                    executor_ip_address=row.ip,
+                    executor_ip_port="",
+                    pods=[RentedPod(pod_id=row.pod_id, container_name="", ssh_port=row.port, status=row.status)],
+                )
+                for row in answer.root
+            }
+        )
+
+    async def report_pod_ssh_reachability(
+        self,
+        pod_id: str,
+        *,
+        state: str,
+        since: str,
+        result: str | None,
+        errno: int | None,
+        observed_at: str,
+        answered_before: bool | None = None,
+    ) -> PodSshReachabilityResponse | None:
+        """Tell the backend a rented pod's SSH stopped answering (``state="unreachable"``, ``since`` =
+        the first missed probe) or answers again (``state="reachable"``, ``since`` = when it came back).
+
+        Raises ``BackendRejected`` on 404 (an older backend without the route); None on any other
+        failure, which the caller reports again next tick.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/ssh-reachability",
+            PodSshReachabilityResponse,
+            json_data={
+                "state": state,
+                "since": since,
+                "result": result,
+                "errno": errno,
+                # DAH-5215 review: the backend stores these to order and judge observations
+                "probe_result": result,
+                "answered_before": answered_before,
+                "observed_at": observed_at,
+                "source": "watch",
+            },
+            timeout=10,
+            # once a minute per down pod: the watch logs the counts, not every failed post
+            non_200_log_level=logging.DEBUG,
+            raise_on_4xx=True,
         )
 
     async def get_filler_run_active(

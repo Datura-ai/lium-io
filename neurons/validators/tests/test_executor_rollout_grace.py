@@ -372,3 +372,11 @@ def test_a_miner_whose_only_withheld_result_is_a_lost_session_gets_no_eligibilit
     ]
 
     assert session_kept_hotkeys(withheld) == {"5Rollout"}
+
+
+def test_an_ssh_drop_under_the_port_probe_during_the_rollout_is_withheld() -> None:
+    """DAH-5981: PortCountCheck fails PORT_VERIFY_FAILED, not INSUFFICIENT_PORTS, when the connection dropped;
+    watchtower recreating the executor under the probe must keep the grace INSUFFICIENT_PORTS had."""
+    still_on_old = _failed("node-3", "PORT_VERIFY_FAILED", observed_digest=OLD)
+
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == "PORT_VERIFY_FAILED"
