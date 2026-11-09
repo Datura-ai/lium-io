@@ -38,6 +38,7 @@ def presented_host_key(ctx: Context) -> str:
 
 class NodeAccountCheck:
     check_id = "executor.validate.node_account"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

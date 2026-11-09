@@ -66,6 +66,7 @@ class RentedPodOwnershipCheck:
     """
 
     check_id = "host.observe.rented_pod_ownership"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:

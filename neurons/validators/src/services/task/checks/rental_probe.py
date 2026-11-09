@@ -243,6 +243,8 @@ class RentalProbeCheck:
     """
 
     check_id = "executor.validate.rental_probe"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

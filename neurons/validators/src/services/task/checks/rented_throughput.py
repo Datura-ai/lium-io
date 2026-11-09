@@ -436,6 +436,8 @@ class RentedThroughputCheck:
     """
 
     check_id = "host.validate.rented_throughput"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
