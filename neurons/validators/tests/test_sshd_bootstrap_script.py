@@ -454,6 +454,10 @@ Components: main
             "Components: main restricted universe multiverse", "Components: main\n restricted universe multiverse"
         ),
         UBUNTU_SOURCES.replace("Components: main restricted universe multiverse", "Components: restricted\n main universe"),
+        # field names are case-insensitive
+        UBUNTU_SOURCES.replace("Types: deb\n", "types: deb\n", 1).replace(
+            "Components: main restricted universe multiverse", "COMPONENTS: main restricted universe multiverse"
+        ),
         # a comment line inside a multi-line value does not end it
         UBUNTU_SOURCES.replace("Types: deb\n", "Types: deb\n# sources too\n deb-src\n", 1).replace(
             "Components: main restricted universe multiverse", "Components: main\n# the rest\n restricted universe multiverse"
