@@ -793,12 +793,14 @@ class MinerLogLine(BaseModel):
         filler_rate: float,
         paid_fraction: float,
         pay_factor: float,
+        secure_share: float = 1.0,
     ) -> MinerLogLine:
         return MinerLogLine(
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
                 "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
                 f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate) "
+                f"(secure_rate = {secure_share:g} * hourly_rate * sysbox_multiplier * driver_multiplier) "
                 "* spot_pool_multiplier (below 1 when the GPU model's spot nodes together would be paid "
                 "more than its fillers earn per hour, filler_revenue_usd_per_hour); "
                 "paid on top of the rental share (paid_fraction < 1: the pool had room for only "

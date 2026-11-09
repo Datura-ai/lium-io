@@ -48,6 +48,8 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # `NVIDIA GB300` is priced like B300 for now. A different card from the B300, so its own base
 # model and idle tier (it never fills the B300 cap), at the B300 rate and caps.
 RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]  # mirrors B300; revisit when GB300 market data exists
+# DAH-6008: `NVIDIA GB200` (Grace Blackwell superchip GPU) is priced like B200 for now, its own base model as GB300 is.
+RENTAL_PRICES_PER_HOUR["NVIDIA GB200"] = RENTAL_PRICES_PER_HOUR["NVIDIA B200"]  # mirrors B200; revisit when GB200 market data exists
 # The names above priced at another name's rate on purpose: alias -> source. A market rate for the source
 # (DAH-5934, core/validator.py apply_market_secure_rates) moves the alias with it, as the table does.
 PARITY_PRICE_ALIASES: dict[str, str] = {
@@ -55,7 +57,7 @@ PARITY_PRICE_ALIASES: dict[str, str] = {
     "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     "NVIDIA B300 SXM6 PC": "NVIDIA B300 SXM6 AC",
     "NVIDIA GB300": "NVIDIA B300 SXM6 AC",
-    # priced like B200 by lio#2149 (DAH-6008); unused until a GB200 name is known
+    # DAH-6008, above
     "NVIDIA GB200": "NVIDIA B200",
 }
 # DAH-5508: the RTX 4090 48GB, its own model and idle tier; only reachable with RTX_4090_48GB_MODEL_ENABLED on.
@@ -254,6 +256,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "Tesla M40": {1: 10, 8: 64},
 }
 MAX_UNRENTED_GPUS_BY_TYPE["GB300"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B300"])  # mirrors B300; revisit when GB300 market data exists
+MAX_UNRENTED_GPUS_BY_TYPE["GB200"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B200"])  # mirrors B200; revisit when GB200 market data exists
 MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] = {1: 10, 8: 64}  # DAH-5508: the default tier (DAH-5070)
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
@@ -378,6 +381,7 @@ BASE_GPU_MAP = {
 }
 BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
 BASE_GPU_MAP["NVIDIA GB300"] = "GB300"  # own family, see RENTAL_PRICES_PER_HOUR
+BASE_GPU_MAP["NVIDIA GB200"] = "GB200"  # own family, see RENTAL_PRICES_PER_HOUR
 BASE_GPU_MAP["NVIDIA GeForce RTX 4090 48GB"] = "RTX 4090 48GB"  # own family, never fills the RTX 4090 tier
 
 
