@@ -572,3 +572,19 @@ async def test_a_sent_whole_host_memory_limit_above_host_ram_is_clamped_in_the_r
 # ------------------------------------------------------------------
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "why"),
+    [
+        (_ssh_result(exit_status=1), "exit status 1"),
+        (_ssh_result(stdout="not a number"), "unparsable output"),
+    ],
+)
+async def test_read_host_pid_max_logs_why_it_missed(svc, caplog, result, why):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=result)
+    with caplog.at_level("WARNING", logger="services.docker_service"):
+        assert await svc._read_host_pid_max(ssh_client) is None
+    assert why in caplog.text
