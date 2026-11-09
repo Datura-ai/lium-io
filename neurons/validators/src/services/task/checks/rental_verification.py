@@ -179,7 +179,10 @@ class RentalVerificationCheck:
                     "executor_uuid": executor.uuid,
                     "error": "No verified ports available for rental verification",
                 },
-                remediation="Port connectivity check should have failed - this is a safety check",
+                remediation=(
+                    "No renting port answered the validator from outside. Open the RENTING_PORT_RANGE ports in the "
+                    "host and network firewalls and forward them to this machine."
+                ),
             )
             return CheckResult(
                 passed=False,

@@ -17,7 +17,7 @@ from services.gpu_power_limit import (
 )
 
 from ..messages import GpuPowerLimitMessages as Msg
-from ..messages import render_message
+from ..messages import render_message, shown
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 
@@ -113,10 +113,20 @@ class GpuPowerLimitCheck:
             stale_cap_event = await self._rescue_stale_lium_caps(ctx, rejected)
             if stale_cap_event is not None:
                 return CheckResult(passed=True, event=stale_cap_event)
+            measured = "; ".join(
+                f"GPU {m.index}: {shown(m.power_limit, 0, failed_below=True)} W limit, "
+                f"default {m.power_default_limit:.0f} W "
+                f"({shown(m.power_limit / m.power_default_limit * 100, 0, failed_below=True)}%)"
+                for m in rejected
+            )
             event = render_message(
                 Msg.LIMIT_BELOW_DEFAULT,
                 ctx=ctx,
                 check_id=self.check_id,
+                remediation=(
+                    f"{measured}. {Msg.LIMIT_BELOW_DEFAULT.remediation} Restore it with "
+                    "`sudo nvidia-smi -i <GPU> -pl <default W>`."
+                ),
                 what={
                     "threshold": MIN_POWER_LIMIT_RATIO,
                     "rejected_gpus": _dump_measurements(rejected),

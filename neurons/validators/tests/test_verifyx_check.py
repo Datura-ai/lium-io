@@ -403,6 +403,7 @@ async def test_verifyx_success_ema_below_threshold_fails_check(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(55.0)
+    assert result.event.remediation.startswith("Average download speed 55.0 Mbps, 100 Mbps required.")
 
 
 @pytest.mark.asyncio
@@ -924,3 +925,19 @@ def test_verifyx_verdict_applies_the_upload_floor(upload, prev_upload, fallback,
     data = {"success": True, "network": network}
 
     assert verifyx_verdict(data, prev, first_pass=False) is expected
+
+
+@pytest.mark.asyncio
+# prev_ema, current=0 -> EMA half of it: 99.96 and 99.99999999 must not read as 100.0
+@pytest.mark.parametrize("prev_download", [199.92, 199.99999998])
+async def test_an_average_speed_just_under_the_floor_never_shows_as_meeting_it(context_factory, prev_download):
+    services = build_services(verifyx=DummyVerifyXService(success=True, updated_specs={"network": {}}))
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=prev_download),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.event.remediation.startswith("Average download speed 99.9 Mbps, 100 Mbps required.")
