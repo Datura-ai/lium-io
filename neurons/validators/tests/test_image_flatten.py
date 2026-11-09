@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import shutil
 import subprocess
+import sys
 import time
 from unittest.mock import AsyncMock, Mock
 
@@ -56,8 +58,21 @@ def test_changes_refuse_an_env_value_with_a_line_break():
         image_flatten_changes({"Env": ["A=1\n2"]})
 
 
-def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2"):
+def _ssh(
+    *, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0,
+    docker_version: str = "29.8.0",
+):
     async def run(command, check=False, timeout=None):
+        if command.startswith("/usr/bin/docker version"):
+            return Mock(exit_status=0, stdout=f"{docker_version}\n")
+        if "--pid=host" in command:
+            return Mock(exit_status=0, stdout="/usr/bin/containerd \n")
+        if command == image_flatten.containerd_plugins_command("/run/containerd/containerd.sock"):
+            return Mock(exit_status=0, stdout=_plugins("/var/lib/containerd"))
+        if command.startswith("/usr/bin/docker info --format '{{json .DriverStatus}}'"):
+            return Mock(exit_status=same_disk_rc, stdout="version = 3\n")
+        if command.startswith("root=$(/usr/bin/docker info --format '{{.DockerRootDir}}')"):
+            return Mock(exit_status=0, stdout="")
         if command.startswith("/usr/bin/docker info --format '{{.Driver}}'"):
             return Mock(exit_status=0, stdout=f"{driver}\n")
         if command.startswith("/usr/bin/docker image inspect --format"):
@@ -100,12 +115,259 @@ async def test_the_copy_is_built_from_the_inspected_image_id_never_the_mutable_t
 
 
 @pytest.mark.asyncio
-async def test_no_flatten_off_the_classic_overlay2_store():
-    # the containerd store keeps images outside the data root the disk check measures
-    ssh = _ssh(exists=False, driver="overlayfs")
+async def test_no_flatten_on_a_store_off_the_measured_disk():
+    # the containerd store keeps images under containerd's root, which may not be the data root the disk check measures
+    ssh = _ssh(exists=False, driver="overlayfs", same_disk_rc=1)
+    with pytest.raises(RuntimeError, match="storage driver"):
+        await flatten_image_on_host(ssh, "model:dev", lease="r1")
+    assert ssh.run.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_on_the_containerd_store_of_a_docker_that_undercounts_image_size():
+    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.7.2")
+    with pytest.raises(RuntimeError, match="storage driver"):
+        await flatten_image_on_host(ssh, "model:dev", lease="r1")
+    assert ssh.run.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "version, counts",
+    [("29.8.0", True), ("29.10.1", True), ("30.0.0-rc.1", True), ("29.7.9", False), ("28.5.2", False), ("", False),
+     ("dev", False)],
+)
+def test_only_a_docker_whose_containerd_size_counts_unpacked_snapshots(version, counts):
+    assert image_flatten.docker_counts_unpacked_size(version) is counts
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_on_a_containerd_snapshotter_other_than_overlayfs():
+    # only the overlayfs snapshotter's directory is measured: stargz, native or zfs write elsewhere
+    ssh = _ssh(exists=False, driver="stargz")
     with pytest.raises(RuntimeError, match="storage driver"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
     assert ssh.run.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_containerd_store_flattens_when_its_root_shares_the_measured_disk():
+    ssh = _ssh(exists=False, driver="overlayfs")
+    assert await flatten_image_on_host(ssh, "model:dev", lease="r1") == _TAG
+
+
+def _plugins(root) -> str:
+    """`ctr plugins ls -d` of a daemon running on `root`."""
+    return "".join(
+        f"Type:          {kind}\nID:            {ident}\nPlatforms:     linux/amd64\nExports:\n"
+        f"               root      {root}/{kind}.{ident}\n\n"
+        for kind, ident in (("io.containerd.content.v1", "content"), ("io.containerd.snapshotter.v1", "overlayfs"))
+    )
+
+
+def _same_disk_rc(
+    tmp_path, *, driver_status: str, config: str | None, daemons: str = "/usr/bin/containerd \n", link=None,
+    running_root=None,
+) -> int:
+    """The real check line against a fake docker whose `run` maps each --mount dst to its src locally."""
+    data_root = tmp_path / "docker"
+    data_root.mkdir()
+    (tmp_path / "etc" / "containerd").mkdir(parents=True)
+    if config is not None:
+        (tmp_path / "etc" / "containerd" / "config.toml").write_text(config)
+    if link is not None:
+        link(tmp_path / "etc")
+    fake = tmp_path / "fake-docker"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        "a = sys.argv[1:]\n"
+        "if a[0] == 'version':\n"
+        "    print('29.8.0'); sys.exit(0)\n"
+        f"if '--pid=host' in a:\n    print({daemons!r}, end=''); sys.exit(0)\n"
+        "if a[0] == 'info':\n"
+        f"    print({driver_status!r} if 'DriverStatus' in a[2] else {str(data_root)!r}); sys.exit(0)\n"
+        "mounts, i = {}, 2\n"
+        "while a[i] == '--mount':\n"
+        "    kv = dict(p.split('=', 1) for p in a[i + 1].split(',') if '=' in p); i += 2\n"
+        f"    src = {str(tmp_path)!r} + kv['src'] if kv['src'] == '/etc' else kv['src']\n"
+        "    if not __import__('os').path.isdir(src): sys.exit(125)\n"
+        "    mounts[kv['dst']] = src\n"
+        "script = a[i + 3]\n"
+        "for dst, src in mounts.items(): script = script.replace(dst + '/', src + '/')\n"
+        "sys.exit(subprocess.run(['sh', '-c', script]).returncode)\n"
+    )
+    fake.chmod(0o755)
+    async def run(command, check=False, timeout=None):
+        # only the host-side command answers: run in the executor container, ctr is missing and this check refuses
+        if command == image_flatten.containerd_plugins_command(image_flatten.containerd_address(config)):
+            live = running_root or image_flatten.containerd_root(config)
+            return Mock(exit_status=0 if live != "unavailable" else 1, stdout=_plugins(live))
+        done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", str(fake))], capture_output=True, text=True)
+        return Mock(exit_status=done.returncode, stdout=done.stdout)
+
+    ssh = Mock()
+    ssh.run = AsyncMock(side_effect=run)
+    return 0 if asyncio.run(image_flatten.containerd_store_on_data_root(ssh)) else 1
+
+
+_STORE = '[["driver-type","io.containerd.snapshotter.v1"]]'
+
+
+def _ctrd(root, **elsewhere):
+    """A containerd root with its snapshot and content directories; `elsewhere` links one to another filesystem."""
+    for sub in image_flatten._CONTAINERD_DATA_DIRS:
+        if any(sub.startswith(f"{linked}/") for linked in elsewhere):
+            continue  # under a linked directory: the link decides
+        (root / sub).parent.mkdir(parents=True, exist_ok=True)
+        if sub in elsewhere:
+            (root / sub).symlink_to(elsewhere[sub])
+        else:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+
+
+@pytest.mark.parametrize(
+    "sub, target, expected",
+    [
+        (None, None, True),  # ordinary directories on the data root's disk
+        ("io.containerd.snapshotter.v1.overlayfs", "/proc", False),  # snapshots on another filesystem
+        ("io.containerd.content.v1.content", "/proc", False),  # the content store on another filesystem
+        ("io.containerd.snapshotter.v1.overlayfs", "/nonexistent", False),  # a dangling link fails the mount
+        ("io.containerd.snapshotter.v1.overlayfs/snapshots", "/proc", False),  # only the snapshots child elsewhere
+        ("io.containerd.content.v1.content/ingest", "/proc", False),  # only the content ingest child elsewhere
+        ("io.containerd.content.v1.content/blobs/sha256", "/proc", False),  # only the content blobs child elsewhere
+    ],
+)
+def test_the_snapshot_and_content_dirs_must_share_the_data_root_filesystem(tmp_path, sub, target, expected):
+    _ctrd(tmp_path / "ctrd", **({sub: target} if sub else {}))
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config) == 0) is expected
+
+
+def test_a_proxy_snapshotter_refuses_the_flatten():
+    stargz = (
+        "version = 2\n[proxy_plugins]\n  [proxy_plugins.stargz]\n    type = 'snapshot'\n"
+        "    address = '/run/containerd-stargz-grpc/containerd-stargz-grpc.sock'\n"
+    )
+    assert image_flatten.containerd_root(stargz) is None
+
+
+@pytest.mark.parametrize(
+    "driver_status, root, expected_same",
+    [
+        (_STORE, "same", True),
+        (_STORE, "other", False),  # containerd root on another filesystem than the measured data root
+        (_STORE, "missing", False),
+        ('[["Backing Filesystem","zfs"]]', "same", False),  # a classic driver other than overlay2
+    ],
+)
+def test_containerd_store_check_requires_its_root_on_the_data_root_filesystem(
+    tmp_path, driver_status, root, expected_same
+):
+    path = {"same": tmp_path / "ctrd", "other": "/proc", "missing": tmp_path / "nope"}[root]
+    if root == "same":
+        _ctrd(path)
+    config = f'version = 2\nroot = "{path}"\n[plugins]\n  root = "/ignored"\n'
+    assert (_same_disk_rc(tmp_path, driver_status=driver_status, config=config) == 0) is expected_same
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        ("version = 3\nroot = '{same}'\n", True),  # the reviewer's config: literal-string root, version 3
+        ('version = 2\nroot = "{same}"\n', True),
+        ('root="{same}" # comment\n', True),
+        ("version = 3\nroot = '{other}'\n", False),  # points at another filesystem: never the default root
+        ("version = 3\nroot = '{same}\n", False),  # unparsable: refuse, never assume
+        ("imports = ['/etc/containerd/conf.d/*.toml']\nroot = '{same}'\n", False),  # imports may move it
+        ("root = 'relative/ctrd'\n", False),
+    ],
+)
+def test_containerd_root_comes_from_the_config_or_the_check_refuses(tmp_path, config, expected):
+    _ctrd(tmp_path / "ctrd")
+    if config is not None:
+        config = config.format(same=tmp_path / "ctrd", other="/proc")
+    rc = _same_disk_rc(tmp_path, driver_status=_STORE, config=config)
+    assert (rc == 0) is expected
+
+
+@pytest.mark.parametrize(
+    "daemons, expected",
+    [
+        ("/usr/bin/containerd \n", True),
+        ("/usr/bin/containerd --config /etc/containerd/config.toml \n", True),
+        ("/usr/bin/containerd --root /mnt/b/containerd \n", False),  # the flag overrides the file's root
+        ("/usr/bin/containerd --config /srv/containerd.toml \n", False),  # another file entirely
+        ("/usr/bin/containerd \ncontainerd --config /var/run/docker/containerd/containerd.toml \n", False),
+        ("", False),  # no containerd seen: the daemon serving Docker is unknown
+    ],
+)
+def test_containerd_store_check_requires_one_daemon_reading_the_etc_config(tmp_path, daemons, expected):
+    _ctrd(tmp_path / "ctrd")
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config, daemons=daemons) == 0) is expected
+
+
+def _link_config(etc):
+    target = etc.parent / "srv-containerd.toml"
+    (etc / "containerd" / "config.toml").rename(target)
+    (etc / "containerd" / "config.toml").symlink_to(target)
+
+
+def _link_dir(etc):
+    (etc / "containerd").rename(etc.parent / "srv-containerd")
+    (etc / "containerd").symlink_to(etc.parent / "srv-containerd")
+
+
+@pytest.mark.parametrize("link", [_link_config, _link_dir])
+def test_a_symlinked_containerd_config_is_refused_never_read_as_missing(tmp_path, link):
+    _ctrd(tmp_path / "ctrd")
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    assert _same_disk_rc(tmp_path, driver_status=_STORE, config=config, link=link) == 1
+
+
+@pytest.mark.parametrize("running, expected", [("same", True), ("other", False), ("unavailable", False)])
+def test_a_config_rewritten_without_a_containerd_restart_is_refused(tmp_path, running, expected):
+    # the daemon started on another disk, then the config was edited to a root on the measured disk
+    _ctrd(tmp_path / "ctrd")
+    config = f"version = 3\nroot = '{tmp_path / 'ctrd'}'\n"
+    live = {"same": str(tmp_path / "ctrd"), "other": "/mnt/b/containerd", "unavailable": "unavailable"}[running]
+    assert (_same_disk_rc(tmp_path, driver_status=_STORE, config=config, running_root=live) == 0) is expected
+
+
+def test_the_running_root_check_runs_the_hosts_ctr_on_the_configured_socket(tmp_path):
+    command = image_flatten.containerd_plugins_command("/run/containerd/containerd.sock")
+    # the executor container has no ctr and no containerd socket: the check must enter the host's mount namespace
+    assert command.startswith("nsenter -t 1 -m -- sh -c ")
+    script = command.removeprefix("nsenter -t 1 -m -- ")
+    log = tmp_path / "ctr.log"
+    for path in image_flatten._CTR_PATHS:
+        script = script.replace(path, str(tmp_path / path.lstrip("/")))
+    bundled = tmp_path / "usr/bin/docker-containerd-ctr"
+    bundled.parent.mkdir(parents=True)
+    run = lambda: subprocess.run(["sh", "-c", script], env={"PATH": os.environ["PATH"]}).returncode  # noqa: E731
+    assert run() == 127  # no ctr on the host: the caller refuses
+    bundled.write_text(f'#!/bin/sh\necho "$*" > {log}\n')
+    bundled.chmod(0o755)
+    assert run() == 0 and log.read_text() == "--address /run/containerd/containerd.sock plugins ls -d\n"
+    assert image_flatten.containerd_address(None) == "/run/containerd/containerd.sock"
+    assert image_flatten.containerd_address("version = 2\n[grpc]\n  address = '/run/c/c.sock'\n") == "/run/c/c.sock"
+    assert image_flatten.containerd_address("version = 3\n[grpc]\n  uid = 0\n") == "/run/containerd/containerd.sock"
+    assert image_flatten.containerd_address("grpc = 'x'\n") is None
+
+
+def test_a_snapshotter_root_path_elsewhere_refuses_the_flatten():
+    v2 = "version = 2\n[plugins.'io.containerd.snapshotter.v1.overlayfs']\n  root_path = '/mnt/b/snap'\n"
+    v3 = "version = 3\n[plugins]\n  [plugins.'io.containerd.snapshotter.v1.overlayfs']\n    root_path = '/mnt/b'\n"
+    assert image_flatten.containerd_root(v2) is None
+    assert image_flatten.containerd_root(v3) is None
+    assert image_flatten.containerd_root("version = 2\n[plugins.'io.containerd.snapshotter.v1.overlayfs']\n  root_path = ''\n") == "/var/lib/containerd"
+
+
+def test_the_default_root_is_used_only_without_a_config_file():
+    assert image_flatten.containerd_root(None) == "/var/lib/containerd"
+    assert image_flatten.containerd_root("version = 3\n[plugins]\n  root = '/x'\n") == "/var/lib/containerd"
+    assert image_flatten.containerd_root("version = 3\nroot = '/mnt/ssd/containerd'\n") == "/mnt/ssd/containerd"
+    assert image_flatten.containerd_root("root = [") is None
 
 
 _HEALTH = {"Interval": 30 * 10**9, "Timeout": 5 * 10**9, "StartPeriod": 0, "Retries": 3}
@@ -144,7 +406,21 @@ def test_changes_refuse_a_health_check_they_cannot_carry():
 
 
 def _flatten_script(
-    tmp_path, *, lease="r1", export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=(), sized_mark=""
+    tmp_path,
+    *,
+    lease="r1",
+    export_rc=0,
+    import_rc=0,
+    rm_rc=0,
+    avail=10**12,
+    import_sleep=0,
+    volumes=(),
+    sized_mark="",
+    need_bytes=100,
+    export_bytes=3,
+    export_factor=0,
+    fixed_bytes=0,
+    export_sleep=0,
 ) -> list[str]:
     """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
@@ -157,14 +433,17 @@ def _flatten_script(
         f"  run) printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 {avail} 1%% /hostfs\\n' ;;\n"
         f'  image) if [ "$2" = ls ]; then cat {tmp_path}/copies 2>/dev/null; else [ -e {tmp_path}/tagged ]; fi ;;\n'
         "  create) echo cid1 ;;\n"
-        f"  export) echo tar; exit {export_rc} ;;\n"
+        f"  export) sleep {export_sleep}; head -c {export_bytes} /dev/zero; exit {export_rc} ;;\n"
         f"  import) cat >/dev/null; sleep {import_sleep}; echo sha256:new; exit {import_rc} ;;\n"
         f"  rm) exit {rm_rc} ;;\n"
         f"  tag) touch {tmp_path}/tagged ;;\n"
         "esac\n"
     )
     fake.chmod(0o755)
-    script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100, lease, sized_mark)
+    script = _flatten_command(
+        "sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), need_bytes, lease, sized_mark,
+        export_factor=export_factor, fixed_bytes=fixed_bytes,
+    )
     for real, local in (
         ("/usr/bin/docker", fake),
         (FLATTEN_LOCK_PATH, tmp_path / "lock"),
@@ -202,6 +481,31 @@ def test_flatten_script_tags_only_a_complete_copy_and_always_removes_the_contain
     assert sorted(c.split()[0] for c in calls) == sorted(expected_calls)  # export and import run concurrently
     if "rm" in expected_calls:
         assert "rm -fv cid1" in calls  # -v: the container's anonymous volumes go with it
+
+
+@pytest.mark.parametrize(
+    "size, export_bytes, export_rc, expected_rc, expected_calls",
+    [
+        # dense, and snapshots-only (Size ~ its unpacked data): the export matches Size, the copy runs
+        (40, 40, 0, 0, ["image", "image", "info", "run", "create", "export", "export", "import", "rm", "tag"]),
+        (40, 38, 0, 0, ["image", "image", "info", "run", "create", "export", "export", "import", "rm", "tag"]),
+        # sparse: Size counts allocated blocks, the export expands the holes; refused before any import
+        (4, 60, 0, FLATTEN_NO_DISK_EXIT, ["image", "image", "info", "run", "create", "export", "rm"]),
+        # the counting export failed: no copy
+        (40, 40, 1, 98, ["image", "image", "info", "run", "create", "export", "rm"]),
+    ],
+)
+def test_the_containerd_disk_check_budgets_the_bytes_the_export_really_writes(
+    tmp_path, size, export_bytes, export_rc, expected_rc, expected_calls
+):
+    # 100 free, 10 kept: the import writes the export twice, so at most 45 bytes of export fit
+    argv = _flatten_script(
+        tmp_path, avail=100, need_bytes=2 * size + 10, export_bytes=export_bytes, export_rc=export_rc,
+        export_factor=2, fixed_bytes=10,
+    )
+    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == expected_rc
+    assert sorted(c.split()[0] for c in _calls(tmp_path)) == sorted(expected_calls)
+    assert "rm -fv cid1" in _calls(tmp_path)
 
 
 def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(tmp_path):
@@ -314,7 +618,28 @@ def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):
 
 def test_timeout_bounds_both_sides_of_the_copy():
     script = _flatten_command("img", "t", [], [], 0, "r1")
-    assert script.count(f"timeout {image_flatten.FLATTEN_TIMEOUT_SECONDS} ") == 2
+    assert script.count('timeout "$left" ') == 2
+
+
+@pytest.mark.parametrize("export_factor", [0, 2])
+def test_counting_and_copying_share_one_deadline(tmp_path, monkeypatch, export_factor):
+    # scaled: each export pass takes 3/4 of the limit; two passes in a row must not hold the lock past the
+    # limit the waiters (flatten lock wait, flatten_wait_command) allow for
+    monkeypatch.setattr(image_flatten, "FLATTEN_TIMEOUT_SECONDS", 2)
+    argv = _flatten_script(tmp_path, export_sleep=1.5, export_factor=export_factor)
+    # a logging timeout: the limit each pass gets, not wall-clock time, so a loaded host cannot flake it
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "timeout").write_text(f'#!/bin/sh\necho "$1" >> {tmp_path}/limits\nexec {shutil.which("timeout")} "$@"\n')
+    (shim / "timeout").chmod(0o755)
+    rc = subprocess.run(argv, capture_output=True, env={"PATH": f"{shim}:{os.environ['PATH']}"}).returncode
+    limits = [int(n) for n in (tmp_path / "limits").read_text().split()] if (tmp_path / "limits").exists() else []
+    if export_factor:
+        # the count used 1.5 of the 2 seconds: the copy gets at most what is left, or does not start
+        assert limits[0] == 2 and all(n <= 1 for n in limits[1:]) and rc in (0, 98)
+    else:
+        assert limits == [2, 2] and rc == 0
+    assert "rm -fv cid1" in _calls(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -417,17 +742,24 @@ def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_oth
     assert subprocess.run(_flatten_script(tmp_path, sized_mark=mark.stdout.strip()), env=env).returncode == 0
 
 
+_GIB24 = 24 * 1024**3
+_MANY = image_flatten.FLATTEN_BUDGET_MIN_LAYERS
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "stdout, copy_exit, expected",
     [
         # uncached many-layer image: the sizing keeps room for the new copy
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", 1, 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
-        # its copy is already on the node: the flatten reuses it, so no extra room is kept
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", 0, None),
+        (f"{_GIB24} {_MANY} sha256:abc\noverlay2\n", 1, _GIB24 + FLATTEN_DISK_MARGIN_BYTES),
+        # containerd store, complete or snapshots-only image: the import writes a compressed blob and unpacks a snapshot
+        (f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n", 1, 2 * _GIB24 + FLATTEN_DISK_MARGIN_BYTES),
+        # its copy is already on the node: the flatten reuses it, so no extra room is kept, on either store
+        (f"{_GIB24} {_MANY} sha256:abc\noverlay2\n", 0, None),
+        (f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n", 0, None),
         # the copy cannot be looked up: keep the room
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", RuntimeError("ssh"), 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS - 1} sha256:abc\n", 1, None),  # starts as is: no copy
+        (f"{_GIB24} {_MANY} sha256:abc\noverlay2\n", RuntimeError("ssh"), _GIB24 + FLATTEN_DISK_MARGIN_BYTES),
+        (f"{_GIB24} {_MANY - 1} sha256:abc\noverlay2\n", 1, None),  # starts as is: no copy
         ("garbage\n", 1, None),
     ],
 )
@@ -441,3 +773,15 @@ async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, cop
         return Mock(exit_status=copy_exit)
 
     assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver, copies", [("overlay2", 1), ("overlayfs", 2)])
+async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(driver, copies):
+    # a snapshots-only image (compressed blobs gone) still has Size ~ its unpacked data; the import writes both again
+    ssh = _ssh(exists=False, driver=driver)
+    await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=79 * 1024**3)
+    command = ssh.run.await_args_list[-1].args[0]
+    assert f"-ge {copies * 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
+    # containerd also counts the real export bytes (a sparse file reports a small Size); overlay2's Size does not under-count
+    assert ("head -c" in command) == (copies == 2)
