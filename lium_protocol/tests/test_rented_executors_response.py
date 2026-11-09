@@ -46,9 +46,9 @@ def test_executor_owner_hotkey_arrived_in_1_6_and_is_empty_from_an_older_backend
     assert reply.executor_owner_hotkeys == owners
 
 
-def test_kept_volume_names_arrived_in_2_11_and_is_empty_from_an_older_backend() -> None:
+def test_kept_volume_names_arrived_in_2_12_and_is_empty_from_an_older_backend() -> None:
     major, minor, _patch = (int(part) for part in PROTOCOL_VERSION.split("."))
-    assert (major, minor) >= (2, 11)
+    assert (major, minor) >= (2, 12)
     executor = {"miner_hotkey": "hk", "executor_ip_address": "198.51.100.7", "executor_ip_port": "8001", "pods": []}
     older = RentedExecutorsResponse.model_validate({"executors": {"e1": executor}})
     assert older.executors["e1"].kept_volume_names == []
