@@ -348,8 +348,7 @@ class Settings(BaseSettings):
     LIUMD_SHADOW_TIMEOUT_SECONDS: int = Field(env="LIUMD_SHADOW_TIMEOUT_SECONDS", default=330)
     # The only executors the shadow runs on: reserved, non-rentable dev executors, as
     # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries, or `all` for every
-    # executor. `all` is accepted only with DEPLOY_ENV=STAGE; any other deployment rejects the
-    # setting at startup. A pod or filler started after the cycle's snapshot is not seen, so on
+    # executor. A pod or filler started after the cycle's snapshot is not seen, so on
     # a rentable node the shadow could run its GPU/RAM/disk/network probe next to a workload.
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
@@ -803,15 +802,9 @@ class Settings(BaseSettings):
     def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]] | None:
         """`LIUMD_SHADOW_RESERVED_EXECUTORS` as (miner_hotkey, executor_uuid, address, ssh_port).
 
-        `all` means every executor and is accepted only when DEPLOY_ENV is STAGE. A malformed
-        entry raises ValueError rather than being dropped.
+        `all` means every executor. A malformed entry raises ValueError rather than being dropped.
         """
         if self.LIUMD_SHADOW_RESERVED_EXECUTORS.strip().lower() == "all":
-            if self.DEPLOY_ENV != "STAGE":
-                raise ValueError(
-                    "LIUMD_SHADOW_RESERVED_EXECUTORS=all is staging only; "
-                    f"DEPLOY_ENV is {self.DEPLOY_ENV}"
-                )
             return None
         reserved = set()
         for entry in self.LIUMD_SHADOW_RESERVED_EXECUTORS.split(","):

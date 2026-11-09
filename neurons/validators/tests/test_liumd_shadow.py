@@ -268,7 +268,6 @@ async def test_agreeing_verdicts_are_logged_as_one_structured_line(
 @pytest.mark.asyncio
 async def test_all_reserved_runs_on_any_executor(keypair, monkeypatch, verifyx_service):
     monkeypatch.setattr(settings, "LIUMD_SHADOW_RESERVED_EXECUTORS", "all")
-    monkeypatch.setattr(settings, "DEPLOY_ENV", "STAGE")
     fake = FakeLiumd()
 
     record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
@@ -288,15 +287,6 @@ async def test_gpu_steps_are_off_by_default(keypair, monkeypatch, verifyx_servic
     assert intent["steps"]["inspector"] is False
     assert record["outcome"] == "compared" and record["agree"] is None
     assert "liumd_verdict" not in record["steps"]["matmul"]
-
-
-@pytest.mark.parametrize("deploy_env", ["PROD", "LOCAL"])
-def test_all_reserved_is_staging_only(monkeypatch, deploy_env):
-    monkeypatch.setattr(settings, "LIUMD_SHADOW_RESERVED_EXECUTORS", "all")
-    monkeypatch.setattr(settings, "DEPLOY_ENV", deploy_env)
-
-    with pytest.raises(ValueError, match="staging only"):
-        settings.get_liumd_shadow_reserved_executors()
 
 
 @pytest.mark.asyncio
