@@ -199,5 +199,6 @@ if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
     log "Activating docker group for current session..."
     exec sg docker -c "$SHELL"
   fi
-  log "Your session does not have the docker group yet: run 'newgrp docker' or log in again before using docker."
+  # non-zero so a caller that captures the output (lium mine) shows this instead of failing later on the socket
+  die "Added to the docker group, but this session does not have it yet: run 'newgrp docker' or log in again, then rerun."
 fi

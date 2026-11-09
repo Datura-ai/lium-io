@@ -100,12 +100,18 @@ def test_preinstalled_docker_adds_the_user_to_the_docker_group_and_verifies_thro
     tmp_path: Path,
 ) -> None:
     proc, log = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
     assert "Docker already installed" in proc.stdout
     assert "usermod -aG docker u" in log
     assert "Docker daemon reachable & compose available" in proc.stdout
-    # no terminal (lium mine captures the output): no new shell, a re-login hint instead
-    assert "newgrp docker" in proc.stdout and "Activating docker group" not in proc.stdout
+    # no terminal (lium mine captures the output): no new shell; fail with the re-login step so the caller shows it
+    assert proc.returncode != 0 and "Activating docker group" not in proc.stdout
+    assert "run 'newgrp docker' or log in again, then rerun" in proc.stderr
+
+
+def test_a_session_that_already_has_the_docker_group_finishes_cleanly(tmp_path: Path) -> None:
+    proc, _ = _run(tmp_path, IN_DOCKER_GROUP="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "All required executor prerequisites are installed" in proc.stdout
 
 
 def test_a_stopped_daemon_is_reported_as_stopped_not_as_a_permission_problem(
@@ -117,7 +123,7 @@ def test_a_stopped_daemon_is_reported_as_stopped_not_as_a_permission_problem(
 
 
 def test_missing_compose_plugin_is_installed(tmp_path: Path) -> None:
-    proc, log = _run(tmp_path, compose=False, COMPOSE_INSTALLABLE="1")
+    proc, log = _run(tmp_path, compose=False, COMPOSE_INSTALLABLE="1", IN_DOCKER_GROUP="1")
     assert proc.returncode == 0, proc.stderr
     assert "install --no-install-recommends --no-remove docker-compose-plugin" in log
 
