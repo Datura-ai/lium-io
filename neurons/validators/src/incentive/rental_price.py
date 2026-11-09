@@ -1272,8 +1272,8 @@ class RentalPriceIncentive(DefaultIncentive):
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
         runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
         0 where a secure node of this configuration earns no idle pay, so the min() pays 0 there.
-        A configuration with no filler average yet is seeded with the secure rate (Fish 23 Oct: every
-        GPU model gets idle pay), and the seed is not scaled to the model's filler earnings.
+        A configuration with no filler average yet is seeded with SPOT_IDLE_SECURE_RATE_SHARE x the secure
+        rate (Fish 23 Oct: every GPU model gets idle pay), and the seed is not scaled to the model's filler earnings.
         """
         base_model: str = self.get_base_model_for_gpu(result.gpu_model)
         cap_spec: dict[int, int] = self.config.max_unrented_gpus.get(base_model, {})

@@ -120,7 +120,7 @@ class ZeroIncentiveReason(StrEnum):
     REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
     # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
-    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"  # wire code, append-only; no longer emitted: an unmeasured configuration is seeded with its secure rate
+    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"  # wire code, append-only; no longer emitted: an unmeasured configuration is seeded with its spot ceiling
     SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
     # Group C: the validation run itself did not pass; context.reason_code names the check
     VALIDATION_FAILED = "validation_failed"
@@ -622,7 +622,7 @@ class MinerLogLine(BaseModel):
             message=(
                 f"Spot-tier rate seeded: there is no average filler revenue yet for the "
                 f"{result.gpu_count}x {result.gpu_model} configuration, so this executor is paid "
-                "what it would earn idle on Secure until there is one."
+                "the Spot maximum, a fixed share of what it would earn idle on Secure, until there is one."
             ),
             fields={
                 "executor_id": str(result.executor_info.uuid),

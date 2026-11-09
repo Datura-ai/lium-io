@@ -358,19 +358,20 @@ async def test_spot_whose_config_earned_zero_is_not_seeded_with_its_secure_rate(
 
 
 @pytest.mark.asyncio
-async def test_spot_whose_config_has_no_average_is_seeded_with_its_secure_rate():
-    # Fish 23 Oct: every GPU model gets idle pay; the seed is not scaled down by the model's (tiny) earnings
+async def test_spot_whose_config_has_no_average_is_seeded_with_its_spot_ceiling():
+    # Fish 23 Oct: every GPU model gets idle pay; the seed is not scaled down by the model's (tiny) earnings.
+    # The seed is the spot ceiling, SPOT_IDLE_SECURE_RATE_SHARE of the secure rate, like any spot rate
     spot = _spot(filler_revenue_per_gpu_hour=None, filler_revenue_usd_per_hour=None)
     measured = _spot("spot-2", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=8.0)
 
     incentive = await _run([spot, measured])
 
-    secure_rate = HOURLY_RATE
-    assert spot.effective_rate == pytest.approx(secure_rate)
+    seed = rental_price.SPOT_IDLE_SECURE_RATE_SHARE * HOURLY_RATE
+    assert spot.effective_rate == pytest.approx(seed)
     assert spot.spot_pool_multiplier == pytest.approx(1.0)
     assert spot.incentive > 0
     assert _codes(spot) == []
-    assert _logged(spot, "Spot-tier rate seeded")[0]["spot_rate_seed"] == pytest.approx(secure_rate)
+    assert _logged(spot, "Spot-tier rate seeded")[0]["spot_rate_seed"] == pytest.approx(seed)
     # the measured node still shares only its model's filler earnings
     assert measured.spot_pool_multiplier == pytest.approx(8.0 / 16.0)
     _assert_pool_pays_exactly(incentive)
@@ -437,7 +438,7 @@ async def test_secure_decision_seeds_a_spot_node_with_no_average(secure_decision
 
     await _run([spot])
 
-    assert spot.effective_rate == pytest.approx(HOURLY_RATE)
+    assert spot.effective_rate == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * HOURLY_RATE)
     assert spot.incentive > 0
     assert _codes(spot) == []
 
