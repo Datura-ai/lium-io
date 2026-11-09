@@ -60,6 +60,11 @@ STUBS = {
             "ps --format") [ -z "${STUB_RUNNING:-}" ] || echo "$STUB_RUNNING" ;;   # install mode's running-container sort
             "ps -a")   # every container, stopped ones too
                 [ -z "${STUB_PS_A_HANGS:-}" ] || exit 124
+                if [ "$3" = --format ]; then
+                    [ -z "${STUB_ALL_CONTAINERS:-}" ] && exit 0
+                    case "$4" in *.ID*) echo -e "$STUB_ALL_CONTAINERS" ;; *) echo -e "$STUB_ALL_CONTAINERS" | awk '{print $2}' ;; esac
+                    exit 0
+                fi
                 echo "${STUB_STOPPED_POD:-}"
                 [ "$4" != name=pod_ ] || [ -z "${STUB_PODS:-}" ] || echo "$STUB_PODS" ;;
             "ps --filter")
@@ -478,6 +483,30 @@ def test_install_mode_stops_on_a_stopped_rental(tmp_path):
     assert "docker ps -a --filter name=pod_" in proc.stdout
     assert "pod_abc123" in proc.stdout
     assert "Removing stopped containers" not in proc.stdout
+
+
+def test_install_mode_keeps_the_default_job(tmp_path):
+    # the Default Job (filler_*) is not an unknown container; the install stops it, keeps it and starts it again
+    proc = run_script(
+        tmp_path,
+        env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_RUNNING": "filler_abc", "STUB_ALL_CONTAINERS": "aaa filler_abc\nbbb old_one"},
+    )
+    # the stub host cannot fetch packages, so the run ends at step 3; the clean-up before it is what matters
+    assert "Docker is clear for sysbox installation." in proc.stdout, proc.stdout + proc.stderr
+    assert "Unknown containers found" not in proc.stdout
+    calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
+    assert "stop filler_abc" in calls
+    assert "rm -f bbb" in calls
+    assert not [c for c in calls if c.startswith("rm -f") and "aaa" in c]
+
+
+def test_install_mode_keeps_a_default_job_that_was_already_stopped(tmp_path):
+    # the provider stopped it by hand before running setup: it is still kept, and in the list started after setup
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_ALL_CONTAINERS": "aaa filler_abc\nbbb old_one"})
+    assert "Docker is clear for sysbox installation." in proc.stdout, proc.stdout + proc.stderr
+    calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
+    assert "stop filler_abc" in calls
+    assert "rm -f bbb" in calls
 
 
 def test_install_mode_loads_the_iptables_modules_itself(tmp_path):

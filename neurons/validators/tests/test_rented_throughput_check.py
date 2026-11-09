@@ -1326,9 +1326,12 @@ async def test_a_slow_redis_save_after_a_reading_never_drops_the_cycle():
 @pytest.mark.parametrize(
     "answer, detail",
     [
-        (SLOW_NET, r"network: pypi \d+\.\d Mbps measured, 10 Mbps required"),
+        (SLOW_NET, r"network: pypi \d+\.\d Mbps, hf \d+\.\d Mbps measured, 10 Mbps required"),
         (SLOW_DISK, r"disk: \d+\.\d MB/s measured, 50 MB/s required"),
-        (SLOW_BOTH, r"network: pypi \d+\.\d Mbps measured, 10 Mbps required; disk: \d+\.\d MB/s measured, 50 MB/s required"),
+        (
+            SLOW_BOTH,
+            r"network: pypi \d+\.\d Mbps, hf \d+\.\d Mbps measured, 10 Mbps required; disk: \d+\.\d MB/s measured, 50 MB/s required",
+        ),
     ],
     ids=["network", "disk", "both"],
 )

@@ -120,6 +120,18 @@ async def test_outage_zeros_keep_the_last_good_budget(uncapped, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_zero_stored_by_an_earlier_revision_is_no_reading(uncapped, monkeypatch):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
+    redis = _redis()
+    await redis.set(DJ_REVENUE_KEY, json.dumps({"usd_per_hour": 0.0, "at": time.time()}))
+
+    capped = await _run(redis)
+
+    assert capped.idle_pay_scale == 1.0
+    assert _paid(capped) == pytest.approx(_paid(uncapped))
+
+
+@pytest.mark.asyncio
 async def test_k_zero_pays_no_idle_incentive(uncapped, monkeypatch):
     monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.0)
     redis = _redis()

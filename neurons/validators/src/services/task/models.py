@@ -47,6 +47,9 @@ class JobResult(BaseModel):
     # One timestamp shared by every executor finalized in this validator cycle.
     # It is assigned after final weights are calculated and is the accounting/day key.
     scored_at: datetime | None = None
+    # Set by the express lane: when its run outside the cycle started (the backend reads it, not job_batch_id,
+    # against a maintenance window's end).
+    check_started_at: datetime | None = None
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False

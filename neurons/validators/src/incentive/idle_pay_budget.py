@@ -44,6 +44,8 @@ async def load_default_job_revenue(redis_service) -> tuple[float | None, float |
             return None, None
         age_hours: float = (time.time() - float(stored["at"])) / 3600
         usd_per_hour: float = float(stored["usd_per_hour"])
+        if usd_per_hour <= 0:  # only an earlier revision stored zeros; never let one stop idle pay
+            return None, None
         if age_hours > MAX_READING_AGE_HOURS:
             logger.warning(
                 _m("Idle-pay budget: Default Job revenue stale, last good budget kept", extra={"age_hours": age_hours})
