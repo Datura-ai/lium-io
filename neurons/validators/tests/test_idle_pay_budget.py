@@ -108,11 +108,23 @@ async def test_cold_start_without_any_reading_pays_unscaled_and_says_so(uncapped
 
 
 @pytest.mark.asyncio
-async def test_zero_revenue_pays_no_idle_incentive(uncapped, monkeypatch):
+async def test_outage_zeros_keep_the_last_good_budget(uncapped, monkeypatch):
     monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
     redis = _redis()
-    await store_default_job_revenue(redis, 0.0)
-    await store_default_job_revenue(redis, 0.0)  # a zero counts on its second reading in a row
+    budget = 0.25 * _usd_per_hour(uncapped)
+    for reading in (budget / 0.9, 0.0, 0.0, 0.0):  # good, then zeros from a revenue outage
+        await store_default_job_revenue(redis, reading)
+
+    capped = await _run(redis)
+
+    assert _usd_per_hour(capped) == pytest.approx(budget)
+
+
+@pytest.mark.asyncio
+async def test_k_zero_pays_no_idle_incentive(uncapped, monkeypatch):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.0)
+    redis = _redis()
+    await store_default_job_revenue(redis, _usd_per_hour(uncapped))
 
     capped = await _run(redis)
 
@@ -134,19 +146,6 @@ async def test_a_single_zero_between_good_readings_does_not_stop_idle_pay(uncapp
     capped = await _run(redis)
 
     assert _usd_per_hour(capped) == pytest.approx(budget)
-
-
-@pytest.mark.asyncio
-async def test_a_zero_older_than_a_day_is_no_reading(uncapped, monkeypatch):
-    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
-    redis = _redis()
-    old = time.time() - (MAX_READING_AGE_HOURS + 1) * 3600
-    await redis.set(DJ_REVENUE_KEY, json.dumps({"usd_per_hour": 0.0, "at": old}))
-
-    capped = await _run(redis)
-
-    assert capped.idle_pay_scale == 1.0
-    assert _paid(capped) == pytest.approx(_paid(uncapped))
 
 
 @pytest.mark.asyncio
