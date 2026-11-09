@@ -63,6 +63,7 @@ DISK_HELPERS = {
 _CTRD_ADDRESS = "/run/containerd/containerd.sock"
 _OVERLAYFS = "io.containerd.snapshotter.v1.overlayfs"
 _CONTENT_PLUGIN = "io.containerd.content.v1.content"
+_METADATA_PLUGIN = "io.containerd.metadata.v1.bolt"
 
 
 def _ctr(exports: dict):
@@ -74,15 +75,17 @@ def _ctr(exports: dict):
         blocks = ["\tType:          io.containerd.grpc.v1\n\tID:            cri\n\tRequires:\n\t               io.containerd.event.v1\n"]
         for plugin, root in exports.items():
             kind, name = plugin.rsplit(".", 1)
+            key = "path" if plugin == _METADATA_PLUGIN else "root"  # the metadata plugin exports its file
             blocks.append(f"\tType:          {kind}\n\tID:            {name}\n\tPlatforms:     linux/amd64\n"
-                          f"\tExports:       \n\t               root      {root}\n")
+                          f"\tExports:       \n\t               {key}      {root}\n")
         return "\n".join(blocks)
 
     return run_cmd
 
 
 def _running_root(root: str) -> dict:
-    return {_OVERLAYFS: f"{root}/{_OVERLAYFS}", _CONTENT_PLUGIN: f"{root}/{_CONTENT_PLUGIN}"}
+    return {_OVERLAYFS: f"{root}/{_OVERLAYFS}", _CONTENT_PLUGIN: f"{root}/{_CONTENT_PLUGIN}",
+            _METADATA_PLUGIN: f"{root}/{_METADATA_PLUGIN}/meta.db"}
 
 
 @pytest.fixture
@@ -633,6 +636,7 @@ _SNAPSHOTTER_INFO = {"DockerRootDir": "/data/docker", "DriverStatus": [["driver-
 _CTRD = "/proc/1/root/var/lib/containerd"
 _SNAPSHOTS = f"{_CTRD}/{_OVERLAYFS}"
 _CONTENT = f"{_CTRD}/{_CONTENT_PLUGIN}"
+_METADATA = f"{_CTRD}/{_METADATA_PLUGIN}"
 
 
 def test_disk_usage_is_measured_where_the_containerd_image_store_keeps_containers(scrape: dict, monkeypatch) -> None:
@@ -813,6 +817,43 @@ def test_a_disk_mounted_on_the_snapshots_dir_is_measured_with_the_store(scrape: 
     assert tuple(store_usage) == tuple(expected)
 
 
+_ROOMY = _Usage(436 * _GiB, 36 * _GiB, 400 * _GiB)  # a healthy 436 GiB root disk
+
+
+@pytest.mark.parametrize(
+    "parent, snapshots, shared_data_root, expected_total_gib, expected_free_gib",
+    [
+        # snapshots/ on 14 TiB under a 436 GiB parent: containers live on 14 TiB, the parent's free room still counts
+        (_ROOMY, _BIG, False, 14 * 1024, 400),
+        # a smaller disk on snapshots/ binds the store
+        (_BIG, _SMALL, False, 400, 50),
+        # data-root on the parent's filesystem: rental volumes land there, so its size binds as any data-root does
+        (_ROOMY, _BIG, True, 436, 400),
+        (_BIG, _SMALL, True, 400, 50),
+    ],
+)
+def test_the_store_is_sized_by_a_disk_mounted_on_its_snapshots_dir(
+    scrape: dict, monkeypatch, parent, snapshots, shared_data_root, expected_total_gib, expected_free_gib
+) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    data_root = parent if shared_data_root else _BIG
+    paths = {_SNAPSHOTS: parent, f"{_SNAPSHOTS}/snapshots": snapshots, "/proc/1/root/data/docker": data_root}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=set(paths), usage_by_path=paths)
+    devices = {_SNAPSHOTS: 1, f"{_SNAPSHOTS}/snapshots": 2, "/proc/1/root/data/docker": 1 if shared_data_root else 3}
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=devices[path])
+
+    store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
+    hard_disk = scrape["hard_disk_reading"](data_root_usage or store_usage)
+    scrape["report_tighter_store"](hard_disk, store_usage if data_root_usage else None)
+
+    assert (hard_disk["hard_disk_total"], hard_disk["hard_disk_free"]) == (
+        expected_total_gib * 1024**2,
+        expected_free_gib * 1024**2,
+    )
+    fullest = max(usage.used / usage.total for usage in (parent, snapshots, data_root)) * 100
+    assert hard_disk["hard_disk_utilization"] == pytest.approx(fullest, rel=1e-6)
+
+
 def test_a_containerd_root_with_spaces_is_measured(scrape: dict, monkeypatch) -> None:
     _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
     scrape["run_cmd"] = _ctr(_running_root("/mnt/big disk/containerd"))
@@ -831,13 +872,15 @@ _FULL = _Usage(400 * _GiB, 400 * _GiB, 0)
     [
         # pulled layers land in the content store: a full one fails a pull, but its size is not the disk gate's
         (_CONTENT, 14 * 1024),
+        # containerd's meta.db grows on a pull too: a full disk under it fails the pull, its size is not the gate's
+        (_METADATA, 14 * 1024),
         (_SNAPSHOTS, 400),
         ("/proc/1/root/data/docker", 400),
     ],
 )
 def test_a_full_filesystem_leaves_no_free_room_whichever_it_is(scrape: dict, monkeypatch, full, expected_total_gib) -> None:
     _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
-    paths = {_SNAPSHOTS: _BIG, _CONTENT: _BIG, "/proc/1/root/data/docker": _BIG, full: _FULL}
+    paths = {_SNAPSHOTS: _BIG, _CONTENT: _BIG, _METADATA: _BIG, "/proc/1/root/data/docker": _BIG, full: _FULL}
     _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, *paths}, usage_by_path=paths)
     scrape["os"].stat = lambda path: SimpleNamespace(st_dev=hash(path))
 
@@ -858,7 +901,7 @@ _FULLER = _Usage(16 * 1024 * _GiB, 15 * 1024 * _GiB, 1024 * _GiB)  # 93.75% used
 def test_a_fuller_filesystem_is_not_hidden_by_a_tighter_one(scrape: dict, monkeypatch, fuller) -> None:
     _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
     paths = {_SNAPSHOTS: _BIG, f"{_SNAPSHOTS}/snapshots": _BIG, _CONTENT: _BIG, f"{_CONTENT}/ingest": _BIG,
-             f"{_CONTENT}/blobs/sha256": _BIG, "/proc/1/root/data/docker": _BIG}
+             f"{_CONTENT}/blobs/sha256": _BIG, _METADATA: _BIG, "/proc/1/root/data/docker": _BIG}
     tight = f"{_CONTENT}/blobs/sha256" if fuller.startswith(_SNAPSHOTS) else f"{_SNAPSHOTS}/snapshots"
     paths.update({fuller: _FULLER, tight: _SMALL})
     _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, *paths}, usage_by_path=paths)
@@ -945,8 +988,8 @@ def test_provider_side_disk_of_an_older_scrape_subtracts_the_breakdown_from_used
 )
 def test_a_disk_mounted_inside_the_content_store_limits_free_room(scrape: dict, monkeypatch, child, child_device, expected) -> None:
     _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
-    paths = {_SNAPSHOTS: _BIG, _CONTENT: _BIG, "/proc/1/root/data/docker": _BIG}
-    devices = {_SNAPSHOTS: 1, _CONTENT: 1, "/proc/1/root/data/docker": 2}
+    paths = {_SNAPSHOTS: _BIG, _CONTENT: _BIG, _METADATA: _BIG, "/proc/1/root/data/docker": _BIG}
+    devices = {_SNAPSHOTS: 1, _CONTENT: 1, _METADATA: 1, "/proc/1/root/data/docker": 2}
     if child:
         paths[f"{_CONTENT}/{child}"] = _SMALL
         devices[f"{_CONTENT}/{child}"] = child_device
@@ -958,7 +1001,7 @@ def test_a_disk_mounted_inside_the_content_store_limits_free_room(scrape: dict, 
 
 def test_a_content_store_on_the_snapshots_filesystem_is_not_read_twice(scrape: dict, monkeypatch) -> None:
     _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
-    asked = _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, _SNAPSHOTS, _CONTENT}, usage_by_path={})
+    asked = _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, _SNAPSHOTS, _CONTENT, _METADATA}, usage_by_path={})
     scrape["os"].stat = lambda path: SimpleNamespace(st_dev=1)
 
     assert scrape["get_content_store_usage"]() is None

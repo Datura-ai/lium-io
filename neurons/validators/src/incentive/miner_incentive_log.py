@@ -393,9 +393,10 @@ class MinerLogLine(BaseModel):
             # no reading: "0 GB of total disk" would be false
             message = (
                 f"No unrented incentive: this executor's disk could not be measured, because the validator could not "
-                f"find where Docker's containerd image store keeps containers. An idle executor must have at least "
-                f"{measured.rate}x its {measured.vram_gb} GB of GPU VRAM ({required_disk_gb} GB) in total disk. Run "
-                "one containerd with a readable config, or rent it out to earn."
+                f"ask Docker's containerd where its image store keeps containers. An idle executor must have at least "
+                f"{measured.rate}x its {measured.vram_gb} GB of GPU VRAM ({required_disk_gb} GB) in total disk. The "
+                "validator asks the running containerd with containerd's ctr CLI: install ctr on the host (the "
+                "containerd package ships it) and keep Docker's containerd answering, or rent it out to earn."
             )
         else:
             message = (
@@ -411,6 +412,8 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "total_vram_gb": measured.vram_gb,
                 "total_disk_gb": None if measured.disk_unknown else measured.disk_gb,
+                # unknown is not measured-short: consumers must not tell this provider to add disk
+                "disk_unknown": measured.disk_unknown,
                 "min_disk_to_vram_rate": measured.rate,
                 "required_disk_gb": required_disk_gb,
             },

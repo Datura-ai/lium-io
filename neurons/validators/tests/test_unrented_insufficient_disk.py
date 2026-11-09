@@ -169,6 +169,8 @@ def test_an_unknown_containerd_root_fails_the_gate_closed():
     assert "0.0 GB of total disk" not in line.message
     assert "could not be measured" in line.message
     assert line.fields["total_disk_gb"] is None
+    assert line.fields["disk_unknown"] is True
+    assert "ctr" in line.message and "readable config" not in line.message
     # switching image stores hides the node's existing containers, so the line never suggests it
     assert "containerd-snapshotter" not in line.message
 

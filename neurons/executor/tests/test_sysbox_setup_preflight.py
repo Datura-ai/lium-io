@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -24,7 +25,9 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir", "readlink"]
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir", "readlink",
+              # the real ones are used only where a test drops the recording stub (an unresponsive ctr)
+              "timeout", "sleep"]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
@@ -167,17 +170,21 @@ STUBS = {
             */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 ${STUB_DATA_DF_AVAIL_KB:-$STUB_DATA_DF_TOTAL_KB} 1% /data"; exit 0; } ;;
             *.content) [ -z "${STUB_CONTENT_DF_AVAIL_KB:-}" ] || { echo "/dev/sdb1 $((14 * 1024 ** 3)) 1 $STUB_CONTENT_DF_AVAIL_KB 1% /content"; exit 0; } ;;
             */ingest | */sha256) [ -z "${STUB_CHILD_DF_AVAIL_KB:-}" ] || { echo "/dev/sdd1 $((14 * 1024 ** 3)) 1 $STUB_CHILD_DF_AVAIL_KB 1% /child"; exit 0; } ;;
+            *.bolt) [ -z "${STUB_META_DF_AVAIL_KB:-}" ] || { echo "/dev/sde1 $((436 * 1024 ** 2)) 1 $STUB_META_DF_AVAIL_KB 1% /"; exit 0; } ;;
             */snapshots) [ -z "${STUB_SNAPSHOTS_DF_KB:-}" ] || { echo "/dev/sdc1 $STUB_SNAPSHOTS_DF_KB 1 $STUB_SNAPSHOTS_DF_KB 1% /snap"; exit 0; } ;;
         esac
         echo "${STUB_DF_SOURCE:-/dev/nvme0n1p1} ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
         """
     ),
-    # `ctr --address <socket> plugins ls -d` of the running containerd: its content and snapshotter roots
+    # `ctr --address <socket> plugins ls -d` of the running containerd: its content and snapshotter roots and
+    # its metadata file; STUB_CTR_HANGS: a containerd that accepts the connection but never answers
     "ctr": textwrap.dedent(
         """\
         #!/bin/bash
+        [ -z "${STUB_CTR_HANGS:-}" ] || exec sleep 600
         [ "$3 $4 $5" = "plugins ls -d" ] && [ -z "${STUB_CTR_FAILS:-}" ] || exit 1
         r=${STUB_CTR_ROOT:-$SYSBOX_SETUP_HOST_ROOT/var/lib/containerd}
+        printf '\\tType:\\tio.containerd.metadata.v1\\n\\tID:\\tbolt\\n\\tExports:\\t\\n\\t\\tpath\\t%s\\n\\n' "$r/io.containerd.metadata.v1.bolt/meta.db"
         printf '\\tType:\\tio.containerd.content.v1\\n\\tID:\\tcontent\\n\\tExports:\\t\\n\\t\\troot\\t%s\\n\\n' "$r/io.containerd.content.v1.content"
         printf '\\tType:\\tio.containerd.snapshotter.v1\\n\\tID:\\toverlayfs\\n\\tExports:\\t\\n\\t\\troot\\t%s\\n' "$r/io.containerd.snapshotter.v1.overlayfs"
         """
@@ -482,6 +489,70 @@ def test_a_smaller_disk_mounted_on_the_snapshots_dir_binds_the_store(tmp_path, c
     assert rc == expected_rc, out
     if submount:
         assert f"/{SNAPSHOTS}/snapshots is below" in out, out
+
+
+_STORE_PARENT = f"var/lib/containerd/{_OVERLAYFS}"
+
+
+@pytest.mark.parametrize(
+    "check, parent_kb, snapshots_kb, data_root_kb, expected_rc, limiting",
+    [
+        # snapshots/ on 14 TiB under a 436 GiB parent: containers live on 14 TiB, so the store is 14 TiB
+        ("check_total_disk_for_vram", 436 * 1024**2, 14 * 1024**3, 14 * 1024**3, 0, None),
+        # data-root on the parent's filesystem: rental volumes land there, so its size binds as any data-root does
+        ("check_total_disk_for_vram", 436 * 1024**2, 14 * 1024**3, None, 1, "/var/lib/docker"),
+        # a smaller disk on snapshots/ binds the store, data-root apart or shared
+        ("check_total_disk_for_vram", 14 * 1024**3, 436 * 1024**2, 14 * 1024**3, 1, f"/{_STORE_PARENT}/snapshots"),
+        ("check_total_disk_for_vram", 14 * 1024**3, 436 * 1024**2, None, 1, f"/{_STORE_PARENT}/snapshots"),
+        # the parent's free room still counts: a full parent fails the free check under a roomy snapshots disk
+        ("check_free_disk_for_node", 0, 14 * 1024**3, 14 * 1024**3, 1, f"/{_STORE_PARENT}"),
+    ],
+)
+def test_the_store_is_sized_by_a_disk_mounted_on_its_snapshots_dir(
+    tmp_path, check, parent_kb, snapshots_kb, data_root_kb, expected_rc, limiting
+):
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": str(parent_kb or 436 * 1024**2), "STUB_DF_AVAIL_KB": str(parent_kb),
+           "STUB_SNAPSHOTS_DF_KB": str(snapshots_kb)}
+    if data_root_kb:
+        env["STUB_DATA_DF_TOTAL_KB"] = str(data_root_kb)
+    rc, out, _ = run_check(tmp_path, check, env=env, files={f"{_STORE_PARENT}/snapshots/.keep": ""})
+    assert rc == expected_rc, out
+    if limiting:
+        assert f"{limiting} is below" in out, out
+
+
+_METADATA_ROOT = "var/lib/containerd/io.containerd.metadata.v1.bolt"
+
+
+@pytest.mark.parametrize("check, expected_rc", [("check_free_disk_for_node", 1), ("check_total_disk_for_vram", 0)])
+def test_a_full_filesystem_under_containerds_metadata_fails_the_free_check_only(tmp_path, check, expected_rc):
+    # snapshots and content on 14 TiB, meta.db on a full root disk: a pull that grows the metadata file still fails
+    big = str(14 * 1024**3)
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": big, "STUB_DF_AVAIL_KB": big, "STUB_DATA_DF_TOTAL_KB": big,
+           "STUB_CONTENT_DF_AVAIL_KB": big, "STUB_META_DF_AVAIL_KB": "0"}
+    files = {f"{SNAPSHOTS}/.keep": "", CONTENT_STORE: "", f"{_METADATA_ROOT}/meta.db": ""}
+    rc, out, _ = run_check(tmp_path, check, env=env, files=files)
+    assert rc == expected_rc, out
+    if expected_rc:
+        assert f"FIX  Free disk 0.0 GB on {tmp_path}/root/{_METADATA_ROOT} is below" in out, out
+
+
+def test_the_containerd_query_has_a_deadline(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=SNAPSHOTTER, files={f"{SNAPSHOTS}/.keep": ""})
+    assert rc == 0, out
+    timeouts = (tmp_path / "root" / ".stub-docker" / "timeouts").read_text().splitlines()
+    assert any(line.startswith("20 ctr --address ") for line in timeouts), timeouts
+
+
+def test_an_unresponsive_containerd_is_unknown_not_a_hung_check(tmp_path):
+    # a containerd that accepts the connection but never answers: the real timeout ends the query after 20 s
+    env = {**SNAPSHOTTER, "STUB_CTR_HANGS": "1", "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    started = time.monotonic()
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env, files={f"{SNAPSHOTS}/.keep": ""},
+                           without=("timeout",))
+    assert time.monotonic() - started < 60
+    assert rc == 0, out
+    assert "SKIP" in out and "is below" not in out, out
 
 
 def test_a_containerd_root_with_spaces_is_measured(tmp_path):

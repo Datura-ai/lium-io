@@ -467,9 +467,9 @@ check_iptables_modules() {
 CTRD_UNKNOWN="where Docker's containerd keeps containers is unknown (Docker names no containerd address, or that running containerd does not report its root). The check needs containerd's ctr CLI on the host to ask it: install containerd's ctr (the containerd package ships it)."
 
 ctrd_export_root() {
-    # the root the running containerd ($1: its plugin listing) reports for plugin $2; its config files may name a
-    # root it has not restarted onto; ctr prints the root verbatim, so one with spaces is kept whole
-    awk -v want="$2" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF >= 2 && $1 == "root" {sub(/^[ \t]*root[ \t]+/, ""); print; exit}' <<<"$1"
+    # the root (or export $3) the running containerd ($1: its plugin listing) reports for plugin $2; its config files
+    # may name a root it has not restarted onto; ctr prints the root verbatim, so one with spaces is kept whole
+    awk -v want="$2" -v key="${3:-root}" '$1 == "Type:" {t = $NF} $1 == "ID:" {p = t "." $NF} p == want && NF >= 2 && $1 == key {sub("^[ \t]*" key "[ \t]+", ""); print; exit}' <<<"$1"
 }
 
 resolve_disk_dir() {
@@ -478,13 +478,14 @@ resolve_disk_dir() {
     # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
     # SNAPSHOTTER_FIX: the extra fix line for that case, else empty. Fails when Docker's containerd or its root cannot be told.
     # DATA_ROOT: Docker's data-root, where rental volumes stay whatever store keeps the containers.
-    local address listing plugin content data_root
+    local address listing plugin content meta data_root
     DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
     [ -d "$DISK_DIR" ] || DISK_DIR=/
     data_root=$DISK_DIR
     DATA_ROOT=$DISK_DIR
     CONTENT_DIR=""
+    META_DIR=""
     SNAPSHOTTER_FIX=""
     SNAPSHOTTER_STORE=""
     docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
@@ -494,8 +495,9 @@ resolve_disk_dir() {
     [ "$plugin" != io.containerd.snapshotter.v1. ] || plugin=io.containerd.snapshotter.v1.overlayfs
     # without ctr only files on disk are left, and they cannot show what the running daemon loaded: unknown
     command -v ctr &>/dev/null || return 1
-    # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it
-    listing=$(ctr --address "$address" plugins ls -d 2>/dev/null) || return 1
+    # asked of the running daemon Docker uses: a root edited into its config only counts once it restarts onto it;
+    # a containerd that accepts the connection but never answers is unknown too, not a hung check
+    listing=$(timeout 20 ctr --address "$address" plugins ls -d 2>/dev/null) || return 1
     DISK_DIR=$(ctrd_export_root "$listing" "$plugin")
     # a root that is not there is unknown, not the data-root
     [ -n "$DISK_DIR" ] && [ -d "$DISK_DIR" ] || return 1
@@ -503,22 +505,28 @@ resolve_disk_dir() {
     # pulled image layers land in the content store first, which may be another filesystem than the snapshots
     content=$(ctrd_export_root "$listing" io.containerd.content.v1.content)
     [ -z "$content" ] || [ ! -d "$content" ] || CONTENT_DIR=$content
+    # a pull also grows containerd's metadata file (meta.db): a full disk under it fails the pull
+    meta=$(ctrd_export_root "$listing" io.containerd.metadata.v1.bolt path)
+    [ -z "$meta" ] || [ ! -d "${meta%/*}" ] || META_DIR=${meta%/*}
     # Docker's own containerd keeps its root in data-root (<data-root>/containerd/daemon): the data-root fix covers it
     case "$DISK_DIR/" in "$data_root"/* | "${SYSBOX_SETUP_HOST_ROOT:-}$data_root"/*) return 0 ;; esac
     SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (or the snapshotter's \"root_path\") to the big disk and restart containerd."
 }
 
 tighter_df_kb() {
-    # "<kB> <dir>": df column $1 (2 total, 4 available) of DISK_DIR or DATA_ROOT, whichever is smaller; free space
-    # also counts the containerd content store. The validator reports the tighter filesystem (machine_scrape
-    # report_tighter_store); empty when DISK_DIR is unreadable
-    local dir kb best="" where="" dirs=("$DISK_DIR" "$DATA_ROOT")
-    # a pull writes to ingest/, then blobs/sha256/: a disk mounted on either limits it too
-    [ "$1" != 4 ] || [ -z "${CONTENT_DIR:-}" ] || for dir in "$CONTENT_DIR" "$CONTENT_DIR/ingest" "$CONTENT_DIR/blobs/sha256"; do
+    # "<kB> <dir>": df column $1 (2 total, 4 available) of the store or DATA_ROOT, whichever is smaller; free space
+    # also counts the store's own filesystem, the containerd content store and containerd's metadata. The validator
+    # reports the tighter filesystem (machine_scrape report_tighter_store); empty when DISK_DIR is unreadable
+    local dir kb best="" where="" store=$DISK_DIR
+    # containers' files land in <store>/snapshots/<id>/fs: a disk mounted there is the store's size, while the
+    # store's own filesystem (its metadata) still needs free room
+    [ -z "${SNAPSHOTTER_STORE:-}" ] || [ ! -d "$DISK_DIR/snapshots" ] || store=$DISK_DIR/snapshots
+    local dirs=("$store" "$DATA_ROOT")
+    [ "$1" != 4 ] || [ "$store" = "$DISK_DIR" ] || dirs+=("$DISK_DIR")
+    # a pull writes to ingest/, then blobs/sha256/, and grows meta.db: a disk mounted on any of them limits it too
+    [ "$1" != 4 ] || for dir in ${CONTENT_DIR:+"$CONTENT_DIR" "$CONTENT_DIR/ingest" "$CONTENT_DIR/blobs/sha256"} ${META_DIR:+"$META_DIR"}; do
         [ ! -d "$dir" ] || dirs+=("$dir")
     done
-    # containers' files land in <store>/snapshots/<id>/fs: a smaller disk mounted there binds the store too
-    [ -z "${SNAPSHOTTER_STORE:-}" ] || [ ! -d "$DISK_DIR/snapshots" ] || dirs+=("$DISK_DIR/snapshots")
     for dir in "${dirs[@]}"; do
         kb=$(df -Pk "$dir" 2>/dev/null | awk -v c="$1" 'NR == 2 {print $c}')
         # 0 available is a reading (a full disk), not a missing one

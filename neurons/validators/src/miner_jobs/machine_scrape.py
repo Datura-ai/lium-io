@@ -889,24 +889,27 @@ def get_host_disk_usage(data_root_too=False):
     snapshots_usage = None
     if os.path.isdir(f"/proc/1/root{snapshots}") and not on_one_filesystem(store, snapshots):
         snapshots_usage = shutil.disk_usage(f"/proc/1/root{snapshots}")
+    # with snapshots/ on its own disk the containers' files live there, so that disk is the store's size; the
+    # parent only holds metadata, which still needs free room
+    store_usage = tighter_usage(usage, snapshots_usage, snapshots_usage)
     if not data_root_too:
-        return tighter_usage(usage, snapshots_usage)
+        return store_usage
     # rental volumes stay under data-root whatever store keeps the containers: its own reading when apart
     data_root = info.get("DockerRootDir") or "/var/lib/docker"
     if not os.path.isdir(f"/proc/1/root{data_root}"):
-        return tighter_usage(usage, snapshots_usage), None
+        return store_usage, None
     if on_one_filesystem(store, data_root):
         # the filler cache is released from data-root's own bytes before the snapshots disk folds in (F-92)
         return (snapshots_usage, usage) if snapshots_usage else (usage, None)
-    return tighter_usage(usage, snapshots_usage), shutil.disk_usage(f"/proc/1/root{data_root}")
+    return store_usage, shutil.disk_usage(f"/proc/1/root{data_root}")
 
 
-def tighter_usage(a, b):
-    # one reading for two filesystems a rental needs: the smaller size, the least free room and the fuller one's
-    # utilization (its used share of the smaller size), so neither hides the other running full
+def tighter_usage(a, b, sized=None):
+    # one reading for two filesystems a rental needs: the smaller size (or sized's, when given), the least free
+    # room and the fuller one's utilization (its used share of that size), so neither hides the other running full
     if a is None or b is None:
         return a or b
-    small = a if a.total <= b.total else b
+    small = sized or (a if a.total <= b.total else b)
     used = max(small.used, -(-a.used * small.total // a.total), -(-b.used * small.total // b.total))
     return small._replace(used=used, free=min(a.free, b.free))
 
@@ -964,18 +967,21 @@ def get_content_store_usage():
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return None
     content = containerd_store_root(info, "io.containerd.content.v1.content")
+    # a pull also grows containerd's metadata file, so a full disk under it fails the pull too
+    metadata = containerd_store_root(info, "io.containerd.metadata.v1.bolt", "path")
     measured = (disk_root_dir(info), info.get("DockerRootDir") or "/var/lib/docker")
     tightest = None
     # a pull writes to ingest/, then blobs/sha256/: a disk mounted on either limits it too
-    for path in (content, host_realpath(f"{content}/ingest"), host_realpath(f"{content}/blobs/sha256")):
+    for path in (content, host_realpath(f"{content}/ingest"), host_realpath(f"{content}/blobs/sha256"), metadata):
         if not os.path.isdir(f"/proc/1/root{path}") or any(on_one_filesystem(path, d) for d in measured):
             continue
         tightest = tighter_usage(tightest, shutil.disk_usage(f"/proc/1/root{path}"))
     return tightest
 
 
-def containerd_store_root(info, plugin):
-    # the root the containerd Docker talks to reports for plugin (its Exports root), asked of that running daemon:
+def containerd_store_root(info, plugin, export="root"):
+    # the root the containerd Docker talks to reports for plugin (its Exports root, or the directory of its Exports
+    # path for the metadata file), asked of that running daemon:
     # its config files may already name a root it has not restarted onto. Unknown when it cannot be asked.
     address = (info.get("Containerd") or {}).get("Address") or ""
     if not re.fullmatch(r"[\w./+-]+", address):  # never handed to a shell
@@ -994,8 +1000,8 @@ def containerd_store_root(info, plugin):
             kind, name = words[-1], None
         elif words[:1] == ["ID:"]:
             name = f"{kind}.{words[-1]}"
-        elif name == plugin and len(words) == 2 and words[0] == "root":
-            root = host_realpath(words[1])
+        elif name == plugin and len(words) == 2 and words[0] == export:
+            root = host_realpath(words[1] if export == "root" else os.path.dirname(words[1]))
             if not os.path.isdir(f"/proc/1/root{root}"):
                 raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
             return root
