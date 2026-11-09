@@ -148,19 +148,32 @@ async def test_two_genuine_zeros_pay_no_idle_incentive(uncapped, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reading", [0.0, 0.25])
-async def test_a_reading_older_than_a_day_is_no_reading(uncapped, monkeypatch, reading, caplog):
+async def test_a_zero_older_than_a_day_is_no_reading(uncapped, monkeypatch):
     monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
     redis = _redis()
     old = time.time() - (MAX_READING_AGE_HOURS + 1) * 3600
-    await redis.set(DJ_REVENUE_KEY, json.dumps({"usd_per_hour": reading * _usd_per_hour(uncapped), "at": old}))
+    await redis.set(DJ_REVENUE_KEY, json.dumps({"usd_per_hour": 0.0, "at": old}))
+
+    capped = await _run(redis)
+
+    assert capped.idle_pay_scale == 1.0
+    assert _paid(capped) == pytest.approx(_paid(uncapped))
+
+
+@pytest.mark.asyncio
+async def test_a_positive_reading_older_than_a_day_keeps_capping(uncapped, monkeypatch, caplog):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
+    redis = _redis()
+    budget = 0.25 * _usd_per_hour(uncapped)
+    old = time.time() - (MAX_READING_AGE_HOURS + 1) * 3600
+    await redis.set(DJ_REVENUE_KEY, json.dumps({"usd_per_hour": budget / 0.9, "at": old}))
 
     with caplog.at_level(logging.WARNING):
         capped = await _run(redis)
 
-    assert capped.idle_pay_scale == 1.0
-    assert _paid(capped) == pytest.approx(_paid(uncapped))
-    assert "older than a day" in caplog.text
+    assert capped.idle_pay_scale < 1.0
+    assert _usd_per_hour(capped) == pytest.approx(budget)
+    assert "stale, last good budget kept" in caplog.text
 
 
 @pytest.mark.asyncio
