@@ -138,6 +138,8 @@ class BootstrapHarness:
         self.nvidia_lib_dir = tmp_path / "lib"
         self.nvidia_lib_dir.mkdir()
         self.vulkan_icd_dir = tmp_path / "icd.d"
+        self.apt_etc = tmp_path / "apt"
+        (self.apt_etc / "sources.list.d").mkdir(parents=True)
 
         for name, body in (
             ("pgrep", PGREP_SHIM),
@@ -195,6 +197,7 @@ class BootstrapHarness:
             "LIUM_SSH_LOCK_TIMEOUT_SECS": "1",
             "LIUM_NVIDIA_LIB_DIRS": str(self.nvidia_lib_dir),
             "LIUM_VULKAN_ICD_DIR": str(self.vulkan_icd_dir),
+            "LIUM_APT_ETC": str(self.apt_etc),
         }
         return subprocess.run(
             ["sh", str(SCRIPT), *args],
@@ -416,3 +419,75 @@ def test_vulkan_icd_only_registers_the_driver_and_leaves_sshd_alone(harness):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (harness.vulkan_icd_dir / "nvidia_egl_icd.json").exists()
     assert harness.sshd_start_attempts() == []
+
+
+# DAH-6029: records the narrowed sources apt-get was pointed at (the temp dir is gone afterwards)
+APT_GET_CAPTURES_SOURCES = """#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        Dir::Etc::SourceList=*) cat "${a#*=}" >> "$SHIM_STATE/main_list" ;;
+        Dir::Etc::SourceParts=*) cat "${a#*=}"/* >> "$SHIM_STATE/main_parts" 2>/dev/null ;;
+    esac
+done
+""" + APT_GET_SHIM.split("\n", 1)[1]
+
+UBUNTU_SOURCES = """Types: deb
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb-src
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: noble
+Components: main
+"""
+
+
+@pytest.mark.parametrize("awk", ["mawk", "gawk"])
+def test_sshd_install_reads_only_the_main_package_lists(harness, awk):
+    if not any(Path(d, awk).exists() for d in os.environ["PATH"].split(":")):
+        pytest.skip(f"{awk} not installed")
+    os.symlink(next(Path(d, awk) for d in os.environ["PATH"].split(":") if Path(d, awk).exists()), harness.shims / "awk")
+    harness.stage_sshd_payload(SSHD_STARTS)
+    harness._write_executable(harness.shims / "apt-get", APT_GET_CAPTURES_SOURCES)
+    (harness.apt_etc / "sources.list").write_text(
+        "# comment main\n"
+        "deb http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n"
+        "deb-src http://http.kali.org/kali kali-rolling main\n"
+    )
+    (harness.apt_etc / "sources.list.d" / "cuda.list").write_text(
+        "deb [signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /\n"
+    )
+    (harness.apt_etc / "sources.list.d" / "ubuntu.sources").write_text(UBUNTU_SOURCES)
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    assert len(calls) == 2 and calls[0].startswith("update -o Dir::Etc::SourceList=")
+    # update and install both read the narrowed lists: kali main only, no CUDA, no deb-src
+    assert (harness.state / "main_list").read_text() == "deb http://http.kali.org/kali kali-rolling main\n" * 2
+    parts = (harness.state / "main_parts").read_text()
+    assert parts.count("Components: main\n") == 2 and "universe" not in parts and "deb-src" not in parts
+    assert "Suites: noble noble-updates noble-backports" in parts and "Signed-By:" in parts
+    assert harness.sshd_start_attempts() == ["started"]
+
+
+def test_failed_main_only_install_falls_back_to_all_sources(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    harness._write_executable(
+        harness.shims / "apt-get",
+        APT_GET_SHIM.replace("case", 'case "$*" in install*SourceList*) exit 100 ;; esac\ncase', 1),
+    )
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    assert "SourceList" in calls[1] and calls[2:] == [
+        "update",
+        "install -y --no-install-recommends openssh-server ncurses-term xauth python3 wget ca-certificates",
+    ]
+    assert "retrying with all of the image's apt sources" in result.stdout

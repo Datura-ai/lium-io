@@ -137,11 +137,59 @@ get_sshd_binary() {
     return 1
 }
 
+APT_ETC="${LIUM_APT_ETC:-/etc/apt}"
+APT_PACKAGES="openssh-server ncurses-term xauth python3 wget ca-certificates"
+
+# The image's apt sources narrowed to the distro's `main` component, which holds every package
+# installed here; flat third-party repos (the CUDA one) drop out. A full `apt-get update` reads
+# ~36 MB of indexes (universe, CUDA) and took 2-8 min on slow node links before the install
+# began (DAH-6029). Prints the temp dir, or fails when nothing is left to read.
+apt_main_only_dir() {
+    command -v mktemp >/dev/null 2>&1 || return 1
+    dir="$(mktemp -d)" || return 1
+    mkdir -p "$dir/parts"
+    for f in "$APT_ETC/sources.list" "$APT_ETC"/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        sed -n -E 's/^[[:space:]]*(deb[[:space:]]+(\[[^]]*\][[:space:]]+)?[^[:space:]]+[[:space:]]+[^[:space:]]+)[[:space:]](.*[[:space:]])?main([[:space:]].*)?$/\1 main/p' "$f"
+    done > "$dir/sources.list"
+    for f in "$APT_ETC"/sources.list.d/*.sources; do
+        [ -f "$f" ] || continue
+        # deb822: keep binary stanzas that list main, narrowed to it ([ \t] since old mawk lacks classes)
+        awk 'BEGIN { RS = ""; ORS = "" }
+        {
+            n = split($0, lines, "\n"); out = ""; main = 0; bin = 0
+            for (i = 1; i <= n; i++) {
+                l = lines[i]
+                if (l ~ /^Components:/) { if (l ~ /[ \t]main([ \t]|$)/) main = 1; l = "Components: main" }
+                else if (l ~ /^Types:/) { if (l ~ /[ \t]deb([ \t]|$)/) bin = 1; l = "Types: deb" }
+                out = out l "\n"
+            }
+            if (main && bin) print out "\n"
+        }' "$f" > "$dir/parts/$(basename "$f")"
+    done
+    if [ -s "$dir/sources.list" ] || [ -n "$(cat "$dir"/parts/* 2>/dev/null)" ]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    rm -rf "$dir"
+    return 1
+}
+
 install_sshd() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
+        # shellcheck disable=SC2086 # APT_PACKAGES is a word list
+        if main_dir="$(apt_main_only_dir)"; then
+            apt_main="-o Dir::Etc::SourceList=$main_dir/sources.list -o Dir::Etc::SourceParts=$main_dir/parts"
+            if apt-get update $apt_main && apt-get install -y --no-install-recommends $APT_PACKAGES $apt_main; then
+                rm -rf "$main_dir"
+                return 0
+            fi
+            rm -rf "$main_dir"
+            log "Install from the main package lists failed; retrying with all of the image's apt sources"
+        fi
         apt-get update
-        apt-get install -y --no-install-recommends openssh-server ncurses-term xauth python3 wget ca-certificates
+        apt-get install -y --no-install-recommends $APT_PACKAGES
         return 0
     fi
 
