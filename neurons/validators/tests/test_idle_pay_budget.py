@@ -137,7 +137,7 @@ async def test_a_single_zero_between_good_readings_does_not_stop_idle_pay(uncapp
 
 
 @pytest.mark.asyncio
-async def test_a_reading_older_than_a_day_is_no_reading(uncapped, monkeypatch):
+async def test_a_zero_older_than_a_day_is_no_reading(uncapped, monkeypatch):
     monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
     redis = _redis()
     old = time.time() - (MAX_READING_AGE_HOURS + 1) * 3600
@@ -147,6 +147,19 @@ async def test_a_reading_older_than_a_day_is_no_reading(uncapped, monkeypatch):
 
     assert capped.idle_pay_scale == 1.0
     assert _paid(capped) == pytest.approx(_paid(uncapped))
+
+
+@pytest.mark.asyncio
+async def test_a_positive_reading_older_than_a_day_keeps_capping(uncapped, monkeypatch):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
+    redis = _redis()
+    budget = 0.25 * _usd_per_hour(uncapped)
+    old = time.time() - (MAX_READING_AGE_HOURS + 1) * 3600
+    await redis.set(DJ_REVENUE_KEY, json.dumps({"usd_per_hour": budget / 0.9, "at": old}))
+
+    capped = await _run(redis)
+
+    assert _usd_per_hour(capped) == pytest.approx(budget)
 
 
 @pytest.mark.asyncio
