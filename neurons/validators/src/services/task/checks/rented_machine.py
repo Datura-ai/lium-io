@@ -1141,17 +1141,6 @@ async def _restore_missing_volume_mount(
         async with asyncio.timeout(min(_RECOVERY_DEADLINE_SEC, budget)):
             # the mount must be the rental's own, at its path: another gocryptfs mount in the pod does not count
             local_volume_path = await _plaintext_volume_path(ctx, pod_id)
-            # paused by a restore whose stop no store could record: an exec into it is refused, which the probe
-            # below reads as "cannot tell", so it is resumed first, under the create lock, once the mark is written
-            if await recovery.container_paused(ctx.ssh, container_name) and await recovery.paused_by_recovery(pod_id):
-                async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
-                    if not clear or not await recovery.resume_paused_unmounted_pod(ctx.ssh, container_name, pod_id):
-                        return False
-                    running = False
-                    if not await recovery.encrypted_volume_mount_missing(ctx.ssh, container_name, local_volume_path):
-                        return True  # mounted after all: the caller clears the mark of a running pod
-                    running = await restore(local_volume_path=local_volume_path)
-                    return running
             if not await recovery.encrypted_volume_mount_missing(ctx.ssh, container_name, local_volume_path):
                 return True
             async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:

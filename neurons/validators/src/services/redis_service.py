@@ -62,10 +62,6 @@ STOPPED_BY_RECOVERY_PREFIX = "stopped_by_recovery:"
 # still judged down); STOPPED also means the recovery itself stopped the pod
 STOPPED_BY_RECOVERY_RENAMING = "renaming"
 STOPPED_BY_RECOVERY_STOPPED = "stopped"
-# pod id -> set while a pod is paused by the recovery itself, so only that pause is lifted, never the provider's;
-# the expiry keeps a key whose delete was lost from claiming a later pause for ever
-PAUSED_BY_RECOVERY_PREFIX = "paused_by_recovery:"
-PAUSED_BY_RECOVERY_TTL_SECONDS = 24 * 3600
 # DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
 RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:

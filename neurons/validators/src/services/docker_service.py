@@ -167,8 +167,6 @@ from services.redis_service import (
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
-    PAUSED_BY_RECOVERY_PREFIX,
-    PAUSED_BY_RECOVERY_TTL_SECONDS,
     RECENT_FILLER_PREFIX,
     RECENT_FILLER_TTL_SECONDS,
     RENTAL_PROBE_FAILED_PREFIX,
@@ -2542,8 +2540,6 @@ _unmarked_recovery_stop_dao = UnmarkedRecoveryStopDao()
 _UNMARKED_RECOVERY_STOP_DB_TIMEOUT_SEC = 5
 # pod_id -> outcome of its last unmounted-pod stop, popped by the rented-machine check: only a confirmed stop defers
 _UNMOUNTED_STOP_OUTCOMES: dict[str, str] = {}
-# pods this process paused itself, until their Redis key is written: a pause made while Redis is down
-_PAUSED_BY_RECOVERY: set[str] = set()
 
 
 def _cancel_recovery_mark_cleanup(pod_id: str) -> None:
@@ -2586,7 +2582,7 @@ async def _load_unmarked_recovery_stops() -> None:
 
 
 async def _record_unmarked_recovery_stop(pod_id: str) -> bool:
-    """True once the record is in the validator DB: only a durable record may attribute a park (F-31)."""
+    """True once the record is in the validator DB (F-31)."""
     if not await _unmarked_recovery_stop_db(_unmarked_recovery_stop_dao.add(pod_id), pod_id):
         return False
     _UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.discard(pod_id)
@@ -12539,38 +12535,13 @@ class DockerService:
         parked = f"{container_name}{RECOVERY_STOPPED_SUFFIX}"
         is_parked = False
         if not marked:
-            # recorded in the validator DB before the park: with neither the mark nor that record, a validator restart
-            # would lose the attribution and the stop would fail the host (lio#1827 review F-31). The pod is paused
-            # instead, so the renter's writes stop landing unencrypted; a later cycle resumes it through
-            # resume_paused_unmounted_pod once the mark can be written
+            # recorded in the validator DB before the park, so a validator restart keeps the attribution (F-31).
+            # shortcut: with Redis and the DB both down the record lives in this process only until the mark's
+            # background retry lands; a validator restart inside that double outage judges the parked pod down.
             if not await _record_unmarked_recovery_stop(pod_id):
-                _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
-                # claimed before the pause, as the stop mark is: a pause whose reply is lost may still have applied,
-                # and only the claim lets a later cycle lift it (F-55/F-51). Dropped only when docker answers no
-                _PAUSED_BY_RECOVERY.add(pod_id)
-                try:
-                    paused = await ssh_client.run(
-                        f"/usr/bin/docker pause {shlex.quote(container_name)}",
-                        timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
-                    )
-                except (asyncio.CancelledError, Exception):
-                    self._retry_pause_key_in_background(pod_id)
-                    raise
-                pause_exit = getattr(paused, "exit_status", None)
-                # only a plain error exit is docker refusing, as in _stop_outcome: a signalled or killed CLI (no exit
-                # code, -1, 128+n) may still have paused, so the claim stays
-                if isinstance(pause_exit, int) and 0 < pause_exit <= 128:
-                    _PAUSED_BY_RECOVERY.discard(pod_id)
-                else:
-                    self._retry_pause_key_in_background(pod_id)  # first, so a cancel during the write keeps the claim
-                    await self.paused_by_recovery(pod_id)  # written to Redis now if it is back
-                logger.error(
-                    _m(
-                        "POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD",
-                        extra=get_extra_info({"pod_id": pod_id, "paused": pause_exit == 0}),
-                    )
-                )
-                return False
+                logger.error(_m("POD_UNMOUNTED_STOP_RECORD_IN_MEMORY_ONLY", extra=get_extra_info({"pod_id": pod_id})))
+                _UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.discard(pod_id)
+                _UNMARKED_RECOVERY_STOPS.add(pod_id)
             is_parked = await self._park_by_id(ssh_client, container_name, parked)
             if is_parked:
                 container_name = parked
@@ -12588,77 +12559,6 @@ class DockerService:
         elif not marked:
             self._retry_stopped_mark_in_background(pod_id)
         return outcome == "stopped"
-
-    async def container_paused(self, ssh_client: asyncssh.SSHClientConnection, container_name: str) -> bool:
-        probed = await ssh_client.run(
-            f"/usr/bin/docker inspect -f '{{{{.State.Paused}}}}' {shlex.quote(container_name)}",
-            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
-        )
-        return getattr(probed, "exit_status", 1) == 0 and (probed.stdout or "").strip() == "true"
-
-    async def paused_by_recovery(self, pod_id: str) -> bool:
-        """True when this validator paused the pod itself; Redis keeps that across a restart. Unknown (Redis down,
-        nothing in this process) is not ours: the pod is left alone."""
-        key = f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}"
-        try:
-            if pod_id in _PAUSED_BY_RECOVERY:
-                await asyncio.wait_for(
-                    self.redis_service.set(key, "1", ex=PAUSED_BY_RECOVERY_TTL_SECONDS),
-                    timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
-                )
-                _PAUSED_BY_RECOVERY.discard(pod_id)
-                return True
-            return (
-                await asyncio.wait_for(self.redis_service.get(key), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
-                is not None
-            )
-        except Exception:
-            logger.warning(_m("POD_RECOVERY_PAUSE_RECORD_UNAVAILABLE", extra=get_extra_info({"pod_id": pod_id})))
-            return pod_id in _PAUSED_BY_RECOVERY
-
-    def _retry_pause_key_in_background(self, pod_id: str) -> None:
-        # retried until it lands, like the stop mark: only this process knows the pause until then, so a validator
-        # restart would leave the renter's pod paused for good (lio#1827 review). Its own slot, so the stop mark's
-        # writes and clears of the pod do not cancel it.
-        async def write() -> bool:
-            if pod_id in _PAUSED_BY_RECOVERY:
-                await self.paused_by_recovery(pod_id)
-            return pod_id not in _PAUSED_BY_RECOVERY
-
-        _retry_recovery_mark_in_background(
-            f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}",
-            write,
-            "POD_RECOVERY_PAUSE_KEY_WRITE_FAILED",
-            first_delay=_STOPPED_BY_RECOVERY_WRITE_RETRY_SEC,
-        )
-
-    async def resume_paused_unmounted_pod(
-        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
-    ) -> bool:
-        """Unpause a pod paused because no store could record its stop, once the stop mark is written: True when it
-        runs again (the caller re-probes the mount and remounts or stops it, marked). False leaves it paused."""
-        try:
-            await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_STOPPED)
-        except Exception:
-            _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
-            return False
-        unpaused = await ssh_client.run(
-            f"/usr/bin/docker unpause {shlex.quote(container_name)}", timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
-        )
-        if getattr(unpaused, "exit_status", 1) != 0:
-            await self._clear_stopped_by_recovery(pod_id)  # still paused: nothing was stopped
-            _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
-            return False
-        _PAUSED_BY_RECOVERY.discard(pod_id)
-        await _cancel_recovery_mark_cleanup_and_wait(f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}")  # no write after the delete
-        try:
-            await asyncio.wait_for(
-                self.redis_service.delete(f"{PAUSED_BY_RECOVERY_PREFIX}{pod_id}"),
-                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
-            )
-        except Exception:  # left to its expiry
-            logger.warning(_m("POD_RECOVERY_PAUSE_RECORD_UNAVAILABLE", extra=get_extra_info({"pod_id": pod_id})))
-        return True
 
     async def _remove_stale_container_cgroup(
         self,
