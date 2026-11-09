@@ -225,6 +225,9 @@ class RentedExecutorsResponse(BaseModel):
     # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
     # and its volume_<pod_id>. An older backend names none.
     retained_container_names: list[str] = []
+    # DAH-6030: realized Default Job revenue, USD/hour over the trailing 72 h. The idle-pay budget is k times it
+    # (incentive/idle_pay_budget.py). None = unreadable this cycle (an older backend, a TSDB or ETL outage).
+    default_job_revenue_usd_per_hour: float | None = None
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
@@ -296,6 +299,14 @@ class RentedExecutorsResponse(BaseModel):
                     e.errors(include_url=False, include_input=False),
                 )
         return entries
+
+    @field_validator("default_job_revenue_usd_per_hour", mode="before")
+    @classmethod
+    def read_bad_default_job_revenue_as_unreadable(cls, value: Any) -> float | None:
+        # Never fail the reply over it; a non-finite or negative number is no reading, not $0 or unbounded.
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            return None
+        return float(value)
 
     @field_validator("provider_spot_executor_ids", mode="before")
     @classmethod

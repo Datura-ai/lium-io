@@ -11,6 +11,7 @@ from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
+from incentive.idle_pay_budget import store_default_job_revenue
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
@@ -449,6 +450,9 @@ class Validator:
                         ),
                     )
                     return
+                await store_default_job_revenue(
+                    self.redis_service, rented_executors.default_job_revenue_usd_per_hour
+                )
 
                 # DAH-3405: a push between two cycles opens the grace window here, after the last
                 # early return and before the first job of this cycle runs against the new digest,
