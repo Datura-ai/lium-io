@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import redis.asyncio as aioredis
 from payload_models.payloads import GpuResetErrorCode, ResetPodGpuRequest
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
@@ -74,6 +75,12 @@ from neurons.validators.src.services.task.result_handler import ResultHandler
 
 ZERO_GPUS = _scrape_result(stdout=NO_GPU_REPORT, exit_code=1)
 RESET_REQUIRED = _scrape_result(stdout=_driver_report("NVMLError(16)"), exit_code=1)
+
+
+@pytest.fixture(autouse=True)
+def _lock_release_without_lua(monkeypatch):
+    # fakeredis runs no Lua without lupa (not a dependency): release the pod lock with a plain DEL
+    monkeypatch.setattr(aioredis.lock.Lock, "do_release", lambda self, expected_token: self.redis.delete(self.name))
 
 
 async def _cycle(context_factory, service, *, scrape, pod_gpu_count: int | None = None):
