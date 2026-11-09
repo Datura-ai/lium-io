@@ -143,6 +143,8 @@ class GpuLossHoldCheck:
     """
 
     check_id = "gpu.validate.loss_hold"
+    # a replay would read this cycle's scrape against the mark it just wrote: one dropout would count twice
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
