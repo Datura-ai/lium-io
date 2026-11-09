@@ -8660,20 +8660,26 @@ class DockerService:
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"docker save {shlex.quote(image_tag)} | /usr/bin/docker load"
             )
-            ok, err = await self._unless_cancelled_by_delete(
-                ssh_client,
-                payload,
-                default_extra,
-                self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=export_cmd,
-                    log_tag=log_tag,
-                    log_text=f"Exporting custom image {image_tag}",
-                    log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
-                    timeout=export_timeout_s,
-                    raise_exception=False,
-                ),
+            export_reporter = asyncio.ensure_future(
+                self._report_export_progress(image_tag, size_bytes, log_tag)
             )
+            try:
+                ok, err = await self._unless_cancelled_by_delete(
+                    ssh_client,
+                    payload,
+                    default_extra,
+                    self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=export_cmd,
+                        log_tag=log_tag,
+                        log_text=f"Exporting custom image {image_tag}",
+                        log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
+                        timeout=export_timeout_s,
+                        raise_exception=False,
+                    ),
+                )
+            finally:
+                export_reporter.cancel()
             if not ok:
                 if stream_timed_out(err):
                     return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {export_timeout_s} s")
@@ -11437,6 +11443,20 @@ class DockerService:
             if text and text != last:
                 last = text
                 await self.stream_log(f"Pulling docker image {image}: {text}", "success", log_tag)
+
+    async def _report_export_progress(
+        self, image_tag: str, size_bytes: int | None, log_tag: str, every: float = 30
+    ) -> None:
+        """DAH-6025: `docker save | docker load` prints nothing until it ends, often minutes for a big
+        image; renters cancelled pods mid-export. Say it is still going every `every` seconds."""
+        started = time.monotonic()
+        size = f"{size_bytes / 1e9:.1f} GB image, " if size_bytes else ""
+        while True:
+            await asyncio.sleep(every)
+            elapsed = int(time.monotonic() - started)
+            await self.stream_log(
+                f"Still loading built image {image_tag} onto host ({size}{elapsed} s so far)", "success", log_tag
+            )
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:

@@ -48,3 +48,19 @@ async def test_reporter_streams_only_changed_progress_to_the_renter():
     reporter.cancel()
 
     assert logs == [("Pulling docker image img:1: 2 of 3 layers done, 1.7 GB downloaded", "success", "tag")]
+
+
+@pytest.mark.asyncio
+async def test_export_reporter_says_the_load_is_still_running():
+    logs = []
+
+    async def stream_log(msg, status, tag):
+        logs.append(msg)
+
+    reporter = asyncio.ensure_future(
+        DockerService._report_export_progress(SimpleNamespace(stream_log=stream_log), "lium-build-x", 4_200_000_000, "tag", every=0.01)
+    )
+    await asyncio.sleep(0.05)
+    reporter.cancel()
+
+    assert logs and all(m.startswith("Still loading built image lium-build-x onto host (4.2 GB image, ") for m in logs)
