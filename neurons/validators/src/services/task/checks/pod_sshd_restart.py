@@ -8,12 +8,12 @@ import asyncssh
 
 from core.docker_utils import DockerCommand
 from protocol.vc_protocol.validator_requests import PodSshResult
-from services.pod_ssh_probe import POD_STATUS_RUNNING
 from services.redis_service import IN_CONTAINER_SSH_BOOTSTRAP_PATH
 
 from ..messages import PodSshdRestartMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rented_gpu_drop import POD_STATUS_RUNNING
 from .rented_pod_ssh import tcp_connect_fault
 
 _BOOTSTRAP_SCRIPT = Path(__file__).resolve().parents[2] / "assets" / "sshd_bootstrap.sh"
