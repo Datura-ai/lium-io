@@ -161,6 +161,8 @@ from services.redis_service import (
     GPU_RESET_PENDING_KIND,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    IDLE_MEM_AVAILABLE_PREFIX,
+    IDLE_MEM_AVAILABLE_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
     RECENT_FILLER_PREFIX,
     RECENT_FILLER_TTL_SECONDS,
@@ -545,6 +547,9 @@ CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
 _KIB_PER_GIB = 1024 * 1024
+# DAH-6066: kept free under the host's idle MemAvailable: the kernel's free-page floor (min_free_kbytes, up to
+# ~1 GiB on large hosts) plus slab and page-table growth while a rental runs.
+_IDLE_MEM_AVAILABLE_MARGIN_KIB = 4 * _KIB_PER_GIB
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -3669,6 +3674,7 @@ class DockerService:
         host_pid_max: int | None = None,
         host_ram_kib: int | None = None,
         gpu_share: float = 1.0,
+        idle_available_kib: int | None = None,
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_driver: str | None = None,
@@ -3693,7 +3699,7 @@ class DockerService:
             )
             else 0
         )
-        memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share)
+        memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share, idle_available_kib)
         # Swap off and the renter-first OOM score need a memory limit to hang on (Docker refuses
         # --memory-swap without --memory).
         swap_off = bool(memory_gb)
@@ -3906,20 +3912,46 @@ class DockerService:
 
     async def _read_host_ram_kib(self, ssh_client) -> int | None:
         """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
+        return (await self._read_host_meminfo_kib(ssh_client))[0]
+
+    async def _read_host_meminfo_kib(self, ssh_client) -> tuple[int | None, int | None]:
+        """The host's (MemTotal, MemAvailable) in KiB from one /proc/meminfo read; None for a value unreadable."""
         try:
             res = await ssh_client.run("cat /proc/meminfo", check=False, timeout=15)
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
-            return None
+            return None, None
         if getattr(res, "exit_status", 1) != 0:
-            return None
+            return None, None
+        values: dict[str, int | None] = {}
         for line in (res.stdout or "").splitlines():
-            if line.startswith("MemTotal:"):
+            key = line.split(":", 1)[0]
+            if key in ("MemTotal", "MemAvailable"):
                 try:
                     value = int(line.split()[1])
                 except (IndexError, ValueError):
-                    return None
-                return value if value > 0 else None
-        return None
+                    value = 0
+                values[key] = value if value > 0 else None
+        return values.get("MemTotal"), values.get("MemAvailable")
+
+    async def _idle_mem_available_kib(
+        self, ssh_client, executor_uuid: str, live_available_kib: int | None
+    ) -> tuple[int | None, str]:
+        """The host's MemAvailable with nothing of ours running on it, and where it came from (DAH-6066).
+
+        An idle host's MemAvailable is what it can give tenants: MemTotal less the kernel, GPU driver, slab and
+        the provider's own services (~47 GiB on a 1 TiB 8-GPU host, past the MemTotal-based reserve). With no
+        pod or filler on the host the live value is that baseline and is remembered; with one running, the live
+        value counts its usage, so the remembered one is used. None (today's limit) when neither is known.
+        """
+        key = f"{IDLE_MEM_AVAILABLE_PREFIX}:{executor_uuid}"
+        listing = await self._list_all_containers(ssh_client) if live_available_kib else None
+        if listing is not None and not any(
+            name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)) for name in listing[0]
+        ):
+            await self.redis_service.set(key, str(live_available_kib), ex=IDLE_MEM_AVAILABLE_TTL_SECONDS)
+            return live_available_kib, "live"
+        stored = await self.redis_service.get(key)
+        return (int(stored), "stored") if stored else (None, "none")
 
     async def _read_host_gpu_count(self, ssh_client) -> int | None:
         """The executor host's GPU count, or None when unreadable. Same bounded read as RAM.
@@ -3943,7 +3975,12 @@ class DockerService:
         return value if value > 0 else None
 
     @staticmethod
-    def _rental_memory_gb(memory_gb: int | None, host_ram_kib: int | None, gpu_share: float = 1.0) -> int | None:
+    def _rental_memory_gb(
+        memory_gb: int | None,
+        host_ram_kib: int | None,
+        gpu_share: float = 1.0,
+        idle_available_kib: int | None = None,
+    ) -> int | None:
         """The rental's memory limit: the backend's, or host RAM less the host reserve when it sent none.
 
         The backend's limit is clamped to the rental's GPU share of host RAM less the reserve: it is sized
@@ -3959,6 +3996,10 @@ class DockerService:
         the renter gets (host - reserve) times its GPU share, not the whole host less the reserve. Without
         the share, two legacy zero-RAM pods on different GPUs of one host would each be capped near the
         full host RAM and could together exceed it, re-opening the OOM path this limit exists to close.
+
+        DAH-6066: with the host's idle MemAvailable known, the ceiling is also at most that less a margin, times
+        the share. It only ever lowers the limit: a large host whose kernel and driver hold more than the reserve
+        ran out of memory while the pod stayed under a MemTotal-based limit.
         """
         if not host_ram_kib:
             return memory_gb
@@ -3966,8 +4007,11 @@ class DockerService:
             settings.RENTAL_HOST_RAM_RESERVE_GB * _KIB_PER_GIB,
             host_ram_kib * settings.RENTAL_HOST_RAM_RESERVE_PERCENT / 100,
         )
+        tenant_kib = host_ram_kib - reserve_kib
+        if idle_available_kib:
+            tenant_kib = min(tenant_kib, idle_available_kib - _IDLE_MEM_AVAILABLE_MARGIN_KIB)
         share = min(max(gpu_share, 0.0), 1.0)
-        ceiling_gb = max(int(((host_ram_kib - reserve_kib) * share) // _KIB_PER_GIB), 1)
+        ceiling_gb = max(int((tenant_kib * share) // _KIB_PER_GIB), 1)
         return min(memory_gb, ceiling_gb) if memory_gb else ceiling_gb
 
     @classmethod
@@ -9633,7 +9677,7 @@ class DockerService:
                 # contention, the exact condition that delays this SSH probe, an unlimited rental lets
                 # the renter exhaust host RAM and OOM the executor/sshd.
                 current_step = "host_ram_kib"
-                host_ram_kib = await self._read_host_ram_kib(ssh_client)
+                host_ram_kib, host_available_kib = await self._read_host_meminfo_kib(ssh_client)
                 rental_gpu_share = 1.0
                 if not payload.memory_gb and host_ram_kib is None:
                     raise RuntimeError(
@@ -9654,6 +9698,38 @@ class DockerService:
                             "host GPU count could not be read or is below the rented GPU count; "
                             "refusing to start a split rental sent without a memory limit"
                         )
+
+                # DAH-6066: cap the limit by the host's idle MemAvailable; best effort, a miss keeps today's limit.
+                idle_available_kib = None
+                if host_ram_kib is not None:
+                    try:
+                        idle_available_kib, idle_source = await self._idle_mem_available_kib(
+                            ssh_client, executor_info.uuid, host_available_kib
+                        )
+                    except Exception as exc:  # noqa: BLE001 — never fails a create; only lowers a limit
+                        idle_source = f"error {exc.__class__.__name__}"
+                    logger.info(
+                        _m(
+                            "Rental memory limit sizing",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "mem_total_kib": host_ram_kib,
+                                    "mem_available_kib": host_available_kib,
+                                    "idle_available_kib": idle_available_kib,
+                                    "idle_source": idle_source,
+                                    "gpu_share": rental_gpu_share,
+                                    "memory_gb_sent": payload.memory_gb,
+                                    "memory_gb_total_clamp": self._rental_memory_gb(
+                                        payload.memory_gb, host_ram_kib, rental_gpu_share
+                                    ),
+                                    "memory_gb": self._rental_memory_gb(
+                                        payload.memory_gb, host_ram_kib, rental_gpu_share, idle_available_kib
+                                    ),
+                                }
+                            ),
+                        )
+                    )
 
                 # DAH-3980 overlaps the filler's irreversible rm with the image inspect/pull. It must not
                 # precede the fail-closed reads above: a probe that then refused (a transient /proc read, or
@@ -10576,6 +10652,7 @@ class DockerService:
                     host_pid_max=host_pid_max,
                     host_ram_kib=host_ram_kib,
                     gpu_share=rental_gpu_share,
+                    idle_available_kib=idle_available_kib,
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
                     docker_data_volume_driver=local_volume_driver,
