@@ -122,6 +122,8 @@ class PortVerificationResult:
     sysbox_measured: bool | None = None
     # DAH-5651: DindProbeResult.sshd_never_answered of this cycle's DinD probe
     host_runtime_fault: bool = False
+    # DAH-5981: status "error" because the SSH connection to the node dropped mid-probe, not a probe or config fault
+    connection_lost: bool = False
 
 
 @dataclass(frozen=True)

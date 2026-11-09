@@ -1349,6 +1349,9 @@ class MinerService:
                             else None
                         ),
                         "host_runtime_fault": result.host_runtime_fault,
+                        "check_started_at": (
+                            result.check_started_at.isoformat() if result.check_started_at else None
+                        ),
                     },
                 )
             except Exception as e:
