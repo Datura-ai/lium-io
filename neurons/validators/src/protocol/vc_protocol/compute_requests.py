@@ -228,6 +228,9 @@ class RentedExecutorsResponse(BaseModel):
     # DAH-5934: full GPU name → the idle Secure rate (USD per GPU-hour) the backend set from the GPU market; it
     # replaces the validator's own table for that name. An older backend sends none: the table applies.
     secure_idle_rate_by_gpu_model: dict[str, float] = {}
+    # DAH-3333: pod ids whose volume_<pod_id> the reapers keep while still removing the container (a balance stop
+    # keeps the renter's disk, never the running container). An older backend names none.
+    retained_volume_pod_ids: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

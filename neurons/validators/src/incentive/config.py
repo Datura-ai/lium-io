@@ -55,6 +55,8 @@ PARITY_PRICE_ALIASES: dict[str, str] = {
     "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     "NVIDIA B300 SXM6 PC": "NVIDIA B300 SXM6 AC",
     "NVIDIA GB300": "NVIDIA B300 SXM6 AC",
+    # priced like B200 by lio#2149 (DAH-6008); unused until a GB200 name is known
+    "NVIDIA GB200": "NVIDIA B200",
 }
 # DAH-5508: the RTX 4090 48GB, its own model and idle tier; only reachable with RTX_4090_48GB_MODEL_ENABLED on.
 # Anchor = the backend's MACHINE_PRICES: RTX 4090 0.30 x the same-chip Quadro RTX 8000/6000 ratio (0.21/0.13), 0.48.

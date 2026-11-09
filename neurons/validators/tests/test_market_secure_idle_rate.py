@@ -103,11 +103,13 @@ def test_a_parity_alias_follows_its_source_names_market_rate(config, monkeypatch
                 "NVIDIA B300 SXM6 AC": 5.77,
                 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 1.3,
                 "NVIDIA GB300": 9.0,  # sent apart from its source: parity wins
+                "NVIDIA B200": 4.1,
             },
         }
     )
     validator_module.Validator.apply_market_secure_rates(fake, reply)
     rates = config.market_rental_prices_per_hour
     assert rates["NVIDIA B300 SXM6 PC"] == rates["NVIDIA GB300"] == 5.77
+    assert rates["NVIDIA GB200"] == 4.1  # lio#2149 prices GB200 at the B200 rate
     assert rates["NVIDIA RTX PRO 6000 Blackwell Server Edition"] == 1.3
     assert rates["NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"] == 1.3
