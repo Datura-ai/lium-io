@@ -205,6 +205,7 @@ from services.rental_docker_sdk import (
     is_docker_not_found_error,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
+    pull_progress_text,
     rental_docker_error_class,
     require_rental_docker_ssh_host_key,
 )
@@ -9774,6 +9775,9 @@ class DockerService:
                             "success",
                             log_tag,
                         )
+                        progress_reporter = asyncio.ensure_future(
+                            self._report_pull_progress(docker_client, payload.docker_image, log_tag)
+                        )
                         try:
                             await self._unless_cancelled_by_delete(
                                 ssh_client,
@@ -9801,6 +9805,8 @@ class DockerService:
                                 f"Docker login failed: {login_error} (pull without login then failed: {exc})",
                                 login_error,
                             ) from exc
+                        finally:
+                            progress_reporter.cancel()
 
                         # Add profiler for docker pull
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
@@ -11420,6 +11426,17 @@ class DockerService:
             local_volume_path,
         ]
         await ssh_client.run(shlex.join(command), check=True)
+
+    async def _report_pull_progress(self, docker_client, image: str, log_tag: str, every: float = 15) -> None:
+        """DAH-6025: a big pull showed one 'Pulling' line for minutes, and renters cancelled pods that were
+        still downloading. Tell them how far it has got every `every` seconds until the pull ends."""
+        last = None
+        while True:
+            await asyncio.sleep(every)
+            text = pull_progress_text(getattr(docker_client, "pull_progress", None))
+            if text and text != last:
+                last = text
+                await self.stream_log(f"Pulling docker image {image}: {text}", "success", log_tag)
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:
