@@ -291,6 +291,8 @@ class RentalPriceIncentive(DefaultIncentive):
         self.idle_pay_scale = 1.0
         # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
+        # Idle spot nodes paid the secure rate for lack of a filler sample (DAH-5721 fills it); capped like the rest.
+        self._spot_seeded: list[JobResult] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         # Idle secure nodes in a bucket, and the per-model cap on an idle GPU-hour (DAH-6030), set once all are known.
@@ -1427,12 +1429,15 @@ class RentalPriceIncentive(DefaultIncentive):
         # an estimate starts from the live cycle's inputs and adds its own hypothetical GPUs
         idle_gpus: dict[str, int] = dict(self._seed_idle_gpus_by_model)
         revenue: dict[str, float] = dict(self._seed_dj_revenue_by_model)
+        spot = self._spot_pay_candidates + [(self.get_base_model_for_gpu(r.gpu_model), r) for r in self._spot_seeded]
         # a spot node paid 0 (no capacity for its configuration) must not dilute the payees' cap
-        payees = self._secure_idle_results + [(m, r) for m, r in self._spot_pay_candidates if r.effective_rate > 0]
+        payees = self._secure_idle_results + [(m, r) for m, r in spot if r.effective_rate > 0]
         for base_model, result in payees:
             idle_gpus[base_model] = idle_gpus.get(base_model, 0) + result.gpu_count
-            if result.filler_revenue_usd_per_hour is not None:
-                revenue[base_model] = result.filler_revenue_usd_per_hour
+            usd: float | None = result.filler_revenue_usd_per_hour
+            if usd is not None:
+                # readings of one model can differ by configuration: the lowest bounds pay, whatever the order
+                revenue[base_model] = min(usd, revenue.get(base_model, usd))
         self._idle_gpus_by_model, self._dj_revenue_by_model = idle_gpus, revenue
         # paid weights are divided by the normalization mass, so the raw rate is capped at mass x the model's budget
         mass: float = self._weight_mass()
@@ -1450,7 +1455,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 result.gpu_count * (result.hourly_rate - cap) * result.sysbox_multiplier * result.driver_multiplier
             )
             result.hourly_rate = cap
-        for base_model, result in self._spot_pay_candidates:
+        for base_model, result in spot:
             cap = self._idle_rate_cap_by_model.get(base_model)
             if cap is not None and result.hourly_rate > cap:
                 # cap the Secure-equivalent rate, then keep spot at SPOT_IDLE_SECURE_RATE_SHARE of it (DAH-5930)

@@ -102,3 +102,37 @@ async def test_a_model_without_a_default_job_sample_keeps_its_listed_rate(monkey
     incentive = await _run([_secure("secure-1", model_usd_per_hour=None)])
 
     assert _paid_rate(incentive.job_results["hk"][0]) == pytest.approx(HOURLY_RATE)
+
+
+@pytest.mark.asyncio
+async def test_a_spot_node_seeded_at_the_secure_rate_is_counted_and_capped(monkeypatch):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
+    # DAH-5721: a spot node with no filler sample for its configuration is paid the secure rate outside the spot pool;
+    # another configuration of the model supplies the 16 USD/hour reading
+    seeded = _spot("spot-seeded", filler_revenue_usd_per_hour=None, filler_revenue_per_gpu_hour=None)
+    seeded.hourly_rate, seeded.sysbox_multiplier, seeded.driver_multiplier = HOURLY_RATE, 1.0, 1.0
+    seeded.effective_rate = RentalPriceIncentive._spot_secure_rate(seeded)
+    cap_idle_rates = RentalPriceIncentive._cap_idle_rates_at_default_job_yield
+
+    def seed_then_cap(self):
+        self._spot_seeded.append(seeded)
+        cap_idle_rates(self)
+
+    monkeypatch.setattr(RentalPriceIncentive, "_cap_idle_rates_at_default_job_yield", seed_then_cap)
+    incentive = await _run([_secure("secure-1", model_usd_per_hour=16.0)])
+
+    cap = incentive._idle_rate_cap_by_model["H100"]
+    assert incentive._idle_gpus_by_model["H100"] == 16
+    assert cap == pytest.approx(0.9 * 16.0 * incentive._weight_mass() / 16)
+    assert seeded.effective_rate == pytest.approx(SPOT_IDLE_SECURE_RATE_SHARE * cap)
+
+
+@pytest.mark.asyncio
+async def test_the_cap_does_not_depend_on_the_order_of_a_models_readings(monkeypatch):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
+    caps = []
+    for readings in ((8.0, 16.0), (16.0, 8.0)):
+        incentive = await _run([_secure(str(i), model_usd_per_hour=usd) for i, usd in enumerate(readings)])
+        caps.append(incentive._idle_rate_cap_by_model["H100"])
+
+    assert caps[0] == pytest.approx(caps[1])
