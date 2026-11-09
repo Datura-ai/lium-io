@@ -3,10 +3,8 @@
 The executor image installs the vendored `liumd-amd64` or `liumd-arm64` binary at
 `/usr/local/bin/liumd`.
 
-Both files are the unsigned CI artifacts of
-[Datura-ai/lium-platform#2222](https://github.com/Datura-ai/lium-platform/pull/2222)
-(source head `698c7bf26fac`, merge `2a213566629d`,
-[run 42020290731](https://github.com/Datura-ai/lium-platform/actions/runs/42020290731)):
+Both files are the unsigned CI artifacts built from the lium-platform source head
+`698c7bf26fac`:
 
 | binary | sha256 |
 | --- | --- |
