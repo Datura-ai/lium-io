@@ -54,8 +54,7 @@ STEP_TEARDOWN = "teardown"
 # SSH. A failure there is the validator's (its Redis, its key, the attestation verifier, its own
 # route to the host at `ssh_connect`), so the probe reaches no verdict about the node instead of
 # penalising it. `cancelled_by_delete` is not positional: a delete_container for the same pod id cut
-# the create short and removed the container itself. `docker_sdk_ssh_host_key` is left out: a node that
-# never reported its SSH host key fails every renter's create there.
+# the create short and removed the container itself.
 _CREATE_STEPS_BEFORE_THE_HOST = frozenset(
     {
         "start",
