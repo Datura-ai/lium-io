@@ -12556,16 +12556,18 @@ class DockerService:
                 except (asyncio.CancelledError, Exception):
                     self._retry_pause_key_in_background(pod_id)
                     raise
-                if getattr(paused, "exit_status", 1) != 0:
+                pause_exit = getattr(paused, "exit_status", None)
+                # only a plain error exit is docker refusing, as in _stop_outcome: a signalled or killed CLI (no exit
+                # code, -1, 128+n) may still have paused, so the claim stays
+                if isinstance(pause_exit, int) and 0 < pause_exit <= 128:
                     _PAUSED_BY_RECOVERY.discard(pod_id)
                 else:
+                    self._retry_pause_key_in_background(pod_id)  # first, so a cancel during the write keeps the claim
                     await self.paused_by_recovery(pod_id)  # written to Redis now if it is back
-                    if pod_id in _PAUSED_BY_RECOVERY:
-                        self._retry_pause_key_in_background(pod_id)
                 logger.error(
                     _m(
                         "POD_UNMOUNTED_STOP_SKIPPED_NO_RECORD",
-                        extra=get_extra_info({"pod_id": pod_id, "paused": getattr(paused, "exit_status", 1) == 0}),
+                        extra=get_extra_info({"pod_id": pod_id, "paused": pause_exit == 0}),
                     )
                 )
                 return False
