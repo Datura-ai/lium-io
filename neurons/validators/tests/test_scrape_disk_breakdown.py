@@ -850,6 +850,28 @@ def test_a_full_filesystem_leaves_no_free_room_whichever_it_is(scrape: dict, mon
     assert hard_disk["hard_disk_total"] == expected_total_gib * 1024**2
 
 
+@pytest.mark.parametrize(
+    "child, child_device, expected",
+    [
+        ("ingest", 3, _SMALL),  # a pull's partial downloads land on the disk mounted there
+        ("blobs/sha256", 3, _SMALL),  # ... and the finished layers on this one
+        ("ingest", 1, None),  # on the store's own filesystem: already measured with it
+        (None, None, None),  # no child mounts, the content store beside the snapshots
+    ],
+)
+def test_a_disk_mounted_inside_the_content_store_limits_free_room(scrape: dict, monkeypatch, child, child_device, expected) -> None:
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    paths = {_SNAPSHOTS: _BIG, _CONTENT: _BIG, "/proc/1/root/data/docker": _BIG}
+    devices = {_SNAPSHOTS: 1, _CONTENT: 1, "/proc/1/root/data/docker": 2}
+    if child:
+        paths[f"{_CONTENT}/{child}"] = _SMALL
+        devices[f"{_CONTENT}/{child}"] = child_device
+    _stub_filesystem(scrape, monkeypatch, host_dirs=set(paths), usage_by_path=paths)
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=devices[path])
+
+    assert scrape["get_content_store_usage"]() == expected
+
+
 def test_a_content_store_on_the_snapshots_filesystem_is_not_read_twice(scrape: dict, monkeypatch) -> None:
     _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
     asked = _stub_filesystem(scrape, monkeypatch, host_dirs={_CTRD, _SNAPSHOTS, _CONTENT}, usage_by_path={})

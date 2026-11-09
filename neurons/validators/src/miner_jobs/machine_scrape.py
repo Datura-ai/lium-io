@@ -943,10 +943,16 @@ def get_content_store_usage():
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return None
     content = containerd_store_root(info, "io.containerd.content.v1.content")
-    data_root = info.get("DockerRootDir") or "/var/lib/docker"
-    if any(on_one_filesystem(content, d) for d in (disk_root_dir(info), data_root)):
-        return None
-    return shutil.disk_usage(f"/proc/1/root{content}")
+    measured = (disk_root_dir(info), info.get("DockerRootDir") or "/var/lib/docker")
+    tightest = None
+    # a pull writes to ingest/, then blobs/sha256/: a disk mounted on either limits it too
+    for path in (content, host_realpath(f"{content}/ingest"), host_realpath(f"{content}/blobs/sha256")):
+        if not os.path.isdir(f"/proc/1/root{path}") or any(on_one_filesystem(path, d) for d in measured):
+            continue
+        usage = shutil.disk_usage(f"/proc/1/root{path}")
+        if tightest is None or usage.free < tightest.free:
+            tightest = usage
+    return tightest
 
 
 def containerd_store_root(info, plugin):

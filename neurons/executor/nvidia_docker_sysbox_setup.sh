@@ -513,7 +513,10 @@ tighter_df_kb() {
     # also counts the containerd content store. The validator reports the tighter filesystem (machine_scrape
     # report_tighter_store); empty when DISK_DIR is unreadable
     local dir kb best="" where="" dirs=("$DISK_DIR" "$DATA_ROOT")
-    [ "$1" != 4 ] || [ -z "${CONTENT_DIR:-}" ] || dirs+=("$CONTENT_DIR")
+    # a pull writes to ingest/, then blobs/sha256/: a disk mounted on either limits it too
+    [ "$1" != 4 ] || [ -z "${CONTENT_DIR:-}" ] || for dir in "$CONTENT_DIR" "$CONTENT_DIR/ingest" "$CONTENT_DIR/blobs/sha256"; do
+        [ ! -d "$dir" ] || dirs+=("$dir")
+    done
     # containers' files land in <store>/snapshots/<id>/fs: a smaller disk mounted there binds the store too
     [ -z "${SNAPSHOTTER_STORE:-}" ] || [ ! -d "$DISK_DIR/snapshots" ] || dirs+=("$DISK_DIR/snapshots")
     for dir in "${dirs[@]}"; do

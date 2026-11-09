@@ -166,6 +166,7 @@ STUBS = {
         case "${!#}" in   # STUB_DATA_DF_TOTAL_KB: a data-root on its own big disk, the rest on the root disk
             */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 ${STUB_DATA_DF_AVAIL_KB:-$STUB_DATA_DF_TOTAL_KB} 1% /data"; exit 0; } ;;
             *.content) [ -z "${STUB_CONTENT_DF_AVAIL_KB:-}" ] || { echo "/dev/sdb1 $((14 * 1024 ** 3)) 1 $STUB_CONTENT_DF_AVAIL_KB 1% /content"; exit 0; } ;;
+            */ingest | */sha256) [ -z "${STUB_CHILD_DF_AVAIL_KB:-}" ] || { echo "/dev/sdd1 $((14 * 1024 ** 3)) 1 $STUB_CHILD_DF_AVAIL_KB 1% /child"; exit 0; } ;;
             */snapshots) [ -z "${STUB_SNAPSHOTS_DF_KB:-}" ] || { echo "/dev/sdc1 $STUB_SNAPSHOTS_DF_KB 1 $STUB_SNAPSHOTS_DF_KB 1% /snap"; exit 0; } ;;
         esac
         echo "${STUB_DF_SOURCE:-/dev/nvme0n1p1} ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
@@ -423,6 +424,29 @@ def test_free_disk_counts_whichever_filesystem_is_full(tmp_path, check, full, ex
     assert rc == expected_rc, out
     if limiting:
         assert f"{limiting} is below" in out, out
+
+
+_CONTENT_ROOT = "var/lib/containerd/io.containerd.content.v1.content"
+
+
+# a pull writes to ingest/, then blobs/sha256/: a full disk mounted on either fails the free check, not the size check
+@pytest.mark.parametrize("check, child, expected_rc", [
+    ("check_free_disk_for_node", "ingest", 1),
+    ("check_free_disk_for_node", "blobs/sha256", 1),
+    ("check_free_disk_for_node", None, 0),
+    ("check_total_disk_for_vram", "ingest", 0),
+])
+def test_a_disk_mounted_inside_the_content_store_counts_for_free_room(tmp_path, check, child, expected_rc):
+    big = str(14 * 1024**3)
+    env = {**SNAPSHOTTER, "STUB_DF_TOTAL_KB": big, "STUB_DF_AVAIL_KB": big, "STUB_DATA_DF_TOTAL_KB": big,
+           "STUB_CHILD_DF_AVAIL_KB": "0"}
+    files = {f"{SNAPSHOTS}/.keep": "", f"{_CONTENT_ROOT}/.keep": ""}
+    if child:
+        files[f"{_CONTENT_ROOT}/{child}/.keep"] = ""
+    rc, out, _ = run_check(tmp_path, check, env=env, files=files)
+    assert rc == expected_rc, out
+    if expected_rc:
+        assert f"/{_CONTENT_ROOT}/{child} is below" in out, out
 
 
 @pytest.mark.parametrize(
