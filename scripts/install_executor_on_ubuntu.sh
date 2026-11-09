@@ -113,38 +113,59 @@ install_docker() {
   apt_refresh
   $APT install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-  # Ensure daemon enabled/started on systemd hosts
+  ok "Docker installed"
+}
+
+# Runs whether or not Docker was preinstalled (a preinstalled docker.io never put the user in the group).
+start_docker_and_group() {
   if command -v systemctl >/dev/null 2>&1; then
     $SUDO systemctl enable --now docker || true
   fi
-
-  # Add current user to docker group if not root
-  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    if ! id -nG "${SUDO_USER:-$USER}" | grep -qw docker; then
-      $SUDO usermod -aG docker "${SUDO_USER:-$USER}" || true
-      USER_ADDED_TO_DOCKER_GROUP=1
-      ok "Added ${SUDO_USER:-$USER} to docker group (activating for this session)"
-    fi
+  [[ ${EUID:-$(id -u)} -ne 0 ]] || return 0
+  local user="${SUDO_USER:-$USER}"
+  if ! id -nG "$user" | grep -qw docker; then
+    $SUDO groupadd -f docker
+    $SUDO usermod -aG docker "$user" || die "Could not add ${user} to the docker group: run 'sudo usermod -aG docker ${user}'"
+    ok "Added ${user} to docker group (activating for this session)"
   fi
-  ok "Docker installed"
+  # this shell keeps the groups it started with; until a re-login, reach Docker through sg
+  if ! id -nG | grep -qw docker; then
+    USER_ADDED_TO_DOCKER_GROUP=1
+  fi
+}
+
+ensure_compose() {
+  docker_cmd "docker compose version" && return 0
+  log "docker compose plugin missing; installing it"
+  # Docker's repo ships docker-compose-plugin; Ubuntu's docker.io pairs with docker-compose-v2
+  $APT_INSTALL docker-compose-plugin >/dev/null 2>&1 || $APT_INSTALL docker-compose-v2 >/dev/null 2>&1 || true
+  docker_cmd "docker compose version" \
+    || die "docker compose plugin not available. Install it: 'sudo apt-get install docker-compose-v2' (Ubuntu docker.io) or 'docker-compose-plugin' (Docker's repo)."
+}
+
+docker_cmd() {
+  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
+    sg docker -c "$1" >/dev/null 2>&1
+  else
+    bash -c "$1" >/dev/null 2>&1
+  fi
 }
 
 verify_docker() {
   log "Verifying Docker daemon"
-
-  # If user was just added to docker group, use sg to activate it for verification
-  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
-    if ! sg docker -c "docker info" >/dev/null 2>&1; then
-      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
-    fi
-    sg docker -c "docker compose version" >/dev/null 2>&1 || die "docker compose plugin not available."
-  else
-    if ! docker info >/dev/null 2>&1; then
-      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
-    fi
-    docker compose version >/dev/null 2>&1 || die "docker compose plugin not available."
+  local cmd="docker info" err
+  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then cmd="sg docker -c 'docker info'"; fi
+  if ! err=$(bash -c "$cmd" 2>&1 >/dev/null); then
+    case "$err" in
+      *"permission denied"*)
+        die "Docker is running but ${SUDO_USER:-$USER} may not use it (permission denied on the Docker socket). Run 'sudo usermod -aG docker ${SUDO_USER:-$USER} && newgrp docker', then rerun." ;;
+      *"Cannot connect"*|*"Is the docker daemon running"*|*"No such file"*)
+        die "Docker daemon not running. Start it: 'sudo systemctl enable --now docker', then check 'systemctl status docker'." ;;
+      *)
+        die "Docker daemon not reachable: ${err}" ;;
+    esac
   fi
-
+  ensure_compose
   ok "Docker daemon reachable & compose available"
 }
 
@@ -156,6 +177,7 @@ install_base
 pause_if_needed
 
 install_docker
+start_docker_and_group
 pause_if_needed
 
 verify_docker
