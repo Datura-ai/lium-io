@@ -873,6 +873,25 @@ def test_a_fuller_filesystem_is_not_hidden_by_a_tighter_one(scrape: dict, monkey
     assert hard_disk["hard_disk_free"] == 50 * _GiB // 1024
 
 
+def test_released_cache_is_taken_off_the_filesystem_that_holds_it(scrape: dict, monkeypatch) -> None:
+    # F-92: the store and data-root share the 93.75% filesystem, a smaller disk on the snapshots dir is 10% used;
+    # releasing 100 GiB of cache leaves that filesystem at 93.14%, not the smaller disk's scaled share at 68.75%
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    paths = {_SNAPSHOTS: _FULLER, f"{_SNAPSHOTS}/snapshots": _Usage(400 * _GiB, 40 * _GiB, 360 * _GiB),
+             "/proc/1/root/data/docker": _FULLER}
+    _stub_filesystem(scrape, monkeypatch, host_dirs=set(paths), usage_by_path=paths)
+    devices = {_SNAPSHOTS: 1, f"{_SNAPSHOTS}/snapshots": 2, "/proc/1/root/data/docker": 1}
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=devices[path])
+
+    store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
+    hard_disk = {**scrape["hard_disk_reading"](data_root_usage or store_usage), "filler_released_kb": 100 * 1024**2}
+    scrape["release_filler_cache"](hard_disk)
+    scrape["report_tighter_store"](hard_disk, store_usage if data_root_usage else None)
+
+    assert hard_disk["hard_disk_utilization"] == pytest.approx((15 * 1024 - 100) / (16 * 1024) * 100)
+    assert (hard_disk["hard_disk_total"], hard_disk["hard_disk_free"]) == (400 * 1024**2, 360 * 1024**2)
+
+
 @pytest.mark.parametrize(
     "child, child_device, expected",
     [

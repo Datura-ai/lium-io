@@ -886,15 +886,19 @@ def get_host_disk_usage(data_root_too=False):
     usage = shutil.disk_usage(host_disk_root)
     # containers' files land in <store>/snapshots/<id>/fs: a smaller disk mounted there binds the store too
     snapshots = host_realpath(f"{store}/snapshots")
+    snapshots_usage = None
     if os.path.isdir(f"/proc/1/root{snapshots}") and not on_one_filesystem(store, snapshots):
-        usage = tighter_usage(usage, shutil.disk_usage(f"/proc/1/root{snapshots}"))
+        snapshots_usage = shutil.disk_usage(f"/proc/1/root{snapshots}")
     if not data_root_too:
-        return usage
+        return tighter_usage(usage, snapshots_usage)
     # rental volumes stay under data-root whatever store keeps the containers: its own reading when apart
     data_root = info.get("DockerRootDir") or "/var/lib/docker"
-    if on_one_filesystem(store, data_root) or not os.path.isdir(f"/proc/1/root{data_root}"):
-        return usage, None
-    return usage, shutil.disk_usage(f"/proc/1/root{data_root}")
+    if not os.path.isdir(f"/proc/1/root{data_root}"):
+        return tighter_usage(usage, snapshots_usage), None
+    if on_one_filesystem(store, data_root):
+        # the filler cache is released from data-root's own bytes before the snapshots disk folds in (F-92)
+        return (snapshots_usage, usage) if snapshots_usage else (usage, None)
+    return tighter_usage(usage, snapshots_usage), shutil.disk_usage(f"/proc/1/root{data_root}")
 
 
 def tighter_usage(a, b):
