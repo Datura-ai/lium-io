@@ -55,7 +55,7 @@ MIN_DISK_TO_VRAM_RATE = 1.5
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
 # quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
 # the incentive but stays active.
-FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
+FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB200", "GB300"})  # GB200/GB300 gated as B200/B300
 FULL_8X_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
 NCU_PROFILING_UNRESTRICTED = "unrestricted"
@@ -72,6 +72,9 @@ NVIDIACTL_ROOT_UID = 0
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
 FILLER_REVENUE_PAY_FACTOR = 1.0
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
+# The share of an idle secure node's rate that an idle spot node of the same configuration earns at most
+# (Fish, 6 Nov 2026, DAH-5930): spot idle pay stays below secure idle pay, to keep secure supply worth offering.
+SPOT_IDLE_SECURE_RATE_SHARE = 0.8
 # The share of the secure rental incentive that a rented spot node earns (ENABLE_SPOT_RENTAL_INCENTIVE).
 SPOT_RENTAL_INCENTIVE_FACTOR = 0.5
 
@@ -1108,6 +1111,7 @@ class RentalPriceIncentive(DefaultIncentive):
                         filler_rate=FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
                         paid_fraction=self.unbucketed_paid_fraction,
                         pay_factor=FILLER_REVENUE_PAY_FACTOR,
+                        secure_share=SPOT_IDLE_SECURE_RATE_SHARE,
                     )
                 )
             self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
@@ -1267,7 +1271,8 @@ class RentalPriceIncentive(DefaultIncentive):
         return job_result
 
     def _price_spot_node(self, result: JobResult) -> None:
-        """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average, the secure rate for this node).
+        """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average,
+        SPOT_IDLE_SECURE_RATE_SHARE x the secure rate for this node).
 
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
         runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
@@ -1330,7 +1335,8 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _spot_secure_rate(result: JobResult) -> float:
-        return result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
+        """The ceiling of a spot node's rate: SPOT_IDLE_SECURE_RATE_SHARE of what an idle secure node like it is paid."""
+        return SPOT_IDLE_SECURE_RATE_SHARE * result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
 
     def _floored_rate(self, result: JobResult, diluted_rate: float) -> float:
         """Secure floor: a rate diluted by the bucket cap is raised to SECURE_FILLER_REVENUE_FLOOR_FACTOR x

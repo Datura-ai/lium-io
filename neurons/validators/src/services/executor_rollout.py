@@ -41,7 +41,9 @@ from services.task.checks.executor_image import observed_executor_digest
 from services.task.messages import (
     ExecutorImageMessages,
     FinalizeMessages,
+    GpuPowerLimitMessages,
     MachineSpecMessages,
+    PortConnectivityMessages,
     PortCountMessages,
     RentalVerificationMessages,
     SCRAPE_HOST_SIDE_FAILURE_REASONS,
@@ -91,6 +93,8 @@ ROLLOUT_FAILURE_REASONS = frozenset(
         *SCRAPE_HOST_SIDE_FAILURE_REASONS,
         *SCRAPE_UNDETERMINED_FAILURE_REASONS,
         PortCountMessages.INSUFFICIENT_PORTS.reason,
+        # DAH-5981: PortCountCheck's verdict when the SSH connection dropped under the port probe
+        PortConnectivityMessages.VERIFY_FAILED.reason,
         ExecutorImageMessages.OUTDATED.reason,
     }
 )
@@ -480,7 +484,7 @@ def withhold_renter_gpu_reset_verdicts(
                 _m(
                     "Verdict withheld: the validator's Redis was unavailable"
                     if redis_fault
-                    else "Verdict withheld: the renter is resetting the node's GPUs",
+                    else "Verdict withheld: the renter is resetting the node's GPUs, or its power tier is unknown",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,
@@ -495,8 +499,13 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
+# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), or a power tier
+# reading whose clear was not confirmed (F-43)
+_HELD_REASONS = (MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason, GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason)
+
+
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
-    return result.failure_reason_code == MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason
+    return result.failure_reason_code in _HELD_REASONS
 
 
 # rental and pay flags the held result of this cycle reads fresh from the cycle's rental snapshot
