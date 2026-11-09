@@ -1524,7 +1524,16 @@ async def _remove_pending_pod(ctx: Context, pod_id: str) -> None:
         )
 
 
+_HOST_KEY_REMEDIATION = (
+    "The validator could not start a renter container on this node because the executor has not "
+    "reported its SSH host key. Check that the executor is running and up to date, then restart it "
+    "(`docker restart executor-executor-1`) so it reports the key again."
+)
+
+
 def _remediation(failure: _Failure, *, ssh_port: int | None, expected_gpus: int) -> str:
+    if failure.create_step == "docker_sdk_ssh_host_key":
+        return _HOST_KEY_REMEDIATION
     template = _REMEDIATION_BY_STEP.get(failure.step, "")
     return template.format(
         create_step=failure.create_step or "unknown",

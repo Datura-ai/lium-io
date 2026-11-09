@@ -975,6 +975,8 @@ async def test_a_node_without_an_ssh_host_key_fails_the_probe():
     assert result.passed is False
     assert result.event.reason_code == Msg.PROBE_FAILED.reason
     assert result.updates["score"] == 0.0
+    assert "SSH host key" in result.event.remediation
+    assert "port range" not in result.event.remediation
 
 
 @pytest.mark.asyncio
