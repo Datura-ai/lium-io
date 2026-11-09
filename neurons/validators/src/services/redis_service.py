@@ -68,6 +68,9 @@ SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
 # later rentals' memory limits. Refreshed at every idle create; 30 days so a node rented for weeks keeps it.
 IDLE_MEM_AVAILABLE_PREFIX = "idle_mem_available_kib"
 IDLE_MEM_AVAILABLE_TTL_SECONDS = 30 * 24 * 3600
+# DAH-6066: kept free under the host's idle MemAvailable: the kernel's free-page floor (min_free_kbytes, up to
+# ~1 GiB on large hosts) plus slab and page-table growth while a rental runs.
+IDLE_MEM_AVAILABLE_MARGIN_KIB = 4 * 1024 * 1024
 
 
 def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:

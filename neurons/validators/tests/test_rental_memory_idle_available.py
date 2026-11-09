@@ -92,9 +92,9 @@ def test_idle_available_never_raises_the_limit_above_the_total_clamp():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stored,expected", [(str(IDLE_AVAILABLE_KIB), IDLE_AVAILABLE_KIB), (None, None)])
-async def test_published_specs_carry_the_stored_idle_baseline(context_factory, stored, expected):
-    # Arrange: the backend lists the capped RAM from ram.idle_available; no baseline sends no key
+@pytest.mark.parametrize("stored,expected", [(str(IDLE_AVAILABLE_KIB), IDLE_AVAILABLE_KIB - 4 * GIB_KIB), (None, None)])
+async def test_published_specs_carry_the_host_ceiling_from_the_stored_idle_baseline(context_factory, stored, expected):
+    # Arrange: the backend lists the capped RAM from ram.tenant_ceiling; no baseline sends no key
     from neurons.validators.src.services.task.result_handler import ResultHandler
     from tests.helpers import build_state
 
@@ -113,6 +113,6 @@ async def test_published_specs_carry_the_stored_idle_baseline(context_factory, s
     )
 
     # Assert
-    assert result.spec["ram"].get("idle_available") == expected
+    assert result.spec["ram"].get("tenant_ceiling") == expected
     assert result.spec["ram"]["total"] == HOST_TOTAL_KIB
     redis.get.assert_awaited_once_with(f"{IDLE_MEM_AVAILABLE_PREFIX}:{ctx.executor.uuid}")

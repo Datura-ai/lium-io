@@ -161,6 +161,7 @@ from services.redis_service import (
     GPU_RESET_PENDING_KIND,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    IDLE_MEM_AVAILABLE_MARGIN_KIB,
     IDLE_MEM_AVAILABLE_PREFIX,
     IDLE_MEM_AVAILABLE_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
@@ -547,9 +548,6 @@ CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
 _KIB_PER_GIB = 1024 * 1024
-# DAH-6066: kept free under the host's idle MemAvailable: the kernel's free-page floor (min_free_kbytes, up to
-# ~1 GiB on large hosts) plus slab and page-table growth while a rental runs.
-_IDLE_MEM_AVAILABLE_MARGIN_KIB = 4 * _KIB_PER_GIB
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -4024,7 +4022,7 @@ class DockerService:
         )
         tenant_kib = host_ram_kib - reserve_kib
         if idle_available_kib:
-            tenant_kib = min(tenant_kib, idle_available_kib - _IDLE_MEM_AVAILABLE_MARGIN_KIB)
+            tenant_kib = min(tenant_kib, idle_available_kib - IDLE_MEM_AVAILABLE_MARGIN_KIB)
         share = min(max(gpu_share, 0.0), 1.0)
         ceiling_gb = max(int((tenant_kib * share) // _KIB_PER_GIB), 1)
         return min(memory_gb, ceiling_gb) if memory_gb else ceiling_gb

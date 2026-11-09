@@ -19,6 +19,7 @@ from services.gpu_spec_table import (
 )
 from services.redis_service import (
     GPU_ANCHOR_KEY,
+    IDLE_MEM_AVAILABLE_MARGIN_KIB,
     IDLE_MEM_AVAILABLE_PREFIX,
     INSPECTOR_EVENT_CHANNEL,
     RedisService,
@@ -246,11 +247,11 @@ class ResultHandler:
         if context.state.recommended_image_digest_match is not None:
             specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
 
-        # DAH-6066: the host's learned idle MemAvailable (KiB), which caps a rental's memory limit, so the
-        # backend lists the RAM a pod will actually get
+        # DAH-6066: the ceiling (KiB) all tenants on the host get together, as the rental memory limit applies it, so
+        # the backend lists the RAM a pod will actually get without computing the margin itself
         idle_available_kib = await self._idle_mem_available_kib(executor_info.uuid)
         if idle_available_kib and isinstance(specs.get("ram"), dict):
-            specs["ram"] = {**specs["ram"], "idle_available": idle_available_kib}
+            specs["ram"] = {**specs["ram"], "tenant_ceiling": idle_available_kib - IDLE_MEM_AVAILABLE_MARGIN_KIB}
 
         executor_image_report = (
             context.state.executor_image_report.as_dict()
