@@ -1045,35 +1045,38 @@ class RentalDockerSdkClient:
             self._ensure_rental_network_sync(spec.network)
         created = None
         adopted_id = self._adopt_container_by_name_sync(spec) if adopt_existing else None
-        if adopted_id is None:
+        attempt = spec
+        while adopted_id is None:
             host_config = self._api_client.create_host_config(
-                **_build_host_config_kwargs(spec)
+                **_build_host_config_kwargs(attempt)
             )
-            if spec.before_create is not None:
-                spec.before_create()
+            if attempt.before_create is not None:
+                attempt.before_create()
             try:
                 created = self._api_client.create_container(
-                    image=spec.image,
-                    command=list(spec.command) or None,
+                    image=attempt.image,
+                    command=list(attempt.command) or None,
                     detach=True,
-                    ports=_container_ports(spec.ports) or None,
-                    environment=spec.environment or None,
-                    volumes=_container_volumes(spec.volumes) or None,
-                    name=spec.name,
-                    entrypoint=spec.entrypoint or None,
+                    ports=_container_ports(attempt.ports) or None,
+                    environment=attempt.environment or None,
+                    volumes=_container_volumes(attempt.volumes) or None,
+                    name=attempt.name,
+                    entrypoint=attempt.entrypoint or None,
                     host_config=host_config,
                     labels={
-                        **spec.labels,
-                        **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
+                        **attempt.labels,
+                        **({RENTAL_CPU_COUNT_LABEL: str(attempt.cpu_count)} if attempt.cpu_count else {}),
                     }
                     or None,
                 )
+                break
             except Exception as exc:
                 daemon_cpus = _daemon_cpu_count_from_refusal(exc)
                 # The daemon has fewer CPUs than advertised but within the DAH-2671 bound (as the
-                # health probe's retry allows): rent with the daemon's count, label included, once.
+                # health probe's retry allows): rent with the daemon's count, label included. One retry,
+                # bounded by the original count; a second refusal fails like any other.
                 cpus = spec.cpu_count
-                if cpus and daemon_cpus and daemon_cpus < cpus <= 2 * daemon_cpus + 4:
+                if attempt is spec and cpus and daemon_cpus and daemon_cpus < cpus <= 2 * daemon_cpus + 4:
                     logger.warning(
                         _m(
                             "Docker refused the requested CPUs; retrying with the daemon's count",
@@ -1086,10 +1089,8 @@ class RentalDockerSdkClient:
                             ),
                         )
                     )
-                    return self._run_container_sync(
-                        replace(spec, cpu_count=daemon_cpus, before_create=None),
-                        adopt_existing=adopt_existing,
-                    )
+                    attempt = replace(spec, cpu_count=daemon_cpus, before_create=None)
+                    continue
                 # The first attempt's create timed out on the client but still runs in dockerd: it holds
                 # the name (409) while inspect answers 404 until it registers the container. Adopt it then.
                 if not adopt_existing or f'"/{spec.name}" is already in use' not in str(exc):

@@ -817,6 +817,30 @@ async def test_run_container_retries_a_cpu_refusal_within_the_bound_with_the_dae
     assert api_client.created_container["labels"]["io.lium.cpu_count"] == "10"
 
 
+class ShrinkingCpuApiClient(CpuRefusingApiClient):
+    """dockerd whose CPU count drops between the create and its retry."""
+
+    def __init__(self, daemon_cpus_per_create):
+        super().__init__(daemon_cpus_per_create[0])
+        self.daemon_cpus_per_create = list(daemon_cpus_per_create)
+
+    def create_container(self, **kwargs):
+        self.daemon_cpus = self.daemon_cpus_per_create.pop(0)
+        return super().create_container(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_run_container_retries_a_cpu_refusal_only_once():
+    api_client = ShrinkingCpuApiClient([10, 6])
+
+    with pytest.raises(RentalDockerOperationError, match="only 6 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=12)
+        )
+
+    assert api_client.create_nano_cpus == [12_000_000_000, 10_000_000_000]
+
+
 @pytest.mark.asyncio
 async def test_run_container_does_not_retry_a_cpu_refusal_past_the_bound():
     api_client = CpuRefusingApiClient(daemon_cpus=10)
