@@ -44,7 +44,7 @@ the backend did not acknowledge. A mark nothing was posted
 for is deleted without a post. A backend that is down or older (404) is no answer: the next cycle asks
 again. A dry run judges and logs only: it
 posts nothing and reads and writes no mark. Every mark is also kept in this process and preferred to
-the Redis copy (a failed write or delete leaves Redis behind), so an
+the Redis copy while Redis is unreadable or missed this process's write (a failed write or delete), so an
 incident that spans a Redis outage is still posted once and recovered; the check's verdict never depends
 on Redis.
 """
@@ -70,7 +70,8 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 from services.gpu_reset import renter_gpu_reset_recent_mark, renter_gpu_resets
-from services.redis_service import GPU_ANCHOR_KEY
+from clients.backend_client import BackendClient
+from services.redis_service import GPU_ANCHOR_KEY, RedisService
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -120,10 +121,9 @@ STATE_RECOVERED = "recovered"
 _NO_RETRY_DELIVERIES = frozenset({None, "notified", "recorded", GPU_DROP_DELIVERY_NOT_RENTED})
 _NOT_RECORDED_DELIVERIES = frozenset({GPU_DROP_DELIVERY_DISABLED, GPU_DROP_DELIVERY_NOT_RENTED})
 
-# key -> (mark, monotonic expiry): the marks as this process last wrote them, read when Redis cannot be.
-_LOCAL_MARKS: dict[str, tuple[DropMark, float]] = {}
-# One incident transition per pod at a time: the cycle and a renter's reset both write the mark, and a recovery
-# whose reply lands after a renewed fault was saved would delete that fault.
+# key -> (mark, monotonic expiry, Redis missed the write): the marks as this process last wrote them, read when Redis
+# cannot be or is behind.
+_LOCAL_MARKS: dict[str, tuple[DropMark, float, bool]] = {}
 _POD_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
@@ -264,6 +264,10 @@ class DropMark:
     def needs_recovery(self) -> bool:
         return self.recorded or self.unanswered
 
+    @property
+    def last_seen(self) -> str:
+        return self.fault_seen_at or self.first_seen_at
+
     def after_answer(self, answer: RentedGpuDropResponse | None, evidence: list[Any]) -> DropMark:
         if answer is None:
             return replace(self, reported=False, unanswered=True)
@@ -280,12 +284,16 @@ def _key(pod_id: str) -> str:
     return f"{RENTED_GPU_DROP_KEY_PREFIX}:{pod_id}"
 
 
-def _local_mark(key: str) -> DropMark | None:
+def _current_mark(key: str, stored: DropMark | None, redis_read: bool) -> DropMark | None:
     entry = _LOCAL_MARKS.get(key)
     if entry is None or entry[1] <= time.monotonic():
         _LOCAL_MARKS.pop(key, None)
-        return None
-    return entry[0]
+        return stored
+    mark, _, redis_behind = entry
+    # Redis missed this process's last write, but the renter's reset in the connector may have saved a newer fault since
+    if not redis_read or (redis_behind and (stored is None or stored.last_seen <= mark.last_seen)):
+        return mark
+    return stored
 
 
 def _gpus(count: int | None) -> int | None:
@@ -465,8 +473,15 @@ class RentedGpuDropCheck:
         now_iso: str,
         cycle_started_iso: str,
         memory_unread: bool = False,
+        redis_required: bool = False,
     ) -> dict[str, Any] | None:
-        async with _POD_LOCKS.setdefault(pod.pod_id, asyncio.Lock()):
+        # the Redis lock spans processes; the local one still serialises this process while Redis is down
+        async with (
+            _POD_LOCKS.setdefault(pod.pod_id, asyncio.Lock()),
+            ctx.services.redis.rented_gpu_drop_lock(pod.pod_id) as locked,
+        ):
+            if locked is False or (redis_required and not locked):
+                return None
             key = _key(pod.pod_id)
             redis_ok = True
             stored = None
@@ -475,13 +490,14 @@ class RentedGpuDropCheck:
             except GPU_DROP_REDIS_ERRORS:
                 redis_ok = False
                 self._log_redis_unavailable(ctx, pod.pod_id, "read")
-            # This process's own last write is never older than Redis: a write or delete that failed leaves Redis behind.
-            mark = _local_mark(key) or stored
+                if redis_required:
+                    return None
+            mark = _current_mark(key, stored, redis_ok)
 
             if drop is None:
                 if mark is None:
                     return None
-                if (mark.fault_seen_at or mark.first_seen_at) > cycle_started_iso:
+                if mark.last_seen > cycle_started_iso:
                     # a renter's reset reported this fault after this cycle began: its clean listing may predate the fault
                     return None
                 if memory_unread and mark.ecc:
@@ -506,6 +522,15 @@ class RentedGpuDropCheck:
             evidence = drop.evidence(rented_total, pod.gpu_count)
             due = not mark.reported or mark.evidence != evidence
             if due and not held:
+                if redis_required:
+                    # the cycle that posts the recovery runs in another process and finds the incident only in Redis
+                    try:
+                        await ctx.services.redis.set(
+                            key, replace(mark, unanswered=True).dump(), ex=settings.RENTED_GPU_DROP_STATE_TTL_SECONDS
+                        )
+                    except GPU_DROP_REDIS_ERRORS:
+                        self._log_redis_unavailable(ctx, pod.pod_id, "write")
+                        return None
                 answer = await self._post(
                     ctx, pod, STATE_FAULT, mark, drop, rented_total, nvml_count, now_iso
                 )
@@ -535,7 +560,7 @@ class RentedGpuDropCheck:
         now_iso: str,
     ) -> dict[str, Any] | None:
         if not mark.needs_recovery:
-            await self._forget(ctx, pod.pod_id)
+            await self._forget(ctx, pod.pod_id, mark)
             return None
         owed = replace(
             mark,
@@ -547,7 +572,7 @@ class RentedGpuDropCheck:
         )
         done = answer is not None and answer.delivery in _NO_RETRY_DELIVERIES
         if done:
-            await self._forget(ctx, pod.pod_id)
+            await self._forget(ctx, pod.pod_id, mark)
         elif owed != mark:
             await self._save(ctx, pod.pod_id, owed, redis_ok)
         return {
@@ -565,16 +590,17 @@ class RentedGpuDropCheck:
         key = _key(pod_id)
         ttl = settings.RENTED_GPU_DROP_STATE_TTL_SECONDS
         now = time.monotonic()
-        for stale in [k for k, (_, expires) in _LOCAL_MARKS.items() if expires <= now]:
+        for stale in [k for k, (_, expires, _) in _LOCAL_MARKS.items() if expires <= now]:
             del _LOCAL_MARKS[stale]
-        _LOCAL_MARKS[key] = (mark, now + ttl)
+        _LOCAL_MARKS[key] = (mark, now + ttl, True)
         if redis_ok:
             try:
                 await ctx.services.redis.set(key, mark.dump(), ex=ttl)
+                _LOCAL_MARKS[key] = (mark, now + ttl, False)
             except GPU_DROP_REDIS_ERRORS:
                 self._log_redis_unavailable(ctx, pod_id, "write")
 
-    async def _forget(self, ctx: Context, pod_id: str) -> None:
+    async def _forget(self, ctx: Context, pod_id: str, mark: DropMark) -> None:
         # Deleted even when this cycle's read failed: a mark left in Redis would pass the next incident off as this one.
         key = _key(pod_id)
         _LOCAL_MARKS.pop(key, None)
@@ -582,11 +608,13 @@ class RentedGpuDropCheck:
             await ctx.services.redis.delete(key)
         except GPU_DROP_REDIS_ERRORS:
             self._log_redis_unavailable(ctx, pod_id, "delete")
-            # Redis still holds the closed incident: remember it as closed so a new fault starts a new one.
-            closed = DropMark(first_seen_at="", recovering=True)
+            # Redis still holds the closed incident: remember it as closed so a new fault starts a new one. Its time lets
+            # a fault the connector saves later win over this entry.
+            closed = DropMark(first_seen_at="", recovering=True, fault_seen_at=mark.last_seen)
             _LOCAL_MARKS[key] = (
                 closed,
                 time.monotonic() + settings.RENTED_GPU_DROP_STATE_TTL_SECONDS,
+                True,
             )
 
     async def _post(
@@ -647,17 +675,25 @@ class RentedGpuDropCheck:
 
 
 async def report_gpus_lost_on_reset(
-    redis, backend, *, miner_hotkey: str, executor_id: str, pod_id: str, default_extra: dict[str, Any]
+    redis: RedisService,
+    backend: BackendClient,
+    *,
+    miner_hotkey: str,
+    executor_id: str,
+    pod_id: str,
+    default_extra: dict[str, Any],
 ) -> None:
     # The check's own mark, so its next clean cycle posts the recovery. Only this pod: the scrape judges the others.
     if settings.DRY_RUN:
         return
-    failed = _m("RENTED_GPU_DROP_REPORT_FAILED", extra=get_extra_info({**default_extra, "state": STATE_FAULT}))
+    report_failed_log_message = _m(
+        "RENTED_GPU_DROP_REPORT_FAILED", extra=get_extra_info({**default_extra, "state": STATE_FAULT})
+    )
     # awaited from the reset's `finally` before its pending mark is removed: a raise here would lose the answer
     try:
         rented = await backend.get_rented_executors_now()
         if rented is None:
-            logger.warning(failed)
+            logger.warning(report_failed_log_message)
             return
         executor = rented.executors.get(executor_id)
         if executor is None or executor.miner_hotkey != miner_hotkey:
@@ -682,7 +718,7 @@ async def report_gpus_lost_on_reset(
         )
         now_iso = datetime.now(UTC).isoformat()
         await RentedGpuDropCheck()._track_pod(
-            ctx, pod, drop, _rented_gpu_count(list(executor.pods)), 0, now_iso, now_iso
+            ctx, pod, drop, _rented_gpu_count(list(executor.pods)), 0, now_iso, now_iso, redis_required=True
         )
     except Exception:
-        logger.warning(failed, exc_info=True)
+        logger.warning(report_failed_log_message, exc_info=True)

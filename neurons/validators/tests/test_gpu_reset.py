@@ -284,6 +284,14 @@ async def test_a_whole_host_rental_resolves_gpus_all_on_the_host():
             GpuResetErrorCode.GpusLostOnHost,
         ),
         (FakeHost(gpus_result=make_command_result(True, "")), {}, GpuResetErrorCode.GpusLostOnHost),
+        *[
+            (
+                FakeHost(gpus_result=make_command_result(False, exit_code=-1, error_type=error_type)),
+                {},
+                GpuResetErrorCode.ExecutorUnreachable,
+            )
+            for error_type in ("no_exit_status", "ConnectionLost")
+        ],
         (FakeHost(inspect_exit=1), {}, GpuResetErrorCode.ContainerNotFound),
         (FakeHost(device_ids=(U[0],)), {}, GpuResetErrorCode.GpuNotInContainer),  # backend's U[1] not given
         (FakeHost(), {"indices": [2]}, GpuResetErrorCode.GpuNotInContainer),
