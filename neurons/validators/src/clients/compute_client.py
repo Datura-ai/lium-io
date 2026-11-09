@@ -965,6 +965,8 @@ class ComputeClient:
         else:
             if isinstance(job_request, ContainerCreateRequest) and self.resumed_creates_report is not None:
                 self.create_accepted_while_report_pending = True
+            if isinstance(job_request, ContainerCreateRequest) and job_request.command_id:
+                await self._accept_create_dispatch(job_request)
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
@@ -1181,6 +1183,19 @@ class ComputeClient:
                 await self._untrack_backend_create_for_restart_report(job_request.pod_id)
                 if inflight_creates.is_only_create(job_request.pod_id):
                     self.deleted_pod_ids.discard(job_request.pod_id)
+
+    async def _accept_create_dispatch(self, job_request: ContainerCreateRequest) -> None:
+        """lium-io#1952: in backend-message order, before the create runs, so an older dispatch delayed on its way to
+        its mark can neither drop nor overwrite a newer one's saved success."""
+        try:
+            await self.miner_service.redis_service.accept_create_dispatch(job_request.pod_id, job_request.command_id)
+        except Exception as exc:  # the per-node check of the pending marks still holds
+            logger.warning(
+                _m(
+                    "Could not record the pod's current create dispatch",
+                    extra=get_extra_info({**self.logging_extra, "pod_id": job_request.pod_id, "error": str(exc)}),
+                )
+            )
 
     async def _keep_until_rent_finished(self, created: ContainerCreated) -> None:
         """DAH-5380: a backend restart can close the socket right after the send, losing the report and leaving the

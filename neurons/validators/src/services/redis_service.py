@@ -49,6 +49,11 @@ INFLIGHT_BACKEND_CREATES_KEY = "inflight_backend_creates"
 # DAH-5380: a renter's ContainerCreated sent but not yet answered by the backend's rent-finished, by pod id; resent
 # after a reconnect, since a backend restart can drop it after the send and leave the pod PENDING
 UNACKED_CONTAINER_CREATED_KEY = "unacked_container_created"
+# lium-io#1952: per pod, its creates' command ids in the order the backend's messages were accepted; the last one is
+# the pod's current dispatch, whichever node each runs on
+CREATE_DISPATCH_ORDER_PREFIX = "create_dispatch_order:"
+CREATE_DISPATCH_ORDER_TTL_SECONDS = 24 * 3600
+CREATE_DISPATCH_ORDER_KEPT = 20
 BACKEND_COMMAND_PREFIX = "backend_command:"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
@@ -291,6 +296,14 @@ def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
 class VerifiedPortsMemory(NamedTuple):
     pairs: list[tuple[int, int]]
     measured_at: float
+
+
+def _dispatch_order(raw: str | bytes | None) -> list[str]:
+    try:
+        order = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return order if isinstance(order, list) else []
 
 
 def _saved_command_id(saved: str) -> str:
@@ -856,6 +869,11 @@ class RedisService:
         # replayed while this one runs, the backend would complete this one with the old container's ports. Read
         # before the mark is published: a newer dispatch's success saved after it is never the one deleted
         superseded = await self.hget(UNACKED_CONTAINER_CREATED_KEY, pod_id) if command_id else None
+        # read after the report: a dispatch the backend sent after this one saves only after it is current, so the
+        # report read above is never its own. One sent before the current one supersedes nothing: it paused on its
+        # way here while the newer one, maybe on another node, saved its success
+        if superseded is not None and await self.current_create_dispatch(pod_id) not in ("", command_id):
+            superseded = None
         # every entry: a write must not drop a build past 30 min that the orphan sweep still spares. One step with
         # the stamp: a marker written without it would abort the caller before its cleanup and leave the marker behind
         await self._update_pending_pods(miner_hotkey, executor_id, lambda pending_pods: [*pending_pods, item], stamp)
@@ -887,6 +905,21 @@ class RedisService:
         if kind is None:  # clearing one kind of mark (a GPU reset's) is no create's receipt
             # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
             await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
+
+    async def accept_create_dispatch(self, pod_id: str, command_id: str) -> None:
+        """Records a create the backend sent as the pod's current dispatch. Called only by the receive loop, one
+        backend message at a time, so nothing writes between this read and write. A command id seen before (a
+        redelivery) keeps its place: a late duplicate of an older dispatch never becomes current again."""
+        key = f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"
+        order = _dispatch_order(await self.get(key))
+        if command_id not in order:
+            order = [*order, command_id][-CREATE_DISPATCH_ORDER_KEPT:]
+        await self.set(key, json.dumps(order), ex=CREATE_DISPATCH_ORDER_TTL_SECONDS)
+
+    async def current_create_dispatch(self, pod_id: str) -> str:
+        """The command id of the pod's create the backend sent last; "" when none was recorded."""
+        order = _dispatch_order(await self.get(f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"))
+        return order[-1] if order else ""
 
     async def _update_pending_pods(
         self,
@@ -991,12 +1024,18 @@ class RedisService:
     ) -> bool:
         """Saves a create's success unless the pod's newest create mark names another dispatch: a late success of an
         older dispatch must not overwrite the newer one's only saved report. WATCHed with the pending list, so a
-        dispatch added meanwhile reruns the check (lium-io#1952)."""
+        dispatch added meanwhile reruns the check (lium-io#1952). Nor when the backend has sent the pod a newer create
+        since, on any node: the pod's current dispatch is WATCHed too."""
         field = f"{miner_hotkey}:{executor_id}"
+        order_key = f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"
         async with self.redis.pipeline(transaction=True) as pipe:
             while True:
                 try:
-                    await pipe.watch(PENDING_PODS_PREFIX)
+                    await pipe.watch(PENDING_PODS_PREFIX, order_key)
+                    order = _dispatch_order(await pipe.get(order_key))
+                    if command_id and order and order[-1] != command_id:
+                        await pipe.reset()
+                        return False
                     creates = [
                         item
                         for item in _parse_pending_pods(await pipe.hget(PENDING_PODS_PREFIX, field))

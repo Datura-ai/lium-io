@@ -896,6 +896,39 @@ async def test_a_success_saved_after_an_older_dispatchs_mark_survives_its_supers
     assert landed and (await redis_service.unacked_container_created())["pod-1"] == b_report
 
 
+@pytest.mark.asyncio
+async def test_an_older_dispatch_delayed_before_its_mark_keeps_a_newer_ones_success_on_another_node() -> None:
+    """lium-io#1952: the backend sent A then B; A pauses before its mark while B, on another node, saves its success.
+    A's mark then neither drops B's report, nor does A's own late success replace it."""
+    redis_service = _redis_service()
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a")
+    await redis_service.accept_create_dispatch("pod-1", "cmd-b")
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a")  # a redelivery of A does not make it current
+    b_report = _success("cmd-b", 40023).model_copy(update={"executor_id": "exec-2"}).model_dump_json()
+    await redis_service.add_pending_pod("miner-hk", "exec-2", "pod-1", command_id="cmd-b")
+    assert await redis_service.save_container_created_of_current_dispatch(
+        "miner-hk", "exec-2", "pod-1", "cmd-b", b_report
+    )
+
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-a")
+    assert not await redis_service.save_container_created_of_current_dispatch(
+        "miner-hk", "exec-1", "pod-1", "cmd-a", _success("cmd-a").model_dump_json()
+    )
+
+    assert (await redis_service.unacked_container_created())["pod-1"] == b_report
+
+
+@pytest.mark.asyncio
+async def test_the_receive_loop_records_each_create_as_the_pods_current_dispatch() -> None:
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.miner_driver = AsyncMock()
+    for command_id in ("cmd-a", "cmd-b"):
+        await client.handle_message(_create_request().model_copy(update={"command_id": command_id}).model_dump_json())
+
+    assert await redis_service.current_create_dispatch(_create_request().pod_id) == "cmd-b"
+
+
 @pytest.mark.parametrize(("queued", "after"), [(None, ["cmd-b"]), ("cmd-b", ["cmd-b"]), ("cmd-a", ["cmd-a", "cmd-b"])])
 @pytest.mark.asyncio
 async def test_only_the_same_dispatchs_queued_report_stands_in_for_the_replay(queued, after) -> None:
