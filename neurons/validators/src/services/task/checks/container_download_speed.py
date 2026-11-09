@@ -98,6 +98,8 @@ class EndpointReading:
 class Judgement(NamedTuple):
     is_failing: bool
     has_no_verdict: bool
+    # the readings the failure rests on: every slow one, or the one cut endpoint the validator reached
+    failed: tuple[EndpointReading, ...] = ()
 
 
 def _error_kind(stderr: str) -> str:
@@ -306,12 +308,12 @@ class ContainerDownloadSpeedCheck:
     async def _judge(self, readings: list[EndpointReading]) -> Judgement:
         """Slow on any endpoint fails: a renter needs both."""
         threshold = settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS
-        if any(r.mbps is not None and r.mbps < threshold for r in readings):
-            return Judgement(is_failing=True, has_no_verdict=False)
+        if slow := tuple(r for r in readings if r.mbps is not None and r.mbps < threshold):
+            return Judgement(is_failing=True, has_no_verdict=False, failed=slow)
         urls = dict(ENDPOINTS)
         for r in readings:
             if r.error in NODE_SIDE_ERRORS and await validator_reaches(urls[r.endpoint]):
-                return Judgement(is_failing=True, has_no_verdict=False)
+                return Judgement(is_failing=True, has_no_verdict=False, failed=(r,))
         # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict
         return Judgement(is_failing=False, has_no_verdict=any(r.mbps is None for r in readings))
 

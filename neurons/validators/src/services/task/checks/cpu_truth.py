@@ -31,6 +31,7 @@ class CpuTruthCheck:
     """
 
     check_id = "host.validate.cpu_truth"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
