@@ -489,6 +489,12 @@ class Validator:
                     executor_image_snapshot=executor_image_snapshot,
                     job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                    maintenance_ends={
+                        executor_id: window.expiring_at
+                        for executor_id, window in (
+                            rented_executors.maintenance_windows_by_executor if rented_executors else {}
+                        ).items()
+                    },
                 )
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
