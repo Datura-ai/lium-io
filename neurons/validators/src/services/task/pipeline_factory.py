@@ -66,6 +66,7 @@ from .checks import (
     NvlinkFaultCheck,
     NvmlDigestCheck,
     PinnedMemoryProbeCheck,
+    PodSshdRestartCheck,
     PortConnectivityCheck,
     PortCountCheck,
     PostRentalGpuRecheckCheck,
@@ -415,6 +416,8 @@ class PipelineFactory:
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
                 RentedPodOwnershipCheck(),
+                # restarts a dead sshd in a never-logged-in rented pod, so never in the dry run
+                PodSshdRestartCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),
@@ -550,6 +553,8 @@ class PipelineFactory:
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
                 RentedPodOwnershipCheck(),
+                # restarts a dead sshd in a never-logged-in rented pod, so never in the dry run
+                PodSshdRestartCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 TenantEnforcementCheck(),

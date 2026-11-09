@@ -2769,6 +2769,23 @@ class RentedPodNetworkMessages:
     )
 
 
+class PodSshdRestartMessages:
+    OK = MessageTemplate(
+        event="Rented pod sshd: nothing restarted",
+        reason="POD_SSHD_RESTART_NONE",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    RESTARTED = MessageTemplate(
+        event="Rented pod sshd restarted in a pod the renter never logged in to",
+        reason="POD_SSHD_RESTARTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; the pod answers on SSH again",
+    )
+
+
 class RentedPodOwnershipMessages:
     OK = MessageTemplate(
         event="Rented pod files are owned inside its user namespace",

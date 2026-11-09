@@ -31,6 +31,7 @@ from .node_account import NodeAccountCheck
 from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
 from .pinned_memory_probe import PinnedMemoryProbeCheck
+from .pod_sshd_restart import PodSshdRestartCheck
 from .port_connectivity import PortConnectivityCheck
 from .post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from .provider_side_load import ProviderSideLoadCheck
@@ -100,6 +101,7 @@ __all__ = [
     "NvlinkFaultCheck",
     "NvmlDigestCheck",
     "PinnedMemoryProbeCheck",
+    "PodSshdRestartCheck",
     "PortConnectivityCheck",
     "PortCountCheck",
     "PostRentalGpuRecheckCheck",

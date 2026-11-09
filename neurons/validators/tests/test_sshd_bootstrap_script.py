@@ -182,7 +182,16 @@ class BootstrapHarness:
         return (self.state / "nohup_calls").exists()
 
     def run(self, *args: str, verify_secs: int = 2) -> subprocess.CompletedProcess:
-        env = {
+        return subprocess.run(
+            ["sh", str(SCRIPT), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=self.env(verify_secs),
+        )
+
+    def env(self, verify_secs: int = 2) -> dict[str, str]:
+        return {
             **os.environ,
             "PATH": f"{self.shims}:{os.environ['PATH']}",
             "SHIM_STATE": str(self.state),
@@ -195,14 +204,9 @@ class BootstrapHarness:
             "LIUM_SSH_LOCK_TIMEOUT_SECS": "1",
             "LIUM_NVIDIA_LIB_DIRS": str(self.nvidia_lib_dir),
             "LIUM_VULKAN_ICD_DIR": str(self.vulkan_icd_dir),
+            "LIUM_LOGIN_SEEN": str(self.root / "login-seen"),
+            "LIUM_PROC_DIR": str(self.root / "proc"),
         }
-        return subprocess.run(
-            ["sh", str(SCRIPT), *args],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env=env,
-        )
 
 
 @pytest.fixture
@@ -416,3 +420,47 @@ def test_vulkan_icd_only_registers_the_driver_and_leaves_sshd_alone(harness):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (harness.vulkan_icd_dir / "nvidia_egl_icd.json").exists()
     assert harness.sshd_start_attempts() == []
+
+
+def _watchdog_marks(harness, titles: list[bytes]) -> bool:
+    """Runs the watchdog loop over a fake /proc holding these process titles; True once it marks a login."""
+    for pid, title in enumerate(titles, start=100):
+        (harness.root / "proc" / str(pid)).mkdir(parents=True)
+        (harness.root / "proc" / str(pid) / "cmdline").write_bytes(title)
+    harness.mark_sshd_running()
+    marker = harness.root / "login-seen"
+    loop = subprocess.Popen(
+        ["sh", str(SCRIPT), "--watchdog-loop"], env=harness.env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    try:
+        for _ in range(100):
+            if marker.exists():
+                return True
+            try:
+                loop.wait(0.02)
+            except subprocess.TimeoutExpired:
+                continue
+        return marker.exists()
+    finally:
+        loop.kill()
+        loop.wait()
+
+
+@pytest.mark.parametrize(
+    "title",
+    [b"sshd: root@pts/0\x00\x00", b"sshd: root@notty\x00", b"sshd-session: ubuntu@pts/1\x00"],
+)
+def test_watchdog_marks_a_logged_in_session(harness, title):
+    assert _watchdog_marks(harness, [b"python\x00train.py\x00", title])
+
+
+def test_watchdog_does_not_mark_listener_or_preauth_sessions(harness):
+    assert not _watchdog_marks(
+        harness,
+        [
+            b"sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups\x00",
+            b"sshd: root [priv]\x00",
+            b"sshd: unknown [preauth]\x00",
+            b"sshd-session: root [net]\x00",
+        ],
+    )
