@@ -14,9 +14,9 @@ log line. Nothing is returned to the caller, stored, or scored.
 
 It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (reserved, non-rentable
 dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default,
-`all` for every executor), never on an express-lane first pass. VerifyX is not compared on an executor with no stored download
-EMA: today's check may take a second sample there, the shadow takes one
-(`liumd_reason="cold_sample_retry"`).
+`all` for every executor), never on an express-lane first pass. VerifyX is not compared on an
+executor with no stored download EMA: today's check may take a second sample there, the shadow
+takes one (`liumd_reason="cold_sample_retry"`).
 
 Today's verdict per step comes from the pipeline's events: both checks are fatal, so a check that
 failed is the run's last event on a run that did not pass; one that reported a skip reason did not
