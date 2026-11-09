@@ -3964,6 +3964,8 @@ class DockerService:
             await self.redis_service.set(key, str(live_available_kib), ex=IDLE_MEM_AVAILABLE_TTL_SECONDS)
             return live_available_kib, "live"
         stored = await self.redis_service.get(key)
+        # shortcut: a node never seen idle at a create has no baseline and keeps today's MemTotal-based limit (and
+        # listing); learn one from the validation cycle's idle reading if such nodes turn out to run out of memory
         return (int(stored), "stored") if stored else (None, "none")
 
     async def _read_host_gpu_count(self, ssh_client) -> int | None:

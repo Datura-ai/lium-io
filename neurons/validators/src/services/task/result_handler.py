@@ -17,7 +17,12 @@ from services.gpu_spec_table import (
     list_sxm_on_pcie_adapter_as_pcie,
     reference_gpu_model,
 )
-from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
+from services.redis_service import (
+    GPU_ANCHOR_KEY,
+    IDLE_MEM_AVAILABLE_PREFIX,
+    INSPECTOR_EVENT_CHANNEL,
+    RedisService,
+)
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -241,6 +246,12 @@ class ResultHandler:
         if context.state.recommended_image_digest_match is not None:
             specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
 
+        # DAH-6066: the host's learned idle MemAvailable (KiB), which caps a rental's memory limit, so the
+        # backend lists the RAM a pod will actually get
+        idle_available_kib = await self._idle_mem_available_kib(executor_info.uuid)
+        if idle_available_kib and isinstance(specs.get("ram"), dict):
+            specs["ram"] = {**specs["ram"], "idle_available": idle_available_kib}
+
         executor_image_report = (
             context.state.executor_image_report.as_dict()
             if context.state.executor_image_report
@@ -299,6 +310,14 @@ class ResultHandler:
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
         )
+
+    async def _idle_mem_available_kib(self, executor_uuid: str) -> int | None:
+        """The idle MemAvailable DockerService stored for this host, or None when none is known or unreadable."""
+        try:
+            raw = await self.redis_service.get(f"{IDLE_MEM_AVAILABLE_PREFIX}:{executor_uuid}")
+            return int(raw) if isinstance(raw, (str, bytes)) else None
+        except Exception:  # noqa: BLE001 — no figure is sent as none: the listing keeps its MemTotal-based RAM
+            return None
 
     @staticmethod
     def _specs_with_verifyx_ema_hold(
