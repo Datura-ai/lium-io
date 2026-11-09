@@ -800,6 +800,23 @@ async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_list
 
 
 @pytest.mark.asyncio
+async def test_an_aged_retained_volume_pod_loses_its_container_but_keeps_its_volume():
+    # DAH-3333: a balance stop whose delete the host never answers keeps the renter's disk, not the running container
+    ssh, rm_calls = _host_with_live_and_stray()
+    rented_data = _real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER]).model_copy(
+        update={"retained_volume_pod_ids": [STRAY_POD.removeprefix("pod_")]}
+    )
+
+    _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [STRAY_POD]
+    assert any(STRAY_POD in c and "docker rm -f" in c for c in rm_calls)
+    assert not any("volume rm" in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
 async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
     fleet_pods = [f"pod_00000000-0000-4000-8000-{i:012d}" for i in range(500)]
     stale = [f"pod_00000000-0000-4000-9000-{i:012d}" for i in range(5)]
