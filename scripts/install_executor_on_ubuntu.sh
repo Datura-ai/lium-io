@@ -32,11 +32,17 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command
 # =============== Guards ===============
 require_cmd apt-get
 
-# Must have sudo or be root, and sudo must be passwordless for non-interactive runs
+# Must be root or have sudo; every step runs `sudo -n`, so a password is asked at most once, here
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   require_cmd sudo
   if ! sudo -n true 2>/dev/null; then
-    die "Passwordless sudo required (or run as root). Aborting to remain non-interactive."
+    # sudo's cached password expired (or sudo needs one): at a terminal, ask once; sudo -v prompts on the tty
+    if [[ -t 0 ]]; then
+      log "sudo needs your password once for this install"
+      sudo -v || die "sudo did not accept the password."
+    fi
+    sudo -n true 2>/dev/null \
+      || die "sudo needs a password and there is no terminal to ask for it. Run 'sudo -v', then rerun within a few minutes (or run as root, or set up passwordless sudo)."
   fi
   SUDO="sudo -n"
 else

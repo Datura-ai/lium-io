@@ -2,6 +2,7 @@
 the docker group). The stubs keep group membership in a file and fail `docker info` like the real socket does."""
 
 import os
+import pty
 import stat
 import subprocess
 from pathlib import Path
@@ -12,7 +13,10 @@ SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "install_executor_on_
 
 STUBS = {
     "apt-get": 'echo "apt-get $*" >> "$STATE/log"; [[ "$*" == *install*compose* && -n "$COMPOSE_INSTALLABLE" ]] && touch "$STATE/compose"; exit 0',
-    "sudo": '[[ "$1" == -n ]] && shift; [[ "$1" == true ]] && exit 0; exec "$@"',
+    # -v caches the password; with SUDO_NEEDS_PASSWORD, `sudo -n` fails until then
+    "sudo": '[[ "$1" == -v ]] && { touch "$STATE/sudo_ok"; exit 0; }; [[ "$1" == -n ]] && shift; '
+    '[[ -n "$SUDO_NEEDS_PASSWORD" && ! -f "$STATE/sudo_ok" ]] && { echo "sudo: a password is required" >&2; exit 1; }; '
+    '[[ "$1" == true ]] && exit 0; exec "$@"',
     "systemctl": 'echo "systemctl $*" >> "$STATE/log"; exit 0',
     "groupadd": "exit 0",
     "usermod": 'echo "usermod $*" >> "$STATE/log"; touch "$STATE/in_group"',
@@ -31,7 +35,7 @@ STUBS = {
 
 
 def _run(
-    tmp_path: Path, compose: bool = True, **env: str
+    tmp_path: Path, compose: bool = True, tty: bool = False, **env: str
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     bin_dir, state = tmp_path / "bin", tmp_path / "state"
     bin_dir.mkdir()
@@ -50,6 +54,8 @@ def _run(
         "SHELL": "/bin/true",
         "HOME": str(tmp_path),
     }
+    if tty:
+        return _run_at_a_terminal({**base, **env}), (state / "log").read_text()
     proc = subprocess.run(
         ["bash", str(SCRIPT)],
         env={**base, **env},
@@ -59,6 +65,26 @@ def _run(
         timeout=60,
     )
     return proc, (state / "log").read_text()
+
+
+def _run_at_a_terminal(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """The script on a pseudo-terminal (stdin, stdout and stderr are a TTY); the output comes back as stdout."""
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    out = b""
+    while True:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:  # EIO once the child closed the terminal
+            break
+        if not chunk:
+            break
+        out += chunk
+    os.close(master)
+    return subprocess.CompletedProcess(
+        proc.args, proc.wait(timeout=60), out.decode(errors="replace"), ""
+    )
 
 
 pytestmark = pytest.mark.skipif(
@@ -100,3 +126,15 @@ def test_missing_compose_plugin_that_cannot_be_installed_names_the_package(tmp_p
     proc, _ = _run(tmp_path, compose=False)
     assert proc.returncode != 0
     assert "docker-compose-v2" in proc.stderr
+
+
+def test_an_expired_sudo_password_without_a_terminal_says_run_sudo_v(tmp_path: Path) -> None:
+    proc, _ = _run(tmp_path, SUDO_NEEDS_PASSWORD="1")
+    assert proc.returncode != 0
+    assert "Run 'sudo -v', then rerun" in proc.stderr
+
+
+def test_an_expired_sudo_password_at_a_terminal_is_asked_once_with_sudo_v(tmp_path: Path) -> None:
+    proc, _ = _run(tmp_path, tty=True, SUDO_NEEDS_PASSWORD="1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "sudo needs your password once" in proc.stdout

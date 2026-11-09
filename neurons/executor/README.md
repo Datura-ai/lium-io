@@ -61,7 +61,7 @@ Run following command to install required tools:
 cd lium-io && chmod +x scripts/install_executor_on_ubuntu.sh && scripts/install_executor_on_ubuntu.sh
 ```
 
-It installs Docker if missing. If Docker is already installed, it starts the daemon, adds your user to the `docker` group and installs the compose plugin if absent. A permission error on the Docker socket means your session does not have the group yet: run `newgrp docker` (or log in again) and rerun.
+It installs Docker if missing. If Docker is already installed, it starts the daemon, adds your user to the `docker` group and installs the compose plugin if absent. A permission error on the Docker socket means your session does not have the group yet: run `newgrp docker` (or log in again) and rerun. If sudo needs a password, the script asks for it once at a terminal; without a terminal (for example a provisioning tool), run `sudo -v` first.
 
 if you don't have sudo on your machine, run
 ```shell
