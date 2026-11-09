@@ -20,7 +20,8 @@ COPY libinspector.so /usr/lib/libinspector.so
 
 # Install Python dependencies
 RUN pip3 install --no-cache-dir \
-    nvidia-ml-py
+    nvidia-ml-py \
+    "psutil>=7.0.0"
 
 # Set Python path
 ENV PYTHONPATH=/app
