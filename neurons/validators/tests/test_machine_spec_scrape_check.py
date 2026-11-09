@@ -706,6 +706,14 @@ async def test_a_provider_reported_port_grace_marker_is_dropped(context_factory)
     assert "port_verify_first_miss" not in result.updates["state"].specs
 
 
+@pytest.mark.asyncio
+async def test_a_provider_reported_split_disk_is_dropped(context_factory):
+    # the split disk sizing is the disk check's; a provider-sent one must not reach the listing
+    result = await _scrape_ok_event_for(context_factory, {"split_disk": {"listable_split_count": 8}})
+
+    assert "split_disk" not in result.updates["state"].specs
+
+
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
 # failure no host fault can produce, and none of these qualifies).
@@ -917,3 +925,13 @@ def test_the_scrape_codes_split_into_host_side_and_undetermined():
         "SCRAPE_FAILED_ON_HOST",
     }
     assert SCRAPE_UNDETERMINED_FAILURE_REASONS == {"SCRAPE_TIMEOUT", "SCRAPE_TRANSPORT_FAILED"}
+
+
+@pytest.mark.asyncio
+async def test_a_provider_reported_host_power_limit_is_dropped(context_factory):
+    # DAH-5302: power_host_limit is GpuPowerLimitCheck's, written only under our Pearl cap
+    gpu = {**RAW_SPECS["gpu"], "details": [{**d, "power_host_limit": 999} for d in RAW_SPECS["gpu"]["details"]]}
+    result = await _scrape_ok_event_for(context_factory, {"gpu": gpu})
+
+    details = result.updates["state"].specs["gpu"]["details"]
+    assert details and all("power_host_limit" not in d for d in details)

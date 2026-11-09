@@ -3,6 +3,7 @@ import time
 
 import asyncssh
 from core.utils import _m, get_extra_info
+from services.const import MIN_PORT_COUNT
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.models import PortVerificationResult
@@ -33,6 +34,7 @@ class ExecutorConnectivityService:
         rented_pod_names: list[str] | None = None,
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
         dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability."""
@@ -49,6 +51,7 @@ class ExecutorConnectivityService:
                 # customer rental — the sysbox fallback below reads it that way (DAH-2527)
                 unavailable_ports=(rented_ports or []) + (filler_ports or []),
                 log_ctx=log_ctx,
+                min_ports=min_ports,
                 dind_deadline_monotonic=dind_deadline_monotonic,
             )
             sysbox_result = verification.sysbox_runtime
@@ -83,6 +86,7 @@ class ExecutorConnectivityService:
                 external_probe=verification.external_probe,
                 declared_port_count=verification.declared_port_count,
                 sysbox_measured=verification.sysbox_measured,
+                host_runtime_fault=verification.host_runtime_fault,
             )
 
             return result
@@ -106,5 +110,6 @@ class ExecutorConnectivityService:
                 sysbox_runtime=sysbox_runtime,
                 status="error",
                 error=str(e),
+                connection_lost=isinstance(e, (asyncssh.ChannelOpenError, asyncssh.DisconnectError, ConnectionError)),
                 elapsed_sec=time.monotonic() - t1,
             )

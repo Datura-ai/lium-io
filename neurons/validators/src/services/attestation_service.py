@@ -26,11 +26,6 @@ logger = logging.getLogger(__name__)
 # bare-metal node.
 TDX_ATTESTED_EXECUTOR_SET = "tdx_attested_executors"
 
-# Redis key prefix recording the last nonce-bound attestation event per miner,
-# used to bound re-attestation cadence (G3: freshness = provably recent, not
-# every wave).
-TDX_LAST_ATTESTATION_EVENT_PREFIX = "tdx_last_attestation_event"
-
 
 class AttestationError(RuntimeError):
     """Raised when attestation or host verification fails."""
@@ -115,37 +110,13 @@ class AttestationService:
 
     @property
     def nonce_enabled(self) -> bool:
-        return self.enabled and settings.ENABLE_ATTESTATION_NONCE
+        return self.enabled
 
-    async def maybe_issue_nonce(self, miner_hotkey: str) -> AttestationNonce | None:
-        """Mint a fresh attestation nonce when this miner is due for a
-        nonce-bound attestation event.
-
-        Freshness is bounded by TDX_REATTEST_INTERVAL_SECONDS rather than
-        demanded every validation wave — GPU evidence collection is seconds per
-        node, so the cadence is load-shed (see remediation plan §4). The event
-        timestamp is recorded at issuance so a persistently failing executor
-        cannot force per-wave collection. Without Redis the interval cannot be
-        tracked, so a nonce is issued every wave (safe, just not load-shed).
-        """
+    async def maybe_issue_nonce(self, upload_nonce: str | None) -> AttestationNonce | None:
+        """The challenge for this wave: the upload nonce the miner is sent, or a fresh one when it is sent none."""
         if not self.nonce_enabled:
             return None
-
-        if self.redis_service is not None:
-            key = f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}"
-            try:
-                raw = await self.redis_service.get(key)
-                last = float(raw.decode() if isinstance(raw, bytes) else raw) if raw else 0.0
-                if (time.time() - last) < settings.TDX_REATTEST_INTERVAL_SECONDS:
-                    return None
-                await self.redis_service.set(key, str(time.time()))
-            except Exception as exc:
-                logger.warning(_m(
-                    "Failed to read/record attestation-event cadence; issuing nonce",
-                    extra=get_extra_info({"miner_hotkey": miner_hotkey, "error": str(exc)}),
-                ))
-
-        return AttestationNonce.issue()
+        return AttestationNonce(value_hex=upload_nonce) if upload_nonce else AttestationNonce.issue()
 
     def _expected_report_data(self, host_key: str) -> str:
         digest = hashlib.sha256(self.REPORT_PREFIX +

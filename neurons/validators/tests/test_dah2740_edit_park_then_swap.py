@@ -10,23 +10,35 @@ name, and a failure renames the old one back and starts it.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+import shlex
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
-from payload_models.payloads import ContainerCreated, FailedContainerRequest
+from payload_models.payloads import ContainerCreated, ContainerWarningCode, FailedContainerRequest
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
 
 from core.docker_utils import DockerCommand
 from core.utils import retry_ssh_command
 from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply, inflight_creates
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
+from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
+from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
+
+
+@pytest.fixture(autouse=True)
+def _hung_gpu_reset_on(monkeypatch):
+    # DAH-5301: these cover the reset itself (the flag on); its shadow mode is in test_gpu_clocks/test_hung_gpu_reset
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "HUNG_GPU_RESET_ON_REBOOT_ENABLED", True)
 
 
 @pytest.fixture
 def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
     # pyflakes reads as a name every `svc` parameter below redefines (F811)
-    service = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     service._read_host_ram_kib = AsyncMock(return_value=None)
@@ -56,6 +68,8 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             names = [part.split()[0].rstrip("$").strip("'") for part in cmd.split("--filter name=^")[1:]]
             present = [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
             return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
+        if cmd == HUNG_GPU_QUERY_COMMAND:  # DAH-5301: the pod's GPU is healthy
+            return _ssh_result(stdout="GPU-test, 0, 0\n--compute-apps--\n")
         if "docker stop" in cmd:
             return _ssh_result(exit_status=stop_exit, stderr="tried to kill container, but did not receive an exit event")
         if "docker inspect -f '{{.State.Running}}'" in cmd:
@@ -65,6 +79,14 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
         return _ssh_result(exit_status=0)
 
     client.run = AsyncMock(side_effect=_side)
+
+    # the swap's commands are host-bounded (`timeout ... sh -c '<cmd>'`) and open with create_process;
+    # hand the inner command to run so it is recorded and answered as written
+    async def _create_process(command: str):
+        inner = shlex.split(command)[-1] if command.startswith("timeout ") else command
+        return Mock(wait=lambda: client.run(inner), wait_closed=AsyncMock())
+
+    client.create_process = _create_process
     return client
 
 
@@ -78,6 +100,12 @@ async def _run(svc, payload):
     # a successful edit removes the parked container after its reply, with the create's session close
     await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
     return result
+
+
+_POWER_READ = (
+    "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+    " --format=csv,noheader,nounits"
+)
 
 
 def _docker(commands: list[str], verb: str) -> list[str]:
@@ -126,7 +154,13 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     host_key = next(cmd for cmd in ssh.commands if "pod_ssh_host_key" in cmd)
-    assert ssh.commands == [
+    # DAH-5301: the one hung-GPU query while the old container is parked (a healthy GPU adds nothing). It
+    # races the early power-floor read, so only its place against the sequential steps is pinned.
+    assert ssh.commands.count(HUNG_GPU_QUERY_COMMAND) == 1
+    hung_query = ssh.commands.index(HUNG_GPU_QUERY_COMMAND)
+    assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
+    assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
+    assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
         f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{parked}$',
         f"/usr/bin/docker rename {name} {parked}",
         f"/usr/bin/docker stop -t 10 {parked}",
@@ -138,6 +172,12 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # no parsed probe here: one inspect asks whether the pod (or its parked copy) is on the host
+        f"/usr/bin/docker container inspect {name} >/dev/null 2>&1"
+        f" || /usr/bin/docker container inspect {parked} >/dev/null 2>&1"
+        # or a container an earlier edit kept under its stamped name
+        f" || /usr/bin/docker ps -a --filter name=kept_unmounted_{payload.pod_id}_ --format '{{{{.Names}}}}'"
+        f" | grep -q '^kept_unmounted_{payload.pod_id}_'",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
@@ -419,6 +459,131 @@ async def test_a_fresh_create_never_parks_anything(svc, monkeypatch):
     assert svc.clean_existing_containers.await_args.kwargs["active_container_names"] == ["pod_someone_else"]
 
 
+def _hung_reset(outcome, calls: list | None = None):
+    """Stands in for reset_hung_pod_gpus the way it uses `resetting`: a hung find holds the caller's mark
+    and hands it the result before letting go; an exception escapes like an SSH error would."""
+
+    async def fake(runner, pod_gpu_uuids, *, resetting, shadow):
+        assert not shadow
+        if calls is not None:
+            calls.append(pod_gpu_uuids)
+        if isinstance(outcome, Exception):
+            raise outcome
+        async with resetting() as held:
+            held.append(outcome)
+        return outcome
+
+    return fake
+
+
+@pytest.mark.parametrize(
+    ("outcome", "warnings"),
+    [
+        (HungGpuResult(["GPU-test"], ContainerWarningCode.HungGpuReset), [ContainerWarningCode.HungGpuReset]),
+        (RuntimeError("ssh dropped"), []),  # best-effort: the reboot goes on
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc, monkeypatch, outcome, warnings):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    calls: list = []
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", _hung_reset(outcome, calls))
+    svc.redis_service.mark_gpu_reset_recent = AsyncMock()
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated) and result.warnings == warnings
+    assert calls == [["GPU-test"]]
+    # a reset GPU drops out for a moment: the checks after the reboot must not blame the provider
+    if warnings:
+        svc.redis_service.mark_gpu_reset_recent.assert_awaited_once_with(
+            payload.miner_hotkey, payload.executor_id, payload.pod_id, ["GPU-test"], RECENT_RENTER_GPU_RESET_SECONDS
+        )
+    else:
+        svc.redis_service.mark_gpu_reset_recent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_hung_gpu_reset_holds_the_gpu_reset_pending_mark(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    svc.redis_service.mark_gpu_reset_recent = AsyncMock()
+    held = []
+
+    async def fake_reset(runner, pod_gpu_uuids, *, resetting, shadow):
+        assert not shadow
+        async with resetting():
+            # the rented checks skip the node while the GPUs reset
+            held.append(svc.redis_service.add_pending_pod.await_args)
+            svc.redis_service.remove_pending_pod.assert_not_awaited()
+        return HungGpuResult(pod_gpu_uuids, ContainerWarningCode.HungGpuNotResetMig)
+
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", fake_reset)
+    svc.redis_service.remove_pending_pod.reset_mock()
+
+    assert isinstance(await _run(svc, payload), ContainerCreated)
+    assert held[0].kwargs == {"kind": GPU_RESET_PENDING_KIND, "gpu_uuids": ["GPU-test"]}
+    # only the gpu_reset mark is dropped: the create's own pending mark for the pod stays until its own removal
+    assert call(payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=GPU_RESET_PENDING_KIND) in (
+        svc.redis_service.remove_pending_pod.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_recent_reset_mark_is_written_before_the_pending_mark_goes(svc, monkeypatch):
+    # a check between the two would otherwise see neither mark and blame the provider for the reset
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    order = Mock()
+    for name in ("mark_gpu_reset_recent", "remove_pending_pod"):
+        setattr(svc.redis_service, name, AsyncMock())
+        order.attach_mock(getattr(svc.redis_service, name), name)
+    monkeypatch.setattr(
+        "services.docker_service.reset_hung_pod_gpus",
+        _hung_reset(HungGpuResult(["GPU-test"], ContainerWarningCode.HungGpuReset)),
+    )
+
+    assert isinstance(await _run(svc, payload), ContainerCreated)
+    names = [name for name, _, kwargs in order.mock_calls if name == "mark_gpu_reset_recent" or kwargs.get("kind")]
+    assert names == ["mark_gpu_reset_recent", "remove_pending_pod"]
+
+
+@pytest.mark.parametrize(
+    "warning", [ContainerWarningCode.HungGpuReset, ContainerWarningCode.HungGpuNotResetMig]
+)
+@pytest.mark.asyncio
+async def test_a_failed_recent_reset_mark_does_not_fail_the_reboot(svc, monkeypatch, warning):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", _hung_reset(HungGpuResult(["GPU-test"], warning)))
+    svc.redis_service.mark_gpu_reset_recent = AsyncMock(side_effect=RuntimeError("redis down"))
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated) and result.warnings == [warning]
+    # only a GPU that was actually reset gets the mark
+    assert svc.redis_service.mark_gpu_reset_recent.await_count == (warning == ContainerWarningCode.HungGpuReset)
+
+
+@pytest.mark.parametrize("edit", [True, False])
+@pytest.mark.asyncio
+async def test_nothing_parked_means_no_hung_gpu_check(svc, monkeypatch, edit):
+    # an edit with no container on the host, or a fresh create
+    payload = _edit_payload() if edit else _payload(active_container_names=["pod_someone_else"])
+    ssh = _ssh_recording(container_present=not edit)
+    _patch_happy(svc, monkeypatch, ssh)
+    reset = AsyncMock()
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", reset)
+
+    assert isinstance(await _run(svc, payload), ContainerCreated)
+    reset.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_retry_ssh_command_raises_the_last_attempts_error_not_retryerror():
     ssh = AsyncMock()
@@ -656,3 +821,114 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
         svc._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh, "pod_abc", {})
     else:
         svc._repair_stale_mountpoint_of_container_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_docker_stop_that_never_returns_fails_the_edit_in_bounded_time_and_keeps_the_pod(svc, monkeypatch):
+    # a reboot hung in park: `docker stop` over SSH never returned and nothing bounded it
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
+    # bounds every park command, `docker ps` and the renames too: 0.05 s failed them on a loaded CI runner
+    monkeypatch.setattr("services.docker_service._PARK_COMMAND_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr("services.docker_service._HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    inner = ssh.run
+
+    async def stop_and_kill_hang(cmd, *args, **kwargs):
+        if cmd.startswith(("/usr/bin/docker stop", "/usr/bin/docker kill")):
+            ssh.commands.append(cmd)
+            await asyncio.Event().wait()
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = stop_and_kill_hang
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await asyncio.wait_for(_run(svc, payload), 10)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "park_current_container"
+    # the parked container gets its name back and nothing of the renter's is removed
+    assert ssh.commands[-1] == f"/usr/bin/docker rename {parked} {name}"
+    assert not any(parked in c for c in _docker(ssh.commands, "rm"))
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_and_kill_the_host_times_out_rename_the_pod_back(svc, monkeypatch):
+    # the host's `timeout` ends a wedged stop and kill (exit 124): the pod still runs, so it gets its name back
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    inner = ssh.run
+
+    async def host_times_out(cmd, *args, **kwargs):
+        if cmd.startswith(("/usr/bin/docker stop", "/usr/bin/docker kill")):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=124)
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = host_times_out
+    _patch_happy(svc, monkeypatch, ssh)
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "park_current_container"
+    assert "exit 124" in f"{result.msg} {result.detail}"
+    assert _docker(ssh.commands, "kill") == [f"/usr/bin/docker kill {parked}"]
+    assert _docker(ssh.commands, "rename")[-1] == f"/usr/bin/docker rename {parked} {name}"
+    assert not any(parked in c for c in _docker(ssh.commands, "rm"))
+
+
+@pytest.mark.asyncio
+async def test_a_restore_whose_bring_up_hangs_ends_in_bounded_time_and_keeps_the_pod(svc, monkeypatch):
+    # the undo's start/remount/sshd can wedge on the same node: it gives up, the container keeps its name and volume
+    monkeypatch.setattr("services.docker_service._RESTORE_BRING_UP_TIMEOUT_SECONDS", 0.05)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+
+    async def hangs(**kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock(side_effect=hangs))
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("docker run failed")))
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await asyncio.wait_for(_run(svc, payload), 10)
+
+    assert isinstance(result, FailedContainerRequest)
+    svc._bring_up_existing_container.assert_awaited_once()
+    assert ssh.commands[-1] == f"/usr/bin/docker rename {parked} {name}"
+    assert not any(parked in c or "volume rm" in c for c in ssh.commands if "rm " in c)
+
+
+@pytest.mark.asyncio
+async def test_a_docker_ps_the_host_times_out_fails_the_edit_and_keeps_the_pod(svc, monkeypatch):
+    # review 5766107783: exit 124 with empty stdout must not read as "no container" (the sweep would remove the pod)
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    inner = ssh.run
+
+    async def ps_times_out(cmd, *args, **kwargs):
+        if "docker ps -a" in cmd and "--filter name=" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=124)
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = ps_times_out
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "park_current_container"
+    assert "docker ps exited 124" in f"{result.msg} {result.detail}"
+    assert _docker(ssh.commands, "rename") == []
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    svc.clean_existing_containers.assert_not_awaited()
