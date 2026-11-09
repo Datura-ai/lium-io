@@ -203,7 +203,7 @@ from services.rental_docker_sdk import (
     keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
-    is_rental_docker_transport_error,
+    is_rental_docker_transport_drop,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     rental_docker_error_class,
@@ -1187,7 +1187,7 @@ def is_host_fault_create_failure(current_step: str | None, error: BaseException 
     return (
         error is not None
         and current_step not in _CREATE_STEPS_BEFORE_THE_HOST
-        and is_rental_docker_transport_error(error)
+        and is_rental_docker_transport_drop(error)
     )
 
 
@@ -11243,7 +11243,7 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra, error=e)
+            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e))
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +

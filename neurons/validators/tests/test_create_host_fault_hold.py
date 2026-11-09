@@ -1,10 +1,11 @@
 from unittest.mock import AsyncMock, Mock
 
+import docker.errors
 import pytest
 import requests
 import urllib3
 
-from services.rental_docker_sdk import RentalDockerOperationError
+from services.rental_docker_sdk import RentalDockerOperationError, RentalDockerTransportDropped
 
 from services.docker_service import DockerService, is_host_fault_create_failure
 from services.task.checks.rental_probe import STEP_CONTAINER_START
@@ -108,3 +109,71 @@ async def test_a_drop_before_the_validator_reached_the_host_is_not_stamped():
     await service.hold_node_until_probe_passes(EXECUTOR_UUID, "ssh_connect", {}, error=_dropped_mid_reply())
 
     redis_service.set.assert_not_awaited()
+
+
+def _raised_while_handling(drop: BaseException, error: BaseException) -> BaseException:
+    # a daemon answer raised in an except block that caught a drop: chained implicitly, never caused by it
+    try:
+        try:
+            raise drop
+        except type(drop):
+            raise error
+    except type(error) as exc:
+        return exc
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            docker.errors.APIError("500 Server Error", response=Mock(status_code=500, reason="Internal Server Error")),
+            id="daemon-500",
+        ),
+        pytest.param(docker.errors.ImageNotFound("No such image: renter/image:latest"), id="image-not-found"),
+        pytest.param(
+            RentalDockerOperationError("Docker SDK start container failed: OCI runtime create failed"),
+            id="oci-runtime",
+        ),
+        # a non-zero exec exit carries the command's own output, which can say anything
+        pytest.param(
+            RentalDockerOperationError("Docker exec exited 1: Read timed out; Socket is closed; EOFError"),
+            id="exec-nonzero-exit",
+        ),
+        pytest.param(
+            _raised_while_handling(
+                ConnectionResetError(),
+                docker.errors.APIError("409 Client Error", response=Mock(status_code=409, reason="Conflict")),
+            ),
+            id="daemon-answer-after-a-drop",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_normal_daemon_or_exec_error_past_the_connect_is_not_stamped(error):
+    service, redis_service = _service()
+
+    await service.hold_node_until_probe_passes(EXECUTOR_UUID, "add_public_keys", {}, error=error)
+
+    redis_service.set.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(_dropped_mid_reply(), id="chunked-encoding"),
+        pytest.param(RentalDockerTransportDropped("channel closed"), id="ssh-channel-closed"),
+        pytest.param(
+            requests.exceptions.ConnectionError(
+                urllib3.exceptions.ProtocolError("Connection aborted.", ConnectionResetError())
+            ),
+            id="connection-aborted",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_typed_drop_past_the_connect_is_stamped(error):
+    service, redis_service = _service()
+
+    await service.hold_node_until_probe_passes(EXECUTOR_UUID, "add_public_keys", {}, error=error)
+
+    redis_service.set.assert_awaited_once()

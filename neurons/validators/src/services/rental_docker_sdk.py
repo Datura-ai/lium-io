@@ -15,6 +15,9 @@ from functools import partial
 from pathlib import Path
 from typing import TypeVar
 
+import requests
+import urllib3
+
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.const import RENTAL_CPU_COUNT_LABEL
@@ -120,6 +123,16 @@ class RentalDockerTransportDropped(RentalDockerConnectionError):
         super().__init__(f"SSH transport dropped: {detail}")
 
 
+# the typed errors of a Docker connection over SSH that dropped mid-call; a read timeout is not one
+_TRANSPORT_DROP_TYPES = (
+    RentalDockerTransportDropped,
+    *_TRANSPORT_ERROR_TYPES,
+    urllib3.exceptions.ProtocolError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
 class RentalDockerTransportError(RentalDockerOperationError):
     """A Docker SDK call failed on a dropped SSH transport and its one retry did not recover it."""
 
@@ -167,6 +180,24 @@ def is_rental_docker_transport_error(exc: BaseException) -> bool:
             return True
         if any(marker in text for marker in _TRANSPORT_ERROR_TEXTS):
             return True
+    return False
+
+
+def is_rental_docker_transport_drop(exc: BaseException) -> bool:
+    """True only when a typed dropped-connection error caused `exc`: no text match, and no exception
+    merely raised while handling one, so a daemon answer or a command's own output never counts."""
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        item = stack.pop()
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, _TRANSPORT_DROP_TYPES):
+            return True
+        stack.append(item.__cause__)
+        reason = getattr(item, "reason", None)
+        stack.extend(a for a in (reason, *getattr(item, "args", ())) if isinstance(a, BaseException))
     return False
 
 
