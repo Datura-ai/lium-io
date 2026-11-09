@@ -197,6 +197,35 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
 
 @pytest.mark.asyncio
+async def test_check_executor_health_bounds_the_whole_call_including_retries(reset_session, client):
+    # the first attempt drops late, the retry would start a fresh full-length wait
+    async def drop_late():
+        await asyncio.sleep(0.15)
+        raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+    async def hang():
+        await asyncio.sleep(10)
+
+    attempts = []
+    for enter in (drop_late, hang):
+        async_cm = AsyncMock()
+        async_cm.__aenter__ = AsyncMock(side_effect=enter)
+        async_cm.__aexit__ = AsyncMock(return_value=None)
+        attempts.append(async_cm)
+    mock_session = AsyncMock()
+    mock_session.closed = False
+    mock_session.request = MagicMock(side_effect=attempts)
+    client.CONNECTION_RETRY_BACKOFF_SECONDS = (0.0, 0.0)
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        started = asyncio.get_running_loop().time()
+        result = await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
+
+    assert result is None
+    assert asyncio.get_running_loop().time() - started < 0.35
+
+
+@pytest.mark.asyncio
 async def test_url_construction(reset_session, client):
     response_data = {"data": "test", "count": 42}
     mock_response = create_mock_response(200, response_data)

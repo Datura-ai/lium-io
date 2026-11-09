@@ -26,7 +26,7 @@ from services.verifyx_validation_service import (
     _is_speed_reading,
 )
 
-from ..messages import VerifyXMessages as Msg, render_message
+from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
 from .disk_space import DiskSpaceCheck
 from .network_ema import compute_ema
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
 MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS = 10.0
+_SPEED_NEXT_STEP = "Improve the node's network link; the average recovers on the next cycles once speeds improve."
 _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 # A host can bring on a real Cloudflare 429 by flooding speed.cloudflare.com from its own IP just
@@ -136,6 +137,8 @@ class VerifyXCheck:
     """
 
     check_id = "gpu.validate.verifyx"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     def _extract_errors(self, result) -> str | list | None:
@@ -428,6 +431,10 @@ class VerifyXCheck:
                     Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
                     ctx=ctx,
                     check_id=self.check_id,
+                    remediation=(
+                        f"Average download speed {shown(ema_download, 1, failed_below=True)} Mbps, "
+                        f"{MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:.0f} Mbps required. {_SPEED_NEXT_STEP}"
+                    ),
                     what={
                         "direction": "download",
                         "ema_verifyx_download_speed": ema_download,
@@ -447,6 +454,10 @@ class VerifyXCheck:
                     Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
                     ctx=ctx,
                     check_id=self.check_id,
+                    remediation=(
+                        f"Average upload speed {shown(ema_upload, 1, failed_below=True)} Mbps, "
+                        f"{MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS:.0f} Mbps required. {_SPEED_NEXT_STEP}"
+                    ),
                     what={
                         "direction": "upload",
                         "ema_verifyx_upload_speed": ema_upload,
@@ -940,6 +951,8 @@ class VerifyXColdRetryCheck:
     first sample stands, and a gate it failed fails the node here."""
 
     check_id = "gpu.validate.verifyx_cold_retry"
+    # a replay would benchmark again from the first sample and could throw away a retry that passed
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

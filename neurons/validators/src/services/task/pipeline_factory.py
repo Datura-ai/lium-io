@@ -7,8 +7,10 @@ including context setup and check instantiation.
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import cast
 
+import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
@@ -682,13 +684,16 @@ class PipelineFactory:
             ],
         )
 
-    def build_pipeline(self, checks: list[Check]) -> Pipeline:
+    def build_pipeline(
+        self, checks: list[Check], reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None
+    ) -> Pipeline:
         """Build a pipeline with the given checks.
 
         Args:
             checks: List of validation checks
+            reconnect: opens a fresh session to the node when the open one drops mid-check
 
         Returns:
             Configured Pipeline ready to run
         """
-        return Pipeline(checks, sink=LoggerSink(logger, tracker=self.status_tracker))
+        return Pipeline(checks, sink=LoggerSink(logger, tracker=self.status_tracker), reconnect=reconnect)
