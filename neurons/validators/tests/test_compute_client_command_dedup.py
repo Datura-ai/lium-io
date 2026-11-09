@@ -1,7 +1,7 @@
 import asyncio
 import json
 from fnmatch import fnmatch
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -353,3 +353,63 @@ async def test_a_failed_read_of_the_kept_failures_raises_so_the_next_socket_read
     await client._resend_host_fault_failures()
     assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["reboot-a"]
     assert await redis.hgetall(redis_module.HOST_FAULT_FAILURES_KEY)  # still kept for later sockets
+
+
+class _BackendSocket:
+    """One backend process: it accepts the auth, takes every frame sent to it, then closes."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(raw)
+
+    async def recv(self) -> str:
+        return json.dumps({"status": "success"})
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        raise StopAsyncIteration
+
+
+async def _deliver(client, socket) -> list[dict]:
+    """What handle_send_messages does while `socket` is open: send everything queued on it."""
+    client.ws = socket
+    while len(client.message_queue):
+        await client.send_model(client.message_queue.pop(0))
+    return [json.loads(raw) for raw in socket.sent if raw.startswith("{")]
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_failure_the_backend_lost_in_a_restart_is_sent_again_on_the_new_socket(client):
+    """DAH-5592 (lium-platform#2460 review): with its database and broker down the backend keeps the billing-stop for a
+    failed reboot only in memory, and a restart loses it. The validator sent the failure on the old socket; the
+    restarted backend's first socket gets it again, with the same command_id, so the backend records it then."""
+    client.keypair = None
+    client.resumed_creates_report = None
+    client.miner_service.handle_container.return_value = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+        error_code=FailedContainerErrorCodes.ExecutorUnreachable,
+        msg="Error: Executor unreachable",
+    )
+    before, after = _BackendSocket(), _BackendSocket()  # the backend process before and after its restart
+    auth = MagicMock(model_dump_json=lambda: "auth")
+
+    with patch("clients.compute_client.AuthenticateRequest.from_keypair", return_value=auth):
+        await client.handle_connection(before)
+        await client.miner_driver(request("reboot-a"))
+        first = await _deliver(client, before)  # the backend took it but kept it only in memory, then restarted
+        await client.handle_connection(after)
+        again = await _deliver(client, after)
+
+    def failures(frames):
+        return [(m["command_id"], m["error_code"]) for m in frames if m.get("error_code")]
+
+    code = FailedContainerErrorCodes.ExecutorUnreachable.value
+    assert failures(first) == [("reboot-a", code)]
+    assert failures(again) == [("reboot-a", code)]
