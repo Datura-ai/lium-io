@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
+import asyncssh
+
 from core.config import FeatureFlag, settings
 from core.utils import _m, get_extra_info
 from core.checksums import (
@@ -396,7 +398,15 @@ class VerifyXValidationService:
             lib_name = self.gated_lib_name()
             source = lib_name
             # the CPU first: an ARM host holding the x86 build matches the native digest and must not pass as current
-            arch = await executor_arch(shell)
+            try:
+                arch = await executor_arch(shell)
+            except (asyncssh.Error, OSError) as e:
+                capture = SSHCapture(transport_error=f"{type(e).__name__}: {e}")
+                return self._failure_response(
+                    error=f"SSH transport error ({capture.transport_error})",
+                    ssh_capture=capture,
+                    default_extra=default_extra,
+                )
             if arch == "aarch64":
                 # an ARM executor holds the aarch64 build: check it against (and send) the validator's copy of that
                 source = aarch64_lib_path(lib_name)

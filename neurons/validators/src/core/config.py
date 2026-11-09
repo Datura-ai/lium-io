@@ -404,6 +404,17 @@ class Settings(BaseSettings):
     RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
     RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0, gt=0)
     RENTED_POD_SSH_PROBE_CONCURRENCY: int = Field(env="RENTED_POD_SSH_PROBE_CONCURRENCY", default=64, ge=1)
+    # DAH-5215: the per-cycle probe sees a dead pod up to 15 min late. The watch
+    # (services/rented_pod_watch.py) re-probes the rented RUNNING pods every INTERVAL seconds (0 = off)
+    # with the same TIMEOUT and CONCURRENCY and reports a pod unreachable after MISSES missed probes in a row.
+    RENTED_POD_WATCH_INTERVAL_SECONDS: int = Field(env="RENTED_POD_WATCH_INTERVAL_SECONDS", default=60, ge=0)
+    RENTED_POD_WATCH_MISSES: int = Field(env="RENTED_POD_WATCH_MISSES", default=2, ge=1)
+    # no_banner (TCP accepted, sshd silent) mostly recovers by itself: one retry with this timeout first,
+    # then this many misses in a row (~10 min at the default interval)
+    RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS: float = Field(
+        env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
+    )
+    RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
     # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
     # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
     # stores such a report as evidence only (lium-platform) is deployed:
@@ -551,7 +562,7 @@ class Settings(BaseSettings):
     # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
     # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
     # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
-    # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
+    # Two failing readings in a row (every download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
     # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
     # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
     # So is a failing side the rented pods' own counters show they used while the probe measured it (rented_throughput.DURING_*).
@@ -668,7 +679,7 @@ class Settings(BaseSettings):
     # Spot rental incentive, independent of the flag above. True: a rented spot node the backend
     # lists in provider_spot_executor_ids earns rental incentive at 0.5 x what the same node would
     # earn rented as secure (0.5 = SPOT_RENTAL_INCENTIVE_FACTOR); a node that is spot as a
-    # restriction, and the free remainder of a partially rented spot node, earn 0 as before.
+    # restriction earns 0 as before; the free remainder of a partially rented spot node takes spot idle pay instead.
     # False: every rented spot node earns 0, as before.
     ENABLE_SPOT_RENTAL_INCENTIVE: bool = Field(env="ENABLE_SPOT_RENTAL_INCENTIVE", default=False)
     # A Spot node's configuration filler average is used only when it was taken over at least this
@@ -723,14 +734,6 @@ class Settings(BaseSettings):
     TDX_ALLOWED_TCB_STATUSES: str = Field(env="TDX_ALLOWED_TCB_STATUSES", default="UpToDate")
     TDX_ALLOWED_ADVISORY_IDS: str = Field(env="TDX_ALLOWED_ADVISORY_IDS", default="")
 
-    # G3 — freshness/anti-replay nonce channel. When enabled the validator mints a
-    # 32-byte challenge per attestation event, folds it into the signed SSH-key
-    # request, and requires the executor to echo it in TDX report_data[32:64].
-    ENABLE_ATTESTATION_NONCE: bool = Field(env="ENABLE_ATTESTATION_NONCE", default=False)
-    # A nonce-bound attestation event is required at most once per this interval per
-    # miner (freshness = "bounded, provably recent", not "every wave") — GPU evidence
-    # collection is too expensive to force fleet-wide every cycle.
-    TDX_REATTEST_INTERVAL_SECONDS: int = Field(env="TDX_REATTEST_INTERVAL_SECONDS", default=3600)
     # Issued nonce validity window; a quote echoing an older nonce is stale.
     ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
 

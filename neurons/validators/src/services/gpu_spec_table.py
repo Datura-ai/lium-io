@@ -185,6 +185,8 @@ GPU_VRAM_SIZES_MB["NVIDIA GB300"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"
 # DAH-5863: `NVIDIA GB10` (DGX Spark) has no memory of its own; its GPU uses the host's 128 GB, which the
 # scrape reports as its capacity (machine_scrape read_gpu_memory_mb).
 GPU_VRAM_SIZES_MB["NVIDIA GB10"] = [131072]
+# `NVIDIA GB200` (DAH-6008): 192 GB HBM3e nominal per GPU like the B200 (~186 GB usable), so the B200 size; no reading yet.
+GPU_VRAM_SIZES_MB["NVIDIA GB200"] = list(GPU_VRAM_SIZES_MB["NVIDIA B200"])
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
