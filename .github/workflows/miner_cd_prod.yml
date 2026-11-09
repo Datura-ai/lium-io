@@ -42,3 +42,41 @@ jobs:
         run: |
           docker push "daturaai/compute-subnet-miner:$TAG"
           docker push "daturaai/compute-subnet-miner-runner:$TAG"
+
+  # miner-v1.010 and v1.011 were tagged without a GitHub release, so no #releases post went out and providers told to
+  # pull v1.011 had no notes (6 Nov 2026). The release is created here when the tag has none, with the changes to the
+  # miner image only (neurons/miners and the shared datura package) since the previous miner tag. A release a person
+  # already made is left as it is.
+  release-notes:
+    name: "Release notes"
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create the release when the tag has none
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists: left as it is"
+            exit 0
+          fi
+          prev=$(git tag -l 'miner-v*' --sort=-v:refname | grep -A1 -x "$TAG" | sed -n 2p)
+          [ -n "$prev" ] || { echo "no miner tag before $TAG: no notes to write" >&2; exit 1; }
+          {
+            echo "## What's Changed"
+            git log --reverse --format='* %s' "$prev..$TAG" -- neurons/miners datura
+            echo
+            echo
+            echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$prev...$TAG"
+          } > notes.md
+          cat notes.md
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md --latest=false

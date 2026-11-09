@@ -47,7 +47,7 @@ def _hung_gpu_reset_on(monkeypatch):
 def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
     # pyflakes reads as a name every `svc` parameter below redefines (F811)
-    service = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     service._read_host_ram_kib = AsyncMock(return_value=None)
@@ -212,6 +212,12 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # no parsed probe here: one inspect asks whether the pod (or its parked copy) is on the host
+        f"/usr/bin/docker container inspect {name} >/dev/null 2>&1"
+        f" || /usr/bin/docker container inspect {name}{EDIT_PARKED_SUFFIX} >/dev/null 2>&1"
+        # or a container an edit kept under its stamped name (where this edit parked it)
+        f" || /usr/bin/docker ps -a --filter name=kept_unmounted_{payload.pod_id}_ --format '{{{{.Names}}}}'"
+        f" | grep -q '^kept_unmounted_{payload.pod_id}_'",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
@@ -862,7 +868,8 @@ async def test_a_docker_stop_that_never_returns_fails_the_edit_in_bounded_time_a
     # a reboot hung in park: `docker stop` over SSH never returned and nothing bounded it
     monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
     monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
-    monkeypatch.setattr("services.docker_service._PARK_COMMAND_TIMEOUT_SECONDS", 0.05)
+    # bounds every park command, `docker ps` and the renames too: 0.05 s failed them on a loaded CI runner
+    monkeypatch.setattr("services.docker_service._PARK_COMMAND_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr("services.docker_service._HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
     payload = _edit_payload()
     ssh = _ssh_recording()

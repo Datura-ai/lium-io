@@ -844,6 +844,28 @@ async def test_create_payload_is_what_a_renter_gets():
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "at_cycle_start, under_the_lock, expected",
+    [
+        pytest.param([], [], [], id="none-retained"),
+        pytest.param(["a"], ["a"], ["volume_a"], id="attached"),
+        pytest.param(["a"], [], ["volume_a"], id="already-dangling"),
+        pytest.param([], ["b"], ["volume_b"], id="newly-retained"),
+    ],
+)
+async def test_the_probe_create_keeps_every_retained_pod_volume(at_cycle_start, under_the_lock, expected):
+    """Regression: the probe's create sent no active volumes, so its stale-volume sweep removed a
+    volume_<pod_id> the backend keeps after its container was reaped (a stopped renter's disk)."""
+    snapshot = rented_data().model_copy(update={"retained_volume_pod_ids": at_cycle_start})
+    fresh = rented_data().model_copy(update={"retained_volume_pod_ids": under_the_lock})
+    ctx, docker, _ = make_probe_context(rented=snapshot, rented_now=fresh)
+    with probe_settings(), renter_path():
+        await RentalProbeCheck().run(ctx)
+
+    assert sorted(docker.create_calls[0][0].active_volume_names) == expected
+
+
 def test_no_ram_total_in_the_specs_sends_no_memory_limit():
     ctx, _, _ = make_probe_context()
     no_ram = ctx.model_copy(update={"state": replace(ctx.state, specs={})})

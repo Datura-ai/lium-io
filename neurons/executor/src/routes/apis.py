@@ -465,7 +465,17 @@ async def get_miner_identity(
         miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
         nonce=nonce,
         account_claim=settings.MINER_ACCOUNT_CLAIM or None,
+        ssh_host_key_port=_ssh_host_key_port(),
     )
+
+
+def _ssh_host_key_port() -> int | None:
+    """The SSH port validators dial, only when sshd's host keys survive a recreated container: the keys dir is a
+    mounted volume holding keys. ssh_host_keys.sh fills the dir even without a volume (CVM), hence the mount test."""
+    keys_dir = Path(settings.SSH_HOST_KEYS_DIR)
+    if not (os.path.ismount(keys_dir) and any(keys_dir.glob("ssh_host_*"))):
+        return None
+    return settings.SSH_PUBLIC_PORT or settings.SSH_PORT
 
 
 def _is_loopback_client(request: Request) -> bool:
