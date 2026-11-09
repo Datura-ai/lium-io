@@ -1523,9 +1523,11 @@ def get_egress_probe_network():
     # container's namespace or none, so the trace falls back to the host
     for container in docker_api_get("/containers/json"):
         if any(name.startswith("/pod_") for name in container.get("Names") or []):
-            mode = docker_api_get(f"/containers/{container['Id']}/json")["HostConfig"]["NetworkMode"]
-            if mode == "default":
-                return "bridge"
+            info = docker_api_get(f"/containers/{container['Id']}/json")
+            mode = info["HostConfig"]["NetworkMode"]
+            if mode in ("default", "bridge"):
+                # a legacy pod moved onto another network at start keeps mode "default"
+                return next(iter((info.get("NetworkSettings") or {}).get("Networks") or {}), "bridge")
             if not mode or mode == "none" or mode.startswith("container:"):
                 raise ValueError(f"pod network mode {mode!r}")
             return mode

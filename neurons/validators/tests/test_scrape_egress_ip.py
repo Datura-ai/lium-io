@@ -29,6 +29,7 @@ class _Fake:
     calls: list = []
     containers: list | None = []
     pod_mode = "lium-rentals"
+    pod_networks: dict = {}
 
     @classmethod
     def run(cls, cmd, **kwargs):
@@ -42,7 +43,11 @@ class _Fake:
         if path == "/containers/json":
             return cls.containers
         if path == "/containers/p1/json":
-            return {"HostConfig": {"NetworkMode": cls.pod_mode}, "State": {"Pid": 4242}}
+            return {
+                "HostConfig": {"NetworkMode": cls.pod_mode},
+                "NetworkSettings": {"Networks": cls.pod_networks},
+                "State": {"Pid": 4242},
+            }
         assert path == f"/containers/{socket.gethostname()}/json"
         return {"Image": EXECUTOR_IMAGE}
 
@@ -70,7 +75,7 @@ def get_egress_ip():
     )
     yield ns["get_egress_ip"]
     _Fake.stdout, _Fake.fail, _Fake.calls = TRACE, set(), []
-    _Fake.containers, _Fake.pod_mode = [], "lium-rentals"
+    _Fake.containers, _Fake.pod_mode, _Fake.pod_networks = [], "lium-rentals", {}
 
 
 @pytest.fixture
@@ -107,6 +112,13 @@ def test_default_bridge_pod_probes_on_bridge(get_egress_ip, with_pod) -> None:
     _Fake.pod_mode = "default"
     get_egress_ip()
     assert _probe_network(_Fake.calls[0][0]) == "bridge"
+
+
+@pytest.mark.parametrize("mode", ["default", "bridge"])
+def test_default_mode_pod_moved_to_another_network_probes_there(get_egress_ip, with_pod, mode) -> None:
+    _Fake.pod_mode, _Fake.pod_networks = mode, {"lium-rentals": {}}
+    get_egress_ip()
+    assert _probe_network(_Fake.calls[0][0]) == "lium-rentals"
 
 
 def test_no_pod_probes_on_the_rental_network(get_egress_ip) -> None:
