@@ -6,6 +6,7 @@ from typing import Annotated
 
 import asyncssh
 import bittensor
+import redis.exceptions
 from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
@@ -23,15 +24,25 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
+from .checks.port_connectivity import PortConnectivityCheck
+from .checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from .availability import (
     MAX_PEER_TEXT_LENGTH,
+    ReachSource,
+    ReachTarget,
     availability_errors,
     build_ssh_unreachable_event,
     failed_check_event,
 )
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
-from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
-from .models import JobResult, ValidationEvent, build_msg
+from .messages import (
+    REASON_CODE_DOCS_URL,
+    GpuLossHoldMessages,
+    PostRentalGpuRecheckMessages,
+    TenantEnforcementMessages,
+    render_message,
+)
+from .models import VALIDATOR_REDIS_UNAVAILABLE, JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
@@ -225,7 +236,12 @@ class TaskService:
                         checks = self.pipeline_factory.build_checks(fast_path=True)
                     else:
                         checks = self.pipeline_factory.build_checks()
-                pipeline = self.pipeline_factory.build_pipeline(checks)
+                async def reconnect() -> asyncssh.SSHClientConnection:
+                    # the dead connection is replaced on the shell, so leaving the block closes the new one
+                    await shell.connect_asyncssh()
+                    return shell.ssh_client
+
+                pipeline = self.pipeline_factory.build_pipeline(checks, reconnect=reconnect)
                 ok, events, last_context = await pipeline.run(base_ctx)
 
                 # Determine log_text and success based on ok status
@@ -257,6 +273,34 @@ class TaskService:
                     error.model_dump(mode="json")
                     for error in availability_errors([*events, failed] if failed else events)
                 ]
+                if not ok and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason:
+                    # DAH-5718: the checks after the one whose session died never ran, so [] would clear holds only
+                    # they re-read (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones
+                    # alone. DAH-5792: any check, not only the port check (the pipeline ends a dead session the same way)
+                    result.session_lost_in_port_check = last_event.check_id == PortConnectivityCheck.check_id
+                    reasons = {event.reason_code for event in events}
+                    # a recheck that already passed cleared the marker: nothing is waiting for a load test
+                    if (
+                        GpuLossHoldMessages.CLEAN_AGAIN.reason in reasons
+                        and PostRentalGpuRecheckMessages.PASSED.reason not in reasons
+                    ):
+                        # review 4469609761: this scrape ended a GPU-loss hold but its load test never ran, so the
+                        # hold is published from here, not from the last published list a restart has emptied
+                        waiting = render_message(
+                            PostRentalGpuRecheckMessages.WAITING_AFTER_GPU_LOSS,
+                            ctx=last_context,
+                            check_id=PostRentalGpuRecheckCheck.check_id,
+                            what={
+                                "reach_source": str(ReachSource.VALIDATOR),
+                                "reach_target": str(ReachTarget.GPU),
+                                "executor_uuid": executor_info.uuid,
+                                "load_test": "not run: the SSH session closed first",
+                            },
+                        )
+                        result.availability_errors += [
+                            error.model_dump(mode="json") for error in availability_errors([waiting])
+                        ]
+                    result.availability_errors = result.availability_errors or None
                 # DAH-3405: the last event is the one that ended the run — the failed fatal check,
                 # the finalize event of a run that completed without a score, or the rented halt
                 # (success=True, score 0 when the image is OUTDATED).
@@ -300,6 +344,9 @@ class TaskService:
                 if has_reached_the_node and _is_ssh_transport_failure(e):
                     event = _transport_unreachable_event(executor_uuid=executor_info.uuid, error=e)
                     failure_reason_code = event.reason_code
+                elif isinstance(e, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):
+                    # DAH-5805: the validator's own Redis ended the run; the cycle withholds it instead of scoring 0
+                    failure_reason_code = VALIDATOR_REDIS_UNAVAILABLE
                 log_text = _m(
                     "Pipeline validation error",
                     extra=get_extra_info({
@@ -316,7 +363,7 @@ class TaskService:
                 # A cycle that opened the shell proves the node is reachable, so it reports an
                 # empty list and re-lists a node an earlier cycle hid. A cycle that never got
                 # there says nothing, and must not clear what the cycle before it found.
-                availability_problems = [] if has_reached_the_node else None
+                availability_problems = [] if has_reached_the_node and failure_reason_code != VALIDATOR_REDIS_UNAVAILABLE else None
             logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,

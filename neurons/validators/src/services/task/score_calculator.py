@@ -112,7 +112,9 @@ def calculate_scores(
         warning_messages.append(
             "Rented throughput reading could not run in several cycles in a row"
             if ctx.rented_throughput_not_run
+            # the portal matches the prefix; the detail after it names the side and its values
             else "A rented pod gets far too little network or disk throughput"
+            + (f" ({ctx.rented_throughput_slow_detail})" if ctx.rented_throughput_slow_detail else "")
         )
 
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the
@@ -141,6 +143,12 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("The host wrote into a renter's container")
 
+    # Kernel GPU view gate: BannedProviderCheck is non-fatal on a live rental, so only this
+    # line zeroes the score there.
+    if not ctx.kernel_gpu_view_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Kernel GPU list was overlaid and could not be trusted")
     # Kernel GPU-count gate (DAH-4982): same mechanics as the CPU-truth gate above.
     if not ctx.gpu_kernel_count_passed:
         actual_score = 0.0

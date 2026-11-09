@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import socket
+import time
 from typing import Any
 
 import asyncssh
@@ -29,15 +30,22 @@ logger = logging.getLogger(__name__)
 # The per-attempt timeout is deliberately not tightened to the poll interval: asyncssh counts TCP
 # connect, key exchange AND authentication against it, none of which carry over to the next
 # attempt, so a host slow enough to need 6s would fail every single try. An attempt is shortened
-# only when less than 12s of the deadline is left, which is time it could not have used anyway.
+# only when less than 20s of the deadline is left, which is time it could not have used anyway.
 # DAH-5419: `docker run` over SSH has no timeout of its own; a stuck daemon held it until the task was dropped.
 # Long enough for a first pull of the DinD image. It is enforced on the node (`timeout -s KILL`): cancelling only
 # our SSH wait leaves the remote CLI running, and it could create the container after the removal in `finally`.
 DIND_RUN_TIMEOUT_SECONDS = 180
+# the shortest create a cycle short on time still gets; the caller's deadline keeps time for the checks after this one
+DIND_MIN_RUN_TIMEOUT_SECONDS = 30
 # our own wait on top of it, for an SSH channel that hangs after the remote command is gone
 DIND_RUN_SSH_GRACE_SECONDS = 30
-DIND_SSH_READY_TIMEOUT_SECONDS = 30
-DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
+# DAH-5844: measured 5 Nov 15:31-18:17Z over 5000 connects, sshd answered at p50 10s, p90 16s, p99 30s (cut off by
+# the old 30s wait), a single attempt took up to 21s, and about one probe in ten never answered, its inner dockerd
+# up 25-45s before the give-up. So up to 60s with 20s attempts, never past the cycle deadline and never below
+# the old 30s.
+DIND_SSH_READY_TIMEOUT_SECONDS = 60
+DIND_MIN_SSH_READY_TIMEOUT_SECONDS = 30
+DIND_SSH_CONNECT_TIMEOUT_SECONDS = 20
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 # cap on the one `docker logs` + `docker exec tail` read of a failed container (DAH-2856)
 DIND_DIAGNOSTICS_TIMEOUT_SECONDS = 15
@@ -64,8 +72,7 @@ DIND_LOG_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
 DIND_LOG_EXCERPT_MAX_CHARS = 1500
 DIND_LOG_LINE_MAX_CHARS = 400
 DIND_SSHD_NOT_READY_MESSAGE = (
-    f"sshd inside the DinD container did not answer within {DIND_SSH_READY_TIMEOUT_SECONDS}s and its "
-    "log shows no dockerd error"
+    "sshd inside the DinD container did not answer in time and its log shows no dockerd error"
 )
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
 
@@ -152,6 +159,15 @@ _NODE_SIDE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
+def ssh_ready_timeout(deadline_monotonic: float | None) -> float:
+    """The SSH-ready wait: the full wait, cut to the cycle deadline but never below the old 30s, so a cycle
+    short on time ends no later than before (DAH-5844)."""
+    if deadline_monotonic is None:
+        return DIND_SSH_READY_TIMEOUT_SECONDS
+    left = deadline_monotonic - time.monotonic()
+    return max(DIND_MIN_SSH_READY_TIMEOUT_SECONDS, min(DIND_SSH_READY_TIMEOUT_SECONDS, left))
+
+
 # How long the removal of the probe container may take on the way out of a probe.
 REMOVE_TIMEOUT_SECONDS = 20
 
@@ -171,10 +187,17 @@ class DindVerifier:
         container_name_prefix: str,
         sysbox: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
-        """Verify DinD on port."""
+        """Verify DinD on port. `deadline_monotonic`: the cycle time budget the create must end within."""
         name = f"{container_name_prefix}_{port.external}"
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
+        run_timeout = DIND_RUN_TIMEOUT_SECONDS
+        if deadline_monotonic is not None:
+            left = int(deadline_monotonic - time.monotonic())
+            run_timeout = max(DIND_MIN_RUN_TIMEOUT_SECONDS, min(run_timeout, left))
+            if run_timeout < DIND_RUN_TIMEOUT_SECONDS:
+                log_ctx["run_timeout"] = run_timeout
         created = False
         sshd_answered = False
         sysbox_timed_out = False
@@ -186,8 +209,8 @@ class DindVerifier:
             cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
             logger.debug("run: %s...", cmd[:100])
 
-            cmd = f"timeout -s KILL {DIND_RUN_TIMEOUT_SECONDS} {cmd}"
-            async with asyncio.timeout(DIND_RUN_TIMEOUT_SECONDS + DIND_RUN_SSH_GRACE_SECONDS):
+            cmd = f"timeout -s KILL {run_timeout} {cmd}"
+            async with asyncio.timeout(run_timeout + DIND_RUN_SSH_GRACE_SECONDS):
                 result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
@@ -216,7 +239,7 @@ class DindVerifier:
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
             async with await self._connect_retrying_until_sshd_answers(
-                host, port, pkey, log_ctx
+                host, port, pkey, log_ctx, ssh_ready_timeout(deadline_monotonic)
             ) as ssh:
                 sshd_answered = True
                 if sysbox:
@@ -261,6 +284,7 @@ class DindVerifier:
                 sysbox_runtime=sysbox,
                 port=port,
                 error=error,
+                sshd_never_answered=created and not sshd_answered and isinstance(e, _NODE_SIDE_ERRORS),
             )
         finally:
             # One removal on every way out — ok, failed, raised, and cancelled (the validation
@@ -381,12 +405,13 @@ class DindVerifier:
         port: PortPair,
         pkey: SSHKey,
         log_ctx: dict[str, Any],
+        ready_timeout: float = DIND_SSH_READY_TIMEOUT_SECONDS,
     ) -> SSHClientConnection:
         """Connect to the freshly started DinD container, retrying until sshd answers.
 
         The deadline caps the whole wait, not just the moment an attempt starts: a hanging
         attempt gets whatever is left of the budget rather than a fresh 12s on top of it, so a
-        blackholed port cannot stretch the probe past DIND_SSH_READY_TIMEOUT_SECONDS (DAH-2272
+        blackholed port cannot stretch the probe past `ready_timeout` (DAH-2272
         exists because one such hang stalled the pipeline). No attempt starts once the deadline
         has passed either — a poll that resumes late would otherwise get a negative budget and
         report a timeout in place of the real connection error. The last failure is raised as is,
@@ -395,7 +420,7 @@ class DindVerifier:
         """
         loop = asyncio.get_running_loop()
         started_at = loop.time()
-        deadline = started_at + DIND_SSH_READY_TIMEOUT_SECONDS
+        deadline = started_at + ready_timeout
         attempts = 0
         last_error: Exception | None = None
 
@@ -468,6 +493,7 @@ class DindProbe:
         container_name_prefix: str,
         sysbox_runtime: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
         return await self.verifier.verify(
             port,
@@ -476,4 +502,5 @@ class DindProbe:
             container_name_prefix=container_name_prefix,
             sysbox=sysbox_runtime,
             log_ctx=log_ctx,
+            deadline_monotonic=deadline_monotonic,
         )

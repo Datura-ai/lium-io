@@ -213,6 +213,7 @@ class ResticStorageRunner:
         self._workspace = workspace
         self._restic_binary = restic_binary
         self._docker_binary = docker_binary
+        self._repository_via_helper = False
         self._events = event_writer or JsonEventWriter(
             str(operation.operation_id),
             operation.progress_interval_seconds,
@@ -330,20 +331,46 @@ class ResticStorageRunner:
             retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
 
     def _run_repository_command(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        if self._repository_via_helper:
+            return self._run_repository_helper(restic_arguments)
+        result = self._supervised_run(self._restic_command(restic_arguments))
+        if (
+            result.returncode not in (0, 10)
+            and getattr(self._workspace, "image", None)
+            and _dns_lookup_failed(result.stderr or result.stdout)
+        ):
+            # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge
+            # resolves fine; the backup itself already runs in a default-bridge helper.
+            print("Repository DNS lookup failed in the executor; using a helper container", file=sys.stderr, flush=True)
+            self._repository_via_helper = True
+            return self._run_repository_helper(restic_arguments)
+        return result
+
+    def _run_repository_helper(self, restic_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return self._supervised_run(self._repository_helper_command(restic_arguments))
+        except StorageOperationCancelled:
+            self._stop_helper_container()  # else it keeps the repository credentials until restic exits
+            raise
+
+    def _repository_helper_command(self, restic_arguments: list[str]) -> list[str]:
+        return [
+            *self._docker_helper_base(),
+            "--rm",
+            "--entrypoint",
+            self._restic_binary,
+            self._workspace.image,
+            *self._restic_command(restic_arguments)[1:],
+        ]
+
+    def _supervised_run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         # restic retries S3 for ~15 min on its own; heartbeat meanwhile so the backend does not mark the run stale.
         # shortcut: on cancellation the read-only restic child is left to exit by itself; use Popen if that matters.
         results: queue.Queue[subprocess.CompletedProcess[str] | BaseException] = queue.Queue()
 
         def run() -> None:
             try:
-                results.put(
-                    subprocess.run(
-                        self._restic_command(restic_arguments),
-                        env=self._environment,
-                        capture_output=True,
-                        text=True,
-                    )
-                )
+                results.put(subprocess.run(command, env=self._environment, capture_output=True, text=True))
             except BaseException as error:  # noqa: BLE001 - re-raised in the caller's thread
                 results.put(error)
 
@@ -406,12 +433,7 @@ class ResticStorageRunner:
         snapshot_id = self._operation.snapshot_id
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
-        probe = subprocess.run(
-            self._restic_command(["snapshots", "--json", "--", snapshot_id]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
-        )
+        probe = self._run_repository_command(["snapshots", "--json", "--", snapshot_id])
         if probe.returncode == 10:
             raise ResticOperationError(
                 "backup repository does not exist",
@@ -592,6 +614,7 @@ class ResticStorageRunner:
         if helper:
             self._remove_stopped_helpers()
             self._remove_helper_container()
+        helper_since = f"{time.time():.6f}"
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -688,6 +711,8 @@ class ResticStorageRunner:
                 state = inspection.get("State")
                 self._helper_state = state if isinstance(state, dict) else {}
                 self._helper_id = str(inspection.get("Id") or "")
+                if not inspection:  # gone before this cleanup: docker's events say who stopped and removed it
+                    self._log_helper_events(helper_since)
 
     def _raise_if_credentials_expired(self, error_text: str) -> None:
         # restic 0.19 retries an expired session for 15 minutes before failing; stop it now
@@ -760,6 +785,36 @@ class ResticStorageRunner:
         except ValueError:
             state = None
         return state if isinstance(state, dict) else {"State": {"Status": "unknown"}}
+
+    def _log_helper_events(self, since: str) -> None:
+        """Log the helper's docker events (kill signal, die exit code, destroy) and take its ID from them."""
+        try:
+            listed = subprocess.run(
+                [self._docker_binary, "events", "--since", since, "--until", str(int(time.time()) + 1),
+                 "--filter", f"container={self._helper_container_name()}", "--format", "{{json .}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._events.log(f"helper docker events unavailable: {error}")
+            return
+        lines = []
+        for line in listed.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            actor = event.get("Actor") if isinstance(event.get("Actor"), dict) else {}
+            attributes = actor.get("Attributes") if isinstance(actor.get("Attributes"), dict) else {}
+            event_id = str(event.get("id") or actor.get("ID") or "")
+            self._helper_id = self._helper_id or event_id
+            # signal/exitCode/execDuration only: other attributes are image labels
+            kept = {key: attributes[key] for key in ("signal", "exitCode", "execDuration") if key in attributes}
+            lines.append(f"{event.get('time')} {event_id[:12]} {event.get('Action') or event.get('status')} {json.dumps(kept)}")
+        self._events.log("helper docker events: " + (" | ".join(lines) or f"none (exit {listed.returncode})"))
 
     def _killed_helper_message(self, action: str) -> str:
         """Exit 137: say out of memory only when docker recorded an OOM kill."""
@@ -1011,6 +1066,12 @@ def _is_retryable_repository_failure(failure_detail: str) -> bool:
     # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
     normalized_detail = "".join(failure_detail.casefold().split())
     return any(marker in normalized_detail for marker in retryable_failure_markers)
+
+
+def _dns_lookup_failed(failure_detail: str) -> bool:
+    # 6 Nov: hosts whose compose-network resolver SERVFAILs ("lookup ... on 127.0.0.11:53: server misbehaving").
+    detail = failure_detail.casefold()
+    return "dial tcp: lookup " in detail and ("server misbehaving" in detail or "no such host" in detail)
 
 
 def _connection_closed(failure_detail: str) -> bool:

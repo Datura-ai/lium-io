@@ -430,3 +430,53 @@ async def test_the_backend_client_posts_observed_at():
     assert client.post.await_args.kwargs["json_data"]["observed_at"] == "t1"
     await client.report_rented_gpu_drop(POD_ID, **kwargs)
     assert "observed_at" not in client.post.await_args.kwargs["json_data"]
+
+
+DUPLICATE_LISTED = UUIDS[:7] + [UUIDS[0]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycles_before", "dropped", "replays", "posted"),
+    [
+        (0, False, False, False),
+        (0, True, False, False),
+        (1, False, False, True),
+        (1, True, False, True),
+        # were it replayed, one observation would count as two cycles and post a fault seen once
+        (0, True, True, True),
+    ],
+)
+async def test_one_cycle_advances_consecutive_cycles_at_most_once(
+    context_factory, monkeypatch, cycles_before, dropped, replays, posted
+):
+    # review r4481978335: a session that drops during the mark write must not count the observation twice
+    import asyncssh
+    from unittest.mock import MagicMock
+    from neurons.validators.src.services.task.pipeline import Pipeline
+
+    def session(closed):
+        ssh = MagicMock(spec=asyncssh.SSHClientConnection)
+        ssh.is_closed.return_value = closed
+        return ssh
+
+    defaults = type(rented_gpu_drop.settings)(_env_file=None)
+    services = _services()
+    monkeypatch.setattr(rented_gpu_drop, "settings", defaults)
+    if replays:  # the real check says False
+        monkeypatch.setattr(RentedGpuDropCheck, "replays_after_session_drop", True)
+    for _ in range(cycles_before):
+        await RentedGpuDropCheck().run(_ctx(context_factory, services, listed=DUPLICATE_LISTED))
+    services.backend.report_rented_gpu_drop.reset_mock()
+    ctx = _ctx(context_factory, services, listed=DUPLICATE_LISTED).model_copy(update={"ssh": session(dropped)})
+
+    async def reconnect():
+        return session(False)
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    await Pipeline([RentedGpuDropCheck()], _Sink(), reconnect=reconnect).run(ctx)
+
+    assert services.backend.report_rented_gpu_drop.await_count == (1 if posted else 0)

@@ -1502,6 +1502,10 @@ def get_host_boot_id() -> str:
 # The node is listed at the geo of the address the validator connects to; behind a reverse proxy
 # that is the proxy's. The backend geolocates the host's own egress address instead (Cloudflare's
 # trace echoes the caller's IP). "" when the fetch fails: the backend then keeps the connect address.
+# The trace runs in the host's network namespace (the executor has pid: host and is privileged),
+# where renter pods' traffic leaves the host: the executor container's own route may differ.
+# Never falls back to the container's route. The name is resolved in the container first, since its
+# resolv.conf may point at docker's embedded DNS, which the host namespace cannot reach.
 EGRESS_TRACE_HOST = "www.cloudflare.com"
 EGRESS_TRACE_PATH = "/cdn-cgi/trace"
 EGRESS_TRACE_TIMEOUT_SECONDS = 5
@@ -1509,12 +1513,21 @@ EGRESS_TRACE_TIMEOUT_SECONDS = 5
 
 def get_egress_ip() -> str:
     try:
-        conn = http.client.HTTPSConnection(EGRESS_TRACE_HOST, timeout=EGRESS_TRACE_TIMEOUT_SECONDS)
-        try:
-            conn.request("GET", EGRESS_TRACE_PATH)
-            body = conn.getresponse().read(4096).decode(errors="replace")
-        finally:
-            conn.close()
+        trace_addr = socket.getaddrinfo(
+            EGRESS_TRACE_HOST, 443, socket.AF_INET, socket.SOCK_STREAM
+        )[0][4][0]
+        env = {**os.environ}
+        env.pop("LD_LIBRARY_PATH", None)
+        body = subprocess.run(
+            [
+                "nsenter", "-t", "1", "-n",
+                "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
+                "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
+                f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
+            ],
+            capture_output=True, text=True, check=True, env=env,
+            timeout=EGRESS_TRACE_TIMEOUT_SECONDS + 5,
+        ).stdout[:4096]
     except Exception:
         return ""
     for line in body.splitlines():
@@ -1548,6 +1561,7 @@ class InfinibandPort:
         sm_lid: str,
         pkey: str,
         gids: list[str],
+        driver: str,
     ) -> None:
         self.device = device
         self.port = port
@@ -1561,6 +1575,7 @@ class InfinibandPort:
         self.sm_lid = sm_lid
         self.pkey = pkey
         self.gids = gids
+        self.driver = driver
 
     def as_payload(self) -> dict[str, str | list[str]]:
         return {
@@ -1576,7 +1591,17 @@ class InfinibandPort:
             "ib_sm_lid": self.sm_lid,
             "ib_pkey": self.pkey,
             "ib_gids": self.gids,
+            "ib_driver": self.driver,
         }
+
+
+def read_driver_name(device_path: str) -> str:
+    # The kernel driver behind an RDMA device ("mlx5_core", "efa", ...). AWS EFA reports no
+    # Ethernet or InfiniBand link layer, so the driver is the one fact that names it. "" if unreadable.
+    try:
+        return os.path.basename(os.readlink(f"{device_path}/device/driver"))
+    except Exception:
+        return ""
 
 
 def read_infiniband_port(
@@ -1602,6 +1627,7 @@ def read_infiniband_port(
         read_sysfs_value(f"{port_path}/sm_lid"),
         read_sysfs_value(f"{port_path}/pkeys/0"),
         [gid for gid in gids if gid],
+        read_driver_name(device_path),
     )
 
 
