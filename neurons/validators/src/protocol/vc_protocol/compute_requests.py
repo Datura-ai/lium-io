@@ -245,6 +245,9 @@ class RentedExecutorsResponse(BaseModel):
     # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
     # and its volume_<pod_id>. An older backend names none.
     retained_container_names: list[str] = []
+    # DAH-3333: pod ids whose volume_<pod_id> the reapers keep while still removing the container (a balance stop
+    # keeps the renter's disk, never the running container). An older backend names none.
+    retained_volume_pod_ids: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

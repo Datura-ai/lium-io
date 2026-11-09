@@ -21,6 +21,7 @@ from payload_models.payloads import (
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.container_cleanup import retained_volume_pod_ids
 from services.redis_service import (
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
@@ -193,8 +194,9 @@ class _ProbeGate:
     standing: _Failure | None
     # the fillers the backend listed under the lock, which the probe runs beside and leaves alone
     fillers_beside: frozenset[str] = frozenset()
-    # the paused pods' volumes the backend listed under the lock, which the probe's create keeps
-    kept_volume_names: tuple[str, ...] = ()
+    # volume_<pod_id> names the backend keeps without their container, and the paused pods' volumes; the
+    # probe's create must not sweep them
+    kept_volumes: frozenset[str] = frozenset()
 
 
 class RentalProbeCheck:
@@ -245,6 +247,8 @@ class RentalProbeCheck:
     """
 
     check_id = "executor.validate.rental_probe"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -269,7 +273,7 @@ class RentalProbeCheck:
                 image_ref,
                 gate.create_lock,
                 beside_fillers=bool(gate.fillers_beside),
-                kept_volume_names=gate.kept_volume_names,
+                kept_volumes=gate.kept_volumes,
                 create_deadline=create_deadline,
             )
         finally:
@@ -407,15 +411,12 @@ class RentalProbeCheck:
             create_lock=create_lock,
             standing=standing,
             fillers_beside=stop_result_or_idle.fillers_beside,
-            kept_volume_names=stop_result_or_idle.kept_volume_names,
+            kept_volumes=stop_result_or_idle.kept_volumes,
         )
 
-    async def _idle_under_lock(
-        self, ctx: Context, standing: _Failure | None
-    ) -> CheckResult | _BusyNow:
+    async def _idle_under_lock(self, ctx: Context, standing: _Failure | None) -> CheckResult | _BusyNow:
         """Re-read the node's idleness under the create lock; the result that stops the cycle,
-        or the fresh read: the fillers the probe may run beside (empty on a node without a filler)
-        and the paused pods' volumes its create keeps.
+        or the idle reading: the fillers the probe may run beside and the volumes it must keep.
 
         ctx.state.rented_data is the snapshot the cycle started from, minutes ago for the last check
         in the pipeline. create_container sweeps every pod_* container it is not told about, so the
@@ -581,8 +582,8 @@ class _BusyNow:
     busy: str | None
     # the fillers on it the probe runs beside
     fillers_beside: frozenset[str] = frozenset()
-    # the paused pods' volumes on it, as listed by this fresh read
-    kept_volume_names: tuple[str, ...] = ()
+    # retained volume_<pod_id> names, from the cycle's snapshot and this re-read, and the paused pods' volumes
+    kept_volumes: frozenset[str] = frozenset()
 
 
 async def _busy_now(ctx: Context) -> _BusyNow:
@@ -604,7 +605,9 @@ async def _busy_now(ctx: Context) -> _BusyNow:
     except Exception:
         _read_failed(ctx, "its pending-pod marks in Redis")
         return _BusyNow(None)
-    return _BusyNow("", fillers, tuple(rented.get_kept_volume_names(ctx.executor.uuid)))
+    kept_ids = retained_volume_pod_ids(ctx.state.rented_data) | retained_volume_pod_ids(rented)
+    kept = {f"volume_{pod_id}" for pod_id in kept_ids} | set(rented.get_kept_volume_names(ctx.executor.uuid))
+    return _BusyNow("", fillers, frozenset(kept))
 
 
 def _missing_inputs(ctx: Context) -> str | None:
@@ -863,12 +866,7 @@ def _probe_memory_gb(ctx: Context) -> int | None:
 
 
 def _probe_payload(
-    ctx: Context,
-    *,
-    pod_id: str,
-    image_ref: str,
-    public_key: str,
-    kept_volume_names: tuple[str, ...] = (),
+    ctx: Context, *, pod_id: str, image_ref: str, public_key: str, kept_volumes: frozenset[str] = frozenset()
 ) -> ContainerCreateRequest:
     # the cycle's snapshot and the fresh read under the lock: a pod paused since the snapshot is only in the
     # fresh read, and its volume must survive the create's sweep too
@@ -898,7 +896,7 @@ def _probe_payload(
         # keeps every filler_* on the node, not only the ones listed at this moment. A paused pod's
         # volume stays (DAH-2348).
         active_container_names=[],
-        active_volume_names=list(dict.fromkeys([*snapshot, *kept_volume_names])),
+        active_volume_names=sorted({*snapshot, *kept_volumes}),
     )
 
 
@@ -908,7 +906,7 @@ async def _probe(
     create_lock: _CreateLock,
     *,
     beside_fillers: bool = False,
-    kept_volume_names: tuple[str, ...] = (),
+    kept_volumes: frozenset[str] = frozenset(),
     create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> _ProbeOutcome:
     """Run the six steps in order; whatever happens, the node and this validator's Redis are left as found.
@@ -940,7 +938,7 @@ async def _probe(
             public_key=public_key,
             create_lock=create_lock,
             beside_fillers=beside_fillers,
-            kept_volume_names=kept_volume_names,
+            kept_volumes=kept_volumes,
             create_deadline=create_deadline,
         )
         if created is None:
@@ -969,7 +967,7 @@ async def _step_container_start(
     public_key: str,
     create_lock: _CreateLock,
     beside_fillers: bool = False,
-    kept_volume_names: tuple[str, ...] = (),
+    kept_volumes: frozenset[str] = frozenset(),
     create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> ContainerCreated | None:
     """Step 1: start the container through create_container, the path a renter's pod takes.
@@ -989,11 +987,7 @@ async def _step_container_start(
         result = await asyncio.wait_for(
             docker.create_container(
                 _probe_payload(
-                    ctx,
-                    pod_id=pod_id,
-                    image_ref=image_ref,
-                    public_key=public_key,
-                    kept_volume_names=kept_volume_names,
+                    ctx, pod_id=pod_id, image_ref=image_ref, public_key=public_key, kept_volumes=kept_volumes
                 ),
                 ctx.executor,
                 ctx.config.validator_keypair,
