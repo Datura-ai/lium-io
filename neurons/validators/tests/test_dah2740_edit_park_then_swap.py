@@ -822,8 +822,8 @@ async def test_a_docker_stop_that_never_returns_fails_the_edit_in_bounded_time_a
     # a reboot hung in park: `docker stop` over SSH never returned and nothing bounded it
     monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
     monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
-    # every park command gets this bound, the `docker ps` listing too: 0.05 s failed it on a loaded CI runner
-    monkeypatch.setattr("services.docker_service._PARK_COMMAND_TIMEOUT_SECONDS", 0.5)
+    # bounds every park command, `docker ps` and the renames too: 0.05 s failed them on a loaded CI runner
+    monkeypatch.setattr("services.docker_service._PARK_COMMAND_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr("services.docker_service._HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
     payload = _edit_payload()
     ssh = _ssh_recording()
