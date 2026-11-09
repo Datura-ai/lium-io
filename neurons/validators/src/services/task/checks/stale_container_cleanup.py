@@ -90,6 +90,8 @@ class StaleContainerCleanupCheck:
 
     check_id = "executor.cleanup.stale_containers"
     fatal = False
+    # it removes containers and spends the one-time exemption: a second run finds nothing and drops its update
+    replays_after_session_drop = False
 
     def __init__(self) -> None:
         # executor uuid -> when its cache was last swept. In memory on the check, which the pipeline

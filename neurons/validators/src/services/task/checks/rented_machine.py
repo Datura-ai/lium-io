@@ -189,6 +189,8 @@ class TenantEnforcementCheck:
     """
 
     check_id = "executor.validate.rented_state"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = True
 
     def __init__(self, recover_stale_pods: bool = True):
@@ -385,7 +387,8 @@ class TenantEnforcementCheck:
                         event = split_ports_event(
                             ctx,
                             self.check_id,
-                            reprobed.get("state", ctx.state),
+                            # a completed re-probe is a current reading; the pipeline flag itself stays as it was
+                            replace(reprobed["state"], port_check_deferred=False) if "state" in reprobed else ctx.state,
                             *split_short,
                             what={"stale_pod": stale_what},
                             extra=extra,

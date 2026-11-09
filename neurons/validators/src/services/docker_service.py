@@ -2654,6 +2654,11 @@ def _orphaned_task_id(error_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _is_stale_container_cgroup_error(error_text: str) -> bool:
+    # `docker start` after a host dockerd restart: runc cannot join the old run's leftover cgroup
+    return "cgroup.procs" in error_text and "device or resource busy" in error_text
+
+
 def _is_safe_docker_volume_name(volume_name: str) -> bool:
     return bool(_DOCKER_VOLUME_NAME_RE.fullmatch(volume_name))
 
@@ -11822,17 +11827,27 @@ class DockerService:
             private_key=private_key,
         ) as docker_client:
             # the start goes through the docker SDK; the SSH session is opened only once it
-            # succeeded, for the remount (no shell fallback for a failed start)
-            await run_logged_rental_docker_sdk_operation(
-                operation="start_container",
-                log_extra=default_extra,
-                # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
-                # every `docker start`; start moves it onto the rental network
-                call=lambda: docker_client.start(
-                    container_name=container_name, network=RENTAL_NETWORK_NAME
-                ),
-                container_name=container_name,
-            )
+            # succeeded, for the remount (no shell fallback for a failed start), or for the
+            # stale-mountpoint repair below
+            async def _start() -> None:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="start_container",
+                    log_extra=default_extra,
+                    # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
+                    # every `docker start`; start moves it onto the rental network
+                    call=lambda: docker_client.start(
+                        container_name=container_name, network=RENTAL_NETWORK_NAME
+                    ),
+                    container_name=container_name,
+                )
+
+            stale_mount_error: Exception | None = None
+            try:
+                await _start()
+            except Exception as exc:
+                if not _is_stale_vloopback_mountpoint_error(str(exc)):
+                    raise
+                stale_mount_error = exc
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
@@ -11841,6 +11856,15 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
+                if stale_mount_error is not None:
+                    # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
+                    # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
+                    # mountpoint, then start once more
+                    if not await self._repair_stale_mountpoint_of_container_volume(
+                        ssh_client, container_name, default_extra
+                    ):
+                        raise stale_mount_error
+                    await _start()
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
@@ -11971,9 +11995,12 @@ class DockerService:
         # and never matches, so a customer's stop is never overridden.
         # ticket-0729: the same pod can first be stuck behind an orphaned shim of its own old task;
         # that shim is cleared below, then the stale-mountpoint repair runs as usual.
+        # DAH-5834: a start that failed on the old run's leftover cgroup records that error itself,
+        # so it opens recovery too; the start below clears the cgroup and tries once more.
         orphaned_task_id = _orphaned_task_id(container_error or "")
+        stale_cgroup = _is_stale_container_cgroup_error(container_error or "")
         if not container_error or not (
-            orphaned_task_id or _is_stale_vloopback_mountpoint_error(container_error)
+            orphaned_task_id or stale_cgroup or _is_stale_vloopback_mountpoint_error(container_error)
         ):
             return False
         # one recovery per pod at a time: a second check cycle acting on the same stale verdict
@@ -11990,6 +12017,7 @@ class DockerService:
                 container_name=container_name,
                 pod_id=pod_id,
                 orphaned_task_id=orphaned_task_id,
+                stale_cgroup=stale_cgroup,
                 local_volume_path=local_volume_path,
                 default_extra=default_extra,
             )
@@ -12008,6 +12036,7 @@ class DockerService:
         orphaned_task_id: str | None,
         local_volume_path: str | None,
         default_extra: dict[str, Any],
+        stale_cgroup: bool = False,
     ) -> bool:
         log_extra = {**default_extra, "container_name": container_name}
         try:
@@ -12048,8 +12077,8 @@ class DockerService:
                 )
             )
             return False
-        # an orphaned-shim pod may have no stale mountpoint at all; its start is the test
-        if not repaired_volume and not orphaned_task_id:
+        # an orphaned-shim or leftover-cgroup pod may have no stale mountpoint at all; its start is the test
+        if not repaired_volume and not orphaned_task_id and not stale_cgroup:
             logger.warning(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED",
@@ -12066,16 +12095,27 @@ class DockerService:
                 log_extra,
             )
             require_rental_docker_ssh_host_key(executor_info)
+            start = partial(
+                self.start_existing_container,
+                executor_info=executor_info,
+                private_key=private_key,
+                known_hosts_policy=known_hosts_policy,
+                container_name=container_name,
+                local_volume_path=local_volume_path,
+                pod_id=pod_id,
+                default_extra=log_extra,
+            )
             with node_owner(miner_hotkey):  # a hostname node's DNS counts against its miner
-                await self.start_existing_container(
-                    executor_info=executor_info,
-                    private_key=private_key,
-                    known_hosts_policy=known_hosts_policy,
-                    container_name=container_name,
-                    local_volume_path=local_volume_path,
-                    pod_id=pod_id,
-                    default_extra=log_extra,
-                )
+                try:
+                    await start()
+                except Exception as exc:
+                    # 5 Nov: after a host Docker restart both pods' starts failed on the old run's
+                    # leftover cgroup until a reboot recreated them; clear it and start once more
+                    if not _is_stale_container_cgroup_error(str(exc)) or not await self._remove_stale_container_cgroup(
+                        ssh_client, container_name, log_extra
+                    ):
+                        raise
+                    await start()
         except asyncio.CancelledError:
             # the whole check runs under an outer timeout, so a cancellation can land between
             # `docker start` and the gocryptfs remount and leave the container up with its
@@ -12604,6 +12644,32 @@ class DockerService:
         except Exception:  # left to its expiry
             logger.warning(_m("POD_RECOVERY_PAUSE_RECORD_UNAVAILABLE", extra=get_extra_info({"pod_id": pod_id})))
         return True
+
+    async def _remove_stale_container_cgroup(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        log_extra: dict[str, Any],
+    ) -> bool:
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect {shlex.quote(container_name)} --format '{{{{.Id}}}}'",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        container_id = (inspect_result.stdout or "").strip()
+        if getattr(inspect_result, "exit_status", 0) != 0 or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            return False
+        removed = await ssh_client.run(
+            DockerCommand.remove_stale_container_cgroup(container_id),
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        result = (removed.stdout or "").strip()
+        logger.info(
+            _m(
+                "POD_STALE_CGROUP_REMOVED" if result == "removed" else "POD_STALE_CGROUP_RECOVERY_SKIPPED",
+                extra=get_extra_info({**log_extra, "result": result}),
+            )
+        )
+        return result == "removed"
 
     async def _kill_orphaned_task_shim(
         self,
