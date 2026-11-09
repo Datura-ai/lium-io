@@ -511,3 +511,90 @@ def test_failed_main_only_install_falls_back_to_all_sources(harness):
         "install -y --no-install-recommends openssh-server ncurses-term xauth python3 wget ca-certificates",
     ]
     assert "retrying with all of the image's apt sources" in result.stdout
+
+
+# DAH-6029: one fixture across the deb822 / one-line grammar, checked against apt's own parser.
+GRAMMAR_LIST = """# deb http://commented.example/debian stable main
+deb http://http.kali.org/kali kali-rolling main contrib non-free
+deb-src http://http.kali.org/kali kali-rolling main
+deb [arch=amd64 signed-by=/etc/apt/keyrings/x.gpg] https://ppa.example/ubuntu noble main
+"""
+GRAMMAR_FLAT = "deb [signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /\n"
+GRAMMAR_SOURCES = """## a comment paragraph before the first stanza
+
+types: deb deb-src
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates
+# a comment inside the stanza
+COMPONENTS: restricted
+ main
+# a comment between continuation lines
+ universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu/
+suites: noble-security
+components: main universe
+signed-by: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://disabled.example/
+Suites: s
+Components: main
+Enabled: no
+
+Types: deb
+URIs: http://universe-only.example/
+Suites: s
+Components: universe multiverse
+"""
+
+
+def _apt_targets(source_list: Path, parts: Path, lists: Path) -> set[str]:
+    out = subprocess.run(
+        [
+            "apt-get", "indextargets", "--no-release-info",
+            "-o", f"Dir::Etc::SourceList={source_list}", "-o", f"Dir::Etc::SourceParts={parts}",
+            "-o", f"Dir::State::Lists={lists}",
+            "--format", "$(TARGET_OF) $(REPO_URI) $(RELEASE) $(COMPONENT) $(IDENTIFIER)",
+        ],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return {line for line in out.splitlines() if line.strip()}
+
+
+@pytest.mark.parametrize("awk", ["mawk", "gawk"])
+def test_main_only_sources_match_apts_own_parse(tmp_path, awk):
+    awk_bin = next((Path(d, awk) for d in os.environ["PATH"].split(":") if Path(d, awk).exists()), None)
+    if awk_bin is None or not any(Path(d, "apt-get").exists() for d in os.environ["PATH"].split(":")):
+        pytest.skip(f"needs {awk} and apt-get")
+    etc = tmp_path / "etc"
+    (etc / "sources.list.d").mkdir(parents=True)
+    (etc / "sources.list").write_text(GRAMMAR_LIST)
+    (etc / "sources.list.d" / "cuda.list").write_text(GRAMMAR_FLAT)
+    (etc / "sources.list.d" / "ubuntu.sources").write_text(GRAMMAR_SOURCES)
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    os.symlink(awk_bin, shims / "awk")
+    script = SCRIPT.read_text()
+    func = script[script.index("apt_main_only_dir() {"):]
+    func = func[: func.index("\n}\n") + 3]
+    narrowed = Path(
+        subprocess.run(
+            ["sh", "-c", f'APT_ETC="$1"\n{func}apt_main_only_dir', "sh", str(etc)],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "PATH": f"{shims}:{os.environ['PATH']}"},
+        ).stdout.strip()
+    )
+
+    original = _apt_targets(etc / "sources.list", etc / "sources.list.d", tmp_path / "l1")
+    wanted = {t for t in original if t.startswith("deb ") and t.split()[3] == "main"}
+    got = _apt_targets(narrowed / "sources.list", narrowed / "parts", tmp_path / "l2")
+
+    assert wanted and got == wanted
+    # the kept stanzas keep their own keys
+    parts = "".join(p.read_text() for p in (narrowed / "parts").iterdir())
+    assert parts.count("Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg") == 1
+    assert parts.count("signed-by: /usr/share/keyrings/ubuntu-archive-keyring.gpg") == 1
+    assert "signed-by=/etc/apt/keyrings/x.gpg" in (narrowed / "sources.list").read_text()
