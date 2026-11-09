@@ -30,6 +30,10 @@ class MixedFormulaInputs(BaseModel):
     unrented: dict[str, Any]
 
 
+# DAH-5805: a run the validator's own Redis ended (no pooled connection, a timeout) says nothing about the node
+VALIDATOR_REDIS_UNAVAILABLE = "VALIDATOR_REDIS_UNAVAILABLE"
+
+
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
@@ -43,6 +47,9 @@ class JobResult(BaseModel):
     # One timestamp shared by every executor finalized in this validator cycle.
     # It is assigned after final weights are calculated and is the accounting/day key.
     scored_at: datetime | None = None
+    # Set by the express lane: when its run outside the cycle started (the backend reads it, not job_batch_id,
+    # against a maintenance window's end).
+    check_started_at: datetime | None = None
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
@@ -122,6 +129,9 @@ class JobResult(BaseModel):
     # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
     # from; scored like the cycle it came from, never published
     carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
+    # DAH-5718: the validator's own SSH session died in the port check; no verdict this cycle (withheld at cycle end),
+    # only the findings of the checks that finished are published
+    session_lost_in_port_check: bool = Field(default=False, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic

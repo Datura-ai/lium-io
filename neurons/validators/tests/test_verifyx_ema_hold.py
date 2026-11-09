@@ -158,7 +158,11 @@ async def _cycle_with_the_image_check(context_factory, probes, rented_data, redi
     ssh = (
         _ssh_seq(_result(stdout="[]"))
         if cached
-        else _ssh_seq(_result(exit_status=1), _result(stdout=_prefetch_doc(pull_error=None, last_outcome="pulling")))
+        else _ssh_seq(
+            _result(exit_status=1),
+            _result(exit_status=1),
+            _result(stdout=_prefetch_doc(pull_error=None, last_outcome="pulling")),
+        )
     )
     ctx = context_factory(
         services=build_services(verifyx=probes, backend=_backend(images=[_IMAGE]), redis=redis),

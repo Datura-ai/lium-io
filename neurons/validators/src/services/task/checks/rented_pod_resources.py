@@ -109,6 +109,7 @@ class RentedPodResourcesCheck:
     """
 
     check_id = "host.validate.rented_pod_resources"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
