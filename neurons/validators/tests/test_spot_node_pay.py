@@ -346,6 +346,17 @@ async def test_spot_without_a_lium_filler_gets_zero():
 
 
 @pytest.mark.asyncio
+async def test_spot_whose_config_earned_zero_is_not_seeded_with_its_secure_rate():
+    spot = _spot(filler_revenue_per_gpu_hour=0.0, filler_revenue_usd_per_hour=0.0)
+
+    await _run([spot])
+
+    assert spot.effective_rate == 0.0
+    assert spot.incentive == 0.0
+    assert _logged(spot, "Spot-tier rate seeded") == []
+
+
+@pytest.mark.asyncio
 async def test_spot_whose_config_has_no_average_is_seeded_with_its_secure_rate():
     # Fish 23 Oct: every GPU model gets idle pay; the seed is not scaled down by the model's (tiny) earnings
     spot = _spot(filler_revenue_per_gpu_hour=None, filler_revenue_usd_per_hour=None)
@@ -1197,7 +1208,7 @@ def test_thin_sample_reads_as_no_average():
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24.5) is None
 
 
-@pytest.mark.parametrize("value", [0.0, -1.0, math.nan, math.inf])
+@pytest.mark.parametrize("value", [-1.0, math.nan, math.inf])
 def test_unusable_average_reads_as_no_average(value):
     data = _rented_data(
         FillerRevenueByGpuConfig(
@@ -1206,6 +1217,14 @@ def test_unusable_average_reads_as_no_average(value):
     )
 
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) is None
+
+
+def test_a_measured_zero_average_is_zero_not_unmeasured():
+    data = _rented_data(
+        FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=0.0, gpu_hours=100)
+    )
+
+    assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) == 0.0
 
 
 async def _handled(

@@ -230,7 +230,8 @@ class RentedExecutorsResponse(BaseModel):
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
     ) -> float | None:
         """The configuration's average filler USD per GPU-hour, or None when there is no usable
-        sample: no entry, a sample under min_gpu_hours, or a value that is not a positive number."""
+        sample: no entry, a sample under min_gpu_hours, or a value that is negative or not finite. A measured
+        zero stays 0.0: that configuration's Default Jobs earned nothing, which is not "unmeasured"."""
         if not base_model:
             return None
         for entry in self.filler_revenue_by_gpu_config:
@@ -238,7 +239,7 @@ class RentedExecutorsResponse(BaseModel):
                 continue
             if not entry.gpu_hours >= min_gpu_hours:
                 return None
-            if not (entry.usd_per_gpu_hour > 0 and math.isfinite(entry.usd_per_gpu_hour)):
+            if not (entry.usd_per_gpu_hour >= 0 and math.isfinite(entry.usd_per_gpu_hour)):
                 return None
             return entry.usd_per_gpu_hour
         return None
