@@ -53,6 +53,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
      rental_incentive_calculated, spot_pay_incentive_calculated,
+     idle_rate_capped_at_default_job_earnings (DAH-6030: the per-model cap lowered the
+       node's rate or its secure floor),
      secure_filler_revenue_floor_applied (the secure floor paid a top-up on the listed or
        diluted rate), secure_filler_revenue_floor_not_paid (no room at the burn cap),
      mining_score_missing (internal-error case),
@@ -833,6 +835,28 @@ class MinerLogLine(BaseModel):
                 "unbucketed_share": result.unbucketed_share,
                 "unbucketed_rental_cost": result.unbucketed_rental_cost,
                 "paid_fraction": paid_fraction,
+            },
+        )
+
+    @staticmethod
+    def idle_rate_capped_at_default_job_earnings(
+        result: JobResult, cap: float, rate_before: float | None
+    ) -> MinerLogLine:
+        # report line, not a zero reason: the node is still paid, at a lower rate
+        return MinerLogLine(
+            message=(
+                "Default Job earnings cap: an idle GPU-hour of this GPU model is paid at most "
+                f"{cap:.4g} USD this cycle (a share of what this model's Default Jobs earn per idle GPU-hour), "
+                "so this executor's rate or its secure floor top-up is limited to that."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "idle_rate_capped_at_default_job_earnings",
+                "cap_usd_per_gpu_hour": cap,
+                "rate_before_cap": rate_before,
+                "hourly_rate": result.hourly_rate,
             },
         )
 
