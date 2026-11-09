@@ -429,15 +429,17 @@ class ComputeClient:
             await self.handle_message(raw_msg)
 
     async def _resend_host_fault_failures(self) -> None:
-        """DAH-5592: the host-fault create failures of the last HOST_FAULT_FAILURE_RESEND_SECONDS, again on this socket."""
-        try:
-            raws = await self.miner_service.redis_service.recent_host_fault_failures(
-                settings.HOST_FAULT_FAILURE_RESEND_SECONDS
-            )
-            replies = [BaseValidatorResponse.parse(raw) for raw in raws]
-        except Exception:
-            logger.exception(_m("Could not read the kept host-fault create failures", extra=self.logging_extra))
-            return
+        """DAH-5592: the host-fault create failures of the last HOST_FAULT_FAILURE_RESEND_SECONDS, again on this socket.
+        A failed Redis read raises: run_forever then reconnects and reads again, since nothing else would resend them."""
+        raws = await self.miner_service.redis_service.recent_host_fault_failures(
+            settings.HOST_FAULT_FAILURE_RESEND_SECONDS
+        )
+        replies = []
+        for raw in raws:
+            try:
+                replies.append(BaseValidatorResponse.parse(raw))
+            except Exception:  # one unreadable record is skipped, not retried by reconnecting forever
+                logger.exception(_m("Skipped an unreadable kept host-fault create failure", extra=self.logging_extra))
         if not replies:
             return
         async with self.lock:

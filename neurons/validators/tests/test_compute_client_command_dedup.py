@@ -320,3 +320,36 @@ async def test_a_host_fault_create_failure_is_sent_again_on_each_new_socket_for_
     await client._resend_host_fault_failures()
     assert client.message_queue == []
     assert await client.miner_service.redis_service.hgetall(redis_module.HOST_FAULT_FAILURES_KEY) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_read_of_the_kept_failures_raises_so_the_next_socket_reads_them_again(client):
+    """DAH-5592 review (29b7155): a Redis read error must not end the resend for this socket's lifetime; it raises,
+    run_forever reconnects, and the failure goes out once Redis is back."""
+    import services.redis_service as redis_module
+
+    client.miner_service.handle_container.return_value = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+        error_code=FailedContainerErrorCodes.ExecutorUnreachable,
+        msg="Error: Executor unreachable",
+    )
+    await client.miner_driver(request("reboot-a"))
+    client.message_queue.clear()
+    redis = client.miner_service.redis_service
+    real_hgetall = redis.hgetall
+
+    async def down(key):
+        raise ConnectionError("redis down")
+
+    redis.hgetall = down
+    with pytest.raises(ConnectionError):
+        await client._resend_host_fault_failures()
+    assert client.message_queue == []
+
+    redis.hgetall = real_hgetall  # Redis back; the reconnect authenticates a new socket
+    await client._resend_host_fault_failures()
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["reboot-a"]
+    assert await redis.hgetall(redis_module.HOST_FAULT_FAILURES_KEY)  # still kept for later sockets
