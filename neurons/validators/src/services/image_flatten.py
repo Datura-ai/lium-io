@@ -228,15 +228,19 @@ def _flatten_command(
 
 
 def _export_count_check(factor: int, fixed_bytes: int) -> str:
-    """Count the export, stopping one byte past what the free disk allows; refuse (container removed) past it."""
+    """Count the whole export within the deadline; refuse (container removed) when the free disk cannot hold it,
+    naming the bytes needed and free when the count completed, so the refusal can state the shortfall."""
     t = FLATTEN_TIMEOUT_SECONDS
     gone = '/usr/bin/docker rm -fv "$cid" >/dev/null 2>&1'
+    need = f'$(( {int(factor)} * eb + {int(fixed_bytes)} ))'
     return (
         f'cap=$(( (avail - {int(fixed_bytes)}) / {int(factor)} )); st=$(mktemp); '
-        f'eb=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") | head -c $((cap + 1)) | wc -c); '
+        f'eb=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") | wc -c); '
         'erc=$(cat "$st"); rm -f "$st"; '
-        # a wc output test cannot read refuses too
-        f'[ "$eb" -le "$cap" ] 2>/dev/null || {{ {gone}; echo "flatten refused: the export is larger than the free disk allows" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
+        # a wc output test cannot read refuses too, without numbers (an arithmetic error would end sh)
+        f'[ "$eb" -le "$cap" ] 2>/dev/null || {{ {gone}; '
+        f'[ "$erc" = 0 ] && [ "$eb" -ge 0 ] 2>/dev/null && echo "flatten need={need} avail=$avail" >&2; '
+        f'echo "flatten refused: the export is larger than the free disk allows" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
         f'[ "$erc" = 0 ] || {{ {gone}; echo "flatten failed: counting export=$erc" >&2; exit 98; }}; '
     )
 
@@ -563,9 +567,11 @@ async def flatten_image_on_host(
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
     if result.exit_status == FLATTEN_NO_DISK_EXIT:
-        avail = re.search(r"flatten avail=(\d+)", str(result.stderr or ""))
-        if avail and int(avail.group(1)) < need_bytes:
-            short = need_bytes - int(avail.group(1))
+        # the Size check prints avail only; the containerd export count prints the bytes it needs too
+        found = re.search(r"flatten (?:need=(\d+) )?avail=(\d+)", str(result.stderr or ""))
+        need = int(found.group(1) or need_bytes) if found else 0
+        if found and int(found.group(2)) < need:
+            short = need - int(found.group(2))
             raise ImageFlattenNoDisk(flatten_no_disk_sentence(short), short_bytes=short)
         raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
     if result.exit_status != 0:

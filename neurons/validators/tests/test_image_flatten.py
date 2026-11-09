@@ -16,6 +16,7 @@ from services.image_flatten import (
     FLATTEN_LOCK_PATH,
     FLATTEN_USE_LOCK_PATH,
     FLATTEN_NO_DISK_EXIT,
+    FLATTEN_NO_DISK_RENTER_SENTENCE,
     ImageFlattenNoDisk,
     _flatten_command,
     flatten_image_on_host,
@@ -102,17 +103,32 @@ async def test_the_no_disk_exit_raises_the_renter_sentence_and_other_failures_ra
         await flatten_image_on_host(_ssh(exists=False, flatten_rc=98), "lmsysorg/sglang:dev", lease="r1")
 
 
+_RESERVED = 79 * 1024**3
+_NEED = 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + _RESERVED
+
+
 @pytest.mark.asyncio
-async def test_the_no_disk_refusal_names_the_disk_to_give_up():
-    reserved = 79 * 1024**3
-    need = 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + reserved
-    ssh = _ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT, stderr=f"flatten avail={need - 5 * 1024**3}\n")
+@pytest.mark.parametrize(
+    "stderr, short_gb",
+    [
+        # the Size-based check: the need is the one the validator computed
+        (f"flatten avail={_NEED - 5 * 1024**3}\n", 5),
+        # the containerd export count: a sparse image's export needs more than Size says
+        (f"flatten need={_NEED + 7 * 1024**3} avail={_NEED - 2 * 1024**3}\nflatten refused: the export is larger\n", 9),
+        # another create sized its disk meanwhile, or a count that did not complete: no shortfall to name
+        ("flatten refused: another create sized its disk meanwhile\n", None),
+        ("flatten refused: the export is larger than the free disk allows\n", None),
+    ],
+)
+async def test_the_no_disk_refusal_names_the_shortfall_when_measured(stderr, short_gb):
+    ssh = _ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT, stderr=stderr)
     with pytest.raises(ImageFlattenNoDisk) as exc:
-        await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=reserved)
-    assert exc.value.renter_sentence.endswith("(5 GB short); use a smaller image or one with fewer layers")
-    assert "more free disk" not in exc.value.renter_sentence
-    assert "order" not in exc.value.renter_sentence
-    assert exc.value.short_bytes == 5 * 1024**3
+        await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=_RESERVED)
+    if short_gb is None:
+        assert exc.value.renter_sentence == FLATTEN_NO_DISK_RENTER_SENTENCE and exc.value.short_bytes is None
+    else:
+        assert exc.value.renter_sentence.endswith(f"({short_gb} GB short); use a smaller image or one with fewer layers")
+        assert exc.value.short_bytes == short_gb * 1024**3
     assert 'echo "flatten avail=$avail" >&2' in ssh.run.await_args_list[-1].args[0]
 
 
@@ -517,9 +533,12 @@ def test_the_containerd_disk_check_budgets_the_bytes_the_export_really_writes(
         tmp_path, avail=100, need_bytes=2 * size + 10, export_bytes=export_bytes, export_rc=export_rc,
         export_factor=2, fixed_bytes=10,
     )
-    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == expected_rc
+    result = subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]})
+    assert result.returncode == expected_rc
     assert sorted(c.split()[0] for c in _calls(tmp_path)) == sorted(expected_calls)
     assert "rm -fv cid1" in _calls(tmp_path)
+    # a refusal counts the whole export, so it names the real need: twice the export plus the kept bytes
+    assert (b"flatten need=130 avail=100" in result.stderr) == (export_bytes == 60)
 
 
 def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(tmp_path):
@@ -798,4 +817,4 @@ async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(d
     command = ssh.run.await_args_list[-1].args[0]
     assert f"-ge {copies * 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
     # containerd also counts the real export bytes (a sparse file reports a small Size); overlay2's Size does not under-count
-    assert ("head -c" in command) == (copies == 2)
+    assert ("| wc -c" in command) == (copies == 2)
