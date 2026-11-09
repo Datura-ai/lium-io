@@ -2191,6 +2191,22 @@ class NvlinkFaultMessages:
             "sees the GPUs again. If the errors come back, service the board."
         ),
     )
+    MULTICAST_FAILED = MessageTemplate(
+        event="NVLink multicast is broken: a GPU cannot join a multicast object across the board",
+        reason="NVLINK_FAULT",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink multicast works again",
+        remediation=(
+            "cuMulticastAddDevice returns CUDA_ERROR_UNKNOWN (999) on a full NVLink board whose GPUs report "
+            "multicast support, so NCCL NVLink SHARP (NVLS) cannot start. Check that nvidia-fabricmanager runs "
+            "the same version as the driver and that `nvidia-smi -q` shows Fabric State Completed on every "
+            "GPU, and check the host `dmesg` for NVRM Xid lines. Stop the workloads, restart "
+            "nvidia-fabricmanager or reboot, then restart the executor container "
+            "(`docker restart executor-executor-1`). If it comes back, update the driver and fabric manager "
+            "together or service the board."
+        ),
+    )
     MISSING = MessageTemplate(
         event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
         reason="NVLINK_MISSING",
