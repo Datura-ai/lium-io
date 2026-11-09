@@ -10987,6 +10987,19 @@ class DockerService:
                         )
                     )
                 except Exception as post_run_exc:
+                    if (
+                        isinstance(post_run_exc, ImageExitedDuringKeyInjection)
+                        and not post_run_exc.log_tail
+                        and payload.workload_kind == WorkloadKind.FILLER
+                    ):
+                        # a restarting image's output can land after the first read: read once more before
+                        # the cleanup removes the container
+                        post_run_exc.log_tail = await _container_log_tail_or_empty(
+                            docker_client,
+                            container_name=container_id or container_name,
+                            environment=custom_options.environment if custom_options else None,
+                            log_extra=default_extra,
+                        )
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
