@@ -548,3 +548,30 @@ async def test_the_host_limit_under_our_pearl_cap_reaches_the_specs(
     (detail,) = specs["gpu"]["details"]
     assert detail.get("power_host_limit") == expected_host
     assert detail["power_limit"] == live  # Pearl's guard still reads the live cap
+
+
+@pytest.mark.asyncio
+async def test_a_low_power_limit_names_each_gpu_measured_and_required(context_factory, read_records_mock) -> None:
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    # the requirement is the message's own wording, never a second copy of the threshold
+    assert result.event.remediation.startswith(
+        "GPU 0: 105 W limit, default 350 W (30%). Restore the GPU power limit to at least 80% of the default"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_limit", [279.9, 279.99, 279.9999999])
+async def test_a_power_limit_just_under_the_floor_never_shows_as_meeting_it(
+    context_factory, read_records_mock, current_limit
+) -> None:
+    ctx = context_factory(state=_state(current_limit=current_limit, default_limit=350))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    # neither the watts nor the ratio round up onto the 280 W / 80% floor the GPU failed
+    assert result.event.remediation.startswith(
+        "GPU 0: 279 W limit, default 350 W (79%). Restore the GPU power limit to at least 80% of the default"
+    )

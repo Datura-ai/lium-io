@@ -18,10 +18,12 @@ from services.task.checks import rented_throughput as module
 from services.task.checks.container_download_speed import CAP_BYTES
 from services.task.checks.rented_throughput import (
     RentedThroughputCheck,
+    _State,
     parse_busy,
     parse_disk,
     parse_during,
     pods_incomplete,
+    slow_detail,
     throughput_command,
 )
 from services.task.messages import RentedThroughputMessages as Msg
@@ -92,6 +94,19 @@ def snaps(
 
 def disk(mb: int = 256, secs: float = 0.5, rc: int = 0) -> str:
     return f"lium_disk bytes={mb * 1024 * 1024} start=10.0 end={10 + secs} rc={rc}\n"
+
+
+
+async def test_a_standing_disk_verdict_never_reports_a_passing_write_as_the_failure():
+    with flags() as clock:
+        ctx, _ = make_ctx(SLOW_DISK, SLOW_DISK, BUSY_DISK)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        await check.run(ctx)
+        clock.now += 31 * 60
+        slow = await check.run(ctx)
+    assert slow.updates["rented_throughput_slow_detail"] == "disk"
 
 
 GOOD = snaps() + disk() + FAST
@@ -278,12 +293,84 @@ async def test_two_slow_readings_zero_the_score_until_that_side_passes(answer, r
         clock.now += 31 * 60
         second = await check.run(ctx)
         assert not second.passed and second.event.reason_code == Msg.SLOW.reason
-        assert second.updates == {"rented_throughput_passed": False}
+        assert second.updates["rented_throughput_passed"] is False
         assert "on that resource stayed under its busy threshold" in second.event.remediation
         clock.now += 60  # the finding stands between readings
         assert (await check.run(ctx)).passed is False and len(runner.commands) == 2
         clock.now += 31 * 60
         assert (await check.run(ctx)).passed is True
+
+
+# a failure whose retry never ran (the node was unrented for hours) is not "in a row" with the next rental's first reading
+async def test_a_failure_from_hours_ago_starts_no_streak():
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_NET, SLOW_NET, SLOW_NET)
+        check = RentedThroughputCheck()
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW_ONCE.reason
+        clock.now += 5 * 3600
+        late = await check.run(ctx)
+        assert late.passed and late.event.reason_code == Msg.SLOW_ONCE.reason and len(runner.commands) == 2
+        clock.now += 31 * 60  # a retry on time still counts
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW.reason
+
+
+# a confirmed SLOW does not expire when later cycles are too short to measure: only a passing reading clears it
+async def test_a_standing_slow_verdict_does_not_expire_with_time():
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_NET, SLOW_NET)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).event.reason_code == Msg.SLOW.reason
+        clock.now += 2 * 3600
+        with patch.object(module, "task_seconds_left", lambda ctx: 0):
+            late = await check.run(ctx)
+        assert not late.passed and late.event.reason_code == Msg.SLOW.reason and len(runner.commands) == 2
+
+
+# a lone strike past STREAK_GAP_SECONDS keeps its 30-min retry: the overdue reading runs (the strike expires only then)
+# and late cycles still count toward NOT_RUN
+@pytest.mark.parametrize("gap_minutes, reason", [(89, Msg.SLOW.reason), (91, Msg.SLOW_ONCE.reason), (300, Msg.SLOW_ONCE.reason)])
+async def test_an_overdue_retry_still_measures_and_expires_the_strike_only_then(gap_minutes, reason):
+    with flags() as clock:
+        ctx, runner = make_ctx(SLOW_NET, SLOW_NET)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += gap_minutes * 60
+        late = ctx.model_copy(update={"started_at_monotonic": ctx.started_at_monotonic - 650})
+        for skips in range(1, module.LATE_SKIPS_BEFORE_VERDICT):
+            assert (await check.run(late)).event.reason_code == Msg.SKIPPED.reason
+            assert stored(ctx)["late_skips"] == skips
+        assert (await check.run(late)).event.reason_code == Msg.NOT_RUN.reason
+        assert (await check.run(ctx)).event.reason_code == reason and len(runner.commands) == 2
+
+
+SLOW_BOTH = snaps() + disk(secs=30.0) + SLOW
+
+
+# each side's lone strike expires on its own; a confirmed side's streak stays (net, disk counts after the reading)
+@pytest.mark.parametrize(
+    "before, after, counts, reason",
+    [
+        ([SLOW_NET, SLOW_BOTH], SLOW_DISK, (0, 1), Msg.SLOW_ONCE.reason),  # stale disk strike gone, net passed
+        ([SLOW_DISK, SLOW_BOTH], SLOW_NET, (1, 0), Msg.SLOW_ONCE.reason),  # stale net strike gone, disk passed
+        ([SLOW_NET, SLOW_BOTH], SLOW_BOTH, (3, 1), Msg.SLOW.reason),  # confirmed net kept, disk restarts
+        ([SLOW_DISK, SLOW_BOTH], SLOW_BOTH, (1, 3), Msg.SLOW.reason),  # confirmed disk kept, net restarts
+        ([SLOW_BOTH], SLOW_BOTH, (1, 1), Msg.SLOW_ONCE.reason),
+    ],
+    ids=["stale-disk", "stale-net", "confirmed-net", "confirmed-disk", "both-stale"],
+)
+async def test_stale_strikes_expire_per_side(before, after, counts, reason):
+    with flags() as clock:
+        ctx, _ = make_ctx(*before, after)
+        check = RentedThroughputCheck()
+        for _ in before:
+            await check.run(ctx)
+            clock.now += 31 * 60
+        clock.now += 5 * 3600
+        assert (await check.run(ctx)).event.reason_code == reason
+        assert (stored(ctx)["net_failures"], stored(ctx)["disk_failures"]) == counts
+        assert stored(ctx)["failures_in_a_row"] == max(counts)
 
 
 # the host NICs busy either way (inconclusive), or their counters unreadable (no verdict): no strike, the streak stays
@@ -751,7 +838,7 @@ async def test_only_a_reading_on_the_rentals_network_judges_the_network(network,
         clock.now += 31 * 60
         third = await check.run(ctx)
     assert third.passed is (on_rentals and fast)
-    assert third.updates == ({} if on_rentals and fast else {"rented_throughput_passed": False})
+    assert third.updates.get("rented_throughput_passed", True) is (on_rentals and fast)
     with flags() as clock:  # two slow bridge readings never zero the score
         ctx, _ = make_ctx(answer, answer)
         check = RentedThroughputCheck()
@@ -1234,3 +1321,79 @@ async def test_a_slow_redis_save_after_a_reading_never_drops_the_cycle():
             result = await asyncio.wait_for(RentedThroughputCheck().run(ctx), 5)
         assert result.passed and len(runner.commands) == 1
         assert module._UNSAVED[EXECUTOR.uuid].reading
+
+
+@pytest.mark.parametrize(
+    "answer, detail",
+    [
+        (SLOW_NET, r"network: pypi \d+\.\d Mbps measured, 10 Mbps required"),
+        (SLOW_DISK, r"disk: \d+\.\d MB/s measured, 50 MB/s required"),
+        (SLOW_BOTH, r"network: pypi \d+\.\d Mbps measured, 10 Mbps required; disk: \d+\.\d MB/s measured, 50 MB/s required"),
+    ],
+    ids=["network", "disk", "both"],
+)
+async def test_a_slow_verdict_names_the_failed_side_with_measured_and_required_values(answer, detail):
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        slow = await check.run(ctx)
+    assert re.fullmatch(detail, slow.updates["rented_throughput_slow_detail"])
+    assert slow.event.remediation.startswith(f"failed: {slow.updates['rented_throughput_slow_detail']}. ")
+    ctx = ctx.model_copy(update=slow.updates)
+    _, _, warning = calculate_scores(ctx, rented=True)
+    assert f"network or disk throughput ({slow.updates['rented_throughput_slow_detail']})" in warning
+
+
+# the standing verdict names only endpoints a failing reading confirmed: an HF cut the validator also sees is never
+# the failure, whether it rides beside a slow PyPI or arrives on a later no-verdict reading
+HF_CUT = line("hf", 1024, 0.2, 1, "wget: connection closed prematurely")
+SLOW_PYPI_HF_CUT = snaps() + disk() + RENTALS + line("pypi", 1_800_000, 30.0, 143) + HF_CUT
+PYPI_OK_HF_CUT = snaps() + disk() + RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + HF_CUT
+
+
+@pytest.mark.parametrize(
+    "answers, detail",
+    [
+        ((SLOW_PYPI_HF_CUT, SLOW_PYPI_HF_CUT), r"network: pypi \d+\.\d Mbps measured, 10 Mbps required"),
+        ((SLOW_NET, SLOW_NET, PYPI_OK_HF_CUT), "network"),
+    ],
+    ids=["unconfirmed-hf-beside-slow-pypi", "later-no-verdict-reading"],
+)
+async def test_a_slow_verdict_names_only_confirmed_endpoints(answers, detail):
+    with flags(reachable=False) as clock:
+        ctx, _ = make_ctx(*answers)
+        check = RentedThroughputCheck()
+        for _ in answers:
+            slow = await check.run(ctx)
+            clock.now += 31 * 60
+    assert re.fullmatch(detail, slow.updates["rented_throughput_slow_detail"])
+
+
+async def test_a_reading_sends_one_control_request_per_endpoint_and_names_the_confirmed_one():
+    # both fetches cut: _judge's control requests (PyPI fails, HF answers) are reused, never repeated
+    both_cuts = snaps() + disk() + RENTALS + line("pypi", 0, 30.0, 143) + line("hf", 0, 30.0, 143)
+    urls = dict(download_module.ENDPOINTS)
+    reaches = AsyncMock(side_effect=lambda url: url == urls["hf"])
+    with flags(), patch.object(download_module, "validator_reaches", reaches):
+        ctx, _ = make_ctx(both_cuts)
+        reading, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert net == "fail"
+    assert sorted(c.args[0] for c in reaches.await_args_list) == sorted(urls.values())
+    assert [e.split()[0] for e in reading["net_failed"]] == ["hf"]
+
+
+@pytest.mark.parametrize(
+    "verdict, mb, detail",
+    [
+        ("fail", 8.9, "disk: 8.9 MB/s measured, 50 MB/s required"),
+        ("pass", 80.0, "disk"),
+        ("none", 8.9, "disk"),
+        ("inconclusive", 8.9, "disk"),
+    ],
+)
+def test_a_standing_disk_verdict_names_only_a_write_this_reading_judged_failing(verdict, mb, detail):
+    # two confirmed failures stand; a later excused (renter load) or unsure write is not published as the failure
+    reading = {"disk": {"mb_per_s": mb}, "disk_min_mb_per_s": 50, "disk_verdict": verdict}
+    assert slow_detail(_State(at=0, disk_failures=2, reading=reading)) == detail

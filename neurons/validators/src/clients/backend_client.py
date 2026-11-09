@@ -476,6 +476,7 @@ class BackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        timeout: int = 300,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -498,6 +499,7 @@ class BackendClient:
             loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
                 probes that plugin; without it (or on an older backend, which ignores it) only the
                 legacy plugin is probed. None omits the field.
+            timeout: Seconds to wait; the backend needs time to SSH and verify the container.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -528,13 +530,23 @@ class BackendClient:
         if executor_id:
             json_data["executor_id"] = executor_id
 
-        return await self.post(
-            path,
-            ExecutorHealthCheckResponse,
-            json_data=json_data,
-            add_signature=True,  # Use standard signature headers
-            timeout=300,  # 5 minutes - backend needs time to SSH and verify container
-        )
+        try:
+            # the whole call, retries included: a connection retry must not restart the wait
+            return await asyncio.wait_for(
+                self.post(
+                    path,
+                    ExecutorHealthCheckResponse,
+                    json_data=json_data,
+                    add_signature=True,  # Use standard signature headers
+                    timeout=timeout,
+                ),
+                timeout,
+            )
+        except TimeoutError:
+            logger.error(
+                _m("Executor health check timeout", extra=get_extra_info({"path": path, "timeout": timeout}))
+            )
+            return None
 
     async def report_verification_started(
         self, *, job_batch_id: str, miner_hotkey: str, executor_uuids: list[str], started_at: datetime

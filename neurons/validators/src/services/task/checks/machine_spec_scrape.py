@@ -367,6 +367,8 @@ class MachineSpecScrapeCheck:
     """
 
     check_id = "gpu.scrape.machine_spec"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     DEFAULT_TIMEOUT = 300
