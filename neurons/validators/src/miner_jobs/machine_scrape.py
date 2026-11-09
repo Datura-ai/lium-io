@@ -1502,9 +1502,9 @@ def get_host_boot_id() -> str:
 # The node is listed at the geo of the address the validator connects to; behind a reverse proxy
 # that is the proxy's. The backend geolocates the host's own egress address instead (Cloudflare's
 # trace echoes the caller's IP). "" when the fetch fails: the backend then keeps the connect address.
-# The trace runs in the host's network namespace (the executor has pid: host and is privileged),
-# where renter pods' traffic leaves the host: the executor container's own route may differ.
-# Never falls back to the container's route. The name is resolved in the container first, since its
+# The trace runs where renter pods' traffic leaves: in a running pod's network namespace (the
+# executor has pid: host and is privileged), else, or when that fails, in the host's. The executor
+# container's own route may differ, so it never falls back to the container's route. The name is resolved in the container first, since its
 # resolv.conf may point at docker's embedded DNS, which the host namespace cannot reach.
 EGRESS_TRACE_HOST = "www.cloudflare.com"
 EGRESS_TRACE_PATH = "/cdn-cgi/trace"
@@ -1518,21 +1518,36 @@ def get_egress_ip() -> str:
         )[0][4][0]
         env = {**os.environ}
         env.pop("LD_LIBRARY_PATH", None)
-        body = subprocess.run(
-            [
-                "nsenter", "-t", "1", "-n",
-                "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
-                "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
-                f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
-            ],
-            capture_output=True, text=True, check=True, env=env,
-            timeout=EGRESS_TRACE_TIMEOUT_SECONDS + 5,
-        ).stdout[:4096]
     except Exception:
         return ""
-    for line in body.splitlines():
-        if line.startswith("ip="):
-            return line[3:].strip()[:64]
+    netns_pids = []
+    try:
+        for container in docker_api_get("/containers/json"):
+            if any(name.startswith("/pod_") for name in container.get("Names") or []):
+                pod_pid = docker_api_get(f"/containers/{container['Id']}/json")["State"]["Pid"]
+                if isinstance(pod_pid, int) and pod_pid > 0:
+                    netns_pids.append(pod_pid)
+                break
+    except Exception:
+        pass
+    netns_pids.append(1)
+    for netns_pid in netns_pids:
+        try:
+            body = subprocess.run(
+                [
+                    "nsenter", "-t", str(netns_pid), "-n",
+                    "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
+                    "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
+                    f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
+                ],
+                capture_output=True, text=True, check=True, env=env,
+                timeout=EGRESS_TRACE_TIMEOUT_SECONDS + 5,
+            ).stdout[:4096]
+        except Exception:
+            continue
+        for line in body.splitlines():
+            if line.startswith("ip="):
+                return line[3:].strip()[:64]
     return ""
 
 
