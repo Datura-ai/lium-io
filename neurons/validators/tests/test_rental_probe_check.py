@@ -966,6 +966,19 @@ async def test_a_create_that_cannot_open_its_ssh_session_is_inconclusive():
 
 
 @pytest.mark.asyncio
+async def test_a_node_without_an_ssh_host_key_fails_the_probe():
+    # Regression: a node that never reported its host key scored 1.0 while every renter's create failed
+    ctx, docker, redis = make_probe_context(
+        docker=FakeDocker(create_result=create_failed("docker_sdk_ssh_host_key"))
+    )
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert result.updates["score"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_create_failure_before_the_host_is_not_the_nodes_fault():
     """Regression: a validator-side failure (its Redis lock, its key, the attestation verifier) zeroes an
     honest node's score; or the settle runs `docker rm` on a node the create never reached and reports a
