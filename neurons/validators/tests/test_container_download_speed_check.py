@@ -35,8 +35,10 @@ RENTALS = "lium_dl_net name=lium-rentals\n"
 BRIDGE = "lium_dl_net name=bridge\n"  # a node with no rental yet has no lium-rentals network
 # 16 MiB in 1.0 s = 134 Mbps on both
 FAST = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
-# the reported node: PyPI crawls, 1.8 MB in the 30 s bound
-SLOW = RENTALS + line("pypi", 1_800_000, 30.0, 143) + line("hf", CAP_BYTES, 1.0, 0)
+# a slow link: both endpoints crawl, 1.8 MB in the 30 s bound
+SLOW = RENTALS + line("pypi", 1_800_000, 30.0, 143) + line("hf", 1_800_000, 30.0, 143)
+# only PyPI's CDN crawls while Hugging Face reads fast: the CDN path, not the node
+PYPI_ONLY_SLOW = RENTALS + line("pypi", 1_800_000, 30.0, 143) + line("hf", CAP_BYTES, 1.0, 0)
 SLOW_ON_BRIDGE = SLOW.replace(RENTALS, BRIDGE)
 DNS_DOWN = (
     RENTALS + line("pypi", 0, 0.05, 1, "wget: bad address 'files.pythonhosted.org'") + line("hf", CAP_BYTES, 1.0, 0)
@@ -189,6 +191,18 @@ async def test_slow_twice_fails_the_node():
         clock.now += 60
         third = await check.run(ctx)
         assert len(runner.commands) == 2 and third.passed is False
+
+
+async def test_one_slow_cdn_while_the_other_endpoint_is_fast_passes():
+    # DAH-5979: PyPI's CDN alone crawled on unrelated networks at once while Hugging Face read 20-80 Mbps
+    with flags() as clock:
+        ctx, runner, _ = make_ctx(PYPI_ONLY_SLOW, PYPI_ONLY_SLOW)
+        check = ContainerDownloadSpeedCheck()
+        res = await check.run(ctx)
+        assert res.passed and res.event.reason_code == Msg.OK.reason
+        clock.now += 31 * 60
+        res = await check.run(ctx)  # a pass waits the full interval: no confirming retry
+        assert res.passed and len(runner.commands) == 1
 
 
 async def test_a_streak_with_a_default_bridge_reading_is_never_enforced():

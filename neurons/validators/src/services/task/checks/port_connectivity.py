@@ -22,7 +22,7 @@ from ..host_disk import (
     parse_disk_pressure,
 )
 from ..messages import PortConnectivityMessages as Msg
-from ..messages import render_message
+from ..messages import TenantEnforcementMessages, render_message
 from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
@@ -135,6 +135,11 @@ async def spend_disk_pressure_deferrals(ctx: Context) -> None:
         )
 
 
+def _ssh_session_closed(ssh: object) -> bool:
+    is_closed = getattr(ssh, "is_closed", None)  # asyncssh.SSHClientConnection.is_closed
+    return callable(is_closed) and is_closed() is True
+
+
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
 
@@ -143,6 +148,8 @@ class PortConnectivityCheck:
     """
 
     check_id = "executor.validate.port_connectivity"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -202,6 +209,22 @@ class PortConnectivityCheck:
             else MIN_PORT_COUNT,
             dind_deadline_monotonic=time.monotonic() + task_seconds_left(ctx) - CHECKS_AFTER_DIND_RESERVE_SECONDS,
         )
+        if _ssh_session_closed(ctx.ssh):
+            # the validator's own session died during the check, so no reading of it can be trusted (a partial
+            # "ok" can lose its DinD port to the drop): nothing is saved and the run ends on
+            # EXECUTOR_TRANSPORT_UNREACHABLE (no verdict) instead of a short port count and INSUFFICIENT_PORTS.
+            # a result, not a raise: the run keeps the earlier checks' events (a GPU_MEMORY_HEALTH_FAILED stays)
+            event = render_message(
+                TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "executor_uuid": ctx.executor.uuid,
+                    "transport_error": f"SSH session closed during the port check ({result.status}: {result.error})",
+                },
+                extra=extra,
+            )
+            return CheckResult(passed=False, event=event, fatal=True)
         if probe_sysbox and not ctx.state.sysbox_runtime:
             # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
             # own in-container measurement may say Sysbox works

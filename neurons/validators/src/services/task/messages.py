@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING, Any
 
 from .models import AVAILABILITY_CATEGORY, build_msg
@@ -25,6 +26,17 @@ class MessageTemplate:
     impact: str
     remediation: str | None = None
     help_uri: str | None = None
+
+
+def shown(value: float, decimals: int, *, failed_below: bool) -> str:
+    """Format a failing reading so rounding never makes it look like it meets the limit.
+
+    A value below a minimum rounds down and a value above a maximum rounds up (49.96 GB free
+    shows as 49.9, not 50.0, against a 50 GB minimum).
+    """
+    # decimal from the shortest str(): no float noise (49.9 stays 49.9) and no pre-rounding (99.99999999 stays below 100)
+    step = Decimal(1).scaleb(-decimals)
+    return f"{Decimal(str(value)).quantize(step, rounding=ROUND_FLOOR if failed_below else ROUND_CEILING):.{decimals}f}"
 
 
 def render_message(
@@ -1327,8 +1339,9 @@ class TenantEnforcementMessages:
         category="transport",
         impact="No verdict for this cycle - pod state unknown",
         remediation=(
-            "Transient SSH transport failure (network blip, conntrack flush). "
-            "Persistent unreachability is handled by the stale-executor sweep."
+            "The validator's SSH session to the node dropped mid-check (`transport_error` names how), so this "
+            "cycle has no verdict and the next one retries. If it repeats, check that the node's SSH port answers "
+            "from outside and that the executor container is running."
         ),
     )
     GPU_OUTSIDE_TENANT = MessageTemplate(
@@ -1569,7 +1582,10 @@ class PortCountMessages:
         severity="warning",
         category="runtime",
         impact="Score set to 0",
-        remediation="Increase port range or check port mappings configuration.",
+        remediation=(
+            "Widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS so enough renting ports answer from outside, "
+            "then run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
 
 
@@ -2200,6 +2216,22 @@ class NvlinkFaultMessages:
             "sees the GPUs again. If the errors come back, service the board."
         ),
     )
+    MULTICAST_FAILED = MessageTemplate(
+        event="NVLink multicast is broken: a GPU cannot join a multicast object across the board",
+        reason="NVLINK_FAULT",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink multicast works again",
+        remediation=(
+            "cuMulticastAddDevice returns CUDA_ERROR_UNKNOWN (999) on a full NVLink board whose GPUs report "
+            "multicast support, so NCCL NVLink SHARP (NVLS) cannot start. Check that nvidia-fabricmanager runs "
+            "the same version as the driver and that `nvidia-smi -q` shows Fabric State Completed on every "
+            "GPU, and check the host `dmesg` for NVRM Xid lines. Stop the workloads, restart "
+            "nvidia-fabricmanager or reboot, then restart the executor container "
+            "(`docker restart executor-executor-1`). If it comes back, update the driver and fabric manager "
+            "together or service the board."
+        ),
+    )
     MISSING = MessageTemplate(
         event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
         reason="NVLINK_MISSING",
@@ -2248,7 +2280,10 @@ class RentalVerificationMessages:
         severity="error",
         category="policy",
         impact="Validation halted",
-        remediation="Check executor health with backend or review rental status",
+        remediation=(
+            "The rental check could not confirm this node; `error` in this event names what failed. If it "
+            "repeats, run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
     # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
     GPU_LIST_EMPTY = MessageTemplate(
