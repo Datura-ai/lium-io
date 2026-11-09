@@ -109,25 +109,29 @@ _NEED = 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + _RESERVED
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "stderr, short_gb",
+    "stderr, short_gb, short_words",
     [
         # the Size-based check: the need is the one the validator computed
-        (f"flatten avail={_NEED - 5 * 1024**3}\n", 5),
-        # the containerd export count: a sparse image's export needs more than Size says
-        (f"flatten need={_NEED + 7 * 1024**3} avail={_NEED - 2 * 1024**3}\nflatten refused: the export is larger\n", 9),
+        (f"flatten avail={_NEED - 5 * 1024**3}\n", 5, "5 GB short"),
+        # the containerd export count stops one byte past the free disk: its need is a lower bound
+        (
+            f"flatten need_at_least={_NEED + 7 * 1024**3} avail={_NEED - 2 * 1024**3}\nflatten refused: the export\n",
+            9,
+            "at least 9 GB short",
+        ),
         # another create sized its disk meanwhile, or a count that did not complete: no shortfall to name
-        ("flatten refused: another create sized its disk meanwhile\n", None),
-        ("flatten refused: the export is larger than the free disk allows\n", None),
+        ("flatten refused: another create sized its disk meanwhile\n", None, None),
+        ("flatten refused: the export is larger than the free disk allows\n", None, None),
     ],
 )
-async def test_the_no_disk_refusal_names_the_shortfall_when_measured(stderr, short_gb):
+async def test_the_no_disk_refusal_names_the_shortfall_when_measured(stderr, short_gb, short_words):
     ssh = _ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT, stderr=stderr)
     with pytest.raises(ImageFlattenNoDisk) as exc:
         await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=_RESERVED)
     if short_gb is None:
         assert exc.value.renter_sentence == FLATTEN_NO_DISK_RENTER_SENTENCE and exc.value.short_bytes is None
     else:
-        assert exc.value.renter_sentence.endswith(f"({short_gb} GB short); use a smaller image or one with fewer layers")
+        assert exc.value.renter_sentence.endswith(f"({short_words}); use a smaller image or one with fewer layers")
         assert exc.value.short_bytes == short_gb * 1024**3
     assert 'echo "flatten avail=$avail" >&2' in ssh.run.await_args_list[-1].args[0]
 
@@ -537,8 +541,8 @@ def test_the_containerd_disk_check_budgets_the_bytes_the_export_really_writes(
     assert result.returncode == expected_rc
     assert sorted(c.split()[0] for c in _calls(tmp_path)) == sorted(expected_calls)
     assert "rm -fv cid1" in _calls(tmp_path)
-    # a refusal counts the whole export, so it names the real need: twice the export plus the kept bytes
-    assert (b"flatten need=130 avail=100" in result.stderr) == (export_bytes == 60)
+    # the count stops one byte past the 45 that fit, so a refusal names a lower bound: twice 46 plus the kept bytes
+    assert (b"flatten need_at_least=102 avail=100" in result.stderr) == (export_bytes == 60)
 
 
 def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(tmp_path):
