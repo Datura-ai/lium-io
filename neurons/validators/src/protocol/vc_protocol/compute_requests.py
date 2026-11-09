@@ -228,6 +228,9 @@ class RentedExecutorsResponse(BaseModel):
     # DAH-6030: realized Default Job revenue, USD/hour over the trailing 72 h. The idle-pay budget is k times it
     # (incentive/idle_pay_budget.py). None = unreadable this cycle (an older backend, a TSDB or ETL outage).
     default_job_revenue_usd_per_hour: float | None = None
+    # DAH-3333: pod ids whose volume_<pod_id> the reapers keep while still removing the container (a balance stop
+    # keeps the renter's disk, never the running container). An older backend names none.
+    retained_volume_pod_ids: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

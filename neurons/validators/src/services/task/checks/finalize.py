@@ -16,6 +16,7 @@ class FinalizeCheck:
     """
 
     check_id = "pipeline.finalize"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
