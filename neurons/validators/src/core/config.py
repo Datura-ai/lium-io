@@ -551,7 +551,7 @@ class Settings(BaseSettings):
     # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
     # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
     # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
-    # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
+    # Two failing readings in a row (every download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
     # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
     # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
     # So is a failing side the rented pods' own counters show they used while the probe measured it (rented_throughput.DURING_*).
