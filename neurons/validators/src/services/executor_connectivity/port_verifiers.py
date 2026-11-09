@@ -30,6 +30,7 @@ class ContainerStartWatch:
     """DAH-5682: whether `docker run` of an attempt's test container has not returned yet."""
 
     in_progress: bool = False
+    started_at: float = 0.0  # loop time the in-progress start began
 
 
 class BatchVerifier:
@@ -38,6 +39,9 @@ class BatchVerifier:
     REPROBE_DELAY_SEC = 3
     REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
     ATTEMPT_TIMEOUT_SEC = 60
+    # a start the attempt deadline cut off counts as hung only if it had this long: on a slow host the outside
+    # probe's container can use most of the 60 s, leaving the batch start seconds before the deadline
+    HUNG_START_MIN_SEC = 30
 
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
@@ -53,8 +57,9 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
     ) -> BatchResult:
-        """Verify ports with retries."""
+        """Verify ports with retries; refused ports are re-probed until `min_ports` answer."""
         log_ctx = log_ctx or {}
         timeout_sec = self.ATTEMPT_TIMEOUT_SEC
         max_attempts = 2
@@ -75,7 +80,7 @@ class BatchVerifier:
 
             try:
                 attempt_result = await asyncio.wait_for(
-                    self._attempt(ports, token, container_name, ssh_client, host, start_watch, log_ctx),
+                    self._attempt(ports, token, container_name, ssh_client, host, start_watch, log_ctx, min_ports),
                     timeout=timeout_sec
                 )
                 external = attempt_result.external
@@ -95,7 +100,9 @@ class BatchVerifier:
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
-                start_hung += start_watch.in_progress
+                start_hung += start_watch.in_progress and (
+                    asyncio.get_running_loop().time() - start_watch.started_at >= self.HUNG_START_MIN_SEC
+                )
                 logger.debug(
                     _m(
                         f"attempt {attempt} timed out after {timeout_sec}s"
@@ -131,6 +138,7 @@ class BatchVerifier:
         host: str,
         start_watch: ContainerStartWatch,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
     ) -> BatchResult:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
@@ -165,9 +173,9 @@ class BatchVerifier:
             async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
                 successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
                 # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
-                # re-probe the refused ports while the count is below PortCountCheck's floor (the failure condition)
+                # re-probe the refused ports while the count is below what PortCountCheck needs to list the node
                 for round_no in range(1, self.REPROBE_ROUNDS + 1):
-                    if not failed or len(sampled_ok) + len(successful) >= MIN_PORT_COUNT:
+                    if not failed or len(sampled_ok) + len(successful) >= min_ports:
                         break
                     await asyncio.sleep(self.REPROBE_DELAY_SEC)
                     late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
@@ -198,7 +206,7 @@ class BatchVerifier:
         timeout: int,
     ) -> ContainerStartResult:
         # no `finally`: a cancelled start must stay marked in progress for the attempt's timeout handler
-        start_watch.in_progress = True
+        start_watch.in_progress, start_watch.started_at = True, asyncio.get_running_loop().time()
         result = await self.runner.run(ssh_client, name, script, network_mode, timeout)
         start_watch.in_progress = False
         return result

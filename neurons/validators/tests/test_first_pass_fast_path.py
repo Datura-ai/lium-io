@@ -24,6 +24,7 @@ from neurons.validators.src.services.task.pipeline_factory import PipelineFactor
 from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService, VerifyXValidator
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
+from tests.test_verifyx_cold_sample_retry import _run as _verifyx_then_cold_retry
 from tests.helpers import build_context_config, build_services, build_state
 from tests.test_capability_check import DummyValidationService
 from tests.test_verifyx_check import MockVerifyXResponse
@@ -192,7 +193,9 @@ class _ConfigAwareVerifyX:
         self._response = response
         self.kwargs: dict = {}
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec, **kw):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **kw
+    ):
         self.kwargs = kw
         return self._response
 
@@ -218,7 +221,7 @@ def _never_measured():
 async def test_scored_verifyx_call_passes_no_overrides_and_keeps_the_gate(context_factory):
     service = _ConfigAwareVerifyX(_probe(59.9))
 
-    result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=False, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=False, rented_data=_never_measured()))
 
     assert service.kwargs == {}
     assert result.passed is False
@@ -285,7 +288,9 @@ class _ConfigAwareSequence:
         self._responses = list(responses)
         self.kwargs_per_call: list[dict] = []
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec, **kw):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **kw
+    ):
         self.kwargs_per_call.append(kw)
         return self._responses.pop(0)
 
@@ -296,9 +301,12 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
 ):
     """DAH-2959 + DAH-3011 compose: with the retry flag on, the cold-sample retry is a first-pass
     probe too — the 128 GB / 5 GB write must not come back on the second sample."""
-    service = _ConfigAwareSequence(_probe(59.9), _probe(500.0))
+    retry = _probe(500.0)
+    # the adopted retry's disk reading is judged again (DiskSpaceCheck): give it one that clears the floor
+    retry.data["hard_disk"] = {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024}
+    service = _ConfigAwareSequence(_probe(59.9), retry)
 
-    result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 
     first_pass_overrides = {
         "challenge_config_overrides": {
@@ -341,7 +349,7 @@ async def test_first_pass_ram_or_disk_failure_still_fails(context_factory):
 async def test_scored_pass_is_todays_behaviour(context_factory):
     # A scored cycle has ContextConfig.first_pass False; the checks do nothing special then.
     verifyx = _ConfigAwareVerifyX(_probe(59.9))
-    result = await VerifyXCheck().run(_ctx(context_factory, verifyx, first_pass=False, rented_data=_never_measured()))
+    result = await _verifyx_then_cold_retry(_ctx(context_factory, verifyx, first_pass=False, rented_data=_never_measured()))
     assert verifyx.kwargs == {}
     assert result.passed is False
 

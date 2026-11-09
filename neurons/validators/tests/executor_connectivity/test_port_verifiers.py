@@ -122,6 +122,56 @@ async def test_dind_start_is_killed_on_the_node_before_the_container_is_removed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_exit", "connect_error", "fault"),
+    [
+        (0, ConnectionRefusedError(), True),  # started, sshd never answered
+        (0, TimeoutError(), True),
+        (125, None, False),  # dockerd refused the run
+        (0, RuntimeError("ours"), False),  # the validator's own error
+        (0, None, False),  # sshd answered
+    ],
+    ids=["sshd_refused", "sshd_timeout", "run_refused", "validator_error", "ok"],
+)
+async def test_host_runtime_fault_only_when_the_started_container_never_answers(
+    mocker, run_exit, connect_error, fault
+):
+    # DAH-5651 review: a refused `docker run` or our own error is not a failing host runtime
+    from contextlib import asynccontextmanager
+
+    from services.executor_connectivity import dind_probe
+
+    async def run(cmd):
+        return mocker.Mock(exit_status=run_exit if "docker run" in cmd else 0, stdout="", stderr="")
+
+    @asynccontextmanager
+    async def answered():
+        yield mocker.Mock()
+
+    async def connect(*args, **kwargs):
+        if connect_error is not None:
+            raise connect_error
+        return answered()
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
+    mocker.patch.object(dind_probe.asyncssh, "import_private_key")
+    verifier = dind_probe.DindVerifier(ssh_service)
+    mocker.patch.object(verifier, "_connect_retrying_until_sshd_answers", side_effect=connect)
+
+    result = await verifier.verify(
+        PortPair(9000, 9000),
+        ssh_client=mocker.Mock(run=run),
+        host="1.2.3.4",
+        container_name_prefix="container_x",
+        sysbox=False,
+    )
+
+    assert result.success is (connect_error is None and run_exit == 0)
+    assert result.sshd_never_answered is fault
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("seconds_to_deadline, expected", [(60.5, 60), (-100, 30), (1000, 180)])
 async def test_dind_start_ends_within_the_cycle_time_budget(mocker, seconds_to_deadline, expected):
     # 5bf1770f 3 Nov: a 180 s create after the port fallback left the cycle no time to report, so it was dropped
@@ -248,6 +298,23 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
 
 
 @pytest.mark.asyncio
+async def test_batch_reprobes_past_the_floor_up_to_the_ports_a_split_node_needs(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
+    calls = []
+
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return (probed[:20], probed[20:]) if len(calls) == 1 else (probed, [])
+
+    verifier, _ = _batch_verifier(mocker, late_listeners)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=24)
+
+    assert calls == [ports, ports[20:]]
+    assert len(result.successful) == 24
+
+
+@pytest.mark.asyncio
 async def test_batch_is_start_hung_only_when_every_attempt_times_out_inside_the_container_start(mocker):
     # DAH-5682: a stuck Docker never returns `docker run`; both 60 s attempts end there
     from services.executor_connectivity.port_verifiers import BatchVerifier
@@ -258,6 +325,7 @@ async def test_batch_is_start_hung_only_when_every_attempt_times_out_inside_the_
     verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
     verifier.runner.run.side_effect = hang
     mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
+    mocker.patch.object(BatchVerifier, "HUNG_START_MIN_SEC", 0.05)
 
     result = await verifier.verify([PortPair(9000, 9000)], ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -279,3 +347,24 @@ async def test_batch_is_not_start_hung_when_the_container_started_and_the_ports_
 
     assert not result.start_hung
     assert result.successful == []
+
+
+@pytest.mark.asyncio
+async def test_batch_is_not_start_hung_when_a_slow_outside_start_left_the_batch_start_no_time(mocker):
+    # DAH-5682: the outside probe's container used most of each attempt; the batch start was cut off seconds in
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    async def slow_then_hang(_ssh, name, *_args):
+        await asyncio.sleep(0.08 if name.startswith("port_test_out_") else 5)
+        return CONTAINER_STARTED
+
+    external = mocker.Mock()
+    external.reached = mocker.AsyncMock(return_value=None)
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed), external)
+    verifier.runner.run.side_effect = slow_then_hang
+    mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
+    mocker.patch.object(BatchVerifier, "HUNG_START_MIN_SEC", 0.05)
+
+    result = await verifier.verify([PortPair(9000 + i, 9000 + i) for i in range(5)], ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert not result.start_hung

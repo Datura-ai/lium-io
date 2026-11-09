@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from services.executor_connectivity.dind_probe import DIND_SSHD_NOT_READY
 from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES
 
 from ..messages import MessageTemplate, render_message
@@ -76,6 +77,10 @@ class SysboxRequiredCheck:
             # with no line names the symptom, not the cause, so the generic guidance stays.
             if cause.code in DIND_INNER_DOCKERD_CODES and cause.dockerd_line:
                 remediation += " Fix that on the host first; reinstalling sysbox does not change it."
+            elif cause.code == DIND_SSHD_NOT_READY.code:
+                # DAH-5844: the container never answered at all, so the notice must not say sysbox is missing
+                template = Msg.DIND_PROBE_UNREACHABLE
+                remediation += f" {template.remediation}"
         return render_message(
             template,
             ctx=ctx,

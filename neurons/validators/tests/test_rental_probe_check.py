@@ -852,6 +852,28 @@ async def test_create_payload_is_what_a_renter_gets():
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "at_cycle_start, under_the_lock, expected",
+    [
+        pytest.param([], [], [], id="none-retained"),
+        pytest.param(["a"], ["a"], ["volume_a"], id="attached"),
+        pytest.param(["a"], [], ["volume_a"], id="already-dangling"),
+        pytest.param([], ["b"], ["volume_b"], id="newly-retained"),
+    ],
+)
+async def test_the_probe_create_keeps_every_retained_pod_volume(at_cycle_start, under_the_lock, expected):
+    """Regression: the probe's create sent no active volumes, so its stale-volume sweep removed a
+    volume_<pod_id> the backend keeps after its container was reaped (a stopped renter's disk)."""
+    snapshot = rented_data().model_copy(update={"retained_volume_pod_ids": at_cycle_start})
+    fresh = rented_data().model_copy(update={"retained_volume_pod_ids": under_the_lock})
+    ctx, docker, _ = make_probe_context(rented=snapshot, rented_now=fresh)
+    with probe_settings(), renter_path():
+        await RentalProbeCheck().run(ctx)
+
+    assert sorted(docker.create_calls[0][0].active_volume_names) == expected
+
+
 def test_no_ram_total_in_the_specs_sends_no_memory_limit():
     ctx, _, _ = make_probe_context()
     no_ram = ctx.model_copy(update={"state": replace(ctx.state, specs={})})
@@ -1518,7 +1540,9 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     assert ids.index("RentalProbeCheck") == ids.index("RentalVerificationCheck") + 1
     # DAH-5320: only the shadow idle disk write sits between the probe and scoring
     assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
-    assert ids.index("IdleDiskWriteCheck") == ids.index("ScoreCheck") - 1
+    # DAH-5462: then VerifyX's cold-sample retry, in the time every other check left
+    assert ids.index("IdleDiskWriteCheck") == ids.index("VerifyXColdRetryCheck") - 1
+    assert ids.index("VerifyXColdRetryCheck") == ids.index("ScoreCheck") - 1
     assert ids.index("RentalProbeCheck") > ids.index("PortConnectivityCheck")
     assert ids.index("RentalProbeCheck") > ids.index("TenantEnforcementCheck")
     dry = [
@@ -1526,7 +1550,7 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     ]
     assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
     fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
-    assert fast[-4:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck"]
+    assert fast[-5:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
 
 
 @pytest.mark.asyncio
@@ -1727,7 +1751,7 @@ async def test_a_filler_node_is_probed_beside_its_filler():
         result = await RentalProbeCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
-    assert docker.create_options == [{"beside_fillers": True}]
+    assert docker.create_options == [{"beside_fillers": True, "synthetic_probe": True}]
     assert redis.stamped()
 
 
@@ -1752,7 +1776,7 @@ async def test_a_probe_on_a_node_without_a_filler_creates_with_beside_fillers_of
     with probe_settings(), renter_path():
         await RentalProbeCheck().run(ctx)
 
-    assert docker.create_options == [{"beside_fillers": False}]
+    assert docker.create_options == [{"beside_fillers": False, "synthetic_probe": True}]
 
 
 @pytest.mark.asyncio

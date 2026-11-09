@@ -739,6 +739,38 @@ async def test_a_central_miner_hotkey_runs_past_the_per_miner_cap_under_the_glob
 
 
 @pytest.mark.asyncio
+async def test_a_node_is_rechecked_once_when_its_maintenance_window_ends(monkeypatch, wallet):
+    node, others_node = str(uuid4()), str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-a": [
+                _portal_executor(node, registered_seconds_ago=7 * 86400),
+                _portal_executor(others_node, registered_seconds_ago=7 * 86400, validator="another-validator"),
+            ]
+        },
+        [_Neuron("miner-a")],
+    )
+    await harness.redis_service.mark_executors_validated([node, others_node])
+    ends_at = datetime.now(UTC) + timedelta(minutes=10)
+    harness.inputs.maintenance_ends = {node: ends_at, others_node: ends_at}
+
+    assert await harness.tick_and_settle() == 0  # the window is still running
+
+    ends_at = datetime.now(UTC) - timedelta(seconds=1)
+    harness.inputs.maintenance_ends = {node: ends_at, others_node: ends_at}
+    assert await harness.tick_and_settle() == 1
+
+    (results, _, _), _ = harness.miner_service.publish_machine_specs.await_args
+    assert [r.executor_info.uuid for r in results] == [node]
+    # still the cycle's id, so no counter moves; the backend reads the recheck's start against the window's end
+    assert results[0].job_batch_id == CYCLE_BATCH_ID
+    assert results[0].check_started_at > ends_at
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+    assert await harness.tick_and_settle() == 0  # one recheck per window
+
+
+@pytest.mark.asyncio
 async def test_a_recheck_never_overlaps_the_next_wave(monkeypatch, wallet):
     import core.express_lane as express_lane
 
