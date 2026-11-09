@@ -474,11 +474,20 @@ class RedisService:
 
     async def pop_executor_recheck_request(self, executor_id: str, generation: int | None = None) -> None:
         """Ends the request; with a generation, only if no newer request for the node came in since it was read.
-        shortcut: read-then-remove, not atomic across the two processes; a Lua script if requests ever collide."""
-        if generation is not None and await self.get_executor_recheck_generation(executor_id) != generation:
-            return
-        await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
-        await self.redis.hdel(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
+        The check and the removal are one WATCH/MULTI transaction: a request landing in between aborts it."""
+        try:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                if generation is not None:
+                    await pipe.watch(EXPRESS_LANE_RECHECK_GENERATIONS_HASH)
+                    current = await pipe.hget(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
+                    if int(current or 0) != generation:
+                        return
+                pipe.multi()
+                pipe.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
+                pipe.hdel(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
+                await pipe.execute()
+        except redis.exceptions.WatchError:
+            pass  # a newer request came in meanwhile: it stays for the next run
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None

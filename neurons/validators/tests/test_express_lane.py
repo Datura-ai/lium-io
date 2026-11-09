@@ -701,6 +701,37 @@ async def test_a_recheck_request_is_queued_and_a_bad_id_is_ignored():
 
 
 @pytest.mark.asyncio
+async def test_a_recheck_request_landing_while_the_old_one_ends_survives():
+    """Review 4512796524: a request made after the finishing run read the generation is not removed by it."""
+    redis_service = _redis_service()
+    node = str(uuid4())
+    await redis_service.request_executor_recheck(node)
+    generation = await redis_service.get_executor_recheck_generation(node)
+
+    make_pipeline = redis_service.redis.pipeline
+
+    def pipeline(*args, **kwargs):
+        pipe = make_pipeline(*args, **kwargs)
+        read = pipe.hget
+
+        async def hget_then_new_request(*a):
+            value = await read(*a)
+            await redis_service.request_executor_recheck(node)  # lands between the read and the removal
+            return value
+
+        pipe.hget = hget_then_new_request
+        return pipe
+
+    redis_service.redis.pipeline = pipeline
+    await redis_service.pop_executor_recheck_request(node, generation)
+    assert await redis_service.get_executor_recheck_requests() == {node}
+
+    redis_service.redis.pipeline = make_pipeline
+    await redis_service.pop_executor_recheck_request(node, generation + 1)
+    assert await redis_service.get_executor_recheck_requests() == set()
+
+
+@pytest.mark.asyncio
 async def test_a_requested_validated_executor_is_rechecked_once_under_the_caps(monkeypatch, wallet):
     nodes = [str(uuid4()) for _ in range(3)]
     old = [_portal_executor(n, registered_seconds_ago=7 * 86400) for n in nodes]
