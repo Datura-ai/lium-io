@@ -160,7 +160,7 @@ apt_main_only_dir() {
             n = split($0, lines, "\n"); out = ""; field = ""; comps = ""; types = ""
             for (i = 1; i <= n; i++) {
                 l = lines[i]
-                # multi-line values: a continuation line starts with a blank and belongs to the field above
+                # multi-line values: a continuation line starts with a blank and belongs to the field above, comments between them too
                 if (l ~ /^[ \t]/) {
                     if (field == "Components") { comps = comps " " l; continue }
                     if (field == "Types") { types = types " " l; continue }
@@ -168,7 +168,7 @@ apt_main_only_dir() {
                     field = substr(l, 1, index(l, ":") - 1)
                     if (field == "Components") { comps = substr(l, 12); out = out "Components: main\n"; continue }
                     if (field == "Types") { types = substr(l, 7); out = out "Types: deb\n"; continue }
-                } else {
+                } else if (l !~ /^#/) {
                     field = ""
                 }
                 out = out l "\n"

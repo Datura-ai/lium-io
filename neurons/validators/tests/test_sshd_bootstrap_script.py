@@ -454,6 +454,10 @@ Components: main
             "Components: main restricted universe multiverse", "Components: main\n restricted universe multiverse"
         ),
         UBUNTU_SOURCES.replace("Components: main restricted universe multiverse", "Components: restricted\n main universe"),
+        # a comment line inside a multi-line value does not end it
+        UBUNTU_SOURCES.replace("Types: deb\n", "Types: deb\n# sources too\n deb-src\n", 1).replace(
+            "Components: main restricted universe multiverse", "Components: main\n# the rest\n restricted universe multiverse"
+        ),
     ],
 )
 def test_sshd_install_reads_only_the_main_package_lists(harness, awk, sources):
