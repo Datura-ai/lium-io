@@ -893,6 +893,41 @@ def test_released_cache_is_taken_off_the_filesystem_that_holds_it(scrape: dict, 
 
 
 @pytest.mark.parametrize(
+    "paths, devices, data_root",
+    [
+        # the store on its own (smaller) filesystem: the reported reading is the store's
+        ({_SNAPSHOTS: _SMALL, "/proc/1/root/data/docker": _BIG}, {_SNAPSHOTS: 1, "/proc/1/root/data/docker": 2}, _BIG),
+        # the store and data-root on one filesystem
+        ({_SNAPSHOTS: _BIG, "/proc/1/root/data/docker": _BIG}, {_SNAPSHOTS: 1, "/proc/1/root/data/docker": 1}, _BIG),
+        # one filesystem, with a smaller disk mounted on the snapshots dir
+        ({_SNAPSHOTS: _FULLER, f"{_SNAPSHOTS}/snapshots": _SMALL, "/proc/1/root/data/docker": _FULLER},
+         {_SNAPSHOTS: 1, f"{_SNAPSHOTS}/snapshots": 2, "/proc/1/root/data/docker": 1}, _FULLER),
+    ],
+)
+def test_provider_side_disk_is_data_roots_own_used_minus_the_docker_breakdown(
+    scrape: dict, monkeypatch, paths, devices, data_root
+) -> None:
+    from neurons.validators.src.services.task.checks.provider_side_load import compute_provider_side_load
+
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    _stub_filesystem(scrape, monkeypatch, host_dirs=set(paths), usage_by_path=paths)
+    scrape["os"].stat = lambda path: SimpleNamespace(st_dev=devices[path])
+    breakdown = {
+        "hard_disk_images": 20 * 1024**2,
+        "hard_disk_containers": 5 * 1024**2,
+        "hard_disk_volumes": 10 * 1024**2,
+    }
+
+    store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
+    hard_disk = {**scrape["hard_disk_reading"](data_root_usage or store_usage), **breakdown}
+    scrape["release_filler_cache"](hard_disk)
+    scrape["report_tighter_store"](hard_disk, store_usage if data_root_usage else None)
+    specs = {"hard_disk": {key.removeprefix("hard_disk_"): value for key, value in hard_disk.items()}}
+
+    assert compute_provider_side_load(specs, None, None).disk_kb == data_root.used // 1024 - 35 * 1024**2
+
+
+@pytest.mark.parametrize(
     "child, child_device, expected",
     [
         ("ingest", 3, _SMALL),  # a pull's partial downloads land on the disk mounted there

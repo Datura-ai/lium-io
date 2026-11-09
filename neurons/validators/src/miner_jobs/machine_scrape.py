@@ -924,6 +924,9 @@ def report_tighter_store(hard_disk, store_usage, size_too=True):
     # hard_disk is data-root's reading after its filler run volumes are released; a rental also needs room in
     # the containerd store on its other filesystem, so the tighter of the two is what a renter can get:
     # the smaller filesystem's size (what the disk gate measures), the least free room and the fuller of the two
+    if "hard_disk_used" in hard_disk:
+        # data-root's own used bytes, before a store folds in: the docker breakdown is measured there
+        hard_disk.setdefault("hard_disk_data_root_used", hard_disk["hard_disk_used"])
     if not store_usage or "hard_disk_total" not in hard_disk:
         return
     store = hard_disk_reading(store_usage)
