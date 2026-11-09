@@ -1,6 +1,7 @@
 """DAH-6030 per-model cap: an idle GPU-hour is rated at most k x what its GPU model's Default Jobs earned per idle
 GPU-hour, so a model's idle pay (listed rate, secure floor and spot together) stays within k x its Default Job revenue."""
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +19,10 @@ def _settings(monkeypatch):
 
 def _secure(uuid: str, model_usd_per_hour: float | None, per_filled_gpu_hour: float = 5.0):
     return _node(uuid, filler_revenue_usd_per_hour=model_usd_per_hour, filler_revenue_per_gpu_hour=per_filled_gpu_hour)
+
+
+def _cap_lines(node) -> list[str]:
+    return [line for line in node.incentive_logs if "Default Job earnings cap" in line]
 
 
 def _model_paid(incentive) -> float:
@@ -49,6 +54,17 @@ async def test_the_cap_binds_on_normalized_pay_and_spot_stays_at_80_pct_of_secur
     assert _paid_rate(secure) / mass == pytest.approx(0.9)
     assert _paid_rate(spot) == pytest.approx(SPOT_IDLE_SECURE_RATE_SHARE * _paid_rate(secure))
     assert _model_paid(incentive) / mass <= 0.9 * 16.0 + 1e-9
+    assert _cap_lines(secure) and _cap_lines(spot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("k, binding", [(None, False), (0.9, False), (0.9, True)])
+async def test_the_cap_line_appears_only_when_the_cap_lowers_pay(monkeypatch, k, binding):
+    monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", k)
+    # 1e6 USD/hour of Default Job revenue leaves the cap far above the listed rate
+    incentive = await _run([_secure("secure-1", model_usd_per_hour=16.0 if binding else 1e6, per_filled_gpu_hour=0.1)])
+
+    assert bool(_cap_lines(incentive.job_results["hk"][0])) is binding
 
 
 @pytest.mark.asyncio
@@ -63,6 +79,7 @@ async def test_the_secure_floor_never_lifts_above_the_cap(monkeypatch):
     for node in incentive.job_results["hk"]:
         assert node.floor_top_up_rate
         assert _paid_rate(node) / mass == pytest.approx(1.8)
+        assert _cap_lines(node)
     assert _model_paid(incentive) / mass == pytest.approx(0.9 * 32.0)
 
 
@@ -83,14 +100,18 @@ async def test_an_unpaid_spot_node_does_not_lower_the_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_an_estimate_applies_the_cap_with_its_own_gpus_added(monkeypatch):
+async def test_an_estimate_applies_the_cap_with_its_own_gpus_added(monkeypatch, caplog):
     monkeypatch.setattr(settings, "IDLE_PAY_BUDGET_K", 0.9)
     live = await _run([_secure("secure-1", model_usd_per_hour=8.0)], _config(cap=16))
     snapshot = live.get_snapshot()
     assert snapshot.rental.idle_gpus_by_model == {"H100": 8}
 
     estimator = RentalPriceIncentive(_config(cap=16), AsyncMock(), {}, {}, snapshot=snapshot)
-    estimate = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model=H100, gpu_count=8))
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        estimate = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model=H100, gpu_count=8))
+
+    assert not any("Idle rate cap per GPU model" in r.getMessage() for r in caplog.records)
 
     # 16 idle GPUs share the model's 8 USD/hour: 0.45 per GPU-hour after normalization
     assert estimate.hourly_rate == pytest.approx(0.9 * 8.0 * estimator._weight_mass() / 16)

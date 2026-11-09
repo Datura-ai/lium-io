@@ -298,6 +298,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # Idle secure nodes in a bucket, and the per-model cap on an idle GPU-hour (DAH-6030), set once all are known.
         self._secure_idle_results: list[tuple[str, JobResult]] = []
         self._idle_rate_cap_by_model: dict[str, float] = {}
+        # id(result) -> its rate before the per-model cap lowered it, for the provider's cap line
+        self._rate_before_idle_cap: dict[int, float] = {}
         self._dj_revenue_by_model: dict[str, float] = {}
         self._idle_gpus_by_model: dict[str, int] = {}
         self._seed_dj_revenue_by_model: dict[str, float] = {}
@@ -1174,6 +1176,7 @@ class RentalPriceIncentive(DefaultIncentive):
                         secure_share=SPOT_IDLE_SECURE_RATE_SHARE,
                     )
                 )
+            self._record_idle_rate_cap(result)
             self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
             return result
 
@@ -1211,6 +1214,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # update incentive logs
         report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
         result.record_incentive_log(report)
+        self._record_idle_rate_cap(result)
 
         top_up_rate: float = (floored_rate - diluted_rate) * result.sysbox_multiplier * result.driver_multiplier
         if top_up_rate > 0:
@@ -1450,6 +1454,7 @@ class RentalPriceIncentive(DefaultIncentive):
             cap: float | None = self._idle_rate_cap_by_model.get(base_model)
             if cap is None or result.hourly_rate <= cap:
                 continue
+            self._rate_before_idle_cap[id(result)] = result.hourly_rate
             key = (base_model, result.count_bucket)
             self._weighted_rate_sum_by_bucket[key] -= (
                 result.gpu_count * (result.hourly_rate - cap) * result.sysbox_multiplier * result.driver_multiplier
@@ -1459,12 +1464,30 @@ class RentalPriceIncentive(DefaultIncentive):
             cap = self._idle_rate_cap_by_model.get(base_model)
             if cap is not None and result.hourly_rate > cap:
                 # cap the Secure-equivalent rate, then keep spot at SPOT_IDLE_SECURE_RATE_SHARE of it (DAH-5930)
+                self._rate_before_idle_cap[id(result)] = result.hourly_rate
                 result.hourly_rate = cap
                 result.effective_rate = min(result.effective_rate, self._spot_secure_rate(result))
-        if self._idle_rate_cap_by_model:
+        if self._idle_rate_cap_by_model and self._seed_snapshot is None:  # an estimate re-runs this; log the cycle once
             logger.info(
                 _m("Idle rate cap per GPU model", extra={"k": k, "usd_per_idle_gpu_hour": self._idle_rate_cap_by_model})
             )
+
+    def _record_idle_rate_cap(self, result: JobResult) -> None:
+        """Tell the provider when the per-model cap lowered this node's rate or its secure floor."""
+        cap: float | None = self._idle_rate_cap_by_model.get(self.get_base_model_for_gpu(result.gpu_model))
+        if cap is None:
+            return
+        rate_before: float | None = self._rate_before_idle_cap.get(id(result))
+        floor_capped: bool = (
+            not result.spot_pay_candidate
+            and result.filler_revenue_per_gpu_hour is not None
+            and bool(result.max_cap)
+            and bool(result.hourly_rate)
+            and SECURE_FILLER_REVENUE_FLOOR_FACTOR * result.filler_revenue_per_gpu_hour > cap
+        )
+        if rate_before is None and not floor_capped:
+            return
+        result.record_incentive_log(MinerLogLine.idle_rate_capped_at_default_job_earnings(result, cap, rate_before))
 
     def _secure_floor_top_up(self) -> float:
         """USD/hour the secure floor adds on top of the bucket sums, paid from the unbucketed share."""
