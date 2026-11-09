@@ -124,6 +124,9 @@ class GpuMemoryHealthCheck:
     also owes a post-rental every-card recheck (post_rental_gpu_recheck.py).
     """
 
+    # a replay would count this cycle's reset warning twice toward RESET_REQUIRED_STREAK_LIMIT
+    replays_after_session_drop = False
+
     check_id = "gpu.validate.memory_health"
     fatal = True
 

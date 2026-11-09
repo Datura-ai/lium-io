@@ -369,6 +369,8 @@ class RentedGpuDropCheck:
     """
 
     check_id = "gpu.validate.rented_gpu_drop"
+    # a replay would count this cycle's observation twice toward consecutive_cycles
+    replays_after_session_drop = False
     fatal = False
 
     def __init__(self, *, unverified: bool = False) -> None:

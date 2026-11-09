@@ -66,6 +66,7 @@ async def test_one_port_short_fails_with_the_split_count_and_the_ports_to_open()
     what = result.event.what_we_saw
     assert (what["available_port_count"], what["required"], what["max_splits"]) == (23, 24, 8)
     assert "Open at least 24 renting ports for this node's 8 GPU splits" in result.event.remediation
+    assert result.event.remediation.startswith("23 renting ports answered, 24 required.")
     assert result.updates["state"].specs["available_port_count"] == 23
 
 

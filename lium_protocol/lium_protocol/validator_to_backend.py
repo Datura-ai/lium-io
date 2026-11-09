@@ -327,6 +327,9 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's DinD test container started on the host and its sshd never answered (a failing container
     # runtime). None from a publisher that predates the field.
     host_runtime_fault: bool | None = None
+    # When an express recheck outside the cycle started; its `job_batch_id` is still the cycle's. None for a cycle's
+    # own report and from a publisher that predates the field.
+    check_started_at: datetime | None = None
 
 
 @VALIDATOR_MESSAGES.register
