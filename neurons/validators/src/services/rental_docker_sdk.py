@@ -2029,7 +2029,8 @@ def _raise_pull_event_error(event) -> None:
     raise APIError("Docker image pull failed", explanation=str(message))
 
 
-_LAYER_DONE_STATUSES = ("Download complete", "Pull complete", "Already exists")
+# "Download complete" comes before extraction; a layer is done once registered
+_LAYER_DONE_STATUSES = ("Pull complete", "Already exists")
 
 
 def _track_pull_progress(progress: dict[str, list], event) -> None:

@@ -16,8 +16,18 @@ EVENTS = [
     {"status": "Downloading", "id": "b2", "progressDetail": {"current": 1_500_000_000, "total": 3_000_000_000}},
     {"status": "Downloading", "id": "c3", "progressDetail": {"current": 200_000_000, "total": 900_000_000}},
     {"status": "Download complete", "id": "c3"},
+    {"status": "Extracting", "id": "c3", "progressDetail": {"current": 100, "total": 900}},
     {"status": "Digest: sha256:abc"},
 ]
+
+
+def test_downloaded_layer_is_not_done_until_extracted():
+    progress: dict = {}
+    for event in EVENTS:
+        _track_pull_progress(progress, event)
+    _track_pull_progress(progress, {"status": "Pull complete", "id": "c3"})
+
+    assert pull_progress_text(progress) == "2 of 3 layers done, 1.7 GB downloaded"
 
 
 def test_progress_counts_layers_and_downloaded_bytes():
@@ -26,7 +36,7 @@ def test_progress_counts_layers_and_downloaded_bytes():
     for event in EVENTS:
         _track_pull_progress(progress, event)
 
-    assert pull_progress_text(progress) == "2 of 3 layers done, 1.7 GB downloaded"
+    assert pull_progress_text(progress) == "1 of 3 layers done, 1.7 GB downloaded"
 
 
 @pytest.mark.asyncio
@@ -47,7 +57,7 @@ async def test_reporter_streams_only_changed_progress_to_the_renter():
     await asyncio.sleep(0.05)
     reporter.cancel()
 
-    assert logs == [("Pulling docker image img:1: 2 of 3 layers done, 1.7 GB downloaded", "success", "tag")]
+    assert logs == [("Pulling docker image img:1: 1 of 3 layers done, 1.7 GB downloaded", "success", "tag")]
 
 
 @pytest.mark.asyncio
