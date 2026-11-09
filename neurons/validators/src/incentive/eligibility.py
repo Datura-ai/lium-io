@@ -23,7 +23,8 @@ def earns_spot_rental_incentive(job_result: JobResult) -> bool:
 
     The same nodes as spot-node pay, while rented: the backend's provider_spot_executor_ids, so a
     node that is spot as a restriction (banned, pinned, or under a self-rent or untrusted-renter
-    rental) keeps earning nothing. The free remainder of a partially rented one is not rented.
+    rental) keeps earning nothing. The free remainder of a partially rented one is not rented: it
+    takes spot idle pay instead, so no GPU earns both.
     """
     return (
         settings.ENABLE_SPOT_RENTAL_INCENTIVE
