@@ -23,7 +23,7 @@ from services.local_verify_client import SCHEMA, LocalVerifyUnavailable, parse_a
 from services.task import liumd_shadow
 from services.task import service as task_service_module
 from services.task.checks import verifyx as verifyx_check
-from services.task.checks.verifyx import VerifyXCheck
+from services.task.checks.verifyx import VerifyXCheck, VerifyXColdRetryCheck
 from services.task.liumd_shadow import (
     LIUMD_SHADOW_EVENT,
     TodayStep,
@@ -36,6 +36,7 @@ from services.task.service import TaskService
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
 from tests.test_local_verify import _FakeVerifyXValidator, matmul_service, matmul_stdout
+from tests.test_verifyx_cold_sample_retry import _idle_now
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
 UUID = "exec-shadow"
@@ -184,7 +185,9 @@ def _ctx(keypair, monkeypatch, verifyx_service, *, sealed="challenge", state=Non
         services=build_services(
             validation=matmul_service(monkeypatch, sealed=sealed),
             verifyx=verifyx_service,
-            redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
+            redis=SimpleNamespace(
+                renting_in_progress=AsyncMock(return_value=False), get=AsyncMock(return_value=None)
+            ),
         ),
         config=build_context_config(
             validator_keypair=keypair,
@@ -544,8 +547,10 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
         verifyx_check._package_fallback_probes[("5Miner", UUID)] = prior_fallbacks
     if prior_upload_kept:
         verifyx_check._kept_upload_probes[("5Miner", UUID)] = prior_upload_kept
-    judged = {"success": True, "ram": {}, "network": network}
-    retried = [{"success": True, "ram": {}, "network": retry}] if retry else []
+    # a disk reading that clears the floor: the retry check judges the disk of the sample it keeps (DiskSpaceCheck)
+    retry_disk = {"total": 1000, "utilization": 50.0, "free": 500 * 1024 * 1024}
+    judged = {"success": True, "ram": {}, "hard_disk": retry_disk, "network": network}
+    retried = [{"success": True, "ram": {}, "hard_disk": retry_disk, "network": retry}] if retry else []
     verifyx_service.judged = judged
     rented = _network_ema(prev_ema, 10.0 if prior_upload_kept else None)
     ctx = _ctx(
@@ -564,7 +569,11 @@ async def test_verifyx_verdict_is_the_checks_own_including_the_ema_gate(
         state=build_state(specs=SPECS, rented_data=rented),
     )
     stored_before = rented.network_ema[UUID].model_dump()
+    _idle_now(todays_ctx.services)
     checked = await VerifyXCheck().run(todays_ctx)
+    if checked.passed and checked.updates["state"].verifyx_cold_retry is not None:
+        # the cold retry, last before scoring, gives today's verdict on a cold first sample
+        checked = await VerifyXColdRetryCheck().run(todays_ctx.model_copy(update=checked.updates))
     assert ("pass" if checked.passed else "fail") == today
     events = (
         [checked.event, _event(CAPABILITY, "GPU_VERIFY_OK")] if checked.passed else [checked.event]

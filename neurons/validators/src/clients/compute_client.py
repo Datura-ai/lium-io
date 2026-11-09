@@ -494,6 +494,8 @@ class ComputeClient:
                             availability_errors=data.get("availability_errors"),
                             pod_states=data.get("pod_states"),
                             pod_ssh=data.get("pod_ssh"),
+                            host_runtime_fault=data.get("host_runtime_fault"),
+                            check_started_at=data.get("check_started_at"),
                             ssh_host_key=data.get("ssh_host_key"),
                         )
 
@@ -1232,6 +1234,7 @@ class ComputeClient:
                 continue
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
+            await redis_service.release_cut_off_create_lock(create.executor_id, pod_id)
             if create.resumes < MAX_CREATE_RESUMES:
                 # the count survives another restart before the backend's re-send arrives
                 await redis_service.add_inflight_backend_create(

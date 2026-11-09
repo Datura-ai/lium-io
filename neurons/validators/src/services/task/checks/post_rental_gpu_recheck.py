@@ -130,6 +130,8 @@ def _all_cards_no_verdict(probe: AllCardsProbe) -> bool:
 
 class PostRentalGpuRecheckCheck:
     check_id = "gpu.validate.post_rental_recheck"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
