@@ -12186,7 +12186,7 @@ class DockerService:
         to rename it back (``_EditSwap.park``), so the renter stayed down until then. The caller has
         made sure no create for the pod is in flight and bounds the call well inside the create lock.
         A start that fails leaves the container stopped and parked again, so the next cycle retries;
-        only a stale-mount start error keeps the name, for the stale-mount recovery to take it.
+        only a stale-mount or leftover-cgroup start error keeps the name, for the pod recovery to repair it.
         ``stopped_by_recovery`` (the pod's STOPPED_BY_RECOVERY mark): a lone stopped ``<name>`` is
         started as well, since a recovery of ours stopped it or renamed it back without an answer.
         A lone ``<name>__stopped`` this process parked (a stop whose mark could not be written) gets its
@@ -12408,9 +12408,13 @@ class DockerService:
         start_error: str | None,
     ) -> bool:
         # stop a half-started container, then park it again by its own id so the next cycle's
-        # recovery retries; a stale-mount start error keeps the name for the stale-mount recovery
+        # recovery retries; a stale-mount or leftover-cgroup start error keeps the name for the pod recovery,
+        # which repairs exactly those
         stopped = await self._stop_half_recovered_container(ssh_client, container_name)
-        if not stopped or (start_error and _is_stale_vloopback_mountpoint_error(start_error)):
+        if not stopped or (
+            start_error
+            and (_is_stale_vloopback_mountpoint_error(start_error) or _is_stale_container_cgroup_error(start_error))
+        ):
             return False
         return await self._park_by_id(ssh_client, container_id, parked)
 

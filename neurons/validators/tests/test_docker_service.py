@@ -8240,6 +8240,14 @@ async def test_recover_parked_retries_after_a_policy_failure_before_the_rename(d
             False,
             id="stale_mount_error_keeps_the_name",
         ),
+        pytest.param(
+            RuntimeError(
+                "OCI runtime create failed: write /sys/fs/cgroup/system.slice/docker-c0ffee.scope/cgroup.procs: "
+                "device or resource busy"
+            ),
+            False,
+            id="stale_cgroup_error_keeps_the_name",
+        ),
     ],
 )
 @pytest.mark.asyncio
