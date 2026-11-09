@@ -287,6 +287,9 @@ class RentalPriceIncentive(DefaultIncentive):
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
+        # Idle secure nodes in a bucket, and the per-model cap on an idle GPU-hour (DAH-6030), set once all are known.
+        self._secure_idle_results: list[tuple[str, JobResult]] = []
+        self._idle_rate_cap_by_model: dict[str, float] = {}
         self.total_rental_cost = 0.0
         self.rental_share = 0.0
         self.rental_share_raw = 0.0
@@ -892,6 +895,7 @@ class RentalPriceIncentive(DefaultIncentive):
             # accumulate raw unrented GPU count and weighted rate sum per bucket
             if result.hourly_rate > 0 and max_cap > 0:
                 key = (base_model, bucket)
+                self._secure_idle_results.append((base_model, result))
                 self.unrented_count_by_bucket[key] = (
                     self.unrented_count_by_bucket.get(key, 0) + result.gpu_count
                 )
@@ -976,6 +980,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
         - Calculate rental share
         """
+        self._cap_idle_rates_at_default_job_yield()
         # DAH-2528: rebalance split-capable nodes before multipliers are computed.
         self._reassign_split_candidates()
 
@@ -1386,7 +1391,44 @@ class RentalPriceIncentive(DefaultIncentive):
             or not result.hourly_rate
         ):
             return diluted_rate
-        return max(diluted_rate, SECURE_FILLER_REVENUE_FLOOR_FACTOR * result.filler_revenue_per_gpu_hour)
+        floor: float = SECURE_FILLER_REVENUE_FLOOR_FACTOR * result.filler_revenue_per_gpu_hour
+        cap: float | None = self._idle_rate_cap_by_model.get(self.get_base_model_for_gpu(result.gpu_model))
+        return max(diluted_rate, floor if cap is None else min(floor, cap))
+
+    def _cap_idle_rates_at_default_job_yield(self) -> None:
+        """DAH-6030 per-model cap: an idle GPU-hour is rated at most k x what its GPU model's Default Jobs earned per
+        idle GPU-hour (the model's Default Job USD/hour over its idle GPUs this cycle). Bounds the listed rate, the
+        secure floor (_floored_rate) and spot pay, so a model's idle pay stays within k x its Default Job revenue.
+        Off while IDLE_PAY_BUDGET_K is unset."""
+        k: float | None = settings.IDLE_PAY_BUDGET_K
+        if k is None:
+            return
+        idle_gpus: dict[str, int] = {}
+        revenue: dict[str, float] = {}
+        for base_model, result in self._secure_idle_results + self._spot_pay_candidates:
+            idle_gpus[base_model] = idle_gpus.get(base_model, 0) + result.gpu_count
+            if result.filler_revenue_usd_per_hour is not None:
+                revenue[base_model] = result.filler_revenue_usd_per_hour
+        # shortcut: a model with no usable Default Job sample stays uncapped here; the total budget
+        # (_apply_idle_pay_budget) still bounds it. Upgrade if such models carry real idle spend.
+        self._idle_rate_cap_by_model = {m: k * usd / idle_gpus[m] for m, usd in revenue.items() if idle_gpus[m] > 0}
+        for base_model, result in self._secure_idle_results:
+            cap: float | None = self._idle_rate_cap_by_model.get(base_model)
+            if cap is None or result.hourly_rate <= cap:
+                continue
+            key = (base_model, result.count_bucket)
+            self._weighted_rate_sum_by_bucket[key] -= (
+                result.gpu_count * (result.hourly_rate - cap) * result.sysbox_multiplier * result.driver_multiplier
+            )
+            result.hourly_rate = cap
+        for base_model, result in self._spot_pay_candidates:
+            cap = self._idle_rate_cap_by_model.get(base_model)
+            if cap is not None:
+                result.effective_rate = min(result.effective_rate, cap)
+        if self._idle_rate_cap_by_model:
+            logger.info(
+                _m("Idle rate cap per GPU model", extra={"k": k, "usd_per_idle_gpu_hour": self._idle_rate_cap_by_model})
+            )
 
     def _secure_floor_top_up(self) -> float:
         """USD/hour the secure floor adds on top of the bucket sums, paid from the unbucketed share."""
