@@ -16,8 +16,8 @@ logger = get_logger(__name__)
 DJ_REVENUE_KEY = "idle_pay_budget:default_job_revenue_usd_per_hour"
 # The k the per-cycle log prices while the guard is off, so the effect is visible before go-live.
 SHADOW_K = 0.9
-# A reading older than this is no reading: idle pay runs unscaled (and says so) until a fresh one arrives, so a long
-# backend outage can neither stop idle pay nor hold it at an old low budget.
+# A zero older than this is no reading, so a stale zero cannot stop idle pay for good. A positive reading keeps
+# capping at any age (logged as stale): dropping it would pay idle uncapped during a long outage.
 MAX_READING_AGE_HOURS = 24.0
 
 
@@ -41,7 +41,7 @@ async def store_default_job_revenue(redis_service, usd_per_hour: float | None) -
 
 async def load_default_job_revenue(redis_service) -> tuple[float | None, float | None]:
     """(last good USD/hour, its age in hours), or (None, age) when there is none: cold start, only a pending zero,
-    or a reading older than MAX_READING_AGE_HOURS."""
+    or a zero older than MAX_READING_AGE_HOURS."""
     try:
         raw = await redis_service.get(DJ_REVENUE_KEY)
         if raw is None:
@@ -50,15 +50,14 @@ async def load_default_job_revenue(redis_service) -> tuple[float | None, float |
         if "at" not in stored:
             return None, None
         age_hours: float = (time.time() - float(stored["at"])) / 3600
+        usd_per_hour: float = float(stored["usd_per_hour"])
         if age_hours > MAX_READING_AGE_HOURS:
+            if usd_per_hour <= 0:
+                return None, age_hours
             logger.warning(
-                _m(
-                    "Idle-pay budget: Default Job revenue older than a day, idle pay unscaled until a fresh reading",
-                    extra={"age_hours": age_hours},
-                )
+                _m("Idle-pay budget: Default Job revenue stale, last good budget kept", extra={"age_hours": age_hours})
             )
-            return None, age_hours
-        return float(stored["usd_per_hour"]), age_hours
+        return usd_per_hour, age_hours
     except Exception as exc:
         logger.warning(_m("Idle-pay budget: Default Job revenue unreadable", extra={"error": str(exc)}))
         return None, None
