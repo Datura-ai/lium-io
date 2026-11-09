@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import json
 import time
+from collections import Counter
+from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel
 from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
+    RENTAL_START_RATIO_TTL_SECONDS,
+    RENTED_MIN_POWER_LIMIT_RATIO,
+    SCORED_TIER_RATIO_TTL_SECONDS,
     STALE_CAP_GRACE_SECONDS,
     GpuPowerCapRevert,
     GpuPowerRestoreRecord,
     detect_cap_revert,
     read_gpu_power_restore_records,
     record_cap_reverts,
+    rental_legacy_pod_key,
+    rental_start_ratio_key,
     restore_tracked_gpu_power_limits,
+    scored_tier_ratio_key,
 )
+from services.redis_service import RedisWrites
 
 from ..messages import GpuPowerLimitMessages as Msg
 from ..messages import render_message, shown
@@ -41,6 +51,23 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _with_host_limits(ctx: Context, records: list[GpuPowerRestoreRecord]) -> dict[str, Any]:
+    """Specs with ``power_host_limit`` (watts) on each GPU under our live Pearl cap: the host's own limit,
+    recorded before the cap and restored when the filler stops. The backend's Reduced power limit badge
+    judges it while ``power_limit`` stays the live cap (DAH-5302). No record = no field."""
+    host_watts = {record.gpu_uuid: record.watts for record in records}
+    gpu = (ctx.state.specs or {}).get("gpu")
+    if not host_watts or not isinstance(gpu, dict) or not isinstance(gpu.get("details"), list):
+        return {}
+    details = [
+        {**detail, "power_host_limit": host_watts[detail["uuid"]]}
+        if isinstance(detail, dict) and detail.get("uuid") in host_watts
+        else detail
+        for detail in gpu["details"]
+    ]
+    return {"state": replace(ctx.state, specs={**ctx.state.specs, "gpu": {**gpu, "details": details}})}
 
 
 def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str, Any]]:
@@ -71,18 +98,19 @@ class GpuPowerLimitCheck:
             # DAH-2786: this is the only moment we can tell a host that raises our cap back
             # WHILE our job runs from one that merely resets the limit after the job ends. The
             # first kills the job it is paid to host; the second harms nothing.
-            await self._record_reverts_of_our_live_cap(ctx)
+            records = await self._record_reverts_of_our_live_cap(ctx)
             event = render_message(
                 Msg.SKIPPED_ACTIVE_LIUM_FILLER,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"executor_uuid": ctx.executor.uuid},
             )
-            return CheckResult(passed=True, event=event)
+            return CheckResult(passed=True, event=event, updates=_with_host_limits(ctx, records))
 
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
         rejected: list[GpuPowerMeasurement] = []
+        floors = await self._rented_floors(ctx)
 
         for index, detail in enumerate(ctx.state.gpu_details or []):
             current_limit = _to_float(detail.get("power_limit"))
@@ -106,7 +134,7 @@ class GpuPowerLimitCheck:
             measurement.power_limit_ratio = round(ratio, 4)
             measurements.append(measurement)
 
-            if ratio < MIN_POWER_LIMIT_RATIO:
+            if ratio < floors.get(measurement.uuid or "", floors.get("", MIN_POWER_LIMIT_RATIO)):
                 rejected.append(measurement)
 
         if rejected:
@@ -141,7 +169,8 @@ class GpuPowerLimitCheck:
                     "score": 0.0,
                     "job_score": 0.0,
                     "score_warning": (
-                        " WARNING: GPU power limit is below 90% of the default power limit"
+                        " WARNING: GPU power limit is below 80% of the default power limit,"
+                        " or was lowered below 90% during a rental"
                     ),
                 },
             )
@@ -168,6 +197,14 @@ class GpuPowerLimitCheck:
                 },
             )
 
+        if self.restore_stale_caps and not await self._remember_tier_ratios(ctx, measurements):  # the dry run writes nothing
+            event = render_message(
+                Msg.TIER_STATE_UNKNOWN,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"threshold": MIN_POWER_LIMIT_RATIO, "measurements": _dump_measurements(measurements)},
+            )
+            return CheckResult(passed=False, event=event)
         event = render_message(
             Msg.LIMIT_OK,
             ctx=ctx,
@@ -179,16 +216,98 @@ class GpuPowerLimitCheck:
         )
         return CheckResult(passed=True, event=event)
 
-    async def _record_reverts_of_our_live_cap(self, ctx: Context) -> None:
+    async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> bool:
+        """Keep each GPU's passing reading in the 80 % tier (and clear it at stock) for a rental-start
+        read that misses the GPU: it then starts at what the renter's badge showed, not at stock (F-36).
+
+        False when a tier reading may still be kept after a stock reading (Redis failed): the cycle then gives
+        no verdict, so the node is neither zeroed by our outage nor shown at stock while 0.8 is kept (F-43)."""
+        writes, stock_keys = RedisWrites(), []
+        for m in measurements:
+            if not m.uuid or m.power_limit_ratio is None:
+                continue
+            key = scored_tier_ratio_key(ctx.executor.uuid, m.uuid)
+            if m.power_limit_ratio < RENTED_MIN_POWER_LIMIT_RATIO:
+                writes.set(key, str(m.power_limit_ratio), ex=SCORED_TIER_RATIO_TTL_SECONDS)
+            else:
+                writes.delete(key)
+                stock_keys.append(key)
+        try:
+            kept: bool | None = any(await ctx.services.redis.mget(stock_keys)) if stock_keys else False
+        except Exception:
+            kept = None  # unknown, never taken as proof that nothing is kept
+        for _ in range(2):
+            try:
+                await ctx.services.redis.write_atomically(writes)
+                return True
+            except Exception:
+                continue
+        # a lost set leaves a missed GPU at stock, the safe side; a lost clear is safe only when nothing was kept
+        return kept is False
+
+    async def _rented_floors(self, ctx: Context) -> dict[str, float]:
+        """Per-GPU floor while the node is rented, by GPU uuid; "" is the floor for any other GPU.
+
+        A GPU whose rental-start record names a pod rented now keeps min(its ratio then,
+        RENTED_MIN_POWER_LIMIT_RATIO), never under MIN_POWER_LIMIT_RATIO, so a renter who rented
+        it in the 80 % tier keeps that cap and nobody else's power drops mid-rental. Other GPUs
+        get MIN_POWER_LIMIT_RATIO only when every settled pod has a record for each of its
+        `gpu_count` GPUs (so they are not rented: a split node's free bundle), else
+        RENTED_MIN_POWER_LIMIT_RATIO. A pod whose container the backend has not recorded yet is
+        still being created; its records are written before its container starts, so it is not
+        judged. A settled pod with no record at all is a rental from before the records: it is
+        marked so its next create (a reboot or edit) records 1.0, never the limit of that day.
+        Unrented node, or Redis did not answer: {} = MIN_POWER_LIMIT_RATIO everywhere; our own
+        outage must not zero a node.
+        """
+        rented_data = ctx.state.rented_data
+        rented = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        if rented is None or not rented.pods:
+            return {}
+        uuids = [str(detail.get("uuid")) for detail in ctx.state.gpu_details or [] if detail.get("uuid")]
+        try:
+            raw = await ctx.services.redis.mget([rental_start_ratio_key(ctx.executor.uuid, u) for u in uuids])
+        except Exception:
+            return {}
+        rented_pod_ids = {pod.pod_id for pod in rented.pods}
+        floors: dict[str, float] = {}
+        records_by_pod: Counter[str] = Counter()
+        for gpu_uuid, value in zip(uuids, raw):
+            if not value:
+                continue
+            try:
+                record = json.loads(value)
+                pod_id, ratio = str(record["pod_id"]), float(record["ratio"])
+            except (ValueError, TypeError, KeyError):
+                continue  # a corrupt record proves nothing: the GPU takes the "" floor
+            if pod_id in rented_pod_ids:
+                records_by_pod[pod_id] += 1
+                # 0.005 slack: the record is read from nvidia-smi in whole watts, the check from the scrape
+                floors[gpu_uuid] = max(MIN_POWER_LIMIT_RATIO, min(RENTED_MIN_POWER_LIMIT_RATIO, ratio - 0.005))
+        settled = [pod for pod in rented.pods if not pod.container_name_pending]
+        every_gpu_recorded = all(
+            pod.gpu_count is not None and records_by_pod[pod.pod_id] >= pod.gpu_count for pod in settled
+        )
+        floors[""] = MIN_POWER_LIMIT_RATIO if every_gpu_recorded else RENTED_MIN_POWER_LIMIT_RATIO
+        if self.restore_stale_caps:  # the dry-run pipeline writes nothing
+            for pod in settled:
+                if not records_by_pod[pod.pod_id]:
+                    try:
+                        await ctx.services.redis.set(
+                            rental_legacy_pod_key(pod.pod_id), "1", ex=RENTAL_START_RATIO_TTL_SECONDS
+                        )
+                    except Exception:
+                        pass  # marked on a later cycle
+        return floors
+
+    async def _record_reverts_of_our_live_cap(self, ctx: Context) -> list[GpuPowerRestoreRecord]:
         """Note every GPU of this executor whose live limit sits above the cap we applied and
         verified for the Lium job running right now (DAH-2786).
 
         Read-only towards the host: it changes no limit, it only records what it saw, so the
         filler keeps running either way. The unrented incentive gate counts these later.
+        Returns this executor's restore records (the host's own limits under the cap).
         """
-        # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
-        if not self.restore_stale_caps:
-            return
         live_watts_by_uuid: dict[str, GpuPowerMeasurement] = {
             str(detail.get("uuid")): GpuPowerMeasurement(
                 index=index,
@@ -202,15 +321,17 @@ class GpuPowerLimitCheck:
             if detail.get("uuid")
         }
         if not live_watts_by_uuid:
-            return
+            return []
         read_result = await read_gpu_power_restore_records(
             ctx.services.redis, list(live_watts_by_uuid), log_extra=ctx.default_extra
         )
+        records = [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
+        # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
+        if not self.restore_stale_caps:
+            return records
         observed_at = time.time()
         reverts: list[GpuPowerCapRevert] = []
-        for record in read_result.records:
-            if record.executor_id != ctx.executor.uuid:
-                continue
+        for record in records:
             measurement = live_watts_by_uuid.get(record.gpu_uuid)
             if measurement is None or measurement.power_limit is None:
                 continue
@@ -223,6 +344,7 @@ class GpuPowerLimitCheck:
             await record_cap_reverts(
                 ctx.services.redis, ctx.executor.uuid, reverts, ctx.default_extra
             )
+        return records
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]

@@ -402,6 +402,24 @@ class RentedGpuDropResponse(BaseModel):
     delivery: str | None = None
 
 
+class RentedPodTarget(BaseModel):
+    """One row of `GET /internal/executors/rented?light=true` (DAH-5215 watch): only what the SSH probe dials."""
+    pod_id: str
+    ip: str
+    miner_hotkey: str = ""  # the probe's per-miner DNS quota; "" from an older backend
+    port: int | None = None  # the pod's mapped SSH port
+    status: str | None = None
+
+
+class RentedPodTargets(RootModel[list[RentedPodTarget] | RentedExecutorsResponse]):
+    """The light list, or the full rented list from a backend that ignores `light=true`."""
+
+
+class PodSshReachabilityResponse(BaseModel):
+    # False when nothing was written (no open rental, or the state was already recorded).
+    recorded: bool
+
+
 GPU_DROP_DELIVERY_DISABLED = "disabled"
 GPU_DROP_DELIVERY_NOT_RENTED = "not_rented"
 

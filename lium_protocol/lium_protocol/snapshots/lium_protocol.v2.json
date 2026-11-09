@@ -2284,6 +2284,19 @@
           "default": null,
           "title": "Batch Total"
         },
+        "check_started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check Started At"
+        },
         "collateral_deposited": {
           "anyOf": [
             {
@@ -6597,7 +6610,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.10.0",
+  "protocol_version": "2.11.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

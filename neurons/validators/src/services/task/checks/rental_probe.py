@@ -77,7 +77,8 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
     STEP_CONTAINER_START: (
         "The validator could not start a renter container on this node (create step: {create_step}). "
         "Check that Docker and the NVIDIA container runtime start a GPU container by hand, that the "
-        "default renter image is present, and that the executor's port range is free."
+        "default renter image is present, that the executor's port range is free, and that sshd, the "
+        "network and dockerd stay up so the validator's Docker connection over SSH does not drop."
     ),
     STEP_SSHD_LISTEN: (
         "The container started but sshd did not answer on port {port} within {deadline} s. "

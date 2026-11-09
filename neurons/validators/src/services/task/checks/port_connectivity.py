@@ -255,6 +255,7 @@ class PortConnectivityCheck:
             externally_unreachable=result.status == "externally_unreachable",
             host_runtime_fault=result.host_runtime_fault,
             external_probe_blocked=result.external_probe == "blocked",
+            port_probe_connection_lost=(result.error or "connection lost") if result.connection_lost else None,
         )
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):

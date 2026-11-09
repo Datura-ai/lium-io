@@ -101,7 +101,6 @@ from services.redis_service import (
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     POD_STATES_CHANNEL,
-    RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
@@ -494,6 +493,7 @@ class ComputeClient:
                             pod_states=data.get("pod_states"),
                             pod_ssh=data.get("pod_ssh"),
                             host_runtime_fault=data.get("host_runtime_fault"),
+                            check_started_at=data.get("check_started_at"),
                             ssh_host_key=data.get("ssh_host_key"),
                         )
 
@@ -813,9 +813,7 @@ class ComputeClient:
                 )
             )
             redis_service = self.miner_service.redis_service
-            await redis_service.delete(RENTED_MACHINE_PREFIX)
-            for machine in response.machines:
-                await redis_service.add_rented_machine(machine)
+            await redis_service.replace_rented_machines(response.machines)
             await redis_service.set_banned_guids(response.banned_guids)
             return
 

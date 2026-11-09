@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -236,6 +237,10 @@ class FakeRedis:
     async def persist(self, key: str):
         self._touch()
         self.ttl.pop(key, None)
+
+    @asynccontextmanager
+    async def rented_gpu_drop_lock(self, pod_id: str):
+        yield None if self.failing else True
 
 
 def default_executor() -> ExecutorSSHInfo:

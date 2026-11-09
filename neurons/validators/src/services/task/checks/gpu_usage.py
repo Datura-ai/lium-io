@@ -236,6 +236,12 @@ class GpuUsageCheck:
         # under the utilization limits
         off_image = await _fillers_off_their_image(ctx, process_names & filler_containers)
         violation = _find_violation(gpu_details, gpu_processes)
+        if violation and "gpu_index" in violation:
+            # the card's index on the node, not in the list left after a reset dropped some
+            busy = gpu_details[violation["gpu_index"]]
+            violation["gpu_index"] = next(
+                i for i, d in enumerate(ctx.state.gpu_details) if d is busy
+            )
         if violation is None and off_image:
             violation = {"filler_containers_off_their_image": off_image}
 
@@ -281,6 +287,7 @@ class GpuUsageCheck:
             ctx=ctx,
             check_id=self.check_id,
             what=violation,
+            **_measured_usage_remediation(violation, filler_containers),
         )
         return CheckResult(passed=False, event=event)
 
@@ -626,6 +633,41 @@ def _time_since_the_rental_closed(rental_closed_at: datetime) -> timedelta:
     return datetime.now(timezone.utc) - closed_at
 
 
+def _measured_usage_remediation(violation: dict, filler_containers: set[str]) -> dict:
+    """DAH-5957: the GPU, its measured load against the limit and what runs on it.
+
+    A filler-off-image violation has no load reading and keeps the template's text."""
+    if "gpu_utilization" not in violation:
+        return {}
+    outside = [
+        p for p in violation["gpu_processes"] if p.get("container_name") not in filler_containers
+    ]
+    if not outside:
+        return {}
+    # Lium's filler is on the node: never name it to stop, and the idle limit does not apply to it
+    beside_a_filler = len(outside) < len(violation["gpu_processes"])
+    template = (
+        Msg.USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION
+        if beside_a_filler
+        else Msg.USAGE_HIGH_MEASURED_REMEDIATION
+    )
+    return {
+        "remediation": template.format(
+            gpu_index=violation["gpu_index"],
+            gpu_utilization=violation["gpu_utilization"],
+            vram_utilization=violation["vram_utilization"],
+            gpu_limit=GPU_UTILIZATION_LIMIT,
+            memory_limit=GPU_MEMORY_UTILIZATION_LIMIT,
+            processes=", ".join(_describe_process(p) for p in outside),
+            fillers=", ".join(
+                _describe_process(p)
+                for p in violation["gpu_processes"]
+                if p.get("container_name") in filler_containers
+            ),
+        )
+    }
+
+
 def _describe_process(process: dict) -> str:
     owner: str = process.get("container_name") or process.get("name") or "a host process"
     return f"{owner} (pid {process.get('pid')})"
@@ -799,12 +841,13 @@ def _find_violation(gpu_details: list[dict], gpu_processes: list[dict]) -> dict 
     if not gpu_processes:
         return None
 
-    for detail in gpu_details:
+    for gpu_index, detail in enumerate(gpu_details):
         gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
         gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
 
         if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
             return {
+                "gpu_index": gpu_index,
                 "gpu_utilization": f"{gpu_utilization}%",
                 "vram_utilization": f"{gpu_memory_utilization}%",
                 "process_count": len(gpu_processes),
