@@ -12545,11 +12545,20 @@ class DockerService:
             # resume_paused_unmounted_pod once the mark can be written
             if not await _record_unmarked_recovery_stop(pod_id):
                 _UNMOUNTED_STOP_OUTCOMES[pod_id] = "unknown"
-                paused = await ssh_client.run(
-                    f"/usr/bin/docker pause {shlex.quote(container_name)}", timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
-                )
-                if getattr(paused, "exit_status", 1) == 0:
-                    _PAUSED_BY_RECOVERY.add(pod_id)
+                # claimed before the pause, as the stop mark is: a pause whose reply is lost may still have applied,
+                # and only the claim lets a later cycle lift it (F-55/F-51). Dropped only when docker answers no
+                _PAUSED_BY_RECOVERY.add(pod_id)
+                try:
+                    paused = await ssh_client.run(
+                        f"/usr/bin/docker pause {shlex.quote(container_name)}",
+                        timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+                    )
+                except (asyncio.CancelledError, Exception):
+                    self._retry_pause_key_in_background(pod_id)
+                    raise
+                if getattr(paused, "exit_status", 1) != 0:
+                    _PAUSED_BY_RECOVERY.discard(pod_id)
+                else:
                     await self.paused_by_recovery(pod_id)  # written to Redis now if it is back
                     if pod_id in _PAUSED_BY_RECOVERY:
                         self._retry_pause_key_in_background(pod_id)
