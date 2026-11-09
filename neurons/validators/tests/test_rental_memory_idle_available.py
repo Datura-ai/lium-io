@@ -18,8 +18,8 @@ def _service(stored: str | None = None) -> DockerService:
     return DockerService(ssh_service=Mock(), redis_service=redis, attestation_service=Mock())
 
 
-def _ssh_listing(*names: str) -> Mock:
-    stdout = "".join(f"{name} {i:064x}\n" for i, name in enumerate(names))
+def _ssh_listing(*names: str, available_kib: int = IDLE_AVAILABLE_KIB) -> Mock:
+    stdout = f"MemAvailable:   {available_kib} kB\n" + "".join(f"{name} {i:064x}\n" for i, name in enumerate(names))
     return Mock(
         run=AsyncMock(return_value=SimpleNamespace(exit_status=0, stdout=stdout, stderr=""))
     )
@@ -32,10 +32,11 @@ async def test_idle_node_uses_live_available_and_stores_it():
     ssh_client = _ssh_listing("lium-executor")
 
     # Act
-    result = await service._idle_mem_available_kib(ssh_client, "exec-1", IDLE_AVAILABLE_KIB)
+    result = await service._idle_mem_available_kib(ssh_client, "exec-1")
 
     # Assert
     assert result == (IDLE_AVAILABLE_KIB, "live")
+    ssh_client.run.assert_awaited_once()  # value and listing from one command: the same instant
     service.redis_service.set.assert_awaited_once_with(
         KEY, str(IDLE_AVAILABLE_KIB), ex=IDLE_MEM_AVAILABLE_TTL_SECONDS
     )
@@ -45,10 +46,10 @@ async def test_idle_node_uses_live_available_and_stores_it():
 async def test_busy_node_uses_stored_baseline():
     # Arrange
     service = _service(stored=str(IDLE_AVAILABLE_KIB))
-    ssh_client = _ssh_listing("lium-executor", "pod_other", "filler_x")
+    ssh_client = _ssh_listing("lium-executor", "pod_other", "filler_x", available_kib=100 * GIB_KIB)
 
     # Act
-    result = await service._idle_mem_available_kib(ssh_client, "exec-1", 100 * GIB_KIB)
+    result = await service._idle_mem_available_kib(ssh_client, "exec-1")
 
     # Assert
     assert result == (IDLE_AVAILABLE_KIB, "stored")
@@ -59,10 +60,10 @@ async def test_busy_node_uses_stored_baseline():
 async def test_busy_node_without_baseline_keeps_todays_limit():
     # Arrange
     service = _service(stored=None)
-    ssh_client = _ssh_listing("filler_x")
+    ssh_client = _ssh_listing("filler_x", available_kib=100 * GIB_KIB)
 
     # Act
-    idle_kib, source = await service._idle_mem_available_kib(ssh_client, "exec-1", 100 * GIB_KIB)
+    idle_kib, source = await service._idle_mem_available_kib(ssh_client, "exec-1")
 
     # Assert
     assert (idle_kib, source) == (None, "none")

@@ -3933,9 +3933,7 @@ class DockerService:
                 values[key] = value if value > 0 else None
         return values.get("MemTotal"), values.get("MemAvailable")
 
-    async def _idle_mem_available_kib(
-        self, ssh_client, executor_uuid: str, live_available_kib: int | None
-    ) -> tuple[int | None, str]:
+    async def _idle_mem_available_kib(self, ssh_client, executor_uuid: str) -> tuple[int | None, str]:
         """The host's MemAvailable with nothing of ours running on it, and where it came from (DAH-6066).
 
         An idle host's MemAvailable is what it can give tenants: MemTotal less the kernel, GPU driver, slab and
@@ -3944,9 +3942,24 @@ class DockerService:
         value counts its usage, so the remembered one is used. None (today's limit) when neither is known.
         """
         key = f"{IDLE_MEM_AVAILABLE_PREFIX}:{executor_uuid}"
-        listing = await self._list_all_containers(ssh_client) if live_available_kib else None
-        if listing is not None and not any(
-            name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)) for name in listing[0]
+        # One SSH command, so the value and the listing describe the same instant: a pod deleted between two
+        # round trips would leave a busy host's value stored as the idle baseline.
+        live_available_kib, names = None, None
+        try:
+            async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
+                res = await ssh_client.run(
+                    f"grep '^MemAvailable:' /proc/meminfo && {DOCKER_PS_ALL_NAMES_IDS_CMD}",
+                    check=False,
+                    timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS,
+                )
+            if res.exit_status == 0 and isinstance(res.stdout, str):
+                first, *rest = res.stdout.splitlines() or [""]
+                live_available_kib = int(first.split()[1]) if first.startswith("MemAvailable:") else None
+                names = parse_container_listing(rest)[0]
+        except (asyncssh.Error, asyncio.TimeoutError, OSError, IndexError, ValueError):
+            pass
+        if live_available_kib and names is not None and not any(
+            name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)) for name in names
         ):
             await self.redis_service.set(key, str(live_available_kib), ex=IDLE_MEM_AVAILABLE_TTL_SECONDS)
             return live_available_kib, "live"
@@ -9704,7 +9717,7 @@ class DockerService:
                 if host_ram_kib is not None:
                     try:
                         idle_available_kib, idle_source = await self._idle_mem_available_kib(
-                            ssh_client, executor_info.uuid, host_available_kib
+                            ssh_client, executor_info.uuid
                         )
                     except Exception as exc:  # noqa: BLE001 — never fails a create; only lowers a limit
                         idle_source = f"error {exc.__class__.__name__}"
