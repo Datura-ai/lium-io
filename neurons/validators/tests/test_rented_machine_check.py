@@ -2595,8 +2595,8 @@ async def test_tenant_enforcement_every_two_pod_combination(context_factory, ord
         assert result.updates["rented"] is True
         assert extra.get("pods_rental_state_unknown", []) == held
         assert extra.get("pods_rental_closed", []) == closed
-        live = [pod for pod in pods if pod.pod_id not in closed]
-        assert extra["rented_gpu_count"] == sum(pod.gpu_count for pod in live)
-        assert result.updates["state"].rented_data.executors["executor-123"].pods == live
+        # the cycle keeps the batch-start rental view its split sizing and pay were built from
+        assert extra["rented_gpu_count"] == sum(pod.gpu_count for pod in pods)
+        assert "state" not in result.updates or result.updates["state"].rented_data == rented_data
     if verdict == Msg.STALE_POD_NOT_RUNNING.reason:
         assert result.updates["rented"] is False

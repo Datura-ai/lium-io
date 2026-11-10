@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from core.docker_utils import ContainerDeathDiagnostics, DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedPod
+from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import (
     ContainerState,
     PodContainerState,
@@ -40,7 +40,7 @@ from services.redis_service import (
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context, ContextState
+from ..pipeline import CheckResult, Context
 from . import port_connectivity
 from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
@@ -313,7 +313,7 @@ class TenantEnforcementCheck:
         # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
         # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
         state_by_pod_id: dict[str, ContainerState] = {}
-        # DAH-6141: pods whose rental the backend confirmed closed, skipped because a sibling is not
+        # DAH-6141: pods whose rental the backend confirmed closed, skipped because a sibling is not closed
         closed_pod_ids: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
@@ -423,6 +423,7 @@ class TenantEnforcementCheck:
                     if not await _every_listed_pod_stale(ctx, rented_pods, pod_index, closed_pod_ids):
                         # one rule (DAH-6141): a closed pod never decides the node while a sibling is running, down
                         # with an open rental or unanswered; the loop judges that sibling, the node stays rented
+                        # (its container stays on the GPU tenant list: the GPU snapshot may predate its end)
                         closed_pod_ids.add(pod_id)
                         ssh_pub_keys = []
                         continue
@@ -573,9 +574,10 @@ class TenantEnforcementCheck:
                 )
             )
 
-        rented_state = ctx.state
         if closed_pod_ids:
-            rented_state, extra = _without_closed_pods(ctx, rented_executor, closed_pod_ids, extra)
+            # reported only: the cycle keeps the batch-start rental view the split sizing and pay were built from,
+            # as for any pod that ends between cycles; the next cycle's list no longer names it
+            extra["pods_rental_closed"] = sorted(closed_pod_ids)
         # a closed pod's container is still the renter's, and the GPU snapshot may predate its end
         container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)
@@ -635,7 +637,6 @@ class TenantEnforcementCheck:
                 passed=True,
                 event=event,
                 updates={
-                    **({"state": rented_state} if closed_pod_ids else {}),
                     "default_extra": extra,
                     "rented": True,
                     "ssh_pub_keys": ssh_pub_keys,
@@ -1339,25 +1340,6 @@ async def _reprobe_split_shortfall(
         _, updates = published(fresh.get_filler_ports(ctx.executor.uuid))
         return None, {**updates, "rented_data": fresh.model_copy(update={"executors": executors})}
     return published(fresh.get_filler_ports(ctx.executor.uuid))
-
-
-def _without_closed_pods(
-    ctx: Context, rented_executor: RentedExecutor, closed: set[str], extra: dict
-) -> tuple[ContextState, dict]:
-    """The cycle's rental data and pod hints without the pods whose rentals the backend confirmed closed."""
-    live = rented_executor.model_copy(update={"pods": [p for p in rented_executor.pods if p.pod_id not in closed]})
-    rented_data = ctx.state.rented_data
-    executors = {key: live if value is rented_executor else value for key, value in rented_data.executors.items()}
-    extra = {
-        **extra,
-        "rented_pods": [entry for entry in extra["rented_pods"] if entry["pod_id"] not in closed],
-        "pods_rental_closed": sorted(closed),
-    }
-    counts = [pod.gpu_count for pod in live.pods if pod.gpu_count]
-    extra.pop("rented_gpu_count", None)
-    if live.pods and len(counts) == len(live.pods):
-        extra["rented_gpu_count"] = sum(counts)
-    return replace(ctx.state, rented_data=rented_data.model_copy(update={"executors": executors})), extra
 
 
 async def _every_listed_pod_stale(
