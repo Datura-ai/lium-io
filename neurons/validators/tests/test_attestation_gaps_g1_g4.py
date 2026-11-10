@@ -622,7 +622,7 @@ async def test_g5_unknown_executor_without_quote_unaffected(monkeypatch):
     assert host_policy.gpu_attestation_passed is None
 
 
-def _score_ctx(tdx_quote, attestation_passed):
+def _score_ctx(tdx_quote, attestation_passed, gpu_attestation_passed=None):
     executor = SimpleNamespace(price_per_gpu=None, tdx_quote=tdx_quote)
     state = SimpleNamespace(
         gpu_model="",
@@ -632,6 +632,7 @@ def _score_ctx(tdx_quote, attestation_passed):
         state=state,
         executor=executor,
         tdx_attestation_passed=attestation_passed,
+        gpu_attestation_passed=gpu_attestation_passed,
         cpu_truth_passed=True,
         provider_side_load_passed=True,
         inspector_blind_streak_passed=True,
@@ -670,6 +671,18 @@ def test_g5_score_gate_passes_attested_cvm_and_bare_metal(monkeypatch):
     # Act / Assert — bare-metal node (no quote) is untouched by the gate
     actual, _, _ = calculate_scores(_score_ctx(None, False), rented=False)
     assert actual == 1.0
+
+
+def test_g5_score_gate_ignores_an_observe_only_bad_gpu_verdict(monkeypatch):
+    # Arrange — the TDX quote verified, the GPU evidence verified bad: attestation_passed is false
+    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
+
+    # Act
+    actual, job, warning = calculate_scores(_score_ctx('{"quote":"00"}', False, gpu_attestation_passed=False), rented=False)
+
+    # Assert — GPU attestation is observe-only, so the verdict alone never zeroes the score
+    assert (actual, job) == (1.0, 1.0)
+    assert "CVM attestation not passed" not in warning
 
 
 def test_g5_score_gate_inert_when_enforcement_off(monkeypatch):
