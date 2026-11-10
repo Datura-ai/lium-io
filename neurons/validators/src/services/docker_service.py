@@ -140,6 +140,7 @@ from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
+    HOST_NSENTER,
     FlattenMeasureFailed,
     ImageFlattenNoDisk,
     flatten_copy_bytes,
@@ -849,7 +850,11 @@ class RentalDiskFit(NamedTuple):
     existing_gb: float  # pod volumes already on disk less the sizing overhead (fresh sizing only)
     disk_share: float
     fresh_sizing: bool
-    needs_free_gb: float
+    floor_gb: float  # resolve_volume_sizing's df_guard: the volume plus headroom whatever the share (fresh only)
+
+    @property
+    def needs_free_gb(self) -> float:
+        return max(self.own_gb / self.disk_share - self.existing_gb, self.floor_gb)
 
 
 class CustomerContainerRemoval(NamedTuple):
@@ -5757,49 +5762,21 @@ class DockerService:
                     CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
                 )
 
-            # a trimmed run volume still counts its declared size among the pod volumes (fit.existing_gb) while
-            # its disk is back in df: without this the rental would be counted on that disk twice
-            trimmed_gb: float = 0
-
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb >= rental_needs_free_gb + trimmed_gb
+                return free_now_gb >= fit.needs_free_gb
 
             for filler in killed:
                 if await rental_fits():
                     break
-                run_volume = f"volume_{filler.removeprefix(FILLER_CONTAINER_PREFIX)}"
-                try:
-                    declared_gb = await self._inspect_vloopback_volumes_bytes(ssh_client, [run_volume]) / (1024**3)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    continue  # no such volume, or not a vloopback one
-                if not declared_gb:
-                    continue
-                # fstrim in the host mount namespace: through /proc/1/root it cannot resolve the vloopback mount
-                command = f'( {_wipe_volume_cmd(run_volume, *killed)} && nsenter -t 1 -m -- fstrim "$p" && echo trimmed ) 2>&1'
-                try:
-                    trimmed = await asyncio.wait_for(ssh_client.run(command), CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
-                    output = trimmed.stdout or ""
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    output = repr(exc)  # best-effort, as the cache removals
-                if "trimmed" not in output:
-                    logger.warning(
-                        _m(
-                            "Could not free a killed filler's run volume",
-                            extra=get_extra_info({**default_extra, "volume": run_volume, "output": output[-2000:]}),
-                        )
-                    )
-                    continue
+                trimmed_gb = await self._trim_killed_filler_run_volume(ssh_client, filler, killed, default_extra)
                 if fit.fresh_sizing:
-                    trimmed_gb += declared_gb
+                    # a trimmed run volume still counts its declared size among the pod volumes (existing_gb) while
+                    # its disk is back in df: without this the rental would be counted on that disk twice
+                    fit = fit._replace(existing_gb=fit.existing_gb - trimmed_gb)
             # shortcut: resolve_volume_sizing still counts a trimmed run volume in its pool until the filler's delete
             # removes it (seconds later), so a split node's slice can read up to share x its size high; exclude killed
             # fillers' volumes there if that shows in prod.
-            fit = fit._replace(existing_gb=fit.existing_gb - trimmed_gb)
 
             def volume_remove(name: str) -> str:
                 if not killed:
@@ -5864,6 +5841,42 @@ class DockerService:
             )
             return True  # the removal may have run before the failure
 
+    async def _trim_killed_filler_run_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        filler: str,
+        killed: tuple[str, ...],
+        default_extra: dict,
+    ) -> float:
+        """Unlink a killed filler's run volume files and fstrim its backing file; the GiB freed, 0 when not (DAH-5798)."""
+        run_volume = f"volume_{filler.removeprefix(FILLER_CONTAINER_PREFIX)}"
+        try:
+            declared_gb = await self._inspect_vloopback_volumes_bytes(ssh_client, [run_volume]) / (1024**3)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return 0  # no such volume, or not a vloopback one
+        if not declared_gb:
+            return 0
+        # fstrim in the host mount namespace: through /proc/1/root it cannot resolve the vloopback mount
+        command = f'( {_wipe_volume_cmd(run_volume, *killed)} && {HOST_NSENTER}fstrim "$p" && echo trimmed ) 2>&1'
+        try:
+            trimmed = await asyncio.wait_for(ssh_client.run(command), CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
+            output = trimmed.stdout or ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            output = repr(exc)  # best-effort, as the cache removals
+        if "trimmed" not in output:
+            logger.warning(
+                _m(
+                    "Could not free a killed filler's run volume",
+                    extra=get_extra_info({**default_extra, "volume": run_volume, "output": output[-2000:]}),
+                )
+            )
+            return 0
+        return declared_gb
+
     async def _rental_disk_fit(
         self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest
     ) -> RentalDiskFit:
@@ -5879,11 +5892,11 @@ class DockerService:
             if fresh_sizing
             else 0
         )
-        needs_free_gb: float = own_gb / disk_share - existing_gb
-        if fresh_sizing and not payload.local_volume:
-            # resolve_volume_sizing's df_guard caps the volume at df free less its headroom
-            needs_free_gb = max(needs_free_gb, payload.volume_limit_gb + _FRESH_SIZING_HEADROOM_GB)
-        return RentalDiskFit(own_gb, existing_gb, disk_share, fresh_sizing, needs_free_gb)
+        # resolve_volume_sizing's df_guard caps the volume at df free less its headroom
+        floor_gb: float = (
+            payload.volume_limit_gb + _FRESH_SIZING_HEADROOM_GB if fresh_sizing and not payload.local_volume else 0
+        )
+        return RentalDiskFit(own_gb, existing_gb, disk_share, fresh_sizing, floor_gb)
 
     async def _clamp_rental_volume_to_free_disk(
         self,

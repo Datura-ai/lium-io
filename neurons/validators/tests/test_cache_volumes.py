@@ -707,6 +707,23 @@ async def test_a_run_volume_a_live_container_mounts_is_not_trimmed(docker_servic
     assert rental.volume_limit_gb < 242 * 0.95
 
 
+@pytest.mark.asyncio
+async def test_a_trimmed_run_volume_does_not_raise_the_df_guard_floor(docker_service, monkeypatch):
+    """Review 4522060750: the trimmed GiB belong to the share term only. 110 GB ordered beside 400 GB of pod
+    volumes: the df_guard floor (110 GiB) binds, and the trim's 74.5 GiB lifts 50 free to 124.5, which fits,
+    so the Dolphin caches stay. Adding the trim to the floor too (184.5) evicted them for nothing."""
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=400 * 10**9))
+    rental = _rental(100, 10)
+    rental.disk_share = 1.0
+    ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7"], free_gb=50)
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"])
+
+    assert _removed_volumes(ssh_client) == []
+    assert ssh_client._free_bytes == int(50 * 1024**3) + 80 * 10**9  # only the trim freed disk
+    assert rental.volume_limit_gb == 100
+
+
 class FailedTrimHost(KilledFillerRunVolumeHost):
     async def run(self, command: str, *args, **kwargs):
         if "fstrim" in command:
