@@ -11,6 +11,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncssh
 import pytest
 from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -1170,3 +1171,40 @@ async def test_a_stale_split_nodes_reprobe_is_the_measurement_published_and_paid
         limited = RentalPriceIncentive._port_limited_remainder(remainder)
         # 7 free one-GPU splits: paid only for as many as the re-probe found ports
         assert (limited.unpaid_gpu_count if limited else 0) == {0: 7, 3: 4, 21: 0}[answering]
+
+
+class DroppedConnectionOrchestrator:
+    def __init__(self, error: Exception):
+        self.error = error
+
+    async def verify(self, *args, **kwargs):
+        raise self.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed"), "PORT_VERIFY_FAILED"),
+        (ValueError("unexpected"), "INSUFFICIENT_PORTS"),
+    ],
+)
+async def test_an_ssh_drop_during_the_port_probe_is_reported_as_a_lost_connection_not_too_few_ports(
+    context_factory, error, reason
+):
+    """DAH-5981 (prod 7 Nov): the probe tested no port because the SSH connection closed, yet the provider was told
+    INSUFFICIENT_PORTS. Any other probe error keeps the port floor's verdict."""
+    ctx = run_context(
+        context_factory,
+        ExecutorConnectivityService(orchestrator=DroppedConnectionOrchestrator(error)),
+        backend=RentalsBackendClient(None),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
+
+    assert count_result.passed is False
+    assert count_result.event.reason_code == reason
+    if reason == "PORT_VERIFY_FAILED":
+        assert "SSH connection closed" in count_result.event.what_we_saw["details"]
+        assert "lost its connection" in count_result.event.remediation

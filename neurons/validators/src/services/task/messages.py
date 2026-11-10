@@ -672,8 +672,9 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 80% of the default limit "
+            "reported by NVML, or during a rental to at least 90% (or the limit "
+            "the rental started on, if lower)."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(
@@ -690,6 +691,14 @@ class GpuPowerLimitMessages:
         severity="info",
         category="env",
         impact="Proceed",
+    )
+    # F-43: a kept 80 % tier reading whose clear is not confirmed (Redis failed): neither zero nor show stock
+    TIER_STATE_UNKNOWN = MessageTemplate(
+        event="GPU power limit at stock, but the validator could not clear its earlier tier reading",
+        reason="GPU_POWER_TIER_STATE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
     )
     SKIPPED_ACTIVE_LIUM_FILLER = MessageTemplate(
         event="GPU power limit check skipped for active Lium default job",
@@ -1383,6 +1392,18 @@ class GpuUsageMessages:
         category="runtime",
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
+    )
+    USAGE_HIGH_MEASURED_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization {vram_utilization}; "
+        "an idle node must stay below {gpu_limit}% utilization and at most {memory_limit}% memory "
+        "utilization. GPU processes on the node: {processes}. Stop these processes and re-run your "
+        "node. If using Docker, ensure no host processes are running."
+    )
+    USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "
+        "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
+        "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
+        "running: {fillers}."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
