@@ -15,7 +15,7 @@ from protocol.vc_protocol.compute_requests import (
 )
 from services.const import (
     BROKEN_POD_CONTAINER_GRACE_MINUTES,
-    EDIT_PARKED_SUFFIX,
+    unparked_name,
     FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
@@ -687,7 +687,7 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
     container called pod_<any uuid> must not buy a pass.
     """
     pod_id: str | None = _uuid_after_prefix(
-        container_name.removesuffix(EDIT_PARKED_SUFFIX), POD_CONTAINER_PREFIX
+        unparked_name(container_name), POD_CONTAINER_PREFIX
     )
     if pod_id is None:
         return PodContainerRental(

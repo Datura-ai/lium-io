@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import sys
 
 from core.config import settings
 from core.collateral import CollateralClient
@@ -11,6 +12,16 @@ logger = logging.getLogger(__name__)
 # Create a ContextVar to hold the context information
 context = contextvars.ContextVar("context", default="ValidatorService")
 context.set("ValidatorService")
+
+
+def cap_recursion_limit():
+    """Called by every entry point (miner, connector, cli) right after its imports."""
+    # py_ecc raises the limit to 100 000 at import, deeper than the 8 MB C stack can hold, so deep recursion in C code
+    # crashes the process instead of raising RecursionError. Importing it here first means no later import raises it.
+    # 10 000 keeps a wide margin both ways: legit code needs ~300 frames, the C stack holds ~40 000 on Python 3.11.
+    import py_ecc  # noqa: F401
+
+    sys.setrecursionlimit(10_000)
 
 
 def wait_for_services_sync(timeout=30):

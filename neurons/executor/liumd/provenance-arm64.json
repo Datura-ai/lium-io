@@ -1,0 +1,8 @@
+{
+  "schema": "liumd.pr-artifact/1",
+  "source_repo": "Datura-ai/lium-platform",
+  "source_head_sha": "49a75a372a9c9e30fb921b9b9ee995bfef9ffc00",
+  "source_merge_sha": "49a75a372a9c9e30fb921b9b9ee995bfef9ffc00",
+  "target": "aarch64-unknown-linux-gnu",
+  "build_sha": "49a75a372a9c"
+}
