@@ -180,6 +180,31 @@ async def test_a_volume_rm_error_after_a_successful_rm_still_counts_the_containe
 
 
 @pytest.mark.asyncio
+async def test_on_removed_runs_before_a_volume_rm_that_hangs():
+    """Review 4521984351: a hang in the volume step after `docker rm` lost on_removed, so the gone
+    container's GPU processes still failed GpuUsageCheck."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, _ = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker volume rm" in cmd:
+            await asyncio.sleep(60)
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+    seen: list[str] = []
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.5):
+            await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+                ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID, on_removed=seen.append
+            )
+
+    assert seen == [name]
+
+
+@pytest.mark.asyncio
 async def test_a_docker_rm_error_still_reports_the_container_as_unremovable():
     """Control for the test above: an SSH error on the `docker rm` itself is a failed removal."""
     name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"

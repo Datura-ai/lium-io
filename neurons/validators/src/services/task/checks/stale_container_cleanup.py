@@ -68,7 +68,7 @@ REAPED_GPU_EXEMPT_KEY_PREFIX = "reaped_gpu_exempt:"
 # with no result. Healthy runs take under ~140 s; past this budget the step gives up for the cycle.
 STALE_CLEANUP_BUDGET_SECONDS = 180
 # After a timeout: the backend lookups and exemption claim for the containers already removed.
-STALE_CLEANUP_EXEMPTION_BUDGET_SECONDS = 30
+GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS = 30
 
 
 class StaleContainerCleanupCheck:
@@ -119,7 +119,7 @@ class StaleContainerCleanupCheck:
         # processes must not count, or GpuUsageCheck judges a container that is gone
         exempt: set[str] = set()
         with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(STALE_CLEANUP_EXEMPTION_BUDGET_SECONDS):
+            async with asyncio.timeout(GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS):
                 await _confirm_reserved_removals(ctx, removed, confirmed, reserved)
                 exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed))
         event = render_message(

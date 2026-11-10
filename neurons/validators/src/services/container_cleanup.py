@@ -331,10 +331,8 @@ class ContainerCleanup:
 
                     if on_before_remove is not None:
                         await on_before_remove(stripped_name)
-                    if await self._remove_container(ssh_client, stripped_name):
+                    if await self._remove_container(ssh_client, stripped_name, on_removed):
                         removed_names.append(stripped_name)
-                        if on_removed is not None:
-                            on_removed(stripped_name)
                         logger.info(
                             _m(
                                 f"Removed stale container {stripped_name}",
@@ -894,7 +892,9 @@ class ContainerCleanup:
             )
             return None
 
-    async def _remove_container(self, ssh_client, container_name: str) -> bool:
+    async def _remove_container(
+        self, ssh_client, container_name: str, on_removed: Callable[[str], None] | None = None
+    ) -> bool:
         """Remove a container and its associated resources.
 
         True once the container itself is gone. The pod volume removal after it is best-effort:
@@ -940,6 +940,9 @@ class ContainerCleanup:
             )
             return False
 
+        # before the volume step: a hang there must not keep the gone container's GPU processes judged
+        if on_removed is not None:
+            on_removed(container_name)
         # A create names both the container and its volume after payload.pod_id (the pod id or the
         # filler run id), so `volume_<id>` is this container's own volume and no one else's.
         for prefix in (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX):
