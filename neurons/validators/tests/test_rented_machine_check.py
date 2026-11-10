@@ -2423,9 +2423,10 @@ async def test_a_replacement_container_under_a_remembered_filler_name_and_image_
     assert result.event.reason_code == Msg.GPU_OUTSIDE_TENANT.reason
 
 
+
 @pytest.mark.asyncio
-async def test_tenant_enforcement_a_pod_recovered_in_the_cycle_resets_the_unanswered_count(context_factory):
-    # hold, hold, then the third cycle's recovery brings the pod back: a later unanswered down pod is held again
+async def test_tenant_enforcement_a_pod_recovered_in_the_cycle_keeps_the_unanswered_count(context_factory):
+    # a provider must not reset the limit by letting recovery start the pod and stopping it again
     ssh = DummySSHClient(pod_running=False, ssh_keys=["ssh-rsa renter"])
     docker = AsyncMock()
     docker.recover_pod_after_stale_vloopback_mount.return_value = False
@@ -2444,10 +2445,10 @@ async def test_tenant_enforcement_a_pod_recovered_in_the_cycle_resets_the_unansw
 
     docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
     assert (await cycle()).passed is True
-    assert "rental_state_unknown:pod-1" not in redis.store
+    assert "rental_state_unknown:pod-1" in redis.store
 
     ssh.pod_running = False
     docker.recover_pod_after_stale_vloopback_mount.side_effect = None
     result = await cycle()
-    assert result.passed is True, result.event
-    assert "clear_verified_job_info" not in result.updates
+    assert result.passed is False
+    assert result.event.reason_code == "POD_NOT_RUNNING"

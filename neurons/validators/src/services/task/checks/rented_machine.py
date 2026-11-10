@@ -546,8 +546,6 @@ class TenantEnforcementCheck:
                 state_by_pod_id[pod_id] = outcome.container_state
                 if outcome.failure:
                     return with_pod_states(outcome.failure)
-                if outcome.container_state == ContainerState.RUNNING and self.recover_stale_pods:
-                    await _forget_unknown_rental_state(ctx, pod_id)  # recovered: the down streak ended
                 ssh_pub_keys = outcome.ssh_pub_keys
                 # Just recovered: judged from the renter's side next cycle, not on the way up.
                 continue
