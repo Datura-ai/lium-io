@@ -722,7 +722,9 @@ class AttestationService:
             attestation_digest, tee_type = await self._verify_tdx(executor, nonce=nonce)
             await self._record_attested_executor(executor)
 
-            gpu_attestation_passed = await self._verify_gpu(executor, nonce)
+            # only beside a verified TDX digest, so a GPU verdict never stands in for a missing one
+            if attestation_digest is not None:
+                gpu_attestation_passed = await self._verify_gpu(executor, nonce)
             # tee_type only claims verified GPU CC when the evidence was bound
             # to the validator-issued challenge (an unbound pass is replayable).
             if gpu_attestation_passed is True and self._gpu_evidence_bound_to(executor, nonce):

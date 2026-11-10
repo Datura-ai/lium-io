@@ -540,6 +540,22 @@ async def test_g1_only_a_passed_verdict_bound_to_the_challenge_claims_gpu_cc(
     assert result.attestation_digest == "digest"
 
 
+async def test_g1_gpu_is_not_verified_without_a_tdx_digest(service, monkeypatch):
+    # Arrange — the verifier accepted the quote but sent no os_image_hash (no digest); the GPU evidence is garbage
+    async def fake_tdx(executor_, nonce=None):
+        return None, "dstack/tdx"
+
+    monkeypatch.setattr(service, "_verify_tdx", fake_tdx)
+    monkeypatch.setattr(service, "_build_known_hosts", lambda executor_: None)
+
+    # Act
+    result = await service.prepare_host_policy(_make_executor(nvidia_payload="x"), nonce=AttestationNonce.issue())
+
+    # Assert — no GPU verdict, so the score gate cannot read garbage evidence as a passed TDX attestation
+    assert result.gpu_attestation_passed is None
+    assert result.attestation_passed is False
+
+
 async def test_g1_nras_overall_failure_observed_as_false(service, monkeypatch):
     # Arrange — verified-bad is recorded, never raised
     nonce = AttestationNonce.issue()
