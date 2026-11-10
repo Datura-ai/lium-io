@@ -1533,24 +1533,82 @@ def get_host_boot_id() -> str:
 # The node is listed at the geo of the address the validator connects to; behind a reverse proxy
 # that is the proxy's. The backend geolocates the host's own egress address instead (Cloudflare's
 # trace echoes the caller's IP). "" when the fetch fails: the backend then keeps the connect address.
+# The trace runs where renter pods' traffic leaves: in a short-lived container on the network a
+# running pod is on (else the one pods are created on), from the executor's own image so nothing is
+# pulled. Never inside a pod itself. When that fails it runs in the host's network namespace (the
+# executor has pid: host and is privileged); never in the executor container's own route.
+# The name is resolved in the container first, since its resolv.conf may point at docker's
+# embedded DNS, which the host namespace cannot reach.
 EGRESS_TRACE_HOST = "www.cloudflare.com"
 EGRESS_TRACE_PATH = "/cdn-cgi/trace"
 EGRESS_TRACE_TIMEOUT_SECONDS = 5
+# container start on top of the trace itself
+EGRESS_PROBE_START_SECONDS = 20
+EGRESS_PROBE_NAME_PREFIX = "lium_egress_probe_"
+# the network pods are created on (services/rental_docker_sdk.py RENTAL_NETWORK_NAME)
+EGRESS_RENTAL_NETWORK = "lium-rentals"
+
+
+def get_egress_probe_network():
+    # a running pod's network, else the one pods are created on; raises on a pod sharing another
+    # container's namespace or none, so the trace falls back to the host
+    for container in docker_api_get("/containers/json"):
+        if any(name.startswith("/pod_") for name in container.get("Names") or []):
+            info = docker_api_get(f"/containers/{container['Id']}/json")
+            mode = info["HostConfig"]["NetworkMode"]
+            if mode in ("default", "bridge"):
+                # a legacy pod moved onto another network at start keeps mode "default"
+                return next(iter((info.get("NetworkSettings") or {}).get("Networks") or {}), "bridge")
+            if not mode or mode == "none" or mode.startswith("container:"):
+                raise ValueError(f"pod network mode {mode!r}")
+            return mode
+    return EGRESS_RENTAL_NETWORK
 
 
 def get_egress_ip() -> str:
     try:
-        conn = http.client.HTTPSConnection(EGRESS_TRACE_HOST, timeout=EGRESS_TRACE_TIMEOUT_SECONDS)
-        try:
-            conn.request("GET", EGRESS_TRACE_PATH)
-            body = conn.getresponse().read(4096).decode(errors="replace")
-        finally:
-            conn.close()
+        trace_addr = socket.getaddrinfo(
+            EGRESS_TRACE_HOST, 443, socket.AF_INET, socket.SOCK_STREAM
+        )[0][4][0]
+        env = {**os.environ}
+        env.pop("LD_LIBRARY_PATH", None)
     except Exception:
         return ""
-    for line in body.splitlines():
-        if line.startswith("ip="):
-            return line[3:].strip()[:64]
+    curl = [
+        "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
+        "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
+        f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
+    ]
+    commands = []
+    probe_name = f"{EGRESS_PROBE_NAME_PREFIX}{os.getpid()}_{os.urandom(3).hex()}"
+    try:
+        network = get_egress_probe_network()
+        image = docker_api_get(f"/containers/{socket.gethostname()}/json")["Image"]
+        commands.append(
+            ["docker", "run", "--rm", "--name", probe_name, "--network", network, "--entrypoint", "curl", image]
+            + curl[1:]
+        )
+    except Exception:
+        pass
+    commands.append(["nsenter", "-t", "1", "-n"] + curl)
+    for command in commands:
+        is_probe = command[0] == "docker"
+        try:
+            body = subprocess.run(
+                command, capture_output=True, text=True, check=True, env=env,
+                timeout=EGRESS_TRACE_TIMEOUT_SECONDS + (EGRESS_PROBE_START_SECONDS if is_probe else 5),
+            ).stdout[:4096]
+        except Exception:
+            if is_probe:
+                # --rm misses a container whose run was cut off by the timeout
+                try:
+                    subprocess.run(["docker", "rm", "-f", probe_name], capture_output=True, env=env, timeout=30)
+                except Exception:
+                    pass
+            continue
+        for line in body.splitlines():
+            if line.startswith("ip="):
+                return line[3:].strip()[:64]
     return ""
 
 

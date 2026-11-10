@@ -190,11 +190,13 @@ def build_ssh_unreachable_event(
         if host_key_mismatch
         else (
             "Check that sshd on the node accepts the validator on its management port, "
-            "and that no firewall or rate limit rejects the connection. If your host NATs or "
-            "proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false and EXECUTOR_SSH_SOURCE_LIMITS=false "
-            "in the executor .env and recreate the executor container (in ~/compute-subnet/neurons/executor: "
-            "docker compose up -d --force-recreate; a plain docker compose up -d or docker restart keeps "
-            "the old .env values)."
+            "and that no firewall or rate limit rejects the connection. While the source pin is on, the "
+            "validator's keys log in only from the validator's addresses, so a relay, tunnel or Docker "
+            "userland-proxy in front of sshd makes every login fail; with the pin off it does not. If your "
+            "host NATs, relays or proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false and "
+            "EXECUTOR_SSH_SOURCE_LIMITS=false in the executor .env and recreate the executor container "
+            "(in ~/compute-subnet/neurons/executor: docker compose up -d --force-recreate; a plain "
+            "docker compose up -d or docker restart keeps the old .env values)."
         ),
         what_we_saw={
             "executor_uuid": executor_uuid,

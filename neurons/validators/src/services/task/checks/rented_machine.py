@@ -51,11 +51,22 @@ logger = logging.getLogger(__name__)
 # cycle time kept after the rented pod reads, to report the result and close the shell
 POD_READ_RESERVE_SECONDS = 30
 
+def _scraped_container_ids(ctx: Context) -> dict[str, str]:
+    return {
+        str(entry.get("name") or ""): str(entry.get("container_id") or "")
+        for entry in ((ctx.state.specs or {}).get("docker") or {}).get("containers") or []
+        if isinstance(entry, dict)
+    }
+
+
 async def _remember_fillers(ctx: Context, names: list[str]) -> None:
+    container_ids = _scraped_container_ids(ctx)
     try:
         for name in names:
-            key = f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
-            await ctx.services.redis.set(key, "1", ex=RECENT_FILLER_TTL_SECONDS)
+            # the record is the container itself: a replacement under the same name is not our load
+            if container_ids.get(name):
+                key = f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
+                await ctx.services.redis.set(key, container_ids[name], ex=RECENT_FILLER_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Recent filler record not written for %s: %s", ctx.executor.uuid, exc)
 
@@ -63,11 +74,15 @@ async def _remember_fillers(ctx: Context, names: list[str]) -> None:
 async def _recently_listed_fillers(ctx: Context, names: set[str]) -> list[str]:
     """The filler-named containers the snapshot listed on THIS node within RECENT_FILLER_TTL_SECONDS: our own load."""
     found = []
+    container_ids = _scraped_container_ids(ctx)
     try:
         for name in sorted(names):
-            if name.startswith(FILLER_CONTAINER_PREFIX) and await ctx.services.redis.get(
-                f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
-            ):
+            if not name.startswith(FILLER_CONTAINER_PREFIX) or not container_ids.get(name):
+                continue
+            recorded = await ctx.services.redis.get(f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}")
+            if isinstance(recorded, bytes):
+                recorded = recorded.decode()
+            if recorded == container_ids[name]:
                 found.append(name)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Recent filler records unreadable for %s: %s", ctx.executor.uuid, exc)
@@ -180,6 +195,8 @@ class TenantEnforcementCheck:
     """
 
     check_id = "executor.validate.rented_state"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = True
 
     def __init__(self, recover_stale_pods: bool = True):
@@ -305,6 +322,22 @@ class TenantEnforcementCheck:
                         ),
                         "diagnostics": diagnostics,
                     }
+                    if ctx.state.port_check_deferred and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                        # DAH-5851: idle now, on a deferred port check: withheld, as PortCountCheck withholds an idle node
+                        await port_connectivity.spend_disk_pressure_deferrals(ctx)
+                        return with_pod_states(
+                            CheckResult(
+                                passed=False,
+                                event=render_message(
+                                    PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED,
+                                    ctx=ctx,
+                                    check_id=self.check_id,
+                                    what={"stale_pod": stale_what},
+                                    extra=extra,
+                                ),
+                                updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
+                            )
+                        )
                     # PortCountCheck exempted this node from the port floor because the batch-start rented
                     # list named a pod; the node goes on as unrented with a count the backend will not list.
                     # The floor is enforced only when every listed pod is stale: a live rental on the same
@@ -333,7 +366,8 @@ class TenantEnforcementCheck:
                         event = split_ports_event(
                             ctx,
                             self.check_id,
-                            reprobed.get("state", ctx.state),
+                            # a completed re-probe is a current reading; the pipeline flag itself stays as it was
+                            replace(reprobed["state"], port_check_deferred=False) if "state" in reprobed else ctx.state,
                             *split_short,
                             what={"stale_pod": stale_what},
                             extra=extra,
