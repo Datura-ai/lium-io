@@ -513,6 +513,23 @@ class ProviderSideLoadCheck:
             cpu_cores=await self._resample_cpu_cores(ctx, lium_container_keys),
         )
 
+    @staticmethod
+    def _cpu_verdict_counts(
+        ctx: Context, provider_side_load: ProviderSideLoad, lium_container_keys: set[str] | None
+    ) -> bool:
+        """Only the CPU half withholds money. A high disk figure is reported and never scored:
+        it is read once, with no second look, and every docker category nobody enumerated
+        (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
+        node. The shadow week measures the disk numbers before that half is armed.
+        Beside a Lium pod or filler the host reading carries Lium's own load; a rental-named key of
+        `lium_containers` is one the backend reported or confirmed after the cycle's snapshot."""
+        late_workloads: set[str] = {
+            key for key in lium_container_keys or () if carries_a_rental_prefix(key)
+        }
+        return provider_side_load.is_cpu_above_limit and not (
+            lium_workload_containers(ctx) | late_workloads
+        )
+
     async def run(self, ctx: Context) -> CheckResult:
         lium_container_keys = await lium_containers(ctx)
         provider_side_load = await self.measure_provider_side_load(ctx, lium_container_keys)
@@ -536,24 +553,13 @@ class ProviderSideLoadCheck:
             event = render_message(Msg.LOAD_OK, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event, updates=updates)
 
-        # Only the CPU half withholds money. A high disk figure is reported and never scored:
-        # it is read once, with no second look, and every docker category nobody enumerated
-        # (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
-        # node. The shadow week measures the disk numbers before that half is armed.
-        # beside a Lium pod or filler the host reading carries Lium's own load; a rental-named key of
-        # `lium_containers` is one the backend reported or confirmed after the cycle's snapshot
-        late_workloads: set[str] = {
-            key for key in lium_container_keys or () if carries_a_rental_prefix(key)
-        }
-        judged: bool = provider_side_load.is_cpu_above_limit and not (
-            lium_workload_containers(ctx) | late_workloads
-        )
-        enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED and judged
+        cpu_verdict_counts = self._cpu_verdict_counts(ctx, provider_side_load, lium_container_keys)
+        enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED and cpu_verdict_counts
         if enforce:
             impact = None
         elif not provider_side_load.is_cpu_above_limit:
             impact = "Disk is observed only: score was NOT changed"
-        elif not judged:
+        elif not cpu_verdict_counts:
             impact = "Observed only beside a Lium workload: score was NOT changed"
         else:
             impact = "Shadow observation only: score was NOT changed"
