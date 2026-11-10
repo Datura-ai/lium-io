@@ -2514,3 +2514,60 @@ async def test_tenant_enforcement_a_closed_pod_beside_a_held_one_keeps_the_node_
         # nothing is held: the closed pod first makes the node idle, as before this change
         assert result.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
         assert result.updates["rented"] is False
+
+
+def _held_and_closed_ctx(context_factory, *, order, ssh=None, gpu_processes=(), gpu_details=()):
+    pods = {
+        "u": RentedPod(pod_id="pod-u", container_name="tenant-u", rented_ports=[], gpu_count=2),
+        "c": RentedPod(pod_id="pod-c", container_name="tenant-c", rented_ports=[], gpu_count=6),
+    }
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=[pods[key] for key in order],
+                owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    ctx = _unknown_rental_ctx(context_factory, _PerPodBackend({"pod-u": None, "pod-c": False}), FakeRedis())
+    state = replace(ctx.state, rented_data=rented_data, gpu_processes=list(gpu_processes), gpu_details=list(gpu_details))
+    return ctx.model_copy(update={"state": state, **({"ssh": ssh} if ssh else {})})
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_gpu_work_of_the_closed_sibling_is_not_outside_the_tenant(context_factory):
+    # the GPU snapshot predates the renter ending pod-c, so its processes are still the renter's
+    ctx = _held_and_closed_ctx(
+        context_factory,
+        order="uc",
+        gpu_processes=[{"container_name": "tenant-c", "pid": 1234}],
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 90}],
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_hung_sibling_read_reports_the_node_unreachable(context_factory, monkeypatch):
+    from neurons.validators.src.services.task.checks import rented_machine
+
+    class HangsOnPodU(DummySSHClient):
+        async def run(self, command: str):
+            if "tenant-u" in command:
+                await asyncio.sleep(3600)
+            return await super().run(command)
+
+    monkeypatch.setattr(rented_machine, "task_seconds_left", lambda _ctx: rented_machine.POD_READ_RESERVE_SECONDS)
+    ctx = _held_and_closed_ctx(context_factory, order="cu", ssh=HangsOnPodU(pod_running=False))
+
+    result = await asyncio.wait_for(TenantEnforcementCheck().run(ctx), 5)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason

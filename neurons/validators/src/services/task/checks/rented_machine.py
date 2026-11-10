@@ -420,7 +420,20 @@ class TenantEnforcementCheck:
                 elif self.recover_stale_pods:  # a dry run never changes the count
                     await _forget_unknown_rental_state(ctx, pod_id)
                 if rental_active and not rental_active.active:
-                    if await _a_sibling_is_held(ctx, rented_pods, pod_index, extra):
+                    try:
+                        sibling_held = await _a_sibling_is_held(ctx, rented_pods, pod_index, extra)
+                    except _SiblingReadFailed as failed:
+                        return with_pod_states(
+                            _executor_transport_unreachable_result(
+                                ctx=ctx,
+                                check_id=self.check_id,
+                                container_name=failed.pod.docker_container_name,
+                                pod_id=failed.pod.pod_id,
+                                transport_error=failed.error,
+                                extra=extra,
+                            )
+                        )
+                    if sibling_held:
                         # an idle verdict would be a guess while a sibling's rental is unknown
                         closed_beside_held.add(pod_id)
                         ssh_pub_keys = []
@@ -577,7 +590,8 @@ class TenantEnforcementCheck:
         rented_state = ctx.state
         if closed_beside_held:
             rented_state, extra = _without_closed_pods(ctx, rented_executor, closed_beside_held, extra)
-        container_names = [pod.docker_container_name for pod in rented_pods if pod.pod_id not in closed_beside_held]
+        # a closed pod's container is still the renter's, and the GPU snapshot may predate its end
+        container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
@@ -1341,6 +1355,12 @@ async def _reprobe_split_shortfall(
     return published(fresh.get_filler_ports(ctx.executor.uuid))
 
 
+class _SiblingReadFailed(Exception):
+    def __init__(self, pod: RentedPod, error: BaseException):
+        super().__init__(str(error))
+        self.pod, self.error = pod, error
+
+
 async def _a_sibling_is_held(ctx: Context, rented_pods: list[RentedPod], pod_index: int, extra: dict) -> bool:
     """True when another listed pod's verdict is held this cycle for an unanswered rental check.
 
@@ -1351,11 +1371,13 @@ async def _a_sibling_is_held(ctx: Context, rented_pods: list[RentedPod], pod_ind
         return True
     for other in rented_pods[pod_index + 1 :]:
         try:
-            other_state = await _check_pod_running_and_read_authorized_keys(
-                ctx.ssh, other.docker_container_name, ctx.default_extra
-            )
-        except (asyncssh.Error, OSError):
-            continue
+            # the main loop's read budget: a hung shell ends as the node-unreachable verdict, not a dropped task
+            async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
+                other_state = await _check_pod_running_and_read_authorized_keys(
+                    ctx.ssh, other.docker_container_name, ctx.default_extra
+                )
+        except (asyncssh.Error, OSError) as exc:
+            raise _SiblingReadFailed(other, exc) from exc
         if other_state.running:
             continue
         if await ctx.services.backend.get_pod_rental_active(other.pod_id) is None and (
