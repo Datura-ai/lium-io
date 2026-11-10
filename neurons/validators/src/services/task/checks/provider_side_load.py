@@ -514,7 +514,7 @@ class ProviderSideLoadCheck:
         )
 
     @staticmethod
-    def _cpu_verdict_counts(
+    def _is_cpu_verdict_scored(
         ctx: Context, provider_side_load: ProviderSideLoad, lium_container_keys: set[str] | None
     ) -> bool:
         """Only the CPU half withholds money. A high disk figure is reported and never scored:
@@ -553,13 +553,13 @@ class ProviderSideLoadCheck:
             event = render_message(Msg.LOAD_OK, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event, updates=updates)
 
-        cpu_verdict_counts = self._cpu_verdict_counts(ctx, provider_side_load, lium_container_keys)
-        enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED and cpu_verdict_counts
+        is_cpu_verdict_scored = self._is_cpu_verdict_scored(ctx, provider_side_load, lium_container_keys)
+        enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED and is_cpu_verdict_scored
         if enforce:
             impact = None
         elif not provider_side_load.is_cpu_above_limit:
             impact = "Disk is observed only: score was NOT changed"
-        elif not cpu_verdict_counts:
+        elif not is_cpu_verdict_scored:
             impact = "Observed only beside a Lium workload: score was NOT changed"
         else:
             impact = "Shadow observation only: score was NOT changed"
