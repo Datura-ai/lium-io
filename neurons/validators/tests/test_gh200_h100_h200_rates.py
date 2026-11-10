@@ -5,8 +5,6 @@ H200 tier. The name is self-reported: off a Grace (aarch64) host it is scored as
 """
 
 import pytest
-from incentive.config import BASE_GPU_MAP, RENTAL_PRICES_PER_HOUR
-from services.const import GPU_MODEL_RATES
 from services.gpu_reference_table import pick_reference
 
 from services import gpu_spec_table
@@ -17,27 +15,27 @@ GH200_96, GH200_144 = "NVIDIA GH200 480GB", "NVIDIA GH200 144G HBM3e"
 H100, H200 = "NVIDIA H100 80GB HBM3", "NVIDIA H200"
 
 
-@pytest.mark.parametrize("gh200, peer", [(GH200_96, H100), (GH200_144, H200)])
-def test_each_gh200_is_paid_like_its_hopper_peer(gh200, peer):
-    assert GPU_MODEL_RATES[gh200] == GPU_MODEL_RATES[peer]
-    assert RENTAL_PRICES_PER_HOUR[gh200] == RENTAL_PRICES_PER_HOUR[peer]
-    assert BASE_GPU_MAP[gh200] == "GH200"
+@pytest.mark.parametrize("gh200", [GH200_96, GH200_144])
+def test_a_reported_gh200_is_scored_as_itself(gh200):
     assert gpu_spec_table.reference_gpu_model(gh200, 97871) == gh200
 
 
 @pytest.mark.asyncio
-async def test_an_idle_gh200_fills_its_own_tier_not_the_h100s():
+@pytest.mark.parametrize(
+    "gh200, peer, peer_base", [(GH200_96, H100, "H100"), (GH200_144, H200, "H200")]
+)
+async def test_an_idle_gh200_is_paid_like_its_peer_from_its_own_tier(gh200, peer, peer_base):
     jobs = {
-        "gh200": [_make_pcc_job("gh200-1x", GH200_96, 1)],
-        "h100": [_make_pcc_job("h100-1x", H100, 1)],
+        "gh200": [_make_pcc_job("gh200-1x", gh200, 1)],
+        "peer": [_make_pcc_job("peer-1x", peer, 1)],
     }
 
     incentive = await _run_with_production_config(jobs)
 
-    assert jobs["gh200"][0].effective_rate == pytest.approx(jobs["h100"][0].effective_rate)
+    assert jobs["gh200"][0].effective_rate == pytest.approx(jobs["peer"][0].effective_rate)
     assert jobs["gh200"][0].effective_rate > 0
     assert incentive.unrented_count_by_bucket[("GH200", 1)] == 1
-    assert incentive.unrented_count_by_bucket[("H100", 1)] == 1
+    assert incentive.unrented_count_by_bucket[(peer_base, 1)] == 1
 
 
 @pytest.mark.parametrize(
