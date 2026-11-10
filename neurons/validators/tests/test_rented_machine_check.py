@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import asyncssh
 import pytest
-from helpers import build_context_config, build_services, build_state
+from helpers import FakeRedis, build_context_config, build_services, build_state
 import neurons.validators.src.services.task.checks.rented_machine as rented_machine_module
 from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
@@ -2323,3 +2323,39 @@ async def test_a_replacement_container_under_a_remembered_filler_name_and_image_
     result = await _rented_cycle_with_filler_process(context_factory, redis, [], filler, specs=specs)
 
     assert result.event.reason_code == Msg.GPU_OUTSIDE_TENANT.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_asks_the_backend_for_a_running_pods_plaintext_path_once(context_factory):
+    # the path is set at create: asking for every running pod every cycle burst the backend into timeouts (10 Nov)
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    backend = DummyBackendClient(active=True, local_volume_path="/workspace")
+    redis = FakeRedis()
+
+    for _ in range(3):
+        result = await TenantEnforcementCheck().run(
+            build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis)
+        )
+        assert result.passed, result.event
+
+    assert backend.called_with == ["pod-1"]
+    assert [c.args[2] for c in docker.encrypted_volume_mount_missing.await_args_list] == ["/workspace"] * 3
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_asks_again_after_an_unanswered_plaintext_path_lookup(context_factory):
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    backend = DummyBackendClient(active=None)
+    redis = FakeRedis()
+
+    await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
+    backend.active, backend.local_volume_path = True, None  # answered: this pod has no encrypted volume
+    await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
+    await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
+
+    assert backend.called_with == ["pod-1", "pod-1"]
+    assert redis.store["plaintext_volume_path:pod-1"] == ""

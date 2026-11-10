@@ -1135,12 +1135,37 @@ def _log_recovery_failed(event: str, ctx: Context, container_name: str, pod_id: 
     )
 
 
+# DAH-5034 follow-up: the backend sets a pod's plaintext path once, at its create, so it is asked once per pod rather
+# than for every running pod every cycle (that burst at cycle start timed the backend out, 10 Nov). "" = no path.
+PLAINTEXT_VOLUME_PATH_PREFIX = "plaintext_volume_path:"
+PLAINTEXT_VOLUME_PATH_TTL_SECONDS = 24 * 3600
+_PLAINTEXT_VOLUME_PATH_REDIS_TIMEOUT_SEC = 2
+
+
 async def _plaintext_volume_path(ctx: Context, pod_id: str) -> str | None:
+    key = f"{PLAINTEXT_VOLUME_PATH_PREFIX}{pod_id}"
+    try:
+        cached = await asyncio.wait_for(ctx.services.redis.get(key), timeout=_PLAINTEXT_VOLUME_PATH_REDIS_TIMEOUT_SEC)
+    except Exception:  # noqa: BLE001
+        cached = None  # Redis down or slow: ask the backend
+    if cached is not None:
+        cached = cached.decode() if isinstance(cached, bytes) else str(cached)
+        return cached or None
     try:
         rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
     except Exception:
         return None  # unknown: the restore stops the pod rather than remount at a guessed path
-    return rental_active.local_volume_path if rental_active else None
+    if rental_active is None:
+        return None  # not cached: an unanswered lookup is asked again next cycle
+    path = rental_active.local_volume_path
+    try:
+        await asyncio.wait_for(
+            ctx.services.redis.set(key, path or "", ex=PLAINTEXT_VOLUME_PATH_TTL_SECONDS),
+            timeout=_PLAINTEXT_VOLUME_PATH_REDIS_TIMEOUT_SEC,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Plaintext volume path not cached for %s: %s", pod_id, exc)
+    return path
 
 
 async def _restore_missing_volume_mount(
