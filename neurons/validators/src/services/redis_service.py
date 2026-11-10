@@ -1054,10 +1054,10 @@ class RedisService:
     async def save_container_created_of_current_dispatch(
         self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str, message_json: str
     ) -> bool:
-        """Saves a create's success unless the pod's newest create mark names another dispatch: a late success of an
-        older dispatch must not overwrite the newer one's only saved report. WATCHed with the pending list, so a
-        dispatch added meanwhile reruns the check (lium-io#1952). Nor when the backend has sent the pod a newer create
-        since, on any node: the pod's current dispatch is WATCHed too."""
+        """Saves a create's success only for the pod's current dispatch (the latest accepted, on any node), so a late
+        success of an older dispatch cannot overwrite the newer one's only saved report (lium-io#1952). A pod with no
+        recorded order falls back to its newest create mark on this node. Both are WATCHed, so a dispatch added
+        meanwhile reruns the check."""
         field = f"{miner_hotkey}:{executor_id}"
         order_key = f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"
         async with self.redis.pipeline(transaction=True) as pipe:
@@ -1074,7 +1074,9 @@ class RedisService:
                         if item.get("pod_id", "") == pod_id and not item.get("kind")
                     ]
                     newest = creates[-1].get("command_id", "") if creates else ""
-                    if command_id and newest and newest != command_id:
+                    # the acceptance order decides when there is one: an older dispatch's mark written last on this
+                    # node does not make it current; the pending list only stands in for a pod with no order
+                    if not order and command_id and newest and newest != command_id:
                         await pipe.reset()
                         return False
                     pipe.multi()

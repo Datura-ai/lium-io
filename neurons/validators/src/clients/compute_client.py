@@ -234,6 +234,10 @@ class ComputeClient:
         self.resume_count_by_pod_id: dict[str, int] = {}
         # pods deleted while a create of theirs runs: that create's late restart record is not written
         self.deleted_pod_ids: set[str] = set()
+        # lium-io#1952: (pod_id, command_id) -> the first acceptance time of a create whose record has not landed yet,
+        # reused by its retries and redeliveries so a redelivery never ranks an older dispatch above a newer one.
+        # shortcut: only failed records leave an entry here (kept for a later redelivery); cap it if Redis outages grow it
+        self.unrecorded_create_acceptances: dict[tuple[str, str], int] = {}
         # set by a start sweep that read the in-flight records; sent once, first on the next authenticated socket
         self.resumed_creates_report: ResumedCreatesReport | None = None
         # pod id -> command_id of each success replayed ahead of the report and not yet answered by its receipt
@@ -970,8 +974,11 @@ class ComputeClient:
                 self.create_accepted_while_report_pending = True
             driver = self.miner_driver(job_request)
             if isinstance(job_request, ContainerCreateRequest) and job_request.command_id:
-                accepted_ns = time.time_ns()
-                if not await self._accept_create_dispatch(job_request, accepted_ns):
+                key = (job_request.pod_id, job_request.command_id)
+                accepted_ns = self.unrecorded_create_acceptances.setdefault(key, time.time_ns())
+                if await self._accept_create_dispatch(job_request, accepted_ns):
+                    self.unrecorded_create_acceptances.pop(key, None)
+                else:
                     driver = self._accept_then_drive(job_request, accepted_ns, driver)
             task = asyncio.create_task(driver)
             await self.miner_drivers.put(task)
@@ -1227,6 +1234,7 @@ class ComputeClient:
                     )
                     return None
                 if await self._accept_create_dispatch(job_request, accepted_ns):
+                    self.unrecorded_create_acceptances.pop((pod_id, job_request.command_id), None)
                     return await driver
         driver.close()
         raise RuntimeError(f"create of pod {pod_id} not run: its dispatch could not be recorded")

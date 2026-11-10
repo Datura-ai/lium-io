@@ -63,6 +63,7 @@ def _client(redis_service: RedisService) -> ComputeClient:
     client.miner_service.redis_service = redis_service
     client.resume_count_by_pod_id = {}
     client.deleted_pod_ids = set()
+    client.unrecorded_create_acceptances = {}
     client.miner_drivers = asyncio.Queue()
     client.resumed_creates_report = None
     client.report_awaiting = {}
@@ -917,6 +918,66 @@ async def test_an_older_dispatch_delayed_before_its_mark_keeps_a_newer_ones_succ
 
     assert (await redis_service.unacked_container_created())["pod-1"] == b_report
 
+
+
+@pytest.mark.parametrize("b_executor", ["exec-1", "exec-2"])
+@pytest.mark.parametrize("marks", [("cmd-a", "cmd-b"), ("cmd-b", "cmd-a")])
+@pytest.mark.asyncio
+async def test_the_acceptance_order_not_the_last_mark_decides_whose_success_is_saved(b_executor, marks) -> None:
+    """lium-io#1952: accepted A then B; whichever pending mark lands last (an overlapping create once the executor
+    exclusion fails open), B's success is saved and A's is refused."""
+    redis_service = _redis_service()
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a", 1)
+    await redis_service.accept_create_dispatch("pod-1", "cmd-b", 2)
+    executor = {"cmd-a": "exec-1", "cmd-b": b_executor}
+    for command_id in marks:
+        await redis_service.add_pending_pod("miner-hk", executor[command_id], "pod-1", command_id=command_id)
+    b_report = _success("cmd-b", 40023).model_copy(update={"executor_id": b_executor}).model_dump_json()
+
+    assert await redis_service.save_container_created_of_current_dispatch(
+        "miner-hk", b_executor, "pod-1", "cmd-b", b_report
+    )
+    assert not await redis_service.save_container_created_of_current_dispatch(
+        "miner-hk", "exec-1", "pod-1", "cmd-a", _success("cmd-a").model_dump_json()
+    )
+    assert (await redis_service.unacked_container_created())["pod-1"] == b_report
+
+
+@pytest.mark.parametrize("redelivery_records", [True, False])
+@pytest.mark.parametrize("retry_before_redelivery", [True, False])
+@pytest.mark.asyncio
+async def test_a_redelivered_create_keeps_its_first_acceptance_time(
+    monkeypatch, redelivery_records, retry_before_redelivery
+) -> None:
+    """lium-io#1952: A's record fails, B is recorded, then A is redelivered. Whether the redelivery's record or A's own
+    retry lands first, A is placed by its first arrival, so B stays the pod's current dispatch."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    real_accept = redis_service.accept_create_dispatch
+    fail = {"cmd-a": 1 if redelivery_records else 2}
+
+    async def flaky_accept(pod_id, command_id, accepted_ns):
+        if fail.get(command_id):
+            fail[command_id] -= 1
+            raise redis.exceptions.ConnectionError("down")
+        await real_accept(pod_id, command_id, accepted_ns)
+
+    monkeypatch.setattr(redis_service, "accept_create_dispatch", flaky_accept)
+    monkeypatch.setattr("clients.compute_client.CREATE_DISPATCH_RECORD_RETRY_DELAYS", (0,) * 6)
+    client.miner_driver = AsyncMock()
+    a = _create_request().model_copy(update={"command_id": "cmd-a"}).model_dump_json()
+    await client.handle_message(a)
+    first_a = await client.miner_drivers.get()
+    await client.handle_message(_create_request().model_copy(update={"command_id": "cmd-b"}).model_dump_json())
+    await client.miner_drivers.get()
+    if retry_before_redelivery:
+        await first_a
+    await client.handle_message(a)
+    redelivered = await client.miner_drivers.get()
+    await asyncio.gather(first_a, redelivered)
+
+    assert await redis_service.current_create_dispatch("pod-1") == "cmd-b"
+    assert client.unrecorded_create_acceptances == {}
 
 @pytest.mark.asyncio
 async def test_the_receive_loop_records_each_create_as_the_pods_current_dispatch() -> None:
