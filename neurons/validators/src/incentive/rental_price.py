@@ -55,7 +55,7 @@ MIN_DISK_TO_VRAM_RATE = 1.5
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
 # quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
 # the incentive but stays active.
-FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
+FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB200", "GB300"})  # GB200/GB300 gated as B200/B300
 FULL_8X_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
 NCU_PROFILING_UNRESTRICTED = "unrestricted"
@@ -72,6 +72,9 @@ NVIDIACTL_ROOT_UID = 0
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
 FILLER_REVENUE_PAY_FACTOR = 1.0
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
+# The share of an idle secure node's rate that an idle spot node of the same configuration earns at most
+# (Fish, 6 Nov 2026, DAH-5930): spot idle pay stays below secure idle pay, to keep secure supply worth offering.
+SPOT_IDLE_SECURE_RATE_SHARE = 0.8
 # The share of the secure rental incentive that a rented spot node earns (ENABLE_SPOT_RENTAL_INCENTIVE).
 SPOT_RENTAL_INCENTIVE_FACTOR = 0.5
 
@@ -274,15 +277,20 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
         # revisited once per-bucket fill is known. Items: (base_model, result).
         self._split_fallback_candidates: list[tuple[str, JobResult]] = []
-        # Spot-node pay and secure-floor top-ups, in USD/hour. No cap (owner rule): they are paid on
-        # top of the burn-capped rental share, from `unbucketed_share`, and sit in no bucket, so they
-        # neither face nor cause cap dilution and never scale another idle payee.
+        # Spot-node pay and secure-floor top-ups, in USD/hour. No cap on the share (owner rule): they
+        # are paid on top of the burn-capped rental share, from `unbucketed_share`, and sit in no
+        # secure bucket, so they never dilute a secure node. Spot nodes face their own per-bucket
+        # cap at the secure numbers (DAH-5944, spot_count_by_bucket).
         self._unbucketed_rental_cost = 0.0
         self.unbucketed_share = 0.0
         self.unbucketed_share_raw = 0.0
         self.unbucketed_paid_fraction = 1.0
         # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
+        # DAH-5944: idle spot GPUs per (base_model, bucket), a pool of their own under the secure caps.
+        self.spot_count_by_bucket: dict[tuple[str, int], int] = {}
+        # every Spot node counted there, diluted by _dilute_spot_pay_over_cap whichever pay list it is on
+        self._spot_cap_members: list[tuple[str, JobResult]] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
@@ -609,6 +617,10 @@ class RentalPriceIncentive(DefaultIncentive):
         if isinstance(verified, list):
             # a port two mappings both publish can still serve only one renter
             available = min(available, len(set(verified)))
+        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
+        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
+        if isinstance(deferred, int) and not isinstance(deferred, bool):
+            available = min(available, deferred)
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
@@ -767,8 +779,11 @@ class RentalPriceIncentive(DefaultIncentive):
                 free_portion.gpu_count = free_gpu_count
                 free_portion.is_rented = False
                 free_portion.is_split_remainder = True
-                # the average was looked up for the whole node's GPU configuration, not the remainder's
-                free_portion.filler_revenue_per_gpu_hour = None
+                # the average is per GPU-hour of the fillers on nodes of this GPU configuration, the free
+                # GPUs of partly rented ones included, so a Spot remainder is paid against it; a secure
+                # remainder takes no floor top-up, as before
+                if not free_portion.is_spot:
+                    free_portion.filler_revenue_per_gpu_hour = None
                 free_portion.rental_created_at = None
                 free_portion.rented_gpu_count = None
                 free_portion.incentive_logs = []
@@ -989,6 +1004,7 @@ class RentalPriceIncentive(DefaultIncentive):
         for key, weighted_sum in self._weighted_rate_sum_by_bucket.items():
             cap_mult = self.cap_multiplier_by_bucket.get(key, 0.0)
             self.total_rental_cost += cap_mult * weighted_sum
+        self._dilute_spot_pay_over_cap()
         self._unbucketed_rental_cost += self._spot_pay_within_filler_earnings()
         self._unbucketed_rental_cost += self._secure_floor_top_up()
 
@@ -1105,6 +1121,7 @@ class RentalPriceIncentive(DefaultIncentive):
                         filler_rate=FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
                         paid_fraction=self.unbucketed_paid_fraction,
                         pay_factor=FILLER_REVENUE_PAY_FACTOR,
+                        secure_share=SPOT_IDLE_SECURE_RATE_SHARE,
                     )
                 )
             self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
@@ -1217,18 +1234,17 @@ class RentalPriceIncentive(DefaultIncentive):
         # Only a node on the backend's spot pay list is paid: set to Spot by its provider, or force-spot
         # by a penalty demotion. A banned hotkey, a pin or a no-incentive rental makes a node spot as a
         # restriction, off the list, and it keeps spot_tier, as before. A rented spot node is not on
-        # this path (earns_spot_rental_incentive decides its pay), and neither is the free remainder of
-        # a partially rented one: it has no configuration average of its own (spot_tier, not "no average")
+        # this path (earns_spot_rental_incentive decides its pay); the free remainder of a partially
+        # rented one is, priced for its own free GPUs like an idle spot node
         return (
             result.is_spot
             and result.is_on_spot_pay_list
             and not result.is_rented
-            and not result.is_split_remainder
         )
 
     @staticmethod
     def _qualify_spot_node(job_result: JobResult, excluded_from_both_pools: bool) -> JobResult:
-        """An idle spot node is never in the mining pool and never in a bucket. It is paid from
+        """An idle spot node is never in the mining pool and never in a secure bucket. It is paid from
         unbucketed_share, on top of the burn-capped rental share, priced in _price_spot_node, only
         while it runs a Lium filler and its GPU configuration has a filler revenue average. The
         idle-pool gates do not apply: the node is paid for the filler work it does, not for being
@@ -1237,6 +1253,7 @@ class RentalPriceIncentive(DefaultIncentive):
         job_result.mining_score = 0
         if excluded_from_both_pools or not (job_result.score > 0 or job_result.job_score > 0):
             return job_result
+        # node-wide, which on a partly rented node means its free GPUs: a filler stops when its GPUs are rented
         if not job_result.has_lium_filler:
             job_result.record_incentive_log(MinerLogLine.no_payout_because_spot_without_lium_filler(job_result))
             return job_result
@@ -1264,16 +1281,22 @@ class RentalPriceIncentive(DefaultIncentive):
         return job_result
 
     def _price_spot_node(self, result: JobResult) -> None:
-        """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average, the secure rate for this node).
+        """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average,
+        SPOT_IDLE_SECURE_RATE_SHARE x the secure rate for this node).
 
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
-        runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
-        0 where a secure node of this configuration earns no idle pay, so the min() pays 0 there.
+        runtime and driver is listed at, before secure bucket-cap dilution. It is 0 where a secure
+        node of this configuration earns no idle pay, so the min() pays 0 there. Spot GPUs are
+        then capped per (GPU model, bucket) at the secure caps, in a pool of their own
+        (_dilute_spot_pay_over_cap, DAH-5944).
         """
         base_model: str = self.get_base_model_for_gpu(result.gpu_model)
         cap_spec: dict[int, int] = self.config.max_unrented_gpus.get(base_model, {})
+        # shortcut: no DAH-2528 split-tier reassignment for spot, extend it if spot split nodes crowd a bucket.
         bucket: int = self._resolve_bucket(result, cap_spec)
         result.count_bucket = bucket
+        # own fields, not max_cap & co: those mark a Secure tier member for every reader (portal tier breakdown)
+        result.spot_cap = cap_spec.get(bucket, 0)
         result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
         result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
         if base_model not in self.config.rental_incentive_gpu_types:
@@ -1291,7 +1314,22 @@ class RentalPriceIncentive(DefaultIncentive):
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
         )
+        # only paid GPUs take cap slots: a zero driver/sysbox multiplier or filler average pays 0 and dilutes nobody
+        if result.effective_rate > 0 and result.spot_cap > 0:
+            key: tuple[str, int] = (base_model, bucket)
+            self.spot_count_by_bucket[key] = self.spot_count_by_bucket.get(key, 0) + result.gpu_count
+            self._spot_cap_members.append((base_model, result))
         self._spot_pay_candidates.append((base_model, result))
+
+    def _dilute_spot_pay_over_cap(self) -> None:
+        """DAH-5944 (Fish): idle spot GPUs of a GPU model and bucket are capped at the secure cap, in a
+        pool of their own (spot never counts against secure caps, nor secure against spot). Above the
+        cap every spot rate there is scaled by min(count, cap) / count, before the DAH-5128 pool."""
+        for base_model, result in self._spot_cap_members:
+            count: int = self.spot_count_by_bucket[(base_model, result.count_bucket)]
+            result.spot_gpus_in_bucket = count
+            result.spot_cap_multiplier = min(count, result.spot_cap) / count
+            result.effective_rate *= result.spot_cap_multiplier
 
     def _spot_pay_within_filler_earnings(self) -> float:
         """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;
@@ -1327,7 +1365,8 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _spot_secure_rate(result: JobResult) -> float:
-        return result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
+        """The ceiling of a spot node's rate: SPOT_IDLE_SECURE_RATE_SHARE of what an idle secure node like it is paid."""
+        return SPOT_IDLE_SECURE_RATE_SHARE * result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
 
     def _floored_rate(self, result: JobResult, diluted_rate: float) -> float:
         """Secure floor: a rate diluted by the bucket cap is raised to SECURE_FILLER_REVENUE_FLOOR_FACTOR x
@@ -1381,60 +1420,9 @@ class RentalPriceIncentive(DefaultIncentive):
         candidate only when the gate is enforced, so its reason is recorded as well."""
         return eligible or (idle_pool_candidate and enforced)
 
-    async def calculate_executor_score(
-        self,
-        job_result: JobResult,
-    ) -> JobResult:
-        """Calculate score for a single executor/job result.
-
-        Phase 1: Unrented eligible GPUs are excluded from mining emission
-        by returning score = 0. All other GPUs use normal scoring logic.
-
-        Eligibility is determined by whether the GPU type has any positive
-        bucket cap in max_unrented_gpus.
-
-        Args:
-            total_gpu_model_count_map: Mapping of GPU models to total counts
-            job_result: Job execution result to score
-
-        Returns:
-            Calculated score (0 for unrented eligible GPUs, normal score otherwise)
-        """
-        # Hard exclusions: reasons a validated executor earns 0 from BOTH pools. Every one is
-        # recorded, and the idle-pool gates below still run on an excluded node, so the miner
-        # learns every fix in one cycle instead of one per cycle. One evaluator per rule, so the
-        # internal log, the customer-facing incentive log, and the scoring decision all read from
-        # the same source and cannot drift (DAH-2327).
-        excluded_for_outdated_image: bool = self._record_outdated_image_reason(job_result)
-        exclusions: list[MinerLogLine] = self._reasons_excluded_from_both_pools(job_result)
-        for exclusion in exclusions:
-            logger.info(exclusion.to_internal_log())
-            job_result.record_incentive_log(exclusion)
-        excluded_from_both_pools: bool = excluded_for_outdated_image or bool(exclusions)
-        on_spot_pay_path: bool = self._on_spot_pay_path(job_result)
-        if on_spot_pay_path and not settings.SPOT_IDLE_PAY_SECURE_DECISION_ENABLED:
-            return self._qualify_spot_node(job_result, excluded_from_both_pools)
-        if excluded_from_both_pools and job_result.gpu_model not in BASE_GPU_MAP:
-            # get_base_model_for_gpu raises on a model it does not know, and nothing above this
-            # guards it: an excluded node keeps its reasons and scores 0 instead of stopping the cycle
-            job_result.eligible_for_rental_share = False
-            job_result.mining_score = 0
-            return job_result
-
-        # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
-        base_model = self.get_base_model_for_gpu(job_result.gpu_model)
-        idle_pool_candidate: bool = (
-            not job_result.is_rented
-            and (base_model in self.config.rental_incentive_gpu_types)
-            and (job_result.score > 0 or job_result.job_score > 0)
-        )
-        eligible_for_rental_share: bool = idle_pool_candidate and not excluded_from_both_pools
-
-        # Each gate below logs its structured line, and its "cannot measure" line, only while the
-        # node is still eligible, so the shadow numbers read as before: against the flags that were
-        # on that cycle. An enforced gate also runs on a node something else already blocks, to
-        # record its reason too.
-
+    def _limit_split_remainder(
+        self, job_result: JobResult, idle_pool_candidate: bool, eligible_for_rental_share: bool
+    ) -> bool:
         # DAH-3698: a split remainder earns idle pay only for the minimum-size splits that have a
         # free port; the rest is capacity nobody can rent. First in the chain so it never reaches
         # the shadow numbers.
@@ -1474,6 +1462,69 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.record_incentive_log(
                 MinerLogLine.no_payout_because_disk_limited_remainder(job_result, disk_limited_remainder)
             )
+        return eligible_for_rental_share
+
+    async def calculate_executor_score(
+        self,
+        job_result: JobResult,
+    ) -> JobResult:
+        """Calculate score for a single executor/job result.
+
+        Phase 1: Unrented eligible GPUs are excluded from mining emission
+        by returning score = 0. All other GPUs use normal scoring logic.
+
+        Eligibility is determined by whether the GPU type has any positive
+        bucket cap in max_unrented_gpus.
+
+        Args:
+            total_gpu_model_count_map: Mapping of GPU models to total counts
+            job_result: Job execution result to score
+
+        Returns:
+            Calculated score (0 for unrented eligible GPUs, normal score otherwise)
+        """
+        # Hard exclusions: reasons a validated executor earns 0 from BOTH pools. Every one is
+        # recorded, and the idle-pool gates below still run on an excluded node, so the miner
+        # learns every fix in one cycle instead of one per cycle. One evaluator per rule, so the
+        # internal log, the customer-facing incentive log, and the scoring decision all read from
+        # the same source and cannot drift (DAH-2327).
+        excluded_for_outdated_image: bool = self._record_outdated_image_reason(job_result)
+        exclusions: list[MinerLogLine] = self._reasons_excluded_from_both_pools(job_result)
+        for exclusion in exclusions:
+            logger.info(exclusion.to_internal_log())
+            job_result.record_incentive_log(exclusion)
+        excluded_from_both_pools: bool = excluded_for_outdated_image or bool(exclusions)
+        on_spot_pay_path: bool = self._on_spot_pay_path(job_result)
+        if on_spot_pay_path and not settings.SPOT_IDLE_PAY_SECURE_DECISION_ENABLED:
+            # a Spot split remainder is paid only for the free splits a renter could take, as a secure one
+            payable: bool = self._limit_split_remainder(
+                job_result, job_result.score > 0 or job_result.job_score > 0, not excluded_from_both_pools
+            )
+            return self._qualify_spot_node(job_result, not payable)
+        if excluded_from_both_pools and job_result.gpu_model not in BASE_GPU_MAP:
+            # get_base_model_for_gpu raises on a model it does not know, and nothing above this
+            # guards it: an excluded node keeps its reasons and scores 0 instead of stopping the cycle
+            job_result.eligible_for_rental_share = False
+            job_result.mining_score = 0
+            return job_result
+
+        # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
+        base_model = self.get_base_model_for_gpu(job_result.gpu_model)
+        idle_pool_candidate: bool = (
+            not job_result.is_rented
+            and (base_model in self.config.rental_incentive_gpu_types)
+            and (job_result.score > 0 or job_result.job_score > 0)
+        )
+        eligible_for_rental_share: bool = idle_pool_candidate and not excluded_from_both_pools
+
+        # Each gate below logs its structured line, and its "cannot measure" line, only while the
+        # node is still eligible, so the shadow numbers read as before: against the flags that were
+        # on that cycle. An enforced gate also runs on a node something else already blocks, to
+        # record its reason too.
+
+        eligible_for_rental_share = self._limit_split_remainder(
+            job_result, idle_pool_candidate, eligible_for_rental_share
+        )
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays active).

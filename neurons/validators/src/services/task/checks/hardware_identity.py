@@ -109,6 +109,8 @@ class HardwareIdentityCheck:
 
     check_id = "host.validate.hardware_identity"
     fatal = True
+    # it overwrites the stored identity before it returns: a replay would compare against what it just wrote
+    replays_after_session_drop = False
 
     async def run(self, ctx: Context) -> CheckResult:
         reported = sorted(set(reported_gpu_uuids(ctx)))

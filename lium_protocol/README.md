@@ -70,6 +70,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.9.0` — `ContainerWarningCode.HungGpuReset`, `HungGpuNotResetMig`, `HungGpuNotResetNvlinkShared`, `HungGpuNotResetInUse`, `HungGpuNotResetUnsupported` (on `ContainerCreated.warnings`): a reboot or edit found a pod GPU hung and reset it before starting the new container, or could not reset it and says why.
 - `2.11.0` — `ExternalVolumeInfo.hf_bucket`, `hf_token` and `read_only` (optional): mount a Hugging Face Storage Bucket with hf-mount; the IAM keys default to "" for such a volume.
 - `2.10.0` — `ExecutorSpecRequest.host_runtime_fault` (optional): this cycle's DinD test container started on the host and its sshd never answered, so the host's container runtime is failing. False for a refused `docker run` or an error on the validator's side; None from an older validator.
+- `2.11.0` — `ExecutorSpecRequest.check_started_at` (optional): when an express recheck outside the cycle started. Its `job_batch_id` stays the cycle's, so the uptime and finished-jobs counters do not move; the backend judges the end of a provider maintenance window by this time instead of the cycle's start. None for a cycle's own report and from an older validator.
 - `1.0.0` — first release.
 
 ## Tests

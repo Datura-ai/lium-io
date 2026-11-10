@@ -19,7 +19,7 @@ from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
 from ...const import (
-    EDIT_PARKED_SUFFIX,
+    unparked_name,
     FILLER_CONTAINER_PREFIX,
     LEGACY_LIUM_CONTAINER_NAME,
     LIUM_WORKLOAD_LOOKUPS_PER_CYCLE,
@@ -90,6 +90,8 @@ class StaleContainerCleanupCheck:
 
     check_id = "executor.cleanup.stale_containers"
     fatal = False
+    # it removes containers and spends the one-time exemption: a second run finds nothing and drops its update
+    replays_after_session_drop = False
 
     def __init__(self) -> None:
         # executor uuid -> when its cache was last swept. In memory on the check, which the pipeline
@@ -312,7 +314,7 @@ async def _lium_workload_ended_here(ctx: Context, container_name: str) -> bool:
     exemption for one historical run (review 4392604823)."""
     if LEGACY_LIUM_CONTAINER_NAME.fullmatch(container_name) is None:
         return False
-    record_id = container_name.removesuffix(EDIT_PARKED_SUFFIX).partition("_")[2]
+    record_id = unparked_name(container_name).partition("_")[2]
     record: PodRentalActiveResponse | FillerRunActiveResponse | None
     if container_name.startswith(FILLER_CONTAINER_PREFIX):
         record = await ctx.services.backend.get_filler_run_active(record_id)
@@ -439,10 +441,10 @@ class _ReapedPodStateQueue:
         try:
             stored = await self._redis.hgetall(self._exempt_key) or {}
             seen = {key.decode() if isinstance(key, bytes) else str(key) for key in stored}
-            fresh = {name for name in names if name.removesuffix(EDIT_PARKED_SUFFIX) not in seen}
+            fresh = {name for name in names if unparked_name(name) not in seen}
             now = datetime.now(UTC).isoformat()
             for name in fresh:
-                await self._redis.hset(self._exempt_key, name.removesuffix(EDIT_PARKED_SUFFIX), now)
+                await self._redis.hset(self._exempt_key, unparked_name(name), now)
         except Exception as e:  # noqa: BLE001 - one-shot unverifiable: the processes still count
             logger.warning(
                 _m("GPU exemption record unavailable; removed containers' processes still count",

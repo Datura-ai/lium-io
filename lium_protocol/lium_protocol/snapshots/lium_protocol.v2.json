@@ -2284,6 +2284,19 @@
           "default": null,
           "title": "Batch Total"
         },
+        "check_started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check Started At"
+        },
         "collateral_deposited": {
           "anyOf": [
             {

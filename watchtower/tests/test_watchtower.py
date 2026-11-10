@@ -160,7 +160,7 @@ def test_fetch_verified_digest_returns_digest_on_success(mock_get, mock_verify):
     # Assert — verified digest is returned and the correct URL was used
     assert digest == "sha256:newdigest"
     mock_get.assert_called_once_with(
-        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.0"}, timeout=30
+        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.1"}, timeout=30
     )
     mock_verify.assert_called_once()
 
@@ -423,6 +423,128 @@ def test_pull_image_by_digest_rejects_an_image_without_the_requested_digest():
 
 
 # ── find_runner_container ────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _no_own_container(monkeypatch, tmp_path):
+    """Outside a container by default (CVM stack, `docker run`): the runner lookup is not scoped."""
+    monkeypatch.setattr("watchtower.MOUNTINFO_PATH", str(tmp_path / "absent"))
+
+
+OWN_ID = "e" * 64
+
+
+def _in_project(monkeypatch, tmp_path, client, project):
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        "1 0 0:1 / / rw - overlay overlay rw\n"
+        f"2 1 259:1 /var/lib/docker/containers/{OWN_ID}/hostname /etc/hostname rw - ext4 /dev/root rw\n"
+    )
+    monkeypatch.setattr("watchtower.MOUNTINFO_PATH", str(mountinfo))
+    own = Mock()
+    own.labels = {"com.docker.compose.project": project} if project else {}
+    get = client.containers.get.side_effect
+
+    def containers_get(reference):
+        return own if reference == OWN_ID else get(reference)
+
+    client.containers.get.side_effect = containers_get
+
+
+def test_find_runner_container_is_scoped_to_its_own_compose_project(monkeypatch, tmp_path):
+    """Regression: a host with this stack's runner and a stopped runner from another compose project
+    matched the service label twice, so every cycle raised and the node never updated. The lookup
+    now asks the daemon for this watchtower's own project only."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    _in_project(monkeypatch, tmp_path, client, "executor")
+
+    assert find_runner_container(client) is runner
+    assert client.containers.list.call_args_list[0].kwargs == {
+        "all": True,
+        "filters": {"label": ["com.docker.compose.service=executor-runner", "com.docker.compose.project=executor"]},
+    }
+
+
+def test_find_runner_container_is_not_scoped_without_a_compose_project(monkeypatch, tmp_path):
+    """A watchtower started with `docker run` has no project label: the lookup stays host-wide."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    _in_project(monkeypatch, tmp_path, client, None)
+
+    assert find_runner_container(client) is runner
+    assert client.containers.list.call_args_list[0].kwargs == {
+        "all": True, "filters": {"label": "com.docker.compose.service=executor-runner"}
+    }
+
+
+@pytest.mark.parametrize("error", [docker.errors.APIError("daemon busy"), docker.errors.NotFound("gone")])
+def test_find_runner_container_fails_closed_when_its_own_container_cannot_be_inspected(monkeypatch, tmp_path, error):
+    """Regression: a failed inspect of its own container read as "not in compose", and the next calls
+    searched every stack on the host by name. It now raises before any lookup, so nothing is touched."""
+    client = _client_with(_fake_container(name="executor-runner"))
+    _in_project(monkeypatch, tmp_path, client, "executor")
+    get = client.containers.get.side_effect
+
+    def containers_get(reference):
+        if reference == OWN_ID:
+            raise error
+        return get(reference)
+
+    client.containers.get.side_effect = containers_get
+
+    with pytest.raises(RunnerLookupError):
+        find_runner_container(client)
+    assert [c.args for c in client.containers.get.call_args_list] == [(OWN_ID,)]
+    client.containers.list.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "project, listed, expected, removed",
+    [
+        # scoped: the daemon answers only this project's runner; a foreign CVM-named container and a
+        # foreign `executor-runner-previous-*` are never looked up, so never returned or removed
+        ("executor", ["runner"], "runner", []),
+        # scoped, this project's own leftover beside its runner: cleared as before
+        ("executor", ["runner", "own_leftover"], "runner", ["own_leftover"]),
+        # unscoped (CVM / docker run): the CVM name wins, as before
+        (None, [], "cvm", []),
+        # unscoped, no CVM runner: the CVM leftover is found by name and restored, as before
+        (None, [], "cvm_leftover", []),
+    ],
+)
+def test_find_runner_container_name_lookups_only_outside_a_project(monkeypatch, tmp_path, project, listed, expected, removed):
+    runner = _fake_container()
+    own_leftover = _fake_container(name="executor-executor-runner-1-previous-abc123", status="exited")
+    cvm = _fake_container(name="executor-runner")
+    cvm_leftover = _fake_container(name="executor-runner-previous-abcd", status="exited")
+    by_name = {"runner": runner, "own_leftover": own_leftover, "cvm": cvm, "cvm_leftover": cvm_leftover}
+    client = _client_with(None)
+    _in_project(monkeypatch, tmp_path, client, project)
+    get = client.containers.get.side_effect
+
+    def containers_get(reference):
+        if reference == "executor-runner" and expected == "cvm":
+            return cvm
+        if reference == "executor-runner":
+            raise docker.errors.NotFound("no CVM runner")
+        return get(reference)
+
+    client.containers.get.side_effect = containers_get
+
+    def containers_list(all=False, filters=None):
+        if "name" in (filters or {}):
+            return [cvm_leftover] if expected == "cvm_leftover" else []
+        return [by_name[n] for n in listed]
+
+    client.containers.list.side_effect = containers_list
+
+    assert find_runner_container(client) is by_name[expected]
+    if project:
+        assert not any("name" in (c.kwargs.get("filters") or {}) for c in client.containers.list.call_args_list)
+        assert not any(c.args == ("executor-runner",) for c in client.containers.get.call_args_list)
+    for name, container in by_name.items():
+        assert container.remove.called == (name in removed)
+
 
 def test_find_runner_container_prefers_the_cvm_name():
     """The CVM stack names the container `executor-runner`; that lookup wins and no label query runs."""

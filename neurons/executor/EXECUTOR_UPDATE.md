@@ -13,7 +13,7 @@ The stack runs two containers: `executor-executor-runner-1` and `executor-watcht
 
 The updater never pulls by tag. A pull by tag (`runner:latest`) asks the host's Docker daemon, and the daemon asks a registry mirror first when `/etc/docker/daemon.json` has one. A mirror can keep an old copy of the tag, and the pull then "succeeds" with the old image. A pull by digest is content-addressed: the daemon checks the hash of what it receives, so a mirror can answer with the right image or with an error, never with an old one. When the daemon's path fails, the updater pulls the same digest from `registry-1.docker.io` directly, which the daemon's mirror setting does not cover.
 
-Stacks started before this change run `nickfedor/watchtower`, which pulls by tag. Those hosts keep it until the one-time restart below.
+Stacks started before this change run `nickfedor/watchtower` (or the older `containrrr/watchtower`), which pulls by tag. The runner replaces it: every time the runner starts, it checks the stack's updater container and, when it runs another image, starts `daturaai/lium-watchtower` in its place with the same name. When that container does not start, the runner puts the old updater back. The next runner release reaches those hosts through their old updater, so they need no step. The one-time restart below is for a host whose updater no longer runs.
 
 ## Make sure that a node is current
 

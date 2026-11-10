@@ -137,6 +137,31 @@ class DockerCommand:
         )
 
     @staticmethod
+    def remove_stale_container_cgroup(container_id: str) -> str:
+        """rmdir the cgroup a stopped container's last run left on the host (systemd or cgroupfs driver).
+
+        After a host dockerd restart the old cgroup can stay behind with child cgroups (the renter's
+        own nested docker or systemd made them), and every `docker start` then fails writing
+        cgroup.procs with "device or resource busy". Only empty cgroups are removed: the kernel
+        refuses rmdir of one that holds a process, so nothing running is touched. Re-reads the state
+        first and acts only while the container is still exited/created. Prints `removed`, `busy`,
+        `no cgroup`, `no host view` or `skipped state=...`; exit 0 always.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ValueError(f"not a full container id: {container_id!r}")
+        return (
+            # the host's cgroup tree is reachable only when /proc/1 is the host's (host pid namespace)
+            "[ /proc/1/root/ -ef / ] && { echo 'no host view'; exit 0; }; "
+            f"st=$(/usr/bin/docker inspect --format '{{{{.State.Status}}}}' {container_id} 2>&1); "
+            "case \"$st\" in exited|created) ;; *) echo \"skipped state=$st\"; exit 0;; esac; "
+            f"found=; for d in /proc/1/root/sys/fs/cgroup/system.slice/docker-{container_id}.scope "
+            f"/proc/1/root/sys/fs/cgroup/docker/{container_id}; do [ -d \"$d\" ] || continue; found=1; "
+            "find \"$d\" -depth -type d -exec rmdir {} \\; 2>/dev/null; "
+            "[ -d \"$d\" ] && { echo busy; exit 0; }; done; "
+            "[ -n \"$found\" ] && echo removed || echo 'no cgroup'; true"
+        )
+
+    @staticmethod
     def ps_filter(*name_patterns: str, output_format: str = "{{.Names}}") -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
