@@ -67,7 +67,7 @@ def test_no_pin_without_sources_or_with_the_switch_off(authorized_keys, monkeypa
 
 
 def test_no_pin_in_a_cvm(authorized_keys, tmp_path, monkeypatch):
-    # QEMU user networking shows sshd 10.0.2.2, never the validator's address
+    # QEMU user networking shows sshd its own gateway address, never the validator's
     sock_path = tmp_path / "dstack.sock"
     sock = socket.socket(socket.AF_UNIX)
     sock.bind(str(sock_path))

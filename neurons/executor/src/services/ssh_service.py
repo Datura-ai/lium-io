@@ -61,7 +61,7 @@ def _split_marker(line: bytes) -> tuple[bytes, bytes | None]:
 
 
 def _in_cvm() -> bool:
-    """A dstack CVM: QEMU user networking shows sshd 10.0.2.2, never the validator's address.
+    """A dstack CVM: QEMU user networking shows sshd its own gateway address, never the validator's.
 
     A socket, not just a path: docker-compose.app.yml bind-mounts /var/run/dstack.sock on every host,
     and on a host without dstack docker creates an empty directory there.
