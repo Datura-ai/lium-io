@@ -608,7 +608,11 @@ def _pull_keeper_marker(pod_id: str) -> str:
     return shlex.quote(f"LIUM_PULL_KEEPER={pod_id}")
 
 
-def _pull_keeper_alive(pod_id: str) -> str:
+def _pull_keeper_log(pod_id: str) -> str:
+    return shlex.quote(f"/tmp/lium-pull-keeper-{pod_id}.log")
+
+
+def _pull_keeper_alive_check(pod_id: str) -> str:
     # the pid is ours only while its environment carries this pod's marker (no kill of a reused pid)
     return (
         f'p=$(cat {_pull_keeper_pidfile(pod_id)} 2>/dev/null) && '
@@ -619,21 +623,37 @@ def _pull_keeper_alive(pod_id: str) -> str:
 def pull_keeper_start_command(pod_id: str, image: str) -> str:
     """Start the keeper unless an earlier attempt's keeper for this pod is still pulling."""
     return (
-        f"{_pull_keeper_alive(pod_id)} || {{ setsid nohup env {_pull_keeper_marker(pod_id)} "
+        f"{_pull_keeper_alive_check(pod_id)} || {{ setsid nohup env {_pull_keeper_marker(pod_id)} "
         f"timeout {int(_DOCKER_PULL_TIMEOUT_SECONDS)} /usr/bin/docker pull {shlex.quote(image)} "
-        f">/dev/null 2>&1 </dev/null & echo $! > {_pull_keeper_pidfile(pod_id)}; "
+        f">{_pull_keeper_log(pod_id)} 2>&1 </dev/null & echo $! > {_pull_keeper_pidfile(pod_id)}; "
         # $! names the fork before env has run: return once the marker shows, or a wait right after sees no keeper
-        f"i=0; until {_pull_keeper_alive(pod_id)} || [ $i -ge 50 ]; do sleep 0.1; i=$((i+1)); done; }}"
+        f"i=0; until {_pull_keeper_alive_check(pod_id)} || [ $i -ge 50 ]; do sleep 0.1; i=$((i+1)); done; }}"
     )
 
 
 def pull_keeper_wait_command(pod_id: str) -> str:
     """Block until this pod's keeper exits (at once when there is none)."""
-    return f"while {_pull_keeper_alive(pod_id)}; do sleep 1; done"
+    return f"while {_pull_keeper_alive_check(pod_id)}; do sleep 1; done"
+
+
+def pull_keeper_progress_command(pod_id: str) -> str:
+    """Print "<layers done> <layers seen>" from the keeper's line-per-event pull output."""
+    log = _pull_keeper_log(pod_id)
+    return (
+        f"d=$(grep -cE ': (Pull complete|Already exists)$' {log} 2>/dev/null); "
+        f"t=$(grep -cE ': (Pulling fs layer|Already exists)$' {log} 2>/dev/null); "
+        'echo "${d:-0} ${t:-0}"'
+    )
 
 
 def pull_keeper_stop_command(pod_id: str) -> str:
-    return f'{_pull_keeper_alive(pod_id)} && kill "$p"; rm -f {_pull_keeper_pidfile(pod_id)}; true'
+    return (
+        f'{_pull_keeper_alive_check(pod_id)} && kill "$p"; '
+        f"rm -f {_pull_keeper_pidfile(pod_id)} {_pull_keeper_log(pod_id)}; true"
+    )
+
+
+_PULL_KEEPER_PROGRESS_INTERVAL_SECONDS = 15
 
 
 _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
@@ -9817,44 +9837,16 @@ class DockerService:
                         )
                         # shortcut: no keeper for a pull with registry credentials (the host CLI has none and
                         # we write none to the host); such a pull still starts over after a restart.
-                        keeper = not has_credentials
-                        if keeper:
-                            with contextlib.suppress(Exception):
-                                await ssh_client.run(
-                                    pull_keeper_start_command(payload.pod_id, payload.docker_image),
-                                    check=False,
-                                    timeout=30,
-                                )
-
-                        async def _stop_keeper() -> None:
-                            if keeper:
-                                with contextlib.suppress(Exception):
-                                    await ssh_client.run(
-                                        pull_keeper_stop_command(payload.pod_id), check=False, timeout=30
-                                    )
-
-                        async def _watched_pull() -> None:
-                            if keeper:
-                                # attach to the keeper, not race it: two concurrent pulls of one image on the
-                                # containerd store fail "failed commit on ref". The SDK pull after it is then a
-                                # no-op, or the real pull (and its error) when the keeper failed.
-                                waited_from = time.monotonic()
-                                with contextlib.suppress(Exception):
-                                    await ssh_client.run(
-                                        pull_keeper_wait_command(payload.pod_id),
-                                        check=False,
-                                        timeout=int(_DOCKER_PULL_TIMEOUT_SECONDS) + 30,
-                                    )
-                                if time.monotonic() - waited_from >= _DOCKER_PULL_TIMEOUT_SECONDS:
-                                    raise RentalDockerOperationError(
-                                        f"Docker SDK pull timed out after {int(_DOCKER_PULL_TIMEOUT_SECONDS)} seconds"
-                                    )
-                            await docker_client.pull(image=payload.docker_image)
+                        use_pull_keeper = not has_credentials
 
                         async def _cancel_pull() -> None:
                             with contextlib.suppress(Exception):
                                 await docker_client.aclose()
-                            await _stop_keeper()
+                            if use_pull_keeper:
+                                with contextlib.suppress(Exception):
+                                    await ssh_client.run(
+                                        pull_keeper_stop_command(payload.pod_id), check=False, timeout=30
+                                    )
 
                         try:
                             await self._unless_cancelled_by_delete(
@@ -9864,7 +9856,9 @@ class DockerService:
                                 run_logged_rental_docker_sdk_operation(
                                     operation="pull",
                                     log_extra=default_extra,
-                                    call=_watched_pull,
+                                    call=lambda: self._pull_image_with_host_keeper(
+                                        ssh_client, docker_client, payload, log_tag, use_pull_keeper=use_pull_keeper
+                                    ),
                                     image=payload.docker_image,
                                 ),
                                 on_cancel=_cancel_pull,
@@ -9872,8 +9866,6 @@ class DockerService:
                         except _CreateCancelledByDelete:
                             raise
                         except Exception as exc:
-                            # not on a cancel: a connector shutdown must leave the keeper running
-                            await _stop_keeper()
                             if login_error is None:
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
@@ -9885,7 +9877,6 @@ class DockerService:
                                 f"Docker login failed: {login_error} (pull without login then failed: {exc})",
                                 login_error,
                             ) from exc
-                        await _stop_keeper()
 
                         # Add profiler for docker pull
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
@@ -11505,6 +11496,64 @@ class DockerService:
             local_volume_path,
         ]
         await ssh_client.run(shlex.join(command), check=True)
+
+    async def _pull_image_with_host_keeper(
+        self, ssh_client, docker_client, payload, log_tag: str, *, use_pull_keeper: bool
+    ) -> None:
+        if not use_pull_keeper:
+            await docker_client.pull(image=payload.docker_image)
+            return
+
+        async def _stop_keeper() -> None:
+            with contextlib.suppress(Exception):
+                await ssh_client.run(pull_keeper_stop_command(payload.pod_id), check=False, timeout=30)
+
+        # from before the start: a keeper its `timeout` killed must not let a second 1h SDK pull begin
+        waited_from = time.monotonic()
+        try:
+            with contextlib.suppress(Exception):
+                await ssh_client.run(
+                    pull_keeper_start_command(payload.pod_id, payload.docker_image), check=False, timeout=30
+                )
+            # attach to the keeper, not race it: two concurrent pulls of one image on the containerd store
+            # fail "failed commit on ref". The SDK pull after it is then a no-op, or the real pull and its error.
+            wait = asyncio.ensure_future(
+                ssh_client.run(
+                    pull_keeper_wait_command(payload.pod_id),
+                    check=False,
+                    timeout=int(_DOCKER_PULL_TIMEOUT_SECONDS) + 30,
+                )
+            )
+            try:
+                while not wait.done():
+                    await asyncio.wait({wait}, timeout=_PULL_KEEPER_PROGRESS_INTERVAL_SECONDS)
+                    if not wait.done():
+                        await self._report_pull_keeper_progress(ssh_client, payload, log_tag, waited_from)
+            finally:
+                wait.cancel()
+            with contextlib.suppress(Exception):
+                wait.result()
+            if time.monotonic() - waited_from >= _DOCKER_PULL_TIMEOUT_SECONDS:
+                raise RentalDockerOperationError(
+                    f"Docker SDK pull timed out after {int(_DOCKER_PULL_TIMEOUT_SECONDS)} seconds"
+                )
+            await docker_client.pull(image=payload.docker_image)
+        except Exception:
+            # not on a cancel: a connector shutdown must leave the keeper running
+            await _stop_keeper()
+            raise
+        await _stop_keeper()
+
+    async def _report_pull_keeper_progress(self, ssh_client, payload, log_tag: str, started: float) -> None:
+        # the SDK pull only starts once the keeper is done, so the keeper's own output is the renter's progress
+        minutes = int((time.monotonic() - started) // 60)
+        progress = f"still downloading ({minutes} min)"
+        with contextlib.suppress(Exception):
+            result = await ssh_client.run(pull_keeper_progress_command(payload.pod_id), check=False, timeout=30)
+            done, total = (int(n) for n in str(result.stdout or "").split())
+            if total:
+                progress = f"{done} of {total} layers done ({minutes} min)"
+        await self.stream_log(f"Pulling docker image {payload.docker_image}: {progress}", "success", log_tag)
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:

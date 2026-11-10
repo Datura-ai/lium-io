@@ -485,8 +485,8 @@ class RentalDockerSdkClient:
 
     async def _pull_retrying_transient(self, image: str) -> None:
         # DAH-5833: a concurrent pull of the same image (containerd store) and a registry reset are
-        # transient daemon answers; retry them twice inside the pull deadline, skipping the retry if
-        # the other puller already landed the image.
+        # transient daemon answers; retry them twice inside the pull deadline. Always pull again: a local
+        # image of the same name may be an older build of a moved tag.
         for delay in (*_PULL_TRANSIENT_RETRY_DELAYS_SECONDS, None):
             try:
                 return await self._retry_once_on_transport_drop(
@@ -502,9 +502,6 @@ class RentalDockerSdkClient:
                     )
                 )
             await asyncio.sleep(delay)
-            with suppress(Exception):
-                if await self.image_exists(image=image):
-                    return
 
     async def image_exists(self, *, image: str) -> bool:
         return await self._retry_once_on_transport_drop(

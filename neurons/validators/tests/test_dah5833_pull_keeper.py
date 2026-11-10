@@ -13,9 +13,11 @@ import uuid
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import services.docker_service as docker_service
 from services.docker_service import (
     DockerService,
     inflight_creates,
+    pull_keeper_progress_command,
     pull_keeper_start_command,
     pull_keeper_stop_command,
     pull_keeper_wait_command,
@@ -176,4 +178,79 @@ async def test_a_delete_mid_pull_stops_the_keeper(svc, monkeypatch):
     assert inflight_creates.cancel(payload.pod_id)
     await asyncio.wait_for(create, 10)
 
+    assert pull_keeper_stop_command(payload.pod_id) in _commands(ssh)
+
+
+def test_the_progress_counts_layers_from_the_keepers_pull_output(tmp_path):
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\nprintf 'a1: Already exists\\nb2: Pulling fs layer\\nc3: Pulling fs layer\\n"
+        "b2: Download complete\\nb2: Pull complete\\n'\nexec sleep 30\n"
+    )
+    fake_docker.chmod(0o755)
+    pod_id = str(uuid.uuid4())
+    assert subprocess.run(["sh", "-c", pull_keeper_progress_command(pod_id)], capture_output=True, text=True).stdout == "0 0\n"
+
+    _sh(pull_keeper_start_command(pod_id, "ghcr.io/org/img:1").replace("/usr/bin/docker", str(fake_docker)))
+    try:
+        for _ in range(50):
+            out = subprocess.run(["sh", "-c", pull_keeper_progress_command(pod_id)], capture_output=True, text=True)
+            if out.stdout == "2 3\n":
+                break
+            subprocess.run(["sleep", "0.1"], check=True)
+        assert out.stdout == "2 3\n"
+    finally:
+        _sh(pull_keeper_stop_command(pod_id))
+    assert not os.path.exists(f"/tmp/lium-pull-keeper-{pod_id}.log")
+
+
+@pytest.mark.asyncio
+async def test_the_renter_sees_layer_progress_while_the_keeper_pulls(svc, monkeypatch):
+    payload = _payload()
+    ssh = _ssh_client(inspect_exit=1)
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(docker_service, "_PULL_KEEPER_PROGRESS_INTERVAL_SECONDS", 0.01)
+    side = ssh.run.side_effect
+    progress_reads = 0
+
+    async def run(cmd, *args, **kwargs):
+        nonlocal progress_reads
+        if cmd == pull_keeper_progress_command(payload.pod_id):
+            progress_reads += 1
+            return Mock(exit_status=0, stdout="3 12\n")
+        if cmd == pull_keeper_wait_command(payload.pod_id):
+            while progress_reads < 2:
+                await asyncio.sleep(0.01)
+        return side(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = run
+    logs = []
+
+    async def stream_log(msg, status, tag):
+        logs.append(msg)
+
+    monkeypatch.setattr(svc, "stream_log", stream_log)
+
+    with inflight_creates.track(payload.pod_id):
+        await _run(svc, payload)
+
+    assert f"Pulling docker image {payload.docker_image}: 3 of 12 layers done (0 min)" in logs
+
+
+@pytest.mark.asyncio
+async def test_a_keeper_that_ran_out_its_timeout_starts_no_second_pull(svc, monkeypatch):
+    payload = _payload()
+    ssh = _ssh_client(inspect_exit=1)
+    _patch_happy(svc, monkeypatch, ssh)
+    # the deadline counts from before the keeper start, so a keeper killed at it is already past it
+    monkeypatch.setattr(docker_service, "_DOCKER_PULL_TIMEOUT_SECONDS", 0)
+    docker = _docker_client(svc)
+    docker.pull = AsyncMock()
+
+    with inflight_creates.track(payload.pod_id):
+        result = await _run(svc, payload)
+
+    assert "timed out after 0 seconds" in str(result)
+
+    docker.pull.assert_not_awaited()
     assert pull_keeper_stop_command(payload.pod_id) in _commands(ssh)

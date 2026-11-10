@@ -1736,14 +1736,15 @@ async def test_pull_retries_a_containerd_race_or_registry_reset(no_pull_backoff,
 
 
 @pytest.mark.asyncio
-async def test_pull_race_skips_the_retry_when_the_other_puller_landed_the_image(no_pull_backoff):
+async def test_pull_retries_even_when_an_older_local_image_has_the_same_tag(no_pull_backoff):
+    # the old build of a moved tag is present locally; only a successful pull may report success
     api_client = FlakyPullApiClient([CONTAINERD_LEASE_RACE])
     client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
 
     await client.pull(image="daturaai/pytorch:dind")
 
-    assert len(api_client.post_calls) == 1
-    assert api_client.inspected_images == ["daturaai/pytorch:dind"]
+    assert len(api_client.post_calls) == 2
+    assert api_client.inspected_images == []
 
 
 @pytest.mark.asyncio
