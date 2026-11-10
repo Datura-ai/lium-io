@@ -335,6 +335,11 @@ class ContainerRunSpec:
     # runs in the Docker thread between the create and the start call with the names of every container
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
+    # the CPU-refusal retry: never below min_cpu_count, pids_limit_for re-sizes pids.max for the granted
+    # count, on_cpus_granted is told the count the container got
+    min_cpu_count: int | None = None
+    pids_limit_for: Callable[[int], int | None] | None = field(default=None, repr=False, compare=False)
+    on_cpus_granted: Callable[[int], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -1069,6 +1074,8 @@ class RentalDockerSdkClient:
                     }
                     or None,
                 )
+                if attempt is not spec and spec.on_cpus_granted is not None:
+                    spec.on_cpus_granted(attempt.cpu_count)
                 break
             except Exception as exc:
                 daemon_cpus = _daemon_cpu_count_from_refusal(exc)
@@ -1076,7 +1083,13 @@ class RentalDockerSdkClient:
                 # health probe's retry allows): rent with the daemon's count, label included. One retry,
                 # bounded by the original count; a second refusal fails like any other.
                 cpus = spec.cpu_count
-                if attempt is spec and cpus and daemon_cpus and daemon_cpus < cpus <= 2 * daemon_cpus + 4:
+                if (
+                    attempt is spec
+                    and cpus
+                    and daemon_cpus
+                    and daemon_cpus < cpus <= 2 * daemon_cpus + 4
+                    and daemon_cpus >= (spec.min_cpu_count or 0)
+                ):
                     logger.warning(
                         _m(
                             "Docker refused the requested CPUs; retrying with the daemon's count",
@@ -1089,7 +1102,12 @@ class RentalDockerSdkClient:
                             ),
                         )
                     )
-                    attempt = replace(spec, cpu_count=daemon_cpus, before_create=None)
+                    attempt = replace(
+                        spec,
+                        cpu_count=daemon_cpus,
+                        pids_limit=spec.pids_limit_for(daemon_cpus) if spec.pids_limit_for else spec.pids_limit,
+                        before_create=None,
+                    )
                     continue
                 # The first attempt's create timed out on the client but still runs in dockerd: it holds
                 # the name (409) while inspect answers 404 until it registers the container. Adopt it then.

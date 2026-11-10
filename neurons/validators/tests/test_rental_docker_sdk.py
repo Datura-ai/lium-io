@@ -807,14 +807,37 @@ class CpuRefusingApiClient(FakeApiClient):
 @pytest.mark.asyncio
 async def test_run_container_retries_a_cpu_refusal_within_the_bound_with_the_daemon_count():
     api_client = CpuRefusingApiClient(daemon_cpus=10)
+    granted = []
 
     container_id = await RentalDockerSdkClient(api_client).run_container(
-        ContainerRunSpec(image="img", name="pod_t", cpu_count=12)
+        ContainerRunSpec(
+            image="img",
+            name="pod_t",
+            cpu_count=12,
+            min_cpu_count=10,
+            pids_limit=12_000,
+            pids_limit_for=lambda cpus: cpus * 1000,
+            on_cpus_granted=granted.append,
+        )
     )
 
     assert container_id == "container-id"
     assert api_client.create_nano_cpus == [12_000_000_000, 10_000_000_000]
     assert api_client.created_container["labels"]["io.lium.cpu_count"] == "10"
+    assert api_client.host_config_kwargs["pids_limit"] == 10_000
+    assert granted == [10]
+
+
+@pytest.mark.asyncio
+async def test_run_container_does_not_retry_a_cpu_refusal_below_the_renters_minimum():
+    api_client = CpuRefusingApiClient(daemon_cpus=10)
+
+    with pytest.raises(RentalDockerOperationError, match="only 10 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=12, min_cpu_count=12)
+        )
+
+    assert api_client.create_nano_cpus == [12_000_000_000]
 
 
 class ShrinkingCpuApiClient(CpuRefusingApiClient):
