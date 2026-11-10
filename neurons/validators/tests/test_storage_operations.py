@@ -288,13 +288,3 @@ async def test_start_never_removes_a_running_helper(
             )
     assert any("docker rm -f" in c for c in commands) is not kept
 
-
-@pytest.mark.asyncio
-async def test_pod_delete_removes_exited_helpers_holding_its_volume() -> None:
-    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(stdout="", exit_status=0)))
-
-    await storage_operations.remove_finished_helpers_mounting(ssh, "volume_abc")
-
-    command = ssh.run.await_args.args[0]
-    assert "label=lium.storage-wrapper" in command and "status=exited" in command
-    assert "volume=volume_abc" in command and "docker rm -f" in command

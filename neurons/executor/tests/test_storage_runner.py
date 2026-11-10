@@ -916,6 +916,23 @@ def test_legacy_tar_restore_keeps_the_4g_helper_cap(monkeypatch: pytest.MonkeyPa
     assert command[command.index("--memory") + 1] == "4g"
 
 
+def test_a_helper_whose_start_fails_is_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _operation_payload()
+    workspace = DockerVolumeWorkspace("executor:test", "customer-volume", PurePosixPath("/workspace/x"), False)
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), workspace)
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=125 if command[1] == "run" else 0, stdout="", stderr="start failed")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
+    with pytest.raises(ResticOperationError):
+        runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", json.dumps(payload))
+
+    assert calls[-1][1:] == ["rm", "--force", runner._helper_container_name()]
+
+
 def _launched_helper(
     monkeypatch: pytest.MonkeyPatch, runner: ResticStorageRunner, spec_json: str
 ) -> tuple[list[str], dict[str, str]]:

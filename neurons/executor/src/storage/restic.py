@@ -835,6 +835,10 @@ class ResticStorageRunner:
             command, env={**os.environ, SPEC_ENV: spec_json}, capture_output=True, text=True
         )
         if started.returncode != 0:
+            # docker run can fail after creating the container; a created helper reads as running and is never reaped
+            subprocess.run(
+                [self._docker_binary, "rm", "--force", self._helper_container_name()], capture_output=True, text=True
+            )
             detail = _redact((started.stderr or "").strip(), self._secret_values())
             raise ResticOperationError(f"storage helper did not start: {_bounded_message(detail, 500)}")
 
