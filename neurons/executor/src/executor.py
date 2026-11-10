@@ -13,7 +13,7 @@ from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
 from services.heartbeat_service import run_node_heartbeat
-from services.ssh_service import run_uploaded_key_purge
+from services.ssh_service import run_ssh_sources_refresh, run_uploaded_key_purge
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +43,8 @@ async def lifespan(app: FastAPI):
     # DAH-3394: ssh keys the validator uploaded and never removed expire (EXECUTOR_UPLOADED_KEY_TTL_S)
     key_purge_task = asyncio.create_task(run_uploaded_key_purge())
     heartbeat_task = asyncio.create_task(run_node_heartbeat())
+    # DAH-4631: the signed list uploads are pinned to, fetched off the upload path
+    ssh_sources_task = asyncio.create_task(run_ssh_sources_refresh())
     try:
         yield
     finally:
@@ -50,6 +52,7 @@ async def lifespan(app: FastAPI):
             ("cache template pre-pull", prefetch_task),
             ("uploaded ssh key purge", key_purge_task),
             ("node heartbeat", heartbeat_task),
+            ("ssh sources refresh", ssh_sources_task),
         ):
             task.cancel()
             try:

@@ -98,6 +98,8 @@ class EndpointReading:
 class Judgement(NamedTuple):
     is_failing: bool
     has_no_verdict: bool
+    # the readings the failure rests on: every slow one, or the one cut endpoint the validator reached
+    failed: tuple[EndpointReading, ...] = ()
 
 
 def _error_kind(stderr: str) -> str:
@@ -213,7 +215,7 @@ class ContainerDownloadSpeedCheck:
     alpine container (sysbox-runc where the node has it, on the rentals bridge pods use) and reads up to
     CAP_BYTES of a pinned PyPI wheel and a pinned Hugging Face file, each under FETCH_TIMEOUT_SECONDS.
 
-    Every measurement is logged as CONTAINER_DOWNLOAD_SPEED. A reading fails when a measured endpoint is below
+    Every measurement is logged as CONTAINER_DOWNLOAD_SPEED. A reading fails when every measured endpoint is below
     CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or the container cannot reach an endpoint (DNS, refused, nothing read in
     time) that the validator itself reaches. An endpoint the validator cannot reach either, an HTTP error, or a
     container that did not run is no verdict. READINGS_BEFORE_VERDICT failing readings in a row (the second
@@ -304,14 +306,16 @@ class ContainerDownloadSpeedCheck:
         return readings
 
     async def _judge(self, readings: list[EndpointReading]) -> Judgement:
-        """Slow on any endpoint fails: a renter needs both."""
+        """Slow on every measured endpoint fails. One CDN slow while another endpoint reads fast is that CDN's
+        path, not the node's link: PyPI-only slow readings come in bursts across unrelated networks (DAH-5979)."""
         threshold = settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS
-        if any(r.mbps is not None and r.mbps < threshold for r in readings):
-            return Judgement(is_failing=True, has_no_verdict=False)
+        measured = [r for r in readings if r.mbps is not None]
+        if measured and max(r.mbps for r in measured) < threshold:
+            return Judgement(is_failing=True, has_no_verdict=False, failed=tuple(measured))
         urls = dict(ENDPOINTS)
         for r in readings:
             if r.error in NODE_SIDE_ERRORS and await validator_reaches(urls[r.endpoint]):
-                return Judgement(is_failing=True, has_no_verdict=False)
+                return Judgement(is_failing=True, has_no_verdict=False, failed=(r,))
         # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict
         return Judgement(is_failing=False, has_no_verdict=any(r.mbps is None for r in readings))
 
