@@ -5316,6 +5316,11 @@
           "title": "Filler Revenue By Gpu Config",
           "type": "array"
         },
+        "filler_revenue_complete": {
+          "default": false,
+          "title": "Filler Revenue Complete",
+          "type": "boolean"
+        },
         "gpu_splitting_config": {
           "additionalProperties": {
             "type": "integer"
@@ -6610,7 +6615,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.11.0",
+  "protocol_version": "2.12.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

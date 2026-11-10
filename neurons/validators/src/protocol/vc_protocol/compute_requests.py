@@ -216,6 +216,10 @@ class RentedExecutorsResponse(BaseModel):
     # measured against. Defaults to empty: an older backend (or a feed with no usable average) reads as a failed
     # feed, so no spot node is seeded and none is paid, as before (has_filler_revenue_averages).
     filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
+    # True only when the backend computed the averages now from every filler run of the window with each run priced
+    # (fresh rates, the earnings TSDB read). A partial or stale feed, and an older backend, send False: then a missing
+    # configuration may be a gap in the feed rather than unmeasured, so it is not seeded.
+    filler_revenue_complete: bool = False
     # executor_id → the hotkey the backend lists the executor under. Only that hotkey may take over a
     # verified record stored under the bare executor id (RedisService.get_verified_job_info).
     executor_owner_hotkeys: dict[str, str] = {}
@@ -249,9 +253,10 @@ class RentedExecutorsResponse(BaseModel):
         return None
 
     def has_filler_revenue_averages(self, min_gpu_hours: float) -> bool:
-        """The feed carries a usable average for at least one configuration. When it carries none, a configuration
-        without an average is a failed or empty feed, not an unmeasured configuration."""
-        return any(
+        """The backend marks the feed fresh and complete and it carries a usable average for at least one
+        configuration. Otherwise a configuration without an average may be a gap in a failed, partial or stale
+        feed, not an unmeasured configuration, so it is not seeded."""
+        return self.filler_revenue_complete and any(
             entry.gpu_hours >= min_gpu_hours and entry.usd_per_gpu_hour >= 0 and math.isfinite(entry.usd_per_gpu_hour)
             for entry in self.filler_revenue_by_gpu_config
         )
