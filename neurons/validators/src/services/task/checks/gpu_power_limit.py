@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from collections import Counter
 from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel
-from services.const import DEFAULT_JOB_OWNER_LIUM
+from services.const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     RENTAL_START_RATIO_TTL_SECONDS,
@@ -72,6 +73,32 @@ def _with_host_limits(ctx: Context, records: list[GpuPowerRestoreRecord]) -> dic
 
 def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str, Any]]:
     return [measurement.model_dump() for measurement in measurements]
+
+
+FILLER_INSPECT_TIMEOUT_SECONDS = 30
+
+
+async def _filler_pods_running(ctx: Context, pod_ids: set[str]) -> set[str]:
+    """The pods among these whose filler container is running on the host now (DAH-2786): one docker inspect, asked
+    only when a revert is about to be recorded. Fails open: no SSH or no answer confirms none, since this feeds a
+    money gate and our own failure must never read as the host's."""
+    if ctx.ssh is None or not pod_ids:
+        return set()
+    names = " ".join(shlex.quote(f"{FILLER_CONTAINER_PREFIX}{pod_id}") for pod_id in sorted(pod_ids))
+    try:
+        # exits 1 when one name is missing but still prints the others
+        result = await ctx.ssh.run(
+            f"/usr/bin/docker inspect --format '{{{{.Name}}}} {{{{.State.Running}}}}' {names}",
+            timeout=FILLER_INSPECT_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001
+        return set()
+    running: set[str] = set()
+    for line in (getattr(result, "stdout", "") or "").splitlines():
+        name, _, state = line.strip().lstrip("/").partition(" ")
+        if state == "true" and name.startswith(FILLER_CONTAINER_PREFIX):
+            running.add(name.removeprefix(FILLER_CONTAINER_PREFIX))
+    return running & pod_ids
 
 
 class GpuPowerLimitCheck:
@@ -340,6 +367,11 @@ class GpuPowerLimitCheck:
             )
             if revert is not None:
                 reverts.append(revert)
+        if reverts:
+            # A claim the delete could not clear (Redis down through the teardown) outlives its job, and the backend
+            # still reports owner "lium" for a STOPPING run: only a job whose container runs now can be reverted
+            running = await _filler_pods_running(ctx, {revert.pod_id for revert in reverts})
+            reverts = [revert for revert in reverts if revert.pod_id in running]
         if reverts:
             await record_cap_reverts(
                 ctx.services.redis, ctx.executor.uuid, reverts, ctx.default_extra

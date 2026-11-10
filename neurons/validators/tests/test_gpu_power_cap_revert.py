@@ -245,12 +245,29 @@ def _running_filler_state(*live_watts_by_uuid: tuple[str, float]) -> ContextStat
     )
 
 
+def host_with_running_fillers(running_pod_ids: set[str] | None = None) -> AsyncMock:
+    """SSH to a host whose docker inspect reports these filler pods running (None: every one asked about)."""
+
+    async def run(command: str, **_kwargs) -> FakeRun:
+        asked = [word.strip("'") for word in command.split() if word.strip("'").startswith("filler_")]
+        lines = [
+            f"/{name} {'true' if running_pod_ids is None or name.removeprefix('filler_') in running_pod_ids else 'false'}"
+            for name in asked
+        ]
+        return FakeRun(stdout="\n".join(lines) + "\n")
+
+    ssh = AsyncMock()
+    ssh.run.side_effect = run
+    return ssh
+
+
 async def _run_check_while_filler_runs(
     context_factory,
     monkeypatch: pytest.MonkeyPatch,
     redis: FakeRedis,
     records: list[GpuPowerRestoreRecord],
     live_watts_by_uuid: list[tuple[str, float]],
+    ssh: AsyncMock | None = None,
 ) -> None:
     monkeypatch.setattr(
         check_module,
@@ -260,6 +277,7 @@ async def _run_check_while_filler_runs(
     ctx = context_factory(
         state=_running_filler_state(*live_watts_by_uuid),
         services=build_services(redis=redis),
+        ssh=ssh or host_with_running_fillers(),
     )
     result = await GpuPowerLimitCheck().run(ctx)
 
@@ -375,6 +393,33 @@ async def test_a_failed_clear_is_retried_once_the_filler_is_gone(
     await _run_check_while_filler_runs(
         context_factory, monkeypatch, redis, [cleared], [("GPU-a", 400.0)]
     )
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_claim_left_by_a_teardown_with_redis_down_is_not_a_revert(context_factory, monkeypatch) -> None:
+    # lio-dep#140 review: Redis was down through the whole delete, so the claim was never cleared and the
+    # backend still reports owner "lium" while the run is STOPPING. The job's container is gone: no revert.
+    stale_claim = BrokenRedis({_restore_key("GPU-a"): _stored_restore_record(executor_id=CHECK_EXECUTOR_UUID)})
+    assert await clear_filler_pod_applied_caps(stale_claim, POD_ID) == {}
+    redis = FakeRedis()
+
+    await _run_check_while_filler_runs(
+        context_factory, monkeypatch, redis, [_record()], [("GPU-a", 400.0)], ssh=host_with_running_fillers(set())
+    )
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_revert_needs_an_answer_from_the_host(context_factory, monkeypatch) -> None:
+    # our SSH failing is no proof the job runs: the money gate fails open
+    redis = FakeRedis()
+    ssh = AsyncMock()
+    ssh.run.side_effect = OSError("ssh dropped")
+
+    await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [_record()], [("GPU-a", 400.0)], ssh=ssh)
+
     assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
 
 
