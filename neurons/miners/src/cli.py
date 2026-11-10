@@ -9,8 +9,9 @@ from rich.table import Table
 from services.cli_service import CliService, collateral_error
 from core.collateral import rpc_origin
 from core.config import settings
-from core.utils import _m, get_collateral_contract, versions_holding_collateral, versions_with_open_reclaim
+from core.utils import _m, cap_recursion_limit, get_collateral_contract, versions_holding_collateral, versions_with_open_reclaim
 
+cap_recursion_limit()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
