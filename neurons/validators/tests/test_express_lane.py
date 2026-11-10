@@ -682,6 +682,19 @@ async def test_a_recheck_request_is_queued_and_a_bad_id_is_ignored():
 
 
 @pytest.mark.asyncio
+async def test_a_recheck_asked_once_per_window_is_queued_only_the_first_time():
+    redis_service = _redis_service()
+    node = str(uuid4())
+
+    first = await redis_service.request_executor_recheck_once(node, 1800)
+    await redis_service.srem("express_lane:recheck_requests", node)  # the lane picked it
+    again = await redis_service.request_executor_recheck_once(node, 1800)
+
+    assert (first, again) == (True, False)
+    assert await redis_service.get_executor_recheck_requests() == set()
+
+
+@pytest.mark.asyncio
 async def test_a_requested_validated_executor_is_rechecked_once_under_the_caps(monkeypatch, wallet):
     nodes = [str(uuid4()) for _ in range(3)]
     old = [_portal_executor(n, registered_seconds_ago=7 * 86400) for n in nodes]
