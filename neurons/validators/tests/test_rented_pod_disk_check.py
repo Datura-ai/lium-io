@@ -3,6 +3,7 @@ paused (never deleted) and resumed once the disk has room; a host with the limit
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from types import SimpleNamespace
@@ -191,3 +192,63 @@ async def test_a_redis_outage_acts_on_nothing(context_factory):
     )
     assert (result.passed, result.event.reason_code) == (True, Msg.UNKNOWN.reason)
     assert not any("pause" in c.split() for c in ssh.calls)
+
+
+@pytest.mark.asyncio
+async def test_the_pause_record_is_saved_before_the_pause_and_a_failed_save_pauses_nothing(
+    context_factory,
+):
+    redis = FakeRedis()
+    ssh = _ssh(_reading(20, f"/pod_1 running {500 * GB} 0"))
+    real_run = ssh.run
+
+    async def run(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker pause"):
+            assert json.loads(redis.store["rented_pod_disk:paused:executor-123"]) == ["pod_1"]
+        return await real_run(cmd, *args, **kwargs)
+
+    ssh.run = run
+    await RentedPodDiskCheck().run(_ctx(context_factory, ssh, redis=redis))
+    assert ssh.calls[-1] == "/usr/bin/docker pause pod_1"
+
+    redis = FakeRedis()
+    redis.fail_next_set_of.add("rented_pod_disk:paused:executor-123")
+    ssh = _ssh(_reading(20, f"/pod_1 running {500 * GB} 0"))
+    ctx = _ctx(context_factory, ssh, redis=redis)
+    result = await RentedPodDiskCheck().run(ctx)
+    assert (result.passed, result.event.reason_code) == (True, Msg.UNKNOWN.reason)
+    assert not any("pause" in c.split() for c in ssh.calls)
+    ctx.services.backend.report_pod_disk_pause.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_billing_stops_only_for_a_pod_seen_paused_and_a_pod_seen_running_again_is_reported_resumed(
+    context_factory,
+):
+    key = "rented_pod_disk:paused:executor-123"
+    # recorded, but missing from this read: kept, and not reported either way
+    redis = FakeRedis()
+    redis.store[key] = json.dumps(["pod_1"])
+    ctx = _ctx(context_factory, _ssh(_reading(70)), redis=redis)
+    await RentedPodDiskCheck().run(ctx)
+    ctx.services.backend.report_pod_disk_pause.assert_not_called()
+    assert json.loads(redis.store[key]) == ["pod_1"]
+
+    # recorded, seen running again: reported resumed and dropped
+    ctx = _ctx(context_factory, _ssh(_reading(70, f"/pod_1 running {500 * GB} 0")), redis=redis)
+    await RentedPodDiskCheck().run(ctx)
+    assert [
+        c.kwargs["paused"] for c in ctx.services.backend.report_pod_disk_pause.call_args_list
+    ] == [False]
+    assert key not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_record_of_a_pod_no_longer_rented_is_cleared(context_factory):
+    key = "rented_pod_disk:paused:executor-123"
+    redis = FakeRedis()
+    redis.store[key] = json.dumps(["old_pod", "pod_1"])
+    await RentedPodDiskCheck().run(
+        _ctx(context_factory, _ssh(_reading(70, f"/pod_1 paused {500 * GB} 0")), redis=redis)
+    )
+    assert json.loads(redis.store[key]) == ["pod_1"]

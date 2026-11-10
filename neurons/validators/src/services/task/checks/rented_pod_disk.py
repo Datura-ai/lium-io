@@ -116,41 +116,48 @@ class RentedPodDiskCheck:
                 return self._event(ctx, Msg.UNKNOWN, reason="docker disk not readable")
             key = PAUSED_KEY_PREFIX + ctx.executor.uuid
             loaded = set(json.loads(await ctx.services.redis.get(key) or "[]"))
-            # a pod of ours seen not paused (resumed by someone else) is ours no more; one missing from this
-            # read is kept, so a partial read never loses a pause
-            ours = loaded - {p.container for p in pods if p.status != "paused"}
+            status = {p.container: p.status for p in pods}
+            # ours: pods this check paused that are still rented and not seen running again. A pod missing from
+            # this read is kept, so a partial read never loses a pause
+            ours = {n for n in loaded & set(names) if status.get(n, "paused") == "paused"}
+            # a pod of ours seen running again (resumed by someone else) is reported resumed
+            resumed = sorted(n for n in loaded & set(names) if n not in ours)
             to_pause, to_resume = plan(size, free, pods, ours)
             what = {
                 "disk_bytes": size,
                 "free_bytes": free,
                 "pods": [asdict(p) for p in pods],
             }
+            event, just_paused = Msg.OK, []
             if to_pause:
+                # recorded before the pause, so a pause this check made is never unrecorded
+                await self._save(ctx, key, ours | set(to_pause))
+                loaded = ours | set(to_pause)
                 done = await ctx.ssh.run(
                     "/usr/bin/docker pause " + " ".join(shlex.quote(n) for n in to_pause),
                     timeout=ACT_TIMEOUT_SECONDS,
                 )
-                # a failed pause is read again next cycle; the backend is told only what happened
+                # kept recorded even on a failed exit: part of the batch may be paused; the next read decides
+                ours |= set(to_pause)
                 if getattr(done, "exit_status", 0) == 0:
-                    ours |= set(to_pause)
-                    await self._save(ctx, key, ours)
-                    await self._report(ctx, ours, [])
-                return self._event(ctx, Msg.PAUSED, paused=to_pause, **what)
-            if to_resume:
+                    just_paused = to_pause
+                event, what = Msg.PAUSED, {"paused": to_pause, **what}
+            elif to_resume:
                 done = await ctx.ssh.run(
                     "/usr/bin/docker unpause " + " ".join(shlex.quote(n) for n in to_resume),
                     timeout=ACT_TIMEOUT_SECONDS,
                 )
-                # a failed unpause is read again next cycle; the backend is told only what happened
+                # a failed unpause is read again next cycle
                 if getattr(done, "exit_status", 0) == 0:
                     ours -= set(to_resume)
-                    await self._save(ctx, key, ours)
-                    await self._report(ctx, ours, to_resume)
-                return self._event(ctx, Msg.RESUMED, resumed=to_resume, **what)
+                    resumed += to_resume
+                event, what = Msg.RESUMED, {"resumed": to_resume, **what}
             if ours != loaded:
                 await self._save(ctx, key, ours)
-            await self._report(ctx, ours, [])
-            return self._event(ctx, Msg.OK, **what)
+            # only a pause confirmed this cycle (seen paused, or just paused) stops billing
+            confirmed = {n for n in ours if status.get(n) == "paused"} | set(just_paused)
+            await self._report(ctx, confirmed, resumed)
+            return self._event(ctx, event, **what)
         except (asyncssh.Error, OSError) as exc:
             return self._event(ctx, Msg.UNKNOWN, reason="ssh transport error", error=repr(exc))
         except redis.exceptions.RedisError as exc:
@@ -164,11 +171,12 @@ class RentedPodDiskCheck:
         else:
             await ctx.services.redis.delete(key)
 
-    async def _report(self, ctx: Context, paused: set[str], to_resume: list[str]) -> None:
+    async def _report(self, ctx: Context, paused: set[str], resumed: list[str]) -> None:
         """Tell the backend which pods are paused, so it bills them nothing, and which were resumed.
 
-        Only pods this check paused are reported. A pod already paused is reported again each cycle (the backend ignores a state it has), so a lost
-        report does not leave a paused pod billed. Never fatal: the pause protects the host either way.
+        Only pods this check paused, and only while seen paused, are reported. A paused pod is reported again each
+        cycle (the backend keeps a report 45 minutes), so a lost report does not leave a paused pod billed and a
+        stale one expires. Never fatal: the pause protects the host either way.
         """
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
@@ -176,9 +184,7 @@ class RentedPodDiskCheck:
             p.docker_container_name: p.pod_id
             for p in (rented_executor.pods if rented_executor else [])
         }
-        for name, is_paused in [(n, True) for n in sorted(paused)] + [
-            (n, False) for n in to_resume
-        ]:
+        for name, is_paused in [(n, True) for n in sorted(paused)] + [(n, False) for n in resumed]:
             if name not in pod_ids:
                 continue
             try:
