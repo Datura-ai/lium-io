@@ -240,7 +240,7 @@ def get_balance_of_eth_address(private_key: str):
 ADD_EXECUTOR_TIER_NOTICE = (
     "Note: this node starts on the Spot tier, unless you deleted it in the Provider Portal in the last 7 days "
     "and add it again at the same IP and port; then it keeps its earlier tier. To move it to Secure, open the "
-    "node's page in the Provider Portal and click Change Tier once the node has been listed for 7 days."
+    "node's page in the Provider Portal and click Change Tier; a node can change tier once every 24 hours."
 )
 
 
