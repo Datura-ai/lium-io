@@ -86,3 +86,34 @@ def test_every_entry_point_caps_the_recursion_limit(tmp_path, entry_point):
     # Assert
     assert result.returncode == 0, result.stderr[-2000:]
     assert result.stdout.split()[-1] == "10000"
+
+
+@pytest.mark.parametrize("entry_point", ["miner", "connector", "cli"])
+def test_startup_survives_a_deeply_nested_shared_config_response(tmp_path, entry_point):
+    # Arrange: the first /v1/shared-config fetch runs while core.config is imported, before the entry point's own cap
+    (tmp_path / "tmp").mkdir()
+    script = (
+        "from unittest.mock import patch\n"
+        "import requests\n"
+        "depth = 100_000\n"
+        "response = requests.Response()\n"
+        "response.status_code = 200\n"
+        "response._content = ('{\"k\":' * depth + '1' + '}' * depth).encode()\n"
+        "patch('requests.get', return_value=response).start()\n"
+        f"import sys, {entry_point}\n"
+        "print(sys.getrecursionlimit())\n"
+    )
+
+    # Act
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": SRC_DIR},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.split()[-1] == "10000"
