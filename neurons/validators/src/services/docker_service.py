@@ -203,6 +203,7 @@ from services.rental_docker_sdk import (
     keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
+    is_rental_docker_transport_drop,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     rental_docker_error_class,
@@ -217,6 +218,7 @@ from services.storage_operations import (
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
+from services.task.checks.rented_gpu_drop import report_gpus_lost_on_reset
 from services.task.checks.rented_pod_ssh import tcp_connect_fault
 from protocol.vc_protocol.validator_requests import PodSshResult
 from tenacity import RetryError
@@ -401,7 +403,8 @@ _PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
 _LISTENING_PORTS_COMMAND = (
     "{ ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null; docker ps --format '{{.Ports}}' 2>/dev/null; } || true"
 )
-_PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})->")
+# docker ps prints a published block as a range: `0.0.0.0:20040-20049->20040-20049/tcp`
+_PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})(?:-(\d{1,5}))?->[\d-]+/tcp")
 # dockerd's two bind refusals name the host address the bind was for:
 #   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
 #   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
@@ -476,9 +479,12 @@ def _port_collision_candidates(
 
 def _parse_listening_ports(output: str) -> set[int]:
     """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`),
-    plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`)."""
+    plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`, ranges too)."""
     ports: set[int] = {
-        int(port) for port in _PUBLISHED_HOST_PORT_RE.findall(output) if 0 < int(port) <= 65535
+        port
+        for first, last in _PUBLISHED_HOST_PORT_RE.findall(output)
+        for port in range(int(first), int(last or first) + 1)
+        if 0 < port <= 65535
     }
     for line in output.splitlines():
         for column in line.split():
@@ -1172,8 +1178,22 @@ _HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags"})
 _RENTAL_PROBE_CONTAINER_START_STEP = "container_start"
 
 
-def is_host_fault_create_failure(current_step: str | None) -> bool:
-    return current_step in _HOST_FAULT_CREATE_STEPS
+# create_container steps before the validator reached the host: a drop there is the validator's own route
+# (rental_probe._CREATE_STEPS_BEFORE_THE_HOST)
+_CREATE_STEPS_BEFORE_THE_HOST = frozenset({"ssh_connect", "docker_sdk_ssh_host_key"})
+
+
+def is_host_fault_create_failure(current_step: str | None, error: BaseException | None = None) -> bool:
+    """A failure on the node itself, or the node's Docker connection over SSH dropping on a step past the connect
+    (after the SDK call's own retry, where it has one): a node whose link keeps dropping fails every create,
+    renter's or filler's, while its checks pass. The probe this stamps decides: one clean create clears it."""
+    if current_step in _HOST_FAULT_CREATE_STEPS:
+        return True
+    return (
+        error is not None
+        and current_step not in _CREATE_STEPS_BEFORE_THE_HOST
+        and is_rental_docker_transport_drop(error)
+    )
 
 
 # DAH-5118: once an image has more layers than fit in one page of overlayfs mount options (no fixed count:
@@ -1719,6 +1739,10 @@ _PARK_KILL_WAIT_SECONDS = 30
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
+# A parked container whose encrypted volume was not mounted at park time holds the renter's writes to the
+# volume path in its own layer (dockerd restarted it by itself, without the gocryptfs mount). It is kept
+# under this prefix after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 
 
 class _UnkillableParkedContainer(Exception):
@@ -3543,7 +3567,8 @@ class DockerService:
         spare_port_pairs: list[PayloadPortMapping],
         default_extra: dict,
     ) -> ContainerRunSpec | None:
-        """Move the mapping dockerd could not bind to the next free advertised pair.
+        """Move the mapping dockerd could not bind, and every other mapping of the pod whose host port the
+        host's live listing shows taken, to the next free advertised pairs.
 
         Returns the run spec with the new host port, having rewritten `port_maps` in place and
         taken the pair out of `spare_port_pairs`. Returns None when the refusal names no host port
@@ -3567,42 +3592,52 @@ class DockerService:
                 )
             )
             return None
-        docker_port, old_internal, old_external = port_maps[index]
-        candidates = _port_collision_candidates(spare_port_pairs, after_host_port=bound_port)
         listening = await self._listening_host_ports(ssh_client, default_extra)
-        chosen = next(
-            (pair for pair in candidates if listening is None or pair.internal_port not in listening),
-            None,
-        )
-        if chosen is None:
-            raise RentalPortCollisionError(
-                f"docker run could not bind host port {bound_port} and the next "
-                f"{len(candidates)} advertised port(s) "
-                f"{[pair.internal_port for pair in candidates]} are listening too: {exc}"
-            ) from exc
-        spare_port_pairs.remove(chosen)
-        port_maps[index] = (docker_port, chosen.internal_port, chosen.external_port)
-        logger.warning(
-            _m(
-                "PORT_COLLISION_REMAPPED",
-                extra=get_extra_info({
-                    **default_extra,
-                    "error_class": PORT_COLLISION_ERROR_CLASS,
-                    "docker_port": docker_port,
-                    "old_host_port": old_internal,
-                    "old_external_port": old_external,
-                    "new_host_port": chosen.internal_port,
-                    "new_external_port": chosen.external_port,
-                    "candidates": [pair.internal_port for pair in candidates],
-                    "probe": "listening" if listening is not None else "inconclusive",
-                }),
+        # DAH-5797: a pod being removed (deleted seconds ago, its container still up) holds the whole
+        # block its ports were in; moving one refused port per retry ran out of remaps on a 10-port block
+        to_move = [index] + [
+            i for i, (_, internal, _) in enumerate(port_maps) if i != index and listening and internal in listening
+        ]
+        moved: dict[int, int] = {}
+        for i in to_move:
+            docker_port, old_internal, old_external = port_maps[i]
+            candidates = _port_collision_candidates(spare_port_pairs, after_host_port=old_internal)
+            chosen = next(
+                (pair for pair in candidates if listening is None or pair.internal_port not in listening),
+                None,
             )
-        )
+            if chosen is None:
+                if i != index:
+                    continue  # docker run refuses it next and the following remap tries again
+                raise RentalPortCollisionError(
+                    f"docker run could not bind host port {bound_port} and the next "
+                    f"{len(candidates)} advertised port(s) "
+                    f"{[pair.internal_port for pair in candidates]} are listening too: {exc}"
+                ) from exc
+            spare_port_pairs.remove(chosen)
+            port_maps[i] = (docker_port, chosen.internal_port, chosen.external_port)
+            moved[old_internal] = chosen.internal_port
+            logger.warning(
+                _m(
+                    "PORT_COLLISION_REMAPPED",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error_class": PORT_COLLISION_ERROR_CLASS,
+                        "docker_port": docker_port,
+                        "old_host_port": old_internal,
+                        "old_external_port": old_external,
+                        "new_host_port": chosen.internal_port,
+                        "new_external_port": chosen.external_port,
+                        "candidates": [pair.internal_port for pair in candidates],
+                        "probe": "listening" if listening is not None else "inconclusive",
+                    }),
+                )
+            )
         return dataclasses.replace(
             run_spec,
             ports=tuple(
-                dataclasses.replace(binding, host_port=chosen.internal_port)
-                if binding.protocol == "tcp" and binding.host_port == old_internal
+                dataclasses.replace(binding, host_port=moved[binding.host_port])
+                if binding.protocol == "tcp" and binding.host_port in moved
                 else binding
                 for binding in run_spec.ports
             ),
@@ -3867,15 +3902,22 @@ class DockerService:
             res = await ssh_client.run(
                 "cat /proc/sys/kernel/pid_max", check=False, timeout=15
             )
-        except (asyncssh.Error, asyncio.TimeoutError, OSError):
-            return None
-        if getattr(res, "exit_status", 1) != 0:
-            return None
-        try:
-            value = int((res.stdout or "").strip())
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
+        except (asyncssh.Error, asyncio.TimeoutError, OSError) as e:
+            why = f"read failed: {type(e).__name__}"
+        else:
+            if getattr(res, "exit_status", 1) != 0:
+                why = f"exit status {getattr(res, 'exit_status', None)}"
+            else:
+                try:
+                    value = int((res.stdout or "").strip())
+                except (TypeError, ValueError):
+                    why = "unparsable output"
+                else:
+                    if value > 0:
+                        return value
+                    why = "not positive"
+        logger.warning(_m(f"Host kernel.pid_max could not be read: {why}"))
+        return None
 
     async def _read_host_ram_kib(self, ssh_client) -> int | None:
         """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
@@ -4708,6 +4750,8 @@ class DockerService:
           preserved for cross-miner isolation on shared physical hosts)
         - 'health_check_*' — backend executor_health_check probes (hotkey-agnostic,
           backend creates these without a hotkey segment — see DAH-1991)
+        - 'port_test_*' — the validator's port verifier (--network=host, so its host ports
+          are invisible to the listening-port probe)
 
         DAH-2272: rentals take priority over background verification. Rather than
         WAITING for a lingering probe to clear (the old max_retries/retry_delay
@@ -5614,12 +5658,16 @@ class DockerService:
                 )
             )
 
-    async def _remember_new_filler_best_effort(self, executor_uuid: str, container_name: str) -> None:
+    async def _remember_new_filler_best_effort(
+        self, executor_uuid: str, container_name: str, container_id: str | None
+    ) -> None:
         """A filler that starts and stops between two cycle snapshots is never listed there; record it at create
         so its leftover GPU process still counts as our load (DAH-5904)."""
+        if not container_id:
+            return
         try:
             await self.redis_service.set(
-                f"{RECENT_FILLER_PREFIX}{executor_uuid}:{container_name}", "1", ex=RECENT_FILLER_TTL_SECONDS
+                f"{RECENT_FILLER_PREFIX}{executor_uuid}:{container_name}", container_id, ex=RECENT_FILLER_TTL_SECONDS
             )
         except Exception as exc:
             logger.warning("Recent filler record not written at create for %s: %s", executor_uuid, exc)
@@ -5634,7 +5682,7 @@ class DockerService:
         """Record the new container in the rented-machine cache; never fail the create over it.
 
         DAH-2475: this hash is a CACHE, not the source of truth — the backend rebuilds it wholesale
-        every ~10 min (RentedMachineRequest -> delete(RENTED_MACHINE_PREFIX) + re-add) and already
+        every ~10 min (RentedMachineRequest -> replace_rented_machines, one MULTI/EXEC) and already
         learns about this container from the ContainerCreated callback. Before this, a Redis blip at
         this last step raised and tripped cleanup_failed_container_creation, destroying a container
         that was already built and running: on 2026-07-22 a "Timeout connecting to server" here tore
@@ -9068,6 +9116,8 @@ class DockerService:
         host_probe: PrerunHostProbe | None,
         default_extra: dict,
         concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
+        record_rental_start: bool = False,
+        executor_info: ExecutorSSHInfo | None = None,
     ) -> None:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
@@ -9101,7 +9151,63 @@ class DockerService:
             payload.gpu_uuids or None,
             log_extra=default_extra,
             concurrency=concurrency,
+            # the create's last power read is the limit the rental starts on (DAH-5302)
+            redis=self.redis_service if record_rental_start else None,
+            pod_id=payload.pod_id if record_rental_start else None,
+            pod_on_host=await DockerService._pod_existed_before_create(
+                ssh_client, self.redis_service, executor_info, payload.pod_id, host_probe
+            )
+            if record_rental_start
+            else False,
         )
+
+    @staticmethod
+    async def _pod_existed_before_create(
+        ssh_client: asyncssh.SSHClientConnection,
+        redis_service: RedisService,
+        executor_info: ExecutorSSHInfo | None,
+        pod_id: str,
+        host_probe: PrerunHostProbe | None,
+    ) -> bool:
+        """A reboot or edit of a running rental, so a rental from before the records keeps 90 %. The
+        backend's rented-machine cache answers first: the host can hide its containers, not that (F-12)."""
+        if executor_info is not None:
+            try:
+                # marker first: it is never unset and the list swaps atomically, so a list read after a
+                # set marker is a synced one; read the other way round a first sync could land between
+                synced = await redis_service.rented_machines_synced()
+                rented = await redis_service.get_rented_machine(executor_info)
+            except Exception as exc:
+                # a guess either way records the wrong start for good; the create fails and is retried
+                raise GpuPowerRestoreStateError("rented-machine cache could not be read") from exc
+            if any(c.get("pod_id") == pod_id for c in (rented or {}).get("containers", [])):
+                return True
+            if not synced:
+                # no backend list yet (fresh Redis): absence proves nothing; the create is retried
+                raise GpuPowerRestoreStateError("rented-machine cache not synced from the backend yet")
+        return await DockerService._pod_container_on_host(ssh_client, pod_id, host_probe)
+
+    @staticmethod
+    async def _pod_container_on_host(
+        ssh_client: asyncssh.SSHClientConnection, pod_id: str, host_probe: PrerunHostProbe | None
+    ) -> bool:
+        """A reboot or edit re-creates a pod whose container is still listed (`ps -a`). Without a probe,
+        one `docker inspect` asks, so a rebooted legacy rental is not taken for a new one (F-12)."""
+        name = f"{POD_CONTAINER_PREFIX}{pod_id}"
+        names = (name, name + EDIT_PARKED_SUFFIX)  # an edit parks the old container before the probe
+        kept = f"{KEPT_UNMOUNTED_PREFIX}{pod_id}_"  # an edit may keep the old container under a stamped name
+        if host_probe is not None:
+            return any(n in names or n.startswith(kept) for n in (host_probe.container_names or ()))
+        try:
+            # docker's name filter is a substring match, so grep keeps only names that start with the prefix
+            result = await ssh_client.run(
+                " || ".join(f"/usr/bin/docker container inspect {shlex.quote(n)} >/dev/null 2>&1" for n in names)
+                + f" || /usr/bin/docker ps -a --filter name={shlex.quote(kept)} --format '{{{{.Names}}}}'"
+                f" | grep -q {shlex.quote('^' + kept)}"
+            )
+        except Exception:
+            return False
+        return result.exit_status == 0
 
     async def _run_create_steps_after_reply(
         self,
@@ -10408,9 +10514,19 @@ class DockerService:
                     # restore a filler create may have capped these GPUs (its Redis records) or the
                     # host may have lowered a limit with no record (the live floor raise).
                     if not beside_fillers:
-                        await self._restore_gpu_power_for_uncapped_pod(
-                            ssh_client, payload, host_probe, default_extra
-                        )
+                        current_step = "gpu_power_restore"  # the host's nvidia-smi, unless the state error below
+                        try:
+                            await self._restore_gpu_power_for_uncapped_pod(
+                                ssh_client,
+                                payload,
+                                host_probe,
+                                default_extra,
+                                record_rental_start=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
+                                executor_info=executor_info,
+                            )
+                        except GpuPowerRestoreStateError:
+                            current_step = "gpu_power_restore_state"  # our Redis, not the host's fault
+                            raise
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
@@ -10979,7 +11095,7 @@ class DockerService:
                         await self._record_filler_image_best_effort(
                             docker_client, container_id or container_name, container_name, default_extra
                         )
-                        await self._remember_new_filler_best_effort(executor_info.uuid, container_name)
+                        await self._remember_new_filler_best_effort(executor_info.uuid, container_name, container_id)
                     # no duration: the collector starts after the reply, its time is logged there
                     profilers.append(
                         ProfilerStep(
@@ -11221,7 +11337,7 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra)
+            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e))
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
@@ -11279,14 +11395,14 @@ class DockerService:
             )
 
     async def hold_node_until_probe_passes(
-        self, executor_uuid: str, current_step: str | None, log_extra: dict
+        self, executor_uuid: str, current_step: str | None, log_extra: dict, error: BaseException | None = None
     ) -> None:
         """Stamp a host-fault create failure as the node's standing rental probe failure.
 
         The node then scores 0 every cycle until a rental probe passes on it; the probe's interval stamp
         is dropped so that probe runs on the next idle cycle.
         """
-        if not is_host_fault_create_failure(current_step):
+        if not is_host_fault_create_failure(current_step, error):
             return
         try:
             await self.redis_service.set(
@@ -13237,6 +13353,16 @@ class DockerService:
                 logger.warning(
                     _m("Reset pod GPUs: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
                 )
+            # still under the pending mark, so a concurrent RentedGpuDropCheck cycle cannot race on the drop mark
+            if report is not None and report.error_code == GpuResetErrorCode.GpusLostOnHost and self.backend_client:
+                await report_gpus_lost_on_reset(
+                    self.redis_service,
+                    self.backend_client,
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    default_extra=default_extra,
+                )
 
         async def operate(runner: SSHCommandRunner, private_key: str, known_hosts_policy, default_extra: dict):
             async def start_container() -> None:
@@ -13282,7 +13408,14 @@ class DockerService:
             workload_kind=payload.workload_kind,
             request_id=payload.request_id,
             ok=report.ok,
-            error_code=report.error_code,
+            # GpusLostOnHost is not on the wire yet: the backend drops the whole frame on an unknown error_code and the
+            # renter's reset hangs until timeout; a separate task adds the wire code and removes this swap after
+            # lium-platform accepts GpusLostOnHost
+            error_code=(
+                GpuResetErrorCode.ResetNotSupported
+                if report.error_code == GpuResetErrorCode.GpusLostOnHost
+                else report.error_code
+            ),
             container_restarted=report.container_restarted,
             gpus=report.gpus,
             detail=report.detail,

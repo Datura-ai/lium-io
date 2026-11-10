@@ -64,7 +64,6 @@ _CREATE_STEPS_BEFORE_THE_HOST = frozenset(
         "pending_pod",
         "ssh_key_import",
         "attestation",
-        "docker_sdk_ssh_host_key",
         "build_input_empty",
         "cancelled_by_delete",
         # renters got pods on the nodes whose probe create failed here on 21 Oct
@@ -77,7 +76,8 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
     STEP_CONTAINER_START: (
         "The validator could not start a renter container on this node (create step: {create_step}). "
         "Check that Docker and the NVIDIA container runtime start a GPU container by hand, that the "
-        "default renter image is present, and that the executor's port range is free."
+        "default renter image is present, that the executor's port range is free, and that sshd, the "
+        "network and dockerd stay up so the validator's Docker connection over SSH does not drop."
     ),
     STEP_SSHD_LISTEN: (
         "The container started but sshd did not answer on port {port} within {deadline} s. "
@@ -1524,7 +1524,16 @@ async def _remove_pending_pod(ctx: Context, pod_id: str) -> None:
         )
 
 
+_HOST_KEY_REMEDIATION = (
+    "The validator could not start a renter container on this node because the executor has not "
+    "reported its SSH host key. Check that the executor is running and up to date, then restart it "
+    "(`docker restart executor-executor-1`) so it reports the key again."
+)
+
+
 def _remediation(failure: _Failure, *, ssh_port: int | None, expected_gpus: int) -> str:
+    if failure.create_step == "docker_sdk_ssh_host_key":
+        return _HOST_KEY_REMEDIATION
     template = _REMEDIATION_BY_STEP.get(failure.step, "")
     return template.format(
         create_step=failure.create_step or "unknown",
