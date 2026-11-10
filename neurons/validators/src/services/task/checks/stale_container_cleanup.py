@@ -187,8 +187,9 @@ class StaleContainerCleanupCheck:
 
         # DAH-6073: a live pod granted less disk than it ordered (another renter's kept volume held the space) gets
         # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
-        if rented_list_unknown is None:
-            await grow_short_volumes(ctx.ssh, live_pod_ids(ctx.state.rented_data))
+        volume_sizes_gb = (
+            await grow_short_volumes(ctx.ssh, live_pod_ids(ctx.state.rented_data)) if rented_list_unknown is None else {}
+        )
 
         # DAH-2475: give the DPHN filler cache back when the node can no longer afford it. This is
         # the ONLY caller — the create-time sweep deliberately never reclaims (it would raise free
@@ -253,7 +254,7 @@ class StaleContainerCleanupCheck:
             # queued before the attempt (the hook runs first), still on the host: not reaped
             await queue.drop(name)
         reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
-        if not unremovable_names and not reaped and not removed_names:
+        if not unremovable_names and not reaped and not removed_names and not volume_sizes_gb:
             return CheckResult(passed=True, event=event)
         # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
         removed = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
@@ -266,6 +267,7 @@ class StaleContainerCleanupCheck:
                 if process.get("container_name") not in removed
             ],
             pod_states=[*ctx.state.pod_states, *reaped],
+            volume_sizes_gb={**ctx.state.volume_sizes_gb, **volume_sizes_gb},
         )
         return CheckResult(passed=True, event=event, updates={"state": state})
 

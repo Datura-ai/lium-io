@@ -19,7 +19,8 @@ GROW_HEADROOM_BYTES = 10 * 1024**3  # resolve_volume_sizing's headroom: never fi
 _GB = 1024**3
 
 # Runs in the host's mount namespace: the volume's mountpoint and backing file are host paths. Grows only, by whole
-# 4 KiB sectors (the v3 plugin's loop sector size), never past the order or into the headroom. Prints one outcome word.
+# 4 KiB sectors (the v3 plugin's loop sector size), never past the order or into the headroom. Prints the outcome and,
+# when it read one, the volume's size in bytes after it.
 GROW_SCRIPT = r"""
 set -eu
 mp=$1 order=$2 headroom=$3 sparse=$4
@@ -27,17 +28,17 @@ dev=$(findmnt -n -o SOURCE --target "$mp")
 case "$dev" in /dev/loop*) ;; *) echo not-loop; exit 0 ;; esac
 file=$(losetup -n -O BACK-FILE "$dev")
 cur=$(stat -c %s "$file")
-if [ "$cur" -ge "$order" ]; then echo full; exit 0; fi
-command -v xfs_growfs >/dev/null 2>&1 || { echo no-xfs-growfs; exit 0; }
+if [ "$cur" -ge "$order" ]; then echo full "$cur"; exit 0; fi
+command -v xfs_growfs >/dev/null 2>&1 || { echo no-xfs-growfs "$cur"; exit 0; }
 avail=$(df -P -B1 "$(dirname "$file")" | awk 'NR==2 {print $4}')
 target=$((cur + avail - headroom))
 if [ "$target" -gt "$order" ]; then target=$order; fi
 target=$((target / 4096 * 4096))
-if [ "$target" -le "$cur" ]; then echo no-room; exit 0; fi
+if [ "$target" -le "$cur" ]; then echo no-room "$cur"; exit 0; fi
 if [ "$sparse" = true ]; then truncate -s "$target" "$file"; else fallocate -o "$cur" -l $((target - cur)) "$file"; fi
 losetup -c "$dev"
 xfs_growfs "$mp" >/dev/null
-echo grown
+echo grown "$target"
 """
 
 
@@ -48,9 +49,9 @@ def order_labels(ordered_gb: int | None, granted_gb: int | None) -> dict[str, st
     return {ORDER_LABEL: str(ordered_gb)}
 
 
-async def grow_short_volumes(ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str]) -> list[str]:
-    """Grow each live pod's short volume as far as free disk allows; the names of those grown. Never raises: a
-    volume not grown this pass is tried again on the next."""
+async def grow_short_volumes(ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str]) -> dict[str, int]:
+    """Grow each live pod's short volume as far as free disk allows; pod id -> its volume's size in GB after the pass,
+    which the backend records. Never raises: a volume not grown this pass is tried again on the next."""
     try:
         listing = await ssh_client.run(f"/usr/bin/docker volume ls -q --filter label={ORDER_LABEL}")
         names = [
@@ -59,7 +60,7 @@ async def grow_short_volumes(ssh_client: asyncssh.SSHClientConnection, live_pod_
             if listing.exit_status == 0 and name.removeprefix("volume_") in live_pod_ids
         ]
         if not names:
-            return []
+            return {}
         fields = f'{{{{.Name}}}}|{{{{index .Labels "{ORDER_LABEL}"}}}}|{{{{.Mountpoint}}}}|{{{{index .Options "sparse"}}}}'
         inspect = await ssh_client.run(
             f"/usr/bin/docker volume inspect {' '.join(shlex.quote(n) for n in names)} --format {shlex.quote(fields)}"
@@ -68,9 +69,9 @@ async def grow_short_volumes(ssh_client: asyncssh.SSHClientConnection, live_pod_
             raise RuntimeError(f"docker volume inspect failed: {inspect.stderr}")
     except Exception as exc:  # noqa: BLE001 - a later pass retries
         logger.warning(_m("volume_grow_list_failed", extra={"error": str(exc)}))
-        return []
+        return {}
 
-    grown: list[str] = []
+    sizes_gb: dict[str, int] = {}
     for line in (inspect.stdout or "").splitlines():
         name, order_gb, mountpoint, sparse = (line.strip().split("|") + ["", "", "", ""])[:4]
         if not order_gb.isdigit() or not mountpoint:
@@ -84,6 +85,7 @@ async def grow_short_volumes(ssh_client: asyncssh.SSHClientConnection, live_pod_
             continue
         outcome = (result.stdout or "").strip() or f"exit {result.exit_status}: {(result.stderr or '').strip()[-300:]}"
         logger.info(_m("volume_grow", extra={"volume_name": name, "order_gb": int(order_gb), "outcome": outcome}))
-        if outcome == "grown":
-            grown.append(name)
-    return grown
+        size_bytes = outcome.split()[-1]
+        if size_bytes.isdigit():
+            sizes_gb[name.removeprefix("volume_")] = int(size_bytes) // _GB
+    return sizes_gb

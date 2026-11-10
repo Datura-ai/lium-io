@@ -33,7 +33,7 @@ async def test_only_a_live_pods_short_volume_is_grown_to_its_order():
             side_effect=[
                 _ran("volume_live\nvolume_retained\n"),
                 _ran("volume_live|466|/mnt/volume_live|\n"),
-                _ran("grown\n"),
+                _ran(f"grown {466 * GB}\n"),
             ]
         )
     )
@@ -41,7 +41,7 @@ async def test_only_a_live_pods_short_volume_is_grown_to_its_order():
     grown = await grow_short_volumes(ssh, {"live"})
 
     inspect, grow = ssh.run.await_args_list[1].args[0], ssh.run.await_args_list[2].args[0]
-    assert (grown, "volume_retained" in inspect) == (["volume_live"], False)
+    assert (grown, "volume_retained" in inspect) == ({"live": 466}, False)
     assert grow.startswith("nsenter -t 1 -m -- sh -c ")
     assert grow.endswith(f" grow /mnt/volume_live {466 * GB} {GROW_HEADROOM_BYTES} false")
 
@@ -50,7 +50,7 @@ async def test_only_a_live_pods_short_volume_is_grown_to_its_order():
 async def test_a_failed_listing_grows_nothing_and_does_not_raise():
     ssh = SimpleNamespace(run=AsyncMock(side_effect=OSError("channel closed")))
 
-    assert await grow_short_volumes(ssh, {"live"}) == []
+    assert await grow_short_volumes(ssh, {"live"}) == {}
 
 
 def _stub(bin_dir, name, body):
@@ -62,11 +62,11 @@ def _stub(bin_dir, name, body):
 @pytest.mark.parametrize(
     ("cur_gb", "avail_gb", "sparse", "outcome", "grow_call"),
     [
-        (110, 500, "false", "grown", f"fallocate -o {110 * GB} -l {356 * GB} /data/volume_live"),
-        (110, 50, "false", "grown", f"fallocate -o {110 * GB} -l {40 * GB} /data/volume_live"),
-        (110, 500, "true", "grown", f"truncate -s {466 * GB} /data/volume_live"),
-        (110, 5, "false", "no-room", None),
-        (466, 500, "false", "full", None),
+        (110, 500, "false", f"grown {466 * GB}", f"fallocate -o {110 * GB} -l {356 * GB} /data/volume_live"),
+        (110, 50, "false", f"grown {150 * GB}", f"fallocate -o {110 * GB} -l {40 * GB} /data/volume_live"),
+        (110, 500, "true", f"grown {466 * GB}", f"truncate -s {466 * GB} /data/volume_live"),
+        (110, 5, "false", f"no-room {110 * GB}", None),
+        (466, 500, "false", f"full {466 * GB}", None),
     ],
     ids=["to-order", "to-headroom", "sparse", "no-room", "already-full"],
 )
@@ -91,3 +91,19 @@ def test_the_host_script_grows_up_to_the_order_and_never_into_the_headroom(
     calls = log.read_text().splitlines() if log.exists() else []
     expected = [grow_call, "losetup -c /dev/loop7", "xfs_growfs /mnt/volume_live"] if grow_call else []
     assert (result.stdout.strip(), calls) == (outcome, expected)
+
+
+def test_a_pods_volume_size_from_the_cleanup_pass_rides_on_its_pod_state():
+    from services.task.checks.rented_machine import _with_pod_states
+    from services.task.pipeline import CheckResult, ContextState
+
+    from protocol.vc_protocol.compute_requests import RentedPod
+    from protocol.vc_protocol.validator_requests import ContainerState
+
+    ctx = SimpleNamespace(state=ContextState(volume_sizes_gb={"grown": 466}))
+    result = CheckResult.model_construct(passed=True, event=None, updates={})
+    pods = [RentedPod(pod_id="grown", container_name="c1"), RentedPod(pod_id="other", container_name="c2")]
+
+    states = _with_pod_states(result, ctx, pods, {"grown": ContainerState.RUNNING}).updates["state"].pod_states
+
+    assert [(state.pod_id, state.volume_limit_gb) for state in states] == [("grown", 466), ("other", None)]
