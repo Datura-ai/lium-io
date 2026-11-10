@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -237,6 +238,10 @@ class FakeRedis:
         self._touch()
         self.ttl.pop(key, None)
 
+    @asynccontextmanager
+    async def rented_gpu_drop_lock(self, pod_id: str):
+        yield None if self.failing else True
+
 
 def default_executor() -> ExecutorSSHInfo:
     return ExecutorSSHInfo(
@@ -276,6 +281,8 @@ def build_services(**overrides) -> ContextServices:
     pod_recovery = AsyncMock()
     # A bare AsyncMock would report every pod as recovered; opt in per test instead.
     pod_recovery.recover_pod_after_stale_vloopback_mount.return_value = False
+    pod_recovery.recover_parked_pod_container.return_value = False
+    pod_recovery.encrypted_volume_mount_missing.return_value = False
     backend = AsyncMock()
     # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
     backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)

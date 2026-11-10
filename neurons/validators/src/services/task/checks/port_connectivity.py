@@ -87,6 +87,9 @@ class _PressureGate:
     sysbox_verified: bool = False
     # the enforced streak this cycle included once reserved in Redis, else the count found there
     deferrals_in_a_row: int = 0
+    # DAH-5851: an idle node's deferred cycle is withheld, and the backend sweeps a row unpublished for 45 min,
+    # so an idle node defers once in a row; a rented one up to DISK_PRESSURE_MAX_DEFERRALS
+    max_deferrals: int = DISK_PRESSURE_MAX_DEFERRALS
     would_defer: bool = False
     deferred: bool = False
 
@@ -110,6 +113,26 @@ class _SysboxMemoryUpdate:
     is_saved: bool
     # ticket-0494: a rented node's probe measured nothing and the memory says sysbox
     use_last_verified: bool = False
+
+
+async def spend_disk_pressure_deferrals(ctx: Context) -> None:
+    """DAH-5851: a rented node found idle on a deferred cycle (every listed pod stale) defers once in a row, as an
+    idle node does: its streak is used up, so the next pressured cycle runs the check. Fails open (it may defer
+    again, up to DISK_PRESSURE_MAX_DEFERRALS)."""
+    try:
+        for _ in range(DISK_PRESSURE_MAX_DEFERRALS):
+            count = await ctx.services.redis.record_disk_pressure_deferral(
+                ctx.miner_hotkey,
+                ctx.executor.uuid,
+                shadow=False,
+                ttl_seconds=DISK_PRESSURE_DEFERRALS_TTL_SECONDS,
+            )
+            if count >= DISK_PRESSURE_MAX_DEFERRALS:
+                return
+    except Exception as e:  # noqa: BLE001 - never fail the run over it
+        logger.warning(
+            _m("disk pressure streak not spent", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+        )
 
 
 def _ssh_session_closed(ssh: object) -> bool:
@@ -431,6 +454,7 @@ class PortConnectivityCheck:
                 deferral_eligible=deferral_eligible,
                 self_rent=self_rent,
                 default_job_owner=default_job_owner,
+                max_deferrals=DISK_PRESSURE_MAX_DEFERRALS if rented_executor is not None else 1,
             ),
             shadow=not enforce,
         )
@@ -438,7 +462,7 @@ class PortConnectivityCheck:
             reading.pressure
             and deferral_eligible
             and gate.memory is not None
-            and gate.deferrals_in_a_row < DISK_PRESSURE_MAX_DEFERRALS
+            and gate.deferrals_in_a_row < gate.max_deferrals
         )
         if would_defer and not _has_fresh_completed_check((ctx.miner_hotkey, ctx.executor.uuid)):
             # the memory in Redis may be older than the last completed check
@@ -503,7 +527,7 @@ class PortConnectivityCheck:
             )
             deferred = False
         else:
-            if deferrals > DISK_PRESSURE_MAX_DEFERRALS:
+            if deferrals > gate.max_deferrals:
                 # the slot INCR handed out is past the bound: another cycle took the last one between the read
                 # in _load_pressure_gate_memory and this write, so this cycle runs the check
                 logger.info(
@@ -564,7 +588,8 @@ class PortConnectivityCheck:
         self, ctx: Context, gate: _PressureGate, extra: dict[str, object], *, busy_ports: set[int]
     ) -> CheckResult:
         """No containers on a Docker root whose sync already stalls: the last completed check's ports are
-        republished (PortCountCheck counts them as today) and sysbox is what the validator's own probe verified
+        republished (PortCountCheck withholds an idle node's verdict; a rented node's free GPUs stay listed on them
+        and are idle-paid only from its filler ports) and sysbox is what the validator's own probe verified
         (the host's scrape never counts); the sysbox and DinD-miss memories are left as they are."""
         assert gate.memory is not None and gate.reading is not None
         sysbox = gate.sysbox_verified
@@ -603,7 +628,7 @@ class PortConnectivityCheck:
                     f"sync -f on the Docker root took {gate.reading.syncfs_seconds} s"
                     f"{' (timed out)' if gate.reading.syncfs_timed_out else ''}; "
                     f"{len(pairs)} ports from the last completed check republished, "
-                    f"deferral {deferrals} of {DISK_PRESSURE_MAX_DEFERRALS}"
+                    f"deferral {deferrals} of {gate.max_deferrals}"
                 ),
                 "verified_ports_measured_at": gate.memory.measured_at,
                 **gate.event_fields(),
