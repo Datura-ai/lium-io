@@ -686,21 +686,24 @@ def test_the_cycle_cleanup_protects_the_parked_twin_of_every_rented_pod():
         retained_container_names=[],
     )
 
-    assert listed_container_names(rented) == {"pod_aaaa", "pod_aaaa" + EDIT_PARKED_SUFFIX, "pod_bbbb", "pod_bbbb" + EDIT_PARKED_SUFFIX}
+    # both parked twins: an edit's __prev and a recovery's __stopped (a stop whose mark could not be written)
+    assert listed_container_names(rented) == {
+        f"pod_{pod_id}{suffix}" for pod_id in ("aaaa", "bbbb") for suffix in ("", EDIT_PARKED_SUFFIX, "__stopped")
+    }
 
 
 @pytest.mark.asyncio
 async def test_a_sibling_create_sweep_keeps_the_parked_twin_of_an_active_pod(svc):
     """clean_existing_containers with the backend's active names: pod_x__prev survives while pod_x is active,
     an unrelated __prev leftover does not."""
-    listing = "pod_active\npod_active__prev\npod_gone__prev\npod_gone\n"
+    listing = "pod_active\npod_active__prev\npod_active__stopped\npod_gone__prev\npod_gone\n"
     ssh = AsyncMock()
     ssh.run = AsyncMock(side_effect=lambda cmd, *a, **k: _ssh_result(stdout=listing) if "docker ps -a" in cmd else _ssh_result())
 
     await svc.clean_existing_containers(ssh, {}, pod_name="pod_new", clear_volume=False, active_container_names=["pod_active"])
 
     rm = next(c for c in [call.args[0] for call in ssh.run.await_args_list] if c.startswith("/usr/bin/docker rm -fv"))
-    assert "pod_active__prev" not in rm and "pod_active" not in rm.replace("pod_active__prev", "")
+    assert "pod_active__prev" not in rm and "pod_active__stopped" not in rm and "pod_active" not in rm.replace("pod_active__prev", "")
     assert "pod_gone__prev" in rm and "pod_gone" in rm
 
 

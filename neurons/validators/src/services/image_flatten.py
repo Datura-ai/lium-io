@@ -55,7 +55,19 @@ FLATTEN_NO_DISK_RENTER_SENTENCE = (
 
 
 class ImageFlattenNoDisk(RuntimeError):
-    renter_sentence = FLATTEN_NO_DISK_RENTER_SENTENCE
+    def __init__(self, renter_sentence: str = FLATTEN_NO_DISK_RENTER_SENTENCE, short_bytes: int | None = None):
+        super().__init__(renter_sentence)
+        self.renter_sentence = renter_sentence
+        self.short_bytes = short_bytes
+
+
+def flatten_no_disk_sentence(short_bytes: int) -> str:
+    """The refusal with the measured shortfall; a bigger node grows the pod disk too, so only the image can shrink it."""
+    gb = -(-short_bytes // 1024**3)
+    return (
+        f"not enough free disk on this node to prepare this image beside this pod's disk ({gb} GB short); "
+        "use a smaller image or one with fewer layers"
+    )
 
 
 class FlattenMeasureFailed(RuntimeError):
@@ -197,7 +209,7 @@ def _flatten_command(
         "else echo 'flatten: lease dir unreadable, cleanup skipped' >&2; fi; flock -u 8; "
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
-        f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
+        f'[ "$avail" -ge {int(need_bytes)} ] || {{ echo "flatten avail=$avail" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
         # the ID, not the tag: a pull may move the tag after inspect and the copy would not match its name
         f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {mounts} {shlex.quote(image_id)}) || exit 97; "
         f"end=$(( $(date +%s) + {t} )); "
@@ -216,15 +228,17 @@ def _flatten_command(
 
 
 def _export_count_check(factor: int, fixed_bytes: int) -> str:
-    """Count the export, stopping one byte past what the free disk allows; refuse (container removed) past it."""
+    """Count the export, stopping one byte past what the free disk allows; refuse (container removed) past it.
+    The count stops early, so it never knows the real shortfall: the refusal names none."""
     t = FLATTEN_TIMEOUT_SECONDS
     gone = '/usr/bin/docker rm -fv "$cid" >/dev/null 2>&1'
     return (
         f'cap=$(( (avail - {int(fixed_bytes)}) / {int(factor)} )); st=$(mktemp); '
         f'eb=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") | head -c $((cap + 1)) | wc -c); '
         'erc=$(cat "$st"); rm -f "$st"; '
-        # a wc output test cannot read refuses too
-        f'[ "$eb" -le "$cap" ] 2>/dev/null || {{ {gone}; echo "flatten refused: the export is larger than the free disk allows" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
+        # a wc output test cannot read refuses too (an arithmetic error would end sh)
+        f'[ "$eb" -le "$cap" ] 2>/dev/null || {{ {gone}; '
+        f'echo "flatten refused: the export is larger than the free disk allows" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
         f'[ "$erc" = 0 ] || {{ {gone}; echo "flatten failed: counting export=$erc" >&2; exit 98; }}; '
     )
 
@@ -540,12 +554,13 @@ async def flatten_image_on_host(
     config = info.get("Config") or {}
     driver_name = str(driver.stdout).strip()
     fixed = FLATTEN_DISK_MARGIN_BYTES + reserved_bytes
+    need_bytes = _copy_bytes(int(info.get("Size") or 0), driver_name) + fixed
     command = _flatten_command(
         info["Id"],
         tag,
         image_flatten_changes(config),
         sorted(config.get("Volumes") or ()),
-        _copy_bytes(int(info.get("Size") or 0), driver_name) + fixed,
+        need_bytes,
         lease,
         sized_mark,
         # overlay2's Size sums apparent file sizes (sparse files at full length), so only containerd needs the count
@@ -555,6 +570,11 @@ async def flatten_image_on_host(
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
     if result.exit_status == FLATTEN_NO_DISK_EXIT:
+        # only the Size check prints avail, against the need computed here; the containerd count names none
+        found = re.search(r"flatten avail=(\d+)", str(result.stderr or ""))
+        if found and int(found.group(1)) < need_bytes:
+            short = need_bytes - int(found.group(1))
+            raise ImageFlattenNoDisk(flatten_no_disk_sentence(short), short_bytes=short)
         raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
     if result.exit_status != 0:
         raise RuntimeError(f"flatten exited {result.exit_status}: {str(result.stderr or '')[-2000:]}")
