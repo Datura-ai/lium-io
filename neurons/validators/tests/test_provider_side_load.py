@@ -426,15 +426,16 @@ async def test_a_docker_that_does_not_answer_the_second_look_withholds_nothing(c
 
 
 @pytest.mark.asyncio
-async def test_the_roce_link_probe_is_not_the_providers_load(context_factory):
-    # DAH-2667 runs `ib_write_bw` in `lium_roce_probe` on the host. It is ours, it burns cores
-    # while it runs, and it appears on no rental list.
+@pytest.mark.parametrize("probe_name", ["lium_roce_probe", "lium_egress_probe_12_ab12cd"])
+async def test_the_roce_link_probe_is_not_the_providers_load(context_factory, probe_name):
+    # DAH-2667 runs `ib_write_bw` in `lium_roce_probe` on the host; DAH-6004's egress check runs
+    # in `lium_egress_probe_*`. Both are ours, burn cores while they run, and are on no rental list.
     specs = {
         "cpu": {"count": 32},
         "docker": {
             "host_cpu_percent": 4.4,
             # `ib_write_bw` busy-polls one core
-            "containers": [{"name": "lium_roce_probe", "cpu_percent": 100.0}],
+            "containers": [{"name": probe_name, "cpu_percent": 100.0}],
         },
     }
     ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))

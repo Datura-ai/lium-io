@@ -81,6 +81,7 @@ from services.const import MIN_PORT_COUNT
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
+        DiskLimitedRemainder,
         InsufficientDisk,
         MissingFull8xCapability,
         PortLimitedRemainder,
@@ -127,6 +128,8 @@ class ZeroIncentiveReason(StrEnum):
     PROVIDER_EMAIL_NOT_CONFIRMED = "provider_email_not_confirmed"
     # Rented: in the mining pool, but the Sysbox portion zeroed the mining score
     RENTED_SYSBOX_NOT_CONFIRMED = "rented_sysbox_not_confirmed"
+    # Group B (appended): free splits of a partly rented split node without disk room for their share (DAH-4961)
+    DISK_LIMITED_REMAINDER = "disk_limited_remainder"
 
 
 # The reason code a failed run carries when no check produced one (an exception in the pipeline).
@@ -576,6 +579,29 @@ class MinerLogLine(BaseModel):
             },
         )
 
+    @staticmethod
+    def no_payout_because_disk_limited_remainder(
+        result: JobResult, disk_limited: DiskLimitedRemainder
+    ) -> MinerLogLine:
+        # `result` is the free portion; the message names the GPUs the missing disk room leaves unpaid
+        unpaid: int = disk_limited.unpaid_gpu_count
+        floor: str = f"{settings.MIN_FREE_DISK_GB} GB"
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
+            message=(
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: it has less "
+                f"than {floor} free disk, so they are not listed. The rented GPUs keep earning. Idle pay resumes "
+                f"when the node has {floor} free."
+            ),
+            extra_fields={
+                "gpu_count": unpaid,
+                "free_split_count": disk_limited.free_split_count,
+                "paid_split_count": disk_limited.paid_split_count,
+                "required_free_gb": settings.MIN_FREE_DISK_GB,
+            },
+        )
+
     # ── Spot-node pay: an idle spot node that is not paid ────────────────────
 
     @staticmethod
@@ -763,12 +789,14 @@ class MinerLogLine(BaseModel):
         filler_rate: float,
         paid_fraction: float,
         pay_factor: float,
+        secure_share: float = 1.0,
     ) -> MinerLogLine:
         return MinerLogLine(
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
                 "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
                 f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate) "
+                f"(secure_rate = {secure_share:g} * hourly_rate * sysbox_multiplier * driver_multiplier) "
                 "* spot_pool_multiplier (below 1 when the GPU model's spot nodes together would be paid "
                 "more than its fillers earn per hour, filler_revenue_usd_per_hour); "
                 "paid on top of the rental share (paid_fraction < 1: the pool had room for only "

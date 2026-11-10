@@ -84,10 +84,11 @@ def _validator_hotkeys(current: str, next_: str) -> dict[str, str]:
 VALIDATOR_HOTKEYS_SS58: dict[str, str] = _validator_hotkeys(VALIDATOR_HOTKEY_SS58, VALIDATOR_NEXT_HOTKEY_SS58)
 
 # I-78: the addresses the prod validator reaches executors from (the prod VPC's two NAT gateways).
-# A key uploaded through /upload_ssh_key logs in only from these, so a copy of the hotkey can no
-# longer buy a root shell from anywhere else. Fixed by the image like the hotkeys; a non-prod build
-# names its own in config_override (_VALIDATOR_SSH_SOURCES, written by docker_build.sh from
-# VALIDATOR_SSH_SOURCES; absent or "" = no pin).
+# A key uploaded through /upload_ssh_key logs in only from the validator's addresses, so a copy of the
+# hotkey can no longer buy a root shell from anywhere else. The addresses pinned are the signed list
+# at <COMPUTE_REST_API_URL>/watchtower/ssh-sources (services/ssh_service.py); this one only says the
+# build pins at all. A non-prod build names its own in config_override (_VALIDATOR_SSH_SOURCES,
+# written by docker_build.sh from VALIDATOR_SSH_SOURCES; absent or "" = no pin).
 _BUILTIN_VALIDATOR_SSH_SOURCES = "54.163.250.18,13.223.237.157"
 
 
@@ -114,6 +115,8 @@ class Settings(BaseSettings):
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8001)
     SSH_PORT: int = Field(env="SSH_PORT", default=2200)
     SSH_PUBLIC_PORT: Optional[int] = Field(env="SSH_PUBLIC_PORT", default=None)
+    # ssh_host_keys.sh keeps sshd host keys here; a volume in docker-compose.app.yml, absent on CVM
+    SSH_HOST_KEYS_DIR: str = Field(env="SSH_HOST_KEYS_DIR", default="/var/lib/executor-ssh-host-keys")
 
     MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
     # `lium mine --register` writes the portal account's claim here; the portal requires it of a pool-hotkey node
@@ -202,18 +205,16 @@ class Settings(BaseSettings):
     EXECUTOR_UPLOADED_KEY_TTL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_TTL_S", default=900, ge=1)
     # How often the purge looks at authorized_keys; a key lives at most TTL + this.
     EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S", default=60, ge=1)
-    # I-78: off by default until approved; about 5% of nodes relay inbound ssh (sshd sees the relay,
-    # not the validator) and would fail. Safe as an env value: whoever writes this .env is root on the host.
-    EXECUTOR_SSH_SOURCE_PIN: bool = Field(env="EXECUTOR_SSH_SOURCE_PIN", default=False)
+    # I-78: on = pin to the signed list (the backend sends "" to keep the pin off fleet-wide); `false` keeps it off
+    # on this node (inbound ssh relayed). Safe as an env value: whoever writes this .env is root.
+    EXECUTOR_SSH_SOURCE_PIN: bool = Field(env="EXECUTOR_SSH_SOURCE_PIN", default=True)
 
     # liumd phase 1 (DAH-2834): `POST /verify` runs the verification suite locally from one
-    # validator-signed intent instead of 25–40 SSH commands. Off: the route answers 404 and
-    # `/version` does not advertise it, so validators keep the SSH path. On: only the signed,
-    # nonce'd, time-windowed intent of the pinned validator hotkey is accepted, and only through
-    # the validator's SSH tunnel to this process's loopback port (a network peer is refused).
-    # On a CVM the three settings reach the executor through dstacktee/app/init_script.sh's
-    # whitelist; a name missing there is dropped at CVM start.
-    EXECUTOR_LOCAL_VERIFY_ENABLED: bool = Field(env="EXECUTOR_LOCAL_VERIFY_ENABLED", default=False)
+    # validator-signed intent instead of 25–40 SSH commands; `/version` advertises it. Only the
+    # signed, nonce'd, time-windowed intent of the pinned validator hotkey is accepted, and only
+    # through the validator's SSH tunnel to this process's loopback port (a network peer is
+    # refused). On a CVM the settings below reach the executor through
+    # dstacktee/app/init_script.sh's whitelist; a name missing there is dropped at CVM start.
     # Longest a single /verify call may run before answering with what finished (seconds).
     LOCAL_VERIFY_MAX_DEADLINE_SECONDS: int = Field(env="LOCAL_VERIFY_MAX_DEADLINE_SECONDS", default=600)
     # How far the intent's issued_at may be from this host's clock (seconds, either way).

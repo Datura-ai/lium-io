@@ -545,6 +545,36 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
 
 
 @pytest.mark.asyncio
+async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_stops_early(svc, monkeypatch):
+    """DAH-5666: the old DinD still holds the name, so the create stops before `docker run --name` fails on it."""
+    from services.docker_service import inflight_creates
+
+    ssh_client = _make_dind_ssh()
+    inner = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if cmd.startswith("/usr/bin/docker pause "):
+            ssh_client.calls.append(cmd)
+            return _ssh_result(exit_status=1)
+        return await inner(cmd, **kw)
+
+    ssh_client.run = _run
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+
+    with inflight_creates.track(payload.pod_id):
+        ok, step, _ = await svc._custom_build_image(
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
+        )
+
+    assert (ok, step) == (False, "build_dind_start")
+    assert not any("run -d --runtime=sysbox-runc" in c for c in ssh_client.calls)
+    # neither stop (the resumed one nor the finally's retry) confirmed it, so its rules and container stay
+    assert not any("-D DOCKER-USER" in c or c.startswith("/usr/bin/docker rm -fv") for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
 async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_rules_go(svc):
     """DAH-5437: a cut-off attempt's build may still run in its DinD; it must never run without the rules."""
     ssh_client = _make_dind_ssh()
@@ -567,11 +597,27 @@ async def test_A27b_the_teardown_freezes_the_build_container_before_its_egress_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("paused, killed", [("true", False), ("false", True), ("", True)])
+@pytest.mark.parametrize(
+    "before_kill, after_kill, ps, killed, confirmed",
+    [
+        ("truetrue", "", "printf abc", False, True),  # paused
+        ("falsefalse", "", "printf abc", False, True),  # stopped
+        ("Error: No such object: dind_x", "", "exit 0", False, True),  # gone
+        ("error: no such object: dind_x", "", "exit 0", False, True),  # gone, another docker's wording
+        ("Error response from daemon: No such container: dind_x", "", "exit 0", False, True),  # gone, daemon text
+        ("", "", "exit 0", False, True),  # gone, inspect printed nothing
+        ("[]", "", "exit 0", False, True),  # gone, inspect printed an empty list
+        ("unexpected state", "", "printf abc", False, False),  # unknown wording but ps still lists it
+        ("truefalse", "falsefalse", "printf abc", True, True),  # the pause did not freeze it: killed
+        ("truefalse", "truefalse", "printf abc", True, False),  # the kill did not stop it either
+        ("Cannot connect to the Docker daemon", "", "exit 1", False, False),  # state unknown
+    ],
+)
 async def test_A27c_a_build_container_the_pause_did_not_freeze_is_killed_before_its_rules_go(
-    svc, tmp_path, paused, killed
+    svc, tmp_path, before_kill, after_kill, ps, killed, confirmed
 ):
-    """DAH-5437: the pause command, run by a shell against a fake docker, kills a DinD it left running."""
+    """DAH-5437: the pause command, run by a shell against a fake docker, kills a DinD it left running
+    and exits 0 only once the DinD is confirmed paused, stopped or gone (DAH-5666)."""
     ssh_client = _make_dind_ssh()
     await svc._teardown_dind_build(
         ssh_client=ssh_client, dind_name="dind_x", dind_image="img", dind_ip=None, cidrs=[], default_extra={}
@@ -580,12 +626,46 @@ async def test_A27c_a_build_container_the_pause_did_not_freeze_is_killed_before_
     log = tmp_path / "log"
     docker = tmp_path / "docker"
     docker.write_text(
-        f'#!/bin/sh\necho "$@" >> {log}\n[ "$1" = pause ] && exit 1\n[ "$1" = inspect ] && printf {paused}\nexit 0\n'
+        f'#!/bin/sh\necho "$@" >> {log}\n[ "$1" = pause ] && exit 1\n'
+        f'[ "$1" = inspect ] && {{ grep -q "^kill" {log} && printf "{after_kill}" || printf "{before_kill}"; }}\n'
+        f'[ "$1" = ps ] && {{ {ps}; }}\n'
+        "exit 0\n"
     )
     docker.chmod(0o755)
     res = subprocess.run(["sh", "-c", cmd.replace("/usr/bin/docker", str(docker))], capture_output=True)
-    assert res.returncode == 0
+    assert (res.returncode == 0) is confirmed
     assert ("kill dind_x" in log.read_text()) is killed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "exit"])
+async def test_A27d_the_rules_stay_while_the_build_container_is_not_confirmed_stopped(svc, failure):
+    """DAH-5666: a pause/kill that times out (or cannot confirm the DinD stopped) is retried; until it
+    succeeds neither the remove helper nor the helper/DinD rm runs, so the build keeps its rules."""
+    ssh_client = _make_dind_ssh()
+    inner = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if cmd.startswith("/usr/bin/docker pause dind_x "):
+            ssh_client.calls.append(cmd)
+            if failure == "timeout":
+                raise asyncio.TimeoutError()
+            return _ssh_result(exit_status=1)
+        return await inner(cmd, **kw)
+
+    ssh_client.run = _run
+    confirmed = await svc._teardown_dind_build(
+        ssh_client=ssh_client,
+        dind_name="dind_x",
+        dind_image="img",
+        dind_ip="172.20.0.2",
+        cidrs=["10.0.0.0/8"],
+        default_extra={},
+    )
+
+    assert confirmed is False
+    assert len(ssh_client.calls) == 3
+    assert all(c.startswith("/usr/bin/docker pause dind_x ") for c in ssh_client.calls)
 
 
 @pytest.mark.asyncio

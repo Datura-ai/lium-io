@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING, Any
 
 from .models import AVAILABILITY_CATEGORY, build_msg
@@ -25,6 +26,17 @@ class MessageTemplate:
     impact: str
     remediation: str | None = None
     help_uri: str | None = None
+
+
+def shown(value: float, decimals: int, *, failed_below: bool) -> str:
+    """Format a failing reading so rounding never makes it look like it meets the limit.
+
+    A value below a minimum rounds down and a value above a maximum rounds up (49.96 GB free
+    shows as 49.9, not 50.0, against a 50 GB minimum).
+    """
+    # decimal from the shortest str(): no float noise (49.9 stays 49.9) and no pre-rounding (99.99999999 stays below 100)
+    step = Decimal(1).scaleb(-decimals)
+    return f"{Decimal(str(value)).quantize(step, rounding=ROUND_FLOOR if failed_below else ROUND_CEILING):.{decimals}f}"
 
 
 def render_message(
@@ -660,8 +672,9 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 80% of the default limit "
+            "reported by NVML, or during a rental to at least 90% (or the limit "
+            "the rental started on, if lower)."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(
@@ -678,6 +691,14 @@ class GpuPowerLimitMessages:
         severity="info",
         category="env",
         impact="Proceed",
+    )
+    # F-43: a kept 80 % tier reading whose clear is not confirmed (Redis failed): neither zero nor show stock
+    TIER_STATE_UNKNOWN = MessageTemplate(
+        event="GPU power limit at stock, but the validator could not clear its earlier tier reading",
+        reason="GPU_POWER_TIER_STATE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
     )
     SKIPPED_ACTIVE_LIUM_FILLER = MessageTemplate(
         event="GPU power limit check skipped for active Lium default job",
@@ -930,6 +951,19 @@ class SysboxRequiredMessages:
             "toolkit; the sysbox check runs again on the next cycle."
         ),
     )
+    # DAH-5844: the test container started but its sshd never answered and its log names no cause
+    # (dind_probe.DIND_SSHD_NOT_READY), so nothing about sysbox was measured. Same impact as SYSBOX_MISSING.
+    DIND_PROBE_UNREACHABLE = MessageTemplate(
+        event="Sysbox test container never became reachable",
+        reason="DIND_PROBE_UNREACHABLE",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Sysbox was not measured. Check that the node's mapped ports accept SSH from outside and that the "
+            "host is not overloaded; the sysbox check runs again on the next cycle."
+        ),
+    )
     SYSBOX_OK = MessageTemplate(
         event="Sysbox requirement satisfied",
         reason="SYSBOX_REQUIRED_OK",
@@ -1047,6 +1081,31 @@ class CollateralStatusMessages:
         severity="info",
         category="policy",
         impact="None; the last known collateral status is reported, or none deposited when there is none",
+    )
+
+
+class NodeAccountMessages:
+    MATCH = MessageTemplate(
+        event="Node is the one its account registered",
+        reason="NODE_ACCOUNT_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Node account check not applicable",
+        reason="NODE_ACCOUNT_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Node at this address is not the one its account registered",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Verification failed; verification cleared",
+        remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
     )
 
 
@@ -1289,8 +1348,9 @@ class TenantEnforcementMessages:
         category="transport",
         impact="No verdict for this cycle - pod state unknown",
         remediation=(
-            "Transient SSH transport failure (network blip, conntrack flush). "
-            "Persistent unreachability is handled by the stale-executor sweep."
+            "The validator's SSH session to the node dropped mid-check (`transport_error` names how), so this "
+            "cycle has no verdict and the next one retries. If it repeats, check that the node's SSH port answers "
+            "from outside and that the executor container is running."
         ),
     )
     GPU_OUTSIDE_TENANT = MessageTemplate(
@@ -1340,6 +1400,18 @@ class GpuUsageMessages:
         category="runtime",
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
+    )
+    USAGE_HIGH_MEASURED_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization {vram_utilization}; "
+        "an idle node must stay below {gpu_limit}% utilization and at most {memory_limit}% memory "
+        "utilization. GPU processes on the node: {processes}. Stop these processes and re-run your "
+        "node. If using Docker, ensure no host processes are running."
+    )
+    USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "
+        "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
+        "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
+        "running: {fillers}."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
@@ -1507,6 +1579,13 @@ class DiskSpaceMessages:
         remediation="Free space on the node's data disk: check `docker system df` and `df -h`, delete what you no "
         "longer need, or grow the disk. The next validation reads the disk again.",
     )
+    SPLIT_DISK = MessageTemplate(
+        event="Disk space per free split inspected",
+        reason="SPLIT_DISK_SIZED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
 
 
 class PortCountMessages:
@@ -1517,13 +1596,25 @@ class PortCountMessages:
         category="runtime",
         impact="Proceed",
     )
+    # DAH-5851: an idle node's cycle whose port check was deferred for disk pressure: the run is withheld at the
+    # cycle's end (executor_rollout.withhold_renter_gpu_reset_verdicts), neither scored nor hidden
+    VERDICT_WITHHELD_PORT_CHECK_DEFERRED = MessageTemplate(
+        event="Port check deferred for disk pressure; this cycle's verdict is withheld",
+        reason="PORT_VERDICT_WITHHELD_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last completed port check left it",
+    )
     INSUFFICIENT_PORTS = MessageTemplate(
         event="Insufficient available ports",
         reason="INSUFFICIENT_PORTS",
         severity="warning",
         category="runtime",
         impact="Score set to 0",
-        remediation="Increase port range or check port mappings configuration.",
+        remediation=(
+            "Widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS so enough renting ports answer from outside, "
+            "then run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
 
 
@@ -1781,6 +1872,13 @@ class VerifyXMessages:
     VERIFY_SUCCESS = MessageTemplate(
         event="VerifyX validation passed",
         reason="VERIFYX_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    COLD_RETRY = MessageTemplate(
+        event="VerifyX second download sample",
+        reason="VERIFYX_COLD_RETRY",
         severity="info",
         category="env",
         impact="Proceed",
@@ -2147,6 +2245,22 @@ class NvlinkFaultMessages:
             "sees the GPUs again. If the errors come back, service the board."
         ),
     )
+    MULTICAST_FAILED = MessageTemplate(
+        event="NVLink multicast is broken: a GPU cannot join a multicast object across the board",
+        reason="NVLINK_FAULT",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink multicast works again",
+        remediation=(
+            "cuMulticastAddDevice returns CUDA_ERROR_UNKNOWN (999) on a full NVLink board whose GPUs report "
+            "multicast support, so NCCL NVLink SHARP (NVLS) cannot start. Check that nvidia-fabricmanager runs "
+            "the same version as the driver and that `nvidia-smi -q` shows Fabric State Completed on every "
+            "GPU, and check the host `dmesg` for NVRM Xid lines. Stop the workloads, restart "
+            "nvidia-fabricmanager or reboot, then restart the executor container "
+            "(`docker restart executor-executor-1`). If it comes back, update the driver and fabric manager "
+            "together or service the board."
+        ),
+    )
     MISSING = MessageTemplate(
         event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
         reason="NVLINK_MISSING",
@@ -2195,7 +2309,10 @@ class RentalVerificationMessages:
         severity="error",
         category="policy",
         impact="Validation halted",
-        remediation="Check executor health with backend or review rental status",
+        remediation=(
+            "The rental check could not confirm this node; `error` in this event names what failed. If it "
+            "repeats, run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
     # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
     GPU_LIST_EMPTY = MessageTemplate(
@@ -2581,13 +2698,6 @@ class CachedTemplateMessages:
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 
-    DISABLED = MessageTemplate(
-        event="Local verification disabled",
-        reason="LOCAL_VERIFY_DISABLED",
-        severity="info",
-        category="transport",
-        impact="None — every check runs over SSH as before",
-    )
     SKIPPED = MessageTemplate(
         event="Local verification skipped",
         reason="LOCAL_VERIFY_SKIPPED",
@@ -2601,7 +2711,7 @@ class LocalVerifyMessages:
         severity="info",
         category="transport",
         impact="None — the matmul and VerifyX run over SSH as before",
-        remediation="Update the executor image and set EXECUTOR_LOCAL_VERIFY_ENABLED=true to take the one-call path.",
+        remediation="Update the executor image to take the one-call path.",
     )
     FALLBACK = MessageTemplate(
         event="Local verification not used, SSH path taken",
@@ -2691,6 +2801,42 @@ class RentedPodNetworkMessages:
     NOT_RENTED = MessageTemplate(
         event="Rented pod network summary skipped: no running rental",
         reason="RENTED_POD_NETWORK_NOT_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class RentedPodOwnershipMessages:
+    OK = MessageTemplate(
+        event="Rented pod files are owned inside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SHIFTED = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; root login and sudo fail inside the pod until its files are repaired",
+        remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
+        "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
+        "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
+        "(only ids inside the old range; keep setuid bits and file capabilities). Shut the host down "
+        "cleanly to avoid this.",
+    )
+    UNREAD = MessageTemplate(
+        event="Rented pod file ownership not read",
+        reason="RENTED_POD_OWNERSHIP_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented pod file ownership skipped: no running rental",
+        reason="RENTED_POD_OWNERSHIP_NOT_RENTED",
         severity="info",
         category="runtime",
         impact="Proceed",

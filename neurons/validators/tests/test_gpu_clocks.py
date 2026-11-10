@@ -702,6 +702,86 @@ async def test_a_create_reset_after_every_gpu_was_reset_passes_even_when_redis_t
 
 
 @pytest.mark.asyncio
+async def test_a_reboots_hung_gpu_reset_waits_for_a_gpu_operation_in_flight(monkeypatch):
+    # DAH-5301 (review): a renter's Reset GPU or clock lock never overlaps the reboot's hung GPU reset
+    import asyncio
+
+    import services.docker_service as ds
+    from services.hung_gpu_reset import HungGpuResult
+
+    order: list[str] = []
+    service, gates, started = _service_with_gated_steps(order)
+    service.redis_service = None
+    monkeypatch.setattr(ds, "SSHCommandRunner", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        ds, "reset_hung_pod_gpus", AsyncMock(side_effect=lambda *_a, **_k: order.append("hung") or HungGpuResult([], None, ""))
+    )
+
+    gpu = asyncio.create_task(_gpu_operation(service))
+    await started["gpu"].wait()
+    reboot = asyncio.create_task(service._reset_hung_gpus_before_run(None, _create_payload(), {}))
+    await asyncio.sleep(0.05)
+    assert order == []
+    gates["gpu"].set()
+    await asyncio.gather(gpu, reboot)
+
+    assert order == ["gpu", "hung"]
+    assert not ds.pod_gpu_operation_locks._locks
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.asyncio
+async def test_the_reboot_hung_gpu_reset_flag(monkeypatch, enabled):
+    # DAH-5301: off = shadow (logged, no warning to the backend); on = the reset and its warning
+    import services.docker_service as ds
+    from services.hung_gpu_reset import HungGpuResult
+
+    service, _gates, _started = _service_with_gated_steps([])
+    service.redis_service = None
+    monkeypatch.setattr(ds, "SSHCommandRunner", lambda *_a, **_k: None)
+    monkeypatch.setattr(ds.settings, "HUNG_GPU_RESET_ON_REBOOT_ENABLED", enabled)
+    warning = ds.ContainerWarningCode.HungGpuReset if enabled else None
+    reset = AsyncMock(return_value=HungGpuResult(["gpu-0"], warning, "would reset"))
+    monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
+
+    assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) == warning
+    assert reset.await_args.kwargs["shadow"] is not enabled
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_whose_lock_wait_runs_out_runs_no_hung_gpu_reset(monkeypatch):
+    import services.docker_service as ds
+
+    service, _gates, _started = _service_with_gated_steps([])
+    service.redis_service = None
+    reset = AsyncMock()
+    monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
+    monkeypatch.setattr(ds, "POD_GPU_OPERATION_DEADLINE_SECONDS", 0)
+
+    async with ds.pod_gpu_operation_locks.hold("pod1", 0):  # another GPU operation holds the pod
+        assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) is None
+
+    reset.assert_not_awaited()  # never beside the other operation
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_its_delete_cancelled_runs_no_hung_gpu_reset(monkeypatch):
+    import services.docker_service as ds
+
+    service, _gates, _started = _service_with_gated_steps([])
+    service.redis_service = None
+    reset = AsyncMock()
+    monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
+
+    with ds.inflight_creates.track("pod1"):
+        ds.inflight_creates.cancel("pod1")
+        assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) is None
+
+    reset.assert_not_awaited()  # the GPUs may already be the next renter's
+    assert not ds.pod_gpu_operation_locks._locks
+
+
+@pytest.mark.asyncio
 async def test_a_create_its_delete_cancelled_runs_no_clock_reset(monkeypatch):
     import services.docker_service as ds
     from payload_models.payloads import WorkloadKind

@@ -5,7 +5,7 @@ from .capability import CapabilityCheck
 from .collateral_status import CollateralStatusCheck
 from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
-from .disk_space import DiskSpaceCheck
+from .disk_space import DiskSpaceCheck, SplitDiskCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
@@ -27,6 +27,7 @@ from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
+from .node_account import NodeAccountCheck
 from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
 from .pinned_memory_probe import PinnedMemoryProbeCheck
@@ -40,6 +41,7 @@ from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_pod_network import RentedPodNetworkCheck
+from .rented_pod_ownership import RentedPodOwnershipCheck
 from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
@@ -57,7 +59,7 @@ from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
-from .verifyx import VerifyXCheck
+from .verifyx import VerifyXCheck, VerifyXColdRetryCheck
 
 __all__ = [
     "BannedGpuCheck",
@@ -68,6 +70,7 @@ __all__ = [
     "CpuTruthCheck",
     "DiskHealthCheck",
     "DiskSpaceCheck",
+    "SplitDiskCheck",
     "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",
@@ -88,11 +91,13 @@ __all__ = [
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
     "RentedPodNetworkCheck",
+    "RentedPodOwnershipCheck",
     "RentedPodResourcesCheck",
     "RentedThroughputCheck",
     "SshdAuthLogCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
+    "NodeAccountCheck",
     "NvlinkFaultCheck",
     "NvmlDigestCheck",
     "PinnedMemoryProbeCheck",
@@ -120,4 +125,5 @@ __all__ = [
     "SshdBootstrapCheck",
     "UploadFilesCheck",
     "VerifyXCheck",
+    "VerifyXColdRetryCheck",
 ]

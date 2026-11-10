@@ -55,7 +55,7 @@ MIN_DISK_TO_VRAM_RATE = 1.5
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
 # quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
 # the incentive but stays active.
-FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
+FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB200", "GB300"})  # GB200/GB300 gated as B200/B300
 FULL_8X_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
 NCU_PROFILING_UNRESTRICTED = "unrestricted"
@@ -72,9 +72,9 @@ NVIDIACTL_ROOT_UID = 0
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
 FILLER_REVENUE_PAY_FACTOR = 1.0
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
-# DAH-5677 (Rustam): idle pay of an H100 SXM-on-PCIe-adapter node (listed as H100 PCIe) per GPU-hour, as a
-# share of its GPU configuration's filler average, in place of the H100 PCIe rate. No average: no idle pay.
-SXM_ON_PCIE_ADAPTER_FILLER_PAY_FACTOR = 0.9
+# The share of an idle secure node's rate that an idle spot node of the same configuration earns at most
+# (Fish, 6 Nov 2026, DAH-5930): spot idle pay stays below secure idle pay, to keep secure supply worth offering.
+SPOT_IDLE_SECURE_RATE_SHARE = 0.8
 # The share of the secure rental incentive that a rented spot node earns (ENABLE_SPOT_RENTAL_INCENTIVE).
 SPOT_RENTAL_INCENTIVE_FACTOR = 0.5
 
@@ -138,6 +138,15 @@ class PortLimitedRemainder(BaseModel):
     required_port_count: int
     free_split_count: int
     paid_split_count: int  # splits that have a port: their GPUs keep the idle pay
+    unpaid_gpu_count: int
+
+
+class DiskLimitedRemainder(BaseModel):
+    """The free remainder of a partially rented split node that SplitDiskCheck (`specs.split_disk`) lists fewer
+    free GPUs of than it has (DAH-4961): only the listed ones earn idle pay."""
+
+    free_split_count: int
+    paid_split_count: int  # splits with disk room: their GPUs keep the idle pay
     unpaid_gpu_count: int
 
 
@@ -603,6 +612,10 @@ class RentalPriceIncentive(DefaultIncentive):
         if isinstance(verified, list):
             # a port two mappings both publish can still serve only one renter
             available = min(available, len(set(verified)))
+        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
+        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
+        if isinstance(deferred, int) and not isinstance(deferred, bool):
+            available = min(available, deferred)
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
@@ -619,6 +632,47 @@ class RentalPriceIncentive(DefaultIncentive):
             unpaid_gpu_count=free_gpu_count
             if paid_split_count == 0
             else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+        )
+
+    @staticmethod
+    def _disk_limited_remainder(result: JobResult) -> DiskLimitedRemainder | None:
+        # None when the spec carries no readable sizing (unsplit node, older validator): no change to idle pay
+        if not result.is_split_remainder or result.spec is None or not result.gpu_splitting_min_count:
+            return None
+        sizing: Any = result.spec.get("split_disk")
+        if not isinstance(sizing, dict):
+            return None
+        listable: Any = sizing.get("listable_split_count")
+        # the listing offers exactly listable_gpu_count free GPUs, so scoring pays the same count
+        listable_gpus: Any = sizing.get("listable_gpu_count")
+        if any(not isinstance(v, int) or isinstance(v, bool) for v in (listable, listable_gpus)):
+            return None
+        free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
+        paid_gpu_count: int = min(free_gpu_count, max(listable_gpus, 0))
+        if paid_gpu_count >= free_gpu_count:
+            return None
+        return DiskLimitedRemainder(
+            free_split_count=free_gpu_count // result.gpu_splitting_min_count,
+            paid_split_count=max(listable, 0) if paid_gpu_count else 0,
+            unpaid_gpu_count=free_gpu_count - paid_gpu_count,
+        )
+
+    def _log_disk_limited_remainder(self, result: JobResult, disk_limited: DiskLimitedRemainder) -> None:
+        logger.info(
+            _m(
+                "Free remainder of a partially rented split node has too little free disk to be listed",
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "free_split_count": disk_limited.free_split_count,
+                    "paid_split_count": disk_limited.paid_split_count,
+                    "unpaid_gpu_count": disk_limited.unpaid_gpu_count,
+                    "enforced": True,
+                    "reason": ZeroIncentiveReason.DISK_LIMITED_REMAINDER,
+                    "pool": "rental_partial" if disk_limited.paid_split_count else "rental_excluded",
+                },
+            )
         )
 
     def _log_port_limited_remainder(
@@ -720,8 +774,11 @@ class RentalPriceIncentive(DefaultIncentive):
                 free_portion.gpu_count = free_gpu_count
                 free_portion.is_rented = False
                 free_portion.is_split_remainder = True
-                # the average was looked up for the whole node's GPU configuration, not the remainder's
-                free_portion.filler_revenue_per_gpu_hour = None
+                # the average is per GPU-hour of the fillers on nodes of this GPU configuration, the free
+                # GPUs of partly rented ones included, so a Spot remainder is paid against it; a secure
+                # remainder takes no floor top-up, as before
+                if not free_portion.is_spot:
+                    free_portion.filler_revenue_per_gpu_hour = None
                 free_portion.rental_created_at = None
                 free_portion.rented_gpu_count = None
                 free_portion.incentive_logs = []
@@ -1058,6 +1115,7 @@ class RentalPriceIncentive(DefaultIncentive):
                         filler_rate=FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
                         paid_fraction=self.unbucketed_paid_fraction,
                         pay_factor=FILLER_REVENUE_PAY_FACTOR,
+                        secure_share=SPOT_IDLE_SECURE_RATE_SHARE,
                     )
                 )
             self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
@@ -1170,13 +1228,12 @@ class RentalPriceIncentive(DefaultIncentive):
         # Only a node on the backend's spot pay list is paid: set to Spot by its provider, or force-spot
         # by a penalty demotion. A banned hotkey, a pin or a no-incentive rental makes a node spot as a
         # restriction, off the list, and it keeps spot_tier, as before. A rented spot node is not on
-        # this path (earns_spot_rental_incentive decides its pay), and neither is the free remainder of
-        # a partially rented one: it has no configuration average of its own (spot_tier, not "no average")
+        # this path (earns_spot_rental_incentive decides its pay); the free remainder of a partially
+        # rented one is, priced for its own free GPUs like an idle spot node
         return (
             result.is_spot
             and result.is_on_spot_pay_list
             and not result.is_rented
-            and not result.is_split_remainder
         )
 
     @staticmethod
@@ -1190,6 +1247,7 @@ class RentalPriceIncentive(DefaultIncentive):
         job_result.mining_score = 0
         if excluded_from_both_pools or not (job_result.score > 0 or job_result.job_score > 0):
             return job_result
+        # node-wide, which on a partly rented node means its free GPUs: a filler stops when its GPUs are rented
         if not job_result.has_lium_filler:
             job_result.record_incentive_log(MinerLogLine.no_payout_because_spot_without_lium_filler(job_result))
             return job_result
@@ -1217,7 +1275,8 @@ class RentalPriceIncentive(DefaultIncentive):
         return job_result
 
     def _price_spot_node(self, result: JobResult) -> None:
-        """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average, the secure rate for this node).
+        """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average,
+        SPOT_IDLE_SECURE_RATE_SHARE x the secure rate for this node).
 
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
         runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
@@ -1280,7 +1339,8 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _spot_secure_rate(result: JobResult) -> float:
-        return result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
+        """The ceiling of a spot node's rate: SPOT_IDLE_SECURE_RATE_SHARE of what an idle secure node like it is paid."""
+        return SPOT_IDLE_SECURE_RATE_SHARE * result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
 
     def _floored_rate(self, result: JobResult, diluted_rate: float) -> float:
         """Secure floor: a rate diluted by the bucket cap is raised to SECURE_FILLER_REVENUE_FLOOR_FACTOR x
@@ -1294,11 +1354,7 @@ class RentalPriceIncentive(DefaultIncentive):
             or not result.hourly_rate
         ):
             return diluted_rate
-        # an adapter node is floored at its own share of the average, so dilution never pays it less (DAH-5677)
-        factor: float = (
-            SXM_ON_PCIE_ADAPTER_FILLER_PAY_FACTOR if result.sxm_on_pcie_adapter else SECURE_FILLER_REVENUE_FLOOR_FACTOR
-        )
-        return max(diluted_rate, factor * result.filler_revenue_per_gpu_hour)
+        return max(diluted_rate, SECURE_FILLER_REVENUE_FLOOR_FACTOR * result.filler_revenue_per_gpu_hour)
 
     def _secure_floor_top_up(self) -> float:
         """USD/hour the secure floor adds on top of the bucket sums, paid from the unbucketed share."""
@@ -1330,9 +1386,6 @@ class RentalPriceIncentive(DefaultIncentive):
                 self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
             )
             hourly_rate = max(hourly_rate, rate_for_min)
-        # same GPU counts in the program as an H100 PCIe, at its own rate
-        if result.sxm_on_pcie_adapter and hourly_rate > 0:
-            return SXM_ON_PCIE_ADAPTER_FILLER_PAY_FACTOR * (result.filler_revenue_per_gpu_hour or 0.0)
         return hourly_rate
 
     @staticmethod
@@ -1340,6 +1393,50 @@ class RentalPriceIncentive(DefaultIncentive):
         """An idle-pool gate runs while the node is still eligible, and on an already blocked
         candidate only when the gate is enforced, so its reason is recorded as well."""
         return eligible or (idle_pool_candidate and enforced)
+
+    def _limit_split_remainder(
+        self, job_result: JobResult, idle_pool_candidate: bool, eligible_for_rental_share: bool
+    ) -> bool:
+        # DAH-3698: a split remainder earns idle pay only for the minimum-size splits that have a
+        # free port; the rest is capacity nobody can rent. First in the chain so it never reaches
+        # the shadow numbers.
+        port_limited_remainder: PortLimitedRemainder | None = (
+            self._port_limited_remainder(job_result)
+            if idle_pool_candidate
+            else None
+        )
+        if port_limited_remainder is not None:
+            if eligible_for_rental_share:
+                self._log_port_limited_remainder(job_result, port_limited_remainder)
+            if port_limited_remainder.paid_split_count == 0:
+                eligible_for_rental_share = False
+            else:
+                # the pools below count only the paid GPUs; the merge adds the rest back
+                job_result.gpu_count -= port_limited_remainder.unpaid_gpu_count
+                job_result.port_unpaid_gpu_count += port_limited_remainder.unpaid_gpu_count
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited_remainder)
+            )
+
+        # DAH-4961: likewise only the free GPUs SplitDiskCheck lists (none under the host disk floor) earn
+        # idle pay. Read after the port rule so a GPU either rule leaves unpaid is counted once.
+        disk_limited_remainder: DiskLimitedRemainder | None = (
+            self._disk_limited_remainder(job_result) if idle_pool_candidate else None
+        )
+        if disk_limited_remainder is not None:
+            if eligible_for_rental_share:
+                self._log_disk_limited_remainder(job_result, disk_limited_remainder)
+            if disk_limited_remainder.paid_split_count == 0:
+                eligible_for_rental_share = False
+            else:
+                # port_unpaid_gpu_count holds every free GPU left out of the pools; the merge adds it back
+                newly_unpaid: int = max(0, disk_limited_remainder.unpaid_gpu_count - job_result.port_unpaid_gpu_count)
+                job_result.gpu_count -= newly_unpaid
+                job_result.port_unpaid_gpu_count += newly_unpaid
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_disk_limited_remainder(job_result, disk_limited_remainder)
+            )
+        return eligible_for_rental_share
 
     async def calculate_executor_score(
         self,
@@ -1373,7 +1470,11 @@ class RentalPriceIncentive(DefaultIncentive):
         excluded_from_both_pools: bool = excluded_for_outdated_image or bool(exclusions)
         on_spot_pay_path: bool = self._on_spot_pay_path(job_result)
         if on_spot_pay_path and not settings.SPOT_IDLE_PAY_SECURE_DECISION_ENABLED:
-            return self._qualify_spot_node(job_result, excluded_from_both_pools)
+            # a Spot split remainder is paid only for the free splits a renter could take, as a secure one
+            payable: bool = self._limit_split_remainder(
+                job_result, job_result.score > 0 or job_result.job_score > 0, not excluded_from_both_pools
+            )
+            return self._qualify_spot_node(job_result, not payable)
         if excluded_from_both_pools and job_result.gpu_model not in BASE_GPU_MAP:
             # get_base_model_for_gpu raises on a model it does not know, and nothing above this
             # guards it: an excluded node keeps its reasons and scores 0 instead of stopping the cycle
@@ -1395,26 +1496,9 @@ class RentalPriceIncentive(DefaultIncentive):
         # on that cycle. An enforced gate also runs on a node something else already blocks, to
         # record its reason too.
 
-        # DAH-3698: a split remainder earns idle pay only for the minimum-size splits that have a
-        # free port; the rest is capacity nobody can rent. First in the chain so it never reaches
-        # the shadow numbers.
-        port_limited_remainder: PortLimitedRemainder | None = (
-            self._port_limited_remainder(job_result)
-            if idle_pool_candidate
-            else None
+        eligible_for_rental_share = self._limit_split_remainder(
+            job_result, idle_pool_candidate, eligible_for_rental_share
         )
-        if port_limited_remainder is not None:
-            if eligible_for_rental_share:
-                self._log_port_limited_remainder(job_result, port_limited_remainder)
-            if port_limited_remainder.paid_split_count == 0:
-                eligible_for_rental_share = False
-            else:
-                # the pools below count only the paid GPUs; the merge adds the rest back
-                job_result.gpu_count -= port_limited_remainder.unpaid_gpu_count
-                job_result.port_unpaid_gpu_count += port_limited_remainder.unpaid_gpu_count
-            job_result.record_incentive_log(
-                MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited_remainder)
-            )
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays active).

@@ -292,7 +292,7 @@ def create_mock_port_dict(
 def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
-    redis_service = Mock()
+    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True))
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
@@ -3113,6 +3113,58 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repaired, starts", [("volume_x", 2), (None, 1)])
+async def test_start_existing_container_repairs_a_stale_vloopback_mountpoint_and_starts_again(
+    docker_service, monkeypatch, repaired, starts
+):
+    # 5 Nov: a GPU reset's start of a stopped pod failed on "file exists" with no repair, so the pod stayed down
+    stale = RuntimeError(
+        "Docker SDK start failed: 500 Server Error: error while mounting volume '': VolumeDriver.Mount: 01M6: "
+        "cannot create mount point dir '/mnt/volume_x': mkdir /mnt/volume_x: file exists"
+    )
+    ssh_client = AsyncMock()
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect", Mock(return_value=DummySSHConnectionManager(ssh_client))
+    )
+    client = docker_service.rental_docker_client_factory.client
+    client.start = AsyncMock(side_effect=[stale, None])
+    docker_service._repair_stale_mountpoint_of_container_volume = AsyncMock(return_value=repaired)
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    async def start():
+        await docker_service.start_existing_container(
+            executor_info=executor_info,
+            private_key="private-key",
+            known_hosts_policy=None,
+            container_name="pod_test",
+            local_volume_path="/root",
+            pod_id="pod-id",
+            default_extra={},
+        )
+
+    if repaired:
+        await start()
+        docker_service._restore_mount_and_sshd_after_start.assert_awaited_once()
+    else:
+        with pytest.raises(RuntimeError, match="file exists"):
+            await start()
+        docker_service._restore_mount_and_sshd_after_start.assert_not_awaited()
+    assert client.start.await_count == starts
+    docker_service._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh_client, "pod_test", {})
+
+
+@pytest.mark.asyncio
 async def test_start_container_remounts_when_container_state_is_encrypted(docker_service, monkeypatch):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))
@@ -5728,6 +5780,8 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
     # Both filters must be present
     assert "name=^container_5TestMiner_" in ps_cmd
     assert "name=^health_check_" in ps_cmd
+    # the port verifier's host-network container holds the range's host ports
+    assert "name=^port_test_" in ps_cmd
 
 
 @pytest.mark.asyncio
@@ -8715,6 +8769,113 @@ def test_orphaned_shim_kill_spares_a_replacement_shim_started_in_between(tmp_pat
                 os.kill(int(pid_file.read_text()), 9)
 
 
+_CGROUP_BUSY_ERROR = (
+    "OCI runtime create failed: runc create failed: unable to start container process: "
+    "write /sys/fs/cgroup/system.slice/docker-x.scope/cgroup.procs: device or resource busy"
+)
+
+
+@pytest.mark.parametrize(
+    "cgroup_result, expected_recovered, starts",
+    [
+        pytest.param("removed", True, 2, id="leftover_cgroup_removed_then_started"),
+        pytest.param("busy", False, 1, id="cgroup_still_holds_a_process"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_clears_a_leftover_cgroup_and_starts_once_more(
+    docker_service, monkeypatch, cgroup_result, expected_recovered, starts
+):
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    start_existing_container = AsyncMock(side_effect=[RuntimeError(_CGROUP_BUSY_ERROR), None])
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    async def run(command, *_args, **_kwargs):
+        if "--format '{{.Id}}'" in command:
+            return _make_ssh_command_result(stdout=f"{_ORPHANED_TASK_ID}\n")
+        if "cgroup.procs" not in command and "/sys/fs/cgroup" in command:
+            return _make_ssh_command_result(stdout=f"{cgroup_result}\n")
+        if ".Destination" in command:
+            return _make_ssh_command_result(stdout="/root\n")
+        return _make_ssh_command_result(stdout="volume_pod-1\n")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    assert start_existing_container.await_count == starts
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert DockerCommand.remove_stale_container_cgroup(_ORPHANED_TASK_ID) in commands
+
+
+@pytest.mark.parametrize(
+    "cgroup_result, expected_recovered, starts",
+    [
+        pytest.param("removed", True, 2, id="recorded_cgroup_error_cleared_then_started"),
+        pytest.param("busy", False, 1, id="still_busy_left_for_the_next_cycle"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_whose_recorded_error_is_the_leftover_cgroup(
+    docker_service, monkeypatch, cgroup_result, expected_recovered, starts
+):
+    # the failed start saved the cgroup error as State.Error and there is no stale mountpoint to repair:
+    # recovery still runs, so a busy cleanup this cycle is retried on the next one
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    start_existing_container = AsyncMock(side_effect=[RuntimeError(_CGROUP_BUSY_ERROR), None])
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    async def run(command, *_args, **_kwargs):
+        if "--format '{{.Id}}'" in command:
+            return _make_ssh_command_result(stdout=f"{_ORPHANED_TASK_ID}\n")
+        if "cgroup.procs" not in command and "/sys/fs/cgroup" in command:
+            return _make_ssh_command_result(stdout=f"{cgroup_result}\n")
+        return _make_ssh_command_result(stdout="")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _CGROUP_BUSY_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    assert start_existing_container.await_count == starts
+
+
+@pytest.mark.parametrize(
+    "status, holds_process, expected",
+    [
+        ("exited", False, "removed"),
+        ("exited", True, "busy"),
+        ("running", False, "skipped state=running"),
+    ],
+)
+def test_remove_stale_container_cgroup_removes_only_empty_cgroups(tmp_path, status, holds_process, expected):
+    scope = tmp_path / "system.slice" / f"docker-{_ORPHANED_TASK_ID}.scope"
+    (scope / "init.scope").mkdir(parents=True)
+    (scope / "docker" / "inner").mkdir(parents=True)
+    if holds_process:  # a plain file stands in for a process: rmdir of a non-empty dir fails like EBUSY
+        (scope / "docker" / "inner" / "pid").write_text("1")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f"#!/bin/sh\necho {status}\n")
+    fake_docker.chmod(0o755)
+    command = (
+        DockerCommand.remove_stale_container_cgroup(_ORPHANED_TASK_ID)
+        .replace("[ /proc/1/root/ -ef / ]", "false")
+        .replace("/proc/1/root/sys/fs/cgroup", str(tmp_path))
+        .replace("/usr/bin/docker", str(fake_docker))
+    )
+
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=30).stdout.strip()
+
+    assert out == expected
+    assert scope.exists() is (expected != "removed")
+
+
 @pytest.mark.asyncio
 async def test_recover_pod_runs_once_at_a_time_per_pod(docker_service, monkeypatch):
     # two overlapping check cycles on the same stale verdict: only the first one recovers
@@ -9407,7 +9568,9 @@ _COPY = 24 * _GIB + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES
         # review: 200 GiB free gave 120 + 60 and the copy then needed 214; the copy is budgeted first
         (200, None, None, _COPY, False, "flatten_copy", "flattened"),
         (200, None, None, None, False, "pool", "no_disk"),  # no budget (few layers): the flatten guard refuses
-        (200, 500, None, _COPY, False, "flatten_copy", "flattened"),  # non-binding request cap
+        # an ordered volume is never cut for the copy (5 Nov: 233 GB ordered, 157 granted); no room: refused
+        (200, 500, None, _COPY, False, "pool", "no_disk"),
+        (200, 115, None, _COPY, False, "request_cap", "no_disk"),
         (200, 40, None, _COPY, False, "request_cap", "flattened"),  # binding request cap
         # the minimum volume stays granted; a disk too small for it and the copy refuses the flatten
         (100, None, 50, _COPY, False, "flatten_copy", "no_disk"),
@@ -9419,7 +9582,8 @@ _COPY = 24 * _GIB + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES
     ids=[
         "review_full_node",
         "unbudgeted",
-        "cap_nonbinding",
+        "order_over_pool",
+        "order_kept",
         "cap_binding",
         "min_volume_short",
         "min_volume_fits",
@@ -9445,6 +9609,7 @@ async def test_fresh_sizing_leaves_room_for_the_flatten_it_admits(
             flatten_copy_bytes=copy_bytes,
         )
         assert sizing.capped_by == capped_by
+        assert capped_by != "request_cap" or sizing.volume_limit_gb == volume_limit_gb
         assert min_volume_gb is None or sizing.volume_limit_gb >= min_volume_gb
         volume_gb, storage_gb = sizing.volume_limit_gb, sizing.storage_limit_gb
     client = _SysboxFailingRentalClient({"sglang"})
@@ -9460,6 +9625,52 @@ async def test_fresh_sizing_leaves_room_for_the_flatten_it_admits(
     else:
         with pytest.raises(ImageFlattenNoDisk):
             await create
+
+
+@pytest.mark.asyncio
+async def test_fresh_sizing_leaves_the_flatten_room_for_what_the_create_writes_before_it(docker_service):
+    """Regression (4 Nov, a 16 TiB node): the grant's GiB floors left the flatten ~65 MB, and what the create wrote
+    before the flatten's disk check (its container, its volumes) used that up: the copy was refused."""
+    avail = 200 * _GIB
+    sizing = await docker_service.resolve_volume_sizing(
+        _make_sizing_ssh_client(df_avail_bytes=avail),
+        _make_sizing_payload(disk_share=1.0, storage_limit_gb=1, volume_limit_gb=None, min_volume_gb=None),
+        "tag",
+        {},
+        locked_df_avail_bytes=avail,
+        flatten_copy_bytes=_COPY,
+    )
+    client = _SysboxFailingRentalClient({"sglang"})
+    create = _create_with_flatten(
+        docker_service,
+        client,
+        _flatten_on_disk(avail - 2 * _GIB, 24 * _GIB),  # 2 GiB written between the sizing and the copy
+        reserved_bytes=docker_service_module._flatten_reserved_bytes(
+            sizing.storage_limit_gb, sizing.volume_limit_gb, 1.0
+        ),
+    )
+
+    assert await create == "cid"
+    assert client.events[-1] == "run lium-flattened:abc"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "copy, layers, expected",
+    [
+        (None, "/pod_old 5g 0\n", None),  # no copy to budget: nothing read
+        (_COPY, "", _COPY),
+        # the flatten's check keeps a neighbour's unwritten layer free: the sizing budgets it too
+        (_COPY, "/pod_old 5g 1073741824\n/filler 2g 0\n", _COPY + 6 * _GIB),
+        (_COPY, "garbled", _COPY),  # unreadable: the copy alone, the flatten's own check still guards
+    ],
+    ids=["no_copy", "no_neighbours", "neighbours", "unreadable"],
+)
+async def test_flatten_sizing_budget_adds_the_neighbours_unwritten_layers(copy, layers, expected):
+    ssh = _node_ssh(layers)
+    with patch.object(docker_service_module, "flatten_copy_bytes", AsyncMock(return_value=copy)):
+        assert await docker_service_module._flatten_sizing_budget(ssh, "sglang", "pod_x") == expected
+    assert ssh.run.await_count == (0 if copy is None else 1)
 
 
 def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
@@ -9555,7 +9766,7 @@ async def test_no_disk_for_the_flattened_copy_fails_with_the_renter_sentence(doc
 async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(monkeypatch, docker_run_fails):
     # an edit mounts the pod's volume by name and Docker routes it to the plugin that made it
     # (`vloopback:latest` for every rental before v2): no plugin command, no volume create or rm
-    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     svc._read_host_pid_max = AsyncMock(return_value=4_194_304)
     payload = _edit_payload()
     ssh = _ssh_recording()

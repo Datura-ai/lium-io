@@ -307,8 +307,9 @@ async def test_spot_is_paid_the_secure_side_when_it_is_lower():
 
     await _run([spot, secure])
 
-    assert spot.effective_rate == pytest.approx(HOURLY_RATE)
-    assert spot.incentive == pytest.approx(secure.incentive)
+    assert spot.effective_rate == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * HOURLY_RATE)
+    assert spot.incentive == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * secure.incentive)
+    assert "secure_rate = 0.8 * hourly_rate" in _messages(spot, SPOT_LINE)[0]
 
 
 @pytest.mark.asyncio
@@ -318,7 +319,7 @@ async def test_spot_secure_side_carries_the_nodes_own_sysbox_and_driver(monkeypa
 
     await _run([spot])
 
-    assert spot.effective_rate == pytest.approx(0.5 * HOURLY_RATE)
+    assert spot.effective_rate == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * 0.5 * HOURLY_RATE)
 
 
 @pytest.mark.asyncio
@@ -540,32 +541,107 @@ async def test_spot_rental_flag_leaves_an_idle_spot_node_on_spot_pay(spot_rental
     assert _codes(spot) == []
 
 
-@pytest.mark.asyncio
-async def test_the_free_remainder_of_a_partially_rented_spot_node_keeps_spot_tier():
-    config = IncentiveConfig(
+def _split_config() -> IncentiveConfig:
+    return IncentiveConfig(
         rental_incentive_gpu_types=["H100"],
         max_unrented_gpus={"H100": {8: BUCKET_CAP, 1: BUCKET_CAP}},
         rental_prices_per_hour={H100: HOURLY_RATE},
         gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
     )
 
-    def split_spot() -> JobResult:
-        return _spot(
-            "split-spot",
-            is_rented=True,
-            rented_gpu_count=4,
-            supports_gpu_splitting=True,
-            gpu_splitting_min_count=1,
-            filler_revenue_per_gpu_hour=2.0,
-        )
 
-    split = split_spot()
-    await _run([split], config)
+def _split_spot(**overrides) -> JobResult:
+    # 4 of 8 GPUs rented in 1-GPU splits; the average is the node's 8x configuration's
+    return _spot(
+        "split-spot",
+        **{
+            "is_rented": True,
+            "rented_gpu_count": 4,
+            "supports_gpu_splitting": True,
+            "gpu_splitting_min_count": 1,
+            "filler_revenue_per_gpu_hour": 2.0,
+            **overrides,
+        },
+    )
 
-    # the remainder has no average of its own: it stays out as before, not "no average yet"
-    assert split.incentive == 0
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secure_decision", [False, True])
+async def test_the_free_remainder_of_a_partially_rented_spot_node_takes_spot_idle_pay(monkeypatch, secure_decision):
+    monkeypatch.setattr(settings, "SPOT_IDLE_PAY_SECURE_DECISION_ENABLED", secure_decision)
+    split = _split_spot()
+
+    incentive = await _run([split], _split_config())
+
+    # only the 4 free GPUs are a spot pay candidate, rated at the 1-GPU split tier
+    [(_, free)] = incentive._spot_pay_candidates
+    assert free.is_split_remainder and free.gpu_count == 4
+    assert free.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
+    assert split.incentive_idle > 0
+    # the rented part earns no rental incentive with the spot rental flag off
+    assert split.incentive_rented == 0
+    assert split.incentive == pytest.approx(split.incentive_idle)
+    assert split.gpu_count == 8
     assert ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG not in _codes(split)
-    assert set(_codes(split)) == {ZeroIncentiveReason.SPOT_TIER}
+
+
+@pytest.mark.asyncio
+async def test_a_spot_remainder_and_its_rented_part_are_each_paid_once(spot_rental_on):
+    split = _split_spot()
+    redis_service = AsyncMock()
+    redis_service.get_portion_per_gpu_type.return_value = 1.0
+    incentive = RentalPriceIncentive(_split_config(), redis_service, {"hk": [split]}, {H100: 8})
+    incentive.price_provider = AsyncMock()
+    incentive.price_provider.get_tao_price.return_value = TAO_PRICE
+    incentive.price_provider.get_alpha_rate.return_value = ALPHA_RATE
+
+    await incentive.calculate_mining_scores()
+
+    # the rented 4 GPUs earn rental incentive only, the free 4 spot idle pay only
+    [(_, free)] = incentive._spot_pay_candidates
+    assert free.gpu_count == 4 and not free.is_rented
+    assert rental_price.earns_spot_rental_incentive(free) is False
+    assert incentive._unbucketed_rental_cost == pytest.approx(4 * SPOT_FACTOR * 2.0)
+    assert split.incentive_rented > 0
+    assert split.incentive_idle > 0
+    assert split.incentive == pytest.approx(split.incentive_rented + split.incentive_idle)
+
+
+@pytest.mark.asyncio
+async def test_a_spot_remainder_without_a_lium_filler_is_not_paid():
+    split = _split_spot(has_lium_filler=False)
+
+    incentive = await _run([split], _split_config())
+
+    assert incentive._spot_pay_candidates == []
+    assert split.incentive == 0
+    assert ZeroIncentiveReason.SPOT_WITHOUT_LIUM_FILLER in _codes(split)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secure_decision", [False, True])
+async def test_a_spot_remainder_below_the_port_floor_is_not_paid(monkeypatch, secure_decision):
+    monkeypatch.setattr(settings, "SPOT_IDLE_PAY_SECURE_DECISION_ENABLED", secure_decision)
+    split = _split_spot(spec={"available_port_count": 2})
+
+    incentive = await _run([split], _split_config())
+
+    assert incentive._spot_pay_candidates == []
+    assert split.incentive == 0
+    assert ZeroIncentiveReason.PORT_LIMITED_REMAINDER in _codes(split)
+
+
+@pytest.mark.asyncio
+async def test_a_spot_remainder_is_paid_only_for_its_splits_with_a_free_port():
+    # 4 free 1-GPU splits, 3 free ports: 3 GPUs paid, the merged row still reports 8
+    split = _split_spot(spec={"available_port_count": 3})
+
+    incentive = await _run([split], _split_config())
+
+    [(_, free)] = incentive._spot_pay_candidates
+    assert free.gpu_count == 3
+    assert split.gpu_count == 8
+    assert split.incentive_idle > 0
 
 
 @pytest.mark.asyncio
@@ -1482,40 +1558,3 @@ async def test_secure_uses_an_average_taken_over_24_gpu_hours(context_factory):
 
     assert secure.filler_revenue_per_gpu_hour == 2.0
 
-
-ADAPTER_IDLE_PAY_SHARE_OF_FILLER = 0.9  # DAH-5677 (Rustam), written out like the factors above
-
-
-@pytest.mark.asyncio
-async def test_an_sxm_on_pcie_adapter_node_is_paid_90_percent_of_its_filler_average():
-    adapter = _node("adapter", sxm_on_pcie_adapter=True, filler_revenue_per_gpu_hour=0.664)
-    pcie = _node("pcie", filler_revenue_per_gpu_hour=0.664)
-
-    incentive = await _run([adapter, pcie], _config(cap=16))  # both fit: no dilution
-
-    assert adapter.hourly_rate == pytest.approx(ADAPTER_IDLE_PAY_SHARE_OF_FILLER * 0.664)
-    assert _paid_rate(adapter) == pytest.approx(ADAPTER_IDLE_PAY_SHARE_OF_FILLER * 0.664)  # no floor up to 1.0 x
-    assert pcie.hourly_rate == HOURLY_RATE  # a real H100 PCIe keeps its listed rate
-    _assert_pool_pays_exactly(incentive)
-
-
-@pytest.mark.asyncio
-async def test_an_sxm_on_pcie_adapter_node_without_an_average_earns_no_idle_pay():
-    adapter = _node("adapter", sxm_on_pcie_adapter=True, filler_revenue_per_gpu_hour=None)
-
-    await _run([adapter])
-
-    assert adapter.hourly_rate == 0
-    assert _paid_rate(adapter) == 0
-
-
-@pytest.mark.asyncio
-async def test_an_sxm_on_pcie_adapter_node_is_floored_at_its_share_after_dilution():
-    adapters = [_node(f"adapter-{i}", sxm_on_pcie_adapter=True, filler_revenue_per_gpu_hour=0.664) for i in range(2)]
-
-    incentive = await _run(adapters)  # 16 GPUs in a cap of 8: halved
-
-    for node in adapters:
-        assert node.unrented_cap_multiplier == 0.5
-        assert _paid_rate(node) == pytest.approx(ADAPTER_IDLE_PAY_SHARE_OF_FILLER * 0.664)
-    _assert_pool_pays_exactly(incentive)

@@ -89,11 +89,14 @@ PREFIX_FAILED_MARKER = "PRERUN_PROBE_PREFIX_FAILED"
 
 
 def port_check_container_filters(miner_hotkey: str) -> str:
-    """`docker ps` filters for validator probes (`container_{hotkey}_*`) and backend `health_check_*`."""
-    # docker ps OR-s multiple --filter name= flags
+    """`docker ps` filters for validator probes (`container_{hotkey}_*`, the port verifier's
+    `port_test_*`) and backend `health_check_*`."""
+    # docker ps OR-s multiple --filter name= flags. port_test_ runs --network=host, so neither
+    # `ss` in the executor nor `docker ps` Ports shows the host ports it holds (DAH-5797)
     return (
         f"--filter {shlex.quote(f'name=^container_{miner_hotkey}_')} "
-        f"--filter {shlex.quote('name=^health_check_')}"
+        f"--filter {shlex.quote('name=^health_check_')} "
+        f"--filter {shlex.quote('name=^port_test_')}"
     )
 
 

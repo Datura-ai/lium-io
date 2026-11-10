@@ -109,6 +109,15 @@ def no_docker_hub_digest_on_rent_path():
 
 
 @pytest.fixture(autouse=True)
+def no_rental_start_record_on_fake_hosts():
+    """A customer create records each GPU's power at rental start and fails when the host cannot report
+    it; the create tests' fake hosts answer no nvidia-smi. test_gpu_power_limit.py tests the record
+    through `neurons.validators.src.services.gpu_power_limit`, a module this patch does not touch."""
+    with patch("services.gpu_power_limit._record_rental_start_ratios", AsyncMock()) as record:
+        yield record
+
+
+@pytest.fixture(autouse=True)
 def pod_ssh_answers_on_create_path(request):
     """create_container connects to the pod's mapped SSH port before ContainerCreated; tests have no pod there.
     test_pod_ssh_before_created.py covers the check itself (marker real_pod_ssh_check)."""

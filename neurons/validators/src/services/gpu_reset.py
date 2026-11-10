@@ -370,8 +370,14 @@ async def _precheck(
 
     host_gpus_result = await _run(runner, HOST_GPUS_COMMAND)
     host_gpus = parse_host_gpus(host_gpus_result.stdout or "")
+    # a dropped channel says nothing about the host's GPUs; only a hung or failed nvidia-smi does
+    if host_gpus_result.error_type not in (None, "timeout"):
+        raise GpuResetRefused(GpuResetErrorCode.ExecutorUnreachable, "the GPU listing lost its SSH channel")
     if host_gpus_result.exit_code != 0 or not host_gpus:
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "nvidia-smi listed no GPU on the host")
+        raise GpuResetRefused(
+            GpuResetErrorCode.GpusLostOnHost,
+            "The GPUs stopped responding on the host. The provider has to reboot it before they can be used again.",
+        )
     host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
     gpus = pod_gpus(device_requests, host_gpus, pod_gpu_uuids, gpu_indices)
     ordered, requested, index_by_uuid = gpus.ordered, gpus.requested, gpus.index_by_uuid
@@ -394,26 +400,8 @@ async def _precheck(
     # both ownership sources: a `--gpus all` container may see more GPUs than the backend gave the pod
     owns_host = set(ordered) == set(host_by_uuid) == set(pod_gpu_uuids)
     if owns_host:
-        # the pod owns every host GPU: the host's own GPU holders may be stopped around its reset too
-        host_services = [
-            unit
-            for unit in HOST_GPU_SERVICES
-            if unit in fabric_services or (unit not in FABRIC_SERVICES and await _service_active(runner, unit))
-        ]
-        listed = await _run(runner, DOCKER_PS_COMMAND)
-        for line in (listed.stdout or "").splitlines() if listed.exit_code == 0 else []:
-            cid, auto_remove, image = (line.strip().split(" ", 2) + ["", ""])[:3]
-            if (
-                "dcgm-exporter" in image
-                and auto_remove == "false"
-                and cid != container_id
-                and re.fullmatch(r"[0-9a-f]{12,64}", cid)
-            ):
-                holder_containers.append(cid)
-        if not host_services and not holder_containers:
-            # a host proven without systemd and with nothing to stop resets directly, as before the host unit
-            probe = await _run(runner, HOST_SYSTEMD_PROBE)
-            owns_host = not (probe.exit_code == 0 and (probe.stdout or "").strip() == "no-systemd")
+        holders = await plan_host_holders(runner, fabric_services, container_id)
+        host_services, holder_containers, owns_host = holders.host_services, holders.holder_containers, holders.owns_host
     return _Plan(
         container_id,
         ordered,
@@ -424,6 +412,41 @@ async def _precheck(
         holder_containers=holder_containers,
         owns_host=owns_host,
     )
+
+
+@dataclass(frozen=True)
+class HostHolders:
+    host_services: list[str]
+    holder_containers: list[str]
+    owns_host: bool
+
+
+async def plan_host_holders(
+    runner: SSHCommandRunner, fabric_services: list[str], container_id: str | None
+) -> HostHolders:
+    """For a pod that owns every host GPU: the host services and holder containers to stop around its reset, and
+    whether the reset runs in the host unit (False only on a host proven without systemd with nothing to stop)."""
+    host_services = [
+        unit
+        for unit in HOST_GPU_SERVICES
+        if unit in fabric_services or (unit not in FABRIC_SERVICES and await _service_active(runner, unit))
+    ]
+    holder_containers: list[str] = []
+    listed = await _run(runner, DOCKER_PS_COMMAND)
+    for line in (listed.stdout or "").splitlines() if listed.exit_code == 0 else []:
+        cid, auto_remove, image = (line.strip().split(" ", 2) + ["", ""])[:3]
+        if (
+            "dcgm-exporter" in image
+            and auto_remove == "false"
+            and cid != container_id
+            and re.fullmatch(r"[0-9a-f]{12,64}", cid)
+        ):
+            holder_containers.append(cid)
+    if not host_services and not holder_containers:
+        # a host proven without systemd and with nothing to stop resets directly, as before the host unit
+        probe = await _run(runner, HOST_SYSTEMD_PROBE)
+        return HostHolders([], [], not (probe.exit_code == 0 and (probe.stdout or "").strip() == "no-systemd"))
+    return HostHolders(host_services, holder_containers, True)
 
 
 async def _service_active(runner: SSHCommandRunner, unit: str) -> bool:

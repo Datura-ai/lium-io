@@ -1,6 +1,8 @@
 """GET /miner-identity: the executor names the miner hotkey it is configured for and echoes the
 caller's nonce, without a signature (the hotkey is public on chain)."""
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from middlewares.miner import MinerMiddleware
@@ -56,3 +58,30 @@ def test_short_or_non_hex_nonce_is_refused():
     assert client.get("/miner-identity", params={"nonce": "ab" * 8}).status_code == 422
     assert client.get("/miner-identity", params={"nonce": "zz" * 16}).status_code == 422
     assert client.get("/miner-identity", params={"nonce": "ab" * 65}).status_code == 422
+
+
+def _keys_dir(monkeypatch, tmp_path, *, mounted: bool):
+    (tmp_path / "ssh_host_ed25519_key.pub").write_text("ssh-ed25519 AAAA")
+    monkeypatch.setattr(settings, "SSH_HOST_KEYS_DIR", str(tmp_path))
+    monkeypatch.setattr("routes.apis.os.path.ismount", lambda path: mounted and Path(path) == tmp_path)
+
+
+def test_reports_the_ssh_port_when_host_keys_persist(monkeypatch, tmp_path):
+    _keys_dir(monkeypatch, tmp_path, mounted=True)
+    monkeypatch.setattr(settings, "SSH_PUBLIC_PORT", None)
+    assert _client().get("/miner-identity", params={"nonce": NONCE}).json()["ssh_host_key_port"] == settings.SSH_PORT
+
+    monkeypatch.setattr(settings, "SSH_PUBLIC_PORT", 40022)
+    assert _client().get("/miner-identity", params={"nonce": NONCE}).json()["ssh_host_key_port"] == 40022
+
+
+def test_no_ssh_port_when_host_keys_do_not_persist(monkeypatch, tmp_path):
+    # CVM: ssh_host_keys.sh fills the dir, but it is not a volume
+    _keys_dir(monkeypatch, tmp_path, mounted=False)
+    assert "ssh_host_key_port" not in _client().get("/miner-identity", params={"nonce": NONCE}).json()
+
+
+def test_no_ssh_port_when_the_volume_holds_no_keys(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "SSH_HOST_KEYS_DIR", str(tmp_path))
+    monkeypatch.setattr("routes.apis.os.path.ismount", lambda path: True)
+    assert "ssh_host_key_port" not in _client().get("/miner-identity", params={"nonce": NONCE}).json()

@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import time
 from dataclasses import replace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
@@ -9,6 +10,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutorsResponse,
     RentedPod,
 )
+from neurons.validators.src.services.attestation_service import HostPolicyResult
 from neurons.validators.src.services.executor_connectivity.models import (
     DindLogCause,
     PortPair,
@@ -16,6 +18,7 @@ from neurons.validators.src.services.executor_connectivity.models import (
     PortVerificationResult,
 )
 from neurons.validators.src.services.redis_service import VerifiedPortsMemory
+from neurons.validators.src.services.task import service as task_service_module
 from neurons.validators.src.services.task.checks import (
     port_connectivity as port_connectivity_module,
 )
@@ -23,8 +26,18 @@ from neurons.validators.src.services.task.checks.port_connectivity import (
     VERIFIED_PORTS_MEMORY_TTL_SECONDS,
     PortConnectivityCheck,
 )
+from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
+from neurons.validators.src.services.task.messages import (
+    GpuLossHoldMessages,
+    PostRentalGpuRecheckMessages,
+    GpuMemoryHealthMessages,
+    TenantEnforcementMessages,
+    render_message,
+)
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
+from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
+from neurons.validators.src.services.task.service import TaskService
 
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state
@@ -120,6 +133,7 @@ class DummyConnectivityService:
         dind_error: DindLogCause | None = None,
         port_ranges: tuple[PortRangeResult, ...] = (),
         sysbox_measured: bool | None = None,
+        host_runtime_fault: bool = False,
     ):
         """
         Args:
@@ -131,6 +145,7 @@ class DummyConnectivityService:
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
         self.dind_error = dind_error
+        self.host_runtime_fault = host_runtime_fault
         self.sysbox_measured = sysbox_measured
         self.port_ranges = port_ranges
         self.success = success
@@ -151,6 +166,7 @@ class DummyConnectivityService:
         rented_pod_names: list[str] | None = None,
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
+        min_ports: int = 3,
         dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
@@ -160,7 +176,9 @@ class DummyConnectivityService:
             "executor_uuid": executor_info.uuid,
             "sysbox_runtime": sysbox_runtime,
             "rented_ports": rented_ports,
+            "rented_pod_names": rented_pod_names,
             "filler_ports": filler_ports,
+            "min_ports": min_ports,
         }
 
         if self.verified_port_count:
@@ -192,6 +210,7 @@ class DummyConnectivityService:
             dind_error=self.dind_error,
             port_ranges=self.port_ranges,
             sysbox_measured=self.sysbox_measured,
+            host_runtime_fault=self.host_runtime_fault,
         )
 
 
@@ -310,6 +329,18 @@ async def test_port_connectivity_passes_filler_ports_as_exclusions(context_facto
 
     assert connectivity_service.called_with["filler_ports"] == [40001, 40003]
     assert connectivity_service.called_with["rented_ports"] == []
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_asks_the_probe_for_every_port_an_idle_split_node_needs(context_factory):
+    connectivity_service = DummyConnectivityService(success=True, verified_port_count=3)
+    services = build_services(redis=DummyRedis(), backend=DummyBackendService(), connectivity=connectivity_service)
+    state = build_state(gpu_count=8, supports_gpu_splitting=True, gpu_splitting_min_count=1)
+    ctx = context_factory(services=services, config=build_context_config(job_batch_id="batch-123"), state=state)
+
+    await PortConnectivityCheck().run(ctx)
+
+    assert connectivity_service.called_with["min_ports"] == 24
 
 
 @pytest.mark.asyncio
@@ -1055,6 +1086,84 @@ async def test_the_fourth_pressured_cycle_runs_the_check_and_ends_the_streak(con
 
 
 @pytest.mark.asyncio
+async def test_an_idle_node_defers_once_in_a_row(context_factory, monkeypatch):
+    """DAH-5851 review: an idle node's deferred cycle is withheld, so a second one in a row runs the check
+    before the backend's 45-minute sweep could drop the unpublished row."""
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    deferred = []
+    for _ in range(4):
+        ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED)
+        if not redis_service.verified_ports:
+            _remember(redis_service, ctx)
+        result = await PortConnectivityCheck().run(ctx)
+        deferred.append(connectivity.called_with is None)
+        assert result.passed
+    assert deferred == [True, False, True, False]
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_memory_keeps_the_listing_but_never_pays_free_gpus_across_the_deferral_cadence(context_factory, monkeypatch):
+    """Review on #1964: three deferrals then one briefly healthy forced check, repeated. Only the forced
+    check's own measurement reaches the free GPUs' idle pay; the rental stays, and so does the listing (DAH-5851)."""
+    from incentive.rental_price import RentalPriceIncentive
+
+    from neurons.validators.src.services.task.checks.port_count import PortCountCheck
+    from tests.test_split_remainder_port_floor import MINER_HOTKEY, _build_incentive, _make_job
+
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    unpaid, deferred, listed = [], [], []
+    for _ in range(8):
+        ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
+        if not redis_service.verified_ports:
+            _remember(redis_service, ctx, pairs=[(port, port) for port in range(40020, 40044)])
+        connected = await PortConnectivityCheck().run(ctx)
+        counted = await PortCountCheck().run(ctx.model_copy(update=connected.updates))
+        assert counted.passed  # the renter's pod keeps the node rented
+        listed.append(counted.updates["state"].specs["available_port_count"])
+        deferred.append(connectivity.called_with is None)
+        incentive = _build_incentive(
+            _make_job(spec=counted.updates["state"].specs, gpu_count=8, rented_gpu_count=1, is_rented=True)
+        )
+        incentive._expand_partially_rented_split_results()
+        limited = RentalPriceIncentive._port_limited_remainder(incentive.job_results[MINER_HOTKEY][1])
+        unpaid.append(limited.unpaid_gpu_count if limited else 0)
+
+    assert deferred == [True, True, True, False] * 2
+    assert unpaid == [7, 7, 7, 0] * 2  # 7 free one-GPU splits: paid only on the measured cycle
+    # DAH-5851: the free GPUs stay listed on the last completed check's ports (24 remembered, then the forced 100)
+    assert listed == [24, 24, 24, 100, 100, 100, 100, 100]
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_cycle_withholds_an_idle_nodes_verdict_and_never_carries_it(context_factory, monkeypatch):
+    """DAH-5851: an idle node (our filler on it) on a deferral is neither hidden for 0 ports nor scored from the
+    republished ones: the run is withheld at the cycle's end, and the renter-GPU-reset carry never picks it up."""
+    from services.executor_rollout import withhold_renter_gpu_reset_verdicts
+    from neurons.validators.src.services.task.checks.port_count import PortCountCheck
+    from neurons.validators.src.services.task.messages import PortCountMessages
+    from tests.test_executor_rollout_grace import _failed
+
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED)
+    _remember(redis_service, ctx, pairs=[(port, port) for port in range(40020, 40044)])
+    connected = await PortConnectivityCheck().run(ctx)
+    counted = await PortCountCheck().run(ctx.model_copy(update=connected.updates))
+
+    assert connectivity.called_with is None
+    reason = PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    assert not counted.passed and counted.event.reason_code == reason
+    assert "listing_hidden" not in counted.event.model_dump_json()
+    standing, withheld = withhold_renter_gpu_reset_verdicts(
+        {"miner": [_failed("deferred-node", reason), _failed("other-node", "INSUFFICIENT_PORTS")]}
+    )
+    assert [w.result.executor_info.uuid for w in withheld] == ["deferred-node"]
+    assert [r.executor_info.uuid for r in standing["miner"]] == ["other-node"]
+
+
+@pytest.mark.asyncio
 async def test_a_remembered_identity_that_changed_is_not_republished(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
     redis_service = DummyRedis()
@@ -1667,6 +1776,29 @@ async def test_a_persisting_port_miss_restarts_the_window_instead_of_earning_fre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rental_ip, skipped", [("10.0.0.9", False), ("127.0.0.1", True)])
+async def test_another_miners_rental_under_this_uuid_skips_ports_only_on_this_endpoint(
+    context_factory, rental_ip, skipped
+):
+    """DAH-3698: a provider advertising a competitor's executor UUID gets no ports skipped for that rental; on the
+    same IP and port the renter's pod is on this box, so its ports stay skipped."""
+    foreign = RentedExecutor(
+        miner_hotkey="other-miner",
+        executor_ip_address=rental_ip,
+        executor_ip_port="22",
+        pods=[RentedPod(pod_id="pod-x", container_name="container_pod-x", rented_ports=[40010, 40011])],
+    )
+    state = build_state(rented_data=RentedExecutorsResponse(executors={"executor-123": foreign}))
+    ctx = _verified_ctx(context_factory, redis_service=DummyRedis(), state=state, dind_ok=True, sysbox_measured=True)
+
+    await PortConnectivityCheck().run(ctx)
+
+    called = ctx.services.connectivity.called_with
+    assert called["rented_ports"] == ([40010, 40011] if skipped else [])
+    assert called["rented_pod_names"] == (["container_pod-x"] if skipped else [])
+
+
+@pytest.mark.asyncio
 async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
     # DAH-5244 review: a read-then-set counter let two cycles take the same slot of the bounded streak
     import asyncio
@@ -1693,6 +1825,38 @@ async def test_concurrent_deferrals_take_distinct_slots_of_the_streak():
     assert await service.redis.ttl("disk_pressure_deferrals:hk:ex") > 3000
     await service.clear_disk_pressure_deferrals("hk", "ex", shadow=False)
     assert await service.disk_pressure_deferrals("hk", "ex", shadow=False) == 0
+
+
+class _Session:
+    def __init__(self, closed: bool):
+        self.closed = closed
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connectivity",
+    [
+        {"success": False, "status": "error"},
+        {"success": False, "status": "no_working_ports"},
+        # the drop failed only the DinD probe, so two batch ports read as a partial "ok"
+        {"success": True, "verified_port_count": 2, "dind_ok": False},
+        {"success": True, "verified_port_count": 3},
+    ],
+)
+async def test_a_lost_ssh_session_ends_the_run_without_a_ports_verdict(context_factory, connectivity):
+    # the session died, so nothing was measured or saved; the run ends on EXECUTOR_TRANSPORT_UNREACHABLE
+    redis_service = DummyRedis()
+    ctx = _port_ctx(context_factory, redis_service, success=False, connectivity=DummyConnectivityService(**connectivity))
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=True)})
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert (result.passed, result.fatal, result.updates) == (False, True, {})
+    assert result.event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert redis_service.verified_ports == {}
 
 
 class CountingBackendService(DummyBackendService):
@@ -1730,3 +1894,145 @@ async def test_a_rental_holding_every_port_is_an_info_verdict_not_a_port_failure
     assert result.passed is expected_pass
     assert result.event.reason_code == expected_reason
     assert backend.calls == (0 if expected_pass else 1)
+
+
+class _NonFatalGpuMemoryFinding:
+    # GpuMemoryHealthCheck on a partly rented node: the broken card is reported, the run goes on
+    check_id = "gpu.memory_health"
+    fatal = False
+
+    async def run(self, ctx):
+        event = render_message(GpuMemoryHealthMessages.FAILED, ctx=ctx, check_id=self.check_id)
+        return CheckResult(passed=False, event=event, fatal=False)
+
+
+class _PublishedResult:
+    score = 0
+
+
+class _CleanScrapeAfterDropout:
+    # GpuLossHoldCheck on a clean scrape: the hold ends, the load test after the port check must republish it
+    check_id = "gpu.loss_hold"
+    fatal = False
+
+    async def run(self, ctx):
+        event = render_message(GpuLossHoldMessages.CLEAN_AGAIN, ctx=ctx, check_id=self.check_id)
+        return CheckResult(passed=True, event=event)
+
+
+class _RecheckPassed:
+    # PostRentalGpuRecheckCheck after the hold ended: every card passed its load test and the marker is cleared
+    check_id = "gpu.post_rental_recheck"
+    fatal = False
+
+    async def run(self, ctx):
+        event = render_message(PostRentalGpuRecheckMessages.PASSED, ctx=ctx, check_id=self.check_id)
+        return CheckResult(passed=True, event=event)
+
+
+async def _create_task_on_a_session_lost_in_the_port_check(context_factory, monkeypatch, *first_checks):
+    class _DropsTheSession(DummyConnectivityService):
+        # the session dies during the port check, so the earlier checks ran on a live one
+        async def verify_ports(self, ssh_client, *args, **kwargs):
+            ssh_client.closed = True
+            return await super().verify_ports(ssh_client, *args, **kwargs)
+
+    ctx = _port_ctx(
+        context_factory, DummyRedis(), success=False, connectivity=_DropsTheSession(success=False, status="error")
+    )
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=False)})
+
+    class _Shell:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    service = TaskService.__new__(TaskService)
+    service.ssh_service = MagicMock(decrypt_payload=MagicMock(return_value="key"))
+    service.attestation_service = MagicMock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult()))
+    service.redis_service = MagicMock()
+    service.pipeline_factory = MagicMock(
+        build_context=AsyncMock(return_value=ctx),
+        build_checks=MagicMock(return_value=[*first_checks, PortConnectivityCheck(), PortCountCheck()]),
+        build_pipeline=lambda checks, reconnect=None: Pipeline(checks, sink=AsyncMock(), reconnect=reconnect),
+    )
+    handler = MagicMock(handle_result=AsyncMock(return_value=_PublishedResult()))
+    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _Shell())
+    monkeypatch.setattr(task_service_module, "ResultHandler", lambda *a, **k: handler)
+    monkeypatch.setattr(task_service_module.settings, "DRY_RUN", False)
+    monkeypatch.setattr(task_service_module.settings, "VALIDATOR_LIUMD_SHADOW", False)
+
+    result = await service.create_task(
+        miner_info=MagicMock(job_batch_id="batch-123", miner_hotkey="5Miner"),
+        executor_info=ctx.executor,
+        keypair=MagicMock(ss58_address="5Val"),
+        private_key="key",
+        public_key="pub",
+        encrypted_files=MagicMock(),
+        rented_data=None,
+        default_docker_image_digests={},
+    )
+    assert handler.handle_result.await_args.kwargs["success"] is False
+    assert result.failure_reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    # withheld at cycle end, in a rollout or not (test_executor_rollout_grace.py)
+    assert result.session_lost_in_port_check is True
+    return result
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_in_the_port_check_keeps_an_earlier_gpu_finding_published(context_factory, monkeypatch):
+    # review 4468576252: a raise dropped every event and published availability_errors=[], re-listing the broken GPU
+    result = await _create_task_on_a_session_lost_in_the_port_check(
+        context_factory, monkeypatch, _NonFatalGpuMemoryFinding()
+    )
+
+    assert [e["reason_code"] for e in result.availability_errors] == [GpuMemoryHealthMessages.FAILED.reason]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_gpu_finding", [False, True])
+async def test_a_session_lost_after_a_clean_scrape_ended_a_gpu_loss_hold_publishes_the_hold(
+    context_factory, monkeypatch, with_gpu_finding
+):
+    # reviews 4469140353 / 4469609761: [] cleared the stored GPU_LOST hold before the load test could republish it,
+    # and after a restart the last published list is empty, so the run itself carries the hold
+    checks = [_NonFatalGpuMemoryFinding()] if with_gpu_finding else []
+    result = await _create_task_on_a_session_lost_in_the_port_check(
+        context_factory, monkeypatch, *checks, _CleanScrapeAfterDropout()
+    )
+
+    expected = [GpuMemoryHealthMessages.FAILED.reason] if with_gpu_finding else []
+    assert [e["reason_code"] for e in result.availability_errors] == [*expected, "GPU_LOST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recheck_ran", [False, True], ids=["drop-before-recheck", "drop-after-recheck-passed"])
+async def test_a_session_lost_after_the_recheck_passed_publishes_no_hold(context_factory, monkeypatch, recheck_ran):
+    # review 4491529165: a recovery whose load test already passed is not published as still waiting for it
+    checks = [_CleanScrapeAfterDropout(), *([_RecheckPassed()] if recheck_ran else [])]
+    result = await _create_task_on_a_session_lost_in_the_port_check(context_factory, monkeypatch, *checks)
+
+    assert [e["reason_code"] for e in (result.availability_errors or [])] == ([] if recheck_ran else ["GPU_LOST"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [True, False])
+async def test_host_runtime_fault_is_the_dind_probes_own_reading(context_factory, fault):
+    """DAH-5651: the state carries the DinD probe's reading (DindVerifier: the container started and its sshd
+    never answered), not a guess from dind_ok, which a refused `docker run` or our own error also clears."""
+    services = build_services(
+        redis=DummyRedis(),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=False, verified_port_count=100, dind_ok=False, host_runtime_fault=fault
+        ),
+    )
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=_rented_state()
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].host_runtime_fault is fault
