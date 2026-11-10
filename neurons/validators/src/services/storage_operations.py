@@ -148,7 +148,9 @@ async def start_storage_operation(
                 if existing_state != "STARTING":
                     break
         if existing_state == f"STATUS:{KILLED_EXIT}":
-            await report_killed_helper(operation_id, spec)  # a killed helper could not report for itself
+            await report_killed_helper(
+                operation_id, spec
+            )  # a killed helper could not report for itself
         if existing_state.startswith("STATUS:") and not retain_terminal_artifacts:
             # an online job's finished helper (its files are gone already): a new dispatch runs it again
             await _remove_operation_artifacts(ssh_client, files)
@@ -228,7 +230,9 @@ async def wait_for_storage_operation(
     The caller owns the reopened connection and continues on it.
     """
     try:
-        await _wait_for_storage_operation(ssh_client, files, poll_interval_seconds, launch_grace_polls, False, spec)
+        await _wait_for_storage_operation(
+            ssh_client, files, poll_interval_seconds, launch_grace_polls, False, spec
+        )
         return ssh_client
     except (asyncssh.Error, OSError):
         if reconnect is None:
@@ -333,7 +337,9 @@ async def cancel_storage_operation(
     files = StorageOperationFiles.for_operation(operation_id)
     spec = await _read_operation_spec(ssh_client, files.spec)
     helper = shlex.quote(files.helper)
-    legacy_runner = shlex.quote(f"[-]-spec {files.spec}")  # "[-]" keeps pgrep from matching this shell
+    legacy_runner = shlex.quote(
+        f"[-]-spec {files.spec}"
+    )  # "[-]" keeps pgrep from matching this shell
     # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
     # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
     command = (
@@ -414,13 +420,31 @@ async def _remove_stale_helper_container(
     )
 
 
+async def remove_finished_helpers_mounting(
+    ssh_client: asyncssh.SSHClientConnection,
+    volume_name: str,
+) -> None:
+    """An exited plain-volume helper is kept for its exit status, and so keeps the pod volume in use:
+    a pod delete removes it first, or the volume (renter data) would stay on the host."""
+    listing = (
+        f"/usr/bin/docker ps -aq --filter label={WRAPPER_LABEL} --filter status=exited"
+        f" --filter volume={shlex.quote(volume_name)}"
+    )
+    await ssh_client.run(
+        f'ids=$({listing}); test -z "$ids" || /usr/bin/docker rm -f $ids >/dev/null 2>&1 || true',
+        check=False,
+    )
+
+
 async def _tail_operation_log(
     ssh_client: asyncssh.SSHClientConnection,
     log_path: PurePosixPath,
     helper: str = "",
 ) -> str:
     # the launcher's log, then the wrapper helper's own (redacted) event log, which outlives an executor restart
-    fallback = f" 2>/dev/null; /usr/bin/docker logs --tail 20 {shlex.quote(helper)} 2>&1" if helper else ""
+    fallback = (
+        f" 2>/dev/null; /usr/bin/docker logs --tail 20 {shlex.quote(helper)} 2>&1" if helper else ""
+    )
     result = await ssh_client.run(
         f"tail -n 20 {shlex.quote(str(log_path))}{fallback}",
         check=False,
@@ -439,7 +463,11 @@ async def _remove_operation_artifacts(
             shlex.quote(str(path))
             for path in (files.status, files.log, files.pid, files.spec, files.cancel)
         )
-        + (f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true" if files.helper else ""),
+        + (
+            f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true"
+            if files.helper
+            else ""
+        ),
         check=False,
     )
 
@@ -533,14 +561,18 @@ async def _report_operation_status(
     return False
 
 
-async def upload_secrets_file(ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info) -> str:
+async def upload_secrets_file(
+    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info
+) -> str:
     """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file.
 
     Keeps the values out of the remote command line. The file is
     created exclusively with mode 0600 inside a 0700 directory; the script deletes it on read.
     """
     path = str(REMOTE_SECRETS_DIRECTORY / f"{uuid4().hex}.json")
-    await ssh_client.run(f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True)
+    await ssh_client.run(
+        f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True
+    )
     async with ssh_client.start_sftp_client() as sftp:
         async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
             await remote_file.write(

@@ -211,6 +211,7 @@ from services.rental_docker_sdk import (
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
+    remove_finished_helpers_mounting,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
@@ -12942,6 +12943,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_local", volume_name=payload.local_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.local_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.local_volume,
@@ -12954,6 +12956,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.external_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.external_volume,

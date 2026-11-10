@@ -19,7 +19,9 @@ def _fake_docker(tmp_path: Path, inspect_output: str | None) -> tuple[Path, Path
     docker_log = tmp_path / "docker.log"
     fake_docker = tmp_path / "docker"
     inspect = f'echo "{inspect_output}"; exit 0' if inspect_output is not None else "exit 1"
-    fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\nif [ "$1" = inspect ]; then {inspect}; fi\n')
+    fake_docker.write_text(
+        f'#!/bin/sh\necho "$*" >> {docker_log}\nif [ "$1" = inspect ]; then {inspect}; fi\n'
+    )
     fake_docker.chmod(0o755)
     return fake_docker, docker_log
 
@@ -27,9 +29,13 @@ def _fake_docker(tmp_path: Path, inspect_output: str | None) -> tuple[Path, Path
 def _local_ssh(fake_docker: Path) -> SimpleNamespace:
     async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
         # the remote path is fixed; point it at the fake and shorten the bounded waits
-        command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
+        command = command.replace("/usr/bin/docker", str(fake_docker)).replace(
+            "sleep 0.25", "sleep 0.01"
+        )
         result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
-        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        return SimpleNamespace(
+            exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr
+        )
 
     return SimpleNamespace(run=run_locally, start_sftp_client=None)
 
@@ -37,7 +43,13 @@ def _local_ssh(fake_docker: Path) -> SimpleNamespace:
 def _legacy_runner(tmp_path: Path) -> subprocess.Popen:
     # an executor before the wrapper helper: its runner is a local process named by its spec path
     return subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)", "--spec", str(tmp_path / f"{OPERATION_ID}.json")]
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            "--spec",
+            str(tmp_path / f"{OPERATION_ID}.json"),
+        ]
     )
 
 
@@ -79,13 +91,21 @@ async def test_cancel_signals_the_helper_by_name_never_a_stored_pid(
         ("1 exited 1 false", None, "STATUS:1"),
         ("1 exited 137 true", None, "STATUS:137"),
         ("1 exited 1 true", None, "STATUS:137"),  # docker recorded an OOM kill
-        ("<no value> running 0 false", None, "STARTING"),  # an older executor's helper: its files decide
+        (
+            "<no value> running 0 false",
+            None,
+            "STARTING",
+        ),  # an older executor's helper: its files decide
         (None, "1", "STATUS:1"),  # the launcher failed before any helper existed
         (None, None, "STARTING"),
     ],
 )
 async def test_state_is_read_from_the_wrapper_helper(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, helper_state: str | None, status_file: str | None, expected: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    helper_state: str | None,
+    status_file: str | None,
+    expected: str,
 ) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
     fake_docker, _ = _fake_docker(tmp_path, helper_state)
@@ -96,23 +116,32 @@ async def test_state_is_read_from_the_wrapper_helper(
 
 
 @pytest.mark.asyncio
-async def test_wait_reattaches_after_the_executor_restarts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_wait_reattaches_after_the_executor_restarts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    fake_docker, _ = _fake_docker(tmp_path, "1 exited 0 false")  # the helper finished after the restart
+    fake_docker, _ = _fake_docker(
+        tmp_path, "1 exited 0 false"
+    )  # the helper finished after the restart
     fresh = _local_ssh(fake_docker)
 
     async def dropped(command: str, check: bool = False) -> SimpleNamespace:
         raise asyncssh.ConnectionLost("executor restarted")
 
     live = await storage_operations.wait_for_storage_operation(
-        SimpleNamespace(run=dropped), files, poll_interval_seconds=0, reconnect=AsyncMock(return_value=fresh)
+        SimpleNamespace(run=dropped),
+        files,
+        poll_interval_seconds=0,
+        reconnect=AsyncMock(return_value=fresh),
     )
     assert live is fresh  # the caller continues on the reopened session
 
 
 @pytest.mark.asyncio
-async def test_wait_reports_a_killed_helper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_wait_reports_a_killed_helper(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     # the wrapper cannot report its own OOM kill or SIGKILL: the validator's poll does
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
     report = AsyncMock()
@@ -125,18 +154,25 @@ async def test_wait_reports_a_killed_helper(monkeypatch: pytest.MonkeyPatch, tmp
         await storage_operations.wait_for_storage_operation(
             _local_ssh(fake_docker), files, poll_interval_seconds=0, spec=spec
         )
-    assert report.await_args.kwargs["status"] == "FAILED" and report.await_args.kwargs["stage"] == "RESTORING"
+    assert (
+        report.await_args.kwargs["status"] == "FAILED"
+        and report.await_args.kwargs["stage"] == "RESTORING"
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("helper_state", ["1 running 0 false", "1 exited 137 true", "1 exited 1 false"])
+@pytest.mark.parametrize(
+    "helper_state", ["1 running 0 false", "1 exited 137 true", "1 exited 1 false"]
+)
 async def test_redispatch_keeps_a_running_helper_and_relaunches_a_finished_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, helper_state: str
 ) -> None:
     # Real state shell with a fake docker. A running helper owns the run; a finished one is removed and run again,
     # and a killed one is first reported, since it could not report for itself.
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
-    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        storage_operations, "supports_storage_operation", AsyncMock(return_value=True)
+    )
     monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
     killed = AsyncMock()
     monkeypatch.setattr(storage_operations, "report_killed_helper", killed)
@@ -146,13 +182,21 @@ async def test_redispatch_keeps_a_running_helper_and_relaunches_a_finished_one(
 
     if running:
         files = await storage_operations.start_storage_operation(
-            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            ssh_client,
+            "python3",
+            OPERATION_ID,
+            {"engine": "restic"},
+            retain_terminal_artifacts=False,
         )
         assert files.helper == HELPER
     else:
         with pytest.raises(TypeError):  # reaches the sftp spec write: launched again
             await storage_operations.start_storage_operation(
-                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+                ssh_client,
+                "python3",
+                OPERATION_ID,
+                {"engine": "restic"},
+                retain_terminal_artifacts=False,
             )
     assert (f"rm -f -- {HELPER}" in docker_log.read_text().splitlines()) is not running
     assert killed.await_count == ("137" in helper_state)
@@ -171,7 +215,9 @@ async def test_an_older_executor_s_running_helper_is_owned_only_by_a_live_runner
     runner = _legacy_runner(tmp_path) if runner_alive else None
     try:
         files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-        owned = await storage_operations._helper_owned_by_live_runner(_local_ssh(fake_docker), OPERATION_ID, files)
+        owned = await storage_operations._helper_owned_by_live_runner(
+            _local_ssh(fake_docker), OPERATION_ID, files
+        )
     finally:
         if runner:
             runner.kill()
@@ -187,7 +233,9 @@ def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(fi
     probe = storage_operations._WORKSPACE_FIELD_PROBE.replace("/root/app/src", str(executor_src))
 
     assert subprocess.run([sys.executable, "-c", probe, field], check=False).returncode == 0
-    assert subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3
+    assert (
+        subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3
+    )
 
 
 @pytest.mark.asyncio
@@ -198,7 +246,9 @@ async def test_start_never_removes_a_running_helper(
     monkeypatch: pytest.MonkeyPatch, helper_running: bool, runner_alive: bool
 ) -> None:
     # A repeated dispatch sees no runner PID yet (STARTING) while the first run's helper works.
-    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        storage_operations, "supports_storage_operation", AsyncMock(return_value=True)
+    )
     monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
     commands: list[str] = []
 
@@ -217,13 +267,34 @@ async def test_start_never_removes_a_running_helper(
     kept = helper_running and runner_alive
     if kept:
         files = await storage_operations.start_storage_operation(
-            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            ssh_client,
+            "python3",
+            OPERATION_ID,
+            {"engine": "restic"},
+            retain_terminal_artifacts=False,
         )
         assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     else:
         monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-        with pytest.raises(TypeError):  # stops at the sftp spec write, after the stale-helper removal
+        with pytest.raises(
+            TypeError
+        ):  # stops at the sftp spec write, after the stale-helper removal
             await storage_operations.start_storage_operation(
-                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+                ssh_client,
+                "python3",
+                OPERATION_ID,
+                {"engine": "restic"},
+                retain_terminal_artifacts=False,
             )
     assert any("docker rm -f" in c for c in commands) is not kept
+
+
+@pytest.mark.asyncio
+async def test_pod_delete_removes_exited_helpers_holding_its_volume() -> None:
+    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(stdout="", exit_status=0)))
+
+    await storage_operations.remove_finished_helpers_mounting(ssh, "volume_abc")
+
+    command = ssh.run.await_args.args[0]
+    assert "label=lium.storage-wrapper" in command and "status=exited" in command
+    assert "volume=volume_abc" in command and "docker rm -f" in command
