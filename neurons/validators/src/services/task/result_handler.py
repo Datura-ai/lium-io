@@ -14,6 +14,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import (
     classify_gpu_model,
+    list_gh200_off_grace_as_reference,
     list_sxm_on_pcie_adapter_as_pcie,
     reference_gpu_model,
 )
@@ -51,6 +52,7 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
         for detail in details
     ]
     canonical_details = list_sxm_on_pcie_adapter_as_pcie(specs, canonical_details)
+    canonical_details = list_gh200_off_grace_as_reference(specs, canonical_details)
     if canonical_details == details:
         return specs
 
