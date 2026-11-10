@@ -1229,7 +1229,7 @@ class MinerService:
             # recorded before the publish: a node hidden by a partial publish must be re-listable too
             tally.published_early.update(str(result.executor_info.uuid) for result in early)
             await self.publish_machine_specs(
-                early, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+                early, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False, published_early=True
             )
             logger.info(
                 _m(
@@ -1257,11 +1257,14 @@ class MinerService:
         *,
         is_whole_miner_batch: bool = True,
         remember_availability: bool = False,
+        published_early: bool = False,
     ):
         """Publish machine specs to compute app connector process.
 
         `remember_availability` records a partial publish's full availability list (an express run) for the outage
-        restore, as the whole batch's is.
+        restore, as the whole batch's is. Any other partial publish with a finding forgets the recorded list: the
+        backend merges it, so the copy is stale, and the restore then leaves the stored list alone (review
+        4523252162). `published_early` is the early unreachable publish, the one the restore undoes: it keeps it.
 
         `is_whole_miner_batch` False leaves `batch_total` unset: the backend's delivery metrics
         (DAH-2792) take a miner's expected spec count from the first spec per (validator,
@@ -1292,7 +1295,7 @@ class MinerService:
         batch_total = len(results) if is_whole_miner_batch else None
         for result in results:
             try:
-                await self.redis_service.publish(
+                receivers = await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL,
                     {
                         "specs": result.spec,
@@ -1363,10 +1366,16 @@ class MinerService:
                 )
                 continue
             # review 4510532986: recorded only once published, so a failed publish leaves the backend's list in place
+            published_key = (miner_hotkey, str(result.executor_info.uuid).lower())
             if (is_whole_miner_batch or remember_availability) and result.availability_errors is not None:
-                self.cycle_published_availability[(miner_hotkey, str(result.executor_info.uuid).lower())] = list(
-                    result.availability_errors
-                )
+                if receivers:
+                    self.cycle_published_availability[published_key] = list(result.availability_errors)
+                else:
+                    # review 4523252153: no connector listening, so the backend's list is unknown
+                    # shortcut: a receiver is not a backend ack; restore from backend state if one is ever exposed
+                    self.cycle_published_availability.pop(published_key, None)
+            elif result.availability_errors and not published_early:
+                self.cycle_published_availability.pop(published_key, None)
             # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
             if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)

@@ -158,6 +158,7 @@ EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
 # executor id -> how many times it was requested; a run ends only the request it started from (review 4510532999)
 EXPRESS_LANE_RECHECK_GENERATIONS_HASH = "express_lane:recheck_generations"
+RECHECK_POP_ATTEMPTS = 5
 # When the express lane first saw a never-validated executor (epoch s), kept across validator restarts:
 # an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
 EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
@@ -476,9 +477,9 @@ class RedisService:
             # the lock lapses at its TTL as before; the re-send only waits longer
             logger.warning(_m("Could not release a cut-off create's lock", extra={"pod_id": pod_id, "error": str(e)}))
 
-    async def publish(self, channel: str, message: dict):
-        """Publish a message to a Redis channel."""
-        await self.redis.publish(channel, json.dumps(message))
+    async def publish(self, channel: str, message: dict) -> int:
+        """Publish a message to a Redis channel; returns how many subscribers received it."""
+        return await self.redis.publish(channel, json.dumps(message))
 
     async def subscribe(self, *channel: str):
         """Subscribe to a Redis channel. Caller MUST `await pubsub.aclose()` when it stops reading —
@@ -526,20 +527,24 @@ class RedisService:
 
     async def pop_executor_recheck_request(self, executor_id: str, generation: int | None = None) -> None:
         """Ends the request; with a generation, only if no newer request for the node came in since it was read.
-        The check and the removal are one WATCH/MULTI transaction: a request landing in between aborts it."""
-        try:
-            async with self.redis.pipeline(transaction=True) as pipe:
-                if generation is not None:
-                    await pipe.watch(EXPRESS_LANE_RECHECK_GENERATIONS_HASH)
-                    current = await pipe.hget(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
-                    if int(current or 0) != generation:
-                        return
-                pipe.multi()
-                pipe.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
-                pipe.hdel(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
-                await pipe.execute()
-        except redis.exceptions.WatchError:
-            pass  # a newer request came in meanwhile: it stays for the next run
+        The check and the removal are one WATCH/MULTI transaction: a request landing in between aborts it. Raises
+        when neither the removal nor a newer request could be confirmed, so the caller keeps its own state."""
+        for _ in range(RECHECK_POP_ATTEMPTS):
+            try:
+                async with self.redis.pipeline(transaction=True) as pipe:
+                    if generation is not None:
+                        await pipe.watch(EXPRESS_LANE_RECHECK_GENERATIONS_HASH)
+                        current = await pipe.hget(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
+                        if int(current or 0) != generation:
+                            return  # a newer request came in: it stays for the next run
+                    pipe.multi()
+                    pipe.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
+                    pipe.hdel(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
+                    await pipe.execute()
+                    return
+            except redis.exceptions.WatchError:
+                continue  # review 4523252183: the hash is shared, so another node's request aborts it too: re-read
+        raise RuntimeError(f"recheck request of {executor_id} not ended after {RECHECK_POP_ATTEMPTS} attempts")
 
     async def express_first_seen(self, executor_ids: list[str], now: float) -> dict[str, float]:
         """When the express lane first saw each executor (epoch s): SET NX keeps the first sighting,

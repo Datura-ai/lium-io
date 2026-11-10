@@ -711,10 +711,13 @@ class ExpressLane:
         self._log_published(pending, result, passed, extra, started)
 
     async def _end_recheck(self, pending: _Pending) -> None:
+        if not pending.requested:
+            return  # review 4523252174: this run selected no request, so one that arrived during it stays
         executor_id = pending.executor.id
+        # Redis first: local state goes only once the request is gone or a newer one is confirmed (review 4523252183)
+        await self.redis_service.pop_executor_recheck_request(executor_id, pending.recheck_generation)
         self._recheck_runs.pop(executor_id, None)
         self._recheck_pending.pop(executor_id, None)
-        await self.redis_service.pop_executor_recheck_request(executor_id, pending.recheck_generation)
 
     def _log_published(
         self,

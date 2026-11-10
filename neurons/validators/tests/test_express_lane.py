@@ -780,7 +780,8 @@ async def test_a_recheck_request_landing_while_the_old_one_ends_survives():
 
         async def hget_then_new_request(*a):
             value = await read(*a)
-            await redis_service.request_executor_recheck(node)  # lands between the read and the removal
+            if value is not None and int(value) == generation:
+                await redis_service.request_executor_recheck(node)  # lands between the read and the removal
             return value
 
         pipe.hget = hget_then_new_request
@@ -793,6 +794,52 @@ async def test_a_recheck_request_landing_while_the_old_one_ends_survives():
     redis_service.redis.pipeline = make_pipeline
     await redis_service.pop_executor_recheck_request(node, generation + 1)
     assert await redis_service.get_executor_recheck_requests() == set()
+
+
+@pytest.mark.asyncio
+async def test_another_nodes_request_does_not_keep_this_ones_queued():
+    """Review 4523252183: B's request touches the shared generations hash while A ends; A's own request still goes."""
+    redis_service = _redis_service()
+    node_a, node_b = str(uuid4()), str(uuid4())
+    await redis_service.request_executor_recheck(node_a)
+    generation = await redis_service.get_executor_recheck_generation(node_a)
+
+    make_pipeline = redis_service.redis.pipeline
+    landed = []
+
+    def pipeline(*args, **kwargs):
+        pipe = make_pipeline(*args, **kwargs)
+        read = pipe.hget
+
+        async def hget_then_other_request(*a):
+            value = await read(*a)
+            if not landed:
+                landed.append(True)
+                await redis_service.request_executor_recheck(node_b)
+            return value
+
+        pipe.hget = hget_then_other_request
+        return pipe
+
+    redis_service.redis.pipeline = pipeline
+    await redis_service.pop_executor_recheck_request(node_a, generation)
+
+    assert await redis_service.get_executor_recheck_requests() == {node_b}
+
+
+@pytest.mark.asyncio
+async def test_a_request_made_during_an_unrequested_first_pass_survives_it(monkeypatch, wallet):
+    """Review 4523252174: the ordinary first pass of a new node did not select the request, so it does not end it."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.release.clear()
+
+    assert await harness.lane.tick() == 1
+    await harness.redis_service.request_executor_recheck(new_node)
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+
+    assert await harness.redis_service.get_executor_recheck_requests() == {new_node}
 
 
 @pytest.mark.asyncio
