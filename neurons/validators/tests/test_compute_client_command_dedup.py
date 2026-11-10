@@ -302,13 +302,16 @@ async def test_a_host_fault_create_failure_is_sent_again_on_each_new_socket_for_
     monkeypatch.setattr(redis_module.time, "time", lambda: clock[0])
     if reconnect_during_cleanup:  # review 5766355530: a socket that replaces this one before the command finishes
 
-        async def reconnect_before_finish(_pod_id):
+        async def reconnect_before_finish(_pod_id, _create_id):
             client.message_queue.clear()  # the first socket took the frame
             await client._resend_host_fault_failures()
             assert len(client.message_queue) == int(kept)
 
-        client._untrack_backend_create_for_restart_report.side_effect = reconnect_before_finish
+        # the create's cleanup step: it retires the in-flight create record after the failure was kept
+        client._retire_backend_create_record = AsyncMock(side_effect=reconnect_before_finish)
     await client.miner_driver(request("reboot-a"))
+    if reconnect_during_cleanup:
+        client._retire_backend_create_record.assert_awaited_once()
     client.message_queue.clear()
 
     await client._resend_host_fault_failures()  # the next socket authenticated
