@@ -22,6 +22,7 @@ def _validator(monkeypatch: pytest.MonkeyPatch, cycle_seconds: float, cycles: li
     validator.should_exit = False
     validator.initiate_services = AsyncMock()
     validator.express_lane = _Lane()
+    validator.rented_pod_watch = _Lane()
 
     async def sync() -> None:
         cycles.append("started")
