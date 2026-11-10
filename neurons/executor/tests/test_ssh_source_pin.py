@@ -158,6 +158,23 @@ def test_a_failed_refresh_keeps_the_last_good_list(monkeypatch):
     assert get.call_args.args[0] == "https://backend.test/api/watchtower/ssh-sources"
 
 
+def test_a_404_after_a_good_list_turns_the_pin_off(monkeypatch):
+    # a backend without the endpoint (a revert) must unpin, or a node stays on the old list until a restart
+    monkeypatch.setattr(ssh_service.settings, "COMPUTE_REST_API_URL", "https://backend.test/api")
+    monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: "current")
+    now = int(time.time())
+    good = MagicMock(json=MagicMock(return_value={"sources": "198.51.100.7", "timestamp": now, "signature": "0xab"}))
+    gone = MagicMock(status_code=404)
+    monkeypatch.setattr(ssh_service.requests, "get", MagicMock(side_effect=[good, gone]))
+    cache = ssh_service.SignedSshSources()
+
+    cache.refresh()
+    sources_before_404 = cache.get()
+    cache.refresh()
+
+    assert (sources_before_404, cache.get()) == ("198.51.100.7", "")
+
+
 def test_a_node_that_never_got_a_list_does_not_pin(monkeypatch):
     monkeypatch.setattr(ssh_service.settings, "COMPUTE_REST_API_URL", "https://backend.test/api")
     monkeypatch.setattr(ssh_service.requests, "get", MagicMock(side_effect=OSError("down")))

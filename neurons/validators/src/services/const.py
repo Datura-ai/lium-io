@@ -421,6 +421,10 @@ PROBE_CONTAINER_NAME = "lium_roce_probe"
 # of CPU it holds instead of counting our own housekeeping against the miner.
 CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
 
+# DAH-6004: the scrape's short-lived egress check container (miner_jobs/machine_scrape.py
+# EGRESS_PROBE_NAME_PREFIX), suffixed per run.
+EGRESS_PROBE_CONTAINER_PREFIX = "lium_egress_probe_"
+
 # Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
 # them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
 # provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
@@ -439,6 +443,7 @@ LIUM_INFRA_CONTAINER_PREFIXES = (
     "s3fs-backup",
     PROBE_CONTAINER_NAME,
     CACHE_SWEEP_CONTAINER_NAME,
+    EGRESS_PROBE_CONTAINER_PREFIX,
 )
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 

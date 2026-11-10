@@ -4,6 +4,7 @@ import logging
 import math
 import time
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from typing import Literal, NamedTuple
 
 import redis.asyncio as aioredis
@@ -46,6 +47,10 @@ LAST_SCORED_RESULT_TTL_SECONDS = 60 * 60
 # connector starts was cut off by the restart (a redeploy recreates the connector mid-create)
 INFLIGHT_BACKEND_CREATES_KEY = "inflight_backend_creates"
 BACKEND_COMMAND_PREFIX = "backend_command:"
+# DAH-5592: a create's replies that failed it for a host fault (the backend stops billing on these), by command id; sent
+# again on every backend socket for HOST_FAULT_FAILURE_RESEND_SECONDS, since one the backend lost (its database and
+# broker down, then a restart) is not otherwise sent again. The backend ignores a copy of one it already has.
+HOST_FAULT_FAILURES_KEY = "host_fault_create_failures"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
@@ -155,6 +160,10 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# When the express lane first saw a never-validated executor (epoch s), kept across validator restarts:
+# an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
+EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
+EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -211,6 +220,33 @@ REDIS_RETRY_ATTEMPTS = 3
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+
+# Set by the express lane for a new node's first pass (core/express_lane.py). Every RedisService command
+# runs under one process-wide lock; after a wave send hundreds of wave pipelines queue on it, and a new
+# node's few reads waited behind them (69 s before one rental probe's create, 4 Nov). The first pass gets
+# its own slot: its commands queue only behind other first passes.
+EXPRESS_REDIS_SLOT: ContextVar[bool] = ContextVar("express_redis_slot", default=False)
+_HELD_SLOT: ContextVar[asyncio.Lock] = ContextVar("redis_held_slot")
+
+
+class _CommandLock:
+    """The command lock: one slot for the express lane's first passes, one for everything else."""
+
+    def __init__(self):
+        self._default = asyncio.Lock()
+        self._express = asyncio.Lock()
+
+    def _slot(self) -> asyncio.Lock:
+        return self._express if EXPRESS_REDIS_SLOT.get() else self._default
+
+    async def __aenter__(self) -> None:
+        lock = self._slot()
+        await lock.acquire()
+        _HELD_SLOT.set(lock)  # released by the slot it took, even if the flag changed meanwhile
+
+    async def __aexit__(self, *exc) -> None:
+        _HELD_SLOT.get().release()
+
 
 
 class BackendCommand(BaseModel):
@@ -319,7 +355,7 @@ class RedisService:
         # DAH-5723: only for the few methods that send two commands (SET NX then EXPIRE, INCR then EXPIRE, SET NX
         # then GET, SCAN then DEL). A single command is atomic on the server; locking each one queued every Redis
         # call of the process behind one another, 5-12 s per call during a wave.
-        self.lock = asyncio.Lock()
+        self.lock = _CommandLock()
 
     @asynccontextmanager
     async def acquire_executor_lock(
@@ -486,6 +522,21 @@ class RedisService:
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def express_first_seen(self, executor_ids: list[str], now: float) -> dict[str, float]:
+        """When the express lane first saw each executor (epoch s): SET NX keeps the first sighting,
+        so a restarted validator reads the stamp the previous process wrote. One round trip."""
+        keys = [f"{EXPRESS_LANE_FIRST_SEEN_PREFIX}:{executor_id}" for executor_id in executor_ids]
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.set(key, repr(now), ex=EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS, nx=True)
+            pipe.mget(keys)
+            *_, values = await pipe.execute()
+        return {
+            executor_id: float(value)
+            for executor_id, value in zip(executor_ids, values, strict=True)
+            if value is not None
+        }
 
     async def pop_executor_recheck_request(self, executor_id: str) -> None:
         await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
@@ -726,6 +777,20 @@ class RedisService:
         async with self.lock:
             async for key in self.redis.scan_iter(match=pattern):
                 await self.redis.delete(key.decode())
+
+    async def keep_host_fault_failure(self, command_id: str, responses: list[str]) -> None:
+        await self.hset(HOST_FAULT_FAILURES_KEY, command_id, json.dumps({"at": time.time(), "responses": responses}))
+
+    async def recent_host_fault_failures(self, max_age_seconds: float) -> list[str]:
+        """The kept replies younger than `max_age_seconds`, oldest command first; older ones are dropped."""
+        kept, now = [], time.time()
+        for command_id, raw in (await self.hgetall(HOST_FAULT_FAILURES_KEY)).items():
+            entry = json.loads(raw)
+            if now - entry["at"] > max_age_seconds:
+                await self.hdel(HOST_FAULT_FAILURES_KEY, command_id)
+            else:
+                kept.append(entry)
+        return [response for entry in sorted(kept, key=lambda e: e["at"]) for response in entry["responses"]]
 
     async def add_rented_pod(self, executor: ExecutorSSHInfo, pod_id: str, container_name: str):
         rented_machine = await self.get_rented_machine(executor)

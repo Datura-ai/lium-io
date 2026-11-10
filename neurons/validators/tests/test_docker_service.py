@@ -5780,6 +5780,8 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
     # Both filters must be present
     assert "name=^container_5TestMiner_" in ps_cmd
     assert "name=^health_check_" in ps_cmd
+    # the port verifier's host-network container holds the range's host ports
+    assert "name=^port_test_" in ps_cmd
 
 
 @pytest.mark.asyncio
@@ -6857,6 +6859,33 @@ async def test_create_container_encrypted_keys_ride_in_the_volume_setup_exec(doc
     assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     assert setup_spy.await_args.kwargs["authorized_keys"] == ["ssh-ed25519 test-key"]
     keys_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_container_records_its_start_once_the_volume_is_mounted(docker_service, monkeypatch):
+    # the image's entrypoint files written before the first mount are the only ones a later edit may drop
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    order = []
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", AsyncMock(side_effect=lambda **_: order.append("mount")))
+    monkeypatch.setattr(
+        docker_service_module, "_record_validator_start", AsyncMock(side_effect=lambda _ssh, name: order.append(name))
+    )
+    payload = _create_payload(str(uuid4()), encrypted=True).model_copy(update={"bootstrap_restore": None})
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert order == ["mount", DockerService.get_container_name(payload)]
 
 
 @pytest.mark.parametrize("local_volume, allow_init", [(None, True), ("volume_reused", False)])
