@@ -742,3 +742,24 @@ async def test_a_failed_run_volume_trim_is_logged_with_the_volume_and_its_output
 
     [record] = [r for r in caplog.records if "run volume" in r.getMessage()]
     assert record.msg.extra["volume"] == _RUN_VOLUME and "cannot get realpath" in record.msg.extra["output"]
+
+
+class PartialTrimHost(KilledFillerRunVolumeHost):
+    """An exiting filler still holds 50 GB of the run volume open: the trim frees only 30 of its 80 GB."""
+
+    async def run(self, command: str, *args, **kwargs):
+        result = await super().run(command, *args, **kwargs)
+        if "fstrim" in command:
+            self._free_bytes -= 50 * 10**9
+        return result
+
+
+@pytest.mark.asyncio
+async def test_a_partial_trim_counts_only_the_disk_it_freed(docker_service):
+    ssh_client = PartialTrimHost(["filler_f9c9d1e7"], free_gb=262.2)
+
+    freed_gb = await docker_service._trim_killed_filler_run_volume(
+        ssh_client, "filler_f9c9d1e7", ("filler_f9c9d1e7",), "/var/lib/docker", {}
+    )
+
+    assert freed_gb == pytest.approx(30 * 10**9 / 1024**3)

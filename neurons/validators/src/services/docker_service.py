@@ -5769,7 +5769,9 @@ class DockerService:
             for filler in killed:
                 if await rental_fits():
                     break
-                trimmed_gb = await self._trim_killed_filler_run_volume(ssh_client, filler, killed, default_extra)
+                trimmed_gb = await self._trim_killed_filler_run_volume(
+                    ssh_client, filler, killed, docker_root_dir, default_extra
+                )
                 if fit.fresh_sizing:
                     # a trimmed run volume still counts its declared size among the pod volumes (existing_gb) while
                     # its disk is back in df: without this the rental would be counted on that disk twice
@@ -5846,6 +5848,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         filler: str,
         killed: tuple[str, ...],
+        docker_root_dir: str,
         default_extra: dict,
     ) -> float:
         """Unlink a killed filler's run volume files and fstrim its backing file; the GiB freed, 0 when not (DAH-5798)."""
@@ -5861,8 +5864,9 @@ class DockerService:
         # fstrim in the host mount namespace: through /proc/1/root it cannot resolve the vloopback mount
         command = f'( {_wipe_volume_cmd(run_volume, *killed)} && {HOST_NSENTER}fstrim "$p" && echo trimmed ) 2>&1'
         try:
-            trimmed = await asyncio.wait_for(ssh_client.run(command), CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
-            output = trimmed.stdout or ""
+            free_before = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+            trim_result = await asyncio.wait_for(ssh_client.run(command), CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
+            output = trim_result.stdout or ""
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5875,7 +5879,9 @@ class DockerService:
                 )
             )
             return 0
-        return declared_gb
+        # an exiting filler can still hold files open, so fstrim may free less than the declared size
+        freed_gb = (await self._get_fs_available_bytes(ssh_client, docker_root_dir) - free_before) / (1024**3)
+        return min(max(freed_gb, 0), declared_gb)
 
     async def _rental_disk_fit(
         self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest
