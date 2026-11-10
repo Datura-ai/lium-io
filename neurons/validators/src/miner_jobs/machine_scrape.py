@@ -952,7 +952,7 @@ def release_filler_cache(hard_disk):
     hard_disk["hard_disk_utilization"] = used_kb / hard_disk["hard_disk_total"] * 100
 
 
-def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float]]:
+def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float], dict[str, tuple[int, int]]]:
     # per-container CPU in core-percent ("897.45%" = ~9 cores). `stats --no-stream` does its own
     # two-sample delta, one call for all containers. Keyed by the 12-char id stats prints.
     # The host CPU is sampled over the SAME window (reset counter -> stats -> read), because the
@@ -961,16 +961,45 @@ def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float
     # `timeout 30` bounds a wedged docker daemon: the signal degrades instead of hanging the
     # whole (fatal) machine scrape.
     psutil.cpu_percent(interval=None)
-    result = run_cmd(f'timeout 30 {docker_path} stats --no-stream --format "{{{{.ID}}}}|{{{{.CPUPerc}}}}"')
+    result = run_cmd(f'timeout 30 {docker_path} stats --no-stream --format "{{{{.ID}}}}|{{{{.CPUPerc}}}}|{{{{.NetIO}}}}"')
     host_cpu_percent = psutil.cpu_percent(interval=None)
     # An unparsable row means a container whose CPU the window cannot account for — let the
     # ValueError escape so the caller voids the whole CPU signal for this cycle (fail-safe)
     # instead of silently booking that container's load to the provider.
     cpu_percent_by_short_id = {}
     for line in result.strip().splitlines():
-        short_id, _, raw_percent = line.partition('|')
+        short_id, _, rest = line.partition('|')
+        raw_percent = rest.partition('|')[0]
         cpu_percent_by_short_id[short_id.strip()] = float(raw_percent.strip().rstrip('%'))
-    return host_cpu_percent, cpu_percent_by_short_id
+    return host_cpu_percent, cpu_percent_by_short_id, parse_container_net_io(result)
+
+
+_DOCKER_SIZE_UNITS = {"B": 1, "kB": 10**3, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12, "PB": 10**15}
+
+
+# Top level, not nested in its caller: obfuscator.py renames a nested function's body and leaves its
+# signature, which broke every row (lium-io#2146 review).
+def docker_size_bytes(size_text: str) -> int:
+    size_text = size_text.strip()
+    number = size_text.rstrip("kKMGTPB")
+    return int(float(number) * _DOCKER_SIZE_UNITS[size_text[len(number):]])
+
+
+def parse_container_net_io(stats_output: str) -> dict[str, tuple[int, int]]:
+    # `docker stats` NetIO: "<received> / <sent>" since the container started, in decimal units
+    # ("1.23GB / 456MB", 3 significant digits). Keyed by the 12-char id. A row that does not parse
+    # is left out: the traffic shown to the provider is informational, it must not void the CPU signal.
+    net_io_by_short_id = {}
+    for line in stats_output.strip().splitlines():
+        fields = line.split('|')
+        if len(fields) < 3:
+            continue
+        received, _, sent = fields[2].partition('/')
+        try:
+            net_io_by_short_id[fields[0].strip()] = (docker_size_bytes(received), docker_size_bytes(sent))
+        except (KeyError, ValueError):
+            continue
+    return net_io_by_short_id
 
 
 def get_docker_info(content: bytes):
@@ -994,9 +1023,9 @@ def get_docker_info(content: bytes):
         # appears in ps without a stats row, which voids the CPU attribution for the cycle
         # (fail-safe) instead of silently counting that container's CPU as provider-side.
         try:
-            host_cpu_percent, cpu_percents = get_container_cpu_percents(docker_path)
+            host_cpu_percent, cpu_percents, net_io = get_container_cpu_percents(docker_path)
         except Exception:
-            host_cpu_percent, cpu_percents = None, {}
+            host_cpu_percent, cpu_percents, net_io = None, {}, {}
 
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
@@ -1040,6 +1069,8 @@ def get_docker_info(content: bytes):
             cpu_percent = cpu_percents.get(container_id[:12])
             if cpu_percent is not None:
                 container_entry['each_cpu_percent'] = cpu_percent
+            if container_id[:12] in net_io:
+                container_entry['each_net_rx_bytes'], container_entry['each_net_tx_bytes'] = net_io[container_id[:12]]
             containers.append(container_entry)
 
         data["docker_containers"] = containers
@@ -1502,13 +1533,36 @@ def get_host_boot_id() -> str:
 # The node is listed at the geo of the address the validator connects to; behind a reverse proxy
 # that is the proxy's. The backend geolocates the host's own egress address instead (Cloudflare's
 # trace echoes the caller's IP). "" when the fetch fails: the backend then keeps the connect address.
-# The trace runs in the host's network namespace (the executor has pid: host and is privileged),
-# where renter pods' traffic leaves the host: the executor container's own route may differ.
-# Never falls back to the container's route. The name is resolved in the container first, since its
-# resolv.conf may point at docker's embedded DNS, which the host namespace cannot reach.
+# The trace runs where renter pods' traffic leaves: in a short-lived container on the network a
+# running pod is on (else the one pods are created on), from the executor's own image so nothing is
+# pulled. Never inside a pod itself. When that fails it runs in the host's network namespace (the
+# executor has pid: host and is privileged); never in the executor container's own route.
+# The name is resolved in the container first, since its resolv.conf may point at docker's
+# embedded DNS, which the host namespace cannot reach.
 EGRESS_TRACE_HOST = "www.cloudflare.com"
 EGRESS_TRACE_PATH = "/cdn-cgi/trace"
 EGRESS_TRACE_TIMEOUT_SECONDS = 5
+# container start on top of the trace itself
+EGRESS_PROBE_START_SECONDS = 20
+EGRESS_PROBE_NAME_PREFIX = "lium_egress_probe_"
+# the network pods are created on (services/rental_docker_sdk.py RENTAL_NETWORK_NAME)
+EGRESS_RENTAL_NETWORK = "lium-rentals"
+
+
+def get_egress_probe_network():
+    # a running pod's network, else the one pods are created on; raises on a pod sharing another
+    # container's namespace or none, so the trace falls back to the host
+    for container in docker_api_get("/containers/json"):
+        if any(name.startswith("/pod_") for name in container.get("Names") or []):
+            info = docker_api_get(f"/containers/{container['Id']}/json")
+            mode = info["HostConfig"]["NetworkMode"]
+            if mode in ("default", "bridge"):
+                # a legacy pod moved onto another network at start keeps mode "default"
+                return next(iter((info.get("NetworkSettings") or {}).get("Networks") or {}), "bridge")
+            if not mode or mode == "none" or mode.startswith("container:"):
+                raise ValueError(f"pod network mode {mode!r}")
+            return mode
+    return EGRESS_RENTAL_NETWORK
 
 
 def get_egress_ip() -> str:
@@ -1518,21 +1572,43 @@ def get_egress_ip() -> str:
         )[0][4][0]
         env = {**os.environ}
         env.pop("LD_LIBRARY_PATH", None)
-        body = subprocess.run(
-            [
-                "nsenter", "-t", "1", "-n",
-                "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
-                "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
-                f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
-            ],
-            capture_output=True, text=True, check=True, env=env,
-            timeout=EGRESS_TRACE_TIMEOUT_SECONDS + 5,
-        ).stdout[:4096]
     except Exception:
         return ""
-    for line in body.splitlines():
-        if line.startswith("ip="):
-            return line[3:].strip()[:64]
+    curl = [
+        "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
+        "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
+        f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
+    ]
+    commands = []
+    probe_name = f"{EGRESS_PROBE_NAME_PREFIX}{os.getpid()}_{os.urandom(3).hex()}"
+    try:
+        network = get_egress_probe_network()
+        image = docker_api_get(f"/containers/{socket.gethostname()}/json")["Image"]
+        commands.append(
+            ["docker", "run", "--rm", "--name", probe_name, "--network", network, "--entrypoint", "curl", image]
+            + curl[1:]
+        )
+    except Exception:
+        pass
+    commands.append(["nsenter", "-t", "1", "-n"] + curl)
+    for command in commands:
+        is_probe = command[0] == "docker"
+        try:
+            body = subprocess.run(
+                command, capture_output=True, text=True, check=True, env=env,
+                timeout=EGRESS_TRACE_TIMEOUT_SECONDS + (EGRESS_PROBE_START_SECONDS if is_probe else 5),
+            ).stdout[:4096]
+        except Exception:
+            if is_probe:
+                # --rm misses a container whose run was cut off by the timeout
+                try:
+                    subprocess.run(["docker", "rm", "-f", probe_name], capture_output=True, env=env, timeout=30)
+                except Exception:
+                    pass
+            continue
+        for line in body.splitlines():
+            if line.startswith("ip="):
+                return line[3:].strip()[:64]
     return ""
 
 

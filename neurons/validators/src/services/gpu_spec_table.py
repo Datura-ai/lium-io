@@ -180,8 +180,9 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
 # public chip list) takes the AC card's sizes. Derived, never a row of its own: a corrected AC size moves
 # both names. The precheck fails closed on a reading outside the window.
 GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
-# `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300, so the same nominal size; no GB300 reading observed yet.
-GPU_VRAM_SIZES_MB["NVIDIA GB300"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
+# `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300 (NVL72 trays), plus the DGX Station GB300 desktop, which
+# ships with 252 GB HBM3e; no GB300 reading observed yet. Multi-variant.
+GPU_VRAM_SIZES_MB["NVIDIA GB300"] = [258048, *GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"]]
 # DAH-5863: `NVIDIA GB10` (DGX Spark) has no memory of its own; its GPU uses the host's 128 GB, which the
 # scrape reports as its capacity (machine_scrape read_gpu_memory_mb).
 GPU_VRAM_SIZES_MB["NVIDIA GB10"] = [131072]

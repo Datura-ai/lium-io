@@ -326,6 +326,18 @@ FILLER_CONTAINER_PREFIX = "filler_"
 # Still a pod_* name, so both sweepers protect it while the pod is rented (they add this suffix to
 # every protected pod name) and reap it once the pod is gone.
 EDIT_PARKED_SUFFIX = "__prev"
+# The name a recovery parks a pod under when it stopped the pod but could not write its STOPPED_BY_RECOVERY mark:
+# the name itself says the validator stopped it. Protected and reaped like EDIT_PARKED_SUFFIX.
+RECOVERY_STOPPED_SUFFIX = "__stopped"
+PARKED_SUFFIXES = (EDIT_PARKED_SUFFIX, RECOVERY_STOPPED_SUFFIX)
+
+
+def unparked_name(name: str) -> str:
+    """The pod's own name of a parked container (either suffix); any other name as it is."""
+    for suffix in PARKED_SUFFIXES:
+        if name.endswith(suffix):
+            return name.removesuffix(suffix)
+    return name
 # DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
@@ -407,7 +419,7 @@ LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
 # A pod or filler container created before the label: reaped only when the backend's record of
 # that pod or filler run confirms it ended.
 LEGACY_LIUM_CONTAINER_NAME = re.compile(
-    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev)?$"
+    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev|__stopped)?$"
 )
 # The backend's own probe, created over SSH and so never labelled: health_check_{uuid4().hex}, or
 # the int(time.time()) suffix it used before (lium-platform orchestrator/executor_health_check.py).
@@ -422,6 +434,10 @@ PROBE_CONTAINER_NAME = "lium_roce_probe"
 # volumes. Named — and named with a Lium prefix — so the provider-side load gate excuses the seconds
 # of CPU it holds instead of counting our own housekeeping against the miner.
 CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
+
+# DAH-6004: the scrape's short-lived egress check container (miner_jobs/machine_scrape.py
+# EGRESS_PROBE_NAME_PREFIX), suffixed per run.
+EGRESS_PROBE_CONTAINER_PREFIX = "lium_egress_probe_"
 
 # Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
 # them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
@@ -441,6 +457,7 @@ LIUM_INFRA_CONTAINER_PREFIXES = (
     "s3fs-backup",
     PROBE_CONTAINER_NAME,
     CACHE_SWEEP_CONTAINER_NAME,
+    EGRESS_PROBE_CONTAINER_PREFIX,
 )
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
