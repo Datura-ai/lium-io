@@ -190,9 +190,12 @@ class DummyScoreCalculator:
 
 
 class DummyBackendClient:
-    def __init__(self, *, active: bool | None = True, local_volume_path: str | None = None):
+    def __init__(
+        self, *, active: bool | None = True, local_volume_path: str | None = None, status: str | None = "RUNNING"
+    ):
         self.active = active
         self.local_volume_path = local_volume_path
+        self.status = status
         self.called_with: list[str] = []
         self.host_reboot_recoveries: list[tuple[str, str]] = []
 
@@ -204,6 +207,7 @@ class DummyBackendClient:
             active=self.active,
             rental_closed_at=None,
             local_volume_path=self.local_volume_path,
+            status=self.status,
         )
 
     async def report_pod_host_reboot_recovered(self, pod_id: str, container_finished_at: str):
@@ -2344,16 +2348,23 @@ async def test_tenant_enforcement_asks_the_backend_for_a_running_pods_plaintext_
     assert [c.args[2] for c in docker.encrypted_volume_mount_missing.await_args_list] == ["/workspace"] * 3
 
 
+@pytest.mark.parametrize(
+    "first_answer",
+    [{"active": None}, {"active": True, "status": "PENDING", "local_volume_path": None}],
+    ids=["unanswered", "create_in_flight"],
+)
 @pytest.mark.asyncio
-async def test_tenant_enforcement_asks_again_after_an_unanswered_plaintext_path_lookup(context_factory):
+async def test_tenant_enforcement_asks_again_until_a_running_pod_answers_its_plaintext_path(context_factory, first_answer):
+    # a pending pod's row has no path until its ContainerCreated is stored: that answer is not kept
     ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
     docker = AsyncMock()
     docker.encrypted_volume_mount_missing.return_value = False
-    backend = DummyBackendClient(active=None)
+    backend = DummyBackendClient(**first_answer)
     redis = FakeRedis()
 
     await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
-    backend.active, backend.local_volume_path = True, None  # answered: this pod has no encrypted volume
+    assert "plaintext_volume_path:pod-1" not in redis.store
+    backend.active, backend.status, backend.local_volume_path = True, "RUNNING", None  # running, no encrypted volume
     await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
     await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
 

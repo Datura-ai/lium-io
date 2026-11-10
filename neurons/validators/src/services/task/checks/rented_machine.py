@@ -1158,6 +1158,8 @@ async def _plaintext_volume_path(ctx: Context, pod_id: str) -> str | None:
     if rental_active is None:
         return None  # not cached: an unanswered lookup is asked again next cycle
     path = rental_active.local_volume_path
+    if rental_active.status != "RUNNING":
+        return path  # a create, reboot or edit in flight: the path may not be stored yet, so ask again next cycle
     try:
         await asyncio.wait_for(
             ctx.services.redis.set(key, path or "", ex=PLAINTEXT_VOLUME_PATH_TTL_SECONDS),
