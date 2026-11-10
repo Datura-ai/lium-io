@@ -460,35 +460,35 @@ def docker_counts_unpacked_size(server_version: str) -> bool:
     return bool(match) and tuple(map(int, match.groups())) >= _CONTAINERD_SIZE_MIN_DOCKER
 
 
-async def containerd_store_on_data_root(ssh_client: asyncssh.SSHClientConnection) -> bool:
-    """Docker's containerd image store with containerd's root on the filesystem of Docker's data root, on a
-    Docker whose image Size counts the unpacked snapshots. False whenever either cannot be determined, so a
-    flatten never measures the wrong disk or budgets too little of it."""
+async def containerd_store_refusal(ssh_client: asyncssh.SSHClientConnection) -> str | None:
+    """None on Docker's containerd image store with containerd's root on the filesystem of Docker's data root, on a
+    Docker whose image Size counts the unpacked snapshots; else which of those could not be confirmed. Refused
+    whenever either cannot be determined, so a flatten never measures the wrong disk or budgets too little of it."""
     version = await ssh_client.run(
         "/usr/bin/docker version --format '{{.Server.Version}}'", check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
     )
     if version.exit_status != 0 or not docker_counts_unpacked_size(str(version.stdout)):
-        return False
+        return f"docker version {str(version.stdout).strip()!r} does not count unpacked snapshots"
     daemons = await ssh_client.run(containerd_daemons_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
     if daemons.exit_status != 0 or not containerd_daemon_reads_etc_config(str(daemons.stdout)):
-        return False
+        return "not exactly one containerd reading /etc/containerd/config.toml"
     read = await ssh_client.run(containerd_config_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
     if read.exit_status not in (0, _CONTAINERD_NO_CONFIG_EXIT):
-        return False
+        return f"containerd config unreadable (exit {read.exit_status})"
     config = str(read.stdout) if read.exit_status == 0 else None
     root, address = containerd_root(config), containerd_address(config)
     if root is None or address is None:
-        return False
+        return "containerd root or socket not determinable from its config"
     # a config rewritten since the daemon started names a root it does not use
     plugins = await ssh_client.run(
         containerd_plugins_command(address), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
     )
     if plugins.exit_status != 0 or not containerd_runs_on_root(str(plugins.stdout), root):
-        return False
+        return f"running containerd plugins not under {root} (exit {plugins.exit_status})"
     same = await ssh_client.run(
         same_filesystem_as_data_root_command(root), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
     )
-    return same.exit_status == 0
+    return None if same.exit_status == 0 else f"containerd root {root} is not on Docker's data-root filesystem"
 
 
 async def flatten_image_on_host(
@@ -516,8 +516,13 @@ async def flatten_image_on_host(
     # the containerd store reports its snapshotter (e.g. overlayfs) and keeps images outside DockerRootDir
     if str(driver.stdout).strip() != "overlay2":
         # only the overlayfs snapshotter's directory is checked; any other snapshotter writes where nothing measures
-        if str(driver.stdout).strip() != "overlayfs" or not await containerd_store_on_data_root(ssh_client):
-            raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
+        refusal = (
+            await containerd_store_refusal(ssh_client)
+            if str(driver.stdout).strip() == "overlayfs"
+            else "not the overlayfs snapshotter"
+        )
+        if refusal:
+            raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}: {refusal}")
     inspect = await ssh_client.run(
         f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}",
         check=True,

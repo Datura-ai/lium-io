@@ -160,6 +160,24 @@ class OutgoingMessages(list[DeliveryStamps]):
         self.appended.set()
 
 
+# DAH-5592: the backend's billing exemption for a failed reboot (lium-platform utils/reboot_fault.py PROVIDER_ERROR_CODES)
+HOST_FAULT_ERROR_CODES = frozenset(
+    {FailedContainerErrorCodes.ExecutorUnreachable.value, FailedContainerErrorCodes.InvalidExecutorId.value}
+)
+
+
+def _is_host_fault_failure(raw: str) -> bool:
+    try:
+        reply = json.loads(raw)
+    except ValueError:
+        return False
+    return (
+        reply.get("message_type") == FailedContainerRequest.model_fields["message_type"].default.value
+        and bool(reply.get("command_id"))
+        and reply.get("error_code") in HOST_FAULT_ERROR_CODES
+    )
+
+
 def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
     """Keeps the leading findings of an oversized report that fit one frame; counts the rest.
 
@@ -429,6 +447,7 @@ class ComputeClient:
         self.ws = ws
         if report is None:
             await self.resend_unacked_container_created()
+        await self._resend_host_fault_failures()
 
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
@@ -455,6 +474,24 @@ class ComputeClient:
         await ws.send(report.model_dump_json())
         self.resumed_creates_report = None
         self.create_accepted_while_report_pending = False
+
+    async def _resend_host_fault_failures(self) -> None:
+        """DAH-5592: the host-fault create failures of the last HOST_FAULT_FAILURE_RESEND_SECONDS, again on this socket.
+        A failed Redis read raises: run_forever then reconnects and reads again, since nothing else would resend them."""
+        raws = await self.miner_service.redis_service.recent_host_fault_failures(
+            settings.HOST_FAULT_FAILURE_RESEND_SECONDS
+        )
+        replies = []
+        for raw in raws:
+            try:
+                replies.append(BaseValidatorResponse.parse(raw))
+            except Exception:  # one unreadable record is skipped, not retried by reconnecting forever
+                logger.exception(_m("Skipped an unreadable kept host-fault create failure", extra=self.logging_extra))
+        if not replies:
+            return
+        async with self.lock:
+            for reply in replies:
+                self.message_queue.append(reply)
 
     async def subscribe_mesages_from_redis(self):
         validator_hotkey = self.my_hotkey()
@@ -1514,6 +1551,12 @@ class ComputeClient:
                 # the backend fences a failure on the create it answers: a late failure of an earlier create (a
                 # reboot the backend already gave up on) must not fail or exempt the one that replaced it
                 response.command_id = job_request.command_id
+                # kept before it is queued: a socket that replaces this one mid-command must already find it
+                if _is_host_fault_failure(raw := response.model_dump_json()):
+                    try:
+                        await self.miner_service.redis_service.keep_host_fault_failure(job_request.command_id, [raw])
+                    except Exception:
+                        logger.exception("Failed to keep a host-fault create failure: %s", job_request.command_id)
 
             logger.info(
                 _m(

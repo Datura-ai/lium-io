@@ -56,6 +56,10 @@ CREATE_DISPATCH_ORDER_PREFIX = "create_dispatch_order:"
 CREATE_DISPATCH_ORDER_TTL_SECONDS = 24 * 3600
 CREATE_DISPATCH_ORDER_KEPT = 20
 BACKEND_COMMAND_PREFIX = "backend_command:"
+# DAH-5592: a create's replies that failed it for a host fault (the backend stops billing on these), by command id; sent
+# again on every backend socket for HOST_FAULT_FAILURE_RESEND_SECONDS, since one the backend lost (its database and
+# broker down, then a restart) is not otherwise sent again. The backend ignores a copy of one it already has.
+HOST_FAULT_FAILURES_KEY = "host_fault_create_failures"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
@@ -819,6 +823,20 @@ class RedisService:
         async with self.lock:
             async for key in self.redis.scan_iter(match=pattern):
                 await self.redis.delete(key.decode())
+
+    async def keep_host_fault_failure(self, command_id: str, responses: list[str]) -> None:
+        await self.hset(HOST_FAULT_FAILURES_KEY, command_id, json.dumps({"at": time.time(), "responses": responses}))
+
+    async def recent_host_fault_failures(self, max_age_seconds: float) -> list[str]:
+        """The kept replies younger than `max_age_seconds`, oldest command first; older ones are dropped."""
+        kept, now = [], time.time()
+        for command_id, raw in (await self.hgetall(HOST_FAULT_FAILURES_KEY)).items():
+            entry = json.loads(raw)
+            if now - entry["at"] > max_age_seconds:
+                await self.hdel(HOST_FAULT_FAILURES_KEY, command_id)
+            else:
+                kept.append(entry)
+        return [response for entry in sorted(kept, key=lambda e: e["at"]) for response in entry["responses"]]
 
     async def add_rented_pod(self, executor: ExecutorSSHInfo, pod_id: str, container_name: str):
         rented_machine = await self.get_rented_machine(executor)
