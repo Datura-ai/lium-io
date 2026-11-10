@@ -165,15 +165,15 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
 @pytest.mark.parametrize(
     "line, outside",
     [
-        ("4242|0 100000 65536|100000|", None),  # /root unread, / fine: unknown, not healthy
-        ("4242|0 100000 65536||100000", None),  # / unread, /root fine
-        ("4242|0 100000 65536|7|", ["/"]),  # / shifted proves it even with /root unread
+        ("4242|0 100000 65536|100000|", []),  # /root unread (no /root in the image): / alone decides
+        ("4242|0 100000 65536|7|", ["/"]),  # / shifted with /root unread
+        ("4242|0 100000 65536||100000", None),  # / unread, /root fine: unknown, not healthy
         ("4242|0 100000 65536||7", ["/root"]),  # /root shifted proves it even with / unread
         ("4242|0 100000 65536||", None),
         ("4242|0 100000 65536|100000|100000", []),
     ],
 )
-def test_an_unread_path_is_unknown_unless_the_other_is_shifted(line, outside):
+def test_an_unread_root_home_is_judged_from_slash_and_an_unread_slash_is_unknown(line, outside):
     pod = judge(line)
     if outside is None:
         assert pod is None
