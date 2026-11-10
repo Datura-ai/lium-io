@@ -6215,6 +6215,8 @@ class DockerService:
             # the pod's volume is shared by name too: another live create of the pod may have restored into it (F-78)
             if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create(pod_id)):
                 volume = shlex.quote(volume_name)
+                # a failed bootstrap restore's exited helper still mounts the volume
+                await remove_finished_helpers_mounting(ssh_client, volume_name)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {volume} 2>/dev/null || true",
@@ -7255,6 +7257,7 @@ class DockerService:
                 )
                 await self.remove_s3fs_volume_plugin(ssh_client, external_volume_name)
             if local_volume:
+                await remove_finished_helpers_mounting(ssh_client, local_volume)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {shlex.quote(local_volume)} 2>/dev/null || true",
