@@ -130,6 +130,8 @@ def _all_cards_no_verdict(probe: AllCardsProbe) -> bool:
 
 class PostRentalGpuRecheckCheck:
     check_id = "gpu.validate.post_rental_recheck"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -266,7 +268,7 @@ class PostRentalGpuRecheckCheck:
                 inconclusive = True
             else:
                 failures.append(f"all-cards matmul: {all_cards_probe.failure_reason}")
-        probe = await GpuFaultProbeCheck(enforce=True).run(ctx)
+        probe = await GpuFaultProbeCheck(is_post_rental_recheck=True).run(ctx)
         what["fault_probe"] = {
             "reason": probe.event.reason_code,
             "error": probe.event.what_we_saw.get("error"),

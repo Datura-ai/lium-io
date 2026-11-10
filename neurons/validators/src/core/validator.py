@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -50,6 +51,7 @@ from services.redis_service import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
+from services.rented_pod_watch import RentedPodWatch
 from services.task.availability import RunningOutageTally, silence_availability_errors_on_our_own_outage
 from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
@@ -64,6 +66,9 @@ from services.ssh_service import SSHService
 logger = get_logger(__name__)
 
 SYNC_CYCLE = 12
+# DAH-6011: on a rollout's SIGTERM the running cycle may finish for this long; the pod's
+# terminationGracePeriodSeconds must be longer, or the kubelet's SIGKILL still cuts the cycle.
+STOP_CYCLE_WAIT_SECONDS = 25 * 60
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
 # accepted submissions whose inclusion the backend has not acknowledged yet, {tempo_index: block}, each retried
@@ -225,6 +230,8 @@ class Validator:
             subtensor_client=self.subtensor_client,
             cycle_inputs=self.express_lane_cycle_inputs,
         )
+        # DAH-5215: re-probes rented pods' SSH between cycles; observe only.
+        self.rented_pod_watch = RentedPodWatch(backend_client=self.backend_client)
 
         # the tempo index already submitted (or read, in shadow, or found empty): should_set_weights stays true for a
         # tick or two after a submission, and a second attempt for the same frozen window would be rejected as too fast
@@ -489,6 +496,12 @@ class Validator:
                     executor_image_snapshot=executor_image_snapshot,
                     job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                    maintenance_ends={
+                        executor_id: window.expiring_at
+                        for executor_id, window in (
+                            rented_executors.maintenance_windows_by_executor if rented_executors else {}
+                        ).items()
+                    },
                 )
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
@@ -1610,7 +1623,6 @@ class Validator:
         )
         try:
             await self.initiate_services()
-            self.should_exit = False
 
             if not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
@@ -1618,13 +1630,19 @@ class Validator:
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
+                if settings.RENTED_POD_WATCH_INTERVAL_SECONDS > 0:
+                    self.rented_pod_watch_task = asyncio.create_task(
+                        self.rented_pod_watch.run(lambda: self.should_exit)
+                    )
                 # which code saturates the loop the lane shares with the wave (core/loop_sampler.py)
                 self.loop_sampler_stop = start_loop_sampler()
 
             while not self.should_exit:
                 await self.sync()
-                self.should_exit = settings.DRY_RUN
-                if not settings.DRY_RUN:
+                # DAH-6011: only set, never cleared here, so a shutdown that lands mid-cycle ends the loop
+                if settings.DRY_RUN:
+                    self.should_exit = True
+                else:
                     await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
@@ -1642,6 +1660,25 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
+
+    async def finish_running_cycle(self, task: asyncio.Task, wait_seconds: float = STOP_CYCLE_WAIT_SECONDS) -> bool:
+        """DAH-6011: no new cycle starts, and the running one (if any) finishes, within `wait_seconds`.
+        Past it the cycle is cancelled. True when it finished."""
+        self.should_exit = True
+        try:
+            await asyncio.wait_for(asyncio.shield(task), wait_seconds)
+            return True
+        except TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            logger.warning(
+                _m(
+                    "[stop] Running cycle did not finish in time; cancelled",
+                    extra=get_extra_info({**self.default_extra, "wait_seconds": wait_seconds}),
+                ),
+            )
+            return False
 
     async def stop(self):
         logger.info(

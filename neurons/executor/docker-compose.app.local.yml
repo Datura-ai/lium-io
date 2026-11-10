@@ -4,6 +4,7 @@ services:
       context: .
       additional_contexts:
         datura: ../../datura
+        liumd: ./liumd
     image: compute-subnet-executor:local
     env_file: ./.env
     restart: always
