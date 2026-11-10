@@ -298,6 +298,29 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
 
 
 @pytest.mark.asyncio
+async def test_batch_reprobes_late_host_listeners_when_only_the_published_sample_answered(mocker):
+    # DAH-5699: the 3 sampled ports answered on the published container, which met the floor and skipped the
+    # re-probe, then the attempt failed because no host listener had answered yet
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    external = mocker.Mock()
+    external.reached = mocker.AsyncMock(return_value=ports[:3])
+    mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
+    calls = []
+
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return ([], probed) if len(calls) == 1 else (probed, [])
+
+    verifier, _ = _batch_verifier(mocker, late_listeners, external)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert verifier.runner.run.await_count == 2  # one attempt: its published and host-listener containers
+    assert calls == [ports[3:], ports[3:]]
+    assert sorted(result.successful, key=lambda p: p.internal) == ports
+
+
+@pytest.mark.asyncio
 async def test_batch_reprobes_past_the_floor_up_to_the_ports_a_split_node_needs(mocker):
     ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
     calls = []

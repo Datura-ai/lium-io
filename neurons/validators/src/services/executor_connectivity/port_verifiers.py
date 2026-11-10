@@ -177,9 +177,10 @@ class BatchVerifier:
         async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
             successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
             # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
-            # re-probe the refused ports while the count is below what PortCountCheck needs to list the node
+            # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
+            # the published sample alone never ends it: with no host-listener answer the attempt fails below
             for round_no in range(1, self.REPROBE_ROUNDS + 1):
-                if not failed or len(sampled_ok) + len(successful) >= min_ports:
+                if not failed or (successful and len(sampled_ok) + len(successful) >= min_ports):
                     break
                 await asyncio.sleep(self.REPROBE_DELAY_SEC)
                 late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
