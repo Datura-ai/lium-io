@@ -370,8 +370,14 @@ async def _precheck(
 
     host_gpus_result = await _run(runner, HOST_GPUS_COMMAND)
     host_gpus = parse_host_gpus(host_gpus_result.stdout or "")
+    # a dropped channel says nothing about the host's GPUs; only a hung or failed nvidia-smi does
+    if host_gpus_result.error_type not in (None, "timeout"):
+        raise GpuResetRefused(GpuResetErrorCode.ExecutorUnreachable, "the GPU listing lost its SSH channel")
     if host_gpus_result.exit_code != 0 or not host_gpus:
-        raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "nvidia-smi listed no GPU on the host")
+        raise GpuResetRefused(
+            GpuResetErrorCode.GpusLostOnHost,
+            "The GPUs stopped responding on the host. The provider has to reboot it before they can be used again.",
+        )
     host_by_uuid = {gpu.uuid: gpu for gpu in host_gpus}
     gpus = pod_gpus(device_requests, host_gpus, pod_gpu_uuids, gpu_indices)
     ordered, requested, index_by_uuid = gpus.ordered, gpus.requested, gpus.index_by_uuid

@@ -15,6 +15,7 @@ class SpecChangeCheck:
     """
 
     check_id = "gpu.validate.spec_change"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

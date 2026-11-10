@@ -77,6 +77,8 @@ class GpuFaultProbeCheck:
     """
 
     check_id = "gpu.validate.fault_probe"
+    # a replay that is also a no-verdict would count this cycle's unknown streak twice
+    replays_after_session_drop = False
     fatal = True
 
     def __init__(self, is_post_rental_recheck: bool = False):
