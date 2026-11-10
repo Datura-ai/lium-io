@@ -118,18 +118,16 @@ async def test_an_unreachable_host_is_recorded_as_failed_and_the_healthy_pair_is
     }
 
 
-@pytest.mark.asyncio
-async def test_stopping_the_server_cannot_hold_the_sweep_past_the_client_deadline(monkeypatch):
-    a, b = [host(uuid, [EFA_PORT]) for uuid in "ab"]
-    cleanup_timeouts = []
-
+def fake_connection(monkeypatch, client_run=None, cleanup=None):
     @asynccontextmanager
     async def connected(info, key):
         async def run(command, **kwargs):
-            if command == f"docker rm -f {efa_link_probe.PROBE_CONTAINER_NAME} >/dev/null 2>&1":
-                cleanup_timeouts.append(kwargs["timeout"])
+            if command == f"docker rm -f {efa_link_probe.PROBE_CONTAINER_NAME} >/dev/null 2>&1" and cleanup:
+                return await cleanup()
             if command.endswith(" address"):
                 return SimpleNamespace(stdout="203.0.113.1")
+            if " client " in command and client_run:
+                return await client_run()
             return SimpleNamespace(stdout=FI_PINGPONG_OUTPUT)
 
         yield SimpleNamespace(run=run)
@@ -137,6 +135,39 @@ async def test_stopping_the_server_cannot_hold_the_sweep_past_the_client_deadlin
     monkeypatch.setattr(efa_link_probe, "_connected", connected)
     monkeypatch.setattr(efa_link_probe.asyncssh, "import_private_key", lambda _: None)
 
-    await efa_link_probe._measure_pair(a, b, "key", {})
 
-    assert cleanup_timeouts == [efa_link_probe.CLIENT_DEADLINE_SECONDS]
+@pytest.mark.asyncio
+async def test_stopping_the_server_cannot_hold_the_sweep_past_the_client_deadline(monkeypatch):
+    a, b = [host(uuid, [EFA_PORT]) for uuid in "ab"]
+    monkeypatch.setattr(efa_link_probe, "CLIENT_DEADLINE_SECONDS", 0.01)
+
+    async def hanging_cleanup():
+        await asyncio.sleep(60)
+
+    fake_connection(monkeypatch, cleanup=hanging_cleanup)
+
+    gigabits = await asyncio.wait_for(efa_link_probe._measure_pair(a, b, "key", {}), timeout=5)
+
+    assert gigabits == 10.0
+
+
+@pytest.mark.asyncio
+async def test_a_failing_server_stop_does_not_swallow_the_budget_cancel(monkeypatch):
+    a, b = [host(uuid, [EFA_PORT]) for uuid in "ab"]
+    client_started = asyncio.Event()
+
+    async def hanging_client():
+        client_started.set()
+        await asyncio.sleep(60)
+
+    async def failing_cleanup():
+        raise OSError("connection lost")
+
+    fake_connection(monkeypatch, client_run=hanging_client, cleanup=failing_cleanup)
+    task = asyncio.create_task(efa_link_probe._measure_pair(a, b, "key", {}))
+    await client_started.wait()
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task

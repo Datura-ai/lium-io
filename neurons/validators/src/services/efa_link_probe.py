@@ -11,6 +11,7 @@ side carries a fresh measurement naming the other.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shlex
 from datetime import datetime, timezone
@@ -58,11 +59,13 @@ def has_live_efa_port(result: JobResult) -> bool:
 def pairs_to_measure(results: list[JobResult]) -> list[tuple[JobResult, JobResult]]:
     """Every pair of this miner's free EFA hosts: one miner's hosts are the only candidates, and a
     rented host is carrying someone's job."""
-    hosts = sorted(
+    free_efa_hosts = sorted(
         (result for result in results if not result.is_rented and has_live_efa_port(result)),
         key=lambda result: result.executor_info.uuid,
     )
-    return [(server, client) for index, server in enumerate(hosts) for client in hosts[index + 1 :]]
+    return [
+        (server, client) for index, server in enumerate(free_efa_hosts) for client in free_efa_hosts[index + 1 :]
+    ]
 
 
 def measured_gigabits_per_second(fi_pingpong_output: str) -> float | None:
@@ -142,12 +145,12 @@ async def _measure_pair(
                 return None
             finally:
                 # The server holds the card until it is stopped; it must not outlive its measurement.
-                # runs even when the sweep's budget cancels us, and wait_for waits for it
-                await server_ssh.run(
-                    f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1",
-                    check=False,
-                    timeout=CLIENT_DEADLINE_SECONDS,
-                )
+                # runs even when the sweep's budget cancels us: bounded, and its error must not replace the cancel
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        server_ssh.run(f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1", check=False),
+                        timeout=CLIENT_DEADLINE_SECONDS,
+                    )
 
 
 async def _measure_every_pair(
