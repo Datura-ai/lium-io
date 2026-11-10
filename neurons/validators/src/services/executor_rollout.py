@@ -553,6 +553,8 @@ async def carry_renter_gpu_reset_results(
                         rented_data, miner_hotkey, miner_coldkeys.get(miner_hotkey), previous, held
                     ),
                     "filler_revenue_per_gpu_hour": _filler_revenue_now(rented_data, previous),
+                    # refreshed with the average: a carried Spot remainder is seeded only from this cycle's feed
+                    "filler_revenue_feed_ok": _filler_revenue_feed_ok_now(rented_data, previous),
                     "filler_revenue_usd_per_hour": (
                         rented_data.get_filler_revenue_usd_per_hour(
                             BASE_GPU_MAP.get(previous.gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
@@ -608,6 +610,14 @@ def _filler_revenue_now(rented_data: RentedExecutorsResponse | None, previous: J
         BASE_GPU_MAP.get(previous.gpu_model or ""),
         previous.gpu_count,
         settings.get_filler_revenue_min_gpu_hours(previous.is_spot),
+    )
+
+
+def _filler_revenue_feed_ok_now(rented_data: RentedExecutorsResponse | None, previous: JobResult) -> bool:
+    """Whether this cycle's feed is complete and usable; no feed this cycle seeds nothing."""
+    return bool(
+        rented_data
+        and rented_data.has_filler_revenue_averages(settings.get_filler_revenue_min_gpu_hours(previous.is_spot))
     )
 
 
