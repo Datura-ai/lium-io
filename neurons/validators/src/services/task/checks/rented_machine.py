@@ -57,34 +57,39 @@ from .port_count import (
 
 logger = logging.getLogger(__name__)
 
-# DAH-6141: a rental check the backend leaves unanswered holds the pod's verdict; the 3rd such cycle in a row
-# (about 30 min of holds at 15-min cycles) is judged as a down pod, so a backend outage cannot hide one for long
+# DAH-6141: a rental check the backend leaves unanswered holds the pod's verdict; from the 3rd such cycle in a row
+# (about 30 min of holds at 15-min cycles) the down pod is judged as down until the backend answers or the pod runs,
+# so a backend outage cannot hide one for long
 RENTAL_STATE_UNKNOWN_PREFIX = "rental_state_unknown:"
 RENTAL_STATE_UNKNOWN_MAX_HELD = 2
 RENTAL_STATE_UNKNOWN_TTL_SECONDS = 3600
 RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC = 2
 
 
-async def _hold_for_unknown_rental_state(ctx: Context, pod_id: str) -> bool:
-    """True to hold this cycle's verdict; counts the consecutive unanswered cycles. Redis down or slow: held."""
+async def _hold_for_unknown_rental_state(ctx: Context, pod_id: str, *, record: bool) -> bool:
+    """True to hold this cycle's verdict, counting the consecutive unanswered cycles.
+
+    The count stays at its limit (TTL refreshed) until an answer or a running pod clears it. Redis down or slow: not
+    held, as before the hold existed. A dry run (record=False) reads the count and never changes it."""
     redis, key = ctx.services.redis, f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}"
 
     async def count() -> bool:
         held = int(await redis.get(key) or 0)
-        if held >= RENTAL_STATE_UNKNOWN_MAX_HELD:
-            await redis.delete(key)
-            return False
-        await redis.set(key, str(held + 1), ex=RENTAL_STATE_UNKNOWN_TTL_SECONDS)
-        return True
+        if record:
+            await redis.set(
+                key, str(min(held + 1, RENTAL_STATE_UNKNOWN_MAX_HELD)), ex=RENTAL_STATE_UNKNOWN_TTL_SECONDS
+            )
+        return held < RENTAL_STATE_UNKNOWN_MAX_HELD
 
     try:
         return await asyncio.wait_for(count(), timeout=RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Unanswered rental check count not kept for %s: %s", pod_id, exc)
-        return True
+        logger.warning("Unanswered rental check count unreadable for %s, judged now: %s", pod_id, exc)
+        return False
 
 
 async def _forget_unknown_rental_state(ctx: Context, pod_id: str) -> None:
+    """An answer or a running pod ends the unanswered streak."""
     redis, key = ctx.services.redis, f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}"
 
     async def forget() -> None:
@@ -382,6 +387,7 @@ class TenantEnforcementCheck:
                 state_by_pod_id[pod_id] = ContainerState.RUNNING
                 if self.recover_stale_pods:
                     await _clear_leftover_recovery_mark(ctx, pod_container_name, pod_id, pod.status)
+                    await _forget_unknown_rental_state(ctx, pod_id)
             elif pod.container_name_pending and _within_container_name_grace(pod):
                 # DAH-4315: the backend lists a pod before it records the container's name, so
                 # its container may still be being created. Judged next cycle, not penalised.
@@ -403,13 +409,13 @@ class TenantEnforcementCheck:
                     continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active is None:
-                    if await _hold_for_unknown_rental_state(ctx, pod_id):
+                    if await _hold_for_unknown_rental_state(ctx, pod_id, record=self.recover_stale_pods):
                         # the backend did not answer, so the renter may have ended the pod since the batch-start
                         # list. Judged next cycle, not penalised or restarted.
                         extra.setdefault("pods_rental_state_unknown", []).append(pod_id)
                         ssh_pub_keys = []
                         continue
-                else:
+                elif self.recover_stale_pods:  # a dry run never changes the count
                     await _forget_unknown_rental_state(ctx, pod_id)
                 if rental_active and not rental_active.active:
                     stale_what = {

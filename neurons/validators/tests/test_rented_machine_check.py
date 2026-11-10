@@ -533,7 +533,8 @@ async def test_tenant_enforcement_judges_a_down_pod_on_the_third_unanswered_rent
 
     assert third.event.reason_code == Msg.POD_NOT_RUNNING.reason
     assert third.updates["clear_verified_job_info"] is True
-    assert (await cycle()).passed is True  # the count starts over
+    # the same outage goes on: judged every cycle until an answer, never held again
+    assert (await cycle()).event.reason_code == Msg.POD_NOT_RUNNING.reason
 
 
 @pytest.mark.asyncio
@@ -554,13 +555,43 @@ async def test_tenant_enforcement_an_answered_rental_check_resets_the_unanswered
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_holds_the_verdict_when_redis_cannot_count(context_factory):
+async def test_tenant_enforcement_judges_now_when_redis_cannot_count(context_factory):
+    # a backend and Redis outage together must not hide a down pod forever: without a count, the pod is judged
     result = await TenantEnforcementCheck().run(
         _unknown_rental_ctx(context_factory, DummyBackendClient(active=None), FakeRedis(failing=True))
     )
 
-    assert result.passed is True
-    assert "clear_verified_job_info" not in result.updates
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_running_pod_resets_the_unanswered_count(context_factory):
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+    ctx = _unknown_rental_ctx(context_factory, backend, redis)
+
+    await TenantEnforcementCheck().run(ctx)
+    await TenantEnforcementCheck().run(ctx)
+    ctx.ssh.pod_running = True
+    assert (await TenantEnforcementCheck().run(ctx)).passed is True
+    ctx.ssh.pod_running = False
+
+    assert (await TenantEnforcementCheck().run(ctx)).passed is True  # a fresh unanswered check is held again
+    assert redis.store["rental_state_unknown:pod-1"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_dry_run_never_changes_the_unanswered_count(context_factory):
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+    ctx = _unknown_rental_ctx(context_factory, backend, redis)
+
+    for _ in range(2):
+        await TenantEnforcementCheck(recover_stale_pods=False).run(ctx)
+    backend.active = True
+    await TenantEnforcementCheck(recover_stale_pods=False).run(ctx)
+
+    assert "rental_state_unknown:pod-1" not in redis.store
+    backend.active = None
+    assert (await TenantEnforcementCheck().run(ctx)).passed is True  # production still has both holds
 
 
 class DiagnosticsSSHClient:
