@@ -225,6 +225,9 @@ class RentedExecutorsResponse(BaseModel):
     # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
     # and its volume_<pod_id>. An older backend names none.
     retained_container_names: list[str] = []
+    # DAH-3333: pod ids whose volume_<pod_id> the reapers keep while still removing the container (a balance stop
+    # keeps the renter's disk, never the running container). An older backend names none.
+    retained_volume_pod_ids: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
@@ -397,6 +400,24 @@ class RentedGpuDropResponse(BaseModel):
     # "notify_failed" (a notice was refused; report again next cycle), "disabled" (the platform side
     # has the alert switched off; nothing written), "not_rented" (no open rental).
     delivery: str | None = None
+
+
+class RentedPodTarget(BaseModel):
+    """One row of `GET /internal/executors/rented?light=true` (DAH-5215 watch): only what the SSH probe dials."""
+    pod_id: str
+    ip: str
+    miner_hotkey: str = ""  # the probe's per-miner DNS quota; "" from an older backend
+    port: int | None = None  # the pod's mapped SSH port
+    status: str | None = None
+
+
+class RentedPodTargets(RootModel[list[RentedPodTarget] | RentedExecutorsResponse]):
+    """The light list, or the full rented list from a backend that ignores `light=true`."""
+
+
+class PodSshReachabilityResponse(BaseModel):
+    # False when nothing was written (no open rental, or the state was already recorded).
+    recorded: bool
 
 
 GPU_DROP_DELIVERY_DISABLED = "disabled"

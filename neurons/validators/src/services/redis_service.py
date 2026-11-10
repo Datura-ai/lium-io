@@ -3,7 +3,8 @@ import json
 import logging
 import math
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from typing import Literal, NamedTuple
 
 import redis.asyncio as aioredis
@@ -27,6 +28,8 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 # DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
+# set with every rebuild of the hash above: before the first one a missing machine proves nothing
+RENTED_MACHINES_SYNCED_KEY = "rented_machines_synced"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 # epoch seconds of the node's latest create (add_pending_pod); outlives VERIFYX_COMMAND_TIMEOUT_SECONDS (600) so a
 # VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
@@ -153,6 +156,10 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# When the express lane first saw a never-validated executor (epoch s), kept across validator restarts:
+# an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
+EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
+EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -209,6 +216,33 @@ REDIS_RETRY_ATTEMPTS = 3
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+
+# Set by the express lane for a new node's first pass (core/express_lane.py). Every RedisService command
+# runs under one process-wide lock; after a wave send hundreds of wave pipelines queue on it, and a new
+# node's few reads waited behind them (69 s before one rental probe's create, 4 Nov). The first pass gets
+# its own slot: its commands queue only behind other first passes.
+EXPRESS_REDIS_SLOT: ContextVar[bool] = ContextVar("express_redis_slot", default=False)
+_HELD_SLOT: ContextVar[asyncio.Lock] = ContextVar("redis_held_slot")
+
+
+class _CommandLock:
+    """The command lock: one slot for the express lane's first passes, one for everything else."""
+
+    def __init__(self):
+        self._default = asyncio.Lock()
+        self._express = asyncio.Lock()
+
+    def _slot(self) -> asyncio.Lock:
+        return self._express if EXPRESS_REDIS_SLOT.get() else self._default
+
+    async def __aenter__(self) -> None:
+        lock = self._slot()
+        await lock.acquire()
+        _HELD_SLOT.set(lock)  # released by the slot it took, even if the flag changed meanwhile
+
+    async def __aexit__(self, *exc) -> None:
+        _HELD_SLOT.get().release()
+
 
 
 class BackendCommand(BaseModel):
@@ -317,7 +351,7 @@ class RedisService:
         # DAH-5723: only for the few methods that send two commands (SET NX then EXPIRE, INCR then EXPIRE, SET NX
         # then GET, SCAN then DEL). A single command is atomic on the server; locking each one queued every Redis
         # call of the process behind one another, 5-12 s per call during a wave.
-        self.lock = asyncio.Lock()
+        self.lock = _CommandLock()
 
     @asynccontextmanager
     async def acquire_executor_lock(
@@ -400,6 +434,24 @@ class RedisService:
                         )
                     )
 
+    @asynccontextmanager
+    async def rented_gpu_drop_lock(self, pod_id: str):
+        # The validator's cycle and the connector's renter reset both write the pod's drop mark: a recovery whose
+        # reply lands after a renewed fault was saved would delete that fault.
+        # yields True (held), False (another holder kept it past the wait) or None (Redis unreachable)
+        lock = aioredis.lock.Lock(self.redis, f"lock:rented_gpu_drop:{pod_id}", timeout=60, blocking_timeout=30)
+        held: bool | None = None
+        try:
+            held = bool(await lock.acquire())
+        except (redis.exceptions.RedisError, OSError) as e:
+            logger.warning(_m(f"Rented GPU drop lock for pod {pod_id} could not be taken", extra={"error": str(e)}))
+        try:
+            yield held
+        finally:
+            if held:
+                with suppress(redis.exceptions.RedisError, OSError):  # past its TTL the lock is no longer ours
+                    await lock.release()
+
     async def release_cut_off_create_lock(self, executor_id: str, pod_id: str) -> None:
         """The create lock a create cut off by a connector restart still holds, released if it is that create's.
 
@@ -466,6 +518,21 @@ class RedisService:
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def express_first_seen(self, executor_ids: list[str], now: float) -> dict[str, float]:
+        """When the express lane first saw each executor (epoch s): SET NX keeps the first sighting,
+        so a restarted validator reads the stamp the previous process wrote. One round trip."""
+        keys = [f"{EXPRESS_LANE_FIRST_SEEN_PREFIX}:{executor_id}" for executor_id in executor_ids]
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.set(key, repr(now), ex=EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS, nx=True)
+            pipe.mget(keys)
+            *_, values = await pipe.execute()
+        return {
+            executor_id: float(value)
+            for executor_id, value in zip(executor_ids, values, strict=True)
+            if value is not None
+        }
 
     async def pop_executor_recheck_request(self, executor_id: str) -> None:
         await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
@@ -707,9 +774,6 @@ class RedisService:
             async for key in self.redis.scan_iter(match=pattern):
                 await self.redis.delete(key.decode())
 
-    async def add_rented_machine(self, machine: RentedMachine):
-        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json())
-    
     async def add_rented_pod(self, executor: ExecutorSSHInfo, pod_id: str, container_name: str):
         rented_machine = await self.get_rented_machine(executor)
         if not rented_machine:
@@ -731,6 +795,18 @@ class RedisService:
                 await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
             else:
                 await self.hset(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}", json.dumps(rented_machine))
+
+    async def replace_rented_machines(self, machines: list[RentedMachine]) -> None:
+        """Swap in the backend's whole list at once, so a reader never sees the hash half rebuilt."""
+        writes = RedisWrites().delete(RENTED_MACHINE_PREFIX)
+        for machine in machines:
+            writes.hset(
+                RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json()
+            )
+        await self.write_atomically(writes.set(RENTED_MACHINES_SYNCED_KEY, "1"))
+
+    async def rented_machines_synced(self) -> bool:
+        return bool(await self.get(RENTED_MACHINES_SYNCED_KEY))
 
     async def get_rented_machine(self, executor: ExecutorSSHInfo) -> dict | None:
         data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")

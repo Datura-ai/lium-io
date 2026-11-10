@@ -111,7 +111,9 @@ def calculate_scores(
         warning_messages.append(
             "Rented throughput reading could not run in several cycles in a row"
             if ctx.rented_throughput_not_run
+            # the portal matches the prefix; the detail after it names the side and its values
             else "A rented pod gets far too little network or disk throughput"
+            + (f" ({ctx.rented_throughput_slow_detail})" if ctx.rented_throughput_slow_detail else "")
         )
 
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the

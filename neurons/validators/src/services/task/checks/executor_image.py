@@ -59,6 +59,7 @@ def observed_executor_digest(specs: dict[str, object]) -> str | None:
 
 class ExecutorImageCheck:
     check_id = "executor.validate.image_version"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

@@ -292,7 +292,7 @@ def create_mock_port_dict(
 def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
-    redis_service = Mock()
+    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True))
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
@@ -3113,6 +3113,58 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repaired, starts", [("volume_x", 2), (None, 1)])
+async def test_start_existing_container_repairs_a_stale_vloopback_mountpoint_and_starts_again(
+    docker_service, monkeypatch, repaired, starts
+):
+    # 5 Nov: a GPU reset's start of a stopped pod failed on "file exists" with no repair, so the pod stayed down
+    stale = RuntimeError(
+        "Docker SDK start failed: 500 Server Error: error while mounting volume '': VolumeDriver.Mount: 01M6: "
+        "cannot create mount point dir '/mnt/volume_x': mkdir /mnt/volume_x: file exists"
+    )
+    ssh_client = AsyncMock()
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect", Mock(return_value=DummySSHConnectionManager(ssh_client))
+    )
+    client = docker_service.rental_docker_client_factory.client
+    client.start = AsyncMock(side_effect=[stale, None])
+    docker_service._repair_stale_mountpoint_of_container_volume = AsyncMock(return_value=repaired)
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    async def start():
+        await docker_service.start_existing_container(
+            executor_info=executor_info,
+            private_key="private-key",
+            known_hosts_policy=None,
+            container_name="pod_test",
+            local_volume_path="/root",
+            pod_id="pod-id",
+            default_extra={},
+        )
+
+    if repaired:
+        await start()
+        docker_service._restore_mount_and_sshd_after_start.assert_awaited_once()
+    else:
+        with pytest.raises(RuntimeError, match="file exists"):
+            await start()
+        docker_service._restore_mount_and_sshd_after_start.assert_not_awaited()
+    assert client.start.await_count == starts
+    docker_service._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh_client, "pod_test", {})
+
+
+@pytest.mark.asyncio
 async def test_start_container_remounts_when_container_state_is_encrypted(docker_service, monkeypatch):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))
@@ -5728,6 +5780,8 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
     # Both filters must be present
     assert "name=^container_5TestMiner_" in ps_cmd
     assert "name=^health_check_" in ps_cmd
+    # the port verifier's host-network container holds the range's host ports
+    assert "name=^port_test_" in ps_cmd
 
 
 @pytest.mark.asyncio
@@ -8715,6 +8769,113 @@ def test_orphaned_shim_kill_spares_a_replacement_shim_started_in_between(tmp_pat
                 os.kill(int(pid_file.read_text()), 9)
 
 
+_CGROUP_BUSY_ERROR = (
+    "OCI runtime create failed: runc create failed: unable to start container process: "
+    "write /sys/fs/cgroup/system.slice/docker-x.scope/cgroup.procs: device or resource busy"
+)
+
+
+@pytest.mark.parametrize(
+    "cgroup_result, expected_recovered, starts",
+    [
+        pytest.param("removed", True, 2, id="leftover_cgroup_removed_then_started"),
+        pytest.param("busy", False, 1, id="cgroup_still_holds_a_process"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_clears_a_leftover_cgroup_and_starts_once_more(
+    docker_service, monkeypatch, cgroup_result, expected_recovered, starts
+):
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    start_existing_container = AsyncMock(side_effect=[RuntimeError(_CGROUP_BUSY_ERROR), None])
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    async def run(command, *_args, **_kwargs):
+        if "--format '{{.Id}}'" in command:
+            return _make_ssh_command_result(stdout=f"{_ORPHANED_TASK_ID}\n")
+        if "cgroup.procs" not in command and "/sys/fs/cgroup" in command:
+            return _make_ssh_command_result(stdout=f"{cgroup_result}\n")
+        if ".Destination" in command:
+            return _make_ssh_command_result(stdout="/root\n")
+        return _make_ssh_command_result(stdout="volume_pod-1\n")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    assert start_existing_container.await_count == starts
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert DockerCommand.remove_stale_container_cgroup(_ORPHANED_TASK_ID) in commands
+
+
+@pytest.mark.parametrize(
+    "cgroup_result, expected_recovered, starts",
+    [
+        pytest.param("removed", True, 2, id="recorded_cgroup_error_cleared_then_started"),
+        pytest.param("busy", False, 1, id="still_busy_left_for_the_next_cycle"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_whose_recorded_error_is_the_leftover_cgroup(
+    docker_service, monkeypatch, cgroup_result, expected_recovered, starts
+):
+    # the failed start saved the cgroup error as State.Error and there is no stale mountpoint to repair:
+    # recovery still runs, so a busy cleanup this cycle is retried on the next one
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    start_existing_container = AsyncMock(side_effect=[RuntimeError(_CGROUP_BUSY_ERROR), None])
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    async def run(command, *_args, **_kwargs):
+        if "--format '{{.Id}}'" in command:
+            return _make_ssh_command_result(stdout=f"{_ORPHANED_TASK_ID}\n")
+        if "cgroup.procs" not in command and "/sys/fs/cgroup" in command:
+            return _make_ssh_command_result(stdout=f"{cgroup_result}\n")
+        return _make_ssh_command_result(stdout="")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _CGROUP_BUSY_ERROR, ssh_client)
+
+    assert recovered is expected_recovered
+    assert start_existing_container.await_count == starts
+
+
+@pytest.mark.parametrize(
+    "status, holds_process, expected",
+    [
+        ("exited", False, "removed"),
+        ("exited", True, "busy"),
+        ("running", False, "skipped state=running"),
+    ],
+)
+def test_remove_stale_container_cgroup_removes_only_empty_cgroups(tmp_path, status, holds_process, expected):
+    scope = tmp_path / "system.slice" / f"docker-{_ORPHANED_TASK_ID}.scope"
+    (scope / "init.scope").mkdir(parents=True)
+    (scope / "docker" / "inner").mkdir(parents=True)
+    if holds_process:  # a plain file stands in for a process: rmdir of a non-empty dir fails like EBUSY
+        (scope / "docker" / "inner" / "pid").write_text("1")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f"#!/bin/sh\necho {status}\n")
+    fake_docker.chmod(0o755)
+    command = (
+        DockerCommand.remove_stale_container_cgroup(_ORPHANED_TASK_ID)
+        .replace("[ /proc/1/root/ -ef / ]", "false")
+        .replace("/proc/1/root/sys/fs/cgroup", str(tmp_path))
+        .replace("/usr/bin/docker", str(fake_docker))
+    )
+
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=30).stdout.strip()
+
+    assert out == expected
+    assert scope.exists() is (expected != "removed")
+
+
 @pytest.mark.asyncio
 async def test_recover_pod_runs_once_at_a_time_per_pod(docker_service, monkeypatch):
     # two overlapping check cycles on the same stale verdict: only the first one recovers
@@ -9605,7 +9766,7 @@ async def test_no_disk_for_the_flattened_copy_fails_with_the_renter_sentence(doc
 async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(monkeypatch, docker_run_fails):
     # an edit mounts the pod's volume by name and Docker routes it to the plugin that made it
     # (`vloopback:latest` for every rental before v2): no plugin command, no volume create or rm
-    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     svc._read_host_pid_max = AsyncMock(return_value=4_194_304)
     payload = _edit_payload()
     ssh = _ssh_recording()
