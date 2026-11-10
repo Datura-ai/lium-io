@@ -7,16 +7,20 @@ size either. Each validation this check reads the Docker disk's free space and w
 it (writable layer plus local volumes, read with ``du``, never changed). When the disk is almost full it
 pauses (``docker pause``) each rented pod holding a large share of the disk: its data and volume are kept.
 Once the disk has room again it resumes them. A host with the limit is never touched. Each pause and resume is
-reported to the backend, which bills a paused pod nothing and tells its renter.
+reported to the backend, which bills a paused pod nothing and tells its renter. The pods this check paused are
+kept in Redis per node: only those are resumed or reported, so a pod paused for another reason is never
+resumed by this check and never stops billing.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 from dataclasses import asdict, dataclass
 
 import asyncssh
+import redis
 
 from core.utils import _m, get_extra_info
 
@@ -33,6 +37,7 @@ RESUME_AT_FREE_FRACTION = 0.10
 # Only a pod that itself holds at least this share of the disk is paused: a disk the host filled
 # itself never stops a renter.
 MIN_LAYER_FRACTION = 0.10
+PAUSED_KEY_PREFIX = "rented_pod_disk:paused:"
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +81,8 @@ def parse_reading(stdout: str) -> tuple[int | None, int | None, list[PodLayer]]:
     return size, free, pods
 
 
-def plan(size: int, free: int, pods: list[PodLayer]) -> tuple[list[str], list[str]]:
-    """(containers to pause, containers to resume)."""
+def plan(size: int, free: int, pods: list[PodLayer], ours: set[str]) -> tuple[list[str], list[str]]:
+    """(containers to pause, containers to resume); only a pod in `ours` (this check paused it) is resumed."""
     if free < PAUSE_BELOW_FREE_FRACTION * size:
         return [
             p.container
@@ -85,7 +90,7 @@ def plan(size: int, free: int, pods: list[PodLayer]) -> tuple[list[str], list[st
             if p.status == "running" and p.used >= MIN_LAYER_FRACTION * size
         ], []
     if free >= RESUME_AT_FREE_FRACTION * size:
-        return [], [p.container for p in pods if p.status == "paused"]
+        return [], [p.container for p in pods if p.status == "paused" and p.container in ours]
     return [], []
 
 
@@ -109,7 +114,12 @@ class RentedPodDiskCheck:
             size, free, pods = parse_reading(str(getattr(res, "stdout", "") or ""))
             if not size or free is None:
                 return self._event(ctx, Msg.UNKNOWN, reason="docker disk not readable")
-            to_pause, to_resume = plan(size, free, pods)
+            key = PAUSED_KEY_PREFIX + ctx.executor.uuid
+            loaded = set(json.loads(await ctx.services.redis.get(key) or "[]"))
+            # a pod of ours seen not paused (resumed by someone else) is ours no more; one missing from this
+            # read is kept, so a partial read never loses a pause
+            ours = loaded - {p.container for p in pods if p.status != "paused"}
+            to_pause, to_resume = plan(size, free, pods, ours)
             what = {
                 "disk_bytes": size,
                 "free_bytes": free,
@@ -122,7 +132,9 @@ class RentedPodDiskCheck:
                 )
                 # a failed pause is read again next cycle; the backend is told only what happened
                 if getattr(done, "exit_status", 0) == 0:
-                    await self._report(ctx, pods, to_pause, [])
+                    ours |= set(to_pause)
+                    await self._save(ctx, key, ours)
+                    await self._report(ctx, ours, [])
                 return self._event(ctx, Msg.PAUSED, paused=to_pause, **what)
             if to_resume:
                 done = await ctx.ssh.run(
@@ -131,19 +143,31 @@ class RentedPodDiskCheck:
                 )
                 # a failed unpause is read again next cycle; the backend is told only what happened
                 if getattr(done, "exit_status", 0) == 0:
-                    await self._report(ctx, pods, [], to_resume)
+                    ours -= set(to_resume)
+                    await self._save(ctx, key, ours)
+                    await self._report(ctx, ours, to_resume)
                 return self._event(ctx, Msg.RESUMED, resumed=to_resume, **what)
-            await self._report(ctx, pods, [], [])
+            if ours != loaded:
+                await self._save(ctx, key, ours)
+            await self._report(ctx, ours, [])
             return self._event(ctx, Msg.OK, **what)
         except (asyncssh.Error, OSError) as exc:
             return self._event(ctx, Msg.UNKNOWN, reason="ssh transport error", error=repr(exc))
+        except redis.exceptions.RedisError as exc:
+            # without the record of our pauses nothing is resumed or reported; a pause already made stays
+            return self._event(ctx, Msg.UNKNOWN, reason="redis error", error=repr(exc))
 
-    async def _report(
-        self, ctx: Context, pods: list[PodLayer], to_pause: list[str], to_resume: list[str]
-    ) -> None:
+    @staticmethod
+    async def _save(ctx: Context, key: str, ours: set[str]) -> None:
+        if ours:
+            await ctx.services.redis.set(key, json.dumps(sorted(ours)))
+        else:
+            await ctx.services.redis.delete(key)
+
+    async def _report(self, ctx: Context, paused: set[str], to_resume: list[str]) -> None:
         """Tell the backend which pods are paused, so it bills them nothing, and which were resumed.
 
-        A pod already paused is reported again each cycle (the backend ignores a state it has), so a lost
+        Only pods this check paused are reported. A pod already paused is reported again each cycle (the backend ignores a state it has), so a lost
         report does not leave a paused pod billed. Never fatal: the pause protects the host either way.
         """
         rented_data = ctx.state.rented_data
@@ -152,9 +176,6 @@ class RentedPodDiskCheck:
             p.docker_container_name: p.pod_id
             for p in (rented_executor.pods if rented_executor else [])
         }
-        paused = (set(to_pause) | {p.container for p in pods if p.status == "paused"}) - set(
-            to_resume
-        )
         for name, is_paused in [(n, True) for n in sorted(paused)] + [
             (n, False) for n in to_resume
         ]:
