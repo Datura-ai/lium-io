@@ -10,7 +10,7 @@ from neurons.validators.src.services.task.messages import (
 )
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
-from tests.helpers import build_context_config, build_services, build_state
+from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 
 
 # Mock VerifyX response matching the real VerifyXResponse
@@ -48,6 +48,7 @@ class DummyVerifyXService:
         default_extra: dict,
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
+        run_dir: str | None = None,
     ) -> MockVerifyXResponse:
         """Mock method that mimics the real verifyx service."""
         # Track what parameters we were called with
@@ -165,7 +166,7 @@ class _VerifyXServiceReturning:
         self._response = response
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
     ):
         return self._response
 
@@ -284,10 +285,11 @@ async def test_verifyx_skips_active_filler_and_reuses_prev_ema(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_skips(context_factory, monkeypatch):
-    """DAH-5742: a stored EMA is not reused forever; the probe runs after MAX_FILLER_SKIPS and the count restarts."""
-    monkeypatch.setattr(verifyx_module, "_filler_skips", {})
-    monkeypatch.setattr(verifyx_module, "MAX_FILLER_SKIPS", 2)
+async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_reuse(context_factory, monkeypatch):
+    """DAH-5742: a stored EMA is not reused for more than a day; the clock is in Redis, so a validator restart
+    (a fresh process, a fresh check) does not start it again, and it restarts only on a new stored reading."""
+    clock, day = [1_000_000.0], 24 * 3600
+    monkeypatch.setattr(verifyx_module.time, "time", lambda: clock[0])
     verifyx_service = DummyVerifyXService(
         success=True,
         updated_specs={"network": {"download_speed": 90.0, "upload_speed": 80.0}},
@@ -303,22 +305,73 @@ async def test_verifyx_probes_an_idle_filler_node_after_a_day_of_skips(context_f
             },
         ),
     )
-    ctx = context_factory(services=build_services(verifyx=verifyx_service), config=build_context_config(), state=state)
+    services = build_services(verifyx=verifyx_service)
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    reasons = [(await VerifyXCheck().run(ctx)).event.reason_code for _ in range(4)]
+    async def reason():
+        return (await VerifyXCheck().run(ctx)).event.reason_code
 
-    assert reasons[:2] == [Msg.FILLER_SKIPPED.reason] * 2
-    assert reasons[2] != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
+    assert await reason() == Msg.FILLER_SKIPPED.reason
+    clock[0] += day - 1
+    assert await reason() == Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is None
+
+    # a day of reuse is up: probed once, network only
+    clock[0] += 1
+    assert await reason() != Msg.FILLER_SKIPPED.reason
     # r4472607210: RAM and disk the filler holds are not tested at full size on the refresh
     assert verifyx_service.called_with["challenge_config_overrides"] == verifyx_module.FILLER_REFRESH_CHALLENGE_CONFIG
     # r4472207526: the backend has not stored a new reading (a failed probe stores none), so it probes again
-    assert reasons[3] != Msg.FILLER_SKIPPED.reason
+    verifyx_service.called_with = None
+    assert await reason() != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
+    # r4491384333: a renewal that fails after the read still probes a due node
+    async def expire_fails(key, seconds):
+        raise ConnectionError("Redis timed out")
 
-    # the backend stored the probe's reading: the count restarts and skipping resumes
+    monkeypatch.setattr(services.redis, "expire", expire_fails)
+    verifyx_service.called_with = None
+    assert await reason() != Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is not None
+    monkeypatch.undo()
+    monkeypatch.setattr(verifyx_module.time, "time", lambda: clock[0])
+
+    # the backend stored the probe's reading: the clock restarts and skipping resumes
     ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(
         ema_verifyx_download_speed=95.0, ema_verifyx_upload_speed=85.0
     )
+    assert await reason() == Msg.FILLER_SKIPPED.reason
+    clock[0] += day - 1
+    assert await reason() == Msg.FILLER_SKIPPED.reason
+    # the mark expires on its own if the node stops being checked
+    key = next(iter(services.redis.store))
+    assert services.redis.ttl[key] == 7 * day
+    # r4491079681: every check renews the expiry, so an active node's mark never lapses into a fresh day of reuse
+    services.redis.ttl[key] = 60
+    assert await reason() == Msg.FILLER_SKIPPED.reason
+    assert services.redis.ttl[key] == 7 * day
+
+
+@pytest.mark.asyncio
+async def test_verifyx_keeps_reusing_the_ema_when_redis_is_down(context_factory):
+    """DAH-5742: without the reuse clock the stored EMA is reused, as before; no probe every cycle."""
+    verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
+    state = build_state(
+        specs={"gpu": {"count": 8}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+            network_ema={
+                "executor-123": NetworkEMA(ema_verifyx_download_speed=182.0, ema_verifyx_upload_speed=161.0)
+            },
+        ),
+    )
+    ctx = context_factory(
+        services=build_services(verifyx=verifyx_service, redis=FakeRedis(failing=True)),
+        config=build_context_config(),
+        state=state,
+    )
+
     assert (await VerifyXCheck().run(ctx)).event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert verifyx_service.called_with is None
 
 
 @pytest.mark.asyncio
@@ -402,6 +455,7 @@ async def test_verifyx_success_ema_below_threshold_fails_check(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(55.0)
+    assert result.event.remediation.startswith("Average download speed 55.0 Mbps, 100 Mbps required.")
 
 
 @pytest.mark.asyncio
@@ -923,3 +977,19 @@ def test_verifyx_verdict_applies_the_upload_floor(upload, prev_upload, fallback,
     data = {"success": True, "network": network}
 
     assert verifyx_verdict(data, prev, first_pass=False) is expected
+
+
+@pytest.mark.asyncio
+# prev_ema, current=0 -> EMA half of it: 99.96 and 99.99999999 must not read as 100.0
+@pytest.mark.parametrize("prev_download", [199.92, 199.99999998])
+async def test_an_average_speed_just_under_the_floor_never_shows_as_meeting_it(context_factory, prev_download):
+    services = build_services(verifyx=DummyVerifyXService(success=True, updated_specs={"network": {}}))
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=prev_download),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.event.remediation.startswith("Average download speed 99.9 Mbps, 100 Mbps required.")

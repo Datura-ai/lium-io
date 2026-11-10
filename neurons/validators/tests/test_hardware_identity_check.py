@@ -195,3 +195,32 @@ async def test_finding_is_fatal_only_without_a_live_rental(context_factory, rent
     nxt = _Next()
     await Pipeline(checks=[HardwareIdentityCheck(), nxt], sink=AsyncMock()).run(ctx)
     assert nxt.ran is rented  # with a live pod the pipeline goes on to TenantEnforcementCheck
+
+
+@pytest.mark.asyncio
+async def test_a_dmi_change_stays_a_finding_when_the_session_drops_while_the_new_identity_is_stored(context_factory):
+    """Review 4491939660 on #2080: the check stores the new identity before it returns, so a replay on a fresh
+    session would compare against it and pass."""
+    first = _ctx(context_factory, stdout=_stdout(values="uuid-1|serial-1|"))
+    redis = first.services.redis
+    assert (await _run(first)).passed is True
+
+    ctx = _ctx(context_factory, stdout=_stdout(values="uuid-2|serial-1|"), redis=redis)  # same GPU UUIDs
+    closed = []
+    ctx.ssh.is_closed = lambda: bool(closed)
+    set_ = redis.set
+
+    async def set_then_drop(*args, **kwargs):
+        await set_(*args, **kwargs)
+        closed.append(1)
+
+    redis.set = set_then_drop
+    reconnect = AsyncMock()
+
+    _, events, after = await Pipeline(checks=[HardwareIdentityCheck()], sink=AsyncMock(), reconnect=reconnect).run(
+        ctx
+    )
+
+    assert not reconnect.called
+    assert Msg.SPOOFED.reason in [e.reason_code for e in events]
+    assert after.hardware_identity_passed is False

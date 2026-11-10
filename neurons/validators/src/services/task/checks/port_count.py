@@ -9,7 +9,7 @@ from services.const import MIN_PORT_COUNT
 from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..availability import AVAILABILITY_CATEGORY, ReachSource, ReachTarget
-from ..messages import PortCountMessages as Msg, render_message
+from ..messages import PortConnectivityMessages, PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
@@ -90,6 +90,7 @@ def split_ports_event(
             **(what or {}),
         },
         remediation=(
+            f"{ports_answered_text(state, port_count, required)} "
             f"Open at least {required} renting ports for this node's {max_splits} GPU splits "
             f"({MIN_PORT_COUNT} per split): widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS, "
             "then run `docker compose restart executor-runner` in neurons/executor. Edit .env with nano: "
@@ -97,6 +98,20 @@ def split_ports_event(
         ),
         extra=extra,
     )
+
+
+def ports_answered_text(state: ContextState, port_count: int, required: int) -> str:
+    """The measured-vs-required prefix; a deferred cycle has no current reading to state."""
+    if state.port_check_deferred:
+        return "Renting-port check deferred; no current measurement. Wait for the next check."
+    # the count adds ports held by our idle filler, which the probe skips: they did not answer
+    held = max(port_count - (state.verified_port_count or 0), 0)
+    if held:
+        return (
+            f"{port_count - held} renting ports answered, {held} held by Lium's Default Job: "
+            f"{port_count} of {required} required available."
+        )
+    return f"{port_count} renting ports answered, {required} required."
 
 
 def hidden_from_renters_text(available_port_count: int) -> str:
@@ -213,6 +228,28 @@ class PortCountCheck:
                 updates={"port_count": port_count, "state": updated_state},
             )
 
+        if not is_rented and port_count < MIN_PORT_COUNT and ctx.state.port_probe_connection_lost:
+            # DAH-5981: the probe lost the node before testing a port, so the count says nothing about the ports
+            event = render_message(
+                PortConnectivityMessages.VERIFY_FAILED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "details": f"Port verification error: {ctx.state.port_probe_connection_lost}",
+                    "available_port_count": port_count,
+                    "probed_port_count": updated_state.probed_port_count,
+                },
+                remediation=(
+                    "The validator lost its connection to the node during the port check, so no port was tested. "
+                    "It checks again next cycle; if this repeats, check the node's network stability."
+                ),
+            )
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={"port_count": port_count, "state": updated_state},
+            )
+
         if not is_rented and port_count < MIN_PORT_COUNT:
             # DAH-2991: when the shortfall is our own leftover — an orphaned rental container the
             # cleanup could not remove — say so, instead of a bare count (ticket-0287 diagnosed it by hand).
@@ -231,7 +268,7 @@ class PortCountCheck:
                     "the validator retries every cycle; a host reboot frees them at once."
                 )
                 if orphaned
-                else None,
+                else f"{ports_answered_text(updated_state, port_count, MIN_PORT_COUNT)} {Msg.INSUFFICIENT_PORTS.remediation}",
             )
             return CheckResult(
                 passed=False,

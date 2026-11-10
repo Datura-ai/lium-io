@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 from neurons.validators.src.services.executor_connectivity.dind_probe import (
+    DIND_SSH_READY_TIMEOUT_SECONDS,
+    DIND_SSHD_NOT_READY_MESSAGE,
     DOCKER_RUN_CAUSES,
     diagnose_docker_run_error,
+    ssh_ready_timeout,
 )
 from neurons.validators.src.services.task.checks.sysbox_required import (
     _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE,
@@ -123,18 +128,28 @@ async def test_inner_dockerd_down_without_dockerd_line_keeps_the_generic_guidanc
 
 @pytest.mark.asyncio
 async def test_no_sysbox_with_unknown_dind_cause_does_not_claim_sysbox_is_irrelevant(context_factory):
-    """DIND_SSHD_NOT_READY means the log showed nothing: the verdict quotes it and says no more."""
-    cause = DindLogCause(
-        "DIND_SSHD_NOT_READY",
-        "sshd inside the DinD container did not answer within 30s and its log shows no dockerd error",
-    )
+    """DIND_SSHD_NOT_READY means the log showed nothing: the verdict quotes it and does not blame sysbox.
+    DAH-5844: it gets its own reason code, so the notice no longer says sysbox is missing; still a failed check."""
+    cause = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
     ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
 
     result = await SysboxRequiredCheck().run(ctx)
 
     assert result.passed is False
+    assert result.event.reason_code == Msg.DIND_PROBE_UNREACHABLE.reason == "DIND_PROBE_UNREACHABLE"
     assert cause.text in result.event.remediation
+    assert Msg.DIND_PROBE_UNREACHABLE.remediation in result.event.remediation
     assert "reinstalling sysbox" not in result.event.remediation
+    assert "Install the sysbox runtime" not in result.event.remediation
+
+
+def test_ssh_ready_wait_is_cut_to_the_cycle_deadline_but_never_below_the_old_wait():
+    """DAH-5844: up to 60s, never past the cycle deadline, and never shorter than the 30s it replaced."""
+    now = time.monotonic()
+    assert ssh_ready_timeout(None) == DIND_SSH_READY_TIMEOUT_SECONDS == 60
+    assert ssh_ready_timeout(now + 600) == 60
+    assert 44 < ssh_ready_timeout(now + 45) <= 45
+    assert ssh_ready_timeout(now + 5) == ssh_ready_timeout(now - 5) == 30
 
 
 @pytest.mark.asyncio

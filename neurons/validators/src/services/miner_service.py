@@ -286,6 +286,8 @@ REST_POD_LOGS_TIMEOUT = 30  # Timeout for pod logs requests
 REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
 MINER_RESTART_WAIT_S = 90  # how long a create waits for a miner that refuses connections
 MINER_RESTART_RETRY_S = 5
+# a connect that gets no answer (a stopped miner's address during a redeploy) fails fast as ConnectionTimeoutError
+MINER_CONNECT_TIMEOUT_S = 10
 
 # Emitted instead of a validation result for an executor under a special manual (bare-metal)
 # rental. Distinct string so manual passes are greppable in Loki and can never be mistaken for a
@@ -1347,6 +1349,9 @@ class MinerService:
                             else None
                         ),
                         "host_runtime_fault": result.host_runtime_fault,
+                        "check_started_at": (
+                            result.check_started_at.isoformat() if result.check_started_at else None
+                        ),
                     },
                 )
             except Exception as e:
@@ -1896,7 +1901,7 @@ class MinerService:
                     url=url,
                     json=json_data,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    timeout=aiohttp.ClientTimeout(total=timeout, sock_connect=MINER_CONNECT_TIMEOUT_S),
                 ) as response:
                     response.raise_for_status
                     response_data = await response.json()
@@ -2076,13 +2081,11 @@ class MinerService:
             # Generate SSH key
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-            # G3 — attestation event: when due, mint a challenge that executors
-            # must echo in TDX report_data[32:64] / GPU evidence. The nonce is
-            # covered by validator_signature so it cannot be stripped or swapped.
-            attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                payload.miner_hotkey
-            )
-            nonce_hex = attestation_nonce.value_hex if attestation_nonce else self._upload_nonce_for_miner(payload.miner_hotkey)
+            # G3 — every wave carries a challenge that executors must echo in TDX
+            # report_data[32:64] / GPU evidence. The nonce is covered by
+            # validator_signature so it cannot be stripped or swapped.
+            nonce_hex = self._upload_nonce_for_miner(payload.miner_hotkey)
+            attestation_nonce = await self.attestation_service.maybe_issue_nonce(nonce_hex)
 
             # Prepare request
             ssh_request = SSHPubKeySubmitRequest(
@@ -2381,9 +2384,10 @@ class MinerService:
                     stale = status == 401 and "too old" in str(response_data)
                     if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
                         break
-                except aiohttp.ClientConnectorError:
-                    # refused: it never reached the miner, so its rental hook did not run and a resubmit must
-                    # run it. A timeout may have run it, and the hook is not idempotent: that create fails.
+                except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError):
+                    # refused, or a connect nobody answered: it never reached the miner, so its rental hook did not
+                    # run and a resubmit must run it. A read timeout may have run it, and the hook is not idempotent:
+                    # that create fails.
                     if not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
                         raise
                 await asyncio.sleep(MINER_RESTART_RETRY_S)

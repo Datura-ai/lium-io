@@ -238,3 +238,11 @@ def test_an_idle_node_the_miner_cannot_reach_during_the_rollout_gets_the_rented_
 
     assert "EXECUTOR_UNREACHABLE_BY_MINER" in ROLLOUT_FAILURE_REASONS
     assert rollout_grace_reason(still_on_old, _open_window(), J1) == "EXECUTOR_UNREACHABLE_BY_MINER"
+
+
+def test_an_ssh_drop_under_the_port_probe_during_the_rollout_is_withheld() -> None:
+    """DAH-5981: PortCountCheck fails PORT_VERIFY_FAILED, not INSUFFICIENT_PORTS, when the connection dropped;
+    watchtower recreating the executor under the probe must keep the grace INSUFFICIENT_PORTS had."""
+    still_on_old = _failed("node-3", "PORT_VERIFY_FAILED", observed_digest=OLD)
+
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == "PORT_VERIFY_FAILED"
