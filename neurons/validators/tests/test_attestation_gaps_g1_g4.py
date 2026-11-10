@@ -483,6 +483,20 @@ async def test_g1_unbound_nonce_is_logged_not_raised(service, monkeypatch):
     assert await service._verify_gpu(executor, nonce) is True
 
 
+async def test_g1_nras_outage_on_a_challenged_wave_never_rejects_the_node(service, monkeypatch):
+    # Arrange — every wave carries a nonce; NRAS is down (nothing listens on port 9)
+    monkeypatch.setattr(settings, "NVIDIA_NRAS_URL", "http://127.0.0.1:9/")
+    nonce = AttestationNonce.issue()
+    executor = _make_executor(nvidia_payload=_gpu_payload(nonce.value_hex))
+
+    # Act
+    gpu = await service._verify_gpu(executor, nonce)
+
+    # Assert — undeterminable, not raised and not verified-bad: the TDX result alone decides
+    assert gpu is None
+    assert HostPolicyResult(attestation_digest="0xabc", gpu_attestation_passed=gpu).attestation_passed is True
+
+
 async def test_g1_nras_overall_failure_observed_as_false(service, monkeypatch):
     # Arrange — verified-bad is recorded, never raised
     nonce = AttestationNonce.issue()
