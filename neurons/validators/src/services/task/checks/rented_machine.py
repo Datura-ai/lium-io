@@ -1364,8 +1364,8 @@ class _SiblingReadFailed(Exception):
 async def _a_sibling_is_held(ctx: Context, rented_pods: list[RentedPod], pod_index: int, extra: dict) -> bool:
     """True when another listed pod's verdict is held this cycle for an unanswered rental check.
 
-    An earlier pod already recorded its hold; a later one is looked at the way the loop will: down, no
-    backend answer, and still under the hold limit (read only, the loop records it).
+    An earlier pod already recorded its hold. A later pod that is down with no backend answer defers this
+    closed pod either way: the loop then holds it, or judges it once the hold limit is spent.
     """
     if extra.get("pods_rental_state_unknown"):
         return True
@@ -1380,10 +1380,8 @@ async def _a_sibling_is_held(ctx: Context, rented_pods: list[RentedPod], pod_ind
             raise _SiblingReadFailed(other, exc) from exc
         if other_state.running:
             continue
-        if await ctx.services.backend.get_pod_rental_active(other.pod_id) is None and (
-            await _hold_for_unknown_rental_state(ctx, other.pod_id, record=False)
-        ):
-            return True
+        if await ctx.services.backend.get_pod_rental_active(other.pod_id) is None:
+            return True  # held or judged, the main loop decides when it reaches that pod
     return False
 
 

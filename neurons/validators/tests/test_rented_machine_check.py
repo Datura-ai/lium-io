@@ -2507,13 +2507,9 @@ async def test_tenant_enforcement_a_closed_pod_beside_a_held_one_keeps_the_node_
         assert extra["rented_gpu_count"] == 2
         live = result.updates["state"].rented_data.executors["executor-123"].pods
         assert [pod.pod_id for pod in live] == ["pod-u"]
-    elif unknown_first:
-        # past the hold limit the down pod is judged as before
-        assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
     else:
-        # nothing is held: the closed pod first makes the node idle, as before this change
-        assert result.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
-        assert result.updates["rented"] is False
+        # past the hold limit the down pod is judged in either order; the closed pod cannot hide it
+        assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
 
 
 def _held_and_closed_ctx(context_factory, *, order, ssh=None, gpu_processes=(), gpu_details=()):
