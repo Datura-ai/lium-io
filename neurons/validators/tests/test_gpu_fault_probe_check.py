@@ -112,7 +112,7 @@ def make_ctx(context_factory, runner, *, rented_data=None, first_pass=False):
     )
 
 
-def test_the_probe_runs_by_default_and_always_enforces():
+def test_the_fault_enforcement_flag_is_gone():
     fields = type(module.settings).model_fields
     assert "GPU_FAULT_PROBE_CHECK_ENABLED" not in fields
     assert "GPU_FAULT_PROBE_ENFORCEMENT_ENABLED" not in fields
