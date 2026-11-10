@@ -90,6 +90,7 @@ def _spot(uuid: str = "spot-1", **overrides) -> JobResult:
             "is_on_spot_pay_list": True,
             "has_lium_filler": True,
             "filler_revenue_usd_per_hour": AMPLE_FILLER_EARNINGS,
+            "filler_revenue_feed_ok": True,
             **overrides,
         },
     )
@@ -352,9 +353,33 @@ async def test_spot_whose_config_earned_zero_is_not_seeded_with_its_secure_rate(
 
     await _run([spot])
 
-    assert spot.effective_rate == 0.0
     assert spot.incentive == 0.0
     assert _logged(spot, "Spot-tier rate seeded") == []
+    # a measured zero records its own reason, as before seeding
+    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+    assert any("fillers earned nothing" in line for line in spot.incentive_logs)
+
+
+@pytest.mark.asyncio
+async def test_spot_with_no_average_from_a_failed_feed_is_not_seeded():
+    # no usable average for any configuration (failed fetch, backend outage, older backend): keep the old result
+    spot = _spot(filler_revenue_per_gpu_hour=None, filler_revenue_usd_per_hour=None, filler_revenue_feed_ok=False)
+
+    await _run([spot])
+
+    assert spot.incentive == 0
+    assert _logged(spot, "Spot-tier rate seeded") == []
+    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+
+
+@pytest.mark.asyncio
+async def test_secure_decision_does_not_seed_from_a_failed_feed(secure_decision_on):
+    spot = _spot(has_lium_filler=False, filler_revenue_per_gpu_hour=None, filler_revenue_feed_ok=False)
+
+    await _run([spot])
+
+    assert spot.incentive == 0
+    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
 
 
 @pytest.mark.asyncio
@@ -1294,6 +1319,21 @@ def test_unusable_average_reads_as_no_average(value):
     )
 
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) is None
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        ([], False),  # an older backend's default, or nothing sent
+        ([FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=1.0, gpu_hours=10)], False),
+        ([FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=math.nan, gpu_hours=100)], False),
+        ([FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=0.0, gpu_hours=100)], True),
+    ],
+)
+def test_the_feed_is_live_only_with_a_usable_average(entries, expected):
+    data = _rented_data(*entries)
+
+    assert data.has_filler_revenue_averages(24) is expected
 
 
 def test_a_measured_zero_average_is_zero_not_unmeasured():

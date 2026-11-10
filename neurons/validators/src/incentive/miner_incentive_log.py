@@ -120,7 +120,9 @@ class ZeroIncentiveReason(StrEnum):
     REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
     # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
-    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"  # wire code, append-only; no longer emitted: an unmeasured configuration is seeded with its spot ceiling
+    # an idle spot node whose configuration's filler average is a measured zero, or that has no average while the
+    # averages feed itself sent nothing usable (an unmeasured configuration of a live feed is seeded instead)
+    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
     SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
     # Group C: the validation run itself did not pass; context.reason_code names the check
     VALIDATION_FAILED = "validation_failed"
@@ -614,6 +616,33 @@ class MinerLogLine(BaseModel):
                 "Spot-tier executors earn only while Lium's filler jobs run on them."
             ),
             extra_fields={"has_lium_filler": result.has_lium_filler},
+        )
+
+    @staticmethod
+    def no_payout_because_spot_no_filler_revenue_for_gpu_config(result: JobResult) -> MinerLogLine:
+        """The averages feed sent no usable average for any configuration this cycle (a failed fetch, a backend
+        data outage, an older backend): spot pay keeps the rule from before seeding and pays nothing."""
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG,
+            message=(
+                f"No subnet incentive: there is no average filler revenue for the "
+                f"{result.gpu_count}x {result.gpu_model} configuration this cycle, and spot-tier pay is "
+                "measured against it."
+            ),
+            extra_fields={"filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour},
+        )
+
+    @staticmethod
+    def no_payout_because_spot_filler_revenue_is_zero_for_gpu_config(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG,
+            message=(
+                f"No subnet incentive: Lium's fillers earned nothing on the {result.gpu_count}x {result.gpu_model} "
+                "configuration over the last 24 hours, and spot-tier pay is measured against that."
+            ),
+            extra_fields={"filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour},
         )
 
     @staticmethod

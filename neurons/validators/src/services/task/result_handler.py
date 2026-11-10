@@ -197,6 +197,9 @@ class ResultHandler:
             if rented_data
             else None
         )
+        filler_revenue_feed_ok = bool(
+            rented_data and rented_data.has_filler_revenue_averages(settings.get_filler_revenue_min_gpu_hours(is_spot))
+        )
         filler_revenue_usd_per_hour = (
             rented_data.get_filler_revenue_usd_per_hour(
                 BASE_GPU_MAP.get(gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
@@ -289,6 +292,7 @@ class ResultHandler:
             default_job_owner=default_job_owner,
             has_lium_filler=has_lium_filler,
             filler_revenue_per_gpu_hour=filler_revenue_per_gpu_hour,
+            filler_revenue_feed_ok=filler_revenue_feed_ok,
             filler_revenue_usd_per_hour=filler_revenue_usd_per_hour,
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,

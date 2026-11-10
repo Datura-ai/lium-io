@@ -213,7 +213,8 @@ class RentedExecutorsResponse(BaseModel):
     # field force-passes nobody (fail-closed) rather than everybody.
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
     # Average filler revenue per GPU configuration: what the spot-node pay and the secure floor are
-    # measured against. Defaults to empty so an older backend pays spot nodes nothing, as before.
+    # measured against. Defaults to empty: an older backend (or a feed with no usable average) reads as a failed
+    # feed, so no spot node is seeded and none is paid, as before (has_filler_revenue_averages).
     filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
     # executor_id → the hotkey the backend lists the executor under. Only that hotkey may take over a
     # verified record stored under the bare executor id (RedisService.get_verified_job_info).
@@ -246,6 +247,14 @@ class RentedExecutorsResponse(BaseModel):
                 return None
             return entry.usd_per_gpu_hour
         return None
+
+    def has_filler_revenue_averages(self, min_gpu_hours: float) -> bool:
+        """The feed carries a usable average for at least one configuration. When it carries none, a configuration
+        without an average is a failed or empty feed, not an unmeasured configuration."""
+        return any(
+            entry.gpu_hours >= min_gpu_hours and entry.usd_per_gpu_hour >= 0 and math.isfinite(entry.usd_per_gpu_hour)
+            for entry in self.filler_revenue_by_gpu_config
+        )
 
     def get_filler_revenue_usd_per_hour(self, base_model: str | None, min_gpu_hours: float) -> float | None:
         """What Lium's fillers earned per hour in total on a GPU model, over every configuration with a

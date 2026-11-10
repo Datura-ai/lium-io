@@ -1241,9 +1241,10 @@ class RentalPriceIncentive(DefaultIncentive):
     def _qualify_spot_node(job_result: JobResult, excluded_from_both_pools: bool) -> JobResult:
         """An idle spot node is never in the mining pool and never in a bucket. It is paid from
         unbucketed_share, on top of the burn-capped rental share, priced in _price_spot_node, only
-        while it runs a Lium filler and its GPU configuration has a filler revenue average. The
-        idle-pool gates do not apply: the node is paid for the filler work it does, not for being
-        listed for rent."""
+        while it runs a Lium filler. A configuration with no filler average yet is seeded with its spot
+        ceiling (DAH-5721); one whose average is a measured zero, or any node while the averages feed sent
+        nothing usable, is not paid (_spot_average_rules_out). The idle-pool gates do not apply: the node is
+        paid for the filler work it does, not for being listed for rent."""
         job_result.eligible_for_rental_share = False
         job_result.mining_score = 0
         if excluded_from_both_pools or not (job_result.score > 0 or job_result.job_score > 0):
@@ -1252,8 +1253,27 @@ class RentalPriceIncentive(DefaultIncentive):
         if not job_result.has_lium_filler:
             job_result.record_incentive_log(MinerLogLine.no_payout_because_spot_without_lium_filler(job_result))
             return job_result
+        if RentalPriceIncentive._spot_average_rules_out(job_result):
+            return job_result
         job_result.spot_pay_candidate = True
         return job_result
+
+    @staticmethod
+    def _spot_average_rules_out(job_result: JobResult) -> bool:
+        """Record why an idle spot node is not paid on its filler average, if it is not: a measured zero (its
+        configuration's fillers earned nothing), or no average while the feed sent no usable average at all (a failed
+        fetch, a backend data outage, an older backend), which keeps the result from before seeding."""
+        if job_result.filler_revenue_per_gpu_hour == 0:
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_spot_filler_revenue_is_zero_for_gpu_config(job_result)
+            )
+            return True
+        if job_result.filler_revenue_per_gpu_hour is None and not job_result.filler_revenue_feed_ok:
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_spot_no_filler_revenue_for_gpu_config(job_result)
+            )
+            return True
+        return False
 
     @staticmethod
     def _qualify_spot_node_by_the_secure_decision(job_result: JobResult) -> JobResult:
@@ -1262,6 +1282,8 @@ class RentalPriceIncentive(DefaultIncentive):
         would not be paid for takes the unrented not-paid path in calculate_executor_score."""
         job_result.eligible_for_rental_share = False
         job_result.mining_score = 0
+        if RentalPriceIncentive._spot_average_rules_out(job_result):
+            return job_result
         job_result.spot_pay_candidate = True
         return job_result
 
