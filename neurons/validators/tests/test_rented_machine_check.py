@@ -461,7 +461,7 @@ async def test_tenant_enforcement_skips_pod_not_running_when_backend_says_inacti
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_keeps_pod_not_running_when_backend_state_unknown(context_factory):
+async def test_tenant_enforcement_withholds_the_verdict_when_the_backend_state_is_unknown(context_factory):
     executor_uuid = "executor-123"
     rented_data = build_rented_data(
         executor_uuid,
@@ -491,11 +491,11 @@ async def test_tenant_enforcement_keeps_pod_not_running_when_backend_state_unkno
 
     result = await TenantEnforcementCheck().run(ctx)
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    # a renter who ended the pod since the batch-start list is not the provider's fault
+    assert result.passed is True
     assert backend.called_with == ["pod-1"]
-    assert result.updates["clear_verified_job_info"] is True
-    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+    assert result.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-1"]
+    assert "clear_verified_job_info" not in result.updates
 
 
 class DiagnosticsSSHClient:
@@ -1512,9 +1512,9 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
         assert not any(key.startswith("clear_verified_job") for key in first.updates)
         assert first.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
     else:
-        assert not first.passed
-        assert first.event.reason_code == Msg.POD_NOT_RUNNING.reason
-        assert first.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+        # the backend did not answer whether the rental is still open, so the verdict waits for the next cycle
+        assert not any(key.startswith("clear_verified_job") for key in first.updates)
+        assert first.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-1"]
 
     backend.active, backend.local_volume_path = True, "/workspace"
     second = await cycle()
@@ -1524,6 +1524,7 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
         assert _pod_states(second)["pod-1"] == "running"
     else:
         assert not second.passed
+        assert second.event.reason_code == Msg.POD_NOT_RUNNING.reason
         assert not ssh.pod_running
         docker.recover_parked_pod_container.assert_not_awaited()
 

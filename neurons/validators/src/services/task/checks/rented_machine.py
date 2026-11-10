@@ -362,7 +362,13 @@ class TenantEnforcementCheck:
                     ssh_pub_keys = []
                     continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
-                if rental_active and not rental_active.active:
+                if rental_active is None:
+                    # the backend did not answer, so the renter may have ended the pod since the batch-start list.
+                    # Judged next cycle, not penalised or restarted.
+                    extra.setdefault("pods_rental_state_unknown", []).append(pod_id)
+                    ssh_pub_keys = []
+                    continue
+                if not rental_active.active:
                     stale_what = {
                         "pod_id": pod_id,
                         "container_name": pod_container_name,
