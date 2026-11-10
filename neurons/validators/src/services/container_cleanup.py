@@ -15,7 +15,8 @@ from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     CACHE_SWEEP_CONTAINER_NAME,
-    EDIT_PARKED_SUFFIX,
+    PARKED_SUFFIXES,
+    unparked_name,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
@@ -148,7 +149,7 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
         names.update(pod.docker_container_name for pod in executor.pods)
         # An edit parks the pod's current container under <name>__prev while the replacement
         # is created; it is the customer's only copy until then, whatever its age
-        names.update(f"{pod.docker_container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
+        names.update(f"{pod.docker_container_name}{suffix}" for pod in executor.pods for suffix in PARKED_SUFFIXES)
     # Every filler is protected — a GPU-split node runs one per VRAM bundle, and reaping a
     # sibling kills a live worker mid-cycle. The legacy single map covers an older backend.
     for fillers in rented_data.all_filler_containers_by_executor.values():
@@ -157,6 +158,11 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
     # DAH-5510: a moved pod's old container is kept on the node it left until the backend's removal time
     names.update(getattr(rented_data, "retained_container_names", None) or [])
     return names
+
+
+def retained_volume_pod_ids(rented_data: Optional[RentedExecutorsResponse]) -> set[str]:
+    """DAH-3333: pod ids whose volume_<pod_id> stays on the host even when their container is reaped."""
+    return set(getattr(rented_data, "retained_volume_pod_ids", None) or [])
 
 
 def live_pod_ids(rented_data: Optional[RentedExecutorsResponse]) -> set[str]:
@@ -195,7 +201,7 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
     A renter's image can carry an inherited label naming another live pod, so the label counts only
     when it matches the name: the id after pod_/filler_ (ignoring __prev), or a probe's own name.
     """
-    base = container_name.removesuffix(EDIT_PARKED_SUFFIX)
+    base = unparked_name(container_name)
     if base.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
         return label if label == base.partition("_")[2] else ""
     return label if label == container_name else ""
@@ -288,6 +294,7 @@ class ContainerCleanup:
             # Get currently rented containers for this executor
             rented_containers = listed_container_names(rented_data)
             live_ids = live_pod_ids(rented_data)
+            kept_volumes = retained_volume_pod_ids(rented_data)
             extra["rented_container_count"] = len(rented_containers)
 
             # Check each container
@@ -327,7 +334,8 @@ class ContainerCleanup:
 
                     if on_before_remove is not None:
                         await on_before_remove(stripped_name)
-                    if await self._remove_container(ssh_client, stripped_name):
+                    keep_volume = stripped_name.partition("_")[2] in kept_volumes
+                    if await self._remove_container(ssh_client, stripped_name, keep_volume=keep_volume):
                         removed_names.append(stripped_name)
                         logger.info(
                             _m(
@@ -535,6 +543,7 @@ class ContainerCleanup:
                 return 0
             dangling: Optional[list[str]] = await self._get_dangling_volumes(ssh_client)
             listed_names: set[str] = listed_container_names(rented_data)
+            kept_volumes: set[str] = retained_volume_pod_ids(rented_data)
             listed_pod_ids: set[str] = {
                 pod.pod_id for executor in rented_data.executors.values() for pod in executor.pods
             }
@@ -543,6 +552,7 @@ class ContainerCleanup:
                 for name in dangling or []
                 if (match := POD_VOLUME_NAME_PATTERN.match(name))
                 and match[1] not in listed_pod_ids
+                and match[1] not in kept_volumes
                 and f"{POD_CONTAINER_PREFIX}{match[1]}" not in listed_names
                 and f"{FILLER_CONTAINER_PREFIX}{match[1]}" not in listed_names
             )
@@ -888,7 +898,7 @@ class ContainerCleanup:
             )
             return None
 
-    async def _remove_container(self, ssh_client, container_name: str) -> bool:
+    async def _remove_container(self, ssh_client, container_name: str, keep_volume: bool = False) -> bool:
         """Remove a container and its associated resources.
 
         True once the container itself is gone. The pod volume removal after it is best-effort:
@@ -937,7 +947,7 @@ class ContainerCleanup:
         # A create names both the container and its volume after payload.pod_id (the pod id or the
         # filler run id), so `volume_<id>` is this container's own volume and no one else's.
         for prefix in (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX):
-            if not container_name.startswith(prefix):
+            if keep_volume or not container_name.startswith(prefix):
                 continue
             volume_name = f"volume_{container_name.removeprefix(prefix)}"
             try:
