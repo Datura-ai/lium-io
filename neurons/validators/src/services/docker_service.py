@@ -5769,13 +5769,13 @@ class DockerService:
             for filler in killed:
                 if await rental_fits():
                     break
-                trimmed_gb = await self._trim_killed_filler_run_volume(
+                freed_gb = await self._trim_killed_filler_run_volume(
                     ssh_client, filler, killed, docker_root_dir, default_extra
                 )
                 if fit.fresh_sizing:
                     # a trimmed run volume still counts its declared size among the pod volumes (existing_gb) while
                     # its disk is back in df: without this the rental would be counted on that disk twice
-                    fit = fit._replace(existing_gb=fit.existing_gb - trimmed_gb)
+                    fit = fit._replace(existing_gb=fit.existing_gb - freed_gb)
             # shortcut: resolve_volume_sizing still counts a trimmed run volume in its pool until the filler's delete
             # removes it (seconds later), so a split node's slice can read up to share x its size high; exclude killed
             # fillers' volumes there if that shows in prod.
