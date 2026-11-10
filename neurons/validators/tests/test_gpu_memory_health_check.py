@@ -99,7 +99,6 @@ def test_the_snapshot_reads_the_recovery_action_through_field_value_230(monkeypa
     namespace = _probe_namespace(
         "nvml_snapshot",
         "nvml_recovery_action",
-        "nvml_clock_event_reasons",
         "NVML_FI_DEV_GET_GPU_RECOVERY_ACTION",
     )
     asked = []

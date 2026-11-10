@@ -311,7 +311,7 @@ async def _track_rented_scrape_timeout(ctx: Context, timed_out: bool) -> None:
             streak = 1
         await ctx.services.redis.set(key, str(streak), ex=settings.RENTED_GPU_DROP_STATE_TTL_SECONDS)
         if streak >= SCRAPE_TIMEOUT_CYCLES:
-            await RentedGpuDropCheck(unverified=True).run(ctx)
+            await RentedGpuDropCheck(scrape_timed_out_repeatedly=True).run(ctx)
     except GPU_DROP_REDIS_ERRORS:
         logger.warning(_m("RENTED_SCRAPE_TIMEOUT_REDIS_UNAVAILABLE", extra=get_extra_info(ctx.default_extra)))
     except Exception:

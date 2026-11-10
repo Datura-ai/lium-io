@@ -16,7 +16,7 @@ setup) is an error, not a fault: the validator does not penalise what it could n
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
 `--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
 `flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-seen` (`xid_faults`)
-and the hardware slowdowns and PCIe link downgrades of this read (`card_suspects`); none of those sets the status.
+and the PCIe link downgrades of this read (`card_suspects`); none of those sets the status.
 """
 
 from __future__ import annotations
@@ -56,6 +56,10 @@ DMESG_TIMEOUT_SECONDS = 5
 # Xid types an application raises on a healthy card (graphics exception, MMU fault, channel reset, preemptive
 # cleanup): a rented pod's own bug, not the hardware. The probe's own kernels report those through CUresult.
 SOFTWARE_XIDS = {13, 31, 43, 45}
+# On a rented card the renter's own work raises many more application Xids (32, 68, 69, 109, ...): there only
+# these, which NVIDIA documents as hardware, are a fault. DBE/uncontained ECC, internal microcontroller, row-remap
+# failure, NVLink, fell off the bus, GSP timeout/error, unrecovered ECC.
+HARDWARE_XIDS = {48, 61, 62, 64, 74, 79, 95, 119, 120, 140}
 
 # fmix32-style mixer whose every step is a bijection on [0, 2**k): (x + seed) mod 2**k, odd multiplier
 # mod 2**k, xorshift within k bits. Mirrored in PTX by k_perm; the host replays it to check the chase.
@@ -767,16 +771,6 @@ def nvml_recovery_action(handle):
     return field.value.uiVal
 
 
-def nvml_clock_event_reasons(handle):
-    import pynvml
-
-    # renamed from "throttle" in newer bindings; the bits are the same
-    read = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None) or getattr(
-        pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons"
-    )
-    return read(handle)
-
-
 def nvml_snapshot() -> dict:
     """Per-GPU counters that move when hardware faults: uncorrected ECC, remapped rows, recovery action."""
     try:
@@ -803,7 +797,6 @@ def nvml_snapshot() -> dict:
                 ),
                 ("remapped_rows", lambda h: list(pynvml.nvmlDeviceGetRemappedRows(h))),
                 ("recovery_action", nvml_recovery_action),
-                ("clock_event_reasons", nvml_clock_event_reasons),
                 ("pcie_gen", lambda h: pynvml.nvmlDeviceGetCurrPcieLinkGeneration(h)),
                 ("pcie_gen_max", lambda h: pynvml.nvmlDeviceGetMaxPcieLinkGeneration(h)),
                 ("pcie_width", lambda h: pynvml.nvmlDeviceGetCurrPcieLinkWidth(h)),
@@ -958,20 +951,13 @@ def nvml_health(snapshot: dict) -> tuple[list[str], list[str]]:
     return flags, warnings
 
 
-# nvmlClocksEventReason bits (nvml.h) the hardware sets on its own: HW slowdown, HW thermal slowdown, HW power brake.
-# App-clock settings, the SW power cap and SW thermal slowdown follow what the renter runs and are not read.
-HW_SLOWDOWN_REASONS = {0x8: "HW slowdown", 0x40: "HW thermal slowdown", 0x80: "HW power brake slowdown"}
-
-
 def nvml_card_suspects(snapshot: dict) -> list[str]:
-    """Per card, a hardware slowdown or a PCIe link below what the card and slot can do, in this one read.
-    The validator reports one only once the same reading comes back on the next cycle."""
+    """Per card, a PCIe link below what the card and slot can do, in this one read. The validator reports one
+    only once the same reading comes back on the next cycle. Clocks are GpuThermalThrottleCheck's alone: one rule
+    for a slowdown bit, which never holds a rented node."""
     suspects = []
     for gpu in snapshot.get("gpus") or []:
         name = f"gpu {gpu.get('index')} ({gpu.get('uuid')})"
-        reasons = gpu.get("clock_event_reasons")
-        if isinstance(reasons, int):
-            suspects += [f"{name}: {what}" for bit, what in HW_SLOWDOWN_REASONS.items() if reasons & bit]
         width, width_max = gpu.get("pcie_width"), gpu.get("pcie_width_max")
         if isinstance(width, int) and isinstance(width_max, int) and 0 < width < width_max:
             suspects.append(f"{name}: PCIe link x{width} of x{width_max}")
@@ -1008,12 +994,15 @@ def pci_key(bus_id) -> str | None:
     return f"{parts[0][-4:].rjust(4, '0')}:{parts[1]}:{parts[2]}"
 
 
-def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list[str]]:
+def xid_faults(
+    before: dict, after: dict, bus_ids: set, hardware_only: bool = False
+) -> tuple[list[str], list[str]]:
     """New Xid lines split into this executor's hardware faults and evidence about other cards.
 
     dmesg is host-wide: a rented pod's illegal address on another card, or a sibling executor's fault, must
     not be scored against this one. A new line counts as a fault only when its PCI id is one of the probed
-    devices and its Xid type is not an application error (SOFTWARE_XIDS); everything else is kept as evidence.
+    devices and its Xid type is not an application error (SOFTWARE_XIDS), or with hardware_only one of HARDWARE_XIDS;
+    everything else is kept as evidence.
     """
     if not (before.get("available") and after.get("available")):
         return [], []
@@ -1028,7 +1017,7 @@ def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list
             pci
             and pci_key(pci.group(1)) in bus_ids
             and xid is not None
-            and xid not in SOFTWARE_XIDS
+            and (xid in HARDWARE_XIDS if hardware_only else xid not in SOFTWARE_XIDS)
         ):
             faults.append(f"new NVRM Xid on a probed GPU: {line[:200]}")
         else:
@@ -1124,14 +1113,14 @@ def card_xid_faults(snapshot: dict, xid: dict, xid_seen: int | None) -> list[str
         bus = pci_key(gpu.get("pci_bus_id"))
         if bus is None:
             continue
-        for fault in xid_faults(before, xid, {bus})[0]:
+        for fault in xid_faults(before, xid, {bus}, hardware_only=True)[0]:
             faults.append(f"gpu {gpu.get('index')} ({gpu.get('uuid')}): {fault}")
     return faults
 
 
 def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
     """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults, plus the cards'
-    new hardware Xids and this read's slowdowns and PCIe downgrades."""
+    new hardware Xids and this read's PCIe downgrades."""
     snapshot = nvml_snapshot_forked(mp)
     flags, warnings = nvml_health(snapshot)
     status = "error" if not snapshot.get("available") else "flagged" if flags else "ok"

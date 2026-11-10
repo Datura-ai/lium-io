@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import redis.exceptions
@@ -29,25 +30,37 @@ RESET_REQUIRED_STREAK_LIMIT = 3
 _reset_required_streak: dict[tuple[str, str], int] = {}
 
 # DAH-5869: per executor, the kernel-log Xid lines already judged and the last read's card suspects
-# (hardware slowdown, PCIe downgrade), so only new Xids count and a suspect needs two reads in a row
+# (PCIe downgrade), so only new Xids count and a suspect needs two reads in a row
 CARD_HEALTH_KEY_PREFIX = "gpu_card_health"
 CARD_HEALTH_TTL_SECONDS = 86400
 _REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
+
+
+@dataclass
+class CardHealthState:
+    xid_seen: int | None = None
+    suspects: list[str] = field(default_factory=list)
 
 
 def _card_health_key(ctx: Context) -> str:
     return f"{CARD_HEALTH_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
 
 
-async def _load_card_health(ctx: Context) -> dict[str, Any]:
+async def _load_card_health(ctx: Context) -> CardHealthState:
     try:
         stored = json.loads(await ctx.services.redis.get(_card_health_key(ctx)) or "{}")
     except (*_REDIS_ERRORS, TypeError, ValueError):
-        return {}
-    return stored if isinstance(stored, dict) else {}
+        return CardHealthState()
+    if not isinstance(stored, dict):
+        return CardHealthState()
+    xid_seen, suspects = stored.get("xid_seen"), stored.get("suspects")
+    return CardHealthState(
+        xid_seen=xid_seen if type(xid_seen) is int else None,
+        suspects=[s for s in suspects if isinstance(s, str)] if isinstance(suspects, list) else [],
+    )
 
 
-async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: dict[str, Any]) -> None:
+async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
     """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids, and a
     suspect also read on the previous cycle; then keep the state for the next read. A dry run shares Redis
     with the live validator, so it writes nothing."""
@@ -55,16 +68,15 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: dict[
         return  # no NVML reading: the state stays as it was
     suspects = [s for s in report.get("card_suspects") or [] if isinstance(s, str)]
     xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
-    previous = before.get("suspects") or []
-    report["card_faults"] = xid_faults + [s for s in suspects if s in previous]
+    report["card_faults"] = xid_faults + [s for s in suspects if s in before.suspects]
     xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
-    seen = xid.get("count") if xid.get("available") else before.get("xid_seen")
+    seen = xid.get("count") if xid.get("available") else before.xid_seen
     if settings.DRY_RUN:
         return
     try:
         await ctx.services.redis.set(
             _card_health_key(ctx),
-            json.dumps({"xid_seen": seen, "suspects": suspects}),
+            json.dumps(asdict(CardHealthState(xid_seen=seen, suspects=suspects))),
             ex=CARD_HEALTH_TTL_SECONDS,
         )
     except _REDIS_ERRORS:
@@ -78,8 +90,8 @@ async def read_memory_health(ctx: Context) -> MemoryHealthRead:
         return ctx.state.memory_health
     before = await _load_card_health(ctx)
     command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
-    if type(before.get("xid_seen")) is int:
-        command += f" --xid-seen {before['xid_seen']}"
+    if before.xid_seen is not None:
+        command += f" --xid-seen {before.xid_seen}"
     run = await ctx.runner.run(
         command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
     )
@@ -98,7 +110,7 @@ def flagged_uuids(report: dict[str, Any]) -> list[str]:
 
 def card_fault_uuids(report: dict[str, Any]) -> list[str]:
     """The UUIDs of the cards with a hardware fault this cycle (`report["card_faults"]`): a new Xid, or a
-    hardware slowdown or PCIe downgrade read twice in a row."""
+    PCIe downgrade read twice in a row."""
     found = (_FLAG_UUID.match(f) for f in report.get("card_faults") or [] if isinstance(f, str))
     return sorted({match.group(1) for match in found if match and match.group(1) != "None"})
 

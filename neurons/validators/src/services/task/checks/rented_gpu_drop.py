@@ -23,8 +23,8 @@ adds no `nvml_error` label. A card NVML still lists but reports its memory broke
 failed row remap: GpuMemoryHealthCheck's NVML read, done here first on a rented node) is
 `ecc_uncorrected`, even when every card is listed; its UUID goes into `missing_uuids` on a part-rented
 node too: the backend knows which cards each pod holds, and a fault naming no card is refused there.
-DAH-5869: a card NVML still lists but that logged a new hardware Xid, or reads a hardware clock slowdown
-or a PCIe link below its maximum on two cycles in a row (the same memory read), is `gpu_hw_fault`, its
+DAH-5869: a card NVML still lists but that logged a new hardware Xid, or reads a PCIe link below its
+maximum on two cycles in a row (the same memory read), is `gpu_hw_fault`, its
 UUID named the same way. A rented node whose scrape timed out SCRAPE_TIMEOUT_CYCLES in a row
 (MachineSpecScrapeCheck) posts `gpu_unverified` with no card seen, and recovers on its next clean scrape.
 The pod is never touched by any of these.
@@ -335,7 +335,7 @@ class BrokenCardsRead:
 
     uuids: list[str] | None
     updates: dict[str, Any]
-    # DAH-5869: the cards with a new hardware Xid or a slowdown / PCIe downgrade read twice in a row
+    # DAH-5869: the cards with a new hardware Xid or a PCIe downgrade read twice in a row
     hw_uuids: list[str] | None = None
 
 
@@ -361,6 +361,19 @@ async def _read_broken_uuids(ctx: Context) -> BrokenCardsRead:
     return BrokenCardsRead(uuids, updates, hw_uuids)
 
 
+def _unverified_drop(rented_total: int, anchor_uuids: list[str]) -> GpuDrop:
+    """No reading at all: nothing is read from the node, and no card is named."""
+    return GpuDrop(
+        expected=max(rented_total or 1, len(anchor_uuids)),
+        visible=0,
+        nvml_count=0,
+        missing_uuids=[],
+        nvml_error_code=None,
+        faults=[FAULT_GPU_UNVERIFIED],
+        confirm_first=False,
+    )
+
+
 class RentedGpuDropCheck:
     """Report a rented node that lost a GPU on the cycle it is seen, once per incident per pod.
 
@@ -373,9 +386,9 @@ class RentedGpuDropCheck:
     replays_after_session_drop = False
     fatal = False
 
-    def __init__(self, *, unverified: bool = False) -> None:
-        # DAH-5869: the scrape timed out cycle after cycle, so no card was seen at all (MachineSpecScrapeCheck)
-        self.unverified = unverified
+    def __init__(self, *, scrape_timed_out_repeatedly: bool = False) -> None:
+        # DAH-5869: no card was seen at all (MachineSpecScrapeCheck)
+        self.scrape_timed_out_repeatedly = scrape_timed_out_repeatedly
 
     async def run(self, ctx: Context) -> CheckResult:
         rented_data = ctx.state.rented_data
@@ -392,7 +405,7 @@ class RentedGpuDropCheck:
             return CheckResult(passed=True, event=event)
         specs = ctx.state.specs or {}
         gpu_details = list(ctx.state.gpu_details or [])
-        if not self.unverified and await missing_gpus_under_reset(ctx, gpu_details):
+        if not self.scrape_timed_out_repeatedly and await missing_gpus_under_reset(ctx, gpu_details):
             event = render_message(Msg.GPU_RESET_IN_PROGRESS, ctx=ctx, check_id=self.check_id)
             return CheckResult(passed=True, event=event)
 
@@ -402,18 +415,9 @@ class RentedGpuDropCheck:
         scrape_error = specs.get("gpu_scrape_error")
         rented_total = _rented_gpu_count(all_pods)
         anchor_uuids = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
-        if self.unverified:
-            # no reading at all: nothing is read from the node, and no card is named
+        if self.scrape_timed_out_repeatedly:
             broken_uuids, hw_uuids, updates = None, None, {}
-            drop: GpuDrop | None = GpuDrop(
-                expected=max(rented_total or 1, len(anchor_uuids)),
-                visible=0,
-                nvml_count=0,
-                missing_uuids=[],
-                nvml_error_code=None,
-                faults=[FAULT_GPU_UNVERIFIED],
-                confirm_first=False,
-            )
+            drop: GpuDrop | None = _unverified_drop(rented_total, anchor_uuids)
         else:
             memory = await _read_broken_uuids(ctx)
             broken_uuids, hw_uuids, updates = memory.uuids, memory.hw_uuids, memory.updates

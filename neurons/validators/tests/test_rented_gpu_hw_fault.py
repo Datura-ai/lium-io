@@ -1,5 +1,5 @@
-"""DAH-5869: a rented card that stays visible but fails (a new hardware Xid, a hardware slowdown or a
-PCIe link downgrade read twice in a row) is named in the renter's incident, and a rented node whose
+"""DAH-5869: a rented card that stays visible but fails (a new hardware Xid, or a PCIe link
+downgrade read twice in a row) is named in the renter's incident, and a rented node whose
 scrape keeps timing out posts gpu_unverified instead of nothing. The pod is never touched."""
 
 import json
@@ -27,18 +27,13 @@ from tests.test_rented_gpu_drop_check import UUIDS, _clear_local_marks, _ctx, _r
 
 
 def _suspects(**gpu):
-    fn = _probe_namespace("nvml_card_suspects", "HW_SLOWDOWN_REASONS")["nvml_card_suspects"]
+    fn = _probe_namespace("nvml_card_suspects")["nvml_card_suspects"]
     return fn({"available": True, "gpus": [{"index": 1, "uuid": "GPU-1", **gpu}]})
 
 
-def test_only_hardware_slowdown_bits_are_suspects():
-    # 0x1 idle, 0x2 app clocks, 0x4 SW power cap, 0x20 SW thermal: what the renter's load causes
-    assert _suspects(clock_event_reasons=0x1 | 0x2 | 0x4 | 0x20) == []
-    assert _suspects(clock_event_reasons=0x8 | 0x40 | 0x80) == [
-        "gpu 1 (GPU-1): HW slowdown",
-        "gpu 1 (GPU-1): HW thermal slowdown",
-        "gpu 1 (GPU-1): HW power brake slowdown",
-    ]
+def test_a_clock_slowdown_bit_is_not_a_suspect():
+    # clocks are GpuThermalThrottleCheck's alone (review)
+    assert _suspects(clock_event_reasons=0x8 | 0x40 | 0x80) == []
 
 
 def test_a_narrow_link_is_a_suspect_and_a_slow_one_only_at_full_performance():
@@ -48,25 +43,27 @@ def test_a_narrow_link_is_a_suspect_and_a_slow_one_only_at_full_performance():
     assert _suspects(pcie_gen=3, pcie_gen_max=4, pstate=0) == ["gpu 1 (GPU-1): PCIe link gen 3 of gen 4"]
     assert _suspects(pcie_width=16, pcie_width_max=16, pcie_gen=4, pcie_gen_max=4, pstate=0) == []
     # not supported (None) is not judged
-    assert _suspects(pcie_width=None, pcie_width_max=16, clock_event_reasons=None) == []
+    assert _suspects(pcie_width=None, pcie_width_max=16) == []
 
 
 XID_GPU = {"index": 2, "uuid": "GPU-2", "pci_bus_id": "00000000:81:00.0"}
 OLD = "NVRM: Xid (PCI:0000:81:00): 79, pid=1, GPU has fallen off the bus."
 HW = "NVRM: Xid (PCI:0000:81:00): 119, pid=1, Timeout waiting for RPC from GSP!"
 APP = "NVRM: Xid (PCI:0000:81:00): 13, pid=1, Graphics Exception"
+# an application Xid outside SOFTWARE_XIDS: a renter's out-of-range access, not the card (review)
+APP_UNLISTED = "NVRM: Xid (PCI:0000:81:00): 69, pid=1, Graphics Exception: Class error"
 OTHER_CARD = "NVRM: Xid (PCI:0000:c1:00): 79, pid=1, GPU has fallen off the bus."
 
 
 def _card_xids(lines, seen, available=True):
-    ns = _probe_namespace("card_xid_faults", "xid_faults", "pci_key", "SOFTWARE_XIDS")
+    ns = _probe_namespace("card_xid_faults", "xid_faults", "pci_key", "SOFTWARE_XIDS", "HARDWARE_XIDS")
     ns["re"] = __import__("re")
     xid = {"available": available, "count": len(lines), "lines": lines}
     return ns["card_xid_faults"]({"available": True, "gpus": [XID_GPU]}, xid, seen)
 
 
 def test_only_a_new_hardware_xid_on_this_nodes_card_is_a_fault():
-    faults = _card_xids([OLD, HW, APP, OTHER_CARD], seen=1)
+    faults = _card_xids([OLD, HW, APP, APP_UNLISTED, OTHER_CARD], seen=1)
 
     assert faults == [f"gpu 2 (GPU-2): new NVRM Xid on a probed GPU: {HW}"]
 
@@ -102,7 +99,7 @@ def test_nvml_only_reports_the_xid_read_and_the_card_lists():
 
 # --- the validator's memory read --------------------------------------------------------------------------------
 
-SLOW = "gpu 3 (%s): HW slowdown" % UUIDS[3]
+NARROW_LINK = "gpu 3 (%s): PCIe link x8 of x16" % UUIDS[3]
 
 
 def _ok(**extra):
@@ -137,13 +134,13 @@ async def test_the_xid_baseline_is_kept_and_passed_to_the_next_read(context_fact
 @pytest.mark.asyncio
 async def test_a_suspect_counts_only_when_read_on_two_cycles_in_a_row(context_factory):
     services = _services()
-    first, _ = await _read(context_factory, services, _ok(card_suspects=[SLOW]))
-    second, _ = await _read(context_factory, services, _ok(card_suspects=[SLOW]))
+    first, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    second, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
     await _read(context_factory, services, _ok(card_suspects=[]))
-    after_gap, _ = await _read(context_factory, services, _ok(card_suspects=[SLOW]))
+    after_gap, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
 
     assert first.report["card_faults"] == []
-    assert second.report["card_faults"] == [SLOW]
+    assert second.report["card_faults"] == [NARROW_LINK]
     assert after_gap.report["card_faults"] == []
 
 
@@ -181,12 +178,12 @@ async def test_a_new_hardware_xid_on_a_listed_card_is_posted_naming_it(context_f
 
 
 @pytest.mark.asyncio
-async def test_a_slowdown_is_posted_from_its_second_cycle_and_recovers_when_gone(context_factory):
+async def test_a_link_downgrade_is_posted_from_its_second_cycle_and_recovers_when_gone(context_factory):
     services = _services()
 
-    await _drop(context_factory, services, _ok(card_suspects=[SLOW]))
+    await _drop(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
     assert _states(services) == []
-    await _drop(context_factory, services, _ok(card_suspects=[SLOW]))
+    await _drop(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
     assert _states(services) == ["fault"]
     # an NVML read that failed proves nothing: the incident stays open
     await _drop(context_factory, services, _report("error", flags=[], nvml={"available": False}))
