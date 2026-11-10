@@ -57,6 +57,46 @@ from .port_count import (
 
 logger = logging.getLogger(__name__)
 
+# DAH-6141: a rental check the backend leaves unanswered holds the pod's verdict; the 3rd such cycle in a row
+# (about 30 min of holds at 15-min cycles) is judged as a down pod, so a backend outage cannot hide one for long
+RENTAL_STATE_UNKNOWN_PREFIX = "rental_state_unknown:"
+RENTAL_STATE_UNKNOWN_MAX_HELD = 2
+RENTAL_STATE_UNKNOWN_TTL_SECONDS = 3600
+RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC = 2
+
+
+async def _hold_for_unknown_rental_state(ctx: Context, pod_id: str) -> bool:
+    """True to hold this cycle's verdict; counts the consecutive unanswered cycles. Redis down or slow: held."""
+    redis, key = ctx.services.redis, f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}"
+
+    async def count() -> bool:
+        held = int(await redis.get(key) or 0)
+        if held >= RENTAL_STATE_UNKNOWN_MAX_HELD:
+            await redis.delete(key)
+            return False
+        await redis.set(key, str(held + 1), ex=RENTAL_STATE_UNKNOWN_TTL_SECONDS)
+        return True
+
+    try:
+        return await asyncio.wait_for(count(), timeout=RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unanswered rental check count not kept for %s: %s", pod_id, exc)
+        return True
+
+
+async def _forget_unknown_rental_state(ctx: Context, pod_id: str) -> None:
+    redis, key = ctx.services.redis, f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}"
+
+    async def forget() -> None:
+        if await redis.get(key) is not None:  # the usual case writes nothing
+            await redis.delete(key)
+
+    try:
+        await asyncio.wait_for(forget(), timeout=RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unanswered rental check count not cleared for %s: %s", pod_id, exc)
+
+
 # cycle time kept after the rented pod reads, to report the result and close the shell
 POD_READ_RESERVE_SECONDS = 30
 
@@ -363,12 +403,15 @@ class TenantEnforcementCheck:
                     continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active is None:
-                    # the backend did not answer, so the renter may have ended the pod since the batch-start list.
-                    # Judged next cycle, not penalised or restarted.
-                    extra.setdefault("pods_rental_state_unknown", []).append(pod_id)
-                    ssh_pub_keys = []
-                    continue
-                if not rental_active.active:
+                    if await _hold_for_unknown_rental_state(ctx, pod_id):
+                        # the backend did not answer, so the renter may have ended the pod since the batch-start
+                        # list. Judged next cycle, not penalised or restarted.
+                        extra.setdefault("pods_rental_state_unknown", []).append(pod_id)
+                        ssh_pub_keys = []
+                        continue
+                else:
+                    await _forget_unknown_rental_state(ctx, pod_id)
+                if rental_active and not rental_active.active:
                     stale_what = {
                         "pod_id": pod_id,
                         "container_name": pod_container_name,

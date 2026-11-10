@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import asyncssh
 import pytest
-from helpers import build_context_config, build_services, build_state
+from helpers import FakeRedis, build_context_config, build_services, build_state
 import neurons.validators.src.services.task.checks.rented_machine as rented_machine_module
 from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
@@ -495,6 +495,71 @@ async def test_tenant_enforcement_withholds_the_verdict_when_the_backend_state_i
     assert result.passed is True
     assert backend.called_with == ["pod-1"]
     assert result.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-1"]
+    assert "clear_verified_job_info" not in result.updates
+
+
+def _unknown_rental_ctx(context_factory, backend, redis):
+    rented_data = build_rented_data(
+        "executor-123", {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False}
+    )
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend,
+        redis=redis,
+    )
+    state = build_state(gpu_processes=[], gpu_details=[], gpu_model="NVIDIA RTX 4090", rented_data=rented_data)
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=DummySSHClient(pod_running=False),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_judges_a_down_pod_on_the_third_unanswered_rental_check(context_factory):
+    # a long backend outage must not keep a really-down pod unpenalised: two cycles held, the third judged
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+
+    def cycle():
+        return TenantEnforcementCheck().run(_unknown_rental_ctx(context_factory, backend, redis))
+
+    assert [(await cycle()).passed for _ in range(2)] == [True, True]
+    third = await cycle()
+
+    assert third.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert third.updates["clear_verified_job_info"] is True
+    assert (await cycle()).passed is True  # the count starts over
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_an_answered_rental_check_resets_the_unanswered_count(context_factory):
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+
+    def cycle():
+        return TenantEnforcementCheck().run(_unknown_rental_ctx(context_factory, backend, redis))
+
+    await cycle()
+    await cycle()
+    backend.active = False  # the stale-pod answer
+    assert (await cycle()).event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    backend.active = None
+
+    assert (await cycle()).passed is True
+    assert redis.store["rental_state_unknown:pod-1"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_holds_the_verdict_when_redis_cannot_count(context_factory):
+    result = await TenantEnforcementCheck().run(
+        _unknown_rental_ctx(context_factory, DummyBackendClient(active=None), FakeRedis(failing=True))
+    )
+
+    assert result.passed is True
     assert "clear_verified_job_info" not in result.updates
 
 
@@ -1413,6 +1478,7 @@ def _recovery_redis(lock, marks: dict[str, str]) -> Mock:
         renting_in_progress=AsyncMock(return_value=False),
         executor_create_lock=Mock(return_value=lock),
         get=AsyncMock(side_effect=lambda key: marks.get(key)),
+        set=AsyncMock(side_effect=lambda key, value, ex=None: marks.__setitem__(key, value)),
         delete=AsyncMock(side_effect=lambda key: marks.pop(key, None)),
     )
 
