@@ -255,6 +255,7 @@ class VerifyXCheck:
                     default_extra=ctx.default_extra,
                     machine_spec=specs,
                     run_dir=run_dir,
+                    deadline_optional=True,
                     **sizing,
                 )
             except asyncio.CancelledError:

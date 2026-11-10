@@ -323,7 +323,9 @@ class BlockingVerifyX:
         self.started = asyncio.Event()
         self.kill_remote_verifyx = AsyncMock(return_value=True)
 
-    async def validate_verifyx_and_process_job(self, *, run_dir=None, **_):
+    async def validate_verifyx_and_process_job(self, *, run_dir=None, deadline_optional=False, **_):
+        # the first sample falls back to the old run on a host without `timeout -k`
+        assert deadline_optional
         self.run_dir = run_dir
         self.started.set()
         await asyncio.sleep(3600)

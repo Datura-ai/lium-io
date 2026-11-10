@@ -389,6 +389,7 @@ class VerifyXValidationService:
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
         run_dir: str | None = None,
+        deadline_optional: bool = False,
     ):
         # The SSH transport: library checksum over the shell → prepare_verifyx_challenge → one
         # remote `verifyx_executor.py` run → evaluate_verifyx_capture. The local transport
@@ -480,7 +481,7 @@ class VerifyXValidationService:
                 machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir)
+            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir, deadline_optional)
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
@@ -623,7 +624,12 @@ class VerifyXValidationService:
         return None
 
     def _verifyx_command(
-        self, executor_info, challenge: "VerifyXChallenge", lib_name: str, run_dir: str | None = None
+        self,
+        executor_info,
+        challenge: "VerifyXChallenge",
+        lib_name: str,
+        run_dir: str | None = None,
+        deadline_optional: bool = False,
     ) -> str:
         command = (
             f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py "
@@ -634,13 +640,21 @@ class VerifyXValidationService:
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
-        return (
-            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
-            # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
-            f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
+        guarded = (
             f"mkdir {d} && cd {d} || exit 1; "
             f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
             f"cd .. && rm -rf {d}; exit $rc"
+        )
+        if deadline_optional:
+            # the first sample: a host whose `timeout` lacks -k runs it as before, unkillable, rather than fail it
+            return (
+                f"if command -v timeout >/dev/null 2>&1 && timeout -k 1 1 true 2>/dev/null; "
+                f"then {guarded}; else {command}; fi"
+            )
+        return (
+            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
+            # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
+            f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; {guarded}"
         )
 
     async def kill_remote_verifyx(self, shell, run_dir: str, default_extra: dict) -> bool:

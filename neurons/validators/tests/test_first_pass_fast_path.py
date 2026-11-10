@@ -192,7 +192,7 @@ class _ConfigAwareVerifyX:
         self.kwargs: dict = {}
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **kw
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, deadline_optional=False, **kw
     ):
         self.kwargs = kw
         return self._response
@@ -280,7 +280,7 @@ class _ConfigAwareSequence:
         self.kwargs_per_call: list[dict] = []
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **kw
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, deadline_optional=False, **kw
     ):
         self.kwargs_per_call.append(kw)
         return self._responses.pop(0)
