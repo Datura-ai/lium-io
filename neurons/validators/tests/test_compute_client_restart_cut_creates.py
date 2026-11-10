@@ -946,7 +946,7 @@ async def test_a_dispatch_whose_record_failed_runs_once_recorded_and_its_success
         await real_accept(*args)
 
     monkeypatch.setattr(redis_service, "accept_create_dispatch", flaky_accept)
-    monkeypatch.setattr("clients.compute_client.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("clients.compute_client.CREATE_DISPATCH_RECORD_RETRY_DELAYS", (0,) * 6)
     ran: list[str] = []
 
     async def drive(job_request):
@@ -968,7 +968,7 @@ async def test_a_create_whose_dispatch_never_records_does_not_run(monkeypatch) -
     redis_service = _redis_service()
     client = _client(redis_service)
     monkeypatch.setattr(redis_service, "accept_create_dispatch", AsyncMock(side_effect=redis.exceptions.ConnectionError()))
-    monkeypatch.setattr("clients.compute_client.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("clients.compute_client.CREATE_DISPATCH_RECORD_RETRY_DELAYS", (0,) * 6)
     client.miner_driver = AsyncMock()
     await client.handle_message(_create_request().model_dump_json())
 
@@ -977,6 +977,27 @@ async def test_a_create_whose_dispatch_never_records_does_not_run(monkeypatch) -
     client.miner_driver.assert_called_once()  # the coroutine is made, then closed unawaited
     client.miner_driver.assert_not_awaited()
 
+
+
+@pytest.mark.asyncio
+async def test_a_delete_while_the_dispatch_is_being_recorded_cancels_the_create(monkeypatch) -> None:
+    """lium-io#1952: a renter's delete that lands during the acceptance retries finds the create in flight and cancels
+    it, so the create never runs after the pod was answered deleted."""
+    from services.docker_service import inflight_creates
+
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    monkeypatch.setattr(redis_service, "accept_create_dispatch", AsyncMock(side_effect=redis.exceptions.ConnectionError()))
+    monkeypatch.setattr("clients.compute_client.CREATE_DISPATCH_RECORD_RETRY_DELAYS", (5,) * 6)
+    client.miner_driver = AsyncMock()
+    await client.handle_message(_create_request().model_dump_json())
+    task = await client.miner_drivers.get()
+    await asyncio.sleep(0)
+
+    assert inflight_creates.cancel("pod-1")  # what the delete's teardown does first
+    assert await asyncio.wait_for(task, 1) is None
+    client.miner_driver.assert_not_awaited()
+    assert not inflight_creates.is_running("pod-1")
 
 @pytest.mark.parametrize(("queued", "after"), [(None, ["cmd-b"]), ("cmd-b", ["cmd-b"]), ("cmd-a", ["cmd-a", "cmd-b"])])
 @pytest.mark.asyncio

@@ -1210,13 +1210,26 @@ class ComputeClient:
     async def _accept_then_drive(self, job_request: ContainerCreateRequest, accepted_ns: int, driver):
         """The create runs only once its acceptance is recorded: unrecorded, its success could never be saved over the
         older dispatch still current. Still failing, the create does not run and takes no command claim, so the
-        backend's resend of it runs."""
-        for delay in CREATE_DISPATCH_RECORD_RETRY_DELAYS:
-            await asyncio.sleep(delay)
-            if await self._accept_create_dispatch(job_request, accepted_ns):
-                return await driver
+        backend's resend of it runs. Tracked as in flight from the start, so a delete during the waits cancels it
+        instead of answering "deleted" before the create runs and recreates the container."""
+        pod_id = job_request.pod_id
+        with inflight_creates.track(pod_id):
+            for delay in CREATE_DISPATCH_RECORD_RETRY_DELAYS:
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(inflight_creates.wait_cancelled(pod_id), delay)
+                if inflight_creates.is_cancelled(pod_id):
+                    driver.close()
+                    logger.info(
+                        _m(
+                            "Create not run: the pod was deleted while its dispatch was being recorded",
+                            extra=get_extra_info({**self.logging_extra, "pod_id": pod_id}),
+                        )
+                    )
+                    return None
+                if await self._accept_create_dispatch(job_request, accepted_ns):
+                    return await driver
         driver.close()
-        raise RuntimeError(f"create of pod {job_request.pod_id} not run: its dispatch could not be recorded")
+        raise RuntimeError(f"create of pod {pod_id} not run: its dispatch could not be recorded")
 
     async def _keep_until_rent_finished(self, created: ContainerCreated) -> None:
         """DAH-5380: a backend restart can close the socket right after the send, losing the report and leaving the
