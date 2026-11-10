@@ -2085,13 +2085,11 @@ class MinerService:
             # Generate SSH key
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-            # G3 — attestation event: when due, mint a challenge that executors
-            # must echo in TDX report_data[32:64] / GPU evidence. The nonce is
-            # covered by validator_signature so it cannot be stripped or swapped.
-            attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                payload.miner_hotkey
-            )
-            nonce_hex = attestation_nonce.value_hex if attestation_nonce else self._upload_nonce_for_miner(payload.miner_hotkey)
+            # G3 — every wave carries a challenge that executors must echo in TDX
+            # report_data[32:64] / GPU evidence. The nonce is covered by
+            # validator_signature so it cannot be stripped or swapped.
+            nonce_hex = self._upload_nonce_for_miner(payload.miner_hotkey)
+            attestation_nonce = await self.attestation_service.maybe_issue_nonce(nonce_hex)
 
             # Prepare request
             ssh_request = SSHPubKeySubmitRequest(

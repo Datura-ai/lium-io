@@ -55,7 +55,7 @@ MIN_DISK_TO_VRAM_RATE = 1.5
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
 # quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
 # the incentive but stays active.
-FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
+FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB200", "GB300"})  # GB200/GB300 gated as B200/B300
 FULL_8X_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
 NCU_PROFILING_UNRESTRICTED = "unrestricted"
@@ -612,6 +612,10 @@ class RentalPriceIncentive(DefaultIncentive):
         if isinstance(verified, list):
             # a port two mappings both publish can still serve only one renter
             available = min(available, len(set(verified)))
+        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
+        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
+        if isinstance(deferred, int) and not isinstance(deferred, bool):
+            available = min(available, deferred)
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable

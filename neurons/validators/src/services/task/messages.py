@@ -672,8 +672,9 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 80% of the default limit "
+            "reported by NVML, or during a rental to at least 90% (or the limit "
+            "the rental started on, if lower)."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(
@@ -690,6 +691,14 @@ class GpuPowerLimitMessages:
         severity="info",
         category="env",
         impact="Proceed",
+    )
+    # F-43: a kept 80 % tier reading whose clear is not confirmed (Redis failed): neither zero nor show stock
+    TIER_STATE_UNKNOWN = MessageTemplate(
+        event="GPU power limit at stock, but the validator could not clear its earlier tier reading",
+        reason="GPU_POWER_TIER_STATE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
     )
     SKIPPED_ACTIVE_LIUM_FILLER = MessageTemplate(
         event="GPU power limit check skipped for active Lium default job",
@@ -1384,6 +1393,18 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
     )
+    USAGE_HIGH_MEASURED_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization {vram_utilization}; "
+        "an idle node must stay below {gpu_limit}% utilization and at most {memory_limit}% memory "
+        "utilization. GPU processes on the node: {processes}. Stop these processes and re-run your "
+        "node. If using Docker, ensure no host processes are running."
+    )
+    USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "
+        "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
+        "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
+        "running: {fillers}."
+    )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
         "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "
@@ -1566,6 +1587,15 @@ class PortCountMessages:
         severity="info",
         category="runtime",
         impact="Proceed",
+    )
+    # DAH-5851: an idle node's cycle whose port check was deferred for disk pressure: the run is withheld at the
+    # cycle's end (executor_rollout.withhold_renter_gpu_reset_verdicts), neither scored nor hidden
+    VERDICT_WITHHELD_PORT_CHECK_DEFERRED = MessageTemplate(
+        event="Port check deferred for disk pressure; this cycle's verdict is withheld",
+        reason="PORT_VERDICT_WITHHELD_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last completed port check left it",
     )
     INSUFFICIENT_PORTS = MessageTemplate(
         event="Insufficient available ports",
@@ -2070,8 +2100,8 @@ class GpuMemoryHealthMessages:
 
 
 class GpuFaultProbeMessages:
-    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
-    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+    """DAH-3035 — the kernel-fault probe that follows the matmul. It always runs; PROBE_FAILED is an
+    error and zeroes the score."""
 
     FILLER_SKIPPED = MessageTemplate(
         event="GPU kernel-fault probe skipped for active filler",
@@ -2079,13 +2109,6 @@ class GpuFaultProbeMessages:
         severity="info",
         category="policy",
         impact="Active filler runtime preserved; the probe would compete for VRAM.",
-    )
-    FIRST_PASS_SKIPPED = MessageTemplate(
-        event="GPU kernel-fault probe skipped on the first pass",
-        reason="GPU_FAULT_PROBE_SKIPPED_FIRST_PASS",
-        severity="info",
-        category="policy",
-        impact="Proceed; in shadow the verdict changes nothing, so the probe waits for the next cycle.",
     )
     PROBE_OK = MessageTemplate(
         event="GPU kernel-fault probe passed",

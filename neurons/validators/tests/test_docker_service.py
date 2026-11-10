@@ -292,7 +292,7 @@ def create_mock_port_dict(
 def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
-    redis_service = Mock()
+    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True))
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
@@ -5780,6 +5780,8 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
     # Both filters must be present
     assert "name=^container_5TestMiner_" in ps_cmd
     assert "name=^health_check_" in ps_cmd
+    # the port verifier's host-network container holds the range's host ports
+    assert "name=^port_test_" in ps_cmd
 
 
 @pytest.mark.asyncio
@@ -9764,7 +9766,7 @@ async def test_no_disk_for_the_flattened_copy_fails_with_the_renter_sentence(doc
 async def test_edit_keeps_the_existing_local_volume_on_the_plugin_that_owns_it(monkeypatch, docker_run_fails):
     # an edit mounts the pod's volume by name and Docker routes it to the plugin that made it
     # (`vloopback:latest` for every rental before v2): no plugin command, no volume create or rm
-    svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    svc = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     svc._read_host_pid_max = AsyncMock(return_value=4_194_304)
     payload = _edit_payload()
     ssh = _ssh_recording()
