@@ -169,10 +169,10 @@ def test_a_404_after_a_good_list_turns_the_pin_off(monkeypatch):
     cache = ssh_service.SignedSshSources()
 
     cache.refresh()
-    first = cache.get()
+    sources_before_404 = cache.get()
     cache.refresh()
 
-    assert (first, cache.get()) == ("198.51.100.7", "")
+    assert (sources_before_404, cache.get()) == ("198.51.100.7", "")
 
 
 def test_a_node_that_never_got_a_list_does_not_pin(monkeypatch):
