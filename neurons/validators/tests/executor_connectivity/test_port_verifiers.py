@@ -435,3 +435,26 @@ async def test_a_wide_batch_spreads_its_probes_over_a_bounded_time(mocker):
 
     assert len(ok) == 300
     assert max(delays) <= 0.3
+
+
+@pytest.mark.asyncio
+async def test_batch_keeps_verified_ports_when_cleanup_passes_the_attempt_timeout(mocker):
+    # DAH-5868: 297 of 300 ports answered near the end of the 60 s, then the cleanup crossed it
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: (probed[:7], probed[7:]))
+    cleanup_calls = []
+
+    async def slow_cleanup(*_args):
+        cleanup_calls.append(1)
+        await asyncio.sleep(0.3)  # longer than the attempt timeout below
+
+    verifier.runner.cleanup.side_effect = slow_cleanup
+    mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.successful == ports[:7]
+    assert verifier.runner.run.await_count == 1  # no second attempt, no fallback tier
+    assert len(cleanup_calls) == 1  # the batch container is removed once, after the attempt

@@ -553,6 +553,29 @@ async def test_healthy_node_issues_no_extra_ssh_call(context_factory, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_a_failed_inspect_is_looked_at_again_before_the_node_is_zeroed(
+    context_factory, monkeypatch
+):
+    _set_cutoff(monkeypatch, active=True)
+    stderr = "Error response from daemon: context deadline exceeded"
+    miss = Mock(exit_status=1, stdout="", stderr=stderr)
+    ssh = _ssh_seq(miss, _result(stdout=_LOCAL_MATCH))
+    ctx = context_factory(
+        services=_services([_IMAGE]),
+        config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=ssh,
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.DIGEST_MATCH.reason
+    assert ssh.run.await_count == 2
+    assert result.event.what_we_saw["first_inspect_miss"] == {"exit_status": 1, "stderr": stderr}
+
+
+@pytest.mark.asyncio
 async def test_not_cached_stays_advisory_before_cutoff(context_factory, monkeypatch):
     # Same bad signal as the fatal test, but before the cutoff → advisory pass, info severity.
     _set_cutoff(monkeypatch, active=False)
@@ -612,7 +635,7 @@ def _uncached_ctx(context_factory, monkeypatch, redis, prefetch_doc, *, digests=
         services=build_services(backend=_backend(images=[_IMAGE]), redis=redis),
         config=_config_with_digests(digests or {}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
-        ssh=_ssh_seq(_result(exit_status=1), _result(stdout=prefetch_doc)),
+        ssh=_ssh_seq(_result(exit_status=1), _result(exit_status=1), _result(stdout=prefetch_doc)),
     )
 
 

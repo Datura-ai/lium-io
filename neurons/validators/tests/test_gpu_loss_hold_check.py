@@ -679,3 +679,45 @@ async def test_a_pod_given_every_gpu_is_served_by_the_new_cards(context_factory)
     ctx.ssh.run = run
 
     assert (await GpuLossHoldCheck().run(ctx)).passed
+
+
+class _DroppingDockerHost(_DockerHost):
+    def __init__(self, closed: bool):
+        super().__init__(DUPLICATED["listed"], ["container_pod1"])
+        self.closed = closed
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycles_before", "dropped", "replays", "hidden"),
+    [
+        (0, False, False, False),
+        (0, True, False, False),
+        (1, False, False, True),
+        (1, True, False, True),
+        # were it replayed, one observation would read its own new mark and hide the node a cycle early
+        (0, True, True, True),
+    ],
+)
+async def test_one_cycle_advances_the_weak_evidence_count_at_most_once(
+    context_factory, monkeypatch, cycles_before, dropped, replays, hidden
+):
+    # review r4481978335: a session that drops during the mark write must not count the scrape twice
+    redis = FakeRedis()
+    for _ in range(cycles_before):
+        await _cycle(context_factory, redis, **DUPLICATED)
+    ctx = _ctx(context_factory, redis, **DUPLICATED).model_copy(update={"ssh": _DroppingDockerHost(dropped)})
+    if replays:  # the real check says False
+        monkeypatch.setattr(GpuLossHoldCheck, "replays_after_session_drop", True)
+
+    async def reconnect():
+        return _DroppingDockerHost(False)
+
+    ok, events, _ = await Pipeline([GpuLossHoldCheck()], _ListSink(), reconnect=reconnect).run(ctx)
+
+    assert any(e.reason_code == AvailabilityErrorCode.GPU_LOST for e in availability_errors(events)) is hidden
+    if not hidden:
+        assert ok and events[-1].reason_code == Msg.PENDING.reason
