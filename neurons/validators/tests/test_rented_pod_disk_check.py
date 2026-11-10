@@ -252,3 +252,18 @@ async def test_a_record_of_a_pod_no_longer_rented_is_cleared(context_factory):
         _ctx(context_factory, _ssh(_reading(70, f"/pod_1 paused {500 * GB} 0")), redis=redis)
     )
     assert json.loads(redis.store[key]) == ["pod_1"]
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_pod_seen_running_and_paused_again_is_reported_paused_only(
+    context_factory,
+):
+    key = "rented_pod_disk:paused:executor-123"
+    redis = FakeRedis()
+    redis.store[key] = json.dumps(["pod_1"])
+    ctx = _ctx(context_factory, _ssh(_reading(20, f"/pod_1 running {500 * GB} 0")), redis=redis)
+    await RentedPodDiskCheck().run(ctx)
+    assert [
+        c.kwargs["paused"] for c in ctx.services.backend.report_pod_disk_pause.call_args_list
+    ] == [True]
+    assert json.loads(redis.store[key]) == ["pod_1"]

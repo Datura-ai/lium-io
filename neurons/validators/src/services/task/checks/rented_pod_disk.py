@@ -156,7 +156,8 @@ class RentedPodDiskCheck:
                 await self._save(ctx, key, ours)
             # only a pause confirmed this cycle (seen paused, or just paused) stops billing
             confirmed = {n for n in ours if status.get(n) == "paused"} | set(just_paused)
-            await self._report(ctx, confirmed, resumed)
+            # a recorded pod seen running and paused again this cycle stays paused: never report it resumed
+            await self._report(ctx, confirmed, [n for n in resumed if n not in confirmed])
             return self._event(ctx, event, **what)
         except (asyncssh.Error, OSError) as exc:
             return self._event(ctx, Msg.UNKNOWN, reason="ssh transport error", error=repr(exc))
