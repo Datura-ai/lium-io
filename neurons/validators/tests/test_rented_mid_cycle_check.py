@@ -393,32 +393,43 @@ async def test_a_cancelled_gpu_probe_kills_its_remote_process(check, specs, monk
 
 
 class BlockingCardShell:
-    """Each card's matmul never ends; the kills answer at once."""
+    """Each card's matmul never ends and keeps its session; like sshd's MaxSessions 10, a command that would
+    open an 11th session at once is refused."""
+
+    MAX_SESSIONS = 10
 
     def __init__(self, cards: int):
         self.calls: list[str] = []
+        self.refused: list[str] = []
         self.cards = cards
+        self.open = 0
         self.started = asyncio.Event()
 
     async def run(self, cmd, **_):
         self.calls.append(cmd)
         if "kill -KILL" in cmd:
+            if self.open + 1 > self.MAX_SESSIONS:
+                self.refused.append(cmd)
+                raise ConnectionError("open failed: administratively prohibited")
+            self.open += 1
+            await asyncio.sleep(0.01)  # the kill's own session, held while it runs
+            self.open -= 1
             return MagicMock(exit_status=0, stdout="")
+        self.open += 1  # a cancelled card run keeps its session until its own command ends
         if sum("kill -KILL" not in c for c in self.calls) == self.cards:
             self.started.set()
         await asyncio.sleep(3600)
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_all_cards_matmul_kills_every_card_run():
+async def test_a_cancelled_all_cards_matmul_kills_every_card_run_in_one_session():
+    """review 4523441629: on an 8-card host the live card runs leave two sessions, so one kill carries every card."""
     from services.matrix_validation_service import ValidationService
 
     service = ValidationService.__new__(ValidationService)
-    shell = BlockingCardShell(cards=2)
+    shell = BlockingCardShell(cards=8)
     executor = MagicMock(python_path="/usr/bin/python3")
-    runs = asyncio.ensure_future(
-        asyncio.gather(*(service._run_one_card(shell, executor, "/tmp/s.py", i, "params") for i in range(2)))
-    )
+    runs = asyncio.ensure_future(service._run_cards(shell, executor, "/tmp/s.py", ["params"] * 8))
     await asyncio.wait_for(shell.started.wait(), 5)
 
     runs.cancel()
@@ -428,7 +439,8 @@ async def test_a_cancelled_all_cards_matmul_kills_every_card_run():
     card_runs = [c for c in shell.calls if "kill -KILL" not in c]
     kills = [c for c in shell.calls if "kill -KILL" in c]
     tags = {re.search(r"lium-probe-[0-9a-f]+", c).group(0) for c in card_runs}
-    assert len(tags) == 2 and all(any(tag in kill for kill in kills) for tag in tags)
+    assert len(tags) == 8 and len(kills) == 1 and shell.refused == []
+    assert all(tag in kills[0] for tag in tags)
 
 
 def test_the_post_rental_recheck_stops_on_a_rent():
