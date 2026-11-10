@@ -105,20 +105,39 @@ def test_an_empty_signed_list_keeps_the_pin_off(authorized_keys, signed_sources)
     assert authorized_keys.read_text().startswith(RENTER_KEY + KEY + " ")
 
 
+@pytest.fixture()
+def clock(monkeypatch):
+    monkeypatch.setattr(ssh_service.time, "time", lambda: 1000.0)
+
+
+def answer(sources="198.51.100.7", timestamp=1000):
+    return ssh_service.SshSourcesAnswer(sources=sources, timestamp=timestamp, signature="0xab")
+
+
 @pytest.mark.parametrize(
-    "payload,signed",
+    "sources,timestamp,signed",
     [
-        ({"sources": "198.51.100.7", "timestamp": 1000, "signature": "0xab"}, False),
-        ({"sources": "198.51.100.7,not-an-ip", "timestamp": 1000, "signature": "0xab"}, True),
-        ({"sources": "198.51.100.7,", "timestamp": 1000, "signature": "0xab"}, True),
-        ({"sources": "198.51.100.7", "timestamp": 1000 - 3600, "signature": "0xab"}, True),
-        ({"timestamp": 1000, "signature": "0xab"}, True),
+        ("198.51.100.7", 1000, False),
+        ("198.51.100.7,not-an-ip", 1000, True),
+        ("198.51.100.7,", 1000, True),
+        ("198.51.100.7", 1000 - 3600, True),
     ],
 )
-def test_a_bad_answer_is_refused(monkeypatch, payload, signed):
+def test_a_bad_answer_is_refused(monkeypatch, clock, sources, timestamp, signed):
     monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: "current" if signed else None)
     with pytest.raises(ValueError):
-        ssh_service.verify_signed_ssh_sources(payload, now=1000)
+        ssh_service.verify_signed_ssh_sources(answer(sources, timestamp))
+
+
+def test_an_answer_without_sources_is_refused():
+    with pytest.raises(ValueError):
+        ssh_service.SshSourcesAnswer.model_validate({"timestamp": 1000, "signature": "0xab"})
+
+
+def test_spaces_the_backend_accepts_are_stripped(monkeypatch, clock):
+    # lium-platform accepts `a, b`; sshd's from= takes no spaces
+    monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: "current")
+    assert ssh_service.verify_signed_ssh_sources(answer("198.51.100.7, 198.51.100.8")) == "198.51.100.7,198.51.100.8"
 
 
 def test_a_failed_refresh_keeps_the_last_good_list(monkeypatch):
@@ -130,11 +149,11 @@ def test_a_failed_refresh_keeps_the_last_good_list(monkeypatch):
     monkeypatch.setattr(ssh_service.requests, "get", get)
     cache = ssh_service.SignedSshSources()
 
-    first = cache.get(now=0)
-    cached = cache.get(now=1)
-    after_failure = cache.get(now=ssh_service.SSH_SOURCES_CACHE_SECONDS + 1)
+    cache.refresh()
+    first = cache.get()
+    cache.refresh()
 
-    assert (first, cached, after_failure) == ("198.51.100.7", "198.51.100.7", "198.51.100.7")
+    assert (first, cache.get()) == ("198.51.100.7", "198.51.100.7")
     assert get.call_count == 2
     assert get.call_args.args[0] == "https://backend.test/api/watchtower/ssh-sources"
 
@@ -142,14 +161,15 @@ def test_a_failed_refresh_keeps_the_last_good_list(monkeypatch):
 def test_a_node_that_never_got_a_list_does_not_pin(monkeypatch):
     monkeypatch.setattr(ssh_service.settings, "COMPUTE_REST_API_URL", "https://backend.test/api")
     monkeypatch.setattr(ssh_service.requests, "get", MagicMock(side_effect=OSError("down")))
-    assert ssh_service.SignedSshSources().get(now=0) == ""
+    cache = ssh_service.SignedSshSources()
+    cache.refresh()
+    assert cache.get() == ""
 
 
-def test_the_signed_message_carries_the_ssh_sources_prefix(monkeypatch):
+def test_the_signed_message_carries_the_ssh_sources_prefix(monkeypatch, clock):
     # a signed digest answer must never read as a signed source list, nor the other way round
     messages = []
     monkeypatch.setattr(ssh_service, "match_validator_hotkey", lambda message, sig: messages.append(message) or "current")
 
-    payload = {"sources": "198.51.100.7", "timestamp": 1000, "signature": "0xab"}
-    assert ssh_service.verify_signed_ssh_sources(payload, now=1000) == "198.51.100.7"
+    assert ssh_service.verify_signed_ssh_sources(answer()) == "198.51.100.7"
     assert messages == ["ssh-sources:198.51.100.7:1000"]

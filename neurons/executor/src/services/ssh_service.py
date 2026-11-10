@@ -8,10 +8,9 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Any
 
 import requests
+from pydantic import BaseModel
 
 from core.config import VALIDATOR_SSH_SOURCES, settings
 from dependencies.auth import match_validator_hotkey
@@ -81,48 +80,50 @@ SSH_SOURCES_TIMEOUT_SECONDS = 5.0
 SSH_SOURCES_MAX_SKEW_SECONDS = 10 * 60
 
 
-def verify_signed_ssh_sources(payload: dict[str, Any], now: int | None = None) -> str:
+class SshSourcesAnswer(BaseModel):
+    """The `/watchtower/ssh-sources` answer (lium-platform SignedSshSourcesResponse)."""
+
+    sources: str
+    timestamp: int
+    signature: str
+
+
+def verify_signed_ssh_sources(answer: SshSourcesAnswer) -> str:
     """The `ip,ip` list of a `/watchtower/ssh-sources` answer after checking its signature; "" = no pin."""
-    sources, timestamp, signature = payload.get("sources"), payload.get("timestamp"), payload.get("signature")
-    if not isinstance(sources, str) or not isinstance(timestamp, int) or not isinstance(signature, str):
-        raise ValueError("ssh-sources answer has no sources, timestamp or signature")
-    if now is None:
-        now = int(datetime.now(UTC).timestamp())
-    if abs(timestamp - now) > SSH_SOURCES_MAX_SKEW_SECONDS:
-        raise ValueError(f"ssh-sources answer timestamp out of range (now={now}, ts={timestamp})")
-    if match_validator_hotkey(f"ssh-sources:{sources}:{timestamp}", signature) is None:
+    now = int(time.time())
+    if abs(answer.timestamp - now) > SSH_SOURCES_MAX_SKEW_SECONDS:
+        raise ValueError(f"ssh-sources answer timestamp out of range (now={now}, ts={answer.timestamp})")
+    if match_validator_hotkey(f"ssh-sources:{answer.sources}:{answer.timestamp}", answer.signature) is None:
         raise ValueError("ssh-sources answer is not signed by a configured validator hotkey")
+    # the backend accepts `a, b`; sshd's from= takes no spaces, so pin the stripped entries
+    entries = [entry.strip() for entry in answer.sources.split(",")] if answer.sources else []
     # a malformed from= makes sshd refuse the key: keep the last good list instead
-    for source in sources.split(",") if sources else []:
-        ipaddress.ip_network(source)  # an empty entry (`ip,`) is refused too
-    return sources
+    for entry in entries:
+        ipaddress.ip_network(entry)  # an empty entry (`ip,`) is refused too
+    return ",".join(entries)
 
 
 class SignedSshSources:
-    """The signed source list, refreshed at most every SSH_SOURCES_CACHE_SECONDS; a failed refresh keeps the last
-    good list, and a node that never got one does not pin."""
+    """The signed source list. A background task refreshes it (run_ssh_sources_refresh) so an upload never waits
+    on the backend; a failed refresh keeps the last good list, and a node that never got one does not pin."""
 
     def __init__(self):
         self._sources = ""
-        self._fetched_at: float | None = None
-        self._lock = threading.Lock()
 
-    def get(self, now: float | None = None) -> str:
-        now = time.monotonic() if now is None else now
-        with self._lock:
-            if self._fetched_at is not None and now - self._fetched_at < SSH_SOURCES_CACHE_SECONDS:
-                return self._sources
-            self._fetched_at = now
-            if not settings.COMPUTE_REST_API_URL:
-                return self._sources
-            url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/ssh-sources"
-            try:
-                response = requests.get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
-                response.raise_for_status()
-                self._sources = verify_signed_ssh_sources(response.json())
-            except Exception as exc:  # never fail an upload over this
-                logger.warning("Validator ssh sources not refreshed from %s: %s: %s", url, type(exc).__name__, exc)
-            return self._sources
+    def get(self) -> str:
+        return self._sources
+
+    def refresh(self) -> None:
+        """Blocking: run it off the event loop."""
+        if not settings.COMPUTE_REST_API_URL:
+            return
+        url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/ssh-sources"
+        try:
+            response = requests.get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            self._sources = verify_signed_ssh_sources(SshSourcesAnswer.model_validate(response.json()))
+        except Exception as exc:  # never fail an upload over this
+            logger.warning("Validator ssh sources not refreshed from %s: %s: %s", url, type(exc).__name__, exc)
 
 
 _signed_ssh_sources = SignedSshSources()
@@ -257,6 +258,13 @@ def purge_expired_uploaded_keys(ttl_s: int, now: float | None = None) -> int:
             return _rewrite_authorized_keys(path, keep)
         except FileNotFoundError:
             return 0
+
+
+async def run_ssh_sources_refresh() -> None:
+    """Background loop: refresh the signed source list every SSH_SOURCES_CACHE_SECONDS, off the event loop."""
+    while True:
+        await asyncio.to_thread(_signed_ssh_sources.refresh)
+        await asyncio.sleep(SSH_SOURCES_CACHE_SECONDS)
 
 
 async def run_uploaded_key_purge() -> None:
