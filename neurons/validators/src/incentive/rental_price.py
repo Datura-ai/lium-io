@@ -612,6 +612,10 @@ class RentalPriceIncentive(DefaultIncentive):
         if isinstance(verified, list):
             # a port two mappings both publish can still serve only one renter
             available = min(available, len(set(verified)))
+        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
+        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
+        if isinstance(deferred, int) and not isinstance(deferred, bool):
+            available = min(available, deferred)
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable

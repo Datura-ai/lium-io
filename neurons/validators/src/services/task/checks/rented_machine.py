@@ -322,6 +322,22 @@ class TenantEnforcementCheck:
                         ),
                         "diagnostics": diagnostics,
                     }
+                    if ctx.state.port_check_deferred and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                        # DAH-5851: idle now, on a deferred port check: withheld, as PortCountCheck withholds an idle node
+                        await port_connectivity.spend_disk_pressure_deferrals(ctx)
+                        return with_pod_states(
+                            CheckResult(
+                                passed=False,
+                                event=render_message(
+                                    PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED,
+                                    ctx=ctx,
+                                    check_id=self.check_id,
+                                    what={"stale_pod": stale_what},
+                                    extra=extra,
+                                ),
+                                updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
+                            )
+                        )
                     # PortCountCheck exempted this node from the port floor because the batch-start rented
                     # list named a pod; the node goes on as unrented with a count the backend will not list.
                     # The floor is enforced only when every listed pod is stale: a live rental on the same

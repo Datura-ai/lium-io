@@ -246,7 +246,7 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     ("deferred", "prefix"),
     [
         (False, f"2 renting ports answered, {MIN_PORT_COUNT} required."),
-        (True, "Renting-port check deferred; no current measurement. Wait for the next check."),
+        (True, None),  # DAH-5851: an idle node's deferred cycle is withheld, it states no measurement
     ],
 )
 async def test_the_port_message_states_a_measurement_only_when_one_was_taken(context_factory, deferred, prefix):
@@ -257,7 +257,10 @@ async def test_the_port_message_states_a_measurement_only_when_one_was_taken(con
     result = await PortCountCheck().run(ctx)
 
     assert result.passed is False
-    assert result.event.remediation.startswith(prefix)
+    if prefix is None:
+        assert result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    else:
+        assert result.event.remediation.startswith(prefix)
 
 @pytest.mark.asyncio
 async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_completed(context_factory):
@@ -322,6 +325,34 @@ async def test_stale_pod_fails_insufficient_ports_with_the_enforcement_flag(cont
     assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
     assert tenant_result.event.what_we_saw["available_port_count"] == 2
     assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-1"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(context_factory, monkeypatch):
+    """DAH-5851: every listed pod stale makes the node idle: its deferred cycle is withheld and, like an idle
+    node's, is the only one in a row."""
+    from dataclasses import replace
+
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_one_pod(),
+        ssh=DummySSHClient(pod_running=False),
+        backend=DummyBackendClient(active=False),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, port_check_deferred=True)})
+    ctx.services.redis.record_disk_pressure_deferral.side_effect = [1, 2, 3]
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-1"
+    # idle now, so it defers once in a row: the streak is spent and the next pressured cycle runs the check
+    assert ctx.services.redis.record_disk_pressure_deferral.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -891,7 +922,7 @@ async def test_a_stale_split_nodes_reprobe_keeps_crediting_its_idle_fillers_port
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reprobe_ok", [True, False])
 async def test_a_deferred_stale_split_node_states_a_reprobe_as_a_measurement(context_factory, monkeypatch, reprobe_ok):
-    """A deferred cycle whose re-probe completes reports that reading; a failed re-probe has none to report."""
+    """A deferred cycle on a node whose every listed pod is stale is idle: withheld before any re-probe (DAH-5851)."""
     from dataclasses import replace
 
     ctx = stale_split_ctx(context_factory, Firewalled(blocked=set()), 40020)
@@ -904,11 +935,7 @@ async def test_a_deferred_stale_split_node_states_a_reprobe_as_a_measurement(con
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
     assert tenant_result.passed is False
-    if reprobe_ok:
-        assert tenant_result.event.remediation.startswith("21 renting ports answered, 24 required.")
-        assert tenant_result.updates["state"].port_check_deferred is True  # the pipeline flag is untouched
-    else:
-        assert tenant_result.event.remediation.startswith("Renting-port check deferred; no current measurement.")
+    assert tenant_result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("since_snapshot, passed", [("nothing", False), ("rental", True), ("filler", True)])
