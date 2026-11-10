@@ -126,7 +126,7 @@ async def test_no_flatten_on_a_store_off_the_measured_disk():
 @pytest.mark.asyncio
 async def test_no_flatten_on_the_containerd_store_of_a_docker_that_undercounts_image_size():
     ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.7.2")
-    with pytest.raises(RuntimeError, match="storage driver"):
+    with pytest.raises(RuntimeError, match="storage driver 'overlayfs': docker version '29.7.2' does not count"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
     assert ssh.run.await_count == 2
 
@@ -207,7 +207,7 @@ def _same_disk_rc(
 
     ssh = Mock()
     ssh.run = AsyncMock(side_effect=run)
-    return 0 if asyncio.run(image_flatten.containerd_store_on_data_root(ssh)) else 1
+    return 1 if asyncio.run(image_flatten.containerd_store_refusal(ssh)) else 0
 
 
 _STORE = '[["driver-type","io.containerd.snapshotter.v1"]]'
