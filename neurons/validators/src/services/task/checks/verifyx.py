@@ -164,6 +164,8 @@ class VerifyXCheck:
     """
 
     check_id = "gpu.validate.verifyx"
+    # a renter's create on the node stops it mid-run (Pipeline._run_step_unless_rented)
+    stops_on_rent = True
     # a replay would advance this cycle's counters a second time
     replays_after_session_drop = False
     fatal = True

@@ -148,7 +148,9 @@ async def test_same_pod_with_independent_commands(client, ids):
         await client.miner_driver(request(command_id))
     assert client.miner_service.handle_container.await_count == 2
     if not ids[0]:
-        assert client.miner_service.redis_service.mock_calls == []
+        # no command id, no dedup state; only the renter's create mark (test_rented_mid_cycle_check)
+        dedup = [c for c in client.miner_service.redis_service.mock_calls if "rent_requested" not in c[0]]
+        assert dedup == []
 
 
 @pytest.mark.asyncio

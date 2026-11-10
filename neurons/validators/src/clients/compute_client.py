@@ -55,6 +55,7 @@ from payload_models.payloads import (
     ResetPodGpuRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
+    WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
@@ -1129,12 +1130,19 @@ class ComputeClient:
             if inflight_creates.is_running(job_request.pod_id):
                 self.deleted_pod_ids.add(job_request.pod_id)
             await self._untrack_backend_create_for_restart_report(job_request.pod_id)
+            await self._rent_requested(job_request, mark=False)
         if not isinstance(job_request, ContainerCreateRequest):
             return await self._drive_miner_job(job_request)
         with inflight_creates.track(job_request.pod_id):
             await self._track_backend_create_for_restart_report(job_request)
+            if job_request.workload_kind == WorkloadKind.CUSTOMER_RENTAL:
+                # the validation cycle on this node stops its GPU and network tests for the renter
+                await self._rent_requested(job_request, mark=True)
             try:
                 return await self._drive_miner_job(job_request)
+            except BaseException:
+                await self._rent_requested(job_request, mark=False)
+                raise
             finally:
                 await self._untrack_backend_create_for_restart_report(job_request.pod_id)
                 if inflight_creates.is_only_create(job_request.pod_id):
@@ -1160,6 +1168,15 @@ class ComputeClient:
             await self.miner_service.redis_service.remove_inflight_backend_create(pod_id)
         except Exception as exc:
             self._log_backend_create_tracking_error(pod_id, exc)
+
+    async def _rent_requested(self, job_request: ContainerCreateRequest | ContainerDeleteRequest, mark: bool) -> None:
+        """Mark a renter's create, or clear it once the create failed or the pod went; best effort, the TTL backs it."""
+        redis_service = self.miner_service.redis_service
+        args = (job_request.miner_hotkey, str(job_request.executor_id), job_request.pod_id)
+        try:
+            await (redis_service.mark_rent_requested(*args) if mark else redis_service.clear_rent_requested(*args))
+        except Exception as exc:
+            self._log_backend_create_tracking_error(job_request.pod_id, exc)
 
     def _log_backend_create_tracking_error(self, pod_id: str, exc: Exception) -> None:
         logger.error(
@@ -1329,6 +1346,7 @@ class ComputeClient:
                 # the backend fences a failure on the create it answers: a late failure of an earlier create (a
                 # reboot the backend already gave up on) must not fail or exempt the one that replaced it
                 response.command_id = job_request.command_id
+                await self._rent_requested(job_request, mark=False)
 
             logger.info(
                 _m(

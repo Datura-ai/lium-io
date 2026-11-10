@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from payload_models.payloads import ContainerCreateRequest, ContainerDeleteRequest, FailedContainerRequest, WorkloadKind
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.executor_rollout import ExecutorRolloutTracker
+from services.redis_service import RENT_REQUESTED_TTL_SECONDS, RedisService, rent_requested_key
+from services.task import pipeline as pipeline_module
 from services.task.checks.rented_mid_cycle import RentedMidCycleCheck
-from services.task.messages import TenantEnforcementMessages as Msg
+from services.task.messages import TenantEnforcementMessages as Msg, render_message
+from services.task.pipeline import CheckResult, Pipeline, ParallelStage
 from services.task.pipeline_factory import PipelineFactory
 
-from tests.helpers import build_services, build_state, make_context
+from clients.compute_client import ComputeClient
+from core.config import settings
+from tests.helpers import FakeRedis, build_services, build_state, make_context
+from test_compute_client_restart_cut_creates import _client
 from test_executor_rollout_grace import _failed, _scored, _validator_process
+
+KEY = rent_requested_key("miner-hotkey", "executor-123")
 
 
 def rented(*pods: RentedPod) -> RentedExecutorsResponse:
@@ -28,8 +38,6 @@ def rented(*pods: RentedPod) -> RentedExecutorsResponse:
 
 
 UNRENTED = RentedExecutorsResponse(executors={}, banned_guids=[])
-# created a moment ago: the backend lists it, its container is not up and not named yet
-STARTING = RentedPod(pod_id="pod-new", container_name="", rented_ports=[], status="PENDING")
 OLD = RentedPod(pod_id="pod-old", container_name="tenant-old", rented_ports=[])
 
 
@@ -40,39 +48,239 @@ class NoSSH:
         raise AssertionError(f"unexpected SSH call: {command}")
 
 
-def make_ctx(fresh: RentedExecutorsResponse | None, at_start: RentedExecutorsResponse = UNRENTED):
-    services = build_services()
-    services.backend.get_rented_executors_now.return_value = fresh
+def make_ctx(marked: str | None = None, at_start: RentedExecutorsResponse = UNRENTED, redis: FakeRedis | None = None):
+    services = build_services(redis=redis or FakeRedis())
+    if marked:
+        services.redis.store[KEY] = marked
     return make_context(services=services, state=build_state(rented_data=at_start), ssh=NoSSH())
 
 
+def redis_service(redis: FakeRedis | None = None) -> RedisService:
+    service = RedisService.__new__(RedisService)
+    service.redis = redis or FakeRedis()
+    service.lock = asyncio.Lock()
+    return service
+
+
 @pytest.mark.asyncio
-async def test_a_pod_still_starting_at_the_recheck_ends_the_run_with_no_verdict():
-    result = await RentedMidCycleCheck().run(make_ctx(rented(STARTING)))
+async def test_a_rent_requested_since_cycle_start_ends_the_run_with_no_verdict():
+    result = await RentedMidCycleCheck().run(make_ctx(marked="pod-new"))
 
     assert not result.passed and not result.halt
     assert result.event.reason_code == Msg.RENTED_SINCE_CYCLE_START.reason
-    assert result.event.reason_code != Msg.POD_NOT_RUNNING.reason
     # no score, no rented flag, no reset of the verified job
     assert not result.updates
 
 
 @pytest.mark.parametrize(
-    "fresh, at_start",
+    "marked, at_start, redis",
     [
-        (UNRENTED, UNRENTED),
-        (None, UNRENTED),
-        # already listed at start: TenantEnforcementCheck judged it, nothing new here
-        (rented(OLD), rented(OLD)),
+        # no mark, or one that expired
+        (None, UNRENTED, None),
+        # the pod was listed at start: TenantEnforcementCheck judged it, nothing new here
+        ("pod-old", rented(OLD), None),
+        # Redis down: no evidence of a rent, the run goes on
+        (None, UNRENTED, FakeRedis(failing=True)),
     ],
 )
 @pytest.mark.asyncio
-async def test_no_new_pod_goes_on(fresh, at_start):
-    result = await RentedMidCycleCheck().run(make_ctx(fresh, at_start))
+async def test_no_rent_since_cycle_start_goes_on(marked, at_start, redis):
+    result = await RentedMidCycleCheck().run(make_ctx(marked, at_start, redis))
 
     assert result.passed and not result.halt
     assert result.event.reason_code == Msg.NOT_RENTED.reason
     assert not result.updates
+
+
+def test_the_mark_outlives_one_validation_run_and_no_more():
+    # a run that began before the rent is over within JOB_TIME_OUT; the mark must not reach far into the next cycle
+    assert settings.JOB_TIME_OUT < RENT_REQUESTED_TTL_SECONDS <= settings.JOB_TIME_OUT + 120
+
+
+@pytest.mark.asyncio
+async def test_a_mark_left_by_a_crash_expires_on_its_own():
+    redis = FakeRedis()
+    await redis_service(redis).mark_rent_requested("miner-hotkey", "executor-123", "pod-new")
+
+    assert redis.store[KEY] == "pod-new"
+    assert redis.ttl[KEY] == RENT_REQUESTED_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_clearing_one_pod_keeps_a_later_pods_mark():
+    redis = FakeRedis()
+    service = redis_service(redis)
+    await service.mark_rent_requested("miner-hotkey", "executor-123", "pod-2")
+
+    await service.clear_rent_requested("miner-hotkey", "executor-123", "pod-1")
+
+    assert redis.store[KEY] == "pod-2"
+
+
+# the connector: marks a renter's create on receipt, clears it when the create fails or the pod is deleted
+
+
+def _create(kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerCreateRequest:
+    return ContainerCreateRequest.model_construct(
+        pod_id="pod-new", miner_hotkey="miner-hotkey", executor_id="executor-123", workload_kind=kind
+    )
+
+
+def _connector(drive) -> tuple[MagicMock, FakeRedis]:
+    redis = FakeRedis()
+    client = _client(redis_service(redis))
+    client.miner_service.redis_service = redis_service(redis)
+    client._drive_miner_job = drive
+    return client, redis
+
+
+@pytest.mark.asyncio
+async def test_a_renters_create_is_marked_while_it_runs_and_the_mark_stays_once_it_succeeds():
+    seen = []
+
+    async def drive(request):
+        seen.append(redis.store.get(KEY))
+
+    client, redis = _connector(drive)
+
+    await client._run_miner_job(_create())
+
+    assert seen == ["pod-new"]
+    # the pod is up: the next cycle's rented list carries it, the mark ends with its TTL
+    assert redis.store[KEY] == "pod-new"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_create_clears_its_mark():
+    client, redis = _connector(AsyncMock())
+    client.miner_service.handle_container = AsyncMock(
+        return_value=FailedContainerRequest.model_construct(
+            miner_hotkey="miner-hotkey", executor_id="executor-123", pod_id="pod-new", msg="no"
+        )
+    )
+    client._drive_miner_job = ComputeClient._drive_miner_job.__get__(client)
+    client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="miner", port=8000))
+    client.lock = asyncio.Lock()
+
+    await client._run_miner_job(_create())
+
+    assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_create_that_raises_clears_its_mark():
+    client, redis = _connector(AsyncMock(side_effect=RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError):
+        await client._run_miner_job(_create())
+
+    assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_create_cancelled_mid_way_clears_its_mark():
+    client, redis = _connector(AsyncMock(side_effect=asyncio.CancelledError))
+
+    with pytest.raises(asyncio.CancelledError):
+        await client._run_miner_job(_create())
+
+    assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_deleting_the_pod_clears_its_mark():
+    client, redis = _connector(AsyncMock())
+    redis.store[KEY] = "pod-new"
+
+    await client._run_miner_job(
+        ContainerDeleteRequest.model_construct(pod_id="pod-new", miner_hotkey="miner-hotkey", executor_id="executor-123")
+    )
+
+    assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_filler_create_is_not_marked():
+    client, redis = _connector(AsyncMock())
+
+    await client._run_miner_job(_create(WorkloadKind.FILLER))
+
+    assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_does_not_stop_the_create():
+    drive = AsyncMock()
+    client, _ = _connector(drive)
+    client.miner_service.redis_service = redis_service(FakeRedis(failing=True))
+
+    await client._run_miner_job(_create())
+
+    drive.assert_awaited_once()
+
+
+# the pipeline: a rent that arrives while the GPU or network tests run stops them
+
+
+class HeavyStep:
+    check_id = "executor.heavy"
+    fatal = True
+    stops_on_rent = True
+
+    def __init__(self, redis: FakeRedis | None = None):
+        self.cancelled = False
+        self.redis = redis
+        self.finished = False
+
+    async def run(self, ctx):
+        try:
+            if self.redis is not None:
+                # the renter's create lands while the test runs
+                self.redis.store[KEY] = "pod-new"
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        self.finished = True
+        return CheckResult(passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id, what={}))
+
+
+@pytest.fixture(autouse=True)
+def fast_rent_poll(monkeypatch):
+    monkeypatch.setattr(pipeline_module, "RENT_POLL_SECONDS", 0.01)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.asyncio
+async def test_a_rent_during_the_gpu_and_network_tests_stops_them_with_no_verdict(staged):
+    ctx = make_ctx()
+    heavy = HeavyStep(ctx.services.redis)
+
+    ok, events, _ = await Pipeline([ParallelStage([[heavy]]) if staged else heavy], AsyncMock()).run(ctx)
+
+    assert not ok and heavy.cancelled and not heavy.finished
+    assert events[-1].reason_code == Msg.RENTED_SINCE_CYCLE_START.reason
+
+
+@pytest.mark.asyncio
+async def test_an_expired_mark_does_not_stop_the_tests():
+    ctx = make_ctx()
+    heavy = HeavyStep()
+
+    ok, events, _ = await Pipeline([heavy], AsyncMock()).run(ctx)
+
+    assert ok and heavy.finished
+    assert events[-1].reason_code == Msg.NOT_RENTED.reason
+
+
+@pytest.mark.asyncio
+async def test_a_mark_for_a_pod_listed_at_cycle_start_does_not_stop_the_tests():
+    ctx = make_ctx(marked="pod-old", at_start=rented(OLD))
+    heavy = HeavyStep()
+
+    ok, _, _ = await Pipeline([heavy], AsyncMock()).run(ctx)
+
+    assert ok and heavy.finished
 
 
 @pytest.mark.asyncio
