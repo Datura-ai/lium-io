@@ -5688,13 +5688,8 @@ class DockerService:
             return False
         try:
             # DAH-5014: the Engy checkpoint cache gives way to the renter too.
-            # never the image this create is about to run with (No such image, 4 Nov)
             cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
-                ssh_client,
-                set(),
-                default_extra,
-                FILLER_CACHE_VOLUME_PREFIXES,
-                host_probe=host_probe,
+                ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES, host_probe=host_probe
             )
             if not cache_volumes:
                 return False
