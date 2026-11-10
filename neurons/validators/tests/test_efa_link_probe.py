@@ -21,7 +21,7 @@ def host(uuid: str, ports: list[dict], is_rented: bool = False) -> JobResult:
     return JobResult(
         executor_info=ExecutorSSHInfo(
             uuid=uuid,
-            address="10.0.0.1",
+            address="192.0.2.1",
             port=8080,
             ssh_username="root",
             ssh_port=22,
@@ -58,13 +58,13 @@ def test_the_rate_is_read_from_fi_pingpongs_table_and_a_run_without_one_measures
     assert efa_link_probe.measured_gigabits_per_second("fi_getinfo(): No data available\n") is None
 
 
-@pytest.mark.parametrize("c_address", ["10.0.1.3", "10.0.1.2"])
+@pytest.mark.parametrize("c_address", ["192.0.2.13", "192.0.2.12"])
 @pytest.mark.asyncio
 async def test_each_pair_is_recorded_on_both_hosts_under_its_own_spec_key(monkeypatch, c_address):
     a, b, c = [host(uuid, [EFA_PORT]) for uuid in "abc"]
 
     async def measure(server, client, key, addresses):
-        addresses.update({"a": "10.0.1.1", "b": "10.0.1.2", "c": c_address})
+        addresses.update({"a": "192.0.2.11", "b": "192.0.2.12", "c": c_address})
         return 10.0 if (server.executor_info.uuid, client.executor_info.uuid) == ("a", "b") else None
 
     monkeypatch.setattr(efa_link_probe, "_measure_pair", measure)
@@ -74,14 +74,14 @@ async def test_each_pair_is_recorded_on_both_hosts_under_its_own_spec_key(monkey
     for node, expected in [(a, {"b": 10.0, "c": None}), (b, {"a": 10.0, "c": None}), (c, {"a": None, "b": None})]:
         assert {m["peer_executor_uuid"]: m["gigabits_per_second"] for m in node.spec["efa_link_measurements"]} == expected
         assert "roce_link_measurements" not in node.spec
-    assert [(m["peer_executor_uuid"], m["peer_address"]) for m in b.spec["efa_link_measurements"]][0] == ("a", "10.0.1.1")
+    assert [(m["peer_executor_uuid"], m["peer_address"]) for m in b.spec["efa_link_measurements"]][0] == ("a", "192.0.2.11")
 
 
 @pytest.mark.parametrize("failure", ["ssh_closed", "blackhole"])
 @pytest.mark.asyncio
 async def test_an_unreachable_host_is_recorded_as_failed_and_the_healthy_pair_is_still_measured(monkeypatch, failure):
     a, b, c = [host(uuid, [EFA_PORT]) for uuid in "abc"]
-    ips = {"a": "10.1.0.1", "b": "10.2.0.1", "c": "10.2.0.2"}
+    ips = {"a": "198.51.100.1", "b": "203.0.113.1", "c": "203.0.113.2"}
 
     @asynccontextmanager
     async def connected(info, key):
@@ -116,3 +116,27 @@ async def test_an_unreachable_host_is_recorded_as_failed_and_the_healthy_pair_is
         "a": None,
         "c": 10.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_stopping_the_server_cannot_hold_the_sweep_past_the_client_deadline(monkeypatch):
+    a, b = [host(uuid, [EFA_PORT]) for uuid in "ab"]
+    cleanup_timeouts = []
+
+    @asynccontextmanager
+    async def connected(info, key):
+        async def run(command, **kwargs):
+            if command == f"docker rm -f {efa_link_probe.PROBE_CONTAINER_NAME} >/dev/null 2>&1":
+                cleanup_timeouts.append(kwargs["timeout"])
+            if command.endswith(" address"):
+                return SimpleNamespace(stdout="203.0.113.1")
+            return SimpleNamespace(stdout=FI_PINGPONG_OUTPUT)
+
+        yield SimpleNamespace(run=run)
+
+    monkeypatch.setattr(efa_link_probe, "_connected", connected)
+    monkeypatch.setattr(efa_link_probe.asyncssh, "import_private_key", lambda _: None)
+
+    await efa_link_probe._measure_pair(a, b, "key", {})
+
+    assert cleanup_timeouts == [efa_link_probe.CLIENT_DEADLINE_SECONDS]

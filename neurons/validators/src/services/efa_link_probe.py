@@ -80,7 +80,7 @@ def measured_gigabits_per_second(fi_pingpong_output: str) -> float | None:
     return None
 
 
-def _docker_run(arguments: str, detached: bool = False) -> str:
+def _docker_run_command(arguments: str, detached: bool = False) -> str:
     return (
         f"docker run --rm {'-d --name ' + PROBE_CONTAINER_NAME + ' ' if detached else ''}--network host "
         f"--device /dev/infiniband {RDMA_DOCKER_FLAGS} {arguments}"
@@ -90,7 +90,7 @@ def _docker_run(arguments: str, detached: bool = False) -> str:
 async def _host_address(ssh: asyncssh.SSHClientConnection) -> str | None:
     """The host's own IPv4, where the peer's fi_pingpong reaches it for the handshake."""
     completed = await ssh.run(
-        _docker_run(f"--entrypoint {EFA_PROBE_ENTRYPOINT} {EFA_PROBE_IMAGE} address"),
+        _docker_run_command(f"--entrypoint {EFA_PROBE_ENTRYPOINT} {EFA_PROBE_IMAGE} address"),
         check=False,
         timeout=PROBE_TIMEOUT_SECONDS,
     )
@@ -115,7 +115,7 @@ async def _measure_pair(
                 return None
             await server_ssh.run(
                 f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1; "
-                + _docker_run(
+                + _docker_run_command(
                     f"--entrypoint timeout {EFA_PROBE_IMAGE} {PROBE_TIMEOUT_SECONDS} "
                     f"{EFA_PROBE_ENTRYPOINT} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}",
                     detached=True,
@@ -128,7 +128,7 @@ async def _measure_pair(
                     if attempt:
                         await asyncio.sleep(CLIENT_RETRY_DELAY_SECONDS)
                     completed = await client_ssh.run(
-                        _docker_run(
+                        _docker_run_command(
                             f"--entrypoint timeout {EFA_PROBE_IMAGE} {CLIENT_DEADLINE_SECONDS} "
                             f"{EFA_PROBE_ENTRYPOINT} client "
                             f"{PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS} {shlex.quote(server_address)}"
@@ -142,10 +142,11 @@ async def _measure_pair(
                 return None
             finally:
                 # The server holds the card until it is stopped; it must not outlive its measurement.
+                # runs even when the sweep's budget cancels us, and wait_for waits for it
                 await server_ssh.run(
                     f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1",
                     check=False,
-                    timeout=PROBE_TIMEOUT_SECONDS,
+                    timeout=CLIENT_DEADLINE_SECONDS,
                 )
 
 
