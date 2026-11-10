@@ -82,7 +82,7 @@ async def test_a_verdict_ends_the_streak(context_factory, caplog):
 
 
 @pytest.mark.asyncio
-async def test_under_both_switches_a_no_verdict_streak_fails_like_a_fault(context_factory):
+async def test_under_the_streak_switch_a_no_verdict_streak_fails_like_a_fault(context_factory):
     results = await _cycles(
         context_factory,
         [NO_VERDICT] * UNKNOWN_STREAK_LIMIT,

@@ -153,7 +153,7 @@ async def test_probe_source_goes_over_stdin_to_the_executor_interpreter(context_
 
 
 @pytest.mark.asyncio
-async def test_fault_under_enforcement_fails_the_fatal_check(context_factory):
+async def test_a_fault_fails_the_fatal_check(context_factory):
     stdout = probe_stdout("fault", faults=["gpu 0: gather: 1 of 134217728 elements wrong"])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
