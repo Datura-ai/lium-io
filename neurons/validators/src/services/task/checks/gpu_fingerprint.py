@@ -68,6 +68,7 @@ class GpuFingerprintCheck:
     """
 
     check_id = "gpu.validate.fingerprint"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
