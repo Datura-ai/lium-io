@@ -15,8 +15,9 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
 )
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
-from services.container_cleanup import rented_list_unknown_reason
+from services.container_cleanup import live_pod_ids, rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
+from services.volume_grow import grow_short_volumes
 
 from ...const import (
     unparked_name,
@@ -183,6 +184,11 @@ class StaleContainerCleanupCheck:
                 is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
             )
             self._last_sweep_at[ctx.executor.uuid] = now
+
+        # DAH-6073: a live pod granted less disk than it ordered (another renter's kept volume held the space) gets
+        # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
+        if rented_list_unknown is None:
+            await grow_short_volumes(ctx.ssh, live_pod_ids(ctx.state.rented_data))
 
         # DAH-2475: give the DPHN filler cache back when the node can no longer afford it. This is
         # the ONLY caller — the create-time sweep deliberately never reclaims (it would raise free
