@@ -4,7 +4,7 @@ import logging
 import math
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Callable, Literal, NamedTuple
 
 import redis.asyncio as aioredis
@@ -439,6 +439,24 @@ class RedisService:
                             extra={"error": str(e)},
                         )
                     )
+
+    @asynccontextmanager
+    async def rented_gpu_drop_lock(self, pod_id: str):
+        # The validator's cycle and the connector's renter reset both write the pod's drop mark: a recovery whose
+        # reply lands after a renewed fault was saved would delete that fault.
+        # yields True (held), False (another holder kept it past the wait) or None (Redis unreachable)
+        lock = aioredis.lock.Lock(self.redis, f"lock:rented_gpu_drop:{pod_id}", timeout=60, blocking_timeout=30)
+        held: bool | None = None
+        try:
+            held = bool(await lock.acquire())
+        except (redis.exceptions.RedisError, OSError) as e:
+            logger.warning(_m(f"Rented GPU drop lock for pod {pod_id} could not be taken", extra={"error": str(e)}))
+        try:
+            yield held
+        finally:
+            if held:
+                with suppress(redis.exceptions.RedisError, OSError):  # past its TTL the lock is no longer ours
+                    await lock.release()
 
     async def release_cut_off_create_lock(self, executor_id: str, pod_id: str) -> None:
         """The create lock a create cut off by a connector restart still holds, released if it is that create's.

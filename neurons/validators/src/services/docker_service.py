@@ -218,6 +218,7 @@ from services.storage_operations import (
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
+from services.task.checks.rented_gpu_drop import report_gpus_lost_on_reset
 from services.task.checks.rented_pod_ssh import tcp_connect_fault
 from protocol.vc_protocol.validator_requests import PodSshResult
 from tenacity import RetryError
@@ -5640,12 +5641,16 @@ class DockerService:
                 )
             )
 
-    async def _remember_new_filler_best_effort(self, executor_uuid: str, container_name: str) -> None:
+    async def _remember_new_filler_best_effort(
+        self, executor_uuid: str, container_name: str, container_id: str | None
+    ) -> None:
         """A filler that starts and stops between two cycle snapshots is never listed there; record it at create
         so its leftover GPU process still counts as our load (DAH-5904)."""
+        if not container_id:
+            return
         try:
             await self.redis_service.set(
-                f"{RECENT_FILLER_PREFIX}{executor_uuid}:{container_name}", "1", ex=RECENT_FILLER_TTL_SECONDS
+                f"{RECENT_FILLER_PREFIX}{executor_uuid}:{container_name}", container_id, ex=RECENT_FILLER_TTL_SECONDS
             )
         except Exception as exc:
             logger.warning("Recent filler record not written at create for %s: %s", executor_uuid, exc)
@@ -11077,7 +11082,7 @@ class DockerService:
                         await self._record_filler_image_best_effort(
                             docker_client, container_id or container_name, container_name, default_extra
                         )
-                        await self._remember_new_filler_best_effort(executor_info.uuid, container_name)
+                        await self._remember_new_filler_best_effort(executor_info.uuid, container_name, container_id)
                     # no duration: the collector starts after the reply, its time is logged there
                     profilers.append(
                         ProfilerStep(
@@ -13345,6 +13350,16 @@ class DockerService:
                 logger.warning(
                     _m("Reset pod GPUs: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
                 )
+            # still under the pending mark, so a concurrent RentedGpuDropCheck cycle cannot race on the drop mark
+            if report is not None and report.error_code == GpuResetErrorCode.GpusLostOnHost and self.backend_client:
+                await report_gpus_lost_on_reset(
+                    self.redis_service,
+                    self.backend_client,
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    default_extra=default_extra,
+                )
 
         async def operate(runner: SSHCommandRunner, private_key: str, known_hosts_policy, default_extra: dict):
             async def start_container() -> None:
@@ -13390,7 +13405,14 @@ class DockerService:
             workload_kind=payload.workload_kind,
             request_id=payload.request_id,
             ok=report.ok,
-            error_code=report.error_code,
+            # GpusLostOnHost is not on the wire yet: the backend drops the whole frame on an unknown error_code and the
+            # renter's reset hangs until timeout; a separate task adds the wire code and removes this swap after
+            # lium-platform accepts GpusLostOnHost
+            error_code=(
+                GpuResetErrorCode.ResetNotSupported
+                if report.error_code == GpuResetErrorCode.GpusLostOnHost
+                else report.error_code
+            ),
             container_restarted=report.container_restarted,
             gpus=report.gpus,
             detail=report.detail,
