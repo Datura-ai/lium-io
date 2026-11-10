@@ -110,7 +110,6 @@ class BatchVerifier:
                         extra=get_extra_info(log_ctx),
                     )
                 )
-                await self.runner.cleanup(ssh_client, container_name)
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
 
@@ -119,9 +118,15 @@ class BatchVerifier:
                     _m(f"attempt {attempt} failed: {e}", extra=get_extra_info(log_ctx)),
                     exc_info=True,
                 )
-                await self.runner.cleanup(ssh_client, container_name)
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
+
+            finally:
+                # DAH-5868: outside wait_for, so a slow cleanup cannot time out an attempt whose ports answered
+                try:
+                    await self.runner.cleanup(ssh_client, container_name)
+                except Exception as e:
+                    logger.debug(_m(f"cleanup failed: {str(e)[:50]}", extra=get_extra_info(log_ctx)))
 
         # DAH-3593: the outcome is the PortCountCheck verdict ("Port verification failed"); the
         # attempts and tiers on the way there are DEBUG. An exception inside an attempt keeps
@@ -169,25 +174,22 @@ class BatchVerifier:
             )
             return BatchResult([], ports, external)
 
-        try:
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
-                successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
-                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
-                # re-probe the refused ports while the count is below what PortCountCheck needs to list the node
-                for round_no in range(1, self.REPROBE_ROUNDS + 1):
-                    if not failed or len(sampled_ok) + len(successful) >= min_ports:
-                        break
-                    await asyncio.sleep(self.REPROBE_DELAY_SEC)
-                    late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
-                    successful = successful + late
-                    logger.debug(
-                        _m(f"re-probe {round_no}/{self.REPROBE_ROUNDS}: {len(late)} late", extra=get_extra_info(log_ctx))
-                    )
-                logger.info(
-                    _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+        async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+            successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
+            # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
+            # re-probe the refused ports while the count is below what PortCountCheck needs to list the node
+            for round_no in range(1, self.REPROBE_ROUNDS + 1):
+                if not failed or len(sampled_ok) + len(successful) >= min_ports:
+                    break
+                await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
+                successful = successful + late
+                logger.debug(
+                    _m(f"re-probe {round_no}/{self.REPROBE_ROUNDS}: {len(late)} late", extra=get_extra_info(log_ctx))
                 )
-        finally:
-            await self.runner.cleanup(ssh_client, name)
+            logger.info(
+                _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+            )
 
         if not successful:
             # DAH-5597: only the host listener decides this tier; a host that drops INPUT but forwards published

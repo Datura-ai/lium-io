@@ -52,6 +52,7 @@ class TdxHostCheck:
     """
 
     check_id = "host.detect.tdx"
+    replays_after_session_drop = True
     fatal = False
 
     @staticmethod

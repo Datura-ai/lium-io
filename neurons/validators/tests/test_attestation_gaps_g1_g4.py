@@ -123,7 +123,6 @@ def service(monkeypatch):
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", False)
-    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_NONCE", False)
     return AttestationService()
 
 
@@ -402,28 +401,14 @@ async def test_verify_tdx_no_retry_on_report_data_or_nonce_mismatch(service, mon
     assert len(calls) == 1
 
 
-async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
-    # Arrange
-    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
-    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_NONCE", True)
-    monkeypatch.setattr(settings, "TDX_REATTEST_INTERVAL_SECONDS", 3600)
-    service = AttestationService(redis_service=FakeRedis())
+async def test_g3_every_wave_is_challenged_with_the_nonce_the_miner_is_sent(service):
+    upload_nonce = AttestationNonce.issue().value_hex
 
-    # Act
-    first = await service.maybe_issue_nonce("miner-hotkey")
-    second = await service.maybe_issue_nonce("miner-hotkey")
+    sent = await service.maybe_issue_nonce(upload_nonce)
+    unsent = await service.maybe_issue_nonce(None)
 
-    # Assert — one event per interval per miner
-    assert first is not None
-    assert len(first.value_bytes) == 32
-    assert second is None
-
-
-async def test_g3_maybe_issue_nonce_disabled_returns_none(service):
-    # Arrange — ENABLE_ATTESTATION_NONCE is off in the service fixture
-
-    # Act / Assert
-    assert await service.maybe_issue_nonce("miner-hotkey") is None
+    assert sent.value_hex == upload_nonce
+    assert unsent is not None and unsent.value_hex != upload_nonce
 
 
 def test_g3_signing_blob_covers_nonce():
