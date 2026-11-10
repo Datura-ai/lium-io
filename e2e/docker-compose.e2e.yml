@@ -77,6 +77,8 @@ services:
       # the validator hotkey the executor trusts — production bakes it into the image (core/config.py); the :dev
       # images override it the same way, through core/config_override.py
       - ./executor/trust_anchor.py:/root/app/src/core/config_override.py:ro
+      # GPU-less host: the rental-start power read sees no GPUs (executor/nvidia-smi)
+      - ./executor/nvidia-smi:/usr/local/bin/nvidia-smi:ro
       # the host's docker socket, as on a provider's machine (exists once dind is healthy — see depends_on)
       - ./.dind-sock/docker.sock:/var/run/docker.sock
     healthcheck:
