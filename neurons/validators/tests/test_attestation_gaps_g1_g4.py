@@ -497,6 +497,49 @@ async def test_g1_nras_outage_on_a_challenged_wave_never_rejects_the_node(servic
     assert HostPolicyResult(attestation_digest="0xabc", gpu_attestation_passed=gpu).attestation_passed is True
 
 
+CHALLENGE = "aa" * 32
+
+
+@pytest.mark.parametrize(
+    "challenged, payload, nras, expected_tee_type",
+    [
+        (True, _gpu_payload(CHALLENGE), "pass", "dstack/tdx+nvcc"),  # bound to the issued challenge
+        (True, _gpu_payload("ab" * 32), "pass", "dstack/tdx"),  # replayable self-nonce
+        (False, _gpu_payload(CHALLENGE), "pass", "dstack/tdx"),  # no challenge issued
+        (True, None, "pass", "dstack/tdx"),  # evidence missing
+        (True, "not-json{", "pass", "dstack/tdx"),  # evidence malformed
+        (True, _gpu_payload(CHALLENGE), "fail", "dstack/tdx"),  # failed verdict
+        (True, _gpu_payload(CHALLENGE), "outage", "dstack/tdx"),  # NRAS unreachable
+    ],
+)
+async def test_g1_only_a_passed_verdict_bound_to_the_challenge_claims_gpu_cc(
+    service, monkeypatch, challenged, payload, nras, expected_tee_type
+):
+    # Arrange
+    nonce = AttestationNonce(value_hex=CHALLENGE) if challenged else None
+    executor = _make_executor(nvidia_payload=payload)
+
+    async def fake_tdx(executor_, nonce=None):
+        return "digest", "dstack/tdx"
+
+    async def fake_post(payload_, executor_):
+        if nras == "outage":
+            raise AttestationError("NRAS unreachable")
+        echoed = json.loads(payload_)["nonce"] if isinstance(payload_, str) else payload_["nonce"]
+        return _nras_response(overall=nras == "pass", nonce=echoed)
+
+    monkeypatch.setattr(service, "_verify_tdx", fake_tdx)
+    monkeypatch.setattr(service, "_post_nras", fake_post)
+    monkeypatch.setattr(service, "_build_known_hosts", lambda executor_: None)
+
+    # Act
+    result = await service.prepare_host_policy(executor, nonce=nonce)
+
+    # Assert — observe-only: the node is never rejected, only the label differs
+    assert result.tee_type == expected_tee_type
+    assert result.attestation_digest == "digest"
+
+
 async def test_g1_nras_overall_failure_observed_as_false(service, monkeypatch):
     # Arrange — verified-bad is recorded, never raised
     nonce = AttestationNonce.issue()

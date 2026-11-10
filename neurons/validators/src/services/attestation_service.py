@@ -675,6 +675,18 @@ class AttestationService:
             ))
             return None
 
+    @staticmethod
+    def _gpu_evidence_bound_to(executor: ExecutorSSHInfo, nonce: AttestationNonce | None) -> bool:
+        """Whether the GPU evidence carries the issued challenge: observe-only acceptance takes a
+        self-nonced (replayable) payload too, but only a bound one may claim GPU CC."""
+        if nonce is None:
+            return False
+        try:
+            payload = json.loads(executor.nvidia_payload or "")
+        except (ValueError, TypeError):
+            return False
+        return isinstance(payload, dict) and payload.get("nonce") == nonce.value_hex
+
     async def prepare_host_policy(
         self,
         executor: ExecutorSSHInfo,
@@ -713,7 +725,7 @@ class AttestationService:
             gpu_attestation_passed = await self._verify_gpu(executor, nonce)
             # tee_type only claims verified GPU CC when the evidence was bound
             # to the validator-issued challenge (an unbound pass is replayable).
-            if gpu_attestation_passed is True and nonce is not None:
+            if gpu_attestation_passed is True and self._gpu_evidence_bound_to(executor, nonce):
                 tee_type = "dstack/tdx+nvcc"
 
         known_hosts = self._build_known_hosts(executor)
