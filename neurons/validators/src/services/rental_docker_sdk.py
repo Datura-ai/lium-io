@@ -1079,15 +1079,14 @@ class RentalDockerSdkClient:
                 break
             except Exception as exc:
                 daemon_cpus = _daemon_cpu_count_from_refusal(exc)
-                # The daemon has fewer CPUs than advertised but within the DAH-2671 bound (as the
-                # health probe's retry allows): rent with the daemon's count, label included. One retry,
-                # bounded by the original count; a second refusal fails like any other.
+                # The daemon has at most 2 CPUs fewer than advertised (DAH-5991): rent with the daemon's
+                # count, label included. One retry; a larger gap or a second refusal fails like any other.
                 cpus = spec.cpu_count
                 if (
                     attempt is spec
                     and cpus
                     and daemon_cpus
-                    and daemon_cpus < cpus <= 2 * daemon_cpus + 4
+                    and cpus - 2 <= daemon_cpus < cpus
                     and daemon_cpus >= (spec.min_cpu_count or 0)
                 ):
                     logger.warning(

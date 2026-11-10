@@ -877,6 +877,18 @@ async def test_run_container_does_not_retry_a_cpu_refusal_past_the_bound():
 
 
 @pytest.mark.asyncio
+async def test_run_container_does_not_retry_a_cpu_refusal_more_than_two_cpus_short():
+    api_client = CpuRefusingApiClient(daemon_cpus=4)
+
+    with pytest.raises(RentalDockerOperationError, match="only 4 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=11)
+        )
+
+    assert api_client.create_nano_cpus == [11_000_000_000]
+
+
+@pytest.mark.asyncio
 async def test_run_container_without_a_network_stays_on_the_default_bridge():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
