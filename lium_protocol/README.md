@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.10.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.11.0`) is semver over the wire.
 
 ## Using it
 
@@ -69,6 +69,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.6.0` — `RecheckExecutorRequest` (backend → validator; `executor_id`): validate one node now, outside the cycle (a provider's "Recheck now" in the portal). A validator that does not list the node ignores it; an older validator ignores the message.
 - `2.9.0` — `ContainerWarningCode.HungGpuReset`, `HungGpuNotResetMig`, `HungGpuNotResetNvlinkShared`, `HungGpuNotResetInUse`, `HungGpuNotResetUnsupported` (on `ContainerCreated.warnings`): a reboot or edit found a pod GPU hung and reset it before starting the new container, or could not reset it and says why.
 - `2.10.0` — `ExecutorSpecRequest.host_runtime_fault` (optional): this cycle's DinD test container started on the host and its sshd never answered, so the host's container runtime is failing. False for a refused `docker run` or an error on the validator's side; None from an older validator.
+- `2.11.0` — `ExecutorSpecRequest.check_started_at` (optional): when an express recheck outside the cycle started. Its `job_batch_id` stays the cycle's, so the uptime and finished-jobs counters do not move; the backend judges the end of a provider maintenance window by this time instead of the cycle's start. None for a cycle's own report and from an older validator.
 - `1.0.0` — first release.
 
 ## Tests

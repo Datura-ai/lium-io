@@ -1037,3 +1037,13 @@ async def test_a_failed_build_keeps_the_stdin_verdict(context_factory):
     assert result.passed is False
     assert result.event.what_we_saw["delivery"] == "stdin"
     assert ssh_client.sftp_client.put_called_with is None
+
+
+@pytest.mark.asyncio
+async def test_a_provider_reported_host_power_limit_is_dropped(context_factory):
+    # DAH-5302: power_host_limit is GpuPowerLimitCheck's, written only under our Pearl cap
+    gpu = {**RAW_SPECS["gpu"], "details": [{**d, "power_host_limit": 999} for d in RAW_SPECS["gpu"]["details"]]}
+    result = await _scrape_ok_event_for(context_factory, {"gpu": gpu})
+
+    details = result.updates["state"].specs["gpu"]["details"]
+    assert details and all("power_host_limit" not in d for d in details)

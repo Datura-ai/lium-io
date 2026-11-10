@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -219,6 +220,13 @@ ORIGINAL_KEYS = {
     'dh_write_probe': "write_probe",
 }
 
+
+
+@dataclass(frozen=True)
+class ObfuscatedScrape:
+    source: str
+    all_keys: dict[str, str]
+    encryption_key: str
 
 class FileEncryptService:
     def __init__(
@@ -468,7 +476,8 @@ class FileEncryptService:
             except FileNotFoundError:  # a build's cleanup removed it first
                 continue
         directory = Path(tempfile.mkdtemp(prefix=f"cycle-{time.time_ns():020d}-", dir=root))
-        source, all_keys, encryption_key = self._obfuscated_scrape()
+        scrape = self._obfuscated_scrape()
+        source, all_keys, encryption_key = scrape.source, scrape.all_keys, scrape.encryption_key
         file_name = f"tmp{secrets.token_hex(4)}"
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
@@ -479,7 +488,7 @@ class FileEncryptService:
             binary_build=ScrapeBinaryBuild(directory, file_name, source, keep_directories),
         )
 
-    def _obfuscated_scrape(self) -> tuple[str, dict, str]:
+    def _obfuscated_scrape(self) -> ObfuscatedScrape:
         """The obfuscated scrape source, its key mapping and its encryption key."""
         machine_scrape_file_path = str(Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py")
         obfuscator_machine_scrape_file_path = str(Path(__file__).parent / ".." / "miner_jobs/obfuscator.py")
@@ -496,7 +505,7 @@ class FileEncryptService:
         obfuscated_content = with_vloopback_check_switch(
             obfuscated_content, settings.VLOOPBACK_SCRAPE_CHECK_ENABLED
         )
-        return obfuscated_content, all_keys, encryption_key
+        return ObfuscatedScrape(source=obfuscated_content, all_keys=all_keys, encryption_key=encryption_key)
 
     def ecrypt_miner_job_files(self, keep_directories: Iterable[str] = ()):
         """
@@ -513,7 +522,8 @@ class FileEncryptService:
         Returns: MinerJobEnryptedFiles
         """
         tmp_directory = self.fresh_job_files_directory(keep_directories)
-        obfuscated_content, all_keys, encryption_key = self._obfuscated_scrape()
+        scrape = self._obfuscated_scrape()
+        obfuscated_content, all_keys, encryption_key = scrape.source, scrape.all_keys, scrape.encryption_key
 
         # build binary with nuitka
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:
@@ -599,9 +609,9 @@ class ScrapeBinaryBuild:
 
     def _remove_earlier_directories(self, kept: set[Path]) -> None:
         # only older cycles: a late build of the last cycle must not remove the new cycle's directory
-        own = _cycle_started_ns(self.directory)
+        own_cycle_started_ns = _cycle_started_ns(self.directory)
         for entry in JOB_FILES_ROOT.iterdir():
-            if entry.resolve() in kept or _cycle_started_ns(entry) >= own:
+            if entry.resolve() in kept or _cycle_started_ns(entry) >= own_cycle_started_ns:
                 continue
             if entry.is_dir():
                 shutil.rmtree(entry, ignore_errors=True)
