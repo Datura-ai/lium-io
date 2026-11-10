@@ -140,6 +140,8 @@ class Settings(BaseSettings):
     BACKEND_COMMAND_CLAIM_TTL_SECONDS: int = Field(default=60, gt=0)
     BACKEND_COMMAND_HEARTBEAT_SECONDS: float = Field(default=20, gt=0)
     BACKEND_COMMAND_ANSWER_TTL_SECONDS: int = Field(default=900, gt=0)
+    # DAH-5592: how long a host-fault create failure is sent again on each new backend socket (redis_service)
+    HOST_FAULT_FAILURE_RESEND_SECONDS: int = Field(default=2 * 3600, gt=0)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
@@ -353,12 +355,20 @@ class Settings(BaseSettings):
     # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
     # and the matmul (at most 120 s) run one after the other.
     LIUMD_SHADOW_TIMEOUT_SECONDS: int = Field(env="LIUMD_SHADOW_TIMEOUT_SECONDS", default=330)
-    # The only executors the shadow runs on: reserved, non-rentable dev executors, as
-    # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries. A pod or filler started
-    # after the cycle's snapshot is not seen, so on a rentable node the shadow could run its
-    # GPU/RAM/disk/network probe next to a workload. Executor UUIDs are miner-chosen, so an entry
-    # matches only that miner's executor at that SSH endpoint. Empty = none.
+    # The executors the shadow runs on: comma-separated
+    # `miner_hotkey/executor_uuid/address/ssh_port` entries, or `all` for every executor. A
+    # listed entry is meant to be a reserved, non-rentable dev executor; `all` can include
+    # rentable nodes, so it refuses to start with GPU steps enabled until the rental-overlap
+    # guard lands. A pod or filler started after the cycle's snapshot is not seen, so on a
+    # rentable node the shadow could run its GPU/RAM/disk/network probe next to a workload.
+    # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
+    # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
+    # Flip this on when liumd's GPU checks are the thing being compared again.
+    LIUMD_SHADOW_GPU_STEPS_ENABLED: bool = Field(
+        env="LIUMD_SHADOW_GPU_STEPS_ENABLED", default=False
+    )
     # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
     # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
     # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
@@ -499,9 +509,7 @@ class Settings(BaseSettings):
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in
     # uncorrected ECC or remapped rows, a pending or failed remap, or a required recovery action is a fault.
     # A card that faults under indexed access (Blender "Illegal address in CUDA queue", 6 Sep) passes the
-    # sequential matmul. It always runs and logs the verdict (DAH-4257 shadow, flag removed);
-    # ENFORCEMENT lets a fault zero the score and stays off until the owner decides.
-    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
+    # sequential matmul. It always runs; a fault always zeroes the score.
     # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
     # row remap, a required recovery action) fails the node like a GPU ban until the host resets or
     # replaces it. On: a broken card faults renters' jobs. Off is the kill switch back to flag-only.
@@ -516,7 +524,7 @@ class Settings(BaseSettings):
     PINNED_MEMORY_PROBE_CHECK_ENABLED: bool = Field(env="PINNED_MEMORY_PROBE_CHECK_ENABLED", default=True)
     # A fault probe with no verdict passes. Five such cycles in a row on one node are logged
     # (GPU_FAULT_PROBE_UNKNOWN_STREAK); with this on they are judged like a fault, which fails the
-    # node only while GPU_FAULT_PROBE_ENFORCEMENT_ENABLED is on too. Off by default.
+    # node. Off by default.
     GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED: bool = Field(
         env="GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED", default=False
     )
@@ -785,9 +793,18 @@ class Settings(BaseSettings):
     def get_allowed_advisory_ids(self) -> set[str]:
         return {s.strip() for s in self.TDX_ALLOWED_ADVISORY_IDS.split(",") if s.strip()}
 
-    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]]:
+    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]] | None:
         """`LIUMD_SHADOW_RESERVED_EXECUTORS` as (miner_hotkey, executor_uuid, address, ssh_port).
-        A malformed entry raises ValueError rather than being dropped."""
+
+        `all` means every executor. A malformed entry raises ValueError rather than being dropped.
+        """
+        if self.LIUMD_SHADOW_RESERVED_EXECUTORS.strip().lower() == "all":
+            if self.LIUMD_SHADOW_GPU_STEPS_ENABLED:
+                raise ValueError(
+                    "LIUMD_SHADOW_RESERVED_EXECUTORS=all cannot enable GPU steps until the "
+                    "rental-overlap guard exists; list the executors instead"
+                )
+            return None
         reserved = set()
         for entry in self.LIUMD_SHADOW_RESERVED_EXECUTORS.split(","):
             if not entry.strip():

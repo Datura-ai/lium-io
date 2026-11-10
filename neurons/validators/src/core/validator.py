@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -65,6 +66,9 @@ from services.ssh_service import SSHService
 logger = get_logger(__name__)
 
 SYNC_CYCLE = 12
+# DAH-6011: on a rollout's SIGTERM the running cycle may finish for this long; the pod's
+# terminationGracePeriodSeconds must be longer, or the kubelet's SIGKILL still cuts the cycle.
+STOP_CYCLE_WAIT_SECONDS = 25 * 60
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
 # accepted submissions whose inclusion the backend has not acknowledged yet, {tempo_index: block}, each retried
@@ -1619,7 +1623,6 @@ class Validator:
         )
         try:
             await self.initiate_services()
-            self.should_exit = False
 
             if not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
@@ -1636,8 +1639,10 @@ class Validator:
 
             while not self.should_exit:
                 await self.sync()
-                self.should_exit = settings.DRY_RUN
-                if not settings.DRY_RUN:
+                # DAH-6011: only set, never cleared here, so a shutdown that lands mid-cycle ends the loop
+                if settings.DRY_RUN:
+                    self.should_exit = True
+                else:
                     await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
@@ -1655,6 +1660,25 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
+
+    async def finish_running_cycle(self, task: asyncio.Task, wait_seconds: float = STOP_CYCLE_WAIT_SECONDS) -> bool:
+        """DAH-6011: no new cycle starts, and the running one (if any) finishes, within `wait_seconds`.
+        Past it the cycle is cancelled. True when it finished."""
+        self.should_exit = True
+        try:
+            await asyncio.wait_for(asyncio.shield(task), wait_seconds)
+            return True
+        except TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            logger.warning(
+                _m(
+                    "[stop] Running cycle did not finish in time; cancelled",
+                    extra=get_extra_info({**self.default_extra, "wait_seconds": wait_seconds}),
+                ),
+            )
+            return False
 
     async def stop(self):
         logger.info(
