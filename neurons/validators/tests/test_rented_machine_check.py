@@ -14,6 +14,8 @@ from helpers import FakeRedis, build_context_config, build_services, build_state
 import neurons.validators.src.services.task.checks.rented_machine as rented_machine_module
 from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
+    RENTAL_STATE_UNKNOWN_MAX_HELD,
+    RENTAL_STATE_UNKNOWN_PREFIX,
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
 )
@@ -2467,51 +2469,6 @@ class _PerPodBackend(DummyBackendClient):
         return Mock(active=self.answers[pod_id], rental_closed_at=None, local_volume_path=None)
 
 
-@pytest.mark.parametrize("unknown_first", [True, False])
-@pytest.mark.parametrize("exhausted", [False, True])
-@pytest.mark.asyncio
-async def test_tenant_enforcement_a_closed_pod_beside_a_held_one_keeps_the_node_rented(
-    context_factory, unknown_first, exhausted
-):
-    # pod-u's rental check is unanswered, pod-c's rental is confirmed closed; both are down
-    pods = [
-        RentedPod(pod_id="pod-u", container_name="tenant-u", rented_ports=[], gpu_count=2),
-        RentedPod(pod_id="pod-c", container_name="tenant-c", rented_ports=[], gpu_count=6),
-    ]
-    rented_data = RentedExecutorsResponse(
-        executors={
-            "executor-123": RentedExecutor(
-                miner_hotkey="miner-hotkey",
-                executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
-                pods=pods if unknown_first else pods[::-1],
-                owner_flag=False,
-            )
-        },
-        banned_guids=[],
-    )
-    redis = FakeRedis()
-    if exhausted:
-        await redis.set("rental_state_unknown:pod-u", "2")
-    ctx = _unknown_rental_ctx(context_factory, _PerPodBackend({"pod-u": None, "pod-c": False}), redis)
-    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data)})
-
-    result = await TenantEnforcementCheck().run(ctx)
-
-    if not exhausted:
-        assert result.passed is True and result.halt is True
-        assert result.updates["rented"] is True
-        extra = result.updates["default_extra"]
-        assert extra["pods_rental_state_unknown"] == ["pod-u"]
-        assert extra["pods_rental_closed"] == ["pod-c"]
-        assert extra["rented_gpu_count"] == 2
-        live = result.updates["state"].rented_data.executors["executor-123"].pods
-        assert [pod.pod_id for pod in live] == ["pod-u"]
-    else:
-        # past the hold limit the down pod is judged in either order; the closed pod cannot hide it
-        assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
-
-
 def _held_and_closed_ctx(context_factory, *, order, ssh=None, gpu_processes=(), gpu_details=()):
     pods = {
         "u": RentedPod(pod_id="pod-u", container_name="tenant-u", rented_ports=[], gpu_count=2),
@@ -2567,3 +2524,79 @@ async def test_tenant_enforcement_a_hung_sibling_read_reports_the_node_unreachab
 
     assert result.passed is False
     assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+
+
+# DAH-6141 exhaustive table, two pods: R running, A down with an active rental, N down with no backend
+# answer, C down with its rental confirmed closed. The rule: a closed pod never decides the node while any
+# sibling is not confirmed closed; N is held while its count is fresh and judged like A once it is spent.
+_SIBLING_STATES = "RANC"
+
+
+def _intended(order: str, spent: bool) -> tuple[str, list[str], list[str]]:
+    """(verdict, held pod ids, closed pod ids dropped from the rental)"""
+    if "A" in order or ("N" in order and spent):
+        return Msg.POD_NOT_RUNNING.reason, [], []
+    if set(order) == {"C"}:
+        return Msg.STALE_POD_NOT_RUNNING.reason, [], []
+    return (
+        Msg.ALREADY_RENTED.reason,
+        [f"pod-{i}" for i, state in enumerate(order) if state == "N"],
+        [f"pod-{i}" for i, state in enumerate(order) if state == "C"],
+    )
+
+
+class _StatesSSH(DummySSHClient):
+    def __init__(self, running: set[str]):
+        super().__init__(pod_running=False)
+        self.running = running
+
+    async def run(self, command: str):
+        result = await super().run(command)
+        if "docker ps" in command:
+            result.stdout = "container_id_123" if any(name in command for name in self.running) else ""
+        elif "{{.State.Running}}" in command:
+            result.stdout = f"{str(any(name in command for name in self.running)).lower()}\n"
+        return result
+
+
+@pytest.mark.parametrize("spent", [False, True])
+@pytest.mark.parametrize("order", [a + b for a in _SIBLING_STATES for b in _SIBLING_STATES])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_every_two_pod_combination(context_factory, order, spent):
+    pods = [
+        RentedPod(pod_id=f"pod-{i}", container_name=f"tenant-{i}", rented_ports=[], gpu_count=i + 1)
+        for i in range(len(order))
+    ]
+    answers = {f"pod-{i}": {"R": True, "A": True, "N": None, "C": False}[state] for i, state in enumerate(order)}
+    redis = FakeRedis()
+    if spent:
+        for pod_id, answer in answers.items():
+            if answer is None:
+                await redis.set(f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}", str(RENTAL_STATE_UNKNOWN_MAX_HELD))
+    ctx = _unknown_rental_ctx(context_factory, _PerPodBackend(answers), redis)
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey", executor_ip_address="127.0.0.1", executor_ip_port="22",
+                pods=pods, owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    running = {f"tenant-{i}" for i, state in enumerate(order) if state == "R"}
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data), "ssh": _StatesSSH(running)})
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    verdict, held, closed = _intended(order, spent)
+    assert result.event.reason_code == verdict
+    if verdict == Msg.ALREADY_RENTED.reason:
+        extra = result.updates["default_extra"]
+        assert result.updates["rented"] is True
+        assert extra.get("pods_rental_state_unknown", []) == held
+        assert extra.get("pods_rental_closed", []) == closed
+        live = [pod for pod in pods if pod.pod_id not in closed]
+        assert extra["rented_gpu_count"] == sum(pod.gpu_count for pod in live)
+        assert result.updates["state"].rented_data.executors["executor-123"].pods == live
+    if verdict == Msg.STALE_POD_NOT_RUNNING.reason:
+        assert result.updates["rented"] is False

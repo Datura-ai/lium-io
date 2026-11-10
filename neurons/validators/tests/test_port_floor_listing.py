@@ -403,10 +403,10 @@ async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enf
 
     assert ctx.state.specs["available_port_count"] == 2
     assert count_result.passed is True
-    # main's verdict for this node, flag or no flag: the stale pod is reported and the run goes on
+    # DAH-6141: a closed pod never decides the node beside a live rental; it stays rented, floor not enforced
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
-    assert tenant_result.event.what_we_saw["pod_id"] == "pod-stale"
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
+    assert tenant_result.updates["default_extra"]["pods_rental_closed"] == ["pod-stale"]
 
 
 @pytest.mark.asyncio
@@ -446,8 +446,8 @@ async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced
     _, ctx = await apply(ctx, PortCountCheck())
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
-    assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    # DAH-6141: the closed pod no longer hides the down pod with an open rental; that pod is judged, not the floor
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.POD_NOT_RUNNING.reason
 
 
 @pytest.mark.asyncio
@@ -465,8 +465,9 @@ async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enfo
     _, ctx = await apply(ctx, PortCountCheck())
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
+    # DAH-6141: a running sibling keeps the node rented, as the loop treats every running pod
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
 
 
 @pytest.mark.asyncio

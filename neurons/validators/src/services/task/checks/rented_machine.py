@@ -313,8 +313,8 @@ class TenantEnforcementCheck:
         # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
         # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
         state_by_pod_id: dict[str, ContainerState] = {}
-        # closed pods skipped because a sibling's verdict is held: the node stays rented without them
-        closed_beside_held: set[str] = set()
+        # DAH-6141: pods whose rental the backend confirmed closed, skipped because a sibling is not
+        closed_pod_ids: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
@@ -420,22 +420,10 @@ class TenantEnforcementCheck:
                 elif self.recover_stale_pods:  # a dry run never changes the count
                     await _forget_unknown_rental_state(ctx, pod_id)
                 if rental_active and not rental_active.active:
-                    try:
-                        sibling_held = await _a_sibling_is_held(ctx, rented_pods, pod_index, extra)
-                    except _SiblingReadFailed as failed:
-                        return with_pod_states(
-                            _executor_transport_unreachable_result(
-                                ctx=ctx,
-                                check_id=self.check_id,
-                                container_name=failed.pod.docker_container_name,
-                                pod_id=failed.pod.pod_id,
-                                transport_error=failed.error,
-                                extra=extra,
-                            )
-                        )
-                    if sibling_held:
-                        # an idle verdict would be a guess while a sibling's rental is unknown
-                        closed_beside_held.add(pod_id)
+                    if not await _every_listed_pod_stale(ctx, rented_pods, pod_index, closed_pod_ids):
+                        # one rule (DAH-6141): a closed pod never decides the node while a sibling is running, down
+                        # with an open rental or unanswered; the loop judges that sibling, the node stays rented
+                        closed_pod_ids.add(pod_id)
                         ssh_pub_keys = []
                         continue
                     stale_what = {
@@ -449,7 +437,7 @@ class TenantEnforcementCheck:
                         ),
                         "diagnostics": diagnostics,
                     }
-                    if ctx.state.port_check_deferred and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                    if ctx.state.port_check_deferred:
                         # DAH-5851: idle now, on a deferred port check: withheld, as PortCountCheck withholds an idle node
                         await port_connectivity.spend_disk_pressure_deferrals(ctx)
                         return with_pod_states(
@@ -467,14 +455,13 @@ class TenantEnforcementCheck:
                         )
                     # PortCountCheck exempted this node from the port floor because the batch-start rented
                     # list named a pod; the node goes on as unrented with a count the backend will not list.
-                    # The floor is enforced only when every listed pod is stale: a live rental on the same
-                    # node is a real exemption, and this loop returns before it would reach later pods.
+                    # Every listed pod is stale here (the check above): the floor applies to an idle node.
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
                     # node whose every listed pod is stale is idle and needs them, with or without the floor flag
                     split_short = split_port_shortfall(ctx.state)
                     reprobed: dict[str, Any] = {}
-                    if split_short is not None and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                    if split_short is not None:
                         # the probe skipped the stale pods' ports: re-probe them all, only answering ports count
                         split_short, reprobed = await _reprobe_split_shortfall(ctx, split_short, rented_pods)
                         if "rented_data" in reprobed:
@@ -509,7 +496,6 @@ class TenantEnforcementCheck:
                     if (
                         port_count_below_floor is not None
                         and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
-                        and await _every_listed_pod_stale(ctx, rented_pods, pod_index)
                     ):
                         event = render_message(
                             PortCountMessages.INSUFFICIENT_PORTS,
@@ -588,8 +574,8 @@ class TenantEnforcementCheck:
             )
 
         rented_state = ctx.state
-        if closed_beside_held:
-            rented_state, extra = _without_closed_pods(ctx, rented_executor, closed_beside_held, extra)
+        if closed_pod_ids:
+            rented_state, extra = _without_closed_pods(ctx, rented_executor, closed_pod_ids, extra)
         # a closed pod's container is still the renter's, and the GPU snapshot may predate its end
         container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)
@@ -649,7 +635,7 @@ class TenantEnforcementCheck:
                 passed=True,
                 event=event,
                 updates={
-                    **({"state": rented_state} if closed_beside_held else {}),
+                    **({"state": rented_state} if closed_pod_ids else {}),
                     "default_extra": extra,
                     "rented": True,
                     "ssh_pub_keys": ssh_pub_keys,
@@ -1355,36 +1341,6 @@ async def _reprobe_split_shortfall(
     return published(fresh.get_filler_ports(ctx.executor.uuid))
 
 
-class _SiblingReadFailed(Exception):
-    def __init__(self, pod: RentedPod, error: BaseException):
-        super().__init__(str(error))
-        self.pod, self.error = pod, error
-
-
-async def _a_sibling_is_held(ctx: Context, rented_pods: list[RentedPod], pod_index: int, extra: dict) -> bool:
-    """True when another listed pod's verdict is held this cycle for an unanswered rental check.
-
-    An earlier pod already recorded its hold. A later pod that is down with no backend answer defers this
-    closed pod either way: the loop then holds it, or judges it once the hold limit is spent.
-    """
-    if extra.get("pods_rental_state_unknown"):
-        return True
-    for other in rented_pods[pod_index + 1 :]:
-        try:
-            # the main loop's read budget: a hung shell ends as the node-unreachable verdict, not a dropped task
-            async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
-                other_state = await _check_pod_running_and_read_authorized_keys(
-                    ctx.ssh, other.docker_container_name, ctx.default_extra
-                )
-        except (asyncssh.Error, OSError) as exc:
-            raise _SiblingReadFailed(other, exc) from exc
-        if other_state.running:
-            continue
-        if await ctx.services.backend.get_pod_rental_active(other.pod_id) is None:
-            return True  # held or judged, the main loop decides when it reaches that pod
-    return False
-
-
 def _without_closed_pods(
     ctx: Context, rented_executor: RentedExecutor, closed: set[str], extra: dict
 ) -> tuple[ContextState, dict]:
@@ -1404,20 +1360,24 @@ def _without_closed_pods(
     return replace(ctx.state, rented_data=rented_data.model_copy(update={"executors": executors})), extra
 
 
-async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:
+async def _every_listed_pod_stale(
+    ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int, closed_pod_ids: set[str]
+) -> bool:
     """True only when every listed pod is not running and its rental is closed.
 
-    `rented_pods[stale_pod_index]` is already known stale. The loop only gets past a pod that is running
-    (or was recovered), so any pod before it is live. Anything unknown (no rental record, a dead SSH
-    transport) counts as live, so the floor is never enforced on a guess.
+    `rented_pods[stale_pod_index]` is already known stale. An earlier pod is stale only if the loop skipped
+    it as closed; any other earlier pod was running, held or judged. Anything unknown (no rental record, a
+    dead or hung SSH transport) counts as live, so the node is never sent on as idle on a guess.
     """
-    if stale_pod_index > 0:
+    if any(pod.pod_id not in closed_pod_ids for pod in rented_pods[:stale_pod_index]):
         return False
-    for other in rented_pods[1:]:
+    for other in rented_pods[stale_pod_index + 1 :]:
         try:
-            other_state = await _check_pod_running_and_read_authorized_keys(
-                ctx.ssh, other.docker_container_name, ctx.default_extra
-            )
+            # the main loop's read budget; a hung read counts as live and the loop's own read then reports it
+            async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
+                other_state = await _check_pod_running_and_read_authorized_keys(
+                    ctx.ssh, other.docker_container_name, ctx.default_extra
+                )
         except (asyncssh.Error, OSError):
             return False
         if other_state.running:
