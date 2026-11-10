@@ -1,13 +1,20 @@
 import asyncio
 import getpass
+import ipaddress
 import logging
 import os
+import stat
 import tempfile
 import threading
 import time
 from collections.abc import Callable
+from http import HTTPStatus
+
+import requests
+from pydantic import BaseModel
 
 from core.config import VALIDATOR_SSH_SOURCES, settings
+from dependencies.auth import match_validator_hotkey
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +61,88 @@ def _split_marker(line: bytes) -> tuple[bytes, bytes | None]:
     return parts[0], parts[1][len(UPLOADED_KEY_MARKER):]
 
 
+def _in_cvm() -> bool:
+    """A dstack CVM: QEMU user networking shows sshd its own gateway address, never the validator's.
+
+    A socket, not just a path: docker-compose.app.yml bind-mounts /var/run/dstack.sock on every host,
+    and on a host without dstack docker creates an empty directory there.
+    """
+    try:
+        return stat.S_ISSOCK(os.stat(settings.DSTACK_SOCKET_PATH).st_mode)
+    except OSError:
+        return False
+
+
+# The pinned addresses come from `<COMPUTE_REST_API_URL>/watchtower/ssh-sources`, signed by the validator as
+# `ssh-sources:{sources}:{timestamp}` (the prefix keeps it apart from a signed digest), so a NAT change or turning
+# the pin off fleet-wide needs no executor release.
+SSH_SOURCES_CACHE_SECONDS = 300
+SSH_SOURCES_TIMEOUT_SECONDS = 5.0
+SSH_SOURCES_MAX_SKEW_SECONDS = 10 * 60
+
+
+class SshSourcesAnswer(BaseModel):
+    """The `/watchtower/ssh-sources` answer (lium-platform SignedSshSourcesResponse)."""
+
+    sources: str
+    timestamp: int
+    signature: str
+
+
+def verify_signed_ssh_sources(answer: SshSourcesAnswer) -> str:
+    """The `ip,ip` list of a `/watchtower/ssh-sources` answer after checking its signature; "" = no pin."""
+    now = int(time.time())
+    if abs(answer.timestamp - now) > SSH_SOURCES_MAX_SKEW_SECONDS:
+        raise ValueError(f"ssh-sources answer timestamp out of range (now={now}, ts={answer.timestamp})")
+    if match_validator_hotkey(f"ssh-sources:{answer.sources}:{answer.timestamp}", answer.signature) is None:
+        raise ValueError("ssh-sources answer is not signed by a configured validator hotkey")
+    # the backend accepts `a, b`; sshd's from= takes no spaces, so pin the stripped entries
+    entries = [entry.strip() for entry in answer.sources.split(",")] if answer.sources else []
+    # a malformed from= makes sshd refuse the key: keep the last good list instead
+    for entry in entries:
+        ipaddress.ip_network(entry)  # an empty entry (`ip,`) is refused too
+    return ",".join(entries)
+
+
+class SignedSshSources:
+    """The signed source list. A background task refreshes it (run_ssh_sources_refresh) so an upload never waits
+    on the backend; a failed refresh keeps the last good list; a 404 and a node that never got one do not pin."""
+
+    def __init__(self):
+        self._sources = ""
+
+    def get(self) -> str:
+        return self._sources
+
+    def refresh(self) -> None:
+        """Blocking: run it off the event loop."""
+        if not settings.COMPUTE_REST_API_URL:
+            return
+        url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/ssh-sources"
+        try:
+            response = requests.get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
+            if response.status_code == HTTPStatus.NOT_FOUND:
+                # the backend has no list (endpoint reverted): unpin, as a node that never got one
+                self._sources = ""
+                return
+            response.raise_for_status()
+            self._sources = verify_signed_ssh_sources(SshSourcesAnswer.model_validate(response.json()))
+        except Exception as exc:  # never fail an upload over this
+            logger.warning("Validator ssh sources not refreshed from %s: %s: %s", url, type(exc).__name__, exc)
+
+
+_signed_ssh_sources = SignedSshSources()
+
+
 def _validator_source_pin_option() -> bytes:
-    """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin."""
-    if not VALIDATOR_SSH_SOURCES or not settings.EXECUTOR_SSH_SOURCE_PIN:
+    """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin.
+
+    A build without a source list (non-prod, e2e) never pins; a prod build pins to the signed list.
+    """
+    if not VALIDATOR_SSH_SOURCES or not settings.EXECUTOR_SSH_SOURCE_PIN or _in_cvm():
         return b""
-    return b'from="' + VALIDATOR_SSH_SOURCES.encode() + b'" '
+    sources = _signed_ssh_sources.get()
+    return b'from="' + sources.encode() + b'" ' if sources else b""
 
 
 def _key_without_marker_and_source_pin(line: bytes) -> bytes:
@@ -179,6 +263,13 @@ def purge_expired_uploaded_keys(ttl_s: int, now: float | None = None) -> int:
             return _rewrite_authorized_keys(path, keep)
         except FileNotFoundError:
             return 0
+
+
+async def run_ssh_sources_refresh() -> None:
+    """Background loop: refresh the signed source list every SSH_SOURCES_CACHE_SECONDS, off the event loop."""
+    while True:
+        await asyncio.to_thread(_signed_ssh_sources.refresh)
+        await asyncio.sleep(SSH_SOURCES_CACHE_SECONDS)
 
 
 async def run_uploaded_key_purge() -> None:

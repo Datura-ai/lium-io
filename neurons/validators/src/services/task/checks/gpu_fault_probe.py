@@ -72,8 +72,7 @@ class GpuFaultProbeCheck:
     round-trips pinned memory through the copy engines, verifies every result on the device, and reads
     uncorrected ECC / remapped rows / recovery action from NVML before and after.
 
-    Shadow-first like every score-zeroing gate: it always runs and emits the verdict;
-    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED lets a fault fail the (fatal) check. A probe that could not run
+    It always runs; a fault always fails the (fatal) check. A probe that could not run
     (no libcuda, cuInit, JIT) passes with GPU_FAULT_PROBE_UNKNOWN: inability to measure is not a fault.
     """
 
@@ -82,24 +81,14 @@ class GpuFaultProbeCheck:
     replays_after_session_drop = False
     fatal = True
 
-    def __init__(self, enforce: bool = False):
-        # enforce: run and judge a fault as a failure whatever the GPU_FAULT_PROBE_* flags say
-        # (the post-rental recheck, DAH-4482)
-        self.enforce = enforce
+    def __init__(self, is_post_rental_recheck: bool = False):
+        # is_post_rental_recheck: probe even beside an active filler (the post-rental recheck, DAH-4482)
+        self.is_post_rental_recheck = is_post_rental_recheck
 
     async def run(self, ctx: Context) -> CheckResult:
-        if ctx.config.first_pass and not (
-            self.enforce or settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED
-        ):
-            # a shadow verdict cannot fail the node, so it does not delay a new node's first verification
-            return CheckResult(
-                passed=True,
-                event=render_message(Msg.FIRST_PASS_SKIPPED, ctx=ctx, check_id=self.check_id),
-            )
-
         filler_container = get_filler_only_container(ctx)
-        # enforce: the recheck only probes beside a filler after it removed the node's Lium fillers
-        if filler_container and not self.enforce:
+        # the recheck only probes beside a filler after it removed the node's Lium fillers
+        if filler_container and not self.is_post_rental_recheck:
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -109,7 +98,7 @@ class GpuFaultProbeCheck:
             return CheckResult(passed=True, event=event)
 
         command = f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS}"
-        if self.enforce:
+        if self.is_post_rental_recheck:
             # the recheck after a rental: a card that hangs its kernels every cycle must not list again
             command += " --hang-in-kernels-is-fault"
         run = await ctx.runner.run(
@@ -165,10 +154,10 @@ class GpuFaultProbeCheck:
         self, ctx: Context, what: dict[str, Any], counts_toward_streak: bool = True
     ) -> CheckResult:
         """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is logged, and under
-        GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. An enforce run is a
+        GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. A post-rental recheck is a
         second probe in the same cycle, and a card too busy to probe (counts_toward_streak=False) is not
         a silent one, so neither counts: the streak is left as it was."""
-        if self.enforce or not counts_toward_streak:
+        if self.is_post_rental_recheck or not counts_toward_streak:
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
@@ -198,7 +187,6 @@ class GpuFaultProbeCheck:
     def _fault_verdict(
         self, ctx: Context, what: dict[str, Any], *, error: str, report: dict[str, Any] | None
     ) -> CheckResult:
-        enforce = self.enforce or settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED
         what["error"] = error[: MAX_FAULT_LINES * MAX_FAULT_CHARS]
         if report is not None:
             what["xid"] = _capped_xid(report.get("xid"))
@@ -206,11 +194,9 @@ class GpuFaultProbeCheck:
             Msg.PROBE_FAILED,
             ctx=ctx,
             check_id=self.check_id,
-            severity=None if enforce else "warning",
-            impact=None if enforce else "Shadow observation only: score was NOT changed",
             what=what,
         )
-        return CheckResult(passed=not enforce, event=event)
+        return CheckResult(passed=False, event=event)
 
 
 def _only_busy_vram(report: dict[str, Any]) -> bool:
