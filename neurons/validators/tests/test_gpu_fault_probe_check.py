@@ -158,7 +158,8 @@ async def test_probe_source_goes_over_stdin_to_the_executor_interpreter(context_
     assert result.passed is True
     assert result.event.reason_code == Msg.PROBE_OK.reason
     (call,) = runner.calls
-    assert call["cmd"] == f"{default_executor().python_path} -I - --seconds {PROBE_SECONDS}"
+    # wrapped by run_killed_on_cancel, which records the PID so a rent can kill it
+    assert f"; {default_executor().python_path} -I - --seconds {PROBE_SECONDS}; rc=$?" in call["cmd"]
     assert call["stdin_text"] == PROBE_SOURCE
     assert call["timeout"] == PROBE_TIMEOUT_SECONDS
     assert call["retryable"] is False
@@ -769,7 +770,7 @@ async def test_the_recheck_asks_the_probe_to_fail_a_hang_in_the_kernels(context_
         await GpuFaultProbeCheck(enforce=True).run(ctx)
 
     (call,) = runner.calls
-    assert call["cmd"].endswith(" --hang-in-kernels-is-fault")
+    assert " --hang-in-kernels-is-fault; rc=$?" in call["cmd"]
 
 
 def test_setup_calls_in_the_probe_are_errors_not_faults():

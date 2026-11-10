@@ -124,7 +124,8 @@ async def test_probe_source_goes_over_stdin_and_a_good_copy_passes(context_facto
     assert result.passed is True
     assert result.event.reason_code == "PINNED_MEMORY_PROBE_OK"
     (call,) = runner.calls
-    assert call["cmd"] == f"{default_executor().python_path} -I -"
+    # wrapped by run_killed_on_cancel, which records the PID so a rent can kill it
+    assert f"; {default_executor().python_path} -I -; rc=$?" in call["cmd"]
     assert call["stdin_text"] == PROBE_SOURCE
     assert call["timeout"] == PROBE_TIMEOUT_SECONDS
     assert call["retryable"] is False

@@ -451,7 +451,8 @@ class _HungRetryService(VerifyXValidationService):
     async def validate_verifyx_and_process_job(
         self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
     ):
-        if run_dir is None:
+        if not (run_dir or "").startswith(".verifyx-retry-"):
+            # the first sample: canned (its own run_dir is only for a kill on cancel)
             return self.firsts.pop(0)
         self.run_dirs.append(run_dir)
         challenge = SimpleNamespace(seed=1, cipher_text="c")

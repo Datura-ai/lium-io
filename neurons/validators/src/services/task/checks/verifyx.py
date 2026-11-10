@@ -246,13 +246,20 @@ class VerifyXCheck:
             result = local.verifyx
             transport = "local_verify"
         else:
-            result = await verifyx_service.validate_verifyx_and_process_job(
-                shell=ctx.services.shell,
-                executor_info=ctx.executor,
-                default_extra=ctx.default_extra,
-                machine_spec=specs,
-                **sizing,
-            )
+            # its own run_dir, so a run cancelled for a renter's create is killed on the host, as the cold retry's is
+            run_dir = f".verifyx-{secrets.token_hex(8)}"
+            try:
+                result = await verifyx_service.validate_verifyx_and_process_job(
+                    shell=ctx.services.shell,
+                    executor_info=ctx.executor,
+                    default_extra=ctx.default_extra,
+                    machine_spec=specs,
+                    run_dir=run_dir,
+                    **sizing,
+                )
+            except asyncio.CancelledError:
+                await asyncio.shield(_kill_or_remember_run(ctx, run_dir))
+                raise
 
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
@@ -873,6 +880,11 @@ def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
         else:
             held[key] = previous
     return {**specs, "network": held}
+
+
+async def _kill_or_remember_run(ctx: Context, run_dir: str) -> None:
+    if not await ctx.services.verifyx.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra):
+        await _remember_stale_run(ctx, run_dir)
 
 
 async def _remember_stale_run(ctx: Context, run_dir: str) -> None:

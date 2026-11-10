@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,10 +11,15 @@ from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutor
 from services.executor_rollout import ExecutorRolloutTracker
 from services.redis_service import RENT_REQUESTED_TTL_SECONDS, RedisService, rent_requested_key
 from services.task import pipeline as pipeline_module
+from services.task.checks.gpu_fault_probe import GpuFaultProbeCheck
+from services.task.checks.nvlink_fault import NvlinkFaultCheck
+from services.task.checks.pinned_memory_probe import PinnedMemoryProbeCheck
 from services.task.checks.rented_mid_cycle import RentedMidCycleCheck
+from services.task.checks.verifyx import VerifyXCheck
 from services.task.messages import TenantEnforcementMessages as Msg, render_message
 from services.task.pipeline import CheckResult, Pipeline, ParallelStage
 from services.task.pipeline_factory import PipelineFactory
+from services.task.runner import SSHCommandResult
 
 from clients.compute_client import ComputeClient
 from core.config import settings
@@ -305,3 +312,79 @@ def test_rechecked_right_before_the_gpu_and_network_tests(fast_path):
     before = [names[i + 1] for i, name in enumerate(names) if name == "RentedMidCycleCheck"]
     assert before == ["LocalVerifyCheck", "ParallelStage" if fast_path else "CapabilityCheck"]
     assert names.index("TenantEnforcementCheck") < names.index("RentedMidCycleCheck")
+
+
+# a step the rent poll cancels must not leave its remote work holding the renter's GPUs
+
+
+class BlockingVerifyX:
+    def __init__(self):
+        self.run_dir = None
+        self.started = asyncio.Event()
+        self.kill_remote_verifyx = AsyncMock(return_value=True)
+
+    async def validate_verifyx_and_process_job(self, *, run_dir=None, **_):
+        self.run_dir = run_dir
+        self.started.set()
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_verifyx_run_is_killed_on_the_host():
+    verifyx = BlockingVerifyX()
+    ctx = make_context(services=build_services(verifyx=verifyx), state=build_state(specs={"gpu": {"count": 1}}))
+    task = asyncio.ensure_future(VerifyXCheck().run(ctx))
+    await asyncio.wait_for(verifyx.started.wait(), 5)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert verifyx.run_dir
+    verifyx.kill_remote_verifyx.assert_awaited_once()
+    assert verifyx.kill_remote_verifyx.await_args.args[1] == verifyx.run_dir
+
+
+class BlockingRunner:
+    """The probe's run never ends; every later command (the kill) answers at once."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+        self.started = asyncio.Event()
+
+    async def run(self, cmd, **_):
+        self.calls.append(cmd)
+        if len(self.calls) == 1:
+            self.started.set()
+            await asyncio.sleep(3600)
+        now = datetime.now(UTC)
+        return SSHCommandResult(
+            command=cmd, command_id="k", exit_code=0, stdout="", stderr="", duration_ms=0,
+            started_at=now, finished_at=now, success=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "check, specs",
+    [
+        (GpuFaultProbeCheck(enforce=True), {"gpu": {"count": 1}}),
+        (PinnedMemoryProbeCheck(), {"gpu": {"count": 1}}),
+        (NvlinkFaultCheck(), {"interconnect": {"nvlink": True, "nvlink_links": 18, "nvlink_active_links": 18}}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_cancelled_gpu_probe_kills_its_remote_process(check, specs, monkeypatch):
+    monkeypatch.setattr(settings, "PINNED_MEMORY_PROBE_CHECK_ENABLED", True)
+    runner = BlockingRunner()
+    ctx = make_context(services=build_services(), state=build_state(specs=specs), runner=runner)
+    task = asyncio.ensure_future(check.run(ctx))
+    await asyncio.wait_for(runner.started.wait(), 5)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert check.stops_on_rent
+    probe, kill = runner.calls
+    tag = re.search(r"lium-probe-[0-9a-f]+", probe).group(0)
+    assert tag in kill and "kill -KILL" in kill

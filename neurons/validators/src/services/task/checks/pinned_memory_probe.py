@@ -11,6 +11,7 @@ from core.config import settings
 from ..messages import PinnedMemoryProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from ..runner import run_killed_on_cancel
 from .capability import get_filler_only_container, lium_workload_live_now
 
 # Stdlib-only, shipped over stdin like the kernel-fault probe (DAH-3035): nothing to upload or update.
@@ -51,6 +52,8 @@ class PinnedMemoryProbeCheck:
     """
 
     check_id = "gpu.validate.pinned_memory"
+    # a renter's create on the node stops it mid-run (Pipeline._run_step_unless_rented)
+    stops_on_rent = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -70,9 +73,7 @@ class PinnedMemoryProbeCheck:
             return CheckResult(passed=True, event=event)
 
         command = f"{shlex.quote(ctx.executor.python_path)} -I -"
-        run = await ctx.runner.run(
-            command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=PROBE_SOURCE
-        )
+        run = await run_killed_on_cancel(ctx.runner, command, seconds=PROBE_TIMEOUT_SECONDS, stdin_text=PROBE_SOURCE)
         report = _parse_report(run.stdout)
         what: dict[str, Any] = {
             "executor_uuid": ctx.executor.uuid,
