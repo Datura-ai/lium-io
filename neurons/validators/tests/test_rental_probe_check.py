@@ -844,6 +844,28 @@ async def test_create_payload_is_what_a_renter_gets():
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "at_cycle_start, under_the_lock, expected",
+    [
+        pytest.param([], [], [], id="none-retained"),
+        pytest.param(["a"], ["a"], ["volume_a"], id="attached"),
+        pytest.param(["a"], [], ["volume_a"], id="already-dangling"),
+        pytest.param([], ["b"], ["volume_b"], id="newly-retained"),
+    ],
+)
+async def test_the_probe_create_keeps_every_retained_pod_volume(at_cycle_start, under_the_lock, expected):
+    """Regression: the probe's create sent no active volumes, so its stale-volume sweep removed a
+    volume_<pod_id> the backend keeps after its container was reaped (a stopped renter's disk)."""
+    snapshot = rented_data().model_copy(update={"retained_volume_pod_ids": at_cycle_start})
+    fresh = rented_data().model_copy(update={"retained_volume_pod_ids": under_the_lock})
+    ctx, docker, _ = make_probe_context(rented=snapshot, rented_now=fresh)
+    with probe_settings(), renter_path():
+        await RentalProbeCheck().run(ctx)
+
+    assert sorted(docker.create_calls[0][0].active_volume_names) == expected
+
+
 def test_no_ram_total_in_the_specs_sends_no_memory_limit():
     ctx, _, _ = make_probe_context()
     no_ram = ctx.model_copy(update={"state": replace(ctx.state, specs={})})
@@ -941,6 +963,20 @@ async def test_a_create_that_cannot_open_its_ssh_session_is_inconclusive():
     assert result.passed is True
     assert result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert not redis.stamped() and redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_a_node_without_an_ssh_host_key_fails_the_probe():
+    ctx, docker, redis = make_probe_context(
+        docker=FakeDocker(create_result=create_failed("docker_sdk_ssh_host_key"))
+    )
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert result.updates["score"] == 0.0
+    assert "SSH host key" in result.event.remediation
+    assert "port range" not in result.event.remediation
 
 
 @pytest.mark.asyncio

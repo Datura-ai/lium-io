@@ -20,17 +20,20 @@ from protocol.vc_protocol.validator_requests import (
 )
 
 from ...const import (
+    FILLER_CONTAINER_PREFIX,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
+from services.redis_service import RECENT_FILLER_PREFIX, RECENT_FILLER_TTL_SECONDS
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from . import port_connectivity
+from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .rental_owner import rental_of_this_node
@@ -47,6 +50,45 @@ logger = logging.getLogger(__name__)
 
 # cycle time kept after the rented pod reads, to report the result and close the shell
 POD_READ_RESERVE_SECONDS = 30
+
+def _scraped_container_ids(ctx: Context) -> dict[str, str]:
+    return {
+        str(entry.get("name") or ""): str(entry.get("container_id") or "")
+        for entry in ((ctx.state.specs or {}).get("docker") or {}).get("containers") or []
+        if isinstance(entry, dict)
+    }
+
+
+async def _remember_fillers(ctx: Context, names: list[str]) -> None:
+    container_ids = _scraped_container_ids(ctx)
+    try:
+        for name in names:
+            # the record is the container itself: a replacement under the same name is not our load
+            if container_ids.get(name):
+                key = f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
+                await ctx.services.redis.set(key, container_ids[name], ex=RECENT_FILLER_TTL_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Recent filler record not written for %s: %s", ctx.executor.uuid, exc)
+
+
+async def _recently_listed_fillers(ctx: Context, names: set[str]) -> list[str]:
+    """The filler-named containers the snapshot listed on THIS node within RECENT_FILLER_TTL_SECONDS: our own load."""
+    found = []
+    container_ids = _scraped_container_ids(ctx)
+    try:
+        for name in sorted(names):
+            if not name.startswith(FILLER_CONTAINER_PREFIX) or not container_ids.get(name):
+                continue
+            recorded = await ctx.services.redis.get(f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}")
+            if isinstance(recorded, bytes):
+                recorded = recorded.decode()
+            if recorded == container_ids[name]:
+                found.append(name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Recent filler records unreadable for %s: %s", ctx.executor.uuid, exc)
+    # the remembered name alone is not enough: a container reusing it must also run the image we started
+    off_image = await _fillers_off_their_image(ctx, set(found)) if found else []
+    return [name for name in found if name not in off_image]
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -153,6 +195,8 @@ class TenantEnforcementCheck:
     """
 
     check_id = "executor.validate.rented_state"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = True
 
     def __init__(self, recover_stale_pods: bool = True):
@@ -173,6 +217,7 @@ class TenantEnforcementCheck:
         # makes its siblings' GPU processes read as usage outside the tenant.
         filler_containers = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
         filler_container = filler_containers[0] if filler_containers else None
+        await _remember_fillers(ctx, filler_containers)
 
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
@@ -305,7 +350,8 @@ class TenantEnforcementCheck:
                         event = split_ports_event(
                             ctx,
                             self.check_id,
-                            reprobed.get("state", ctx.state),
+                            # a completed re-probe is a current reading; the pipeline flag itself stays as it was
+                            replace(reprobed["state"], port_check_deferred=False) if "state" in reprobed else ctx.state,
                             *split_short,
                             what={"stale_pod": stale_what},
                             extra=extra,
@@ -402,6 +448,10 @@ class TenantEnforcementCheck:
         container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
+        if gpu_running_outside and not rented_executor.owner_flag:
+            unlisted = {process.get("container_name") or "" for process in gpu_processes} - set(container_names)
+            container_names.extend(await _recently_listed_fillers(ctx, unlisted))
+            gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
 
         if not rented_executor.owner_flag and gpu_running_outside:
             gpu_details = ctx.state.gpu_details

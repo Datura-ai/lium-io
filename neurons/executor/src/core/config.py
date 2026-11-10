@@ -114,6 +114,8 @@ class Settings(BaseSettings):
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8001)
     SSH_PORT: int = Field(env="SSH_PORT", default=2200)
     SSH_PUBLIC_PORT: Optional[int] = Field(env="SSH_PUBLIC_PORT", default=None)
+    # ssh_host_keys.sh keeps sshd host keys here; a volume in docker-compose.app.yml, absent on CVM
+    SSH_HOST_KEYS_DIR: str = Field(env="SSH_HOST_KEYS_DIR", default="/var/lib/executor-ssh-host-keys")
 
     MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
     # `lium mine --register` writes the portal account's claim here; the portal requires it of a pool-hotkey node
