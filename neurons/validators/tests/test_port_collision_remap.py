@@ -61,6 +61,13 @@ def test_many_wide_published_ranges_are_merged_not_expanded_each_time():
     assert time.monotonic() - started < 2
     overlapping = "0.0.0.0:100-200->1/tcp\n0.0.0.0:150-300->1/tcp\n0.0.0.0:0-0->1/tcp\n0.0.0.0:400->1/tcp\n"
     assert _parse_listening_ports(overlapping) == set(range(100, 301)) | {400}
+    # many distinct reversed (ignored) and overlapping ranges, the shape a hostile executor can send
+    reversed_ranges = "".join(f"0.0.0.0:{65535 - i}-{i + 1}->1/tcp\n" for i in range(20000))
+    overlapping_ranges = "".join(f"0.0.0.0:{i + 1}-{i + 100}->1/tcp\n" for i in range(20000))
+    started = time.monotonic()
+    assert _parse_listening_ports(reversed_ranges) == set()
+    assert _parse_listening_ports(overlapping_ranges) == set(range(1, 20100))
+    assert time.monotonic() - started < 2
 
 
 @pytest.mark.asyncio
