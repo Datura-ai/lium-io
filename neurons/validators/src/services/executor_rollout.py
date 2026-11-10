@@ -552,9 +552,9 @@ async def carry_renter_gpu_reset_results(
                     "is_provider_banned": _banned_now(
                         rented_data, miner_hotkey, miner_coldkeys.get(miner_hotkey), previous, held
                     ),
-                    "filler_revenue_per_gpu_hour": _filler_revenue_now(rented_data, previous),
+                    "filler_revenue_per_gpu_hour": _filler_revenue_now(rented_data, previous, held.is_spot),
                     # refreshed with the average: a carried Spot remainder is seeded only from this cycle's feed
-                    "filler_revenue_feed_ok": _filler_revenue_feed_ok_now(rented_data, previous),
+                    "filler_revenue_feed_ok": _filler_revenue_feed_ok_now(rented_data, held.is_spot),
                     "filler_revenue_usd_per_hour": (
                         rented_data.get_filler_revenue_usd_per_hour(
                             BASE_GPU_MAP.get(previous.gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
@@ -602,22 +602,25 @@ def _banned_now(
     )
 
 
-def _filler_revenue_now(rented_data: RentedExecutorsResponse | None, previous: JobResult) -> float | None:
-    """This cycle's filler average for the carried GPU configuration (the held scrape may list none)."""
+def _filler_revenue_now(
+    rented_data: RentedExecutorsResponse | None, previous: JobResult, is_spot: bool
+) -> float | None:
+    """This cycle's filler average for the carried GPU configuration (the held scrape may list none), at this
+    cycle's tier: a node moved Secure -> Spot reads the Spot GPU-hour floor."""
     if rented_data is None:
         return previous.filler_revenue_per_gpu_hour
     return rented_data.get_filler_revenue_per_gpu_hour(
         BASE_GPU_MAP.get(previous.gpu_model or ""),
         previous.gpu_count,
-        settings.get_filler_revenue_min_gpu_hours(previous.is_spot),
+        settings.get_filler_revenue_min_gpu_hours(is_spot),
     )
 
 
-def _filler_revenue_feed_ok_now(rented_data: RentedExecutorsResponse | None, previous: JobResult) -> bool:
+def _filler_revenue_feed_ok_now(rented_data: RentedExecutorsResponse | None, is_spot: bool) -> bool:
     """Whether this cycle's feed is complete and usable; no feed this cycle seeds nothing."""
     return bool(
         rented_data
-        and rented_data.has_filler_revenue_averages(settings.get_filler_revenue_min_gpu_hours(previous.is_spot))
+        and rented_data.has_filler_revenue_averages(settings.get_filler_revenue_min_gpu_hours(is_spot))
     )
 
 

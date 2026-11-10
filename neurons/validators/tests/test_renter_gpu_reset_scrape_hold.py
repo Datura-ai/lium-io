@@ -432,6 +432,31 @@ async def test_a_carried_score_takes_the_feed_state_of_this_cycle(complete, feed
     [carried] = job_results["5Miner"]
     assert carried.filler_revenue_feed_ok is feed_ok
 
+
+@pytest.mark.asyncio
+async def test_a_node_moved_secure_to_spot_reads_the_carried_average_at_the_spot_floor():
+    # a measured-zero average over 2 to under 24 GPU-hours counts for Spot only; read at the old Secure floor it
+    # would go missing and the free GPUs would be seeded
+    service = _redis_service()
+    previous = _rented_scored("node-1")
+    previous.gpu_model, previous.is_spot = "NVIDIA H100 80GB HBM3", False
+    await remember_rented_scored_results({"5Miner": [previous]}, service)
+    held = _failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
+    held.is_spot = True
+    job_results = {"5Miner": [held]}
+    rented_data = _rented_executors(
+        filler_revenue_complete=True,
+        filler_revenue_by_gpu_config=[
+            FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=0.0, gpu_hours=10)
+        ],
+    )
+
+    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, rented_data, {})
+
+    [carried] = job_results["5Miner"]
+    assert carried.filler_revenue_per_gpu_hour == 0.0
+    assert carried.filler_revenue_feed_ok is True
+
 @pytest.mark.asyncio
 async def test_a_held_scrape_without_a_previous_score_is_withheld():
     service = _redis_service()
