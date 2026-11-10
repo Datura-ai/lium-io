@@ -3,7 +3,6 @@ import json
 import logging
 import math
 import time
-import uuid
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Callable, Literal, NamedTuple
@@ -68,6 +67,15 @@ RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# pod id -> set by the rented-pod recovery when it stops a pod or before it renames one back, cleared
+# once the pod is started again (no expiry: it is the only evidence the stop was ours): a stopped
+# pod_<id> it marked is its own to start next cycle, even when the rename's reply and its cleanup
+# were lost with the SSH transport
+STOPPED_BY_RECOVERY_PREFIX = "stopped_by_recovery:"
+# its values: RENAMING only makes the pod restartable (the rename may not have applied, so the pod is
+# still judged down); STOPPED also means the recovery itself stopped the pod
+STOPPED_BY_RECOVERY_RENAMING = "renaming"
+STOPPED_BY_RECOVERY_STOPPED = "stopped"
 # DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
 RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
@@ -195,9 +203,14 @@ def _executor_create_lock_key(executor_id: str) -> str:
     return f"lock:executor-create:{executor_id}"
 
 
-def _renter_create_lock_token_prefix(pod_id: str) -> str:
-    # names the create holding the lock, so a restarted connector can release exactly its cut-off creates' locks
-    return f"create:{pod_id}:"
+# the connector's id of the create execution being run (InflightBackendCreate.create_id), set around the create
+renter_create_id: ContextVar[str] = ContextVar("renter_create_id", default="")
+
+
+def _renter_create_lock_token(pod_id: str, create_id: str = "") -> str:
+    # names the create EXECUTION holding the lock: a late release by an earlier create of the same pod whose lock
+    # lapsed must not free a retry's lock, and a restarted connector releases exactly its cut-off creates' locks
+    return f"create:{pod_id}:{create_id}" if create_id else f"create:{pod_id}"
 
 # DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
 # meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
@@ -269,9 +282,22 @@ class InflightBackendCreate(BaseModel):
     executor_id: str
     workload_kind: WorkloadKind
     started_at_unix_seconds: int
+    # which execution wrote it; each execution has its own record
+    create_id: str = ""
     # DAH-5437: how many connector restarts this create has already been resumed after. The request itself is never
     # stored (it carries the renter's environment and credentials); the backend re-sends it from its own records.
     resumes: int = 0
+
+
+def _inflight_create_field(pod_id: str, create_id: str) -> str:
+    # one field per execution, so overlapping creates of a pod each keep their own record
+    return f"{pod_id}|{create_id}" if create_id else pod_id
+
+
+def _pod_of_inflight_create_field(field: str | bytes) -> str:
+    if isinstance(field, bytes):
+        field = field.decode()
+    return field.split("|", 1)[0]
 
 
 class RedisWrite(NamedTuple):
@@ -454,8 +480,7 @@ class RedisService:
         lock = self.executor_create_lock(executor_id)
         held = False
         try:
-            # unique per acquisition: a create outliving the TTL must not release a later re-send's lock of the same pod
-            held = bool(await lock.acquire(token=f"{_renter_create_lock_token_prefix(pod_id)}{uuid.uuid4().hex}"))
+            held = bool(await lock.acquire(token=_renter_create_lock_token(pod_id, renter_create_id.get())))
             if not held:
                 logger.warning(
                     _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
@@ -499,21 +524,19 @@ class RedisService:
                 with suppress(redis.exceptions.RedisError, OSError):  # past its TTL the lock is no longer ours
                     await lock.release()
 
-    async def release_cut_off_create_lock(self, executor_id: str, pod_id: str) -> None:
+    async def release_cut_off_create_lock(self, executor_id: str, pod_id: str, create_id: str = "") -> None:
         """The create lock a create cut off by a connector restart still holds, released if it is that create's.
 
         The connector that held it is gone, so nothing releases it before its TTL: the backend's re-send of the
         same create would wait out the rest of EXECUTOR_CREATE_LOCK_TIMEOUT (up to 6 min) and renters deleted the
-        pod first. A lock with another token (the rental probe's, or another pod's create) is left alone.
+        pod first. A lock with another token (the rental probe's, another pod's create, or another create of this pod)
+        is left alone.
         """
         key = _executor_create_lock_key(executor_id)
         try:
             async with self.redis.pipeline(transaction=True) as pipe:
                 await pipe.watch(key)
-                holder = await pipe.get(key) or b""
-                # a connector before this token form (lium-io#2051) wrote the bare create:<pod_id>
-                prefix = _renter_create_lock_token_prefix(pod_id).encode()
-                if not (holder.startswith(prefix) or holder == prefix[:-1]):
+                if await pipe.get(key) != _renter_create_lock_token(pod_id, create_id).encode():
                     return
                 pipe.multi()
                 pipe.delete(key)
@@ -946,8 +969,9 @@ class RedisService:
         def stamp() -> RedisWrites:
             # read at each try: a retry after a newer create's EXEC must not write an older time over its stamp
             writes = RedisWrites()
-            if not synthetic_probe:
-                # the validator's own rental probe keeps its marker but leaves no stamp: once done it is no rental
+            if kind is None and not synthetic_probe:
+                # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
+                # keep their marker but leave no stamp, since neither is a rental being created
                 writes.set(
                     create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
                 )
@@ -1099,6 +1123,7 @@ class RedisService:
         miner_hotkey: str,
         executor_id: str,
         workload_kind: WorkloadKind,
+        create_id: str = "",
         resumes: int = 0,
     ) -> None:
         create = InflightBackendCreate(
@@ -1106,12 +1131,14 @@ class RedisService:
             executor_id=executor_id,
             workload_kind=workload_kind,
             started_at_unix_seconds=int(time.time()),
+            create_id=create_id,
             resumes=resumes,
         )
-        await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
+        await self.hset(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id), create.model_dump_json())
 
-    async def remove_inflight_backend_create(self, pod_id: str) -> None:
-        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+    async def remove_inflight_backend_create(self, pod_id: str, create_id: str = "") -> None:
+        """Remove one execution's record; the pod's other executions keep theirs."""
+        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id))
 
     async def add_unacked_container_created(self, pod_id: str, message_json: str) -> None:
         await self.hset(UNACKED_CONTAINER_CREATED_KEY, pod_id, message_json)
@@ -1171,23 +1198,29 @@ class RedisService:
             for k, v in raw.items()
         }
 
-    async def inflight_backend_creates(self) -> dict[str, InflightBackendCreate]:
-        """pod id -> the create the backend sent for it"""
+    async def backend_create_inflight(self, pod_id: str) -> bool:
+        """Whether the connector is running any create, reboot or edit of the pod (another process)."""
+        fields = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
+        return any(_pod_of_inflight_create_field(field) == pod_id for field in fields)
+
+    async def inflight_backend_creates(self) -> dict[str, list[InflightBackendCreate]]:
+        """pod id -> every create the backend sent for it that is still recorded"""
         raw = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
-        creates: dict[str, InflightBackendCreate] = {}
-        for raw_pod_id, entry in raw.items():
-            pod_id = raw_pod_id.decode() if isinstance(raw_pod_id, bytes) else raw_pod_id
+        creates: dict[str, list[InflightBackendCreate]] = {}
+        for raw_field, entry in raw.items():
+            field = raw_field.decode() if isinstance(raw_field, bytes) else raw_field
+            pod_id = _pod_of_inflight_create_field(field)
             try:
-                creates[pod_id] = InflightBackendCreate.model_validate_json(entry)
+                creates.setdefault(pod_id, []).append(InflightBackendCreate.model_validate_json(entry))
             except ValidationError:
                 # one bad entry must not block the sweep of the others on every start
                 logger.error(_m("Dropping an unreadable inflight backend create", extra={"pod_id": pod_id}))
-                await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+                await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, field)
                 continue
             if set(json.loads(entry)) - set(InflightBackendCreate.model_fields):
                 # an entry an earlier build wrote with the whole create request in it: rewritten without
-                await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, creates[pod_id].model_dump_json())
-        return creates
+                await self.hset(INFLIGHT_BACKEND_CREATES_KEY, field, creates[pod_id][-1].model_dump_json())
+        return {pod_id: pod_creates for pod_id, pod_creates in creates.items() if pod_creates}
 
     async def get_pending_pods(
         self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60

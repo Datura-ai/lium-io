@@ -27,9 +27,11 @@ import services.redis_service as redis_service_module
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
+    PENDING_PODS_PREFIX,
     InflightBackendCreate,
     RedisService,
     create_started_at_key,
+    renter_create_id,
 )
 
 
@@ -61,7 +63,8 @@ def _client(redis_service: RedisService) -> ComputeClient:
     client.logging_extra = {"validator_hotkey": "validator-hotkey"}
     client.miner_service = MagicMock()
     client.miner_service.redis_service = redis_service
-    client.resume_count_by_pod_id = {}
+    client.resume_by_pod_id = {}
+    client._restart_reported_create_ids = {}
     client.deleted_pod_ids = set()
     client.unrecorded_create_acceptances = {}
     client.miner_drivers = asyncio.Queue()
@@ -131,7 +134,7 @@ async def test_a_finished_customer_rental_keeps_its_pending_flag_and_is_not_repo
 async def test_a_create_is_tracked_while_it_runs_and_untracked_when_it_ends() -> None:
     redis_service = _redis_service()
     client = _client(redis_service)
-    seen_while_running: list[dict[str, InflightBackendCreate]] = []
+    seen_while_running: list[dict[str, list[InflightBackendCreate]]] = []
 
     async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
         seen_while_running.append(await redis_service.inflight_backend_creates())
@@ -145,7 +148,7 @@ async def test_a_create_is_tracked_while_it_runs_and_untracked_when_it_ends() ->
     with pytest.raises(RuntimeError):
         await client.miner_driver(request)
 
-    assert seen_while_running[0]["pod-2"].executor_id == "exec-2"
+    assert [create.executor_id for create in seen_while_running[0]["pod-2"]] == ["exec-2"]
     assert await redis_service.inflight_backend_creates() == {}
 
 
@@ -175,6 +178,263 @@ async def test_a_create_still_runs_and_returns_when_redis_cannot_track_it() -> N
     assert await client.miner_driver(request) == "created"
 
 
+async def _settle(condition) -> bool:
+    for _ in range(50):
+        if await condition():
+            return True
+        await asyncio.sleep(0)
+    return await condition()
+
+
+@pytest.mark.parametrize(
+    "failing_write, newer_create",
+    [
+        pytest.param("insert", False, id="failed_insert_is_retried_while_the_create_runs"),
+        pytest.param("remove", False, id="failed_removal_is_retried_after_the_create_ends"),
+        pytest.param("remove", True, id="late_removal_never_erases_a_newer_creates_record"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failed_create_record_write_is_retried_until_it_lands(monkeypatch, failing_write, newer_create) -> None:
+    # the rented-pod recovery stays off a pod while this record exists: a lost insert would let it
+    # race a create still running past its pending mark and lock; a lost removal would veto it forever
+    monkeypatch.setattr("clients.compute_client.BACKEND_CREATE_TRACKING_RETRY_SECONDS", 0)
+    redis_service = _redis_service()
+    failures = [ConnectionError("redis blip")]
+    if failing_write == "insert":
+        real_hset = redis_service.redis.hset
+
+        async def flaky_hset(key: str, field: str, value: str) -> None:
+            if failures:
+                raise failures.pop()
+            await real_hset(key, field, value)
+
+        redis_service.redis.hset = flaky_hset
+    else:
+        real_remove = redis_service.remove_inflight_backend_create
+
+        async def remove_once_broken(pod_id: str, create_id: str = "") -> None:
+            if failures:
+                raise failures.pop()
+            await real_remove(pod_id, create_id)
+
+        redis_service.remove_inflight_backend_create = remove_once_broken
+    client = _client(redis_service)
+    seen_while_running: list[bool] = []
+
+    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> str:
+        seen_while_running.append(await _settle(lambda: redis_service.backend_create_inflight("pod-4")))
+        return "created"
+
+    client._drive_miner_job = fake_drive_miner_job
+    request = ContainerCreateRequest.model_construct(
+        pod_id="pod-4", miner_hotkey="miner-hk", executor_id="exec-4", workload_kind=WorkloadKind.CUSTOMER_RENTAL
+    )
+
+    assert await client.miner_driver(request) == "created"
+    assert seen_while_running == [True]
+    if newer_create:
+        # a newer create of the pod writes its record before the old one's removal is retried
+        await redis_service.add_inflight_backend_create(
+            "pod-4", "miner-hk", "exec-4", WorkloadKind.CUSTOMER_RENTAL, "newer"
+        )
+        assert await _settle(_no_retirements)
+        assert _create_ids(await redis_service.inflight_backend_creates(), "pod-4") == ["newer"]
+    else:
+        assert await _settle(lambda: _no_record(redis_service, "pod-4"))
+
+
+async def _no_record(redis_service: RedisService, pod_id: str) -> bool:
+    return not await redis_service.backend_create_inflight(pod_id)
+
+
+async def _no_retirements() -> bool:
+    from clients.compute_client import _retiring_backend_create_records
+
+    return not _retiring_backend_create_records
+
+
+@pytest.mark.parametrize(
+    "removal_fails, newer_create",
+    [
+        pytest.param(True, False, id="failed_removal_after_the_report_is_retried"),
+        pytest.param(False, True, id="report_never_erases_a_newer_creates_record"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_restart_report_retires_only_its_own_create_record(monkeypatch, removal_fails, newer_create) -> None:
+    monkeypatch.setattr("clients.compute_client.BACKEND_CREATE_TRACKING_RETRY_SECONDS", 0)
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create(
+        "pod-4", "miner-hk", "exec-4", WorkloadKind.CUSTOMER_RENTAL, "old", resumes=1
+    )
+    real_remove = redis_service.remove_inflight_backend_create
+    failures = [ConnectionError("redis blip")] if removal_fails else []
+
+    async def remove_once_broken(pod_id: str, create_id: str = "") -> None:
+        if failures:
+            raise failures.pop()
+        await real_remove(pod_id, create_id)
+
+    redis_service.remove_inflight_backend_create = remove_once_broken
+    client = _client(redis_service)
+    client.message_queue = OutgoingMessages()
+    client.lock = asyncio.Lock()
+    client.ws = object()
+
+    async def send(_msg) -> None:
+        if newer_create:  # the backend retried the pod and its create wrote a record meanwhile
+            await redis_service.add_inflight_backend_create(
+                "pod-4", "miner-hk", "exec-4", WorkloadKind.CUSTOMER_RENTAL, "newer"
+            )
+
+    client.send_model = AsyncMock(side_effect=send)
+    await client.fail_creates_cut_off_by_restart()
+
+    async def settled() -> bool:
+        # stopped only once the old record's removal landed: a cancel during that Redis write would race it
+        return await _sent_and_settled(client) and (
+            _create_ids(await redis_service.inflight_backend_creates(), "pod-4") == ["newer"]
+            if newer_create
+            else await _no_record(redis_service, "pod-4")
+        )
+
+    sender = asyncio.create_task(client.handle_send_messages())
+    try:
+        assert await _settle(settled)
+    finally:
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+
+    if newer_create:
+        assert _create_ids(await redis_service.inflight_backend_creates(), "pod-4") == ["newer"]
+    else:
+        assert await _no_record(redis_service, "pod-4")
+
+
+async def _sent_and_settled(client: ComputeClient) -> bool:
+    return client.send_model.await_count > 0 and await _no_retirements()
+
+
+def _create_ids(creates: dict[str, list[InflightBackendCreate]], pod_id: str) -> list[str]:
+    return sorted(create.create_id for create in creates.get(pod_id, []))
+
+
+@pytest.mark.parametrize(
+    "a_ends_first, b_rejected",
+    [
+        pytest.param(True, False, id="first_create_ends_first"),
+        pytest.param(False, False, id="second_create_ends_first"),
+        pytest.param(False, True, id="overlapping_create_rejected"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_overlapping_creates_of_a_pod_keep_it_excluded_until_every_one_ends(a_ends_first, b_rejected) -> None:
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    gates = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> str:
+        if job_request.executor_id == "b" and b_rejected:
+            raise RuntimeError("renting in progress")
+        await gates[job_request.executor_id].wait()
+        return "created"
+
+    client._drive_miner_job = fake_drive_miner_job
+
+    def run(name: str) -> asyncio.Task:
+        request = ContainerCreateRequest.model_construct(
+            pod_id="pod-5", miner_hotkey="miner-hk", executor_id=name, workload_kind=WorkloadKind.CUSTOMER_RENTAL
+        )
+        return asyncio.create_task(client.miner_driver(request))
+
+    a = run("a")
+    await asyncio.sleep(0)
+    b = run("b")
+    if b_rejected:
+        with pytest.raises(RuntimeError):
+            await b
+        assert await redis_service.backend_create_inflight("pod-5")  # A still runs
+        gates["a"].set()
+        await a
+    else:
+        first, second = ("a", "b") if a_ends_first else ("b", "a")
+        gates[first].set()
+        await asyncio.sleep(0.01)
+        assert await redis_service.backend_create_inflight("pod-5")  # the other one still runs
+        gates[second].set()
+        await asyncio.gather(a, b)
+    assert not await redis_service.backend_create_inflight("pod-5")
+
+
+class _RedisFailingOnce(_FakeRedis):
+    def __init__(self, failing: str) -> None:
+        super().__init__()
+        self.failing = failing
+        self.pending_pod_removals = 0
+
+    async def hgetall(self, key: str) -> dict[bytes, bytes]:
+        if self.failing == "enumeration":
+            self.failing = ""
+            raise ConnectionError("redis blip")
+        return await super().hgetall(key)
+
+    def _pending_pod_write(self, key: str) -> None:
+        # each remove_pending_pod rewrites the executor's pending list: fail the second, after one landed
+        if self.failing == "second_cleanup" and key == PENDING_PODS_PREFIX:
+            self.pending_pod_removals += 1
+            if self.pending_pod_removals == 2:
+                self.failing = ""
+                raise ConnectionError("redis blip")
+
+    async def hset(self, key: str, field: str, value: str) -> None:
+        self._pending_pod_write(key)
+        await super().hset(key, field, value)
+
+    async def hdel(self, key: str, *fields: str) -> None:
+        self._pending_pod_write(key)
+        await super().hdel(key, *fields)
+
+
+@pytest.mark.parametrize("resumes", [0, 1], ids=["resumed", "reported_failed"])
+@pytest.mark.parametrize("failing", ["enumeration", "second_cleanup"])
+@pytest.mark.asyncio
+async def test_a_failed_startup_sweep_is_retried_and_reports_each_create_once(monkeypatch, failing, resumes) -> None:
+    # a dead create's record left by a failed sweep would keep the rented-pod recovery off its pod for good
+    monkeypatch.setattr("clients.compute_client.BACKEND_CREATE_TRACKING_RETRY_SECONDS", 0)
+    redis_service = _redis_service()
+    for pod_id in ("pod-6", "pod-7"):
+        await redis_service.add_pending_pod("miner-hk", "exec-6", pod_id)
+        await redis_service.add_inflight_backend_create(
+            pod_id, "miner-hk", "exec-6", WorkloadKind.FILLER, pod_id, resumes=resumes
+        )
+    redis_service.redis.__class__ = _RedisFailingOnce
+    redis_service.redis.failing, redis_service.redis.pending_pod_removals = failing, 0
+    real_remove_pending_pod = redis_service.remove_pending_pod
+
+    async def remove_pending_pod(*args, **kwargs) -> None:
+        # the pending list is rewritten in a WATCH/MULTI pipeline, which the hset/hdel hooks never see
+        redis_service.redis._pending_pod_write(PENDING_PODS_PREFIX)
+        await real_remove_pending_pod(*args, **kwargs)
+
+    redis_service.remove_pending_pod = remove_pending_pod
+    client = _client(redis_service)
+
+    await client.fail_creates_cut_off_by_restart_until_done()
+
+    assert redis_service.redis.failing == ""  # the failure did happen
+    if resumes:
+        assert sorted(report.pod_id for report in client.message_queue) == ["pod-6", "pod-7"]
+        assert client._restart_reported_create_ids == {"pod-6": ["pod-6"], "pod-7": ["pod-7"]}
+    else:
+        # a pod resumed by the failed attempt is not counted a second time by the retry
+        assert client.message_queue == []
+        assert sorted(client.resumed_creates_report.pod_ids) == ["pod-6", "pod-7"]
+        creates = await redis_service.inflight_backend_creates()
+        assert {pod_id: [c.resumes for c in creates[pod_id]] for pod_id in creates} == {"pod-6": [1], "pod-7": [1]}
+    for pod_id in ("pod-6", "pod-7"):
+        assert not await redis_service.renting_in_progress("miner-hk", "exec-6", pod_id)
+
 
 def _create_request() -> ContainerCreateRequest:
     return ContainerCreateRequest(
@@ -203,7 +463,7 @@ async def test_a_create_cut_off_by_a_restart_is_listed_for_the_backend_to_send_a
     assert client.resumed_creates_report.pod_ids == ["pod-1"]
     assert not await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1")
     # the resume is counted in Redis, so a second restart before the re-send reports it failed
-    assert (await redis_service.inflight_backend_creates())["pod-1"].resumes == 1
+    assert [c.resumes for c in (await redis_service.inflight_backend_creates())["pod-1"]] == [1]
 
 
 @pytest.mark.asyncio
@@ -212,7 +472,7 @@ async def test_the_backends_resend_is_tracked_with_its_resume_counted() -> None:
     await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
     client = _client(redis_service)
     await client.fail_creates_cut_off_by_restart()
-    seen: list[InflightBackendCreate] = []
+    seen: list[list[InflightBackendCreate]] = []
 
     async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
         seen.append((await redis_service.inflight_backend_creates())["pod-1"])
@@ -220,7 +480,8 @@ async def test_the_backends_resend_is_tracked_with_its_resume_counted() -> None:
     client._drive_miner_job = fake_drive_miner_job
     await client._run_miner_job(_create_request())
 
-    assert seen[0].resumes == 1
+    # the re-sent create takes over the resumed record: one record, its resume counted
+    assert [c.resumes for c in seen[0]] == [1]
     assert await redis_service.inflight_backend_creates() == {}
 
 
@@ -254,13 +515,20 @@ async def test_the_redis_record_of_a_create_holds_ids_and_counters_only() -> Non
     stored_raw: list[str] = []
 
     async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
-        stored_raw.append(await redis_service.redis.hget("inflight_backend_creates", "pod-1"))
+        stored_raw.extend(await redis_service.redis.hvals("inflight_backend_creates"))
 
     client._drive_miner_job = fake_drive_miner_job
     await client._run_miner_job(request)
 
     record = json.loads(stored_raw[0])
-    assert set(record) == {"miner_hotkey", "executor_id", "workload_kind", "started_at_unix_seconds", "resumes"}
+    assert set(record) == {
+        "miner_hotkey",
+        "executor_id",
+        "workload_kind",
+        "started_at_unix_seconds",
+        "create_id",
+        "resumes",
+    }
     for secret in ("registry-pw", "env-secret", "sk-1", "HF_TOKEN", "environment", "docker_password"):
         assert secret not in stored_raw[0]
 
@@ -347,12 +615,19 @@ async def test_a_delete_before_the_creates_record_write_is_not_undone_by_it() ->
     client = _client(redis_service)
     client._drive_miner_job = AsyncMock()
 
+    seen: list[dict[str, list[InflightBackendCreate]]] = []
+
+    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
+        seen.append(await redis_service.inflight_backend_creates())
+
     with inflight_creates.track("pod-1"):  # the create is picked up, its record write still to come
         await client._run_miner_job(
             ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1")
         )
-        await client._track_backend_create_for_restart_report(_create_request())
+        client._drive_miner_job = fake_drive_miner_job
+        await client._run_miner_job(_create_request())
 
+    assert seen == [{}]
     assert await redis_service.inflight_backend_creates() == {}
 
 
@@ -379,7 +654,7 @@ async def test_a_record_older_than_the_longest_create_is_dropped_not_resumed() -
     # its removal failed long ago; the pod may be running now, and a re-run would replace its container by name
     redis_service = _redis_service()
     await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL)
-    stale = (await redis_service.inflight_backend_creates())["pod-1"]
+    stale = (await redis_service.inflight_backend_creates())["pod-1"][0]
     stale.started_at_unix_seconds -= INFLIGHT_CREATE_MAX_AGE_SECONDS + 1
     await redis_service.redis.hset("inflight_backend_creates", "pod-1", stale.model_dump_json())
     client = _client(redis_service)
@@ -1085,6 +1360,43 @@ def _fakeredis_service() -> RedisService:
 
 
 @pytest.mark.asyncio
+async def test_a_restart_releases_the_lock_of_the_cut_off_create_by_its_create_id() -> None:
+    redis_service = _fakeredis_service()
+    token = renter_create_id.set("cut-off-create")
+    try:
+        assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    finally:
+        renter_create_id.reset(token)
+    await redis_service.add_inflight_backend_create(
+        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, create_id="cut-off-create"
+    )
+
+    await _client(redis_service).fail_creates_cut_off_by_restart()
+
+    assert await redis_service.executor_create_lock("exec-1").acquire(blocking=False)
+
+
+@pytest.mark.asyncio
+async def test_a_late_release_by_a_create_whose_lock_lapsed_keeps_the_retrys_lock() -> None:
+    # create A outlives the TTL, the backend's retry B of the same pod takes the lock; A's release must not free it
+    redis_service = _fakeredis_service()
+    token = renter_create_id.set("create-a")
+    create_a = redis_service.executor_create_exclusion("exec-1", "pod-1")
+    assert await create_a.__aenter__()
+    renter_create_id.reset(token)
+    await redis_service.redis.delete("lock:executor-create:exec-1")  # A's TTL ran out
+    token = renter_create_id.set("create-b")
+    try:
+        assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    finally:
+        renter_create_id.reset(token)
+
+    await create_a.__aexit__(None, None, None)
+
+    assert not await redis_service.executor_create_lock("exec-1").acquire(blocking=False)
+
+
+@pytest.mark.asyncio
 async def test_a_restart_releases_the_create_lock_its_cut_off_create_held() -> None:
     redis_service = _fakeredis_service()
     # the dead connector's create took the executor's lock and never released it
@@ -1098,15 +1410,23 @@ async def test_a_restart_releases_the_create_lock_its_cut_off_create_held() -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("holder", ["probe", "other-pod"])
+@pytest.mark.parametrize("holder", ["probe", "other-pod", "same-pod-other-create"])
 async def test_a_restart_keeps_a_create_lock_held_by_another_create(holder: str) -> None:
     redis_service = _fakeredis_service()
     lock = redis_service.executor_create_lock("exec-1")
     if holder == "probe":
         assert await lock.acquire(blocking=False)
-    else:
+    elif holder == "other-pod":
         assert await redis_service.executor_create_exclusion("exec-1", "pod-2").__aenter__()
-    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+    else:
+        token = renter_create_id.set("live-create")
+        try:
+            assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+        finally:
+            renter_create_id.reset(token)
+    await redis_service.add_inflight_backend_create(
+        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, create_id="cut-off-create"
+    )
 
     await _client(redis_service).fail_creates_cut_off_by_restart()
 
@@ -1117,11 +1437,15 @@ async def test_a_restart_keeps_a_create_lock_held_by_another_create(holder: str)
 async def test_a_create_outliving_its_lock_ttl_cannot_release_the_re_sends_lock() -> None:
     redis_service = _fakeredis_service()
     key = "lock:executor-create:exec-1"
+    slow = renter_create_id.set("slow-create")
     assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    renter_create_id.reset(slow)
     slow_token = await redis_service.redis.get(key)
     await redis_service.redis.delete(key)  # the TTL lapsed mid-create
 
+    re_send = renter_create_id.set("re-send")  # every create execution has its own id
     assert await redis_service.executor_create_exclusion("exec-1", "pod-1").__aenter__()
+    renter_create_id.reset(re_send)
 
     # Lock.release deletes only its own token, so the slow create's late release leaves the re-send's lock
     assert await redis_service.redis.get(key) != slow_token
@@ -1163,14 +1487,22 @@ async def test_a_late_success_of_an_older_dispatch_keeps_the_newer_ones_saved_re
     assert json.loads((await redis_service.unacked_container_created())["pod-1"])["command_id"] == "cmd-b"
 
 
-@pytest.mark.parametrize(("holder", "released"), [("create:pod-1", True), ("create:pod-1:abc", True), ("create:pod-10", False), ("probe-token", False)])
+@pytest.mark.parametrize(
+    ("holder", "create_id", "released"),
+    [
+        ("create:pod-1", "", True),  # a record with no create id: the bare token an older connector wrote
+        ("create:pod-1:abc", "abc", True),
+        ("create:pod-1:abc", "other", False),  # another create of the pod holds it
+        ("create:pod-10", "", False),
+        ("probe-token", "", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_a_restart_releases_a_cut_off_creates_lock_in_either_token_form(holder: str, released: bool) -> None:
-    # create:pod-1 is what a connector before unique tokens (lium-io#2051) wrote
+async def test_a_restart_releases_only_the_cut_off_creates_own_lock(holder: str, create_id: str, released: bool) -> None:
     redis_service = _fakeredis_service()
     await redis_service.redis.set("lock:executor-create:exec-1", holder)
 
-    await redis_service.release_cut_off_create_lock("exec-1", "pod-1")
+    await redis_service.release_cut_off_create_lock("exec-1", "pod-1", create_id)
 
     assert (await redis_service.redis.get("lock:executor-create:exec-1") is None) == released
 

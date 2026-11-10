@@ -16,6 +16,7 @@ from services.image_flatten import (
     FLATTEN_LOCK_PATH,
     FLATTEN_USE_LOCK_PATH,
     FLATTEN_NO_DISK_EXIT,
+    FLATTEN_NO_DISK_RENTER_SENTENCE,
     ImageFlattenNoDisk,
     _flatten_command,
     flatten_image_on_host,
@@ -60,7 +61,7 @@ def test_changes_refuse_an_env_value_with_a_line_break():
 
 def _ssh(
     *, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0,
-    docker_version: str = "29.8.0",
+    docker_version: str = "29.8.0", stderr: str = "boom",
 ):
     async def run(command, check=False, timeout=None):
         if command.startswith("/usr/bin/docker version"):
@@ -79,7 +80,7 @@ def _ssh(
             return Mock(exit_status=0, stdout=json.dumps({"Id": _IMAGE_ID, "Size": size, "Config": _CONFIG}))
         if "docker create" not in command and f"/usr/bin/docker image inspect {_TAG}" in command:
             return Mock(exit_status=0 if exists else 1, stdout="")
-        return Mock(exit_status=flatten_rc, stdout="", stderr="boom")
+        return Mock(exit_status=flatten_rc, stdout="", stderr=stderr)
 
     ssh = Mock()
     ssh.run = AsyncMock(side_effect=run)
@@ -100,6 +101,33 @@ async def test_the_no_disk_exit_raises_the_renter_sentence_and_other_failures_ra
     assert "not enough free disk" in exc.value.renter_sentence
     with pytest.raises(RuntimeError, match="boom"):
         await flatten_image_on_host(_ssh(exists=False, flatten_rc=98), "lmsysorg/sglang:dev", lease="r1")
+
+
+_RESERVED = 79 * 1024**3
+_NEED = 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + _RESERVED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stderr, short_gb, short_words",
+    [
+        # the Size-based check: the need is the one the validator computed
+        (f"flatten avail={_NEED - 5 * 1024**3}\n", 5, "5 GB short"),
+        # another create sized its disk meanwhile, or a count that did not complete: no shortfall to name
+        ("flatten refused: another create sized its disk meanwhile\n", None, None),
+        ("flatten refused: the export is larger than the free disk allows\n", None, None),
+    ],
+)
+async def test_the_no_disk_refusal_names_the_shortfall_when_measured(stderr, short_gb, short_words):
+    ssh = _ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT, stderr=stderr)
+    with pytest.raises(ImageFlattenNoDisk) as exc:
+        await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=_RESERVED)
+    if short_gb is None:
+        assert exc.value.renter_sentence == FLATTEN_NO_DISK_RENTER_SENTENCE and exc.value.short_bytes is None
+    else:
+        assert exc.value.renter_sentence.endswith(f"({short_words}); use a smaller image or one with fewer layers")
+        assert exc.value.short_bytes == short_gb * 1024**3
+    assert 'echo "flatten avail=$avail" >&2' in ssh.run.await_args_list[-1].args[0]
 
 
 @pytest.mark.asyncio
@@ -503,9 +531,13 @@ def test_the_containerd_disk_check_budgets_the_bytes_the_export_really_writes(
         tmp_path, avail=100, need_bytes=2 * size + 10, export_bytes=export_bytes, export_rc=export_rc,
         export_factor=2, fixed_bytes=10,
     )
-    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == expected_rc
+    result = subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]})
+    assert result.returncode == expected_rc
     assert sorted(c.split()[0] for c in _calls(tmp_path)) == sorted(expected_calls)
     assert "rm -fv cid1" in _calls(tmp_path)
+    # the count stops one byte past the 45 that fit, so it never learns the real shortfall and names no number
+    assert (b"larger than the free disk allows" in result.stderr) == (export_bytes == 60)
+    assert b"avail=" not in result.stderr
 
 
 def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(tmp_path):
@@ -784,4 +816,4 @@ async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(d
     command = ssh.run.await_args_list[-1].args[0]
     assert f"-ge {copies * 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
     # containerd also counts the real export bytes (a sparse file reports a small Size); overlay2's Size does not under-count
-    assert ("head -c" in command) == (copies == 2)
+    assert ("| wc -c" in command) == (copies == 2)

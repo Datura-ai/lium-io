@@ -81,10 +81,10 @@ def client(monkeypatch):
     client.lock = asyncio.Lock()
     client.logging_extra = {}
     client.miner_service = MagicMock(redis_service=service)
+    client._write_backend_create_record = AsyncMock(return_value=True)
     client.deleted_pod_ids = set()
     client.unrecorded_create_acceptances = {}
-    client._track_backend_create_for_restart_report = AsyncMock()
-    client._untrack_backend_create_for_restart_report = AsyncMock()
+    client.resume_by_pod_id = {}
     client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="127.0.0.1", port=8000))
     client.miner_service.handle_container = AsyncMock(
         return_value=ContainerCreated(
@@ -304,12 +304,12 @@ async def test_a_host_fault_create_failure_is_sent_again_on_each_new_socket_for_
     monkeypatch.setattr(redis_module.time, "time", lambda: clock[0])
     if reconnect_during_cleanup:  # review 5766355530: a socket that replaces this one before the command finishes
 
-        async def reconnect_before_finish(_pod_id):
+        async def reconnect_before_finish(_pod_id, _create_id):
             client.message_queue.clear()  # the first socket took the frame
             await client._resend_host_fault_failures()
             assert len(client.message_queue) == int(kept)
 
-        client._untrack_backend_create_for_restart_report.side_effect = reconnect_before_finish
+        client._retire_backend_create_record = AsyncMock(side_effect=reconnect_before_finish)
     await client.miner_driver(request("reboot-a"))
     client.message_queue.clear()
 
