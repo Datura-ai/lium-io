@@ -7,6 +7,8 @@ probe cascade and checks to show where the 2 comes from and what each run now re
 
 from __future__ import annotations
 
+import asyncio
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -140,7 +142,7 @@ class RentalsBackendClient(DummyBackendClient):
         return self.rented_data
 
 
-def rented_with_pods(*pod_ids: str, gpu_count: int | None = None) -> RentedExecutorsResponse:
+def rented_with_pods(*pod_ids: str, gpu_count_per_pod: int | None = None) -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             EXECUTOR_UUID: RentedExecutor(
@@ -149,7 +151,7 @@ def rented_with_pods(*pod_ids: str, gpu_count: int | None = None) -> RentedExecu
                 executor_ip_port="8001",
                 pods=[
                     RentedPod(
-                        pod_id=pod_id, container_name=f"container_{pod_id}", rented_ports=[65000 + i], gpu_count=gpu_count
+                        pod_id=pod_id, container_name=f"container_{pod_id}", rented_ports=[65000 + i], gpu_count=gpu_count_per_pod
                     )
                     for i, pod_id in enumerate(pod_ids)
                 ],
@@ -343,7 +345,7 @@ async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enf
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
-        rented_data=rented_with_pods(*pod_order, gpu_count=2),
+        rented_data=rented_with_pods(*pod_order, gpu_count_per_pod=2),
         ssh=PerPodSSHClient(running={"container_pod-live"}),
         backend=PerPodBackendClient(active={"pod-live"}),
     )
@@ -355,7 +357,7 @@ async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enf
     assert ctx.state.specs["available_port_count"] == 2
     assert count_result.passed is True
     # flag or no flag, the live rental keeps the node rented: the run stops here, so no check that loads every
-    # card runs beside the renter (aa801f3e, 31 Oct-3 Nov), and the stale pod is noted
+    # card runs beside the renter, and the stale pod is noted
     assert tenant_result.passed is True
     assert tenant_result.halt is True
     assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
@@ -364,6 +366,35 @@ async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enf
     # the closed pod's GPUs are free, so only the live pod's count as rented (pay and idle gates)
     assert tenant_result.updates["default_extra"]["rented_gpu_count"] == 2
     assert pods_rented_gpu_count(tenant_result.updates["state"].rented_data, EXECUTOR_UUID) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_hung_sibling_read_ends_in_time_instead_of_dropping_the_cycle(context_factory, monkeypatch):
+    from neurons.validators.src.services.task.checks import rented_machine
+
+    class HungLivePodSSH(PerPodSSHClient):
+        async def run(self, command: str):
+            if "container_pod-live" in command:
+                await asyncio.sleep(3600)
+            return await super().run(command)
+
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    monkeypatch.setattr(rented_machine, "task_seconds_left", lambda _ctx: rented_machine.POD_READ_RESERVE_SECONDS)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-stale", "pod-live"),
+        ssh=HungLivePodSSH(running={"container_pod-live"}),
+        backend=PerPodBackendClient(active={"pod-live"}),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await asyncio.wait_for(apply(ctx, TenantEnforcementCheck()), 10)
+
+    # the unread sibling is not counted as live (no enforcement on a guess either): the cycle still ends with a result
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
 
 
 @pytest.mark.asyncio
