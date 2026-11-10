@@ -309,8 +309,11 @@ async def test_a_host_fault_create_failure_is_sent_again_on_each_new_socket_for_
             await client._resend_host_fault_failures()
             assert len(client.message_queue) == int(kept)
 
+        # the create's cleanup step: it retires the in-flight create record after the failure was kept
         client._retire_backend_create_record = AsyncMock(side_effect=reconnect_before_finish)
     await client.miner_driver(request("reboot-a"))
+    if reconnect_during_cleanup:
+        client._retire_backend_create_record.assert_awaited_once()
     client.message_queue.clear()
 
     await client._resend_host_fault_failures()  # the next socket authenticated
