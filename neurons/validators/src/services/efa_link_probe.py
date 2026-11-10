@@ -122,17 +122,18 @@ async def _measure_pair(
             server_address = addresses[server.executor_info.uuid]
             if server_address is None:
                 return None
-            await server_ssh.run(
-                f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1; "
-                + _docker_run_command(
-                    f"--entrypoint timeout {_probe_image()} {PROBE_TIMEOUT_SECONDS} "
-                    f"{EFA_PROBE_ENTRYPOINT} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}",
-                    detached=True,
-                ),
-                check=False,
-                timeout=PROBE_TIMEOUT_SECONDS,
-            )
             try:
+                # inside the try: a cancel during startup must still stop a server that did start
+                await server_ssh.run(
+                    f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1; "
+                    + _docker_run_command(
+                        f"--entrypoint timeout {_probe_image()} {PROBE_TIMEOUT_SECONDS} "
+                        f"{EFA_PROBE_ENTRYPOINT} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}",
+                        detached=True,
+                    ),
+                    check=False,
+                    timeout=PROBE_TIMEOUT_SECONDS,
+                )
                 for attempt in range(CLIENT_ATTEMPTS):
                     if attempt:
                         await asyncio.sleep(CLIENT_RETRY_DELAY_SECONDS)

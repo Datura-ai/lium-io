@@ -141,7 +141,7 @@ async def test_an_unreachable_host_is_recorded_as_failed_and_the_healthy_pair_is
     }
 
 
-def fake_connection(monkeypatch, client_run=None, cleanup=None):
+def fake_connection(monkeypatch, client_run=None, cleanup=None, server_run=None):
     @asynccontextmanager
     async def connected(info, key):
         async def run(command, **kwargs):
@@ -151,6 +151,8 @@ def fake_connection(monkeypatch, client_run=None, cleanup=None):
                 return SimpleNamespace(stdout="203.0.113.1")
             if " client " in command and client_run:
                 return await client_run()
+            if " server " in command and server_run:
+                return await server_run()
             return SimpleNamespace(stdout=FI_PINGPONG_OUTPUT)
 
         yield SimpleNamespace(run=run)
@@ -194,3 +196,28 @@ async def test_a_failing_server_stop_does_not_swallow_the_budget_cancel(monkeypa
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_while_the_server_starts_still_stops_it(monkeypatch):
+    a, b = [host(uuid, [EFA_PORT]) for uuid in "ab"]
+    server_starting = asyncio.Event()
+    stopped = []
+
+    async def hanging_server_start():
+        server_starting.set()
+        await asyncio.sleep(60)
+
+    async def cleanup():
+        stopped.append(True)
+        return SimpleNamespace(stdout="")
+
+    fake_connection(monkeypatch, cleanup=cleanup, server_run=hanging_server_start)
+    task = asyncio.create_task(efa_link_probe._measure_pair(a, b, "key", {}))
+    await server_starting.wait()
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stopped == [True]
