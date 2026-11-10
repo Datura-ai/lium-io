@@ -604,7 +604,7 @@ def _pull_keeper_pidfile(pod_id: str) -> str:
     return shlex.quote(f"/tmp/lium-pull-keeper-{pod_id}.pid")
 
 
-def _pull_keeper_marker(pod_id: str) -> str:
+def _pull_keeper_env_marker(pod_id: str) -> str:
     return shlex.quote(f"LIUM_PULL_KEEPER={pod_id}")
 
 
@@ -616,14 +616,14 @@ def _pull_keeper_alive_check(pod_id: str) -> str:
     # the pid is ours only while its environment carries this pod's marker (no kill of a reused pid)
     return (
         f'p=$(cat {_pull_keeper_pidfile(pod_id)} 2>/dev/null) && '
-        f'grep -qaF {_pull_keeper_marker(pod_id)} /proc/"$p"/environ 2>/dev/null'
+        f'grep -qaF {_pull_keeper_env_marker(pod_id)} /proc/"$p"/environ 2>/dev/null'
     )
 
 
 def pull_keeper_start_command(pod_id: str, image: str) -> str:
     """Start the keeper unless an earlier attempt's keeper for this pod is still pulling."""
     return (
-        f"{_pull_keeper_alive_check(pod_id)} || {{ setsid nohup env {_pull_keeper_marker(pod_id)} "
+        f"{_pull_keeper_alive_check(pod_id)} || {{ setsid nohup env {_pull_keeper_env_marker(pod_id)} "
         f"timeout {int(_DOCKER_PULL_TIMEOUT_SECONDS)} /usr/bin/docker pull {shlex.quote(image)} "
         f">{_pull_keeper_log(pod_id)} 2>&1 </dev/null & echo $! > {_pull_keeper_pidfile(pod_id)}; "
         # $! names the fork before env has run: return once the marker shows, or a wait right after sees no keeper
@@ -11498,7 +11498,13 @@ class DockerService:
         await ssh_client.run(shlex.join(command), check=True)
 
     async def _pull_image_with_host_keeper(
-        self, ssh_client, docker_client, payload, log_tag: str, *, use_pull_keeper: bool
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerCreateRequest,
+        log_tag: str,
+        *,
+        use_pull_keeper: bool,
     ) -> None:
         if not use_pull_keeper:
             await docker_client.pull(image=payload.docker_image)
@@ -11544,7 +11550,9 @@ class DockerService:
             raise
         await _stop_keeper()
 
-    async def _report_pull_keeper_progress(self, ssh_client, payload, log_tag: str, started: float) -> None:
+    async def _report_pull_keeper_progress(
+        self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest, log_tag: str, started: float
+    ) -> None:
         # the SDK pull only starts once the keeper is done, so the keeper's own output is the renter's progress
         minutes = int((time.monotonic() - started) // 60)
         progress = f"still downloading ({minutes} min)"
