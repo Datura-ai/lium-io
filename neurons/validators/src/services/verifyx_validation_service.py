@@ -640,16 +640,17 @@ class VerifyXValidationService:
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
-        guarded = (
-            f"mkdir {d} && cd {d} || exit 1; "
-            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
-            f"cd .. && rm -rf {d}; exit $rc"
-        )
+
+        def in_run_dir(run: str) -> str:
+            return f"mkdir {d} && cd {d} || exit 1; {run} & echo $! > pid; wait $!; rc=$?; cd .. && rm -rf {d}; exit $rc"
+
+        guarded = in_run_dir(f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command}")
         if deadline_optional:
-            # the first sample: a host whose `timeout` lacks -k runs it as before, unkillable, rather than fail it
+            # the first sample: a host whose `timeout` lacks -k runs it without the deadline rather than fail it,
+            # still in its run dir with its PID on record, so a rent's cancel can kill it
             return (
                 f"if command -v timeout >/dev/null 2>&1 && timeout -k 1 1 true 2>/dev/null; "
-                f"then {guarded}; else {command}; fi"
+                f"then {guarded}; else {in_run_dir(command)}; fi"
             )
         return (
             # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;

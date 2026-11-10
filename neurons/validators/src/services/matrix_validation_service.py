@@ -427,8 +427,18 @@ class ValidationService:
         # The command sent to the executor is unchanged except the CUDA_VISIBLE_DEVICES env prefix,
         # and never reveals which card/signal disagreed (anti-treadmill).
         command = f"CUDA_VISIBLE_DEVICES={index} {executor_info.python_path} {script_path} {params}"
+        from services.task.runner import pid_tagged  # services.task imports this module
+
+        command, kill = pid_tagged(command)
         try:
             result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            # a rent cancelled the recheck: the card's run must not keep loading the renter's GPU
+            try:
+                await asyncio.shield(ssh_client.run(kill, timeout=10))
+            except Exception:  # noqa: BLE001 — the cancel goes on whether the kill landed or not
+                pass
+            raise
         except (TimeoutError, asyncssh.TimeoutError):
             return {"card_index": index, "ok": False, "reason": "timeout"}
         except Exception as e:

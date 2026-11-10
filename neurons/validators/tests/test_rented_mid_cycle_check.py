@@ -390,3 +390,48 @@ async def test_a_cancelled_gpu_probe_kills_its_remote_process(check, specs, monk
     probe, kill = runner.calls
     tag = re.search(r"lium-probe-[0-9a-f]+", probe).group(0)
     assert tag in kill and "kill -KILL" in kill
+
+
+class BlockingCardShell:
+    """Each card's matmul never ends; the kills answer at once."""
+
+    def __init__(self, cards: int):
+        self.calls: list[str] = []
+        self.cards = cards
+        self.started = asyncio.Event()
+
+    async def run(self, cmd, **_):
+        self.calls.append(cmd)
+        if "kill -KILL" in cmd:
+            return MagicMock(exit_status=0, stdout="")
+        if sum("kill -KILL" not in c for c in self.calls) == self.cards:
+            self.started.set()
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_all_cards_matmul_kills_every_card_run():
+    from services.matrix_validation_service import ValidationService
+
+    service = ValidationService.__new__(ValidationService)
+    shell = BlockingCardShell(cards=2)
+    executor = MagicMock(python_path="/usr/bin/python3")
+    runs = asyncio.ensure_future(
+        asyncio.gather(*(service._run_one_card(shell, executor, "/tmp/s.py", i, "params") for i in range(2)))
+    )
+    await asyncio.wait_for(shell.started.wait(), 5)
+
+    runs.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runs
+
+    card_runs = [c for c in shell.calls if "kill -KILL" not in c]
+    kills = [c for c in shell.calls if "kill -KILL" in c]
+    tags = {re.search(r"lium-probe-[0-9a-f]+", c).group(0) for c in card_runs}
+    assert len(tags) == 2 and all(any(tag in kill for kill in kills) for tag in tags)
+
+
+def test_the_post_rental_recheck_stops_on_a_rent():
+    from services.task.checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
+
+    assert PostRentalGpuRecheckCheck.stops_on_rent

@@ -394,8 +394,8 @@ async def test_the_first_sample_runs_with_or_without_timeout_k(tmp_path, monkeyp
     capture = await service._run_ssh_command(_LocalShell(tmp_path), command)
 
     assert capture.exit_status == 3
-    # with -k: in its own run dir with its PID on record (killable on cancel); without: in the login dir, as before
-    assert capture.stdout.split() == ([str(tmp_path / ".vx-run"), "has-pid"] if has_k else [str(tmp_path)])
+    # either way in its own run dir with its PID on record, so a rent's cancel can kill it; only the -k deadline is dropped
+    assert capture.stdout.split() == [str(tmp_path / ".vx-run"), "has-pid"]
     assert not (tmp_path / ".vx-run").exists()
 
 

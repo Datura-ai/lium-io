@@ -148,23 +148,28 @@ class SSHCommandRunner:
         raise last_exc or RuntimeError(f"Unknown SSH error for cmd: {cmd}")
 
 
-async def run_killed_on_cancel(
-    runner: SSHCommandRunner, cmd: str, *, seconds: int, stdin_text: str | None = None
-) -> SSHCommandResult:
-    """`runner.run(cmd)` once; cancelled (a rent landed), its remote process group is killed before the cancel goes on.
-
-    The remote shell, a session leader under sshd, records its PID; the kill reaches only that PID's group, and
-    only while the PID still runs this command (a reused PID is spared), as kill_remote_verifyx does."""
+def pid_tagged(cmd: str) -> tuple[str, str]:
+    """`cmd` wrapped so its remote shell, a session leader under sshd, records its PID, and the command that kills
+    that PID's group, only while the PID still runs this command (a reused PID is spared), as kill_remote_verifyx does.
+    """
     tag = f"lium-probe-{uuid.uuid4().hex}"
     pid_file = f"/tmp/{tag}.pid"
     wrapped = f"echo $$ > {pid_file}; {cmd}; rc=$?; rm -f {pid_file}; exit $rc"
+    kill = (
+        f'p=$(cat {pid_file} 2>/dev/null); [ -n "$p" ] && grep -q {tag} /proc/"$p"/cmdline 2>/dev/null '
+        f'&& kill -KILL -"$p" "$p" 2>/dev/null; rm -f {pid_file}'
+    )
+    return wrapped, kill
+
+
+async def run_killed_on_cancel(
+    runner: SSHCommandRunner, cmd: str, *, seconds: int, stdin_text: str | None = None
+) -> SSHCommandResult:
+    """`runner.run(cmd)` once; cancelled (a rent landed), its remote process group is killed before the cancel goes on."""
+    wrapped, kill = pid_tagged(cmd)
     try:
         return await runner.run(wrapped, timeout=seconds, retryable=False, stdin_text=stdin_text)
     except asyncio.CancelledError:
-        kill = (
-            f'p=$(cat {pid_file} 2>/dev/null); [ -n "$p" ] && grep -q {tag} /proc/"$p"/cmdline 2>/dev/null '
-            f'&& kill -KILL -"$p" "$p" 2>/dev/null; rm -f {pid_file}'
-        )
         # shielded: a second cancel must not stop the kill
         await asyncio.shield(runner.run(kill, timeout=10, retryable=False))
         raise
