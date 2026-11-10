@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import socket
@@ -264,3 +265,71 @@ def test_lambda_refuses_a_wrong_token_and_non_public_targets(monkeypatch):
     assert call("Bearer secret", "10.0.0.1") == 400
     assert call("Bearer secret", "169.254.169.254") == 400
     assert call("Bearer secret", "example.com") == 400
+
+
+TEN = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+
+
+def _parallel_verifier(mocker, reached, answer=lambda tested: (tested, [])):
+    async def docker_run(*_args):
+        await asyncio.sleep(0)  # an SSH round trip: the other start runs meanwhile
+        return ContainerStartResult(ok=True, container_id="c", status="Up")
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(side_effect=docker_run)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: answer(tested))
+    external = mocker.Mock(spec=ExternalPortProbe)
+    external.reached = mocker.AsyncMock(side_effect=reached)
+    mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
+    return BatchVerifier(port_tester, runner, external), runner
+
+
+@pytest.mark.asyncio
+async def test_the_host_listener_starts_alongside_the_outside_reading_without_the_sampled_ports(mocker):
+    # DAH-6133: run one after the other, the two `docker run`s used most of a busy host's 60 s attempt
+    async def reached(host, sample, token):
+        host_starts = [c.args for c in runner.run.await_args_list if c.args[3] == "host"]
+        assert len(host_starts) == 1  # already started while the prober fetches
+        assert "for port in 9003 9004 9005 9006 9007 9008 9009;" in host_starts[0][2]  # no sampled port bound twice
+        return sample
+
+    verifier, runner = _parallel_verifier(mocker, reached)
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.external == "passed" and result.successful == TEN
+    assert runner.run.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_sampled_port_the_outside_reading_missed_gets_its_host_listener_after_it(mocker):
+    async def reached(host, sample, token):
+        return sample[:2]
+
+    # the validator's own first try on the published listener misses the third sampled port too
+    verifier, runner = _parallel_verifier(
+        mocker, reached, answer=lambda tested: ([], tested) if tested == TEN[2:3] else (tested, [])
+    )
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.successful == TEN
+    (_, missed_name, missed_script, network, _) = runner.run.await_args_list[-1].args
+    assert network == "host" and "for port in 9002;" in missed_script
+    assert missed_name in [c.args[1] for c in runner.cleanup.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_a_split_node_needing_every_port_starts_its_host_listener_after_the_outside_reading(mocker):
+    async def reached(host, sample, token):
+        assert all(c.args[3] != "host" for c in runner.run.await_args_list)
+        return sample
+
+    verifier, runner = _parallel_verifier(mocker, reached)
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=10)
+
+    assert result.successful == TEN
+    assert "for port in 9003 9004 9005 9006 9007 9008 9009;" in runner.run.await_args_list[1].args[2]

@@ -29,8 +29,9 @@ EXTERNAL_PROBE_SAMPLE = 3
 class ContainerStartWatch:
     """DAH-5682: whether `docker run` of an attempt's test container has not returned yet."""
 
-    in_progress: bool = False
-    started_at: float = 0.0  # loop time the in-progress start began
+    in_progress: int = 0  # `docker run` calls not returned yet: the host listener starts alongside the outside one
+    started_at: float = 0.0  # loop time the oldest in-progress start began
+    missed_container: str | None = None  # the late host listener for sampled ports the outside reading missed
     # the ports that answered so far: an attempt whose deadline fires after they answered still returns them
     verified: BatchResult | None = None
 
@@ -139,6 +140,8 @@ class BatchVerifier:
                 # DAH-5868: outside wait_for, so a slow cleanup cannot time out an attempt whose ports answered
                 try:
                     await self.runner.cleanup(ssh_client, container_name)
+                    if start_watch.missed_container:
+                        await self.runner.cleanup(ssh_client, start_watch.missed_container)
                 except Exception as e:
                     logger.debug(_m(f"cleanup failed: {str(e)[:50]}", extra=get_extra_info(log_ctx)))
 
@@ -162,9 +165,40 @@ class BatchVerifier:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
         sample = random.sample(ports, min(EXTERNAL_PROBE_SAMPLE, len(ports))) if self.external_probe else []
-        reached, first_round = await self._outside_reading(sample, token, ssh_client, host, log_ctx, start_watch)
+        rest = [p for p in ports if p not in sample]
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timings: dict[str, float] = {}
+
+        async def timed(key: str, step):
+            began = loop.time()
+            result = await step
+            timings[key] = loop.time() - began
+            return result
+
+        def host_start(listen: list[PortPair], container: str, idx: int, key: str):
+            return timed(key, self._start_container(
+                start_watch, ssh_client, container, NetcatScript.batch(listen, token, idx), "host", 60
+            ))
+
+        outside = timed("outside", self._outside_reading(sample, token, ssh_client, host, log_ctx, start_watch, timings))
+        # DAH-6133: on a busy host each `docker run` takes seconds, and run one after another they used most of the
+        # 60 s; the host listener for the ports outside the sample starts alongside the outside reading. Not when
+        # those ports alone cannot reach the floor (a split node needing every port): then it waits for the sample
+        parallel = bool(sample) and len(rest) >= min_ports
+        if parallel:
+            steps = [asyncio.ensure_future(outside), asyncio.ensure_future(host_start(rest, name, 0, "host_start"))]
+            try:
+                (reached, first_round), start_result = await asyncio.gather(*steps)
+            except BaseException:
+                # a start left running would bind its listener after the cleanup and answer attempt 2 stale
+                for step in steps:
+                    step.cancel()
+                raise
+        else:
+            reached, first_round = await outside
         sampled_ok = [p for p in sample if p in (reached or []) or p in first_round]
-        ports_left = [p for p in ports if p not in sampled_ok]
+        missed = [p for p in sample if p not in sampled_ok]
         external_blocked = reached == [] and all(p in first_round for p in sample)
         if external_blocked:
             logger.warning(
@@ -174,15 +208,23 @@ class BatchVerifier:
                 )
             )
         external = "blocked" if external_blocked else "passed" if reached else None
-        if not ports_left:
-            return BatchResult(sampled_ok, [], external)
 
         def answered() -> BatchResult:
             ok = set(sampled_ok + successful)
-            return BatchResult([p for p in ports if p in ok], failed, external)
+            return BatchResult([p for p in ports if p in ok], [p for p in ports if p not in ok], external)
 
-        script = NetcatScript.batch(ports_left, token, 0)
-        start_result = await self._start_container(start_watch, ssh_client, name, script, "host", 60)
+        if parallel:
+            ports_left = rest
+            if start_result.ok and missed:
+                # the outside container held these ports; their host listener can bind now that it is gone
+                start_watch.missed_container = f"{name}_s"
+                if (await host_start(missed, start_watch.missed_container, 1, "missed_start")).ok:
+                    ports_left = rest + missed
+        else:
+            ports_left = [p for p in ports if p not in sampled_ok]
+            if not ports_left:
+                return BatchResult(sampled_ok, [], external)
+            start_result = await host_start(ports_left, name, 0, "host_start")
         if not start_result.ok:
             logger.debug(
                 _m(
@@ -191,7 +233,13 @@ class BatchVerifier:
                 )
             )
             return BatchResult([], ports, external)
-
+        logger.info(
+            _m(
+                f"containers ready in {loop.time() - started:.1f}s ({'parallel' if parallel else 'sequential'}): "
+                + ", ".join(f"{k}={v:.1f}s" for k, v in timings.items()),
+                extra=get_extra_info(log_ctx),
+            )
+        )
         async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
             successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
             start_watch.verified = answered() if successful else None
@@ -229,9 +277,11 @@ class BatchVerifier:
         timeout: int,
     ) -> ContainerStartResult:
         # no `finally`: a cancelled start must stay marked in progress for the attempt's timeout handler
-        start_watch.in_progress, start_watch.started_at = True, asyncio.get_running_loop().time()
+        if not start_watch.in_progress:
+            start_watch.started_at = asyncio.get_running_loop().time()
+        start_watch.in_progress += 1
         result = await self.runner.run(ssh_client, name, script, network_mode, timeout)
-        start_watch.in_progress = False
+        start_watch.in_progress -= 1
         return result
 
     async def _outside_reading(
@@ -242,6 +292,7 @@ class BatchVerifier:
         host: str,
         log_ctx: dict,
         start_watch: ContainerStartWatch,
+        timings: dict[str, float] | None = None,
     ) -> tuple[list[PortPair] | None, list[PortPair]]:
         """DAH-5597: the outside prober fetches ports published with `-p`, as a renter's pod publishes them, so it
         goes through the docker DNAT/FORWARD path; a --network=host listener would test the host INPUT chain
@@ -251,9 +302,12 @@ class BatchVerifier:
             return None, []
         name = f"port_test_out_{token[:8]}"
         publish_flags = " ".join(f"-p {p.internal}:{p.internal}" for p in sample)
+        began = asyncio.get_running_loop().time()
         start = await self._start_container(
             start_watch, ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30
         )
+        if timings is not None:
+            timings["outside_start"] = asyncio.get_running_loop().time() - began
         try:
             if not start.ok:
                 logger.debug(
