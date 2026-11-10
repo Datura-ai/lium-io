@@ -1,5 +1,6 @@
 """I-78: a key uploaded through /upload_ssh_key logs in only from the validator's addresses."""
 
+import asyncio
 import socket
 import time
 from types import SimpleNamespace
@@ -173,3 +174,15 @@ def test_the_signed_message_carries_the_ssh_sources_prefix(monkeypatch, clock):
 
     assert ssh_service.verify_signed_ssh_sources(answer()) == "198.51.100.7"
     assert messages == ["ssh-sources:198.51.100.7:1000"]
+
+
+@pytest.mark.parametrize("sources,pin_on", [("", True), ("198.51.100.7", False)])
+def test_no_refresh_where_the_pin_never_applies(monkeypatch, sources, pin_on):
+    monkeypatch.setattr(ssh_service, "VALIDATOR_SSH_SOURCES", sources)
+    monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", pin_on)
+    get = MagicMock()
+    monkeypatch.setattr(ssh_service.requests, "get", get)
+
+    asyncio.run(asyncio.wait_for(ssh_service.run_ssh_sources_refresh(), timeout=1))  # returns, never loops
+
+    get.assert_not_called()

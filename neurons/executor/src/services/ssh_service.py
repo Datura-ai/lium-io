@@ -129,12 +129,16 @@ class SignedSshSources:
 _signed_ssh_sources = SignedSshSources()
 
 
+def _pin_applies() -> bool:
+    return bool(VALIDATOR_SSH_SOURCES) and settings.EXECUTOR_SSH_SOURCE_PIN and not _in_cvm()
+
+
 def _validator_source_pin_option() -> bytes:
     """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin.
 
     A build without a source list (non-prod, e2e) never pins; a prod build pins to the signed list.
     """
-    if not VALIDATOR_SSH_SOURCES or not settings.EXECUTOR_SSH_SOURCE_PIN or _in_cvm():
+    if not _pin_applies():
         return b""
     sources = _signed_ssh_sources.get()
     return b'from="' + sources.encode() + b'" ' if sources else b""
@@ -261,7 +265,10 @@ def purge_expired_uploaded_keys(ttl_s: int, now: float | None = None) -> int:
 
 
 async def run_ssh_sources_refresh() -> None:
-    """Background loop: refresh the signed source list every SSH_SOURCES_CACHE_SECONDS, off the event loop."""
+    """Background loop: refresh the signed source list every SSH_SOURCES_CACHE_SECONDS, off the event loop.
+    Not run where the pin never applies (no source list in the build, the switch off, a CVM)."""
+    if not _pin_applies():
+        return
     while True:
         await asyncio.to_thread(_signed_ssh_sources.refresh)
         await asyncio.sleep(SSH_SOURCES_CACHE_SECONDS)
