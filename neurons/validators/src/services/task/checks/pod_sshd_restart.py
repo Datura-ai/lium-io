@@ -15,10 +15,14 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .rented_gpu_drop import POD_STATUS_RUNNING
 from .rented_pod_ssh import tcp_connect_fault
+from .task_time import task_seconds_left
 
 _BOOTSTRAP_SCRIPT = Path(__file__).resolve().parents[2] / "assets" / "sshd_bootstrap.sh"
 PROBE_TIMEOUT_SECONDS = 5
 RESTART_TIMEOUT_SECONDS = 120
+# cycle time kept for the checks after this one; a restart that cannot get MIN_RESTART_SECONDS waits a cycle
+LATER_CHECKS_RESERVE_SECONDS = 60
+MIN_RESTART_SECONDS = 10
 # exit codes of the in-pod gate, outside the bootstrap's own 0/1
 NO_WATCHDOG_RECORD, WATCHDOG_ALIVE, RENTER_LOGGED_IN = 10, 11, 12
 # the gate, in the pod: sshd was brought up by the create's bootstrap (its watchdog pidfile), the watchdog that
@@ -67,14 +71,18 @@ class PodSshdRestartCheck:
         for pod, probe in zip(pods, probes):
             # a timeout is the network as often as the pod
             if probe.result in (PodSshResult.REFUSED, PodSshResult.NO_BANNER):
-                outcomes[pod.pod_id] = await self._restart(ctx, pod.docker_container_name)
+                budget = min(RESTART_TIMEOUT_SECONDS, task_seconds_left(ctx) - LATER_CHECKS_RESERVE_SECONDS)
+                if budget < MIN_RESTART_SECONDS:
+                    outcomes[pod.pod_id] = "skipped: no cycle time left"
+                    continue
+                outcomes[pod.pod_id] = await self._restart(ctx, pod.docker_container_name, budget)
         template = Msg.RESTARTED if "restarted" in outcomes.values() else Msg.OK
         return self._event(ctx, template, {"pods": outcomes})
 
-    async def _restart(self, ctx: Context, name: str) -> str:
+    async def _restart(self, ctx: Context, name: str, timeout: float) -> str:
         try:
             res = await asyncio.wait_for(
-                ctx.ssh.run(restart_command(name), check=False), timeout=RESTART_TIMEOUT_SECONDS
+                ctx.ssh.run(restart_command(name), check=False), timeout=timeout
             )
         except (asyncssh.Error, OSError, TimeoutError) as exc:
             return f"error: {exc!r}"

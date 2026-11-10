@@ -125,3 +125,30 @@ async def test_timeouts_and_manual_rentals_are_left_alone(context_factory, tmp_p
         probe[port] = PodSshResult.TIMEOUT
     result = await PodSshdRestartCheck().run(_ctx(context_factory, _ssh(fs, ran)))
     assert ran == [] and result.event.what_we_saw["pods"] == {}
+
+
+@pytest.mark.asyncio
+async def test_a_restart_never_runs_past_the_time_the_later_checks_need(
+    context_factory, tmp_path, probe, monkeypatch
+):
+    fs = {f"pod_{i}": tmp_path / f"pod_{i}" for i in PORTS}
+    for root in fs.values():
+        _pod_fs(root, watchdog="77", cmdline=b"bash\x00")
+    left = iter([pod_sshd_restart.LATER_CHECKS_RESERVE_SECONDS + 30, 0, 0])
+    monkeypatch.setattr(pod_sshd_restart, "task_seconds_left", lambda ctx: next(left))
+    waits: list = []
+    real_wait_for = pod_sshd_restart.asyncio.wait_for
+
+    async def wait_for(aw, timeout):
+        waits.append(timeout)
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(pod_sshd_restart.asyncio, "wait_for", wait_for)
+    ran: list = []
+    result = await PodSshdRestartCheck().run(_ctx(context_factory, _ssh(fs, ran)))
+    assert waits == [30] and ran == ["pod_1"]
+    assert result.event.what_we_saw["pods"] == {
+        "1": "restarted",
+        "2": "skipped: no cycle time left",
+        "3": "skipped: no cycle time left",
+    }
