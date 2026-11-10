@@ -1,3 +1,4 @@
+from dataclasses import replace
 import asyncio
 import json
 import subprocess
@@ -2452,3 +2453,64 @@ async def test_tenant_enforcement_a_pod_recovered_in_the_cycle_keeps_the_unanswe
     result = await cycle()
     assert result.passed is False
     assert result.event.reason_code == "POD_NOT_RUNNING"
+
+
+class _PerPodBackend(DummyBackendClient):
+    def __init__(self, answers: dict[str, bool | None]):
+        super().__init__()
+        self.answers = answers
+
+    async def get_pod_rental_active(self, pod_id: str):
+        self.called_with.append(pod_id)
+        if self.answers[pod_id] is None:
+            return None
+        return Mock(active=self.answers[pod_id], rental_closed_at=None, local_volume_path=None)
+
+
+@pytest.mark.parametrize("unknown_first", [True, False])
+@pytest.mark.parametrize("exhausted", [False, True])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_closed_pod_beside_a_held_one_keeps_the_node_rented(
+    context_factory, unknown_first, exhausted
+):
+    # pod-u's rental check is unanswered, pod-c's rental is confirmed closed; both are down
+    pods = [
+        RentedPod(pod_id="pod-u", container_name="tenant-u", rented_ports=[], gpu_count=2),
+        RentedPod(pod_id="pod-c", container_name="tenant-c", rented_ports=[], gpu_count=6),
+    ]
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=pods if unknown_first else pods[::-1],
+                owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    redis = FakeRedis()
+    if exhausted:
+        await redis.set("rental_state_unknown:pod-u", "2")
+    ctx = _unknown_rental_ctx(context_factory, _PerPodBackend({"pod-u": None, "pod-c": False}), redis)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data)})
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    if not exhausted:
+        assert result.passed is True and result.halt is True
+        assert result.updates["rented"] is True
+        extra = result.updates["default_extra"]
+        assert extra["pods_rental_state_unknown"] == ["pod-u"]
+        assert extra["pods_rental_closed"] == ["pod-c"]
+        assert extra["rented_gpu_count"] == 2
+        live = result.updates["state"].rented_data.executors["executor-123"].pods
+        assert [pod.pod_id for pod in live] == ["pod-u"]
+    elif unknown_first:
+        # past the hold limit the down pod is judged as before
+        assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    else:
+        # nothing is held: the closed pod first makes the node idle, as before this change
+        assert result.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+        assert result.updates["rented"] is False

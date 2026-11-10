@@ -490,7 +490,9 @@ async def test_a_stale_pod_beside_a_down_pod_without_a_rental_record_is_not_enfo
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    # DAH-6141: the unanswered sibling holds the verdict, so the node stays rented, not idle
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
+    assert tenant_result.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-unknown"]
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from core.docker_utils import ContainerDeathDiagnostics, DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedPod
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedPod
 from protocol.vc_protocol.validator_requests import (
     ContainerState,
     PodContainerState,
@@ -40,7 +40,7 @@ from services.redis_service import (
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
 from . import port_connectivity
 from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
@@ -313,6 +313,8 @@ class TenantEnforcementCheck:
         # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
         # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
         state_by_pod_id: dict[str, ContainerState] = {}
+        # closed pods skipped because a sibling's verdict is held: the node stays rented without them
+        closed_beside_held: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
@@ -418,6 +420,11 @@ class TenantEnforcementCheck:
                 elif self.recover_stale_pods:  # a dry run never changes the count
                     await _forget_unknown_rental_state(ctx, pod_id)
                 if rental_active and not rental_active.active:
+                    if await _a_sibling_is_held(ctx, rented_pods, pod_index, extra):
+                        # an idle verdict would be a guess while a sibling's rental is unknown
+                        closed_beside_held.add(pod_id)
+                        ssh_pub_keys = []
+                        continue
                     stale_what = {
                         "pod_id": pod_id,
                         "container_name": pod_container_name,
@@ -567,7 +574,10 @@ class TenantEnforcementCheck:
                 )
             )
 
-        container_names = [pod.docker_container_name for pod in rented_pods]
+        rented_state = ctx.state
+        if closed_beside_held:
+            rented_state, extra = _without_closed_pods(ctx, rented_executor, closed_beside_held, extra)
+        container_names = [pod.docker_container_name for pod in rented_pods if pod.pod_id not in closed_beside_held]
         container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
@@ -625,6 +635,7 @@ class TenantEnforcementCheck:
                 passed=True,
                 event=event,
                 updates={
+                    **({"state": rented_state} if closed_beside_held else {}),
                     "default_extra": extra,
                     "rented": True,
                     "ssh_pub_keys": ssh_pub_keys,
@@ -1328,6 +1339,49 @@ async def _reprobe_split_shortfall(
         _, updates = published(fresh.get_filler_ports(ctx.executor.uuid))
         return None, {**updates, "rented_data": fresh.model_copy(update={"executors": executors})}
     return published(fresh.get_filler_ports(ctx.executor.uuid))
+
+
+async def _a_sibling_is_held(ctx: Context, rented_pods: list[RentedPod], pod_index: int, extra: dict) -> bool:
+    """True when another listed pod's verdict is held this cycle for an unanswered rental check.
+
+    An earlier pod already recorded its hold; a later one is looked at the way the loop will: down, no
+    backend answer, and still under the hold limit (read only, the loop records it).
+    """
+    if extra.get("pods_rental_state_unknown"):
+        return True
+    for other in rented_pods[pod_index + 1 :]:
+        try:
+            other_state = await _check_pod_running_and_read_authorized_keys(
+                ctx.ssh, other.docker_container_name, ctx.default_extra
+            )
+        except (asyncssh.Error, OSError):
+            continue
+        if other_state.running:
+            continue
+        if await ctx.services.backend.get_pod_rental_active(other.pod_id) is None and (
+            await _hold_for_unknown_rental_state(ctx, other.pod_id, record=False)
+        ):
+            return True
+    return False
+
+
+def _without_closed_pods(
+    ctx: Context, rented_executor: RentedExecutor, closed: set[str], extra: dict
+) -> tuple[ContextState, dict]:
+    """The cycle's rental data and pod hints without the pods whose rentals the backend confirmed closed."""
+    live = rented_executor.model_copy(update={"pods": [p for p in rented_executor.pods if p.pod_id not in closed]})
+    rented_data = ctx.state.rented_data
+    executors = {key: live if value is rented_executor else value for key, value in rented_data.executors.items()}
+    extra = {
+        **extra,
+        "rented_pods": [entry for entry in extra["rented_pods"] if entry["pod_id"] not in closed],
+        "pods_rental_closed": sorted(closed),
+    }
+    counts = [pod.gpu_count for pod in live.pods if pod.gpu_count]
+    extra.pop("rented_gpu_count", None)
+    if live.pods and len(counts) == len(live.pods):
+        extra["rented_gpu_count"] = sum(counts)
+    return replace(ctx.state, rented_data=rented_data.model_copy(update={"executors": executors})), extra
 
 
 async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:
