@@ -35,6 +35,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
+from services.redis_service import EXPRESS_REDIS_SLOT
 from services.task_service import JobResult
 
 from core.config import settings
@@ -125,6 +126,8 @@ class _Pending:
     executor: PortalExecutor
     miner_hotkey: str
     first_seen_at: datetime
+    # first_seen_at replaced by the stamp in Redis, which outlives a validator restart
+    first_seen_restored: bool = False
     attempts: int = 0
     not_before: float = 0.0  # monotonic
     # First passes that ran to a failed result; counted apart from attempts, which the miner's
@@ -240,6 +243,7 @@ class ExpressLane:
         if recheck_deadline - time.monotonic() < RECHECK_MIN_SECONDS:
             rechecks = set()  # left in Redis: they run once the next wave has listed their miners
         chosen = self._select(snapshot, validated, inputs.fleet_known_since, rechecks)
+        await self._restore_first_seen()
         for pending in chosen:
             pending.requested = pending.executor.id in rechecks
             pending.recheck_deadline = (
@@ -248,6 +252,20 @@ class ExpressLane:
         if not chosen:
             return 0
         return await self._launch(chosen)
+
+    async def _restore_first_seen(self) -> None:
+        """Newly queued executors take their first sighting from Redis (written now when there is none),
+        so a restart neither resets first_seen_to_publish_s nor the logged discovery wait."""
+        new = [p for p in self._pending.values() if not p.first_seen_restored]
+        if not new:
+            return
+        stored = await self.redis_service.express_first_seen(
+            [p.executor.id for p in new], datetime.now(UTC).timestamp()
+        )
+        for pending in new:
+            pending.first_seen_restored = True
+            if pending.executor.id in stored:
+                pending.first_seen_at = datetime.fromtimestamp(stored[pending.executor.id], UTC)
 
     async def _request_rechecks_at_maintenance_end(
         self, maintenance_ends: dict[str, datetime], snapshot: dict[str, list[PortalExecutor]]
@@ -347,7 +365,8 @@ class ExpressLane:
         """Track this validator's never-validated executors; return the ones to launch now.
 
         An executor in rechecks (DAH-5716: its provider asked for a check) is taken even when
-        validated before. Oldest registration first, under the two in-flight caps.
+        validated before. Oldest registration first, under the global in-flight cap and, for a
+        self-hosted miner, the per-miner cap.
         """
         in_flight = self.miner_service.in_flight
         my_hotkey = self._hotkey()
@@ -402,11 +421,18 @@ class ExpressLane:
             self._pending[e].miner_hotkey for e in express_in_flight if e in self._pending
         )
         per_miner.update(self._rechecks_in_flight.values())
+        # The per-miner cap guards a self-hosted miner's one process. A hotkey routed through the
+        # central miner can carry many providers' nodes on a shared service; only the global cap
+        # bounds it (5 of the 10 longest first-pass waits on 5 Nov sat behind its 2 slots).
+        central = self.subtensor_client.hotkeys_routed_via_central_miner
         chosen: list[_Pending] = []
         for pending in candidates:
             if room <= 0:
                 break
-            if per_miner[pending.miner_hotkey] >= settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER:
+            if (
+                pending.miner_hotkey not in central
+                and per_miner[pending.miner_hotkey] >= settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER
+            ):
                 continue
             chosen.append(pending)
             per_miner[pending.miner_hotkey] += 1
@@ -490,6 +516,8 @@ class ExpressLane:
         inputs: CycleInputs,
         rented_data: RentedExecutorsResponse,
     ) -> None:
+        # this task's Redis commands (and its children's) use the express slot, not the wave's queue
+        EXPRESS_REDIS_SLOT.set(True)
         executor_id = pending.executor.id
         directory = inputs.encrypted_files.tmp_directory
         # Counted against the node once the outcome is the node's (below); a verification the

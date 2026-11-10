@@ -369,7 +369,7 @@ class BlockingRunner:
 @pytest.mark.parametrize(
     "check, specs",
     [
-        (GpuFaultProbeCheck(enforce=True), {"gpu": {"count": 1}}),
+        (GpuFaultProbeCheck(is_post_rental_recheck=True), {"gpu": {"count": 1}}),
         (PinnedMemoryProbeCheck(), {"gpu": {"count": 1}}),
         (NvlinkFaultCheck(), {"interconnect": {"nvlink": True, "nvlink_links": 18, "nvlink_active_links": 18}}),
     ],

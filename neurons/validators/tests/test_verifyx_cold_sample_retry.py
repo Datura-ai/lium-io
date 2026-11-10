@@ -757,10 +757,21 @@ async def test_a_failed_create_stamp_write_leaves_no_pending_pod_marker():
     redis.fail_next_set_of.add(create_started_at_key("miner", EXECUTOR))
 
     with pytest.raises(RedisTimeoutError):
-        await redis.add_pending_pod("miner", EXECUTOR, "pod-1", kind="gpu_reset")
+        await redis.add_pending_pod("miner", EXECUTOR, "pod-1")
 
     assert redis.hashes.get(PENDING_PODS_PREFIX, {}) == {}
     assert await redis.get_pending_pods("miner", EXECUTOR) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["gpu_reset", "gpu_clocks"])
+async def test_a_gpu_operation_marker_leaves_no_create_stamp(kind):
+    # PR review, 5 Nov: a GPU reset or clock operation is no rental create
+    redis = _PendingRedis()
+    await redis.add_pending_pod("miner", EXECUTOR, "pod-1", kind=kind)
+
+    assert [p["kind"] for p in await redis.get_pending_pods("miner", EXECUTOR)] == [kind]
+    assert await redis.get(create_started_at_key("miner", EXECUTOR)) is None
 
 
 class _CreateDuringRetry(_TimedProbeSequence):
