@@ -901,9 +901,9 @@ async def test_an_older_dispatch_delayed_before_its_mark_keeps_a_newer_ones_succ
     """lium-io#1952: the backend sent A then B; A pauses before its mark while B, on another node, saves its success.
     A's mark then neither drops B's report, nor does A's own late success replace it."""
     redis_service = _redis_service()
-    await redis_service.accept_create_dispatch("pod-1", "cmd-a")
-    await redis_service.accept_create_dispatch("pod-1", "cmd-b")
-    await redis_service.accept_create_dispatch("pod-1", "cmd-a")  # a redelivery of A does not make it current
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a", 1)
+    await redis_service.accept_create_dispatch("pod-1", "cmd-b", 2)
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a", 3)  # a redelivery of A does not make it current
     b_report = _success("cmd-b", 40023).model_copy(update={"executor_id": "exec-2"}).model_dump_json()
     await redis_service.add_pending_pod("miner-hk", "exec-2", "pod-1", command_id="cmd-b")
     assert await redis_service.save_container_created_of_current_dispatch(
@@ -927,6 +927,55 @@ async def test_the_receive_loop_records_each_create_as_the_pods_current_dispatch
         await client.handle_message(_create_request().model_copy(update={"command_id": command_id}).model_dump_json())
 
     assert await redis_service.current_create_dispatch(_create_request().pod_id) == "cmd-b"
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_whose_record_failed_runs_once_recorded_and_its_success_is_saved(monkeypatch) -> None:
+    """lium-io#1952: B's acceptance record fails in the receive loop; its create waits, records with B's acceptance
+    time once Redis is back, and only then runs, so B is current and its success is saved. A's record landing late
+    (older acceptance) stays below B."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a", 1)
+    real_accept = redis_service.accept_create_dispatch
+    failures = [redis.exceptions.ConnectionError("down")]
+
+    async def flaky_accept(*args):
+        if failures:
+            raise failures.pop()
+        await real_accept(*args)
+
+    monkeypatch.setattr(redis_service, "accept_create_dispatch", flaky_accept)
+    monkeypatch.setattr("clients.compute_client.asyncio.sleep", AsyncMock())
+    ran: list[str] = []
+
+    async def drive(job_request):
+        ran.append(await redis_service.current_create_dispatch("pod-1"))
+
+    client.miner_driver = drive
+    await client.handle_message(_create_request().model_copy(update={"command_id": "cmd-b"}).model_dump_json())
+    await (await client.miner_drivers.get())
+    await real_accept("pod-1", "cmd-a", 1)  # a late redelivery of A's record
+
+    assert ran == ["cmd-b"]
+    assert await redis_service.save_container_created_of_current_dispatch(
+        "miner-hk", "exec-1", "pod-1", "cmd-b", _success("cmd-b").model_dump_json()
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_create_whose_dispatch_never_records_does_not_run(monkeypatch) -> None:
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    monkeypatch.setattr(redis_service, "accept_create_dispatch", AsyncMock(side_effect=redis.exceptions.ConnectionError()))
+    monkeypatch.setattr("clients.compute_client.asyncio.sleep", AsyncMock())
+    client.miner_driver = AsyncMock()
+    await client.handle_message(_create_request().model_dump_json())
+
+    with pytest.raises(RuntimeError):
+        await (await client.miner_drivers.get())
+    client.miner_driver.assert_called_once()  # the coroutine is made, then closed unawaited
+    client.miner_driver.assert_not_awaited()
 
 
 @pytest.mark.parametrize(("queued", "after"), [(None, ["cmd-b"]), ("cmd-b", ["cmd-b"]), ("cmd-a", ["cmd-a", "cmd-b"])])

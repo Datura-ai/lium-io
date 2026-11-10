@@ -144,6 +144,9 @@ def mark_connector_unready() -> None:
 command_responses: ContextVar[list[str] | None] = ContextVar("command_responses", default=None)
 
 
+# lium-io#1952: retries of a create's dispatch record that failed in the receive loop, before the create gives up
+CREATE_DISPATCH_RECORD_RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
+
 class OutgoingMessages(list[DeliveryStamps]):
     # every append wakes the send loop, so a reply leaves at once instead of on the next 1 s poll
     def __init__(self) -> None:
@@ -965,9 +968,12 @@ class ComputeClient:
         else:
             if isinstance(job_request, ContainerCreateRequest) and self.resumed_creates_report is not None:
                 self.create_accepted_while_report_pending = True
+            driver = self.miner_driver(job_request)
             if isinstance(job_request, ContainerCreateRequest) and job_request.command_id:
-                await self._accept_create_dispatch(job_request)
-            task = asyncio.create_task(self.miner_driver(job_request))
+                accepted_ns = time.time_ns()
+                if not await self._accept_create_dispatch(job_request, accepted_ns):
+                    driver = self._accept_then_drive(job_request, accepted_ns, driver)
+            task = asyncio.create_task(driver)
             await self.miner_drivers.put(task)
             return
 
@@ -1184,18 +1190,33 @@ class ComputeClient:
                 if inflight_creates.is_only_create(job_request.pod_id):
                     self.deleted_pod_ids.discard(job_request.pod_id)
 
-    async def _accept_create_dispatch(self, job_request: ContainerCreateRequest) -> None:
-        """lium-io#1952: in backend-message order, before the create runs, so an older dispatch delayed on its way to
-        its mark can neither drop nor overwrite a newer one's saved success."""
+    async def _accept_create_dispatch(self, job_request: ContainerCreateRequest, accepted_ns: int) -> bool:
+        """lium-io#1952: placed by the time its message was taken, before the create runs, so an older dispatch delayed
+        on its way to its mark can neither drop nor overwrite a newer one's saved success. False when Redis failed."""
         try:
-            await self.miner_service.redis_service.accept_create_dispatch(job_request.pod_id, job_request.command_id)
-        except Exception as exc:  # the per-node check of the pending marks still holds
+            await self.miner_service.redis_service.accept_create_dispatch(
+                job_request.pod_id, job_request.command_id, accepted_ns
+            )
+            return True
+        except Exception as exc:
             logger.warning(
                 _m(
                     "Could not record the pod's current create dispatch",
                     extra=get_extra_info({**self.logging_extra, "pod_id": job_request.pod_id, "error": str(exc)}),
                 )
             )
+            return False
+
+    async def _accept_then_drive(self, job_request: ContainerCreateRequest, accepted_ns: int, driver):
+        """The create runs only once its acceptance is recorded: unrecorded, its success could never be saved over the
+        older dispatch still current. Still failing, the create does not run and takes no command claim, so the
+        backend's resend of it runs."""
+        for delay in CREATE_DISPATCH_RECORD_RETRY_DELAYS:
+            await asyncio.sleep(delay)
+            if await self._accept_create_dispatch(job_request, accepted_ns):
+                return await driver
+        driver.close()
+        raise RuntimeError(f"create of pod {job_request.pod_id} not run: its dispatch could not be recorded")
 
     async def _keep_until_rent_finished(self, created: ContainerCreated) -> None:
         """DAH-5380: a backend restart can close the socket right after the send, losing the report and leaving the

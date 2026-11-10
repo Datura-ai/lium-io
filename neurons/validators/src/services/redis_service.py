@@ -298,12 +298,17 @@ class VerifiedPortsMemory(NamedTuple):
     measured_at: float
 
 
-def _dispatch_order(raw: str | bytes | None) -> list[str]:
+def _dispatch_order(raw: str | bytes | None) -> list[list]:
+    """[command_id, accepted_ns] pairs, oldest acceptance first"""
     try:
         order = json.loads(raw) if raw else []
     except ValueError:
         return []
-    return order if isinstance(order, list) else []
+    return [e for e in order if isinstance(e, list) and len(e) == 2] if isinstance(order, list) else []
+
+
+def _current_dispatch(order: list[list]) -> str:
+    return order[-1][0] if order else ""
 
 
 def _saved_command_id(saved: str) -> str:
@@ -924,20 +929,29 @@ class RedisService:
             # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
             await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
 
-    async def accept_create_dispatch(self, pod_id: str, command_id: str) -> None:
-        """Records a create the backend sent as the pod's current dispatch. Called only by the receive loop, one
-        backend message at a time, so nothing writes between this read and write. A command id seen before (a
-        redelivery) keeps its place: a late duplicate of an older dispatch never becomes current again."""
+    async def accept_create_dispatch(self, pod_id: str, command_id: str, accepted_ns: int) -> None:
+        """Records a create the backend sent, placed by `accepted_ns`, the time the receive loop took its message: the
+        latest acceptance is the pod's current dispatch, however late its record lands (a write retried after a Redis
+        error cannot put an older dispatch above a newer one). A command id seen before (a redelivery) keeps its
+        place: a late duplicate of an older dispatch never becomes current again."""
         key = f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"
-        order = _dispatch_order(await self.get(key))
-        if command_id not in order:
-            order = [*order, command_id][-CREATE_DISPATCH_ORDER_KEPT:]
-        await self.set(key, json.dumps(order), ex=CREATE_DISPATCH_ORDER_TTL_SECONDS)
+        async with self.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(key)
+                    order = _dispatch_order(await pipe.get(key))
+                    if command_id not in (e[0] for e in order):
+                        order = sorted([*order, [command_id, accepted_ns]], key=lambda e: e[1])
+                    pipe.multi()
+                    pipe.set(key, json.dumps(order[-CREATE_DISPATCH_ORDER_KEPT:]), ex=CREATE_DISPATCH_ORDER_TTL_SECONDS)
+                    await pipe.execute()
+                    return
+                except redis.exceptions.WatchError:
+                    continue
 
     async def current_create_dispatch(self, pod_id: str) -> str:
         """The command id of the pod's create the backend sent last; "" when none was recorded."""
-        order = _dispatch_order(await self.get(f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"))
-        return order[-1] if order else ""
+        return _current_dispatch(_dispatch_order(await self.get(f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}")))
 
     async def _update_pending_pods(
         self,
@@ -1051,7 +1065,7 @@ class RedisService:
                 try:
                     await pipe.watch(PENDING_PODS_PREFIX, order_key)
                     order = _dispatch_order(await pipe.get(order_key))
-                    if command_id and order and order[-1] != command_id:
+                    if command_id and order and _current_dispatch(order) != command_id:
                         await pipe.reset()
                         return False
                     creates = [
