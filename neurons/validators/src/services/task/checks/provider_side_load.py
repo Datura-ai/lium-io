@@ -540,8 +540,14 @@ class ProviderSideLoadCheck:
         # it is read once, with no second look, and every docker category nobody enumerated
         # (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
         # node. The shadow week measures the disk numbers before that half is armed.
-        # beside a Lium pod or filler the host reading carries Lium's own load
-        judged: bool = provider_side_load.is_cpu_above_limit and not lium_workload_containers(ctx)
+        # beside a Lium pod or filler the host reading carries Lium's own load; a rental-named key of
+        # `lium_containers` is one the backend reported or confirmed after the cycle's snapshot
+        late_workloads: set[str] = {
+            key for key in lium_container_keys or () if carries_a_rental_prefix(key)
+        }
+        judged: bool = provider_side_load.is_cpu_above_limit and not (
+            lium_workload_containers(ctx) | late_workloads
+        )
         enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED and judged
         if enforce:
             impact = None

@@ -210,6 +210,54 @@ async def test_a_rented_machine_is_observed_only(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_an_idle_node_with_only_a_filler_is_observed_only(context_factory):
+    fillers = {"executor-123": ["filler_run"]}  # the default executor's uuid
+    ctx = context_factory(
+        state=build_state(
+            specs=CPU_ONLY_SPECS,
+            rented_data=RentedExecutorsResponse(
+                executors={}, banned_guids=[], all_filler_containers_by_executor=fillers
+            ),
+        ),
+        runner=confirming_runner(10.56, 32, [("c1", "filler_run", 158.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert "provider_side_load_passed" not in result.updates
+    assert result.event.impact == "Observed only beside a Lium workload: score was NOT changed"
+
+
+@pytest.mark.asyncio
+async def test_a_pod_started_after_the_snapshot_still_voids_the_cpu_verdict(context_factory):
+    # the backend confirms the late pod, so the node is not judged even while the rest stays high
+    pod_id = "0e6f3a2c-1f4d-4a9b-9a51-1f2c3d4e5f60"
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 40.0,
+            "containers": [{"name": f"pod_{pod_id}", "cpu_percent": 158.0}],
+        },
+    }
+    ctx = context_factory(
+        state=build_state(specs=specs, rented_data=_no_rentals()),
+        runner=confirming_runner(12.8, 32, [("c1", f"pod_{pod_id}", 158.0)]),
+    )
+    ctx.services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=True, executor_id=ctx.executor.uuid
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert "provider_side_load_passed" not in result.updates
+    assert result.event.impact == "Observed only beside a Lium workload: score was NOT changed"
+
+
+@pytest.mark.asyncio
 async def test_shadow_logs_the_verdict_and_keeps_the_score(context_factory):
     ctx = context_factory(state=_rented_state(SN13_SPECS))
 
