@@ -17,6 +17,11 @@ FI_PINGPONG_OUTPUT = """bytes   #sent   #ack     total       time     MB/sec    
 """
 
 
+@pytest.fixture(autouse=True)
+def reviewed_probe_digest(monkeypatch):
+    monkeypatch.setattr(efa_link_probe, "EFA_PROBE_IMAGE_DIGEST", "sha256:" + "0" * 64)
+
+
 def host(uuid: str, ports: list[dict], is_rented: bool = False) -> JobResult:
     return JobResult(
         executor_info=ExecutorSSHInfo(
@@ -77,6 +82,24 @@ async def test_each_pair_is_recorded_on_both_hosts_under_its_own_spec_key(monkey
     assert [(m["peer_executor_uuid"], m["peer_address"]) for m in b.spec["efa_link_measurements"]][0] == ("a", "192.0.2.11")
 
 
+@pytest.mark.asyncio
+async def test_no_probe_runs_until_a_reviewed_image_digest_is_pinned(monkeypatch):
+    monkeypatch.setattr(efa_link_probe, "EFA_PROBE_IMAGE_DIGEST", "")
+    measured = []
+
+    async def measure(server, client, key, addresses):
+        measured.append((server, client))
+        return 10.0
+
+    monkeypatch.setattr(efa_link_probe, "_measure_pair", measure)
+    a, b = [host(uuid, [EFA_PORT]) for uuid in "ab"]
+
+    await efa_link_probe.measure_and_attach([a, b], "key", {}, time.monotonic())
+
+    assert measured == []
+    assert "efa_link_measurements" not in a.spec
+
+
 @pytest.mark.parametrize("failure", ["ssh_closed", "blackhole"])
 @pytest.mark.asyncio
 async def test_an_unreachable_host_is_recorded_as_failed_and_the_healthy_pair_is_still_measured(monkeypatch, failure):
@@ -94,7 +117,7 @@ async def test_an_unreachable_host_is_recorded_as_failed_and_the_healthy_pair_is
                         raise OSError("ssh closed")
                     if "--entrypoint timeout" in command:
                         words = shlex.split(command)
-                        await asyncio.sleep(float(words[words.index(efa_link_probe.EFA_PROBE_IMAGE) + 1]) / 1000)
+                        await asyncio.sleep(float(words[words.index(efa_link_probe._probe_image()) + 1]) / 1000)
                         return SimpleNamespace(stdout="")
                     await asyncio.sleep(kwargs["timeout"] / 1000)
                     raise asyncio.TimeoutError()

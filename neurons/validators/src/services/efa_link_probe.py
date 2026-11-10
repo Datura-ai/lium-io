@@ -37,8 +37,10 @@ from services.task.models import JobResult
 
 logger = logging.getLogger(__name__)
 
-# 0.0.2 is the first tag that carries libfabric and `lium-efa-probe`.
-EFA_PROBE_IMAGE = "daturaai/lium-rdma-probe:0.0.2"
+# The reviewed manifest digest of 0.0.2, the first tag that carries libfabric and `lium-efa-probe`; run by digest,
+# never by tag, since the probe gets host networking and the fabric devices. Empty until 0.0.2 is published: no probe.
+EFA_PROBE_IMAGE_DIGEST = ""
+EFA_PROBE_IMAGE_REPOSITORY = "daturaai/lium-rdma-probe"
 EFA_PROBE_ENTRYPOINT = "/usr/local/bin/lium-efa-probe"
 EFA_DRIVER = "efa"
 SPEC_KEY = "efa_link_measurements"
@@ -47,6 +49,10 @@ CLIENT_ATTEMPTS = 2
 CLIENT_RETRY_DELAY_SECONDS = 2
 # The transfer takes well under a second; an unreachable peer must not eat the sweep's budget.
 CLIENT_DEADLINE_SECONDS = 10
+
+
+def _probe_image() -> str:
+    return f"{EFA_PROBE_IMAGE_REPOSITORY}@{EFA_PROBE_IMAGE_DIGEST}"
 
 
 def has_live_efa_port(result: JobResult) -> bool:
@@ -93,7 +99,7 @@ def _docker_run_command(arguments: str, detached: bool = False) -> str:
 async def _host_address(ssh: asyncssh.SSHClientConnection) -> str | None:
     """The host's own IPv4, where the peer's fi_pingpong reaches it for the handshake."""
     completed = await ssh.run(
-        _docker_run_command(f"--entrypoint {EFA_PROBE_ENTRYPOINT} {EFA_PROBE_IMAGE} address"),
+        _docker_run_command(f"--entrypoint {EFA_PROBE_ENTRYPOINT} {_probe_image()} address"),
         check=False,
         timeout=PROBE_TIMEOUT_SECONDS,
     )
@@ -119,7 +125,7 @@ async def _measure_pair(
             await server_ssh.run(
                 f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1; "
                 + _docker_run_command(
-                    f"--entrypoint timeout {EFA_PROBE_IMAGE} {PROBE_TIMEOUT_SECONDS} "
+                    f"--entrypoint timeout {_probe_image()} {PROBE_TIMEOUT_SECONDS} "
                     f"{EFA_PROBE_ENTRYPOINT} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}",
                     detached=True,
                 ),
@@ -132,7 +138,7 @@ async def _measure_pair(
                         await asyncio.sleep(CLIENT_RETRY_DELAY_SECONDS)
                     completed = await client_ssh.run(
                         _docker_run_command(
-                            f"--entrypoint timeout {EFA_PROBE_IMAGE} {CLIENT_DEADLINE_SECONDS} "
+                            f"--entrypoint timeout {_probe_image()} {CLIENT_DEADLINE_SECONDS} "
                             f"{EFA_PROBE_ENTRYPOINT} client "
                             f"{PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS} {shlex.quote(server_address)}"
                         ),
@@ -201,6 +207,8 @@ async def measure_and_attach(
     Nothing may reach the caller: its timeout cancels the miner's whole job and scores it zero.
     """
     budget_seconds = 0.0
+    if not EFA_PROBE_IMAGE_DIGEST:
+        return
     try:
         pairs = pairs_to_measure(results)
         if not pairs:
