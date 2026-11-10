@@ -43,8 +43,9 @@ def judge(line: str) -> dict | None:
     read = {"/": _num(root_uid), "/root": _num(home_uid)}
     owners = {path: uid for path, uid in read.items() if uid is not None}
     shifted = sorted(path for path, uid in owners.items() if not base <= uid < base + length)
-    # one shifted path proves the fault; without one, an unread path is unknown, not healthy
-    if not shifted and len(owners) < len(read):
+    # one shifted path proves the fault; without one, an unread / is unknown, not healthy. An unread /root
+    # (an image without one) is judged from / alone: sysbox shifts the whole tree at once
+    if not shifted and read["/"] is None:
         return None
     return {
         "pid": pid_num,
