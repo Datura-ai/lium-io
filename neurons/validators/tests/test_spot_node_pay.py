@@ -399,6 +399,20 @@ async def test_four_8x_spot_nodes_over_the_cap_are_paid_the_capped_total(filler_
 
 
 @pytest.mark.asyncio
+async def test_unpaid_spot_gpus_take_no_cap_slot():
+    # a zero driver multiplier or a 0 filler average pays 0, so neither dilutes the paid node in the bucket
+    paid = _spot("spot-paid", filler_revenue_per_gpu_hour=2.0)
+    old_driver = _spot("spot-driver", filler_revenue_per_gpu_hour=2.0, nvidia_driver_version="535.104.05")
+    no_filler_pay = _spot("spot-zero", filler_revenue_per_gpu_hour=0.0)
+
+    incentive = await _run([paid, old_driver, no_filler_pay])
+
+    assert incentive.spot_count_by_bucket[("H100", 8)] == 8
+    assert paid.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
+    assert old_driver.effective_rate == no_filler_pay.effective_rate == 0
+
+
+@pytest.mark.asyncio
 async def test_spot_at_its_cap_is_not_diluted():
     spot = _spot(filler_revenue_per_gpu_hour=2.0)
 

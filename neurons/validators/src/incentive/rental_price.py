@@ -1305,18 +1305,16 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         else:
             result.hourly_rate = self._listed_hourly_rate(result)
-        # counted before any rate path below, so every paid Spot GPU sits in the cap pool however its rate is set
-        if result.hourly_rate > 0 and result.spot_cap > 0:
-            key: tuple[str, int] = (base_model, bucket)
-            self.spot_count_by_bucket[key] = (
-                self.spot_count_by_bucket.get(key, 0) + result.gpu_count
-            )
-            self._spot_cap_members.append((base_model, result))
         self._record_zero_driver_and_sysbox_reasons(result, result.driver_multiplier, result.sysbox_multiplier)
         result.effective_rate = min(
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
         )
+        # only paid GPUs take cap slots: a zero driver/sysbox multiplier or filler average pays 0 and dilutes nobody
+        if result.effective_rate > 0 and result.spot_cap > 0:
+            key: tuple[str, int] = (base_model, bucket)
+            self.spot_count_by_bucket[key] = self.spot_count_by_bucket.get(key, 0) + result.gpu_count
+            self._spot_cap_members.append((base_model, result))
         self._spot_pay_candidates.append((base_model, result))
 
     def _dilute_spot_pay_over_cap(self) -> None:
