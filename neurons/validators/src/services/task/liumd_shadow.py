@@ -12,11 +12,12 @@ download-EMA floor, read against the stored EMA; the capture is judged with `rec
 the shadow writes no EMA, state or network-gate tally. The outcome is one `[liumd_shadow] comparison`
 log line. Nothing is returned to the caller, stored, or scored.
 
-It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (reserved, non-rentable
-dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default,
-`all` for every executor), never on an express-lane first pass. VerifyX is not compared on an
-executor with no stored download EMA: today's check may take a second sample there, the shadow
-takes one (`liumd_reason="cold_sample_retry"`).
+It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (each matched on miner
+hotkey, executor UUID, address and SSH port; empty by default, `all` for every executor), never on
+an express-lane first pass. A listed executor is meant to be reserved and non-rentable; `all` can
+include rentable nodes, so GPU steps are refused with `all` until the rental-overlap guard exists.
+VerifyX is not compared on an executor with no stored download EMA: today's check may take a second
+sample there, the shadow takes one (`liumd_reason="cold_sample_retry"`).
 
 Today's verdict per step comes from the pipeline's events: both checks are fatal, so a check that
 failed is the run's last event on a run that did not pass; one that reported a skip reason did not
@@ -196,8 +197,9 @@ async def _compare(
     steps = {name: _today_fields(step) for name, step in today.items()}
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         steps["matmul"]["liumd_reason"] = "allcards_ssh"
-    # A pod or filler started after the cycle's snapshot is not seen below, so the shadow runs only
-    # on reserved, non-rentable dev executors.
+    # A pod or filler started after the cycle's snapshot is not seen below, so a listed executor
+    # is meant to be reserved and non-rentable. `all` can include rentable nodes, so GPU steps are
+    # refused with `all` until the rental-overlap guard exists.
     # Executor UUIDs are miner-chosen: an entry matches only its miner's executor at its endpoint.
     executor = ctx.executor
     key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
@@ -436,13 +438,26 @@ def _judged(
     }
 
 
+def _logged_fact(value: Any) -> Any:
+    """A fact value as logged: keep the value when its text fits, else cap the text."""
+    text = value if isinstance(value, str) else str(value)
+    return value if len(text) <= DETAIL_MAX_CHARS else text[:DETAIL_MAX_CHARS]
+
+
 def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     """Compare the facts both paths collect. Missing or skipped data is not a mismatch."""
     specs = ctx.state.specs or {}
     checks: list[dict[str, Any]] = []
 
     def check(field: str, liumd: Any, python: Any) -> None:
-        checks.append({"field": field, "liumd": liumd, "python": python, "agree": liumd == python})
+        checks.append(
+            {
+                "field": field,
+                "liumd": _logged_fact(liumd),
+                "python": _logged_fact(python),
+                "agree": liumd == python,
+            }
+        )
 
     docker = answer.step("docker")
     data = docker.data if docker.status == "ok" and isinstance(docker.data, dict) else None

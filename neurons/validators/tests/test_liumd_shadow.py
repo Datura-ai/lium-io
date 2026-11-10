@@ -19,7 +19,12 @@ from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsRes
 from protocol.vc_protocol.validator_requests import ValidationEvent
 from services.attestation_service import HostPolicyResult
 from services.liumd_exec_client import LiumdRefusal
-from services.local_verify_client import SCHEMA, LocalVerifyUnavailable, parse_answer
+from services.local_verify_client import (
+    DETAIL_MAX_CHARS,
+    SCHEMA,
+    LocalVerifyUnavailable,
+    parse_answer,
+)
 from services.task import liumd_shadow
 from services.task import service as task_service_module
 from services.task.checks import verifyx as verifyx_check
@@ -276,6 +281,14 @@ async def test_all_reserved_runs_on_any_executor(keypair, monkeypatch, verifyx_s
     assert fake.intents
 
 
+def test_all_reserved_cannot_enable_gpu_steps(monkeypatch):
+    monkeypatch.setattr(settings, "LIUMD_SHADOW_RESERVED_EXECUTORS", "all")
+    monkeypatch.setattr(settings, "LIUMD_SHADOW_GPU_STEPS_ENABLED", True)
+
+    with pytest.raises(ValueError, match="rental-overlap guard"):
+        settings.get_liumd_shadow_reserved_executors()
+
+
 @pytest.mark.asyncio
 async def test_gpu_steps_are_off_by_default(keypair, monkeypatch, verifyx_service):
     fake = FakeLiumd()
@@ -316,6 +329,27 @@ async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch
         "ports.port_range",
         "ports.port_mappings",
     }
+
+
+@pytest.mark.asyncio
+async def test_fact_values_are_capped_in_the_log(keypair, monkeypatch, verifyx_service):
+    long_name = "n" * (DETAIL_MAX_CHARS * 2)
+    specs = {**SPECS, "docker": {"containers": [{"name": long_name, "container_id": "c1"}]}}
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=specs))
+    fake = FakeLiumd(
+        facts={
+            "docker": {
+                "data": {"containers": [{"name": long_name, "status": "running"}]},
+            }
+        }
+    )
+
+    record = await _shadow(ctx, fake)
+
+    entry = {c["field"]: c for c in record["facts"]}["docker.container_names"]
+    assert entry["agree"] is True
+    assert isinstance(entry["liumd"], str) and len(entry["liumd"]) == DETAIL_MAX_CHARS
+    assert isinstance(entry["python"], str) and len(entry["python"]) == DETAIL_MAX_CHARS
 
 
 @pytest.mark.asyncio

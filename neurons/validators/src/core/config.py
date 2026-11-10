@@ -346,10 +346,12 @@ class Settings(BaseSettings):
     # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
     # and the matmul (at most 120 s) run one after the other.
     LIUMD_SHADOW_TIMEOUT_SECONDS: int = Field(env="LIUMD_SHADOW_TIMEOUT_SECONDS", default=330)
-    # The only executors the shadow runs on: reserved, non-rentable dev executors, as
-    # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries, or `all` for every
-    # executor. A pod or filler started after the cycle's snapshot is not seen, so on
-    # a rentable node the shadow could run its GPU/RAM/disk/network probe next to a workload.
+    # The executors the shadow runs on: comma-separated
+    # `miner_hotkey/executor_uuid/address/ssh_port` entries, or `all` for every executor. A
+    # listed entry is meant to be a reserved, non-rentable dev executor; `all` can include
+    # rentable nodes, so it refuses to start with GPU steps enabled until the rental-overlap
+    # guard lands. A pod or filler started after the cycle's snapshot is not seen, so on a
+    # rentable node the shadow could run its GPU/RAM/disk/network probe next to a workload.
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
@@ -805,6 +807,11 @@ class Settings(BaseSettings):
         `all` means every executor. A malformed entry raises ValueError rather than being dropped.
         """
         if self.LIUMD_SHADOW_RESERVED_EXECUTORS.strip().lower() == "all":
+            if self.LIUMD_SHADOW_GPU_STEPS_ENABLED:
+                raise ValueError(
+                    "LIUMD_SHADOW_RESERVED_EXECUTORS=all cannot enable GPU steps until the "
+                    "rental-overlap guard exists; list the executors instead"
+                )
             return None
         reserved = set()
         for entry in self.LIUMD_SHADOW_RESERVED_EXECUTORS.split(","):
