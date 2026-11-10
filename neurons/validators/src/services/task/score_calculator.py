@@ -67,7 +67,7 @@ def calculate_scores(
     # known CVM is rejected upstream by the attestation ratchet. GPU attestation is
     # observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
     # (only verified beside a TDX digest, so False implies one), and that alone must not zero the score.
-    tdx_passed = ctx.tdx_attestation_passed or getattr(ctx, "gpu_attestation_passed", None) is False
+    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
     if settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed:
         actual_score = 0.0
         job_score = 0.0
