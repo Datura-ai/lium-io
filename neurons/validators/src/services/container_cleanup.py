@@ -82,10 +82,10 @@ def _image_repository(image: str) -> str:
     reference = image.split("@", 1)[0]
     name, _, tag = reference.rpartition(":")
     repository = name if name and "/" not in tag else reference
-    return repository.removeprefix("docker.io/")
+    return repository.removeprefix("index.docker.io/").removeprefix("docker.io/")
 
 
-def remove_idle_filler_images(keep_image: str | None = None) -> str:
+def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
     """The idle filler images' removal; `keep_image` is the image a create is about to run, whose repository
     is left alone: a renter may rent the Engy image itself, and it has no container until docker run."""
     keep = _image_repository(keep_image) if keep_image else None
@@ -128,7 +128,7 @@ async def evict_cache_volumes_oldest_first(
     except Exception:
         pass
     # the image first: a pull brings it back far faster than a checkpoint download
-    await run_removal(remove_idle_filler_images(keep_image))
+    await run_removal(idle_filler_images_removal_command(keep_image))
     if await has_room():
         return
     # DAH-5260: a rental passes the Engy prefix, the cache its listing offered as free disk

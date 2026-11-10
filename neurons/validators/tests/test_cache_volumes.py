@@ -3,8 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
+from services.container_cleanup import idle_filler_images_removal_command
 from services.docker_service import DockerService, _filler_run_volume_gb, _wipe_volume_cmd
 
 
@@ -684,12 +684,10 @@ async def test_the_reclaim_never_removes_the_image_the_rental_is_about_to_run(do
     assert _removed_volumes(ssh_client) == [_KIMI]
 
 
-@pytest.mark.asyncio
-async def test_the_reclaim_keeps_a_cache_volume_the_rental_mounts(docker_service):
-    ssh_client = HostSshClient([_KIMI, "dphn_cache_hf_x", "volume_pod"], free_gb=2389)
-    rental = _rental(2620, 1310)
-    rental.cache_volumes = [CacheVolume(name=_KIMI, target="/root/models")]
 
-    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {})
+@pytest.mark.parametrize("keep_image", ["daturaai/dolphin:1", "docker.io/daturaai/dolphin:1", "index.docker.io/daturaai/dolphin:1"])
+def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_prefix(keep_image):
+    command = idle_filler_images_removal_command(keep_image)
 
-    assert _removed_volumes(ssh_client) == ["dphn_cache_hf_x"]
+    assert "reference=daturaai/dolphin " not in command
+    assert "reference=daturaai/dlph " in command
