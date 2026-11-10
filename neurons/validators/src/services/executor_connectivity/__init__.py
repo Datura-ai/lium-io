@@ -10,7 +10,6 @@ from services.executor_connectivity.models import (
 )
 from services.executor_connectivity.netcat_script import NetcatScript
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
-from services.executor_connectivity.persister import PortResultPersister
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
@@ -35,5 +34,4 @@ __all__ = [
     "PortSelector",
     "PortTester",
     "PortVerificationResult",
-    "PortResultPersister",
 ]
