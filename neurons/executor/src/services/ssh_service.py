@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from http import HTTPStatus
 
 import requests
 from pydantic import BaseModel
@@ -105,7 +106,7 @@ def verify_signed_ssh_sources(answer: SshSourcesAnswer) -> str:
 
 class SignedSshSources:
     """The signed source list. A background task refreshes it (run_ssh_sources_refresh) so an upload never waits
-    on the backend; a failed refresh keeps the last good list, and a node that never got one does not pin."""
+    on the backend; a failed refresh keeps the last good list; a 404 and a node that never got one do not pin."""
 
     def __init__(self):
         self._sources = ""
@@ -120,6 +121,10 @@ class SignedSshSources:
         url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/ssh-sources"
         try:
             response = requests.get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
+            if response.status_code == HTTPStatus.NOT_FOUND:
+                # the backend has no list (endpoint reverted): unpin, as a node that never got one
+                self._sources = ""
+                return
             response.raise_for_status()
             self._sources = verify_signed_ssh_sources(SshSourcesAnswer.model_validate(response.json()))
         except Exception as exc:  # never fail an upload over this
