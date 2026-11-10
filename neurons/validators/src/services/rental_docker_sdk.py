@@ -1157,6 +1157,15 @@ class RentalDockerSdkClient:
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
         if existing_image == spec.image:
+            # a CPU-refusal retry whose reply was lost: the container's label holds the count it got (DAH-5991)
+            granted = (config.get("Labels") or {}).get(RENTAL_CPU_COUNT_LABEL)
+            if (
+                spec.on_cpus_granted is not None
+                and spec.cpu_count
+                and str(granted).isdigit()
+                and int(granted) != spec.cpu_count
+            ):
+                spec.on_cpus_granted(int(granted))
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""
         raise ContainerNameTakenOnRetry(
