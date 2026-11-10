@@ -321,6 +321,24 @@ async def test_batch_reprobes_late_host_listeners_when_only_the_published_sample
 
 
 @pytest.mark.asyncio
+async def test_batch_caps_the_reprobe_when_only_the_published_sample_answers(mocker):
+    # a host that drops its host ports (ufw default deny) never answers the host listener: it gets a short
+    # re-probe, not the full below-floor budget, before the semi-batch tier
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    external = mocker.Mock()
+    external.reached = mocker.AsyncMock(return_value=ports[:3])
+    mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed), external)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert port_tester.test_many.await_count == 2 * (1 + BatchVerifier.SAMPLE_ONLY_REPROBE_ROUNDS)
+    assert result.successful == []
+
+
+@pytest.mark.asyncio
 async def test_batch_reprobes_past_the_floor_up_to_the_ports_a_split_node_needs(mocker):
     ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
     calls = []

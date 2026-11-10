@@ -38,6 +38,9 @@ class BatchVerifier:
 
     REPROBE_DELAY_SEC = 3
     REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
+    # the published sample already met the floor: a late host listener answers within seconds, while a host that
+    # drops its host ports (ufw default deny) never does and must reach the semi-batch tier without the full budget
+    SAMPLE_ONLY_REPROBE_ROUNDS = 2
     ATTEMPT_TIMEOUT_SEC = 60
     # a start the attempt deadline cut off counts as hung only if it had this long: on a slow host the outside
     # probe's container can use most of the 60 s, leaving the batch start seconds before the deadline
@@ -179,14 +182,15 @@ class BatchVerifier:
             # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
             # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
             # the published sample alone never ends it: with no host-listener answer the attempt fails below
-            for round_no in range(1, self.REPROBE_ROUNDS + 1):
+            rounds = self.SAMPLE_ONLY_REPROBE_ROUNDS if len(sampled_ok) >= min_ports else self.REPROBE_ROUNDS
+            for round_no in range(1, rounds + 1):
                 if not failed or (successful and len(sampled_ok) + len(successful) >= min_ports):
                     break
                 await asyncio.sleep(self.REPROBE_DELAY_SEC)
                 late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
                 successful = successful + late
                 logger.debug(
-                    _m(f"re-probe {round_no}/{self.REPROBE_ROUNDS}: {len(late)} late", extra=get_extra_info(log_ctx))
+                    _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
                 )
             logger.info(
                 _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
