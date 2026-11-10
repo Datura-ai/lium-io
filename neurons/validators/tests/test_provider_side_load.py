@@ -741,3 +741,46 @@ async def test_under_the_cap_the_honest_stack_is_still_excused(context_factory):
 
     assert result.passed is True
     assert result.event.what_we_saw["executor_stack_cores"] == 1.5
+
+
+BACKUP_HELPER = "lium-storage-0123456789ab"
+
+
+@pytest.mark.asyncio
+async def test_a_lium_backup_helper_beside_a_pod_is_lium_load(context_factory):
+    # DAH-6148: the hourly backup's restic helper starts after the scrape; its cores are Lium's
+    ctx = context_factory(
+        state=_rented_state(SN13_SPECS),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0), ("c2", BACKUP_HELPER, 700.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.event.what_we_saw["provider_cpu_cores"] == 1.9  # below the floor; was 8.9
+
+
+@pytest.mark.asyncio
+async def test_a_backup_helper_name_on_a_node_with_no_pod_stays_on_the_provider(context_factory):
+    ctx = context_factory(
+        state=build_state(specs=SN13_SPECS, rented_data=_no_rentals()),
+        runner=confirming_runner(10.56, 32, [("c2", BACKUP_HELPER, 700.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.event.what_we_saw["provider_cpu_cores"] == 10.5
+
+
+@pytest.mark.asyncio
+async def test_backup_helpers_excuse_no_more_than_restics_own_cores(context_factory):
+    ctx = context_factory(
+        state=_rented_state(SN13_SPECS),
+        runner=confirming_runner(14.0, 32, [("c1", "pod_renter", 158.0), ("c2", BACKUP_HELPER, 1000.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.event.what_we_saw["provider_cpu_cores"] == 4.4

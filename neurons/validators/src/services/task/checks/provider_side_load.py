@@ -38,6 +38,13 @@ PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
 # that container and can hold several cores, and zeroing an honest node is the worse error.
 CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 
+# DAH-6148: a Lium backup runs restic in a `lium-storage-<operation>` helper container (executor
+# storage/restic.py). It is on no rental list and usually starts between the scrape and the second
+# look, so its cores landed on the provider. A name is forgeable, so it is excused only beside a
+# pod the backend reports here (a backup is of a pod), and only up to restic's GOMAXPROCS there.
+STORAGE_HELPER_PREFIX = "lium-storage-"
+STORAGE_HELPER_EXCUSE_CORES = 8.0
+
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
 # (watchtower pulling an image, autoheal restarting a container) can hold two cores inside it.
@@ -115,11 +122,14 @@ def provider_cores_outside_lium(
     reports the first 12 characters.
     """
     lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
-    lium_percent: float = sum(
-        row.measured_cpu_percent
-        for row in rows
-        if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
-    )
+    helpers_are_lium = STORAGE_HELPER_PREFIX in lium_container_keys
+    lium_percent = helper_percent = 0.0
+    for row in rows:
+        if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids:
+            lium_percent += row.measured_cpu_percent
+        elif helpers_are_lium and row.name.startswith(STORAGE_HELPER_PREFIX):
+            helper_percent += row.measured_cpu_percent
+    lium_percent += min(helper_percent, STORAGE_HELPER_EXCUSE_CORES * 100)
     # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
     # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
     provider_cores = max(0.0, host_cores - lium_percent / 100)
@@ -250,6 +260,8 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
+        if rented_executor.pods:
+            containers.add(STORAGE_HELPER_PREFIX)  # a prefix, matched in provider_cores_outside_lium
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
     stack_ids: set[str] = executor_stack_container_ids(specs)
