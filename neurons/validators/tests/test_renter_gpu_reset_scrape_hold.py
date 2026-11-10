@@ -7,11 +7,13 @@ reset was judged.
 """
 
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from payload_models.payloads import ResetPodGpuRequest
+import redis.asyncio as aioredis
+from payload_models.payloads import GpuResetErrorCode, ResetPodGpuRequest
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.docker_service import DockerService
@@ -28,7 +30,14 @@ from services.redis_service import (
     RESET_VERIFIED_JOB_CHANNEL,
     last_scored_result_key,
 )
-from protocol.vc_protocol.compute_requests import FillerRevenueByGpuConfig, RentedExecutor, RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import (
+    FillerRevenueByGpuConfig,
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedGpuDropResponse,
+    RentedPod,
+)
+from services.task.checks import rented_gpu_drop
 from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
 from services.ssh_service import SSHService
 from services.task.models import build_msg
@@ -66,6 +75,12 @@ from neurons.validators.src.services.task.result_handler import ResultHandler
 
 ZERO_GPUS = _scrape_result(stdout=NO_GPU_REPORT, exit_code=1)
 RESET_REQUIRED = _scrape_result(stdout=_driver_report("NVMLError(16)"), exit_code=1)
+
+
+@pytest.fixture(autouse=True)
+def _lock_release_without_lua(monkeypatch):
+    # fakeredis runs no Lua without lupa (not a dependency): release the pod lock with a plain DEL
+    monkeypatch.setattr(aioredis.lock.Lock, "do_release", lambda self, expected_token: self.redis.delete(self.name))
 
 
 async def _cycle(context_factory, service, *, scrape, pod_gpu_count: int | None = None):
@@ -501,15 +516,16 @@ async def test_the_cycle_asks_the_backend_once_whether_the_node_is_still_rented(
     validator_process.backend_client.get_rented_executors_now.assert_awaited_once()
 
 
-def _reset_service(service) -> DockerService:
+def _reset_service(service, backend=None) -> DockerService:
     docker_service = DockerService.__new__(DockerService)
     docker_service.redis_service = service
+    docker_service.backend_client = backend
     docker_service.ssh_service = MagicMock(decrypt_payload=MagicMock(return_value="key"))
     docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
     return docker_service
 
 
-async def _run_reset(service, **connect):
+async def _run_reset(service, backend=None, **connect):
     payload = ResetPodGpuRequest(
         miner_hotkey=RENTAL_OWNER, executor_id=EXECUTOR, pod_id=POD_ID, container_name="c", gpu_uuids=["GPU-1"], request_id="r1"
     )
@@ -518,7 +534,7 @@ async def _run_reset(service, **connect):
             patch("services.docker_service.require_rental_docker_ssh_host_key"), \
             patch("services.docker_service.public_host_sock", AsyncMock(return_value={})), \
             patch("services.docker_service.asyncssh.connect", **connect):
-        return await _reset_service(service).reset_pod_gpus(payload, executor_info, MagicMock(), "encrypted")
+        return await _reset_service(service, backend).reset_pod_gpus(payload, executor_info, MagicMock(), "encrypted")
 
 
 @pytest.mark.asyncio
@@ -578,6 +594,226 @@ async def test_a_reset_that_never_stopped_the_pod_leaves_no_recent_mark():
 
     assert result.ok is False
     assert await renter_gpu_reset_recent(service, RENTAL_OWNER, EXECUTOR, POD_ID) is False
+
+
+GPUS_LOST_DETAIL = "The GPUs stopped responding on the host. The provider has to reboot it before they can be used again."
+GPUS_LOST = GpuResetReport(ok=False, error_code=GpuResetErrorCode.GpusLostOnHost, detail=GPUS_LOST_DETAIL)
+SPLIT_NODE = RentedExecutorsResponse(
+    executors={
+        EXECUTOR: RentedExecutor(
+            miner_hotkey=RENTAL_OWNER,
+            executor_ip_address="203.0.113.5",
+            executor_ip_port="22",
+            pods=[
+                RentedPod(pod_id=POD_ID, container_name="c", gpu_count=1, status="RUNNING"),
+                RentedPod(pod_id="pod-2", container_name="c2", gpu_count=2, status="RUNNING"),
+            ],
+        )
+    }
+)
+
+
+async def _reset_with_gpus_lost(service, backend):
+    connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))
+    with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=GPUS_LOST)):
+        result = await _run_reset(service, backend, return_value=connection)
+    assert (result.ok, result.error_code, result.detail, result.container_restarted, result.gpus) == (
+        False, GpuResetErrorCode.ResetNotSupported, GPUS_LOST_DETAIL, False, []
+    )
+
+
+@pytest.mark.parametrize(
+    "existing_incident, race, states",
+    [
+        (False, "memory-read", ["fault", "recovered"]),
+        (True, "memory-read", ["fault", "recovered"]),
+        (True, "recovery-reply", ["recovered", "fault", "recovered"]),
+        (True, "busy-lock", None),
+        (False, "redis-down", None),
+        (False, "redis-read-error", None),
+        (False, "redis-write-error", ["fault", "recovered"]),
+        (True, "dirty-cycle-local", ["fault"]),
+    ],
+    ids=[
+        "new-incident", "existing-incident", "existing-incident-recovery-reply", "busy-lock", "redis-down",
+        "redis-read-error", "redis-write-error", "dirty-cycle-local",
+    ],
+)
+@pytest.mark.asyncio
+async def test_gpus_lost_on_the_host_post_one_drop_for_the_pod_and_a_clean_cycle_recovers_it(
+    context_factory, monkeypatch, existing_incident, race, states
+):
+    import asyncio
+    from datetime import timedelta
+
+    monkeypatch.setattr(rented_gpu_drop, "_LOCAL_MARKS", {})
+    service = _redis_service()
+    if existing_incident:
+        previous_drop = rented_gpu_drop.judge_rented_gpus(
+            rented_gpu_count=3, anchor_uuids=[], nvml_count=3, listed_uuids=["GPU-0", "GPU-1"], listed_count=2,
+            scrape_error=None,
+        )
+        mark = rented_gpu_drop.DropMark(
+            first_seen_at=(datetime.now(UTC) - timedelta(minutes=15)).isoformat(),
+            reported=True,
+            recorded=True,
+            evidence=previous_drop.evidence(3, 1),
+        )
+        await service.set(
+            f"rented_gpu_drop:{POD_ID}", mark.dump(), ex=rented_gpu_drop.settings.RENTED_GPU_DROP_STATE_TTL_SECONDS
+        )
+    backend = build_services().backend
+    backend.get_rented_executors_now.return_value = SPLIT_NODE
+    backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(recorded=True, delivery="notified")
+    details = [{"uuid": f"GPU-{i}"} for i in range(3)]
+
+    def clean_cycle_ctx():
+        return context_factory(
+            services=build_services(redis=service, backend=backend),
+            state=build_state(specs={"gpu": {"count": 3, "details": details}}, gpu_count=3, gpu_details=details, rented_data=SPLIT_NODE),
+        )
+
+    if race == "dirty-cycle-local":
+        key = f"rented_gpu_drop:{POD_ID}"
+        older_ctx = clean_cycle_ctx()
+        check = rented_gpu_drop.RentedGpuDropCheck()
+        with patch.object(service, "set", AsyncMock(side_effect=OSError("transient"))):
+            await check._save(older_ctx, POD_ID, rented_gpu_drop.DropMark.load(await service.get(key)), True)
+        with monkeypatch.context() as connector:  # the connector process does not share the cycle's cache
+            connector.setattr(rented_gpu_drop, "_LOCAL_MARKS", {})
+            await _reset_with_gpus_lost(service, backend)
+        before = await service.get(key)
+        await check.run(older_ctx)
+        assert [call.kwargs["state"] for call in backend.report_rented_gpu_drop.await_args_list] == states
+        assert await service.get(key) == before
+        return
+    if race == "busy-lock":
+        @asynccontextmanager
+        async def busy_lock(_):
+            yield False
+
+        monkeypatch.setattr(service, "rented_gpu_drop_lock", busy_lock)
+        before = await service.get(f"rented_gpu_drop:{POD_ID}")
+        now = datetime.now(UTC).isoformat()
+        await rented_gpu_drop.RentedGpuDropCheck()._track_pod(
+            clean_cycle_ctx(), SPLIT_NODE.executors[EXECUTOR].pods[0], None, 3, 3, now, now,
+        )
+        backend.report_rented_gpu_drop.assert_not_awaited()
+        assert await service.get(f"rented_gpu_drop:{POD_ID}") == before
+        return
+    if race.startswith("redis"):
+        original_set = service.set
+
+        async def set_failing_after_answer(key, value, **kwargs):
+            if json.loads(value)["reported"]:
+                raise OSError("down")
+            return await original_set(key, value, **kwargs)
+
+        with monkeypatch.context() as outage:
+            if race == "redis-read-error":
+                outage.setattr(service, "get", AsyncMock(side_effect=OSError("down")))
+            outage.setattr(service, "set", set_failing_after_answer)
+            backend, report = _report_gpus_lost(FakeRedis(failing=True) if race == "redis-down" else service)
+            await report
+        if states is None:
+            backend.report_rented_gpu_drop.assert_not_awaited()
+            return
+        rented_gpu_drop._LOCAL_MARKS.clear()  # the cycle runs in the validator process
+
+    # a cycle that read its clean scrape before the reset, still running when the reset reports the loss
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    if race == "memory-read":
+        async def pause_memory_read(ctx):
+            entered.set()
+            await resume.wait()
+            return rented_gpu_drop.BrokenCardsRead(None, {})
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(rented_gpu_drop, "_read_broken_uuids", pause_memory_read)
+            older_cycle = asyncio.create_task(rented_gpu_drop.RentedGpuDropCheck().run(clean_cycle_ctx()))
+            await entered.wait()
+            await _reset_with_gpus_lost(service, backend)
+            await _reset_with_gpus_lost(service, backend)
+            resume.set()
+            await older_cycle
+    elif race == "recovery-reply":
+        lookup_entered = asyncio.Event()
+
+        async def delayed_report(*args, state, **kwargs):
+            if state == "recovered":
+                entered.set()
+                await resume.wait()
+            return RentedGpuDropResponse(recorded=True, delivery="notified")
+
+        async def rented_now():
+            lookup_entered.set()
+            return SPLIT_NODE
+
+        backend.report_rented_gpu_drop.side_effect = delayed_report
+        backend.get_rented_executors_now.side_effect = rented_now
+        older_cycle = asyncio.create_task(rented_gpu_drop.RentedGpuDropCheck().run(clean_cycle_ctx()))
+        await entered.wait()
+        reset = asyncio.create_task(_reset_with_gpus_lost(service, backend))
+        await lookup_entered.wait()
+        resume.set()
+        await asyncio.gather(older_cycle, reset)
+
+    fault = next(c for c in backend.report_rented_gpu_drop.await_args_list if c.kwargs["state"] == "fault")
+    assert fault.args == (POD_ID,)
+    assert fault.kwargs | {
+        "visible_gpu_count": 0, "expected_gpu_count": 1, "pod_gpu_count": 1,
+        "rented_gpu_count": 3, "faults": ["below_rented_count"],
+    } == fault.kwargs
+    assert await service.get(f"rented_gpu_drop:{POD_ID}") is not None
+
+    await rented_gpu_drop.RentedGpuDropCheck().run(clean_cycle_ctx())
+
+    assert [call.kwargs["state"] for call in backend.report_rented_gpu_drop.await_args_list] == states
+    assert await service.get(f"rented_gpu_drop:{POD_ID}") is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"get_rented_executors_now.return_value": None},
+        {"get_rented_executors_now.side_effect": RuntimeError("down")},
+        {"report_rented_gpu_drop.side_effect": RuntimeError("down")},
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failing_backend_leaves_the_gpus_lost_answer_unchanged(failure, monkeypatch):
+    monkeypatch.setattr(rented_gpu_drop, "_LOCAL_MARKS", {})
+    backend = build_services().backend
+    backend.get_rented_executors_now.return_value = SPLIT_NODE
+    backend.configure_mock(**failure)
+
+    await _reset_with_gpus_lost(_redis_service(), backend)
+
+
+def _report_gpus_lost(redis):
+    backend = build_services().backend
+    backend.get_rented_executors_now.return_value = SPLIT_NODE
+    backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(recorded=True, delivery="notified")
+    report = rented_gpu_drop.report_gpus_lost_on_reset(
+        redis, backend, miner_hotkey=RENTAL_OWNER, executor_id=EXECUTOR, pod_id=POD_ID, default_extra={}
+    )
+    return backend, report
+
+
+@pytest.mark.asyncio
+async def test_the_reset_report_waits_for_a_pod_lock_another_process_holds(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(rented_gpu_drop, "_LOCAL_MARKS", {})
+    service = _redis_service()
+    backend, report = _report_gpus_lost(service)
+    async with service.rented_gpu_drop_lock(POD_ID):
+        pending = asyncio.create_task(report)
+        await asyncio.sleep(0.3)
+        backend.report_rented_gpu_drop.assert_not_awaited()
+    await pending
+    backend.report_rented_gpu_drop.assert_awaited_once()
 
 
 @pytest.mark.asyncio

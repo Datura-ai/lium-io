@@ -33,7 +33,7 @@ from fixtures.rest_miner_fixtures import executor_info as _executor_info
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.miner_service import CYCLE_DONE, MinerService
-from services.redis_service import RedisService
+from services.redis_service import EXPRESS_REDIS_SLOT, RedisService, _CommandLock
 from services.task.models import JobResult
 
 pytest_plugins = ["fixtures.incentive_fixtures", "fixtures.rest_miner_fixtures"]
@@ -288,6 +288,31 @@ async def test_a_never_validated_executor_is_verified_alone_and_published_spec_o
     assert extra["executor_uuid"] == new_node and extra["outcome"] == "passed" and extra["attempt"] == 1
     assert 40 <= extra["registration_to_publish_s"] < 60
     assert extra["first_seen_to_publish_s"] >= 0 and extra["verification_s"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_a_restart_keeps_the_first_sighting_from_redis(monkeypatch, wallet, caplog):
+    """Regression: first_seen_at lived in memory only, so every validator rollout re-stamped it and
+    the logged discovery wait (registration to first sighting) grew by the whole restart."""
+    new_node = str(uuid4())
+    snapshot = {"miner-a": [_portal_executor(new_node, registered_seconds_ago=40)]}
+    before = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])
+    before.release.clear()  # the first process is cut off mid-run, before it publishes
+    assert await before.lane.tick() == 1
+    first_seen = before.lane._pending[new_node].first_seen_at
+    for task in before.lane._tasks:
+        task.cancel()
+    await asyncio.gather(*before.lane._tasks, return_exceptions=True)
+
+    after = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])
+    after.redis_service = before.redis_service  # the same Redis outlives the pod
+    after.lane.redis_service = before.redis_service
+    with caplog.at_level(logging.INFO):
+        assert await after.tick_and_settle() == 1
+
+    assert after.lane._pending.get(new_node) is None
+    published = [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
+    assert published[0].msg.extra["first_seen_at"] == first_seen.isoformat()
 
 
 # --- Self-hosted miners: their new nodes are not in the portal snapshot --------------------
@@ -592,6 +617,45 @@ async def test_wave_publishes_nothing_at_pass_while_the_validated_set_is_cold():
     service.publish_machine_specs.assert_not_awaited()
 
 
+# --- The first pass's Redis commands do not queue behind the wave's ------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_first_pass_redis_read_is_not_blocked_by_the_wave_holding_the_command_lock():
+    service = _redis_service()
+    service.lock = _CommandLock()
+    # single commands no longer lock (DAH-5723); the two-command methods still do
+    async with service.lock:  # the wave's slot is held
+        wave_read = asyncio.create_task(service.first_uncached_at("wave", 1.0, 60))
+
+        async def first_pass_read():
+            EXPRESS_REDIS_SLOT.set(True)
+            return await service.first_uncached_at("new", 2.0, 60)
+
+        assert await asyncio.wait_for(asyncio.create_task(first_pass_read()), timeout=1) == 2.0
+        await asyncio.sleep(0)
+        assert not wave_read.done()  # the wave's own commands still wait their turn
+    assert await wave_read == 1.0
+
+
+@pytest.mark.asyncio
+async def test_the_express_lane_runs_its_first_pass_in_the_express_redis_slot(monkeypatch, wallet):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node, registered_seconds_ago=40)]}, [_Neuron("miner-a")])
+    slot_seen = []
+    job_for = harness.job_for
+
+    def record_slot(payload, executor_id):
+        slot_seen.append(EXPRESS_REDIS_SLOT.get())
+        return job_for(payload, executor_id)
+
+    harness.job_for = record_slot
+
+    assert await harness.tick_and_settle() == 1
+    assert slot_seen == [True]
+    assert EXPRESS_REDIS_SLOT.get() is False  # set in the lane's own task only
+
+
 # --- DAH-5716: a provider-requested recheck of one node ------------------------------------
 
 
@@ -643,6 +707,67 @@ async def test_a_requested_validated_executor_is_rechecked_once_under_the_caps(m
     assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0  # each request runs once
+
+
+@pytest.mark.asyncio
+async def test_a_central_miner_hotkey_runs_past_the_per_miner_cap_under_the_global_cap(monkeypatch, wallet):
+    central = [str(uuid4()) for _ in range(6)]
+    self_hosted = [str(uuid4()) for _ in range(3)]
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-central": [_portal_executor(n) for n in central],
+            "miner-a": [_portal_executor(n, registered_seconds_ago=60) for n in self_hosted],
+        },
+        [_Neuron("miner-central"), _Neuron("miner-a")],
+    )
+    harness.lane.subtensor_client.hotkeys_routed_via_central_miner = frozenset({"miner-central"})
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_MAX_IN_FLIGHT", 7)
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", 2)
+    harness.release.clear()
+
+    # The self-hosted nodes are older: 2 of them (its cap), then 5 central ones fill the global 7.
+    assert await harness.lane.tick() == 7
+    running = set(harness.miner_service.in_flight)
+    assert len(running & set(self_hosted)) == 2
+    assert len(running & set(central)) == 5
+    assert await harness.lane.tick() == 0  # the global cap still holds
+
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+    assert await harness.tick_and_settle() == 2  # the rest: one central, one self-hosted
+
+
+@pytest.mark.asyncio
+async def test_a_node_is_rechecked_once_when_its_maintenance_window_ends(monkeypatch, wallet):
+    node, others_node = str(uuid4()), str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-a": [
+                _portal_executor(node, registered_seconds_ago=7 * 86400),
+                _portal_executor(others_node, registered_seconds_ago=7 * 86400, validator="another-validator"),
+            ]
+        },
+        [_Neuron("miner-a")],
+    )
+    await harness.redis_service.mark_executors_validated([node, others_node])
+    ends_at = datetime.now(UTC) + timedelta(minutes=10)
+    harness.inputs.maintenance_ends = {node: ends_at, others_node: ends_at}
+
+    assert await harness.tick_and_settle() == 0  # the window is still running
+
+    ends_at = datetime.now(UTC) - timedelta(seconds=1)
+    harness.inputs.maintenance_ends = {node: ends_at, others_node: ends_at}
+    assert await harness.tick_and_settle() == 1
+
+    (results, _, _), _ = harness.miner_service.publish_machine_specs.await_args
+    assert [r.executor_info.uuid for r in results] == [node]
+    # still the cycle's id, so no counter moves; the backend reads the recheck's start against the window's end
+    assert results[0].job_batch_id == CYCLE_BATCH_ID
+    assert results[0].check_started_at > ends_at
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+    assert await harness.tick_and_settle() == 0  # one recheck per window
 
 
 @pytest.mark.asyncio

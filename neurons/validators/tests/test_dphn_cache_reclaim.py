@@ -133,6 +133,17 @@ async def test_a_mounted_volume_or_a_listed_pod_is_never_a_candidate(cleanup, da
 
 
 @pytest.mark.asyncio
+async def test_a_retained_volume_pod_is_never_a_candidate(cleanup):
+    # DAH-3333: a balance stop keeps the renter's disk while its pod is DELETING (not in the listed pods)
+    ssh_client = VolumeHostSsh(dangling=[f"volume_{POD}"], created={f"volume_{POD}": "2026-09-10T08:00:00Z"}, volumes=[f"volume_{POD}"])
+    snapshot = _snapshot([LIVE]).model_copy(update={"retained_volume_pod_ids": [POD]})
+    is_orphan = AsyncMock(return_value=True)
+    assert await cleanup.remove_orphan_rental_volumes(ssh_client, snapshot, "exec-1", is_orphan) == 0
+    is_orphan.assert_not_called()
+    assert _removed(ssh_client) == []
+
+
+@pytest.mark.asyncio
 async def test_an_empty_snapshot_or_a_kept_verdict_removes_no_volume(cleanup):
     created = {f"volume_{POD}": "2026-09-10T08:00:00Z"}
     ssh_client = VolumeHostSsh(dangling=[f"volume_{POD}"], created=created, volumes=[f"volume_{POD}"])
