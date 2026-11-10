@@ -477,15 +477,14 @@ class FileEncryptService:
                 continue
         directory = Path(tempfile.mkdtemp(prefix=f"cycle-{time.time_ns():020d}-", dir=root))
         scrape = self._obfuscated_scrape()
-        source, all_keys, encryption_key = scrape.source, scrape.all_keys, scrape.encryption_key
         file_name = f"tmp{secrets.token_hex(4)}"
         return MinerJobEnryptedFiles(
-            encrypt_key=encryption_key,
-            all_keys=all_keys,
+            encrypt_key=scrape.encryption_key,
+            all_keys=scrape.all_keys,
             tmp_directory=str(directory),
             machine_scrape_file_name=file_name,
-            machine_scrape_source=source,
-            binary_build=ScrapeBinaryBuild(directory, file_name, source, keep_directories),
+            machine_scrape_source=scrape.source,
+            binary_build=ScrapeBinaryBuild(directory, file_name, scrape.source, keep_directories),
         )
 
     def _obfuscated_scrape(self) -> ObfuscatedScrape:
@@ -523,11 +522,10 @@ class FileEncryptService:
         """
         tmp_directory = self.fresh_job_files_directory(keep_directories)
         scrape = self._obfuscated_scrape()
-        obfuscated_content, all_keys, encryption_key = scrape.source, scrape.all_keys, scrape.encryption_key
 
         # build binary with nuitka
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:
-            machine_scrape_file.write(obfuscated_content.encode("utf-8"))
+            machine_scrape_file.write(scrape.source.encode("utf-8"))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
             
@@ -545,11 +543,11 @@ class FileEncryptService:
             #     )
 
         return MinerJobEnryptedFiles(
-            encrypt_key=encryption_key,
-            all_keys=all_keys,
+            encrypt_key=scrape.encryption_key,
+            all_keys=scrape.all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
-            machine_scrape_source=obfuscated_content,
+            machine_scrape_source=scrape.source,
         )
 
 
