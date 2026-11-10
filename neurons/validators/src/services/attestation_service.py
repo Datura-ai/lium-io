@@ -448,29 +448,16 @@ class AttestationService:
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None,
     ) -> bool | None:
-        """Verify the executor's NVIDIA CC GPU evidence.
-
-        Enforced on attestation events (a nonce was issued): missing/unbound/failed
-        evidence raises AttestationError. Outside events verification is
-        observe-only: the result is logged and recorded but never raises.
+        """Verify the executor's NVIDIA CC GPU evidence, observe-only: the result is logged and
+        recorded but never raises.
 
         Returns True (verified), False (verified-bad), or None (not performed /
         undeterminable). Never returns True unless NRAS accepted the evidence.
         """
-        enforce_event = nonce is not None
         payload_raw = executor.nvidia_payload
         log_extra = {"executor": f"{executor.address}:{executor.port}"}
 
         if not payload_raw:
-            if enforce_event:
-                logger.warning(_m(
-                    "GPU attestation rejected: evidence missing on attestation event",
-                    extra=get_extra_info({**log_extra, "reason": "payload_missing"}),
-                ))
-                raise AttestationError(
-                    f"Executor {executor.address}:{executor.port} did not provide NVIDIA GPU "
-                    "evidence while GPU attestation enforcement is enabled"
-                )
             return None
 
         try:
@@ -478,33 +465,18 @@ class AttestationService:
             if not isinstance(payload, dict) or "evidence_list" not in payload:
                 raise ValueError("missing evidence_list")
         except (ValueError, TypeError) as exc:
-            if enforce_event:
-                raise AttestationError(
-                    f"Malformed NVIDIA GPU evidence from executor {executor.address}:{executor.port}: {exc}"
-                ) from exc
             logger.warning(_m(
                 "Malformed NVIDIA GPU evidence (observe-only)",
                 extra=get_extra_info({**log_extra, "reason": "payload_malformed", "error": str(exc)}),
             ))
             return False
 
-        # On an attestation event the GPU evidence must be bound to the issued
-        # nonce — a self-generated (phase-0) nonce is replayable and rejected.
         payload_nonce = payload.get("nonce")
         if nonce is not None and payload_nonce != nonce.value_hex:
-            logger.warning(_m(
-                "GPU attestation rejected: evidence nonce is not the issued challenge",
-                extra=get_extra_info({
-                    **log_extra,
-                    "reason": "gpu_nonce_unbound",
-                    "expected_nonce": nonce.value_hex,
-                    "payload_nonce": payload_nonce,
-                }),
+            logger.info(_m(
+                "GPU evidence nonce differs from issued challenge (observe-only, likely phase-0 self-nonce)",
+                extra=get_extra_info({**log_extra, "payload_nonce": payload_nonce}),
             ))
-            raise AttestationError(
-                f"NVIDIA GPU evidence from executor {executor.address}:{executor.port} is not "
-                "bound to the issued attestation nonce"
-            )
 
         expected_nonce_hex = nonce.value_hex if (nonce is not None and payload_nonce == nonce.value_hex) else (
             payload_nonce if isinstance(payload_nonce, str) else None
@@ -514,8 +486,6 @@ class AttestationService:
             nras_response = await self._post_nras(payload, executor)
             passed, failures = self._check_gpu_claims(nras_response, expected_nonce_hex, executor)
         except AttestationError as exc:
-            if enforce_event:
-                raise
             logger.warning(_m(
                 "GPU attestation verification undeterminable (observe-only)",
                 extra=get_extra_info({**log_extra, "reason": "nras_unreachable", "error": str(exc)}),
@@ -537,11 +507,6 @@ class AttestationService:
             "NVIDIA GPU attestation failed",
             extra=get_extra_info({**log_extra, "reason": "gpu_att_failed", "failures": failures}),
         ))
-        if enforce_event:
-            raise AttestationError(
-                f"NVIDIA GPU attestation failed for executor {executor.address}:{executor.port}: "
-                + "; ".join(failures)
-            )
         return False
 
     async def _verify_tdx(
