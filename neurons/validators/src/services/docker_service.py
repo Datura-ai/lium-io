@@ -12088,10 +12088,13 @@ class DockerService:
                 )
             )
             try:
+                last_progress = None
                 while not wait.done():
                     await asyncio.wait({wait}, timeout=_PULL_KEEPER_PROGRESS_INTERVAL_SECONDS)
                     if not wait.done():
-                        await self._report_pull_keeper_progress(ssh_client, payload, log_tag, waited_from)
+                        last_progress = await self._report_pull_keeper_progress(
+                            ssh_client, payload, log_tag, waited_from, last_progress
+                        )
             finally:
                 wait.cancel()
             with contextlib.suppress(Exception):
@@ -12108,8 +12111,14 @@ class DockerService:
         await _stop_keeper()
 
     async def _report_pull_keeper_progress(
-        self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest, log_tag: str, started: float
-    ) -> None:
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        log_tag: str,
+        started: float,
+        last: str | None = None,
+    ) -> str:
+        """Post the renter one progress line, unless it is the same as the last one posted; returns it."""
         # the SDK pull only starts once the keeper is done, so the keeper's own output is the renter's progress
         minutes = int((time.monotonic() - started) // 60)
         progress = f"still downloading ({minutes} min)"
@@ -12118,7 +12127,10 @@ class DockerService:
             done, total = (int(n) for n in str(result.stdout or "").split())
             if total:
                 progress = f"{done} of {total} layers done ({minutes} min)"
-        await self.stream_log(f"Pulling docker image {payload.docker_image}: {progress}", "success", log_tag)
+        line = f"Pulling docker image {payload.docker_image}: {progress}"
+        if line != last:
+            await self.stream_log(line, "success", log_tag)
+        return line
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:

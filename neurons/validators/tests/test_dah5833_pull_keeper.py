@@ -234,7 +234,9 @@ async def test_the_renter_sees_layer_progress_while_the_keeper_pulls(svc, monkey
     with inflight_creates.track(payload.pod_id):
         await _run(svc, payload)
 
-    assert f"Pulling docker image {payload.docker_image}: 3 of 12 layers done (0 min)" in logs
+    line = f"Pulling docker image {payload.docker_image}: 3 of 12 layers done (0 min)"
+    # read twice with no change: posted once (review)
+    assert progress_reads >= 2 and logs.count(line) == 1
 
 
 @pytest.mark.asyncio
