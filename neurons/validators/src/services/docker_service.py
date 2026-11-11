@@ -626,15 +626,20 @@ _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # (30 s); a probe slower than this is a hung host, and the per-command path takes over.
 _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 
-_DOCKER_SIZE_UNITS = {"": 1, "k": 1000, "m": 1000**2, "g": 1000**3, "t": 1000**4, "ki": 1024, "mi": 1024**2, "gi": 1024**3, "ti": 1024**4}
+# DAH-6066: per running container, "<name> <bytes>" of the memory its cgroup cannot hand back (no page cache, which
+# MemAvailable already counts as free), or "<name> -" when unreadable. Systemd or cgroupfs driver, cgroup v2 or v1;
+# the host's cgroup tree through /proc/1/root, as the executor runs with the host pid namespace.
+_CONTAINER_UNRECLAIMABLE_MEMORY_CMD = (
+    "ps=$(/usr/bin/docker ps --no-trunc --format '{{.ID}} {{.Names}}') && printf '%s\\n' \"$ps\" | "
+    "while read c n; do v=-; "
+    "for d in sys/fs/cgroup sys/fs/cgroup/memory; do for g in system.slice/docker-$c.scope docker/$c; do "
+    "f=/proc/1/root/$d/$g/memory.stat; [ -r $f ] && v=$(awk '{m[$1]=$2} END{"
+    'if ("total_rss" in m) v=m["total_rss"]; '
+    'else if ("kernel" in m) v=m["anon"]+m["kernel"]-m["slab_reclaimable"]; '
+    'else v=m["anon"]+m["slab_unreclaimable"]+m["kernel_stack"]+m["pagetables"]+m["percpu"]+m["sock"]; '
+    "printf \"%.0f\", v}' $f) && break 2; done; done; echo \"$n $v\"; done"
+)
 
-
-def _docker_size_kib(text: str) -> int:
-    """KiB of a `docker stats` size such as "1.5GiB", "512MiB", "800kB" or "0B"; ValueError when unreadable."""
-    match = re.fullmatch(r"\s*([\d.]+)\s*([kmgt]i?)?b\s*", text, re.I)
-    if not match:
-        raise ValueError(text)
-    return int(float(match[1]) * _DOCKER_SIZE_UNITS[(match[2] or "").lower()] // 1024)
 
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
@@ -4391,9 +4396,9 @@ class DockerService:
 
         An idle host's MemAvailable is what it can give tenants: MemTotal less the kernel, GPU driver, slab and
         the provider's own services (~47 GiB on a 1 TiB 8-GPU host, past the MemTotal-based reserve). It is read
-        live at every create: MemAvailable plus the non-reclaimable memory `docker stats` reports for our running
-        pod_* and filler_* containers, so a provider workload that grew since an idle create counts now. The stored
-        value is only the fallback when the read fails. None (today's limit) when neither is known.
+        live at every create: MemAvailable plus the non-reclaimable memory (cgroup memory.stat, no page cache) of
+        our running pod_* and filler_* containers, so a provider workload that grew since an idle create counts now.
+        The stored value is only the fallback when the read fails. None (today's limit) when neither is known.
         """
         key = f"{IDLE_MEM_AVAILABLE_PREFIX}:{executor_uuid}"
         # One SSH command, so the value and the containers' usage describe the same instant
@@ -4401,16 +4406,16 @@ class DockerService:
         try:
             async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
                 res = await ssh_client.run(
-                    "grep '^MemAvailable:' /proc/meminfo && "
-                    "/usr/bin/docker stats --no-stream --format '{{.Name}} {{.MemUsage}}'",
+                    f"grep '^MemAvailable:' /proc/meminfo && {_CONTAINER_UNRECLAIMABLE_MEMORY_CMD}",
                     check=False,
                     timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS,
                 )
             if res.exit_status == 0 and isinstance(res.stdout, str):
                 first, *rest = res.stdout.splitlines() or [""]
                 if first.startswith("MemAvailable:"):
+                    # an unreadable container of ours ("-") fails the read: leaving it out would undersize the cap
                     live_kib = int(first.split()[1]) + sum(
-                        _docker_size_kib(line.split(" ", 1)[1].split("/", 1)[0])
+                        int(line.split(" ", 1)[1]) // 1024
                         for line in rest
                         if line.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
                     )
