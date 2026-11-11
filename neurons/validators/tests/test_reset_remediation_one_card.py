@@ -9,6 +9,8 @@ from services.task import messages
 from services.task.messages import MessageTemplate
 
 WHOLE_BOARD_RESET = {"NVLINK_FAULT"}
+# these only describe a reset (the latch cure, the executor losing its GPUs); they do not ask for one
+DESCRIBES_A_RESET = {"GPU_WEDGED", "RENTAL_NOT_VERIFIED"}
 BARE_RESET = re.compile(r"nvidia-smi -r(?! -i)[`\s]")
 
 
@@ -23,17 +25,14 @@ def _templates() -> list[MessageTemplate]:
 
 
 def test_reset_advice_names_one_card():
-    bare = [
+    reasons_with_bare_reset = [
         t.reason
         for t in _templates()
-        if t.reason not in WHOLE_BOARD_RESET
+        if t.reason not in WHOLE_BOARD_RESET | DESCRIBES_A_RESET
         and t.remediation
-        and "reset" in t.remediation
         and BARE_RESET.search(t.remediation)
-        and "unreliable" not in t.remediation
-        and "usually after" not in t.remediation
     ]
-    assert bare == []
+    assert reasons_with_bare_reset == []
 
 
 def test_gpu_fault_probe_advice_resets_only_the_card():
