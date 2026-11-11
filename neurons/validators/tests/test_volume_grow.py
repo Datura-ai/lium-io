@@ -505,6 +505,22 @@ def test_a_pass_that_released_more_than_it_took_lists_on_the_disk_now_free(conte
     assert specs["split_disk"]["listable_gpu_count"] == 1
 
 
+def test_a_read_after_the_pass_caps_what_the_listing_judges(context_factory):
+    from services.task.checks.disk_space import KB_PER_GB, specs_after_disk_taken
+
+    from tests.test_disk_space_check import _split_state
+
+    # scrape: 100 GB free; renters then wrote 30 GB and the grow took 21: 49 GB is left, not 100 - 21 = 79
+    state = _split_state(100, gpu_count=2, gpu_splitting_min_count=1, pods=(1,))
+    state.specs["hard_disk"]["used"] = 0
+    ctx = context_factory(state=state, rented=True)
+
+    specs = specs_after_disk_taken(ctx, 21 * GB, free_now_bytes=49 * GB)
+
+    assert specs["hard_disk"]["free"] == 49 * KB_PER_GB
+    assert specs["split_disk"]["listable_gpu_count"] == 0  # under the 50 GB floor
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("free_reads_gb", "reported_gb", "unreported_gb", "free_after_gb"),

@@ -243,7 +243,8 @@ class StaleContainerCleanupCheck:
         )
         measured = free_before - free_after if free_after is not None else grown.allocated_bytes
         taken = measured + grown.unreported_bytes
-        specs_after_grow = specs_after_disk_taken(ctx, taken) if grown.attempted else None
+        # free_after also caps it: what the renters wrote since the scrape is in that read, not in the delta
+        specs_after_grow = specs_after_disk_taken(ctx, taken, free_after) if grown.attempted else None
 
         event = render_message(
             Msg.CLEANED if rented_list_unknown is None else Msg.RENTED_LIST_UNKNOWN,

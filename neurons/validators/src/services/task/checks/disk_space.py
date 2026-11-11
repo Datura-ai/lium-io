@@ -69,17 +69,20 @@ def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | Non
     }
 
 
-def specs_after_disk_taken(ctx: Context, taken_bytes: int) -> dict[str, Any] | None:
+def specs_after_disk_taken(ctx: Context, taken_bytes: int, free_now_bytes: int | None = None) -> dict[str, Any] | None:
     """The cycle's specs with `taken_bytes` more of the host disk used since the scrape (DAH-6073: the cleanup pass's
     net change, a grow taking and a removal releasing; negative when more was released), and the split sizing redone
     on that figure, so the listing, the paid GPU count and the disk floor all judge the disk as it is after the pass.
-    None when nothing changed or there is no disk reading."""
+    `free_now_bytes`, a read taken after the pass, caps the result: anything written since the scrape is in it, which
+    a delta on the older scrape cannot see. None when nothing changed or there is no disk reading."""
     specs = ctx.state.specs or {}
     hard_disk = specs.get("hard_disk")
     free_kb = _as_float(hard_disk.get("free")) if isinstance(hard_disk, dict) else math.nan
     if taken_bytes == 0 or not math.isfinite(free_kb):
         return None
     taken_kb = taken_bytes / 1024
+    if free_now_bytes is not None:
+        taken_kb = max(taken_kb, free_kb - free_now_bytes / 1024)
     used_kb = _as_float(hard_disk.get("used"))
     updated = {**hard_disk, "free": max(free_kb - taken_kb, 0)}
     if math.isfinite(used_kb) and used_kb + free_kb > 0:
