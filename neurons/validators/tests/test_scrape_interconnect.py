@@ -10,6 +10,7 @@ are extracted by ast and executed in their own namespace (same pattern as test_s
 
 import ast
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -510,3 +511,27 @@ def test_probe_lists_the_p2p_table_read_under_the_rental_runtime(scrape: dict[st
     assert observation.payload["ic_p2p"] is False
     assert observation.payload["ic_p2p_ok_pairs"] == 27
     assert scrape["rental_p2p_output"]("+---- nvidia-smi ----+\n") is None
+
+
+def test_sysbox_probe_returns_the_p2p_table_its_shipped_command_prints(tmp_path) -> None:
+    # review on lio#2205: run the probe's own `sh -c` script, so a dropped marker fails here instead of
+    # silently falling back to the host read
+    table = p2p_table(uniform(2, "NS"))
+    (tmp_path / "table").write_text(table)
+    fake = tmp_path / "nvidia-smi"
+    fake.write_text(f'#!/bin/sh\n[ "$1" = topo ] && cat {tmp_path / "table"} || echo "+---- nvidia-smi ----+"\n')
+    fake.chmod(0o755)
+    scrape = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {"COMMANDS", "RENTAL_P2P_MARKER", "rental_p2p_output", "check_sysbox_gpu_compatibility"},
+        {"subprocess": subprocess},
+    )
+    script = scrape["COMMANDS"]["CHECK_SYSBOX_COMPATIBILITY"][-3:]  # sh -c "<script>", run as the container would
+    scrape["run_capability_check"] = lambda command: subprocess.run(
+        script, capture_output=True, text=True, env={"PATH": f"{tmp_path}:/usr/bin:/bin"}
+    )
+
+    ok, _message, rental_table = scrape["check_sysbox_gpu_compatibility"]()
+
+    assert ok is True
+    assert rental_table.strip() == table.strip()
