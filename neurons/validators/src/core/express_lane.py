@@ -141,6 +141,28 @@ class _Pending:
     requested: bool = False
 
 
+class _LeftToLane:
+    """What the wave leaves to the lane (MinerService.express_queued): the lane's queue, minus a
+    node whose failed-first-pass retry is due. The lane launches nothing for a miner the wave has
+    not listed yet, and each cycle start marks every miner so, so a due retry could wait cycle
+    after cycle while the wave kept leaving the node to the lane (DAH-6185); the wave runs it.
+    A live view of the queue, never a copy."""
+
+    def __init__(self, pending: dict[str, _Pending]):
+        self._pending = pending
+
+    def _left(self, executor_id: str, now: float) -> bool:
+        pending = self._pending.get(executor_id)
+        return pending is not None and not (pending.failed_runs and pending.not_before <= now)
+
+    def __contains__(self, executor_id: object) -> bool:
+        return isinstance(executor_id, str) and self._left(executor_id, time.monotonic())
+
+    def __iter__(self):
+        now = time.monotonic()
+        return iter([e for e in self._pending if self._left(e, now)])
+
+
 class ExpressLane:
     def __init__(
         self,
@@ -162,9 +184,9 @@ class ExpressLane:
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
         self._pending: dict[str, _Pending] = {}
-        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle). The
-        # same dict, never rebound, so the wave always reads the current queue.
-        self.miner_service.express_queued = self._pending
+        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle), through
+        # a view of this dict, never rebound, so the wave always reads the current queue.
+        self.miner_service.express_queued = _LeftToLane(self._pending)
         self._tasks: set[asyncio.Task] = set()
         self._my_hotkey: str | None = None
         # Given up on this process's watch (MAX_ATTEMPTS without the miner returning them); the
@@ -633,8 +655,8 @@ class ExpressLane:
             with suppress(Exception):
                 await self._end_recheck(executor_id)
         if should_run_first_pass_again:
-            # Not recorded as validated, so the lane runs it again; a wave that starts meanwhile
-            # claims it through in_flight and its publish records it.
+            # Not recorded as validated, so the lane runs it again; a wave that lists its miner
+            # once the retry is due takes it instead (_LeftToLane) and its publish records it.
             pending.failed_runs += 1
             pending.not_before = time.monotonic() + FIRST_PASS_FAILED_RETRY_SECONDS
             self._log_published(pending, result, passed, extra, started)

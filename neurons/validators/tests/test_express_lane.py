@@ -26,6 +26,8 @@ from core.express_lane import (
     EXPRESS_PUBLISHED_EVENT,
     CycleInputs,
     ExpressLane,
+    _LeftToLane,
+    _Pending,
 )
 from fakeredis.aioredis import FakeRedis
 from fixtures.rest_miner_fixtures import VALIDATOR_HOTKEY
@@ -179,6 +181,38 @@ async def test_the_wave_leaves_a_node_the_express_lane_has_queued_to_it(rest_min
 
     assert {r.executor_info.uuid for r in job["results"]} == {known}
     assert queued not in rest_miner_service.in_flight
+
+
+
+def _queued(executor_id: str, failed_runs: int = 0, not_before: float = 0.0) -> _Pending:
+    return _Pending(
+        executor=_portal_executor(executor_id),
+        miner_hotkey="miner-a",
+        first_seen_at=datetime.now(UTC),
+        failed_runs=failed_runs,
+        not_before=not_before,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_wave_takes_a_node_whose_failed_first_pass_retry_is_due(rest_miner_service):
+    """DAH-6185: the lane launches nothing for a miner the wave has not listed, and each cycle
+    start marks every miner so; leaving a due retry to the lane could starve it cycle after
+    cycle. The wave runs it; a retry not due yet, or a node never run, stays the lane's."""
+    due, waiting, never_run = str(uuid4()), str(uuid4()), str(uuid4())
+    rest_miner_service.miner_returns(due, waiting, never_run)
+    rest_miner_service.express_queued = _LeftToLane(
+        {
+            due: _queued(due, failed_runs=1, not_before=time.monotonic() - 1),
+            waiting: _queued(waiting, failed_runs=1, not_before=time.monotonic() + 60),
+            never_run: _queued(never_run),
+        }
+    )
+
+    job = await _request(rest_miner_service)
+
+    assert {r.executor_info.uuid for r in job["results"]} == {due}
+    assert set(rest_miner_service.express_queued) == {waiting, never_run}
 
 
 # --- ExpressLane: discovery, caps, publish, retries -----------------------------------------
@@ -492,6 +526,29 @@ async def test_a_result_produced_after_the_job_files_vanished_is_not_the_nodes_v
     assert await harness.tick_and_settle() == 1
     harness.miner_service.publish_machine_specs.assert_awaited_once()
     assert harness.lane._pending[new_node].failed_runs == 1
+
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_pass_is_the_waves_once_its_retry_is_due(monkeypatch, wallet):
+    """DAH-6185: after a failed first pass the node stays queued to the lane until its retry is
+    due; from then a wave that lists its miner takes it (the lane may still be waiting for that
+    list), so the retry is never starved."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED", True)
+
+    def failed_job(payload, executor_id, **_):
+        results = [_job_result(executor_id, score=0.0)]
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": results}
+
+    harness.miner_service.request_job_to_miner = AsyncMock(side_effect=failed_job)
+    assert await harness.tick_and_settle() == 1
+    assert harness.lane._pending[new_node].failed_runs == 1
+    assert new_node in harness.miner_service.express_queued  # retry not due: the lane's
+
+    harness.lane._pending[new_node].not_before = time.monotonic() - 1
+    assert new_node not in harness.miner_service.express_queued  # due: the wave's
 
 
 @pytest.mark.asyncio
