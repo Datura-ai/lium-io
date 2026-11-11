@@ -31,6 +31,8 @@ DOWNLOADED_DEB=""
 # as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13).
 VLOOPBACK_PLUGIN="vloopback"
 VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170"
+# the image above is x86-only; on aarch64 the validators install their own arm64 build when a rental needs it
+VLOOPBACK_ARM64_SKIP="the pinned plugin is x86-only; on aarch64 the validators install their arm64 build of it when a rental needs a disk limit."
 VLOOPBACK_DOC_URL="https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
 VLOOPBACK_INSTALL_TIMEOUT=300
 VLOOPBACK_RUN_TIMEOUT=120
@@ -801,6 +803,7 @@ check_vloopback() {
         return 0
     fi
     ! vloopback_storage_opt_unsupported || { pf_fix "$STORAGE_LIMIT_MISSING" "$STORAGE_LIMIT_FIX"; return 1; }
+    [ "$SYSBOX_ARCH" != arm64 ] || { pf_skip "vloopback volumes — $VLOOPBACK_ARM64_SKIP"; return 0; }
     state=$(vloopback_plugin_state)
     if [ "$state" = "absent" ]; then
         pf_fix "The $VLOOPBACK_PLUGIN volume plugin is not installed; the mount test cannot run until it is." \
@@ -834,6 +837,7 @@ fail_vloopback() {
 setup_vloopback() {
     # install mode: the plugin fix, then the mount test; on a failure the caller prints fail_vloopback
     ! vloopback_storage_opt_unsupported || { ok "vloopback: skipped. $VLOOPBACK_NOT_USED"; warn "$STORAGE_LIMIT_MISSING Fix: $STORAGE_LIMIT_FIX"; return 0; }
+    [ "$SYSBOX_ARCH" != arm64 ] || { ok "vloopback: skipped on aarch64: $VLOOPBACK_ARM64_SKIP"; return 0; }
     ensure_vloopback_plugin || return 1
     [ -z "$VLOOPBACK_CHANGED" ] || ok "vloopback: $VLOOPBACK_CHANGED."
     vloopback_mount_test || return 1

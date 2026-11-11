@@ -12,6 +12,7 @@ import pytest
 from core.config import settings
 from payload_models.payloads import ContainerCreateRequest
 from services import docker_service as docker_service_module
+from services import loopback_plugin_setup as loopback_plugin_setup_module
 from services.image_flatten import FlattenMeasureFailed
 from services.loopback_plugin_setup import (
     LOOPBACK_PLUGIN_BUILDS,
@@ -289,6 +290,8 @@ def _plugin_host(
             if install == "hangs":
                 await asyncio.Event().wait()
             return Mock(stdout="", stderr="installation did not produce a plugin", exit_status=1)
+        if command == "uname -m":
+            return Mock(stdout="x86_64\n", stderr="", exit_status=0)
         if "docker info" in command:
             return Mock(stdout=f"{docker_root}\n", stderr="", exit_status=0)
         if "plugin inspect" in command:
@@ -750,3 +753,49 @@ async def test_plugin_setup_runs_under_the_probed_budget_only_for_the_generation
     assert setup_commands[0].startswith(f"timeout -k 5 {budget} ")
     # the script measures its probe against the same deadline
     assert shlex.split(shlex.split(setup_commands[0])[-1])[9] == budget
+
+
+def _on_aarch64(ssh_client: Mock) -> Mock:
+    # the same host, answering `uname -m` as a GB10 / Grace executor does
+    inner = ssh_client.run
+
+    async def run(command: str):
+        if command.endswith(" uname -m") or command.endswith("'uname -m'"):
+            return Mock(stdout="aarch64\n", stderr="", exit_status=0)
+        return await inner(command)
+
+    return ssh_client_answering_through_run(AsyncMock(side_effect=run))
+
+
+@pytest.mark.asyncio
+async def test_aarch64_host_never_installs_the_x86_plugin_while_no_arm64_build_is_pinned(docker_service, monkeypatch):
+    monkeypatch.setattr(loopback_plugin_setup_module, "LOOPBACK_PLUGIN_ARM64_BUILDS", {
+        "vloopback:v3": loopback_plugin_setup_module.LoopbackPluginBuild("daturaai/docker-volume-loopback:1.0.0-lium11-arm64", "", "v3"),
+    })
+    ssh_client = _on_aarch64(_plugin_host(old_state="true"))
+
+    created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == ["vloopback"]
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert not any("python3 " in command for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_aarch64_host_installs_the_pinned_arm64_build(docker_service, monkeypatch):
+    arm64_digest = "sha256:" + "a" * 64
+    monkeypatch.setattr(loopback_plugin_setup_module, "LOOPBACK_PLUGIN_ARM64_BUILDS", {
+        "vloopback:v3": loopback_plugin_setup_module.LoopbackPluginBuild(
+            "daturaai/docker-volume-loopback:1.0.0-lium11-arm64", arm64_digest, "v3"
+        ),
+    })
+    ssh_client = _on_aarch64(_plugin_host(v2_state="true"))
+
+    created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == ["vloopback:v3"]
+    (setup,) = [call.args[0] for call in ssh_client.run.await_args_list if "python3 " in call.args[0]]
+    args = shlex.split(shlex.split(setup)[-1])
+    assert args[5:7] == ["daturaai/docker-volume-loopback:1.0.0-lium11-arm64", arm64_digest]
+    # a marker the arm64 build's probe wrote reads as verified, not as another build's
+    assert arm64_digest in docker_service_module._loopback_plugin_state_command("vloopback:v3")

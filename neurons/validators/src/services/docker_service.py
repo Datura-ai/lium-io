@@ -156,8 +156,10 @@ from services.image_flatten import (
 from services.loopback_plugin_setup import (
     LOOPBACK_PLUGIN_BUILDS,
     current_loopback_plugin_alias,
+    loopback_plugin_build,
     loopback_plugin_probe_marker_path,
     loopback_plugin_setup_command,
+    pinned_loopback_plugin_digests,
 )
 from services.nvidia_devices import MissingRentedGpuError, build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
@@ -756,6 +758,7 @@ class VolumeSizingResult:
 # `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
 # whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
 _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
+_LOOPBACK_PLUGIN_UNAME_TIMEOUT_SECONDS = 10
 # the direct-I/O generation also mounts a probe volume (volume create + mkfs, a helper-image run that
 # may pull, a sync) before it writes its marker; on a host whose dockerd starts containers slowly the
 # install budget alone cut the probe short, and every new-volume rental re-ran it until one finished
@@ -781,14 +784,18 @@ def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
     # prints them); an enabled plugin still being probed, whose probe was cut short, probed as an
     # earlier build, installed again or set to another data directory reads "unverified" and goes
     # through setup
-    digest = LOOPBACK_PLUGIN_BUILDS[loopback_plugin_alias].digest
     installation_command = (
         "/usr/bin/docker plugin inspect --format '{{.Id}} {{json .Settings.Env}}' "
         f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null"
     )
+    # a marker of any pinned build of this alias counts: the setup wrote it for the build of this host's CPU
+    marker_differs = " && ".join(
+        f'[ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != "{digest} $({installation_command})" ]'
+        for digest in pinned_loopback_plugin_digests(loopback_plugin_alias)
+    )
     return (
         f'state="$( {plugin_state_command})"; '
-        f'if [ "$state" = true ] && [ "$(cat {shlex.quote(marker_path)} 2>/dev/null)" != "{digest} $({installation_command})" ]; '
+        f'if [ "$state" = true ] && {marker_differs}; '
         'then echo unverified; else echo "$state"; fi'
     )
 
@@ -7968,6 +7975,12 @@ class DockerService:
         # probed); returns why it cannot be used, None once it can
         generation = LOOPBACK_PLUGIN_BUILDS[alias].generation
         try:
+            # the executor's CPU picks the build; bounded like every host command here. An unread CPU gets
+            # the x86 build, as every host did before aarch64 ones joined
+            uname = await _run_with_host_timeout(ssh_client, "uname -m", _LOOPBACK_PLUGIN_UNAME_TIMEOUT_SECONDS)
+            arch = "aarch64" if (uname.stdout or "").strip() in ("aarch64", "arm64") else None
+            if loopback_plugin_build(alias, arch) is None:
+                return f"{generation} has no published {arch} build"
             setup_timeout_seconds = (
                 _LOOPBACK_PLUGIN_PROBED_SETUP_TIMEOUT_SECONDS
                 if loopback_plugin_probe_marker_path(alias)
@@ -7975,7 +7988,7 @@ class DockerService:
             )
             setup_execution = await _run_with_host_timeout(
                 ssh_client,
-                loopback_plugin_setup_command(docker_root_dir, alias, setup_timeout_seconds),
+                loopback_plugin_setup_command(docker_root_dir, alias, setup_timeout_seconds, arch),
                 setup_timeout_seconds,
             )
             if setup_execution.exit_status == 0:

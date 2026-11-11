@@ -564,3 +564,16 @@ def test_aarch64_host_passes_the_arch_check(tmp_path):
     # GB300 / Grace: nestybox ships an arm64 .deb, so aarch64 is no longer a blocking FIX
     proc = run_script(tmp_path, "--check", env={"STUB_ARCH": "aarch64"})
     assert "PASS Architecture aarch64." in proc.stdout
+
+
+def test_aarch64_install_never_installs_the_x86_only_plugin(tmp_path):
+    # the pinned legacy plugin is an x86 binary (exec format error on GB10); validators set up the arm64 build themselves
+    proc = run_script(tmp_path, env={"STUB_ARCH": "aarch64", "STUB_VLOOPBACK": "absent"})
+    assert "vloopback: skipped on aarch64" in proc.stdout
+    assert not [call for call in _docker_calls(tmp_path) if call.startswith("plugin install")]
+
+
+def test_aarch64_check_skips_the_x86_only_plugin(tmp_path):
+    rc, out, fixes = run_check(tmp_path, "check_vloopback", env={"STUB_ARCH": "aarch64", "STUB_VLOOPBACK": "absent"})
+    assert (rc, fixes) == (0, 0)
+    assert "SKIP vloopback volumes — the pinned plugin is x86-only" in out
