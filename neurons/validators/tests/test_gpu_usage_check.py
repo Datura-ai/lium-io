@@ -557,6 +557,35 @@ async def test_a_foreign_process_beside_a_renters_pod_never_gets_advice_to_stop_
     assert result.event.what_we_saw["process_count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("make_pod_rental", "rented_data", "state"),
+    [
+        (lambda: PodRentalActiveResponse(active=True, executor_id=default_executor().uuid), None, PodRentalState.LIVE),
+        (lambda: _closed(minutes_ago=1), _snapshot_with_pod(), PodRentalState.ENDED_DURING_RUN),
+        (lambda: _closed(minutes_ago=10), None, PodRentalState.ENDED_RECENTLY),
+    ],
+    ids=["live", "ended-during-run", "ended-recently"],
+)
+@pytest.mark.asyncio
+async def test_a_leftover_process_beside_a_renters_pod_is_rebooted_only_once_no_rental_runs(
+    context_factory, make_pod_rental, rented_data, state
+):
+    leftover = {"pid": 644002, "info": f"0::/../docker-{'e' * 64}.scope/init.scope", "container_name": None}
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=make_pod_rental(),
+        rented_data=rented_data,
+        gpu_processes=[_pod_process(), leftover],
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.what_we_saw["pod_containers"][0].state is state
+    remediation = result.event.remediation
+    assert f"container {'e' * 12}, which is no longer running (once no rental is running, reboot" in remediation
+    assert "Do not stop the pod container of the rental on this node" in remediation
+
+
 @pytest.mark.asyncio
 async def test_an_edit_parked_pod_container_is_judged_by_its_pod(context_factory):
     ctx = _unrented_ctx(
@@ -1845,7 +1874,7 @@ async def test_a_busy_gpu_held_by_a_container_no_longer_running_says_a_reboot_cl
 
     assert (
         "GPU processes on the node: a leftover process of container ee61df8264ce, which is no "
-        "longer running (reboot the node to clear it) (pid 644002)." in result.event.remediation
+        "longer running (once no rental is running, reboot the node to clear it) (pid 644002)." in result.event.remediation
     )
 
 
