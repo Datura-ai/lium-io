@@ -6239,6 +6239,7 @@ class DockerService:
                     rental_fits,
                     evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
                     volume_remove=volume_remove,
+                    keep_image=payload.docker_image,
                 )
             except asyncio.CancelledError:
                 raise
