@@ -448,3 +448,41 @@ async def test_create_task_no_longer_reports_per_executor(monkeypatch):
     assert ran == ["pipe-1"]  # the pipeline ran; only the report is gone
     service.report_verification_started.assert_not_called()
     service.backend_client.report_verification_started.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_validators_key_is_removed_only_after_the_passed_probe_teardown(monkeypatch):
+    # DAH-5699: a passed rental probe tears its container down after the verdict, over the
+    # validator's key; removed first, the teardown failed with Permission denied and left the
+    # test pod behind
+    from services.task.checks import rental_probe
+
+    order: list[str] = []
+    service = _miner_service_recording(order)
+    create_task = service.task_service.create_task
+
+    async def teardown():
+        await asyncio.sleep(0.05)
+        order.append("teardown")
+
+    async def create_task_and_pass_the_probe(**kwargs):
+        task = asyncio.create_task(teardown(), name=f"{rental_probe._TEARDOWN_TASK_PREFIX}5Miner")
+        rental_probe._TEARDOWNS_AFTER_VERDICT.add(task)
+        task.add_done_callback(rental_probe._TEARDOWNS_AFTER_VERDICT.discard)
+        return await create_task(**kwargs)
+
+    service.task_service.create_task = create_task_and_pass_the_probe
+    service._generate_auth_headers = MagicMock(return_value={})
+    service._make_rest_request = AsyncMock(
+        return_value=(200, _accepted("exec-a").model_dump(mode="json"))
+    )
+    service._remove_ssh_key_via_rest = AsyncMock(side_effect=lambda **_: order.append("remove_key"))
+    monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
+    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
+
+    with patch("services.miner_service.measure_and_attach", AsyncMock()):
+        await service.request_job_to_miner(
+            _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}
+        )
+
+    assert order[-2:] == ["teardown", "remove_key"]

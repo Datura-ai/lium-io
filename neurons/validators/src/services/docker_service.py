@@ -490,12 +490,20 @@ def _port_collision_candidates(
 def _parse_listening_ports(output: str) -> set[int]:
     """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`),
     plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`, ranges too)."""
-    ports: set[int] = {
-        port
-        for first, last in _PUBLISHED_HOST_PORT_RE.findall(output)
-        for port in range(int(first), int(last or first) + 1)
-        if 0 < port <= 65535
-    }
+    # A difference array over 1..65535: any number of published ranges costs O(matches + 65535), never a set per range.
+    delta = [0] * 65537
+    for match in _PUBLISHED_HOST_PORT_RE.finditer(output):
+        first, last = int(match[1]), int(match[2] or match[1])
+        first, last = max(first, 1), min(last, 65535)
+        if first <= last:
+            delta[first] += 1
+            delta[last + 1] -= 1
+    ports: set[int] = set()
+    covered = 0
+    for port in range(1, 65536):
+        covered += delta[port]
+        if covered:
+            ports.add(port)
     for line in output.splitlines():
         for column in line.split():
             if column.endswith("*") or ":" not in column:
@@ -4115,6 +4123,7 @@ class DockerService:
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_driver: str | None = None,
+        on_cpus_granted: Callable[[int], None] | None = None,
     ) -> ContainerRunSpec:
         # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
         # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
@@ -4217,6 +4226,9 @@ class DockerService:
                 else effective_storage_limit_gb
             ),
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
+            pids_limit_for=partial(self._rental_pids_limit, host_pid_max=host_pid_max),
+            min_cpu_count=payload.min_cpu_count,
+            on_cpus_granted=on_cpus_granted,
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
@@ -6234,6 +6246,7 @@ class DockerService:
                     rental_fits,
                     evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
                     volume_remove=volume_remove,
+                    keep_image=payload.docker_image,
                 )
             except asyncio.CancelledError:
                 raise
@@ -9711,6 +9724,7 @@ class DockerService:
         # check after it) is gated on this, never on workload_kind alone.
         removes_every_filler = payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not beside_fillers
         warnings = []
+        vulkan_icd: asyncio.Task | None = None
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
@@ -9783,7 +9797,7 @@ class DockerService:
             )
             logger.error(log_text)
             await self.redis_service.remove_pending_pod(
-                payload.miner_hotkey, payload.executor_id, payload.pod_id
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
             )
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -9900,7 +9914,11 @@ class DockerService:
             # add executor in pending status dict
             current_step = "pending_pod"
             await self.redis_service.add_pending_pod(
-                payload.miner_hotkey, payload.executor_id, payload.pod_id, synthetic_probe=synthetic_probe
+                payload.miner_hotkey,
+                payload.executor_id,
+                payload.pod_id,
+                command_id=payload.command_id,
+                synthetic_probe=synthetic_probe,
             )
 
             current_step = "ssh_key_import"
@@ -11029,6 +11047,7 @@ class DockerService:
                     )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
+                granted_cpu_counts: list[int] = []
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -11047,6 +11066,7 @@ class DockerService:
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
                     docker_data_volume_driver=local_volume_driver,
+                    on_cpus_granted=granted_cpu_counts.append,
                 )
 
                 logger.info(
@@ -11407,8 +11427,11 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                        await self.register_vulkan_icd_with_rental_docker(
-                            docker_client, container_name=container_name, log_extra=default_extra
+                        # runs beside the remaining steps (median 1.4 s); awaited before the reply
+                        vulkan_icd = asyncio.create_task(
+                            self.register_vulkan_icd_with_rental_docker(
+                                docker_client, container_name=container_name, log_extra=default_extra
+                            )
                         )
                     elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                         docker_client=docker_client,
@@ -11509,6 +11532,11 @@ class DockerService:
 
                     await self.finish_stream_logs()
 
+                    if vulkan_icd is not None:
+                        # before the running check: a Vulkan app started right after readiness must see the GPU,
+                        # and a container that stopped during the registration must not be reported created
+                        await vulkan_icd
+
                     # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
                     # the validator, no environment and ships_sshd, no exec runs after the key step. Read
                     # after the log drain, which awaits, so a kill while it drains is seen too.
@@ -11552,6 +11580,8 @@ class DockerService:
                         )
                     )
                 except Exception as post_run_exc:
+                    if vulkan_icd is not None:
+                        await vulkan_icd  # best effort, never raises: let its exec end before cleanup removes the pod
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -11633,6 +11663,7 @@ class DockerService:
                         payload.miner_hotkey,
                         payload.executor_id,
                         payload.pod_id,
+                        command_id=payload.command_id,
                     )
 
                 # DAH-1524: one structured, Loki-queryable summary of the deploy
@@ -11690,6 +11721,8 @@ class DockerService:
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
+                    command_id=payload.command_id,
+                    cpu_count=granted_cpu_counts[-1] if granted_cpu_counts else cpu_count,
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.
@@ -11785,8 +11818,13 @@ class DockerService:
                 logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e))
+            # this dispatch's mark and report only: a newer dispatch of the pod may have saved its success (lium-io#1952)
+            await self.redis_service.remove_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
+            )
+            await self.hold_node_until_probe_passes(
+                payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e)
+            )
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
@@ -14203,7 +14241,10 @@ class DockerService:
             if after is not None:
                 await after(report, default_extra)
             try:
-                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+                # only this operation's mark: the pod's create mark and saved report are not its to clear
+                await self.redis_service.remove_pending_pod(
+                    payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=kind
+                )
             except Exception as exc:
                 logger.warning(
                     _m(f"{label}: pending mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))
