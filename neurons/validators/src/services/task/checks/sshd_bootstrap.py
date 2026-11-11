@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import logging
 import shlex
 import time
@@ -10,6 +11,8 @@ from core.config import settings
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 from services.redis_service import (
+    FILLER_REMOVED_BY_VALIDATOR_PREFIX,
+    FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
@@ -163,7 +166,9 @@ class SshdBootstrapCheck:
 
 
 async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
-    """`docker rm -fv` each filler, then report it missing so the backend closes its run; never raises."""
+    """`docker rm -fv` each filler, mark it ours, then report it missing so the backend closes its run.
+
+    Never raises."""
     removed: list[str] = []
     for name in fillers:
         try:
@@ -171,6 +176,13 @@ async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
             if result.exit_status != 0:
                 continue
             removed.append(name)
+            # an unmarked removal is judged as before; the missing report below still goes
+            with contextlib.suppress(Exception):
+                await ctx.services.redis.set(
+                    f"{FILLER_REMOVED_BY_VALIDATOR_PREFIX}{name}",
+                    "1",
+                    ex=FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS,
+                )
             await ctx.services.backend.get_filler_run_active(
                 name.removeprefix(FILLER_CONTAINER_PREFIX), container_missing=True
             )

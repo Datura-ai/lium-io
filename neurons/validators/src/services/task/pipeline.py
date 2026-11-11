@@ -230,9 +230,6 @@ class ContextState:
     # ExecutorSpecRequest.pod_states.
     pod_states: list[PodContainerState] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
-    # fillers PostRentalGpuRecheckCheck removed this cycle to probe the cards; RentalVerificationCheck must not
-    # read their absence as a host kill
-    fillers_removed_this_cycle: list[str] = field(default_factory=list)
     memory_health: MemoryHealthRead | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None

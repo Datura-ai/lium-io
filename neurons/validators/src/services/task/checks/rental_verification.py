@@ -18,6 +18,7 @@ from protocol.vc_protocol.compute_requests import (
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     FillerRunActiveResponse,
 )
+from services.redis_service import FILLER_REMOVED_BY_VALIDATOR_PREFIX
 
 from ...const import (
     FILLER_CONTAINER_PREFIX,
@@ -107,6 +108,15 @@ _FILLER_VERDICT_SEVERITY: dict[str, int] = {
 }
 
 
+async def _removed_by_validator(ctx: Context, filler_container: str) -> bool:
+    """We removed this filler ourselves (GPU recheck, failed sshd) and the backend has not closed its run yet."""
+    key = f"{FILLER_REMOVED_BY_VALIDATOR_PREFIX}{filler_container}"
+    try:
+        return await ctx.services.redis.get(key) is not None
+    except Exception:  # noqa: BLE001 — no mark readable: probe the container as before
+        return False
+
+
 class RentalVerificationCheck:
     """Verify executor rental status via backend API health check.
 
@@ -134,8 +144,6 @@ class RentalVerificationCheck:
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
         # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
         filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
-        # the GPU recheck removed these itself this cycle and told the backend; their absence is not a kill
-        filler_containers = [c for c in filler_containers if c not in ctx.state.fillers_removed_this_cycle]
         # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
         # `docker run` leaves no RUNNING run and no container, so the liveness probe below never
         # sees it and the node collects unrented incentive while never running a default job. The
@@ -485,6 +493,12 @@ class RentalVerificationCheck:
         if filler_run is None:
             return self._filler_state_unknown_result(
                 ctx, filler_container, reason="filler-run re-check API unavailable"
+            )
+
+        if await _removed_by_validator(ctx, filler_container):
+            # the report above still feeds the backend's close of the run
+            return self._filler_state_unknown_result(
+                ctx, filler_container, reason="the validator removed this filler itself"
             )
 
         if not filler_run.active:

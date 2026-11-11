@@ -254,7 +254,7 @@ async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(c
 
     assert ctx.ssh.run.await_args.args[0] == f"/usr/bin/docker rm -fv {filler}"
     assert result.event.what_we_saw["removed_fillers"] == [filler]
-    assert result.updates["state"].fillers_removed_this_cycle == [filler]
+    assert ctx.services.redis.store[f"filler_removed_by_validator:{filler}"] == "1"
     assert validation.calls == 1
     assert result.passed and result.event.reason_code == Msg.PASSED.reason
     assert KEY not in ctx.services.redis.store
