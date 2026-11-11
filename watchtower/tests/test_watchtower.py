@@ -160,7 +160,7 @@ def test_fetch_verified_digest_returns_digest_on_success(mock_get, mock_verify):
     # Assert — verified digest is returned and the correct URL was used
     assert digest == "sha256:newdigest"
     mock_get.assert_called_once_with(
-        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.1"}, timeout=30
+        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.2"}, timeout=30
     )
     mock_verify.assert_called_once()
 
