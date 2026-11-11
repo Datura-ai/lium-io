@@ -404,6 +404,8 @@ _PORT_COLLISION_CANDIDATE_CAP = 3
 # range) moves that mapping too instead of failing the create.
 _PORT_COLLISION_REMAP_CAP = 5
 _PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
+# SSH and Jupyter are what the renter connects through: never dropped when no free pair is left
+_PORT_COLLISION_KEPT_DOCKER_PORTS = frozenset({22, 8888})
 # `ss -Hltn` (iproute2) first, `netstat -ltn` where only net-tools is installed; either prints one
 # listening socket per line with the local address in one column. Then the host ports running
 # containers publish (`0.0.0.0:10071->9101/tcp`): with docker's iptables publishing and no
@@ -3674,8 +3676,9 @@ class DockerService:
         candidates, skipping the host's listening sockets and container-published ports read over
         `ssh_client`) and the run is retried with the new mapping; a further refusal moves again, up
         to `_PORT_COLLISION_REMAP_CAP` remaps. `port_maps` is updated in place so the create's answer
-        carries the port the pod really got. No free candidate, or a refusal after the last remap,
-        fails the create as `RentalPortCollisionError`.
+        carries the port the pod really got. With no free candidate a refused extra port (not SSH or
+        Jupyter) is dropped from the pod and the run retried; otherwise no free candidate, or a refusal
+        after the last remap, fails the create as `RentalPortCollisionError`.
 
         `remove_port_checks_listed_live` runs once, on the first bind refusal, before either retry;
         when it removed a port check, the run is retried at once on the same mapping.
@@ -3818,7 +3821,7 @@ class DockerService:
                 if (
                     port_allocation_phrase
                     and port_maps is not None
-                    and spare_port_pairs
+                    and spare_port_pairs is not None
                 ):
                     ssh_port_map_before = self._find_mapping_by_docker_port(port_maps, 22)
                     remapped_spec = await self._remap_colliding_port(
@@ -4000,7 +4003,8 @@ class DockerService:
         host's live listing shows taken, to the next free advertised pairs.
 
         Returns the run spec with the new host port, having rewritten `port_maps` in place and
-        taken the pair out of `spare_port_pairs`. Returns None when the refusal names no host port
+        taken the pair out of `spare_port_pairs`; a mapping with no free pair left (not SSH or Jupyter)
+        is dropped from both instead. Returns None when the refusal names no host port
         of this pod (the caller keeps the same-command wait). Raises `RentalPortCollisionError`
         when every candidate (≤ `_PORT_COLLISION_CANDIDATE_CAP`) is already listening on the host.
         """
@@ -4028,6 +4032,7 @@ class DockerService:
             i for i, (_, internal, _) in enumerate(port_maps) if i != index and listening and internal in listening
         ]
         moved: dict[int, int] = {}
+        dropped: set[int] = set()
         for i in to_move:
             docker_port, old_internal, old_external = port_maps[i]
             candidates = _port_collision_candidates(spare_port_pairs, after_host_port=old_internal)
@@ -4035,6 +4040,24 @@ class DockerService:
                 (pair for pair in candidates if listening is None or pair.internal_port not in listening),
                 None,
             )
+            if chosen is None and docker_port not in _PORT_COLLISION_KEPT_DOCKER_PORTS:
+                # DAH-6186: the pod already holds the node's whole range, so nothing is left to move
+                # to; one fewer extra port beats failing the rental
+                dropped.add(old_internal)
+                logger.warning(
+                    _m(
+                        "PORT_COLLISION_DROPPED",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error_class": PORT_COLLISION_ERROR_CLASS,
+                            "docker_port": docker_port,
+                            "old_host_port": old_internal,
+                            "old_external_port": old_external,
+                            "candidates": [pair.internal_port for pair in candidates],
+                        }),
+                    )
+                )
+                continue
             if chosen is None:
                 if i != index:
                     continue  # docker run refuses it next and the following remap tries again
@@ -4062,6 +4085,7 @@ class DockerService:
                     }),
                 )
             )
+        port_maps[:] = [mapping for mapping in port_maps if mapping[1] not in dropped]
         return dataclasses.replace(
             run_spec,
             ports=tuple(
@@ -4069,6 +4093,7 @@ class DockerService:
                 if binding.protocol == "tcp" and binding.host_port in moved
                 else binding
                 for binding in run_spec.ports
+                if binding.host_port not in dropped
             ),
         )
 
