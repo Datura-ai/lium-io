@@ -249,6 +249,31 @@ daemon_feature_off() {
     fi
 }
 
+# The sysbox .deb's config script exits 1 when dockerd runs, daemon.json lacks bip / default-address-pools
+# (matched line by line, so the file must be indented) and any container exists, before its postinst runs.
+# Write sysbox's own values first, so the provider's containers stay; same subnets and overlap rule as its
+# postinst (Docker is restarted in step 5).
+seed_sysbox_network_config() {
+    local file gw subnet
+    file=$(host_path /etc/docker/daemon.json)
+    docker ps -a --format '{{.ID}}' 2>/dev/null | grep -q . || return 0
+    mkdir -p "$(dirname "$file")"
+    [ -s "$file" ] || echo '{}' > "$file"
+    if ! jq -e '(.bip // "") != "" and ((."default-address-pools" // []) | length) > 0' "$file" > /dev/null 2>&1; then
+        gw=$(ip route | awk '/default/ {print $3; exit}')
+        for subnet in 172.20.0.1 172.25.0.0; do
+            if ! ip route get "$subnet" | grep -q "via $gw"; then
+                fail "$subnet overlaps a local network: set \"bip\" and \"default-address-pools\" in /etc/docker/daemon.json yourself, then re-run."
+                return 1
+            fi
+        done
+    fi
+    jq --indent 4 'if (.bip // "") == "" then .bip = "172.20.0.1/16" else . end
+        | if ((."default-address-pools" // []) | length) == 0 then ."default-address-pools" = [{"base": "172.25.0.0/16", "size": 24}] else . end' \
+        "$file" > "$file.tmp" && mv "$file.tmp" "$file" || { fail "Failed to update $file (invalid JSON?)."; return 1; }
+    ok "Docker network settings for sysbox are in daemon.json (applied at the Docker restart below)."
+}
+
 check_root() {
     [ "$(id -u)" -eq 0 ] && { pf_pass "Running as root."; return 0; }
     pf_fix "Not running as root — the checks read Docker's socket and the kernel modules." \
@@ -1104,13 +1129,9 @@ if [ "$SKIP_INSTALL" = false ]; then
         actual=$(sha256sum "$SYSBOX_DEB" | cut -d' ' -f1)
         [ "$actual" = "$SYSBOX_SHA" ] || { fail "Checksum mismatch!"; exit 1; }
     fi
+    seed_sysbox_network_config || exit 1
     apt_install install -y -qq "$SYSBOX_DEB" || exit 1
     ok "Sysbox v${SYSBOX_VERSION} installed."
-    # its postinst writes bip/default-address-pools but skips its own restart when any container exists,
-    # and prints "remove them": the restart in step 5 applies those settings, so nothing is removed
-    if docker ps -aq 2>/dev/null | grep -q .; then
-        warn "Ignore sysbox's note to remove containers: Docker is restarted below and keeps them."
-    fi
 else
     ok "Sysbox already installed, skipping."
 fi

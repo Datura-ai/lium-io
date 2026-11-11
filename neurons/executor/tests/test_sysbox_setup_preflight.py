@@ -24,7 +24,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir"]
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir", "mv"]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
@@ -138,6 +138,16 @@ STUBS = {
     ),
     # records "<seconds> <command>" in .stub-docker/timeouts, then runs the command
     "timeout": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/timeouts"\nshift\nexec "$@"\n',
+    # `ip route` gives the default route; `ip route get X` routes X via it unless STUB_IP_LOCAL names X (a local subnet)
+    "ip": textwrap.dedent(
+        """\
+        #!/bin/bash
+        case "$1 $2" in
+            "route ") echo "default via 192.0.2.1 dev eth0" ;;
+            "route get") if [ "${STUB_IP_LOCAL:-}" = "$3" ]; then echo "$3 dev br0 src $3"; else echo "$3 via 192.0.2.1 dev eth0"; fi ;;
+        esac
+        """
+    ),
     "apparmor_parser": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/apparmor"\n',
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
@@ -566,3 +576,57 @@ def test_an_explicit_port_in_use_is_still_a_fix(tmp_path):
     )
     assert fix_count == 1
     assert "TCP 8080 (executor port) is already in use" in out
+
+
+# ── sysbox network settings before the .deb ─────────────────────────────────
+
+# the .deb's config script greps daemon.json line by line for these two keys
+SYSBOX_NET_KEYS = re.compile(r'^ +"bip": "[0-9.]+.*"', re.M), re.compile(r'^ +"default-address-pools"', re.M)
+
+
+def _daemon_json(tmp_path: Path) -> str:
+    return (tmp_path / "root/etc/docker/daemon.json").read_text()
+
+
+def test_seed_writes_sysbox_network_settings_when_a_stopped_container_exists(tmp_path):
+    # without them the .deb's config script exits 1 on a host with any container, before anything is installed
+    result = run_check(
+        tmp_path, "seed_sysbox_network_config", env={"STUB_ALL_CONTAINERS": "aaa old_one"}, with_jq=True
+    )
+    assert result.rc == 0, result.output
+    text = _daemon_json(tmp_path)
+    assert all(key.search(text) for key in SYSBOX_NET_KEYS), text
+
+
+def test_seed_keeps_the_provider_settings_and_indents_a_one_line_file(tmp_path):
+    result = run_check(
+        tmp_path,
+        "seed_sysbox_network_config",
+        env={"STUB_ALL_CONTAINERS": "aaa old_one"},
+        files={"etc/docker/daemon.json": '{"data-root":"/data/docker","bip":"192.0.2.1/24"}'},
+        with_jq=True,
+    )
+    assert result.rc == 0, result.output
+    text = _daemon_json(tmp_path)
+    assert all(key.search(text) for key in SYSBOX_NET_KEYS), text
+    assert '"bip": "192.0.2.1/24"' in text and '"data-root": "/data/docker"' in text
+
+
+def test_seed_leaves_daemon_json_alone_without_containers(tmp_path):
+    # sysbox configures and restarts Docker itself when no container exists
+    result = run_check(tmp_path, "seed_sysbox_network_config", with_jq=True)
+    assert result.rc == 0, result.output
+    assert not (tmp_path / "root/etc/docker/daemon.json").exists()
+
+
+def test_seed_stops_when_the_sysbox_subnet_is_a_local_network(tmp_path):
+    result = run_check(
+        tmp_path,
+        "seed_sysbox_network_config",
+        env={"STUB_ALL_CONTAINERS": "aaa old_one", "STUB_IP_LOCAL": "172.25.0.0"},
+        files={"etc/docker/daemon.json": "{}"},
+        with_jq=True,
+    )
+    assert result.rc == 1
+    assert "overlaps a local network" in result.output
+    assert _daemon_json(tmp_path) == "{}"
