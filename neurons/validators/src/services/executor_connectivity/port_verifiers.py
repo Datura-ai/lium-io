@@ -106,8 +106,9 @@ class BatchVerifier:
 
             except asyncio.TimeoutError:
                 if start_watch.verified and len(start_watch.verified.successful) >= min_ports:
-                    # the deadline fired after enough ports answered (a loaded host's starts use most of the 60 s);
-                    # fewer than min_ports would fail the port check, so attempt 2 and the slower tiers run
+                    # the deadline fired after enough ports answered (a loaded host's starts use
+                    # most of the 60 s); fewer than min_ports would fail the port check, so
+                    # attempt 2 and the slower tiers run
                     logger.info(
                         _m(
                             f"complete: {len(start_watch.verified.successful)}/{len(ports)} verified at the deadline",

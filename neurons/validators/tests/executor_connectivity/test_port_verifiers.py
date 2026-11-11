@@ -340,8 +340,8 @@ async def test_batch_caps_the_reprobe_when_only_the_published_sample_answers(moc
 
 @pytest.mark.asyncio
 async def test_batch_runs_attempt_2_when_the_deadline_fires_below_min_ports(mocker):
-    # DAH-5699: ports that answered before the deadline are kept only when they meet min_ports; one of the 3
-    # needed would fail the port check, so attempt 2 and the slower tiers still run
+    # DAH-5699: ports that answered before the deadline are kept only when they meet min_ports;
+    # one of the 3 needed would fail the port check, so attempt 2 and the slower tiers still run
     from services.executor_connectivity.port_verifiers import BatchVerifier
 
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
