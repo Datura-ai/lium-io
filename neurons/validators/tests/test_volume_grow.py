@@ -3,7 +3,7 @@ import fcntl
 import os
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from services.volume_grow import (
@@ -13,6 +13,7 @@ from services.volume_grow import (
     GROW_SCRIPT,
     ORDER_LABEL,
     grow_short_volumes,
+    credit_volumes_on_host,
     host_free_bytes,
     order_labels,
 )
@@ -668,6 +669,58 @@ async def test_host_free_bytes_reads_the_hosts_docker_root_through_pid_1():
     assert await host_free_bytes(ssh) == 123
     command = ssh.run.await_args.args[0]
     assert "h=/proc/1/root$r" in command and 'df -P -B1 "$h"' in command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("credit_volumes", "removed_orphans", "free_published_gb"),
+    [
+        # a customer create evicted the Engy cache since the scrape: its space is in the raw read already
+        (set(), 0, 10),
+        # the sweep removed an orphan, but the cache the credit stands for is still on the host
+        ({"engy_cache_x"}, 1, 150),
+    ],
+)
+async def test_the_cap_credits_only_the_cache_volumes_still_on_the_host(
+    monkeypatch, credit_volumes, removed_orphans, free_published_gb
+):
+    from dataclasses import replace
+
+    from services.task.checks import stale_container_cleanup as module
+    from services.task.checks.disk_space import KB_PER_GB
+
+    from tests.test_container_cleanup import _cleanup_check_ctx
+
+    monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
+    monkeypatch.setattr(module, "host_free_bytes", AsyncMock(side_effect=[160 * GB, 10 * GB]))
+    monkeypatch.setattr(module, "credit_volumes_on_host", AsyncMock(return_value=credit_volumes))
+    monkeypatch.setattr(
+        module, "grow_short_volumes", AsyncMock(return_value=GrowPass(allocated_bytes=150 * GB, attempted=True))
+    )
+    ctx = _cleanup_check_ctx([], [])
+    ctx.services.container_cleanup.remove_orphan_rental_volumes.return_value = removed_orphans
+    disk = {
+        "hard_disk": {
+            "free": 300 * KB_PER_GB,
+            "used": 0,
+            "utilization": 0,
+            "filler_released": 200 * KB_PER_GB,
+            "by_volume": {"engy_cache_x": 200 * KB_PER_GB},
+        }
+    }
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, specs=disk)})
+
+    result = await module.StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].specs["hard_disk"]["free"] == free_published_gb * KB_PER_GB
+
+
+@pytest.mark.asyncio
+async def test_credit_volumes_on_host_lists_the_filler_and_engy_cache_volumes():
+    ssh = MagicMock()
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout="filler_vol\nengy_cache_a\n"))
+
+    assert await credit_volumes_on_host(ssh) == {"filler_vol", "engy_cache_a"}
 
 
 @pytest.mark.asyncio

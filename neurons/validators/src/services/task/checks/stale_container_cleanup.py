@@ -21,6 +21,7 @@ from services.volume_grow import (
     GROW_PASS_MAX_SECONDS,
     SSH_CALL_TIMEOUT_SECONDS,
     GrowPass,
+    credit_volumes_on_host,
     grow_short_volumes,
     host_free_bytes,
     pod_ids_at_endpoint,
@@ -213,8 +214,8 @@ class StaleContainerCleanupCheck:
             if grow_pod_ids
             else None
         )
-        # bounded by the shared budget above, keeping a disk read's worth for the measurement after it
-        grow_budget = grow_deadline - time.monotonic() - SSH_CALL_TIMEOUT_SECONDS
+        # bounded by the shared budget above, keeping two reads' worth for the measurement after it
+        grow_budget = grow_deadline - time.monotonic() - 2 * SSH_CALL_TIMEOUT_SECONDS
         grown = (
             await grow_short_volumes(ctx.ssh, grow_pod_ids, grow_budget)
             if grow_pod_ids and grow_budget > 0
@@ -241,6 +242,11 @@ class StaleContainerCleanupCheck:
             if grown.attempted and free_before is not None
             else None
         )
+        credit_volumes = (
+            await credit_volumes_on_host(ctx.ssh, min(SSH_CALL_TIMEOUT_SECONDS, grow_deadline - time.monotonic()))
+            if free_after is not None
+            else None
+        )
         measured = free_before - free_after if free_after is not None else grown.allocated_bytes
         taken = measured + grown.unreported_bytes
         # free_after also caps it: what the renters wrote since the scrape is in that read, not in the delta.
@@ -248,7 +254,11 @@ class StaleContainerCleanupCheck:
         # (the next scrape restores it) rather than a figure that may sit above the floor when the disk does not
         specs_after_grow = (
             specs_after_disk_taken(
-                ctx, taken, free_after if free_after is not None else 0, scrape_credit_held=not removed_orphan_volumes
+                ctx,
+                taken,
+                free_after if free_after is not None else 0,
+                scrape_credit_held=not removed_orphan_volumes,
+                credit_volumes=credit_volumes,
             )
             if grown.attempted
             else None

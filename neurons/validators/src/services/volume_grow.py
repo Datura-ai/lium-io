@@ -147,6 +147,28 @@ async def host_free_bytes(
     return int(free) if result.exit_status == 0 and free.isdigit() else None
 
 
+async def credit_volumes_on_host(
+    ssh_client: asyncssh.SSHClientConnection, timeout_seconds: float = SSH_CALL_TIMEOUT_SECONDS
+) -> set[str] | None:
+    """The volumes the scrape counts as free disk (release_filler_cache) still on the host: the filler run volumes and
+    the Engy cache. One removed since the scrape (the cleanup's sweep, a customer create's eviction) is free in a raw
+    read already. None when unread or out of time."""
+    if timeout_seconds <= 0:
+        return None
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            result = await ssh_client.run(
+                "/usr/bin/docker volume ls -q --filter label=io.lium.workload=filler"
+                " && /usr/bin/docker volume ls -q --filter name=engy_cache_",
+                timeout=timeout_seconds,
+            )
+    except Exception:  # noqa: BLE001 - unread: the caller falls back to the scrape's credit
+        return None
+    if result.exit_status != 0 or not isinstance(result.stdout, str):
+        return None
+    return set(result.stdout.split())
+
+
 async def grow_short_volumes(
     ssh_client: asyncssh.SSHClientConnection,
     live_pod_ids: set[str],
