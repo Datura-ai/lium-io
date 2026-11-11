@@ -2380,9 +2380,11 @@ class MinerService:
                         log_extra=default_extra,
                         operation_name="SSH key submit",
                     )
-                    # A request held up by the restart reaches the new miner after the signature aged out.
+                    # A request held up (a restarting miner, or a busy one at the top of the hour when the hourly
+                    # backups start) reaches it after the signature aged out. The miner refused it before acting,
+                    # so any request, not only a create, is signed anew and resent.
                     stale = status == 401 and "too old" in str(response_data)
-                    if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
+                    if not stale or time.monotonic() >= deadline:
                         break
                 except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError):
                     # refused, or a connect nobody answered: it never reached the miner, so its rental hook did not
