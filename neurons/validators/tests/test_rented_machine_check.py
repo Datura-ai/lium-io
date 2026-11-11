@@ -193,9 +193,12 @@ class DummyScoreCalculator:
 
 
 class DummyBackendClient:
-    def __init__(self, *, active: bool | None = True, local_volume_path: str | None = None):
+    def __init__(
+        self, *, active: bool | None = True, local_volume_path: str | None = None, status: str | None = "RUNNING"
+    ):
         self.active = active
         self.local_volume_path = local_volume_path
+        self.status = status
         self.called_with: list[str] = []
         self.host_reboot_recoveries: list[tuple[str, str]] = []
 
@@ -207,6 +210,7 @@ class DummyBackendClient:
             active=self.active,
             rental_closed_at=None,
             local_volume_path=self.local_volume_path,
+            status=self.status,
         )
 
     async def report_pod_host_reboot_recovered(self, pod_id: str, container_finished_at: str):
@@ -1536,12 +1540,12 @@ async def test_tenant_enforcement_clears_a_leftover_recovery_mark_on_a_running_p
 
     redis.delete.side_effect = ConnectionError("Redis down")
     assert (await cycle()).passed  # a failed delete is harmless
-    assert marks
+    assert "stopped_by_recovery:pod-1" in marks
 
     redis.delete.side_effect = lambda key: marks.pop(key, None)
     lock.acquire.return_value = False  # a recovery holds the create lock between its mark and its stop
     assert (await cycle()).passed
-    assert marks
+    assert "stopped_by_recovery:pod-1" in marks
 
     async def acquire(*args, **kwargs):  # a competing recovery marks and stops the pod, then releases the lock
         if stopped_before_lock:
@@ -1552,7 +1556,7 @@ async def test_tenant_enforcement_clears_a_leftover_recovery_mark_on_a_running_p
     lock.acquire.side_effect = acquire
     assert (await cycle()).passed
     # only a pod still running under the lock loses its mark
-    assert bool(marks) is stopped_before_lock
+    assert ("stopped_by_recovery:pod-1" in marks) is stopped_before_lock  # marks also holds the path cache
     lock.release.assert_awaited()
     if stopped_before_lock:
         return
@@ -2600,3 +2604,46 @@ async def test_tenant_enforcement_every_two_pod_combination(context_factory, ord
         assert "state" not in result.updates or result.updates["state"].rented_data == rented_data
     if verdict == Msg.STALE_POD_NOT_RUNNING.reason:
         assert result.updates["rented"] is False
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_asks_the_backend_for_a_running_pods_plaintext_path_once(context_factory):
+    # the path is set at create: asking for every running pod every cycle burst the backend into timeouts (10 Nov)
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    backend = DummyBackendClient(active=True, local_volume_path="/workspace")
+    redis = FakeRedis()
+
+    for _ in range(3):
+        result = await TenantEnforcementCheck().run(
+            build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis)
+        )
+        assert result.passed, result.event
+
+    assert backend.called_with == ["pod-1"]
+    assert [c.args[2] for c in docker.encrypted_volume_mount_missing.await_args_list] == ["/workspace"] * 3
+
+
+@pytest.mark.parametrize(
+    "first_answer",
+    [{"active": None}, {"active": True, "status": "PENDING", "local_volume_path": None}],
+    ids=["unanswered", "create_in_flight"],
+)
+@pytest.mark.asyncio
+async def test_tenant_enforcement_asks_again_until_a_running_pod_answers_its_plaintext_path(context_factory, first_answer):
+    # a pending pod's row has no path until its ContainerCreated is stored: that answer is not kept
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    backend = DummyBackendClient(**first_answer)
+    redis = FakeRedis()
+
+    await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
+    assert "plaintext_volume_path:pod-1" not in redis.store
+    backend.active, backend.status, backend.local_volume_path = True, "RUNNING", None  # running, no encrypted volume
+    await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
+    await TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
+
+    assert backend.called_with == ["pod-1", "pod-1"]
+    assert redis.store["plaintext_volume_path:pod-1"] == ""
