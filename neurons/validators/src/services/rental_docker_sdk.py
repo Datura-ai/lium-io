@@ -369,8 +369,8 @@ class ContainerRunSpec:
     # runs in the Docker thread between the create and the start call with the names of every container
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
-    # the CPU-refusal retry: never below min_cpu_count, pids_limit_for re-sizes pids.max for the granted
-    # count, on_cpus_granted is told the count the container got
+    # the CPU-refusal retry: only with a floor set (0 = no renter floor) and never below it, pids_limit_for
+    # re-sizes pids.max for the granted count, on_cpus_granted is told the count the container got
     min_cpu_count: int | None = None
     pids_limit_for: Callable[[int], int | None] | None = field(default=None, repr=False, compare=False)
     on_cpus_granted: Callable[[int], None] | None = field(default=None, repr=False, compare=False)
@@ -1121,7 +1121,9 @@ class RentalDockerSdkClient:
                     and cpus
                     and daemon_cpus
                     and cpus - 2 <= daemon_cpus < cpus
-                    and daemon_cpus >= (spec.min_cpu_count or 0)
+                    # no floor (None) means a backend that cannot record the granted count: hold the downgrade
+                    and spec.min_cpu_count is not None
+                    and daemon_cpus >= spec.min_cpu_count
                 ):
                     logger.warning(
                         _m(

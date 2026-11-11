@@ -901,6 +901,18 @@
           "$ref": "#/$defs/BackendMessageType",
           "default": "ContainerCreateRequest"
         },
+        "min_cpu_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Cpu Count"
+        },
         "min_volume_gb": {
           "anyOf": [
             {
@@ -1081,6 +1093,18 @@
         "container_name": {
           "title": "Container Name",
           "type": "string"
+        },
+        "cpu_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpu Count"
         },
         "executor_id": {
           "title": "Executor Id",
@@ -6610,7 +6634,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.11.0",
+  "protocol_version": "2.12.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

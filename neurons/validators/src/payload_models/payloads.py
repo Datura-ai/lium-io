@@ -333,7 +333,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
     gpu_uuids: list[str]
     cpu_count: int | None = None
-    # the renter's own CPU floor (rent by spec); a node that cannot grant it is refused, never shrunk below it
+    # the renter's own CPU floor (0 = none); a node that cannot grant it is refused, never shrunk below it. None
+    # (a backend that does not read ContainerCreated.cpu_count) refuses any shrink
     min_cpu_count: int | None = None
     memory_gb: int | None = None
     custom_options: CustomOptions | None = None

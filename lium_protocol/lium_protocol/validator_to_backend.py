@@ -446,6 +446,9 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # 2.12.0: the CPUs the container got, below the ordered count when the daemon had fewer (see
+    # `ContainerCreateRequest.min_cpu_count`); None from an older validator
+    cpu_count: int | None = None
 
 
 @VALIDATOR_MESSAGES.register

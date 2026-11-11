@@ -858,7 +858,7 @@ async def test_run_container_retries_a_cpu_refusal_only_once():
 
     with pytest.raises(RentalDockerOperationError, match="only 6 CPUs available"):
         await RentalDockerSdkClient(api_client).run_container(
-            ContainerRunSpec(image="img", name="pod_t", cpu_count=12)
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=12, min_cpu_count=0)
         )
 
     assert api_client.create_nano_cpus == [12_000_000_000, 10_000_000_000]
@@ -870,7 +870,7 @@ async def test_run_container_does_not_retry_a_cpu_refusal_past_the_bound():
 
     with pytest.raises(RentalDockerOperationError, match="only 10 CPUs available"):
         await RentalDockerSdkClient(api_client).run_container(
-            ContainerRunSpec(image="img", name="pod_t", cpu_count=64)
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=64, min_cpu_count=0)
         )
 
     assert api_client.create_nano_cpus == [64_000_000_000]
@@ -882,10 +882,21 @@ async def test_run_container_does_not_retry_a_cpu_refusal_more_than_two_cpus_sho
 
     with pytest.raises(RentalDockerOperationError, match="only 4 CPUs available"):
         await RentalDockerSdkClient(api_client).run_container(
-            ContainerRunSpec(image="img", name="pod_t", cpu_count=11)
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=11, min_cpu_count=0)
         )
 
     assert api_client.create_nano_cpus == [11_000_000_000]
+
+
+@pytest.mark.asyncio
+async def test_run_container_does_not_shrink_the_cpus_without_a_floor_from_the_backend():
+    # an older backend sends no min_cpu_count and would not read the granted count back: refuse, never shrink silently
+    api_client = CpuRefusingApiClient(daemon_cpus=10)
+
+    with pytest.raises(RentalDockerOperationError, match="only 10 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(ContainerRunSpec(image="img", name="pod_t", cpu_count=12))
+
+    assert api_client.create_nano_cpus == [12_000_000_000]
 
 
 @pytest.mark.asyncio

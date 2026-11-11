@@ -144,6 +144,10 @@ class ContainerCreateRequest(ContainerRequest):
     user_public_keys: list[str] = []
     gpu_uuids: list[str]
     cpu_count: int | None = None
+    # 2.12.0: the renter's CPU floor; 0 = no floor. With it set the validator may rent a node whose daemon has a few
+    # CPUs fewer than `cpu_count`, never below the floor, and reports the count in `ContainerCreated.cpu_count`. None
+    # (an older backend, which does not read that count) refuses any shrink
+    min_cpu_count: int | None = None
     memory_gb: int | None = None
     custom_options: CustomOptions | None = None
     debug: bool | None = None
