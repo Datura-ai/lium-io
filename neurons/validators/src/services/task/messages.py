@@ -2503,6 +2503,32 @@ class CpuTruthMessages:
     )
 
 
+class DockerCpuMessages:
+    """The Docker daemon sees fewer CPUs than the machine reports. MISMATCH fails the validation."""
+
+    OK = MessageTemplate(
+        event="Docker CPU count check passed",
+        reason="DOCKER_CPU_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="error",
+        category="env",
+        impact="Score set to 0 for this cycle; rentals on this node fail until Docker sees every CPU",
+    )
+    WARNING = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="warning",
+        category="env",
+        impact="Warning only: score unchanged",
+    )
+
+
 class GpuKernelCountMessages:
     """Reported GPU list against the kernel's list (/proc/driver/nvidia/gpus). COUNT_MISMATCH
     fails the validation; UUID_MISMATCH is logged only."""
