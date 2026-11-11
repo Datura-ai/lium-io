@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import shlex
 import time
@@ -85,9 +86,10 @@ async def _filler_pods_running(ctx: Context, pod_ids: set[str]) -> set[str]:
         return set()
     names = " ".join(shlex.quote(f"{FILLER_CONTAINER_PREFIX}{pod_id}") for pod_id in sorted(pod_ids))
     try:
-        # exits 1 when one name is missing but still prints the others
-        result = await ctx.ssh.run(
-            f"/usr/bin/docker inspect --format '{{{{.Name}}}} {{{{.State.Running}}}}' {names}",
+        # exits 1 when one name is missing but still prints the others; wait_for also bounds a session that never
+        # opens, which asyncssh's own timeout does not cover
+        result = await asyncio.wait_for(
+            ctx.ssh.run(f"/usr/bin/docker inspect --format '{{{{.Name}}}} {{{{.State.Running}}}}' {names}"),
             timeout=FILLER_INSPECT_TIMEOUT_SECONDS,
         )
     except Exception:  # noqa: BLE001

@@ -11,6 +11,7 @@ that leaves our cap alone and merely resets the limit after the job ends, which 
 This suite covers the three halves: the rule, the recording, and the incentive gate.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -418,6 +419,29 @@ async def test_a_revert_needs_an_answer_from_the_host(context_factory, monkeypat
     ssh.run.side_effect = OSError("ssh dropped")
 
     await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [_record()], [("GPU-a", 400.0)], ssh=ssh)
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_host_whose_session_hangs_records_no_revert_and_does_not_hold_the_check(
+    context_factory, monkeypatch
+) -> None:
+    # asyncssh's own timeout starts only once the process is open, so a session that never opens needs a bound
+    monkeypatch.setattr(check_module, "FILLER_INSPECT_TIMEOUT_SECONDS", 0.05)
+    redis = FakeRedis()
+    ssh = AsyncMock()
+
+    async def never_opens(*_args, **_kwargs) -> FakeRun:
+        await asyncio.sleep(60)
+        return FakeRun()
+
+    ssh.run.side_effect = never_opens
+
+    await asyncio.wait_for(
+        _run_check_while_filler_runs(context_factory, monkeypatch, redis, [_record()], [("GPU-a", 400.0)], ssh=ssh),
+        timeout=5,
+    )
 
     assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
 
