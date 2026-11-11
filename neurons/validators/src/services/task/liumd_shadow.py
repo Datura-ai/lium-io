@@ -33,7 +33,6 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Callable
 
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
@@ -139,6 +138,46 @@ def _workload_on_node(ctx: Context, today: dict[str, TodayStep]) -> bool:
     return bool(executor and executor.pods)
 
 
+def _reserved(ctx: Context) -> bool:
+    executor = ctx.executor
+    key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
+    reserved = settings.get_liumd_shadow_reserved_executors()
+    return reserved is None or key in reserved
+
+
+def start_facts_after_scrape(
+    ctx: Context, client_factory: Callable[[Context, float], Any] | None = None
+) -> asyncio.Task | None:
+    """Start liumd's docker and ports read in the background right after machine_scrape, so both
+    read the same containers; the shadow awaits it at the end of the run. None when no shadow
+    will compare this node."""
+    if not settings.VALIDATOR_LIUMD_SHADOW or settings.DRY_RUN or ctx.config.first_pass:
+        return None
+    if ctx.config.validator_keypair is None or not _reserved(ctx) or _workload_on_node(ctx, {}):
+        return None
+    return asyncio.create_task(_facts_only(ctx, client_factory or _default_client))
+
+
+async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], Any]) -> Any:
+    """The liumd answer to a facts-only intent, or the LocalVerifyUnavailable it failed with."""
+    budget = float(settings.LIUMD_SHADOW_TIMEOUT_SECONDS)
+    intent = build_intent(
+        executor_uuid=ctx.executor.uuid,
+        miner_hotkey=ctx.miner_hotkey,
+        matmul=None,
+        verifyx=None,
+        parallel_gpu=False,
+        deadline_s=executor_deadline_s(int(budget)),
+    )
+    intent["steps"]["inspector"] = False
+    try:
+        return await client_factory(ctx, budget).run(ctx.ssh, intent)
+    except LocalVerifyUnavailable as exc:
+        return exc
+    except Exception as exc:  # noqa: BLE001 — the task is awaited later; never fail the cycle
+        return LocalVerifyUnavailable("internal_error", f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS])
+
+
 def _default_client(ctx: Context, timeout_s: float) -> LiumdExecClient:
     return LiumdExecClient(ctx.config.validator_keypair, timeout_s=timeout_s)
 
@@ -202,10 +241,7 @@ async def _compare(
     # is meant to be reserved and non-rentable. `all` can include rentable nodes, so GPU steps are
     # refused with `all` until the rental-overlap guard exists.
     # Executor UUIDs are miner-chosen: an entry matches only its miner's executor at its endpoint.
-    executor = ctx.executor
-    key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
-    reserved = settings.get_liumd_shadow_reserved_executors()
-    if reserved is not None and key not in reserved:
+    if not _reserved(ctx):
         return _skipped("not_reserved", steps=steps)
     if _workload_on_node(ctx, today):
         return _skipped("workload", steps=steps)
@@ -299,9 +335,17 @@ async def _compare(
             deadline_s=executor_deadline_s(int(budget)),
         )
         intent["steps"]["inspector"] = False
-        client = client_factory(ctx, budget)
+        # The facts come from the read taken right after machine_scrape; liumd is called again
+        # here only for GPU steps.
+        early = ctx.state.liumd_facts_task
+        facts_answer = await early if early is not None else None
         try:
-            answer = await client.run(ctx.ssh, intent)
+            if facts_answer is not None and matmul_challenge is None and verifyx_challenge is None:
+                answer = facts_answer
+            else:
+                answer = await client_factory(ctx, budget).run(ctx.ssh, intent)
+            if isinstance(answer, LocalVerifyUnavailable):
+                raise answer
         except LocalVerifyUnavailable as exc:
             return {
                 "outcome": "unavailable",
@@ -321,7 +365,11 @@ async def _compare(
                 "steps": steps,
                 "first_pass": first_pass,
             }
-        return _judged(ctx, answer, today, steps, matmul_challenge, verifyx_challenge, extra)
+        if not isinstance(facts_answer, LocalVerifyAnswer):
+            facts_answer = answer
+        return _judged(
+            ctx, answer, today, steps, matmul_challenge, verifyx_challenge, extra, facts_answer
+        )
     finally:
         if matmul_challenge is not None:
             matmul_challenge.close()
@@ -366,6 +414,7 @@ def _judged(
     matmul_challenge,
     verifyx_challenge,
     extra: dict,
+    facts_answer: LocalVerifyAnswer,
 ) -> dict[str, Any]:
     if matmul_challenge is not None:
         step = answer.step("matmul")
@@ -423,7 +472,7 @@ def _judged(
             entry["agree"] = entry["liumd_verdict"] == today[name].verdict
             compared.append(entry["agree"])
     complete = len(compared) == len(requested)
-    facts = _facts(ctx, answer)
+    facts = _facts(ctx, facts_answer)
     return {
         "outcome": "compared",
         "reason": "ok",
@@ -445,29 +494,18 @@ def _logged_fact(value: Any) -> Any:
     return value if len(text) <= DETAIL_MAX_CHARS else text[:DETAIL_MAX_CHARS]
 
 
-def _created_after(created: Any, since: float) -> bool:
-    """Whether docker's RFC 3339 `Created` is after `since` (epoch seconds); unparsable is not."""
-    if not isinstance(created, str):
-        return False
-    try:
-        return datetime.fromisoformat(created).timestamp() > since
-    except ValueError:
-        return False
-
-
 def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     """Compare the facts both paths collect. Missing or skipped data is not a mismatch."""
     specs = ctx.state.specs or {}
     checks: list[dict[str, Any]] = []
 
-    def check(field: str, liumd: Any, python: Any, **notes: Any) -> None:
+    def check(field: str, liumd: Any, python: Any) -> None:
         checks.append(
             {
                 "field": field,
                 "liumd": _logged_fact(liumd),
                 "python": _logged_fact(python),
                 "agree": liumd == python,
-                **{k: _logged_fact(v) for k, v in notes.items() if v},
             }
         )
 
@@ -480,26 +518,13 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     ):
         # liumd lists every container; today's scrape lists the running ones, and `specs` is the
         # miner's raw machine JSON, so read it through the check that owns that shape.
-        # liumd runs minutes after the scrape, so containers started or removed in between
-        # (the check's own pod_<uuid>, a provider's rotating monitor) are churn, not drift.
-        containers = [c for c in data["containers"] if isinstance(c, dict) and c.get("name")]
-        started = time.time() - (time.monotonic() - ctx.started_at_monotonic)
-        created_since = {c["name"] for c in containers if _created_after(c.get("created"), started)}
-        python_all = {row.name for row in docker_containers(specs) if row.name}
-        removed_since = python_all - {c["name"] for c in containers}
         liumd_names = sorted(
             c["name"]
-            for c in containers
-            if c.get("status") == "running" and c["name"] not in created_since
+            for c in data["containers"]
+            if isinstance(c, dict) and c.get("name") and c.get("status") == "running"
         )
-        python_names = sorted(python_all - created_since - removed_since)
-        check(
-            "docker.container_names",
-            liumd_names,
-            python_names,
-            created_since_start=sorted(created_since),
-            removed_since_scrape=sorted(removed_since),
-        )
+        python_names = sorted(row.name for row in docker_containers(specs) if row.name)
+        check("docker.container_names", liumd_names, python_names)
 
     ports = answer.step("ports")
     data = ports.data if ports.status == "ok" and isinstance(ports.data, dict) else None

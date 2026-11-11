@@ -586,6 +586,9 @@ class MachineSpecScrapeCheck:
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
             )
+            from ..liumd_shadow import start_facts_after_scrape  # liumd_shadow imports checks
+
+            updated_state = replace(updated_state, liumd_facts_task=start_facts_after_scrape(ctx))
             updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
             return CheckResult(passed=True, event=event, updates=updates)
 

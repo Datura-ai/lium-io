@@ -4,6 +4,7 @@ with VALIDATOR_LIUMD_SHADOW off."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
 import time
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ from services.task.liumd_shadow import (
     LIUMD_SHADOW_EVENT,
     TodayStep,
     run_liumd_shadow,
+    start_facts_after_scrape,
     today_verdicts,
 )
 from services.task.models import JobResult
@@ -331,55 +333,64 @@ async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch
     }
 
 
+def _docker(*names):
+    return {"docker": {"data": {"containers": [{"name": n, "status": "running"} for n in names]}}}
+
+
+def _with_facts_task(ctx, early):
+    task = start_facts_after_scrape(ctx, early.factory)
+    return task, ctx.model_copy(update={"state": replace(ctx.state, liumd_facts_task=task)})
+
+
+@pytest.fixture
+def shadow_on(monkeypatch):
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SHADOW", True)
+    monkeypatch.setattr(settings, "DRY_RUN", False)
+
+
 @pytest.mark.asyncio
-async def test_containers_churned_since_the_scrape_are_not_drift(
-    keypair, monkeypatch, verifyx_service
+async def test_facts_come_from_the_read_right_after_the_scrape(
+    keypair, monkeypatch, verifyx_service, shadow_on
 ):
-    # Prod 11 Nov: the check's own pod_<uuid> and a rotating monitor read as drift.
-    specs = {
-        **SPECS,
-        "docker": {
-            "containers": [
-                {"name": "executor-1", "container_id": "c1"},
-                {"name": "monitor-old", "container_id": "c2"},
-            ]
-        },
-    }
-    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=specs))
-    later = datetime.now(UTC).isoformat().replace("+00:00", "123Z")
-    fake = FakeLiumd(
-        facts={
-            "docker": {
-                "data": {
-                    "containers": [
-                        {"name": "executor-1", "status": "running", "created": "2026-01-01T00:00:00Z"},
-                        {"name": "pod_x", "status": "running", "created": later},
-                        {"name": "monitor-new", "status": "running", "created": later},
-                    ]
-                },
-            }
-        }
-    )
-
-    record = await _shadow(ctx, fake)
-
-    entry = {c["field"]: c for c in record["facts"]}["docker.container_names"]
-    assert entry["agree"] is True and entry["liumd"] == ["executor-1"]
-    assert entry["created_since_start"] == ["monitor-new", "pod_x"]
-    assert entry["removed_since_scrape"] == ["monitor-old"]
-
-
-@pytest.mark.asyncio
-async def test_a_running_container_liumd_misses_is_still_drift(keypair, monkeypatch, verifyx_service):
+    # Prod 11 Nov: a read at the end of the run saw the check's own pod_<uuid> the scrape had not.
     specs = {**SPECS, "docker": {"containers": [{"name": "executor-1", "container_id": "c1"}]}}
     ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=specs))
-    fake = FakeLiumd(
-        facts={"docker": {"data": {"containers": [{"name": "executor-1", "status": "exited"}]}}}
-    )
+    early = FakeLiumd(facts=_docker("executor-1"))
+    task, ctx = _with_facts_task(ctx, early)
+    late = FakeLiumd(facts=_docker("executor-1", "pod_x"))
 
-    record = await _shadow(ctx, fake)
+    record = await _shadow(ctx, late)
 
-    assert record["facts_agree"] is False
+    assert task is not None and record["facts_agree"] is True
+    assert len(early.intents) == 1
+    assert not early.intents[0]["steps"]["matmul"] and not early.intents[0]["steps"]["verifyx"]
+    assert late.intents == []  # GPU steps off: liumd is not called a second time
+
+
+@pytest.mark.asyncio
+async def test_no_post_scrape_read_on_a_rented_node(keypair, monkeypatch, verifyx_service, shadow_on):
+    node = {
+        "miner_hotkey": "5Miner",
+        "executor_ip_address": "10.0.0.5",
+        "executor_ip_port": "8001",
+        "pods": [{"pod_id": "p1", "container_name": "c1"}],
+    }
+    rented = RentedExecutorsResponse.model_validate({"executors": {UUID: node}})
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=SPECS, rented_data=rented))
+
+    assert start_facts_after_scrape(ctx, FakeLiumd().factory) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_scrape_read_is_logged_unavailable(
+    keypair, monkeypatch, verifyx_service, shadow_on
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    _, ctx = _with_facts_task(ctx, FakeLiumd(result=LocalVerifyUnavailable("transport", "closed")))
+
+    record = await _shadow(ctx, FakeLiumd())
+
+    assert (record["outcome"], record["reason"]) == ("unavailable", "transport")
 
 
 @pytest.mark.asyncio

@@ -247,6 +247,9 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # The liumd shadow's docker and ports read, started right after machine_scrape so both see the
+    # same containers; awaited by the shadow at the end of the run. None = no shadow for this node.
+    liumd_facts_task: Any = None
     # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
     verifyx_cold_retry: Any = None
 
