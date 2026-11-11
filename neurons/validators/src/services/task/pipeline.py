@@ -382,6 +382,7 @@ class EventSink(Protocol):
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
         "EXECUTOR_IMAGE_OUTDATED",
+        "EXECUTOR_IMAGE_UNOFFICIAL",
         "PROVIDER_BANNED",
         "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
     }

@@ -38,10 +38,9 @@ def calculate_scores(
     # Outdated executor image (DAH-2701). Enforcement is off by default until nodes
     # auto-update again (DAH-3419); off, ExecutorImageCheck logs the verdict as a warning.
     image_report = getattr(ctx.state, "executor_image_report", None)
-    if (
-        settings.EXECUTOR_IMAGE_CHECK_ENFORCE
-        and image_report
-        and image_report.status is ImageVerdict.OUTDATED
+    if image_report and (
+        image_report.status is ImageVerdict.UNOFFICIAL
+        or (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and image_report.status is ImageVerdict.OUTDATED)
     ):
         actual_score = 0.0
         job_score = 0.0
@@ -62,17 +61,16 @@ def calculate_scores(
         )
 
     # Minimal-G5 CVM attestation gate: a CVM-flagged executor (it presented a TDX
-    # quote) whose attestation did not pass earns nothing while TCB enforcement is
+    # quote) whose TDX attestation did not pass earns nothing while TCB enforcement is
     # on. Non-CVM executors (no quote) are untouched — omitted-quote bypass by a
-    # known CVM is rejected upstream by the attestation ratchet.
-    if (
-        settings.ENABLE_TCB_ENFORCEMENT
-        and ctx.executor.tdx_quote
-        and not ctx.tdx_attestation_passed
-    ):
+    # known CVM is rejected upstream by the attestation ratchet. GPU attestation is
+    # observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
+    # (only verified beside a TDX digest, so False implies one), and that alone must not zero the score.
+    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
+    if settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed:
         actual_score = 0.0
         job_score = 0.0
-        warning_messages.append("CVM attestation not passed (TDX/GPU attestation required)")
+        warning_messages.append("CVM attestation not passed (TDX attestation required)")
 
     # CPU-truth gate: the advertised CPU(s) count is contradicted by the kernel-present
     # population. CpuTruthCheck is non-fatal and runs before this, so passed=False alone would
