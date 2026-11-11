@@ -44,10 +44,14 @@ fi
 if [ "$cur" -ge "$order" ]; then echo full "$fs"; exit 0; fi
 command -v xfs_growfs >/dev/null 2>&1 || { echo no-xfs-growfs "$cur"; exit 0; }
 # allocated, not apparent, size: a sparse file's unwritten space is already in avail (counting it twice grows the
-# volume every pass); for a preallocated file the two are the same. Read before avail: a renter write in between
-# then lowers avail only, so the target errs low, never counting the same bytes twice
-alloc=$(( $(stat -c %b "$file") * $(stat -c %B "$file") ))
+# volume every pass); for a preallocated file the two are the same. Read on both sides of avail and take the smaller:
+# a renter write in between raises the later read, a discard (fstrim punches holes in the file) lowers it, and either
+# way the smaller read never counts bytes that avail also counts
+alloc_bytes() { echo $(( $(stat -c %b "$file") * $(stat -c %B "$file") )); }
+alloc=$(alloc_bytes)
 avail=$(df -P -B1 "$(dirname "$file")" | awk 'NR==2 {print $4}')
+after=$(alloc_bytes)
+if [ "$after" -lt "$alloc" ]; then alloc=$after; fi
 target=$((alloc + avail - headroom))
 if [ "$target" -gt "$order" ]; then target=$order; fi
 target=$((target / 4096 * 4096))

@@ -215,25 +215,40 @@ def test_the_host_script_finds_the_backing_file_outside_the_plugins_srv_view(tmp
     )
 
 
-def test_the_host_script_reads_the_allocated_size_before_free_disk(tmp_path):
-    # a renter write between the reads must lower free disk only, never count the same bytes twice
+@pytest.mark.parametrize(
+    ("alloc_reads_gb", "avail_gb"),
+    [((5, 105), 15), ((105, 5), 115)],
+    ids=["renter-write-between-reads", "fstrim-between-reads"],
+)
+def test_bytes_moving_between_the_reads_are_never_counted_twice(tmp_path, alloc_reads_gb, avail_gb):
+    # sparse, 110 GB apparent: 100 GB is written (or trimmed) while free disk is read, so there is no room either way
     log = tmp_path / "calls"
+    reads = tmp_path / "reads"
+    reads.write_text("".join(f"{gb * GB // 512}\n" for gb in alloc_reads_gb))
     _stub(tmp_path, "findmnt", "echo /dev/loop7")
-    _stub(tmp_path, "losetup", "echo /data/volume_live")
     _stub(
-        tmp_path, "stat", f'echo "stat $2" >> {log}; case "$2" in %b) echo 1;; *) echo 512;; esac'
+        tmp_path,
+        "losetup",
+        f'[ "$1" = -c ] && echo "losetup $*" >> {log} || echo /data/volume_live',
     )
-    _stub(tmp_path, "df", f'echo df >> {log}; echo "h"; echo "/dev/x 0 0 0 0% /"')
-    _stub(tmp_path, "xfs_growfs", "true")
+    _stub(
+        tmp_path,
+        "stat",
+        f'case "$2" in %s) echo {110 * GB};; %B) echo 512;; '
+        f"%b) head -n1 {reads}; tail -n +2 {reads} > {reads}.n; mv {reads}.n {reads};; esac",
+    )
+    _stub(tmp_path, "df", f'echo h; echo "/dev/x 0 0 {avail_gb * GB} 0% /"')
+    _stub(tmp_path, "truncate", f'echo "truncate $*" >> {log}')
+    _xfs(tmp_path, log, before=110 * GB, after=110 * GB)
 
-    subprocess.run(
-        ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/x", str(466 * GB), str(10 * GB), "true"],
+    result = subprocess.run(
+        ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/volume_live", str(466 * GB), str(10 * GB), "true"],
         capture_output=True,
         text=True,
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
     )
 
-    assert log.read_text().split("\n").index("df") > log.read_text().split("\n").index("stat %B")
+    assert (result.stdout.strip(), log.exists()) == (f"no-room {110 * GB}", False)
 
 
 @pytest.mark.parametrize(("cur_gb", "outcome"), [(466, "full"), (300, "no-room")])
