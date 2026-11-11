@@ -6319,6 +6319,26 @@ async def test_resolve_volume_sizing_takes_the_free_disk_measured_under_the_flat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_probe", [True, False])
+async def test_resolve_volume_sizing_leaves_killed_fillers_run_volumes_out_of_the_pool(docker_service, with_probe):
+    # DAH-5798: a trimmed run volume's disk is already back in df; counting its declared size too oversizes the slice
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=900 * _SIZING_GB,
+        volume_ls_stdout="volume_killed vloopback:latest\n",
+        volume_inspect_stdout=f"{300 * _SIZING_GB}|<no value>\n",
+    )
+    probe = VolumeHostProbe("/var/lib/docker", 900 * _SIZING_GB, ["volume_killed"], True) if with_probe else None
+
+    result = await docker_service.resolve_volume_sizing(
+        ssh_client, payload, "tag", {}, host_probe=probe, excluded_volume_names={"volume_killed"}
+    )
+
+    assert result.path == "fresh"
+    assert result.existing_volumes_bytes == 0
+
+
+@pytest.mark.asyncio
 async def test_resolve_volume_sizing_fresh_caps_volume_at_ext4_file_limit(docker_service):
     # Arrange: ~28 TiB free, whole node -> 2/3 slice is ~18 TiB, above the 16 TiB ext4 file cap.
     payload = _make_sizing_payload(disk_share=1.0, storage_limit_gb=1)

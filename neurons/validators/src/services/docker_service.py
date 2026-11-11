@@ -477,6 +477,10 @@ def _spare_port_pairs(
     return spare
 
 
+def _filler_run_volume_name(filler: str) -> str:
+    return f"volume_{filler.removeprefix(FILLER_CONTAINER_PREFIX)}"
+
+
 def _port_collision_candidates(
     spare: list[PayloadPortMapping], *, after_host_port: int, cap: int = _PORT_COLLISION_CANDIDATE_CAP
 ) -> list[PayloadPortMapping]:
@@ -6237,9 +6241,6 @@ class DockerService:
                     # a trimmed run volume still counts its declared size among the pod volumes (existing_gb) while
                     # its disk is back in df: without this the rental would be counted on that disk twice
                     fit = fit._replace(existing_gb=fit.existing_gb - freed_gb)
-            # shortcut: resolve_volume_sizing still counts a trimmed run volume in its pool until the filler's delete
-            # removes it (seconds later), so a split node's slice can read up to share x its size high; exclude killed
-            # fillers' volumes there if that shows in prod.
 
             def volume_remove(name: str) -> str:
                 if not killed:
@@ -6314,7 +6315,7 @@ class DockerService:
         default_extra: dict,
     ) -> float:
         """Unlink a killed filler's run volume files and fstrim its backing file; the GiB freed, 0 when not (DAH-5798)."""
-        run_volume = f"volume_{filler.removeprefix(FILLER_CONTAINER_PREFIX)}"
+        run_volume = _filler_run_volume_name(filler)
         try:
             declared_gb = await self._inspect_vloopback_volumes_bytes(ssh_client, [run_volume]) / (1024**3)
         except asyncio.CancelledError:
@@ -8180,6 +8181,7 @@ class DockerService:
     async def _get_existing_vloopback_bytes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
+        excluded_volume_names: frozenset[str] | set[str] = frozenset(),
     ) -> int:
         list_result = await ssh_client.run(
             '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
@@ -8195,7 +8197,7 @@ class DockerService:
             if len(parts) != 2:
                 continue
             name, driver = parts
-            if _is_reserved_vloopback_volume(name, driver):
+            if _is_reserved_vloopback_volume(name, driver) and name not in excluded_volume_names:
                 volume_names.append(name)
         return await self._inspect_vloopback_volumes_bytes(ssh_client, volume_names)
 
@@ -8308,8 +8310,12 @@ class DockerService:
         locked_df_avail_bytes: int | None = None,
         locked_df_error: Exception | None = None,
         flatten_copy_bytes: int | None = None,
+        excluded_volume_names: frozenset[str] | set[str] = frozenset(),
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        `excluded_volume_names` (killed fillers' run volumes, DAH-5798) stay out of the pool: their disk is
+        already back in df, so their declared size would count it twice.
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
         still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
@@ -8359,13 +8365,13 @@ class DockerService:
                 if df_avail_bytes is None:
                     df_avail_bytes = host_probe.df_avail_bytes
                 existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
-                    ssh_client, host_probe.vloopback_volume_names
+                    ssh_client, [n for n in host_probe.vloopback_volume_names if n not in excluded_volume_names]
                 )
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
                 if df_avail_bytes is None:
                     df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client, excluded_volume_names)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -10660,6 +10666,9 @@ class DockerService:
                 # DAH-5260: the Engy cache is listed as free disk; the caches go only when the rental does not fit
                 # beside them, and every removal is awaited here, before the volume is sized and docker run.
                 ordered_volume_gb = payload.volume_limit_gb
+                killed_fillers = (
+                    [] if beside_fillers else [n for n in removed_containers if n.startswith(FILLER_CONTAINER_PREFIX)]
+                )
                 reclaimed_cache_volumes = (
                     False
                     if beside_fillers
@@ -10668,7 +10677,7 @@ class DockerService:
                         payload=payload,
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
-                        killed_fillers=[name for name in removed_containers if name.startswith(FILLER_CONTAINER_PREFIX)],
+                        killed_fillers=killed_fillers,
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
@@ -10846,6 +10855,7 @@ class DockerService:
                         locked_df_avail_bytes=locked_df_avail_bytes,
                         locked_df_error=locked_df_error,
                         flatten_copy_bytes=flatten_copy,
+                        excluded_volume_names={_filler_run_volume_name(f) for f in killed_fillers},
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
