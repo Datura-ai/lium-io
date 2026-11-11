@@ -78,9 +78,9 @@ def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str
 FILLER_INSPECT_TIMEOUT_SECONDS = 30
 
 
-async def _filler_pods_stopped(ctx: Context, pod_ids: set[str]) -> set[str]:
-    """The pods among these whose filler container the host reports as stopped or absent (DAH-2786). Only a clear
-    answer counts: a pod the host does not answer for is not in the result."""
+async def _filler_pods_running(ctx: Context, pod_ids: set[str]) -> set[str]:
+    """The pods among these whose filler container the host reports as running now (DAH-2786). A pod the host does
+    not answer for is not in the result."""
     if ctx.ssh is None or not pod_ids:
         return set()
     names = " ".join(shlex.quote(f"{FILLER_CONTAINER_PREFIX}{pod_id}") for pod_id in sorted(pod_ids))
@@ -92,14 +92,12 @@ async def _filler_pods_stopped(ctx: Context, pod_ids: set[str]) -> set[str]:
         )
     except Exception:  # noqa: BLE001
         return set()
-    stopped: set[str] = set()
+    running: set[str] = set()
     for line in (getattr(result, "stdout", "") or "").splitlines():
         name, _, state = line.strip().lstrip("/").partition(" ")
-        if state == "false" and name.startswith(FILLER_CONTAINER_PREFIX):
-            stopped.add(name.removeprefix(FILLER_CONTAINER_PREFIX))
-    stderr: str = getattr(result, "stderr", "") or ""
-    stopped |= {pod_id for pod_id in pod_ids if f"No such object: {FILLER_CONTAINER_PREFIX}{pod_id}" in stderr}
-    return stopped & pod_ids
+        if state == "true" and name.startswith(FILLER_CONTAINER_PREFIX):
+            running.add(name.removeprefix(FILLER_CONTAINER_PREFIX))
+    return running & pod_ids
 
 
 class GpuPowerLimitCheck:
@@ -370,9 +368,9 @@ class GpuPowerLimitCheck:
                 reverts.append(revert)
         if reverts:
             # A claim the delete could not clear (Redis down through the teardown) outlives its job, and the backend
-            # still reports owner "lium" for a STOPPING run: a job whose container has stopped cannot be reverted
-            stopped = await _filler_pods_stopped(ctx, {revert.pod_id for revert in reverts})
-            reverts = [revert for revert in reverts if revert.pod_id not in stopped]
+            # still reports owner "lium" for a STOPPING run: only a job whose container runs now can be reverted
+            running = await _filler_pods_running(ctx, {revert.pod_id for revert in reverts})
+            reverts = [revert for revert in reverts if revert.pod_id in running]
         if reverts:
             await record_cap_reverts(
                 ctx.services.redis, ctx.executor.uuid, reverts, ctx.default_extra

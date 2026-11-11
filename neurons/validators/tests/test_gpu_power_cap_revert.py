@@ -412,14 +412,14 @@ async def test_a_claim_left_by_a_teardown_with_redis_down_is_not_a_revert(contex
 
 
 @pytest.mark.asyncio
-async def test_a_revert_is_dropped_only_on_a_clear_answer_from_the_host(context_factory, monkeypatch) -> None:
+async def test_a_revert_needs_an_answer_from_the_host(context_factory, monkeypatch) -> None:
     redis = FakeRedis()
     ssh = AsyncMock()
     ssh.run.side_effect = OSError("ssh dropped")
 
     await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [_record()], [("GPU-a", 400.0)], ssh=ssh)
 
-    assert _revert_key(CHECK_EXECUTOR_UUID) in redis.store
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
 
 
 @pytest.mark.asyncio
