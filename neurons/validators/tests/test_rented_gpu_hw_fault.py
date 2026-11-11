@@ -36,14 +36,15 @@ def test_a_clock_slowdown_bit_is_not_a_suspect():
     assert _suspects(clock_event_reasons=0x8 | 0x40 | 0x80) == []
 
 
-def test_a_narrow_link_is_a_suspect_and_a_slow_one_only_at_full_performance():
-    assert _suspects(pcie_width=8, pcie_width_max=16) == ["gpu 1 (GPU-1): PCIe link x8 of x16"]
-    # an idle card (P8) drops its link speed by design
+def test_a_narrow_or_slow_link_is_a_suspect_only_at_full_performance():
+    assert _suspects(pcie_width=8, pcie_width_max=16, pstate=0) == ["gpu 1 (GPU-1): PCIe link x8 of x16"]
+    # a card below P0 (a rented one between kernels too) narrows and slows its link by design (review)
+    assert _suspects(pcie_width=8, pcie_width_max=16, pstate=8) == []
     assert _suspects(pcie_gen=1, pcie_gen_max=4, pstate=8) == []
     assert _suspects(pcie_gen=3, pcie_gen_max=4, pstate=0) == ["gpu 1 (GPU-1): PCIe link gen 3 of gen 4"]
     assert _suspects(pcie_width=16, pcie_width_max=16, pcie_gen=4, pcie_gen_max=4, pstate=0) == []
     # not supported (None) is not judged
-    assert _suspects(pcie_width=None, pcie_width_max=16) == []
+    assert _suspects(pcie_width=None, pcie_width_max=16, pstate=0) == []
 
 
 XID_GPU = {"index": 2, "uuid": "GPU-2", "pci_bus_id": "00000000:81:00.0"}
@@ -102,8 +103,11 @@ def test_nvml_only_reports_the_xid_read_and_the_card_lists():
 NARROW_LINK = "gpu 3 (%s): PCIe link x8 of x16" % UUIDS[3]
 
 
-def _ok(**extra):
-    nvml = {"available": True, "gpus": [{"index": 3, "uuid": UUIDS[3], "ecc_uncorrected": 0}]}
+FULL_LINK_AT_P0 = {"pstate": 0, "pcie_width": 16, "pcie_width_max": 16, "pcie_gen": 4, "pcie_gen_max": 4}
+
+
+def _ok(gpu=None, **extra):
+    nvml = {"available": True, "gpus": [{"index": 3, "uuid": UUIDS[3], "ecc_uncorrected": 0, **(gpu or {})}]}
     return _report("ok", flags=[], nvml=nvml, **extra)
 
 
@@ -132,16 +136,36 @@ async def test_the_xid_baseline_is_kept_and_passed_to_the_next_read(context_fact
 
 
 @pytest.mark.asyncio
-async def test_a_suspect_counts_only_when_read_on_two_cycles_in_a_row(context_factory):
+async def test_a_downgrade_counts_from_its_second_read_and_holds_until_a_full_link_at_p0(context_factory):
     services = _services()
     first, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
     second, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
-    await _read(context_factory, services, _ok(card_suspects=[]))
-    after_gap, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    # a read that merely shows no downgrade (an idle card is not judged) proves nothing (review)
+    idle, _ = await _read(context_factory, services, _ok(gpu={"pstate": 8}, card_suspects=[]))
+    healed, _ = await _read(context_factory, services, _ok(gpu=FULL_LINK_AT_P0, card_suspects=[]))
+    once_again, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
 
     assert first.report["card_faults"] == []
     assert second.report["card_faults"] == [NARROW_LINK]
-    assert after_gap.report["card_faults"] == []
+    assert idle.report["card_faults"] == [NARROW_LINK]
+    assert healed.report["card_faults"] == []
+    assert once_again.report["card_faults"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_xid_fault_holds_until_the_kernel_log_restarts(context_factory):
+    services = _services()
+    xid_fault = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: {HW}"
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 4}))
+    new, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 5}, xid_faults=[xid_fault]))
+    quiet, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 5}))
+    unread, _ = await _read(context_factory, services, _ok(xid={"available": False, "error": "denied"}))
+    rebooted, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 1}))
+
+    assert new.report["card_faults"] == [xid_fault]
+    assert quiet.report["card_faults"] == [xid_fault]
+    assert unread.report["card_faults"] == [xid_fault]
+    assert rebooted.report["card_faults"] == []
 
 
 @pytest.mark.asyncio
@@ -178,7 +202,7 @@ async def test_a_new_hardware_xid_on_a_listed_card_is_posted_naming_it(context_f
 
 
 @pytest.mark.asyncio
-async def test_a_link_downgrade_is_posted_from_its_second_cycle_and_recovers_when_gone(context_factory):
+async def test_a_link_downgrade_is_posted_from_its_second_cycle_and_recovers_on_a_full_link(context_factory):
     services = _services()
 
     await _drop(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
@@ -188,7 +212,10 @@ async def test_a_link_downgrade_is_posted_from_its_second_cycle_and_recovers_whe
     # an NVML read that failed proves nothing: the incident stays open
     await _drop(context_factory, services, _report("error", flags=[], nvml={"available": False}))
     assert _states(services) == ["fault"]
+    # no downgrade read is no proof either: only the full link at P0 is
     await _drop(context_factory, services, _ok(card_suspects=[]))
+    assert _states(services) == ["fault"]
+    await _drop(context_factory, services, _ok(gpu=FULL_LINK_AT_P0, card_suspects=[]))
     assert _states(services) == ["fault", "recovered"]
 
 

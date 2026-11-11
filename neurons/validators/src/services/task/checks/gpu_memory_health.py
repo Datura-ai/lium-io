@@ -29,8 +29,8 @@ _FLAG_UUID = re.compile(r"^gpu \S+ \(([^()]+)\): ")
 RESET_REQUIRED_STREAK_LIMIT = 3
 _reset_required_streak: dict[tuple[str, str], int] = {}
 
-# DAH-5869: per executor, the kernel-log Xid lines already judged and the last read's card suspects
-# (PCIe downgrade), so only new Xids count and a suspect needs two reads in a row
+# DAH-5869: per executor, the kernel-log Xid lines already judged, the last read's PCIe downgrades (one
+# needs two reads in a row) and the card faults still held: a fault closes only on proof the card healed
 CARD_HEALTH_KEY_PREFIX = "gpu_card_health"
 CARD_HEALTH_TTL_SECONDS = 86400
 _REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
@@ -39,7 +39,8 @@ _REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, O
 @dataclass
 class CardHealthState:
     xid_seen: int | None = None
-    suspects: list[str] = field(default_factory=list)
+    pcie_downgrades: list[str] = field(default_factory=list)
+    held: list[str] = field(default_factory=list)
 
 
 def _card_health_key(ctx: Context) -> str:
@@ -53,30 +54,65 @@ async def _load_card_health(ctx: Context) -> CardHealthState:
         return CardHealthState()
     if not isinstance(stored, dict):
         return CardHealthState()
-    xid_seen, suspects = stored.get("xid_seen"), stored.get("suspects")
+    xid_seen = stored.get("xid_seen")
+
+    def strings(key: str) -> list[str]:
+        value = stored.get(key)
+        return [s for s in value if isinstance(s, str)] if isinstance(value, list) else []
+
     return CardHealthState(
         xid_seen=xid_seen if type(xid_seen) is int else None,
-        suspects=[s for s in suspects if isinstance(s, str)] if isinstance(suspects, list) else [],
+        pcie_downgrades=strings("pcie_downgrades"),
+        held=strings("held"),
     )
 
 
+def _healed(fault: str, gpus: dict[str, dict[str, Any]], log_restarted: bool) -> bool:
+    """Proof that a held card fault is over: the card is gone (the missing-card rule reports that), a
+    PCIe downgrade reads its full link at full performance, an Xid the kernel log restarting (reboot or
+    driver reload). A read that merely shows nothing new proves nothing."""
+    match = _FLAG_UUID.match(fault)
+    gpu = gpus.get(match.group(1)) if match else None
+    if gpu is None:
+        return True
+    if ": PCIe link " in fault:
+        return (
+            gpu.get("pstate") == 0
+            and gpu.get("pcie_width") == gpu.get("pcie_width_max")
+            and gpu.get("pcie_gen") == gpu.get("pcie_gen_max")
+        )
+    # shortcut: a card reset without a reboot leaves an Xid fault held; add a reset proof if that bites
+    return log_restarted
+
+
 async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
-    """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids, and a
-    suspect also read on the previous cycle; then keep the state for the next read. A dry run shares Redis
-    with the live validator, so it writes nothing."""
+    """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids, a PCIe
+    downgrade also read on the previous cycle, and every earlier fault not yet proven healed (`_healed`);
+    then keep the state for the next read. A dry run shares Redis with the live validator, so it writes
+    nothing."""
     if report.get("status") not in ("ok", "flagged"):
         return  # no NVML reading: the state stays as it was
-    suspects = [s for s in report.get("card_suspects") or [] if isinstance(s, str)]
+    downgrades = [s for s in report.get("card_suspects") or [] if isinstance(s, str)]
     xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
-    report["card_faults"] = xid_faults + [s for s in suspects if s in before.suspects]
     xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
     seen = xid.get("count") if xid.get("available") else before.xid_seen
+    log_restarted = before.xid_seen is not None and type(seen) is int and seen < before.xid_seen
+    gpus = {
+        gpu["uuid"]: gpu
+        for gpu in (report.get("nvml") or {}).get("gpus") or []
+        if isinstance(gpu, dict) and isinstance(gpu.get("uuid"), str)
+    }
+    new = xid_faults + [s for s in downgrades if s in before.pcie_downgrades]
+    held = [f for f in before.held if f not in new and not _healed(f, gpus, log_restarted)]
+    report["card_faults"] = new + held
     if settings.DRY_RUN:
         return
     try:
         await ctx.services.redis.set(
             _card_health_key(ctx),
-            json.dumps(asdict(CardHealthState(xid_seen=seen, suspects=suspects))),
+            json.dumps(
+                asdict(CardHealthState(xid_seen=seen, pcie_downgrades=downgrades, held=report["card_faults"]))
+            ),
             ex=CARD_HEALTH_TTL_SECONDS,
         )
     except _REDIS_ERRORS:

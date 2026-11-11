@@ -957,13 +957,16 @@ def nvml_card_suspects(snapshot: dict) -> list[str]:
     for a slowdown bit, which never holds a rented node."""
     suspects = []
     for gpu in snapshot.get("gpus") or []:
+        # a card below full performance may narrow and slow its link by design (power saving): a healthy
+        # rented card between kernels reads that way, so the link is only judged at P0 (review)
+        if gpu.get("pstate") != 0:
+            continue
         name = f"gpu {gpu.get('index')} ({gpu.get('uuid')})"
         width, width_max = gpu.get("pcie_width"), gpu.get("pcie_width_max")
         if isinstance(width, int) and isinstance(width_max, int) and 0 < width < width_max:
             suspects.append(f"{name}: PCIe link x{width} of x{width_max}")
         gen, gen_max = gpu.get("pcie_gen"), gpu.get("pcie_gen_max")
-        # an idle card drops its link speed by design: the generation is only judged at full performance (P0)
-        if gpu.get("pstate") == 0 and isinstance(gen, int) and isinstance(gen_max, int) and 0 < gen < gen_max:
+        if isinstance(gen, int) and isinstance(gen_max, int) and 0 < gen < gen_max:
             suspects.append(f"{name}: PCIe link gen {gen} of gen {gen_max}")
     return suspects
 

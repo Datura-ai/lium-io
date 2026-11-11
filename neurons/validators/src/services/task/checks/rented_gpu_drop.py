@@ -24,8 +24,8 @@ failed row remap: GpuMemoryHealthCheck's NVML read, done here first on a rented 
 `ecc_uncorrected`, even when every card is listed; its UUID goes into `missing_uuids` on a part-rented
 node too: the backend knows which cards each pod holds, and a fault naming no card is refused there.
 DAH-5869: a card NVML still lists but that logged a new hardware Xid, or reads a PCIe link below its
-maximum on two cycles in a row (the same memory read), is `gpu_hw_fault`, its
-UUID named the same way. A rented node whose scrape timed out SCRAPE_TIMEOUT_CYCLES in a row
+maximum at full performance on two cycles in a row (the same memory read), is `gpu_hw_fault`, its
+UUID named the same way, and stays so until a read proves it healed (gpu_memory_health._healed). A rented node whose scrape timed out SCRAPE_TIMEOUT_CYCLES in a row
 (MachineSpecScrapeCheck) posts `gpu_unverified` with no card seen, and recovers on its next clean scrape.
 The pod is never touched by any of these.
 
