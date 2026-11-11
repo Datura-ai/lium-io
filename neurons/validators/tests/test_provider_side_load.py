@@ -1,4 +1,5 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
+import os
 import time
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -832,8 +833,8 @@ async def test_a_lium_storage_name_the_validator_did_not_start_is_the_providers(
 
 @pytest.mark.parametrize(
     "state, age",
-    [("STATUS:0", 60), ("EXITED", 60), ("INVALID", 60), ("STARTING", 600)],
-    ids=["finished", "runner_died", "bad_pid", "never_started"],
+    [("STATUS:0", 60), ("EXITED", 60), ("INVALID", 60), ("STARTING", 600), ("GONE", 600)],
+    ids=["finished", "runner_died", "bad_pid", "never_started", "files_gone"],
 )
 @pytest.mark.asyncio
 async def test_a_helper_name_after_its_operation_ended_is_the_providers(
@@ -866,6 +867,24 @@ async def test_a_helper_about_to_start_is_excused(context_factory):
     )
 
     assert await _provider_cores(ctx) == 1.9
+
+
+@pytest.mark.asyncio
+async def test_an_operation_that_ended_inside_the_grace_excuses_nothing(context_factory):
+    # an online operation removes its files when it ends, minutes after its record: a container
+    # taking the freed helper name then is the provider's
+    store: set[str] = set()
+    ctx = _with_recorded_helpers(
+        context_factory(
+            state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER, state="GONE")
+        ),
+        OPERATION,
+        records=store,
+        age=60,
+    )
+
+    assert await _provider_cores(ctx) == 8.9
+    assert len(store) == 1  # it may still be about to launch: kept until the grace ends
 
 
 async def _cycle(context_factory, store: set[str], rows, state="RUNNING") -> float:
@@ -983,6 +1002,31 @@ async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
     redis.expire.assert_awaited_once()
     await forget_storage_helper(redis, "executor-1", OPERATION)
     assert await settle_excused_storage_helper_keys(redis, "executor-1", running) == set()
+
+
+@pytest.mark.parametrize(
+    "files, expected",
+    [
+        ({}, "GONE"),
+        ({"json": "{}"}, "STARTING"),
+        ({"json": "{}", "pid": str(os.getpid())}, "RUNNING"),
+        ({"pid": "999999999"}, "EXITED"),
+        ({"status": "0\n"}, "STATUS:0"),
+    ],
+    ids=["no_files", "spec_only", "live_pid", "dead_pid", "ended_with_status"],
+)
+def test_the_node_command_reads_each_operation_state(tmp_path, files, expected):
+    import subprocess
+
+    for suffix, content in files.items():
+        (tmp_path / f"{OPERATION}.{suffix}").write_text(content)
+    command = operation_states_command([str(OPERATION)]).replace(
+        "/root/app/storage-operations", str(tmp_path)
+    )
+
+    stdout = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
+
+    assert parse_operation_states(stdout) == {str(OPERATION): expected}
 
 
 def test_operation_states_round_trip_through_the_node_command():

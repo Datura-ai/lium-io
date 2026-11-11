@@ -117,12 +117,19 @@ async def forget_storage_helper(
 
 
 def operation_states_command(operation_ids: list[str]) -> str:
-    """One `<operation id> <state>` line per operation, the state as `_operation_state` reads it."""
-    return " ".join(
-        f"printf '%s ' {shlex.quote(op)}; "
-        f"{_operation_state_command(StorageOperationFiles.for_operation(UUID(op)))}; echo;"
-        for op in operation_ids
-    )
+    """One `<operation id> <state>` line per operation, the state as `_operation_state` reads it,
+    except that STARTING with no spec file reads GONE: the operation either has not been written
+    yet or has ended (an online one removes its status, pid and spec when it ends)."""
+    lines = []
+    for op in operation_ids:
+        files = StorageOperationFiles.for_operation(UUID(op))
+        lines.append(
+            f"state=$({_operation_state_command(files)}); "
+            f'if [ "$state" = STARTING ] && ! test -e {shlex.quote(str(files.spec))}; '
+            "then state=GONE; fi; "
+            f"printf '%s %s\\n' {shlex.quote(op)} \"$state\";"
+        )
+    return " ".join(lines)
 
 
 def parse_operation_states(stdout: str) -> dict[str, str]:
@@ -142,8 +149,10 @@ async def settle_excused_storage_helper_keys(
     """Drops the records whose operation ended and returns the helper keys to excuse.
 
     `read_states` reads the operations' runner states on the node (None when unreadable). An
-    operation is open while its runner is alive, or for a short grace before its runner starts;
-    an ended one, or one past the TTL, loses its record. Unreadable states keep every record and
+    operation is open while its runner is alive, or for a short grace while its spec is written
+    and its runner not yet; an ended one, or one past the TTL, loses its record. No files at all
+    (GONE) excuses nothing: inside the grace the record waits for the launch, after it it goes.
+    Unreadable states keep every record and
     excuse nothing this cycle, and so does Redis not answering.
     """
     keys: set[str] = set()
@@ -167,12 +176,11 @@ async def settle_excused_storage_helper_keys(
             return
         for raw, record in live.items():
             state = states.get(record.operation_id, "")
-            starting = state == "STARTING" and (
-                now - record.started <= STORAGE_OPERATION_START_GRACE_SECONDS
-            )
-            if state == "RUNNING" or starting:
+            in_grace = now - record.started <= STORAGE_OPERATION_START_GRACE_SECONDS
+            if state == "RUNNING" or (state == "STARTING" and in_grace):
                 keys.add(storage_helper_key(record.operation_id))
-            else:
+            elif not (state == "GONE" and in_grace):
+                # GONE in the grace may still be about to launch: kept, but excuses nothing
                 await redis.srem(_key(executor_id), raw)
 
     if not await _redis_call(f"read helpers of {executor_id}", settle):
