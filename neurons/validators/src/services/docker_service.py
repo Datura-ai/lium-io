@@ -9711,6 +9711,7 @@ class DockerService:
         # check after it) is gated on this, never on workload_kind alone.
         removes_every_filler = payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not beside_fillers
         warnings = []
+        vulkan_icd: asyncio.Task | None = None
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
@@ -11409,8 +11410,11 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                        await self.register_vulkan_icd_with_rental_docker(
-                            docker_client, container_name=container_name, log_extra=default_extra
+                        # runs beside the remaining steps (median 1.4 s); awaited before the reply
+                        vulkan_icd = asyncio.create_task(
+                            self.register_vulkan_icd_with_rental_docker(
+                                docker_client, container_name=container_name, log_extra=default_extra
+                            )
                         )
                     elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                         docker_client=docker_client,
@@ -11511,6 +11515,11 @@ class DockerService:
 
                     await self.finish_stream_logs()
 
+                    if vulkan_icd is not None:
+                        # before the running check: a Vulkan app started right after readiness must see the GPU,
+                        # and a container that stopped during the registration must not be reported created
+                        await vulkan_icd
+
                     # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
                     # the validator, no environment and ships_sshd, no exec runs after the key step. Read
                     # after the log drain, which awaits, so a kill while it drains is seen too.
@@ -11554,6 +11563,8 @@ class DockerService:
                         )
                     )
                 except Exception as post_run_exc:
+                    if vulkan_icd is not None:
+                        await vulkan_icd  # best effort, never raises: let its exec end before cleanup removes the pod
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
