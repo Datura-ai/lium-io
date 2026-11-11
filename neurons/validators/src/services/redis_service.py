@@ -5,7 +5,7 @@ import math
 import time
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
-from typing import Literal, NamedTuple
+from typing import Callable, Literal, NamedTuple
 
 import redis.asyncio as aioredis
 import redis.exceptions
@@ -46,6 +46,14 @@ LAST_SCORED_RESULT_TTL_SECONDS = 60 * 60
 # DAH-4698: creates the backend sent that are running in this connector right now, by pod id; what is left when a
 # connector starts was cut off by the restart (a redeploy recreates the connector mid-create)
 INFLIGHT_BACKEND_CREATES_KEY = "inflight_backend_creates"
+# DAH-5380: a renter's ContainerCreated sent but not yet answered by the backend's rent-finished, by pod id; resent
+# after a reconnect, since a backend restart can drop it after the send and leave the pod PENDING
+UNACKED_CONTAINER_CREATED_KEY = "unacked_container_created"
+# lium-io#1952: per pod, its creates' command ids in the order the backend's messages were accepted; the last one is
+# the pod's current dispatch, whichever node each runs on
+CREATE_DISPATCH_ORDER_PREFIX = "create_dispatch_order:"
+CREATE_DISPATCH_ORDER_TTL_SECONDS = 24 * 3600
+CREATE_DISPATCH_ORDER_KEPT = 20
 BACKEND_COMMAND_PREFIX = "backend_command:"
 # DAH-5592: a create's replies that failed it for a host fault (the backend stops billing on these), by command id; sent
 # again on every backend socket for HOST_FAULT_FAILURE_RESEND_SECONDS, since one the backend lost (its database and
@@ -176,6 +184,9 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# executor id -> how many times it was requested; a run ends only the request it started from (review 4510532999)
+EXPRESS_LANE_RECHECK_GENERATIONS_HASH = "express_lane:recheck_generations"
+RECHECK_POP_ATTEMPTS = 5
 # When the express lane first saw a never-validated executor (epoch s), kept across validator restarts:
 # an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
 EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
@@ -359,6 +370,39 @@ class VerifiedPortsMemory(NamedTuple):
     measured_at: float
 
 
+def _dispatch_order(raw: str | bytes | None) -> list[list]:
+    """[command_id, accepted_ns] pairs, oldest acceptance first"""
+    try:
+        order = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return [e for e in order if isinstance(e, list) and len(e) == 2] if isinstance(order, list) else []
+
+
+def _current_dispatch(order: list[list]) -> str:
+    return order[-1][0] if order else ""
+
+
+def _saved_command_id(saved: str) -> str:
+    """the command_id of a saved ContainerCreated report; "" when unreadable (never resent anyway)"""
+    try:
+        return json.loads(saved).get("command_id", "")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _parse_pending_pods(data) -> list[dict]:
+    if not data:
+        return []
+    data = json.loads(data)
+    if isinstance(data, dict):
+        return [data]
+    if not isinstance(data, list):
+        logger.warning(f"Unexpected data type in get_pending_pods: {type(data)}")
+        return []
+    return data
+
+
 class RedisService:
     def __init__(self):
         self.redis = aioredis.Redis(
@@ -513,9 +557,9 @@ class RedisService:
             # the lock lapses at its TTL as before; the re-send only waits longer
             logger.warning(_m("Could not release a cut-off create's lock", extra={"pod_id": pod_id, "error": str(e)}))
 
-    async def publish(self, channel: str, message: dict):
-        """Publish a message to a Redis channel."""
-        await self.redis.publish(channel, json.dumps(message))
+    async def publish(self, channel: str, message: dict) -> int:
+        """Publish a message to a Redis channel; returns how many subscribers received it."""
+        return await self.redis.publish(channel, json.dumps(message))
 
     async def subscribe(self, *channel: str):
         """Subscribe to a Redis channel. Caller MUST `await pubsub.aclose()` when it stops reading —
@@ -549,14 +593,38 @@ class RedisService:
 
     async def request_executor_recheck(self, executor_id: str) -> None:
         async with self.lock:
+            await self.redis.hincrby(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id, 1)
             await self.redis.sadd(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
-            await self.redis.expire(
-                EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS
-            )
+            for key in (EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_GENERATIONS_HASH):
+                await self.redis.expire(key, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS)
 
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def get_executor_recheck_generation(self, executor_id: str) -> int:
+        return int(await self.redis.hget(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id) or 0)
+
+    async def pop_executor_recheck_request(self, executor_id: str, generation: int | None = None) -> None:
+        """Ends the request; with a generation, only if no newer request for the node came in since it was read.
+        The check and the removal are one WATCH/MULTI transaction: a request landing in between aborts it. Raises
+        when neither the removal nor a newer request could be confirmed, so the caller keeps its own state."""
+        for _ in range(RECHECK_POP_ATTEMPTS):
+            try:
+                async with self.redis.pipeline(transaction=True) as pipe:
+                    if generation is not None:
+                        await pipe.watch(EXPRESS_LANE_RECHECK_GENERATIONS_HASH)
+                        current = await pipe.hget(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
+                        if int(current or 0) != generation:
+                            return  # a newer request came in: it stays for the next run
+                    pipe.multi()
+                    pipe.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
+                    pipe.hdel(EXPRESS_LANE_RECHECK_GENERATIONS_HASH, executor_id)
+                    await pipe.execute()
+                    return
+            except redis.exceptions.WatchError:
+                continue  # review 4523252183: the hash is shared, so another node's request aborts it too: re-read
+        raise RuntimeError(f"recheck request of {executor_id} not ended after {RECHECK_POP_ATTEMPTS} attempts")
 
     async def express_first_seen(self, executor_ids: list[str], now: float) -> dict[str, float]:
         """When the express lane first saw each executor (epoch s): SET NX keeps the first sighting,
@@ -572,9 +640,6 @@ class RedisService:
             for executor_id, value in zip(executor_ids, values, strict=True)
             if value is not None
         }
-
-    async def pop_executor_recheck_request(self, executor_id: str) -> None:
-        await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
@@ -918,10 +983,9 @@ class RedisService:
         pod_id: str,
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
+        command_id: str = "",
         synthetic_probe: bool = False,
     ):
-        # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
         now = int(time.time())
 
         item: dict = {"time": now, "pod_id": pod_id}
@@ -930,29 +994,120 @@ class RedisService:
             item["kind"] = kind
         if gpu_uuids:
             item["gpu_uuids"] = list(gpu_uuids)
-        pending_pods.append(item)
-        # one step: a marker written without its stamp would abort the caller before its cleanup and leave the marker behind
-        writes = RedisWrites().hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
-        if kind is None and not synthetic_probe:
-            # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
-            # keep their marker but leave no stamp, since neither is a rental being created
-            writes = writes.set(
-                create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
-            )
-        await self.write_atomically(writes)
+        if command_id:
+            item["command_id"] = command_id
 
-    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str, kind: str | None = None):
-        """Every pending mark of the pod, or only its marks of `kind` when given."""
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
-        pending_pods = [
-            item
-            for item in pending_pods
-            if item.get('pod_id', '') != pod_id or (kind is not None and item.get('kind') != kind)
-        ]
-        if pending_pods:
-            await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
-        else:
-            await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
+        def stamp() -> RedisWrites:
+            # read at each try: a retry after a newer create's EXEC must not write an older time over its stamp
+            writes = RedisWrites()
+            if kind is None and not synthetic_probe:
+                # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
+                # keep their marker but leave no stamp, since neither is a rental being created
+                writes.set(
+                    create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
+                )
+            return writes
+
+        # lium-io#1952: a new dispatch (a reboot, an edit, a retry) supersedes the success saved for an older one;
+        # replayed while this one runs, the backend would complete this one with the old container's ports. Read
+        # before the mark is published: a newer dispatch's success saved after it is never the one deleted
+        superseded = await self.hget(UNACKED_CONTAINER_CREATED_KEY, pod_id) if command_id else None
+        # read after the report: a dispatch the backend sent after this one saves only after it is current, so the
+        # report read above is never its own. One sent before the current one supersedes nothing: it paused on its
+        # way here while the newer one, maybe on another node, saved its success
+        if superseded is not None and await self.current_create_dispatch(pod_id) not in ("", command_id):
+            superseded = None
+        # every entry: a write must not drop a build past 30 min that the orphan sweep still spares. One step with
+        # the stamp: a marker written without it would abort the caller before its cleanup and leave the marker behind
+        await self._update_pending_pods(miner_hotkey, executor_id, lambda pending_pods: [*pending_pods, item], stamp)
+        if superseded is not None and _saved_command_id(superseded) != command_id:
+            await self.remove_unacked_container_created(pod_id, superseded)
+
+    async def remove_pending_pod(
+        self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str = "", kind: str | None = None
+    ):
+        """Every pending mark of the pod, or only its marks of `kind` when given. command_id given (a rent-finished
+        bound to one dispatch): only that dispatch's flag and saved report go, and ones that carry no id (written
+        before ids); a reboot's own create keeps its flag and report"""
+
+        def other_dispatch(item_command_id: str) -> bool:
+            return bool(command_id and item_command_id and item_command_id != command_id)
+
+        def keep(item: dict) -> bool:
+            # a gpu_reset/gpu_clocks mark carries no command_id: a bound receipt never clears one
+            return (
+                item.get("pod_id", "") != pod_id
+                or other_dispatch(item.get("command_id", ""))
+                or bool(command_id and item.get("kind"))
+                or (kind is not None and item.get("kind") != kind)
+            )
+
+        await self._update_pending_pods(
+            miner_hotkey, executor_id, lambda pending_pods: [item for item in pending_pods if keep(item)]
+        )
+        if kind is None:  # clearing one kind of mark (a GPU reset's) is no create's receipt
+            # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
+            await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
+
+    async def accept_create_dispatch(self, pod_id: str, command_id: str, accepted_ns: int) -> None:
+        """Records a create the backend sent, placed by `accepted_ns`, the time the receive loop took its message: the
+        latest acceptance is the pod's current dispatch, however late its record lands (a write retried after a Redis
+        error cannot put an older dispatch above a newer one). A command id seen before (a redelivery) keeps its
+        place: a late duplicate of an older dispatch never becomes current again."""
+        key = f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"
+        async with self.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(key)
+                    order = _dispatch_order(await pipe.get(key))
+                    if command_id not in (e[0] for e in order):
+                        order = sorted([*order, [command_id, accepted_ns]], key=lambda e: e[1])
+                    pipe.multi()
+                    pipe.set(key, json.dumps(order[-CREATE_DISPATCH_ORDER_KEPT:]), ex=CREATE_DISPATCH_ORDER_TTL_SECONDS)
+                    await pipe.execute()
+                    return
+                except redis.exceptions.WatchError:
+                    continue
+
+    async def current_create_dispatch(self, pod_id: str) -> str:
+        """The command id of the pod's create the backend sent last; "" when none was recorded."""
+        return _current_dispatch(_dispatch_order(await self.get(f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}")))
+
+    async def _update_pending_pods(
+        self,
+        miner_hotkey: str,
+        executor_id: str,
+        change: Callable[[list[dict]], list[dict]],
+        also: Callable[[], RedisWrites] | None = None,
+    ) -> None:
+        """Read, change and write one executor's pending list as one WATCH/MULTI transaction: a concurrent add or
+        remove makes EXEC fail and the change rerun on the new list, so neither write is lost (lium-io#1952).
+        `also()`, built again at each try, is written in the same EXEC."""
+        field = f"{miner_hotkey}:{executor_id}"
+        async with self.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(PENDING_PODS_PREFIX)
+                    pending_pods = change(_parse_pending_pods(await pipe.hget(PENDING_PODS_PREFIX, field)))
+                    pipe.multi()
+                    if pending_pods:
+                        pipe.hset(PENDING_PODS_PREFIX, field, json.dumps(pending_pods))
+                    else:
+                        pipe.hdel(PENDING_PODS_PREFIX, field)
+                    for write in also().ops if also else ():
+                        getattr(pipe, write.command)(*write.args, **write.kwargs)
+                    await pipe.execute()
+                    return
+                except redis.exceptions.WatchError:
+                    continue
+
+    async def _remove_unacked_container_created_unless(self, pod_id: str, keep: Callable[[str], bool]) -> None:
+        """keep: called with the saved report's command_id. The delete compares the whole saved report, so one a
+        newer dispatch saved after the read is never the one deleted."""
+        saved = await self.hget(UNACKED_CONTAINER_CREATED_KEY, pod_id)
+        if saved is None or keep(_saved_command_id(saved)):
+            return
+        await self.remove_unacked_container_created(pod_id, saved)
 
     async def claim_backend_command(self, command_id: str, claim: str) -> BackendCommand | None:
         key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
@@ -1016,6 +1171,64 @@ class RedisService:
         """Remove one execution's record; the pod's other executions keep theirs."""
         await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id))
 
+    async def add_unacked_container_created(self, pod_id: str, message_json: str) -> None:
+        await self.hset(UNACKED_CONTAINER_CREATED_KEY, pod_id, message_json)
+
+    async def save_container_created_of_current_dispatch(
+        self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str, message_json: str
+    ) -> bool:
+        """Saves a create's success only for the pod's current dispatch (the latest accepted, on any node), so a late
+        success of an older dispatch cannot overwrite the newer one's only saved report (lium-io#1952). A pod with no
+        recorded order falls back to its newest create mark on this node. Both are WATCHed, so a dispatch added
+        meanwhile reruns the check."""
+        field = f"{miner_hotkey}:{executor_id}"
+        order_key = f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"
+        async with self.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(PENDING_PODS_PREFIX, order_key)
+                    order = _dispatch_order(await pipe.get(order_key))
+                    if command_id and order and _current_dispatch(order) != command_id:
+                        await pipe.reset()
+                        return False
+                    creates = [
+                        item
+                        for item in _parse_pending_pods(await pipe.hget(PENDING_PODS_PREFIX, field))
+                        if item.get("pod_id", "") == pod_id and not item.get("kind")
+                    ]
+                    newest = creates[-1].get("command_id", "") if creates else ""
+                    # the acceptance order decides when there is one: an older dispatch's mark written last on this
+                    # node does not make it current; the pending list only stands in for a pod with no order
+                    if not order and command_id and newest and newest != command_id:
+                        await pipe.reset()
+                        return False
+                    pipe.multi()
+                    pipe.hset(UNACKED_CONTAINER_CREATED_KEY, pod_id, message_json)
+                    await pipe.execute()
+                    return True
+                except redis.exceptions.WatchError:
+                    continue
+
+    async def remove_unacked_container_created(self, pod_id: str, saved: str | bytes) -> None:
+        """Deletes the pod's saved report only while it is still `saved`, the one the caller read: a newer
+        dispatch's report saved meanwhile stays (lium-io#1952)."""
+        async with self.lock:
+            await self.redis.eval(
+                "if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then return redis.call('HDEL', KEYS[1], ARGV[1]) end return 0",
+                1,
+                UNACKED_CONTAINER_CREATED_KEY,
+                pod_id,
+                saved,
+            )
+
+    async def unacked_container_created(self) -> dict[str, str]:
+        """pod id -> the ContainerCreated JSON the backend has not answered yet"""
+        raw = await self.hgetall(UNACKED_CONTAINER_CREATED_KEY)
+        return {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in raw.items()
+        }
+
     async def backend_create_inflight(self, pod_id: str) -> bool:
         """Whether the connector is running any create, reboot or edit of the pod (another process)."""
         fields = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
@@ -1044,17 +1257,7 @@ class RedisService:
         self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60
     ) -> list[dict]:
         """Pending-pod entries younger than `max_age_seconds` (None: every entry)."""
-        data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
-        if not data:
-            return []
-
-        data = json.loads(data)
-        if isinstance(data, dict):
-            data = [data]
-        elif not isinstance(data, list):
-            logger.warning(f"Unexpected data type in get_pending_pods: {type(data)}")
-            return []
-        
+        data = _parse_pending_pods(await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}"))
         now = int(time.time())
         pending_pods = []
         

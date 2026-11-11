@@ -302,6 +302,27 @@ async def test_a_create_re_signs_when_the_restarted_miner_says_the_signature_is_
 
 
 @pytest.mark.asyncio
+async def test_a_backup_re_signs_when_the_busy_miner_says_the_signature_is_too_old(mocker, miner_service):
+    # 10-11 Nov: hourly backups failed "Failed to submit SSH key: ... Authentication message too old" at the top of
+    # the hour on nodes whose other runs pass; only a create used to re-sign
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    too_old = (401, {"detail": "Authentication message too old. Timestamp is outside the allowed 10-second window"})
+    miner_service._make_rest_request.side_effect = [too_old, (200, {"message_type": "AcceptSSHKeyRequest"}), (200, {})]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    stamps = iter(range(100))
+    mocker.patch.object(miner_service, "_generate_auth_headers", side_effect=lambda *_: {"X-Timestamp": next(stamps)})
+    backup = mocker.patch.object(miner_service, "handle_backup_container_req", AsyncMock(return_value=Mock()))
+    payload = _storage_payload("backup").model_copy(update={"executor_id": executor_id})
+
+    await miner_service._handle_container(payload)
+
+    backup.assert_awaited_once()
+    sent = [c.kwargs["headers"]["X-Timestamp"] for c in miner_service._make_rest_request.await_args_list]
+    assert sent[:2] == [0, 1]  # the third call removes the key afterwards
+
+
+@pytest.mark.asyncio
 async def test_a_create_gives_up_once_the_miner_stays_unreachable_past_the_wait(mocker, miner_service):
     executor_id = str(uuid4())
     _wire_common_mocks(mocker, miner_service, executor_id)

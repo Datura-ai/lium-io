@@ -550,6 +550,35 @@ async def test_a_foreign_process_beside_a_renters_pod_never_gets_advice_to_stop_
     assert result.event.what_we_saw["process_count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("make_pod_rental", "rented_data", "state"),
+    [
+        (lambda: PodRentalActiveResponse(active=True, executor_id=default_executor().uuid), None, PodRentalState.LIVE),
+        (lambda: _closed(minutes_ago=1), _snapshot_with_pod(), PodRentalState.ENDED_DURING_RUN),
+        (lambda: _closed(minutes_ago=10), None, PodRentalState.ENDED_RECENTLY),
+    ],
+    ids=["live", "ended-during-run", "ended-recently"],
+)
+@pytest.mark.asyncio
+async def test_a_leftover_process_beside_a_renters_pod_is_rebooted_only_once_no_rental_runs(
+    context_factory, make_pod_rental, rented_data, state
+):
+    leftover = {"pid": 644002, "info": f"0::/../docker-{'e' * 64}.scope/init.scope", "container_name": None}
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=make_pod_rental(),
+        rented_data=rented_data,
+        gpu_processes=[_pod_process(), leftover],
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.what_we_saw["pod_containers"][0].state is state
+    remediation = result.event.remediation
+    assert f"container {'e' * 12}, which is no longer running (once no rental is running, reboot" in remediation
+    assert "Do not stop the pod container of the rental on this node" in remediation
+
+
 @pytest.mark.parametrize("container_name", [TEARDOWN_POD, f"{TEARDOWN_POD}__prev"], ids=["pod", "edit-parked"])
 @pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
 @pytest.mark.parametrize(
@@ -1912,6 +1941,52 @@ async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(co
         "utilization and at most 5% memory utilization. GPU processes on the node: python3 "
         "(pid 4242)."
     )
+
+
+_LEFTOVER_ID = "ee61df8264ce3006fff5b96ac6005f46067c6fedb3cb053ac67b7f91030dc9a7"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [
+        f"0::/../docker-{_LEFTOVER_ID}.scope/init.scope",  # systemd cgroup driver
+        f"0::/../{_LEFTOVER_ID}/init.scope",  # cgroupfs driver
+        f"0::/docker/{_LEFTOVER_ID}",  # cgroupfs driver, host cgroup namespace
+    ],
+)
+async def test_a_busy_gpu_held_by_a_container_no_longer_running_says_a_reboot_clears_it(
+    context_factory, info
+):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 0}],
+        gpu_processes=[{"pid": 644002, "info": info, "container_name": None}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert (
+        "GPU processes on the node: a leftover process of container ee61df8264ce, which is no "
+        "longer running (once no rental is running, reboot the node to clear it) (pid 644002)." in result.event.remediation
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info", [f"0::/../docker-{_LEFTOVER_ID}.scope/init.scope", f"0::/../{_LEFTOVER_ID}/init.scope"]
+)
+async def test_a_running_named_container_is_named_not_called_a_leftover(context_factory, info):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 0}],
+        gpu_processes=[{"pid": 4242, "info": info, "container_name": "someones-trainer"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert "someones-trainer (pid 4242)" in result.event.remediation
+    assert "leftover process of container" not in result.event.remediation
 
 
 @pytest.mark.asyncio
