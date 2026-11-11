@@ -11515,6 +11515,11 @@ class DockerService:
 
                     await self.finish_stream_logs()
 
+                    if vulkan_icd is not None:
+                        # before the running check: a Vulkan app started right after readiness must see the GPU,
+                        # and a container that stopped during the registration must not be reported created
+                        await vulkan_icd
+
                     # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
                     # the validator, no environment and ships_sshd, no exec runs after the key step. Read
                     # after the log drain, which awaits, so a kill while it drains is seen too.
@@ -11534,10 +11539,6 @@ class DockerService:
                             executor_info.address, ssh_mapping[2], log_extra=default_extra
                         )
                         current_step = "finalize"
-
-                    if vulkan_icd is not None:
-                        # a Vulkan app started right after readiness must see the GPU
-                        await vulkan_icd
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.

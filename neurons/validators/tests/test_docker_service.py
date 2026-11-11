@@ -4514,6 +4514,49 @@ async def test_the_vulkan_icd_is_registered_before_the_create_replies(
 
     assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     assert registered == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_container_that_stops_during_the_icd_registration_is_not_reported_created(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """Sergej (lio#2105 F-2): the running check read the container before the registration ended."""
+    from services.rental_docker_sdk import ContainerGoneBeforeExec
+
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    stopped = []
+
+    async def registration_during_which_it_stops(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        stopped.append(True)
+
+    async def running_check(docker_client, *, container_name, container_id=None):
+        if stopped:
+            raise ContainerGoneBeforeExec("the container exited", container_name=container_name, state=None)
+
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", registration_during_which_it_stops)
+    monkeypatch.setattr("services.docker_service._raise_unless_running_before_created", running_check)
+    payload = _private_registry_create_payload().model_copy(update={"ships_sshd": True})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert not isinstance(result, ContainerCreated)
 @pytest.mark.asyncio
 async def test_create_container_reports_set_environment_failure_step(
     docker_service,
